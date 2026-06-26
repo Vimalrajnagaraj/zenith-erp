@@ -1,0 +1,247 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
+        default-menu-title="Job Work Challan" default-menu-index="2">
+    <transition name="createChallan">
+        <actions>
+            <script><![CDATA[
+                import java.sql.Timestamp
+                import java.util.Calendar
+                
+                Timestamp issueTs = null
+                if (issueDate instanceof Timestamp) {
+                    issueTs = issueDate
+                } else if (issueDate) {
+                    // Try to parse standard date string
+                    try {
+                        issueTs = new Timestamp(java.sql.Date.valueOf(issueDate.toString()).getTime())
+                    } catch (Exception e) {
+                        issueTs = ec.user.nowTimestamp
+                    }
+                } else {
+                    issueTs = ec.user.nowTimestamp
+                }
+                
+                Calendar cal = Calendar.getInstance()
+                cal.setTime(issueTs)
+                cal.add(Calendar.YEAR, 1)
+                Timestamp expectedTs = new Timestamp(cal.getTimeInMillis())
+                
+                String orgId = ec.user.getPreference("ActiveOrgId")
+                if (!orgId) {
+                    def orgList = ec.entity.find("mantle.party.PartyRole").condition("roleTypeId", "OrgInternal").list()
+                    if (orgList) orgId = orgList[0].partyId
+                }
+                if (!orgId) orgId = "ORG_ZIZI" // Fallback
+                
+                def newChallan = ec.entity.makeValue("zenith.erp.india.JobWorkChallan")
+                newChallan.setSequencedIdPrimary()
+                newChallan.jobWorkerPartyId = jobWorkerPartyId
+                newChallan.organizationPartyId = orgId
+                newChallan.issueDate = issueTs
+                newChallan.expectedReturnDate = expectedTs
+                newChallan.challanNumber = "JWC-" + newChallan.challanId
+                newChallan.isDeemedSale = "N"
+                newChallan.create()
+                
+                ec.message.addMessage("Job Work Challan ${newChallan.challanNumber} created successfully!")
+            ]]></script>
+        </actions>
+        <default-response url="."/>
+    </transition>
+
+    <transition name="receiveChallan">
+        <service-call name="update#zenith.erp.india.JobWorkChallan" in-map="[challanId:challanId, actualReturnDate:actualReturnDate]"/>
+        <actions>
+            <message type="success">Successfully logged return date for Challan ${challanId}</message>
+        </actions>
+        <default-response url="."/>
+    </transition>
+
+    <actions>
+        <set field="nowTimestamp" from="ec.user.nowTimestamp"/>
+        <set field="thirtyDaysFromNow" from="new java.sql.Timestamp(nowTimestamp.getTime() + (30L * 24L * 60L * 60L * 1000L))"/>
+        
+        <entity-find-count entity-name="zenith.erp.india.JobWorkChallan" count-field="activeCount">
+            <econdition field-name="actualReturnDate" operator="is-null"/>
+            <econdition field-name="isDeemedSale" operator="not-equals" value="Y" or-null="true"/>
+            <econdition field-name="expectedReturnDate" operator="greater-equals" from="nowTimestamp" or-null="true"/>
+        </entity-find-count>
+        
+        <entity-find-count entity-name="zenith.erp.india.JobWorkChallan" count-field="approachingDeadlineCount">
+            <econdition field-name="actualReturnDate" operator="is-null"/>
+            <econdition field-name="isDeemedSale" operator="not-equals" value="Y" or-null="true"/>
+            <econdition field-name="expectedReturnDate" operator="greater-equals" from="nowTimestamp"/>
+            <econdition field-name="expectedReturnDate" operator="less-equals" from="thirtyDaysFromNow"/>
+        </entity-find-count>
+        
+        <entity-find-count entity-name="zenith.erp.india.JobWorkChallan" count-field="overdueCount">
+            <econditions combine="or">
+                <econdition field-name="isDeemedSale" value="Y"/>
+                <econditions combine="and">
+                    <econdition field-name="actualReturnDate" operator="is-null"/>
+                    <econdition field-name="expectedReturnDate" operator="less" from="nowTimestamp"/>
+                </econditions>
+            </econditions>
+        </entity-find-count>
+        
+        <entity-find-count entity-name="zenith.erp.india.JobWorkChallan" count-field="returnedCount">
+            <econdition field-name="actualReturnDate" operator="is-not-null"/>
+        </entity-find-count>
+
+        <entity-find entity-name="zenith.erp.india.JobWorkChallan" list="challanList">
+            <search-form-inputs default-order-by="-issueDate"/>
+        </entity-find>
+    </actions>
+
+    <widgets>
+        <label text="Job Work Challan Management" type="h4"/>
+        
+        <!-- Dashboard Summary Cards -->
+        <container-row>
+            <row-col lg="3">
+                <container-box><box-header title="Active Challans"/><box-body>
+                    <label text="${activeCount ?: 0}" type="h2" style="text-primary mb-2"/>
+                    <label text="Materials currently at job worker premises." type="p" style="text-muted"/>
+                </box-body></container-box>
+            </row-col>
+            <row-col lg="3">
+                <container-box><box-header title="Approaching Deadline"/><box-body>
+                    <label text="${approachingDeadlineCount ?: 0}" type="h2" style="text-warning mb-2"/>
+                    <label text="Deadline within 30 days. Needs immediate followup." type="p" style="text-muted"/>
+                </box-body></container-box>
+            </row-col>
+            <row-col lg="3">
+                <container-box><box-header title="Overdue (Deemed Sale)"/><box-body>
+                    <label text="${overdueCount ?: 0}" type="h2" style="text-danger mb-2"/>
+                    <label text="Breached 1-year GST deadline. ITC must be reversed." type="p" style="text-muted"/>
+                </box-body></container-box>
+            </row-col>
+            <row-col lg="3">
+                <container-box><box-header title="Successfully Returned"/><box-body>
+                    <label text="${returnedCount ?: 0}" type="h2" style="text-success mb-2"/>
+                    <label text="Materials returned within statutory timeline." type="p" style="text-muted"/>
+                </box-body></container-box>
+            </row-col>
+        </container-row>
+
+        <container-box><box-header title="Job Work Challans"/><box-toolbar>
+            <container-dialog id="FindOptionsDialog" button-text="Find Options" button-class="btn btn-default">
+                <form-single name="FindOptionsForm" transition="." type="find">
+                    <field name="challanId"><default-field title="Challan ID"><text-find hide-options="true"/></default-field></field>
+                    <field name="jobWorkerPartyId">
+                        <default-field title="Job Worker">
+                            <drop-down allow-empty="true">
+                                <entity-options key="${partyId}" text="${organizationName?:firstName} ${lastName?:''} [${partyId}]">
+                                    <entity-find entity-name="mantle.party.PartyDetailAndRole">
+                                        <econdition field-name="roleTypeId" value="Supplier"/>
+                                    </entity-find>
+                                </entity-options>
+                            </drop-down>
+                        </default-field>
+                    </field>
+                    <field name="isDeemedSale">
+                        <default-field title="Status Flag">
+                            <drop-down allow-empty="true">
+                                <option key="N" text="Normal"/>
+                                <option key="Y" text="Deemed Sale"/>
+                            </drop-down>
+                        </default-field>
+                    </field>
+                    <field name="searchButton"><default-field title=""><submit text="Search" icon="fa fa-search"/></default-field></field>
+                </form-single>
+            </container-dialog>
+            <container-dialog id="CreateChallanDialog" button-text="New Challan" button-class="btn btn-primary">
+                    <form-single name="CreateChallanForm" transition="createChallan">
+                        <field name="jobWorkerPartyId">
+                            <default-field title="Job Worker">
+                                <drop-down allow-empty="false">
+                                    <entity-options key="${partyId}" text="${organizationName?:firstName} ${lastName?:''} [${partyId}]">
+                                        <entity-find entity-name="mantle.party.PartyDetailAndRole">
+                                            <econdition field-name="roleTypeId" value="Supplier"/>
+                                        </entity-find>
+                                    </entity-options>
+                                </drop-down>
+                            </default-field>
+                        </field>
+                        <field name="issueDate"><default-field><date-time type="date" default-value="${ec.l10n.format(ec.user.nowTimestamp, 'yyyy-MM-dd')}"/></default-field></field>
+                        <field name="submitButton"><default-field title=""><submit text="Create Challan" type="success"/></default-field></field>
+                    </form-single>
+                </container-dialog>
+        </box-toolbar><box-body>
+            <label text="Track raw materials sent for subcontracting (1-year return deadline under GST)." type="p"/>
+            <form-list name="JobWorkList" list="challanList" skip-form="true" header-dialog="true" show-csv-button="true" show-xlsx-button="true" show-page-size="true">
+                <row-actions>
+                    <script><![CDATA[
+                        formattedDeadline = expectedReturnDate ? ec.l10n.format(expectedReturnDate, 'dd MMM yyyy') : ''
+                        isPenalty = isDeemedSale == 'Y' || (expectedReturnDate != null && expectedReturnDate < ec.user.nowTimestamp && !actualReturnDate)
+                        statusText = isPenalty ? 'Deemed Sale (Penalty)' : (actualReturnDate ? 'Returned' : 'Pending')
+                        statusClass = isPenalty ? 'text-danger' : (actualReturnDate ? 'text-success' : 'text-warning')
+                        isCsv = ec.web?.parameters?.renderMode == 'csv' || ec.web?.parameters?.renderMode == 'xlsx'
+                    ]]></script>
+                </row-actions>
+                    <field name="challanId">
+                        <header-field title="ID" show-order-by="true"/>
+                        <default-field>
+                            <link text="${challanId}" url="../JobWorkChallanDetail" parameter-map="[challanId:challanId]"/>
+                        </default-field>
+                    </field>
+                    
+                    <field name="jobWorkerPartyId">
+                        <header-field title="Job Worker"/>
+                        <default-field>
+                            <display-entity entity-name="mantle.party.PartyDetail" text="${organizationName?:firstName} ${lastName?:''}"/>
+                        </default-field>
+                    </field>
+
+                    <field name="issueDate">
+                        <header-field title="Issue Date"/>
+                        <default-field><display format="dd MMM yyyy"/></default-field>
+                    </field>
+                    
+                    <field name="expectedReturnDate">
+                        <header-field title="Return Deadline (1 Year)"/>
+                        <conditional-field condition="isCsv">
+                            <display text="${formattedDeadline}"/>
+                        </conditional-field>
+                        <default-field>
+                            <label text="${formattedDeadline}" type="span" style="text-strong ${isPenalty ? 'text-danger' : ''}"/>
+                        </default-field>
+                    </field>
+                    
+                    <field name="isDeemedSale">
+                        <header-field title="Status"/>
+                        <conditional-field condition="isCsv">
+                            <display text="${statusText}"/>
+                        </conditional-field>
+                        <default-field>
+                            <label text="${statusText}" type="span" style="text-strong ${statusClass}"/>
+                        </default-field>
+                    </field>
+
+                    <field name="receiveAction">
+                        <header-field title="Action"/>
+                        <conditional-field condition="isCsv"><ignored/></conditional-field>
+                        <conditional-field condition="actualReturnDate == null">
+                            <container-dialog id="ReceiveChallan_${challanId}" button-text="Receive" button-class="btn btn-info btn-sm">
+                                <label text="Log exactly when the raw materials or finished items were returned by the job worker. (Detailed line-item quantities will be tracked in a future phase)." type="p"/>
+                                <form-single name="ReceiveForm_${challanId}" transition="receiveChallan">
+                                    <field name="challanId"><default-field><hidden/></default-field></field>
+                                    <field name="actualReturnDate">
+                                        <default-field title="Date Goods Received">
+                                            <date-time type="date" default-value="${ec.l10n.format(ec.user.nowTimestamp, 'yyyy-MM-dd')}"/>
+                                        </default-field>
+                                    </field>
+                                    <field name="submitButton"><default-field title=""><submit text="Confirm Return" type="success"/></default-field></field>
+                                </form-single>
+                            </container-dialog>
+                        </conditional-field>
+                        <default-field>
+                            <label text="Received" type="span" style="text-success"/>
+                        </default-field>
+                    </field>
+
+                </form-list>
+        </box-body></container-box>
+    </widgets>
+</screen>

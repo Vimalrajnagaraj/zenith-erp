@@ -1,0 +1,154 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
+        require-authentication="false" default-menu-include="false">
+
+    <transition name="" method="post" require-session-token="false" read-only="true">
+        <actions>
+            <script><![CDATA[
+                import javax.crypto.Mac
+                import javax.crypto.spec.SecretKeySpec
+                import groovy.json.JsonSlurper
+                import groovy.json.JsonOutput
+
+                def request = ec.web.getRequest()
+                def response = ec.web.getResponse()
+
+                // Read raw body from request input stream
+                def rawBody = ''
+                try {
+                    rawBody = request.getInputStream()?.text ?: ''
+                } catch (Exception e) {
+                    try { rawBody = request.getReader()?.text ?: '' } catch (Exception e2) { }
+                }
+
+                if (!rawBody) {
+                    response.setStatus(400)
+                    ec.web.sendJsonResponse([status: 'error', message: 'Empty request body'])
+                    return
+                }
+
+                // Get Razorpay signature from header
+                def signature = request.getHeader('X-Razorpay-Signature')
+                if (!signature) {
+                    response.setStatus(401)
+                    ec.web.sendJsonResponse([status: 'error', message: 'Missing signature'])
+                    return
+                }
+
+                // Get webhook secret
+                boolean authDisabled = ec.artifactExecution.disableAuthz()
+                try {
+                    def webhookSecret = ec.entity.find("zenith.erp.base.CompanySettings")
+                        .condition("organizationPartyId", "ZETAERP")
+                        .condition("settingKey", "RAZORPAY_WEBHOOK_SECRET").one()?.settingValue
+
+                    if (!webhookSecret) {
+                        ec.logger.warn("Razorpay webhook: RAZORPAY_WEBHOOK_SECRET not configured")
+                        response.setStatus(500)
+                        ec.web.sendJsonResponse([status: 'error', message: 'Webhook not configured'])
+                        return
+                    }
+
+                    // Verify HMAC-SHA256 signature
+                    def mac = Mac.getInstance("HmacSHA256")
+                    mac.init(new SecretKeySpec(webhookSecret.getBytes("UTF-8"), "HmacSHA256"))
+                    def computed = mac.doFinal(rawBody.getBytes("UTF-8"))
+                    def expectedSig = computed.collect { String.format('%02x', it) }.join('')
+
+                    if (expectedSig != signature) {
+                        ec.logger.warn("Razorpay webhook: signature mismatch")
+                        response.setStatus(401)
+                        ec.web.sendJsonResponse([status: 'error', message: 'Invalid signature'])
+                        return
+                    }
+
+                    // Parse webhook payload
+                    def payload = new JsonSlurper().parseText(rawBody)
+                    def event = payload?.event
+                    def paymentEntity = payload?.payload?.payment?.entity
+
+                    ec.logger.info("Razorpay webhook received: ${event}")
+
+                    if (!paymentEntity) {
+                        response.setStatus(200)
+                        ec.web.sendJsonResponse([status: 'ok', message: 'No payment entity in payload'])
+                        return
+                    }
+
+                    if (event == 'payment.captured') {
+                        def orderId = paymentEntity.order_id
+                        if (orderId) {
+                            def invoices = ec.entity.find("zenith.erp.saas.SaasInvoice")
+                                .condition("notes", "like", "%${orderId}%").list()
+                            if (invoices) {
+                                def inv = invoices[0]
+                                if (inv.statusId != 'SiPaid') {
+                                    ec.service.sync().name("update#zenith.erp.saas.SaasInvoice")
+                                        .parameter("saasInvoiceId", inv.saasInvoiceId)
+                                        .parameter("statusId", "SiPaid")
+                                        .parameter("paidDate", ec.user.nowTimestamp).call()
+
+                                    // Create payment record if not exists
+                                    def existingPayment = ec.entity.find("zenith.erp.saas.SaasPayment")
+                                        .condition("gatewayPaymentId", paymentEntity.id).one()
+                                    if (!existingPayment) {
+                                        ec.service.sync().name("create#zenith.erp.saas.SaasPayment")
+                                            .parameter("saasInvoiceId", inv.saasInvoiceId)
+                                            .parameter("tenantId", inv.tenantId)
+                                            .parameter("paymentDate", ec.user.nowTimestamp)
+                                            .parameter("amount", (paymentEntity.amount ?: 0) / 100.0)
+                                            .parameter("currencyUomId", paymentEntity.currency?.toUpperCase() ?: "INR")
+                                            .parameter("paymentGateway", "Razorpay")
+                                            .parameter("gatewayPaymentId", paymentEntity.id)
+                                            .parameter("gatewayOrderId", orderId)
+                                            .parameter("paymentMethod", paymentEntity.method ?: "")
+                                            .parameter("statusId", "SpSuccess").call()
+                                    }
+
+                                    // Reactivate if suspended
+                                    def tenant = ec.entity.find("zenith.erp.saas.SaasTenant")
+                                        .condition("tenantId", inv.tenantId).one()
+                                    if (tenant?.statusId == 'SaasTenantSuspended') {
+                                        ec.service.sync().name("zenith.saas.SaasLifecycleServices.reactivate#AfterPayment")
+                                            .parameter("tenantId", inv.tenantId)
+                                            .parameter("paymentId", paymentEntity.id).call()
+                                    }
+
+                                    ec.service.sync().name("create#zenith.erp.saas.SaasAuditLog")
+                                        .parameter("tenantId", inv.tenantId)
+                                        .parameter("eventType", "WEBHOOK_PAYMENT_CAPTURED")
+                                        .parameter("eventDate", ec.user.nowTimestamp)
+                                        .parameter("description", "Razorpay webhook: payment ${paymentEntity.id} captured for ${(paymentEntity.amount ?: 0) / 100.0} ${paymentEntity.currency ?: 'INR'}").call()
+                                }
+                            }
+                        }
+                    } else if (event == 'payment.failed') {
+                        def orderId = paymentEntity.order_id
+                        def tenantId = null
+                        if (orderId) {
+                            def invoices = ec.entity.find("zenith.erp.saas.SaasInvoice")
+                                .condition("notes", "like", "%${orderId}%").list()
+                            if (invoices) tenantId = invoices[0].tenantId
+                        }
+                        ec.service.sync().name("create#zenith.erp.saas.SaasAuditLog")
+                            .parameter("tenantId", tenantId)
+                            .parameter("eventType", "WEBHOOK_PAYMENT_FAILED")
+                            .parameter("eventDate", ec.user.nowTimestamp)
+                            .parameter("description", "Razorpay webhook: payment failed - ${paymentEntity.error_description ?: paymentEntity.error_reason ?: paymentEntity.id}").call()
+                    }
+
+                    response.setStatus(200)
+                    ec.web.sendJsonResponse([status: 'ok'])
+                } finally {
+                    if (!authDisabled) ec.artifactExecution.enableAuthz()
+                }
+            ]]></script>
+        </actions>
+        <default-response type="none"/>
+    </transition>
+
+    <widgets>
+        <label text="Razorpay Webhook Endpoint" style="text-grey-5"/>
+    </widgets>
+</screen>

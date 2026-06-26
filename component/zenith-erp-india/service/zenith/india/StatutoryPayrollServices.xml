@@ -1,0 +1,255 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <!-- ========== Indian Statutory Payroll Calculations ========== -->
+
+    <service verb="calculate" noun="EpfContribution">
+        <description>Calculate EPF (Employees' Provident Fund) contributions.
+            Employee: 12% of basic (up to wage ceiling)
+            Employer: 12% split as 8.33% Pension Fund + 3.67% PF
+            Admin charges: 0.50%, EDLI: 0.50%</description>
+        <in-parameters>
+            <parameter name="employeeId" required="true"/>
+            <parameter name="basicPay" type="BigDecimal" required="true"/>
+            <parameter name="organizationPartyId"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="epfWages" type="BigDecimal"/>
+            <parameter name="employeeContribution" type="BigDecimal"/>
+            <parameter name="employerPfAmount" type="BigDecimal"/>
+            <parameter name="employerPensionAmount" type="BigDecimal"/>
+            <parameter name="adminCharges" type="BigDecimal"/>
+            <parameter name="edliCharges" type="BigDecimal"/>
+            <parameter name="totalEmployerCost" type="BigDecimal"/>
+        </out-parameters>
+        <actions>
+            <!-- Check if employee is PF applicable -->
+            <entity-find-one entity-name="zenith.erp.india.EmployeeStatutoryDetail" value-field="empStat">
+                <field-map field-name="employeeId"/></entity-find-one>
+
+            <if condition="empStat?.isPfApplicable == 'N'">
+                <set field="epfWages" from="0" type="BigDecimal"/>
+                <set field="employeeContribution" from="0" type="BigDecimal"/>
+                <set field="employerPfAmount" from="0" type="BigDecimal"/>
+                <set field="employerPensionAmount" from="0" type="BigDecimal"/>
+                <set field="adminCharges" from="0" type="BigDecimal"/>
+                <set field="edliCharges" from="0" type="BigDecimal"/>
+                <set field="totalEmployerCost" from="0" type="BigDecimal"/>
+                <return/>
+            </if>
+
+            <!-- Get EPF configuration -->
+            <entity-find entity-name="zenith.erp.india.EpfConfiguration" list="epfConfigs">
+                <econdition field-name="isActive" value="Y"/>
+                <econdition field-name="organizationPartyId" from="organizationPartyId" ignore-if-empty="true"/>
+                <order-by field-name="-epfConfigId"/>
+            </entity-find>
+            <set field="config" from="epfConfigs ? epfConfigs[0] : null"/>
+
+            <script><![CDATA[
+                import java.math.BigDecimal
+                import java.math.RoundingMode
+
+                def wagesCeiling = config?.wagesCeiling ?: new BigDecimal("15000")
+                def pensionCeiling = config?.pensionWagesCeiling ?: new BigDecimal("15000")
+                def empPercent = config?.employeeContributionPercent ?: new BigDecimal("12")
+                def erPercent = config?.employerContributionPercent ?: new BigDecimal("12")
+                def pensionPercent = config?.pensionFundPercent ?: new BigDecimal("8.33")
+                def adminPercent = config?.epfAdminChargesPercent ?: new BigDecimal("0.50")
+                def edliPercent = config?.edliChargesPercent ?: new BigDecimal("0.50")
+
+                // EPF wages = min(basic, wages ceiling) unless employee opts for full basic
+                epfWages = basicPay.min(wagesCeiling)
+                if (empStat?.pfWages) epfWages = empStat.pfWages.min(basicPay)
+
+                // Employee contribution: 12% of EPF wages
+                employeeContribution = epfWages.multiply(empPercent)
+                    .divide(new BigDecimal("100"), 0, RoundingMode.HALF_UP)
+
+                // Voluntary PF addition
+                if (empStat?.voluntaryPfPercent && empStat.voluntaryPfPercent > 0) {
+                    def vpf = basicPay.multiply(empStat.voluntaryPfPercent)
+                        .divide(new BigDecimal("100"), 0, RoundingMode.HALF_UP)
+                    employeeContribution = employeeContribution.add(vpf)
+                }
+
+                // Employer pension: 8.33% of min(basic, pensionCeiling)
+                def pensionWages = basicPay.min(pensionCeiling)
+                employerPensionAmount = pensionWages.multiply(pensionPercent)
+                    .divide(new BigDecimal("100"), 0, RoundingMode.HALF_UP)
+
+                // Employer PF = 12% - 8.33% = 3.67% of EPF wages
+                def erPfPercent = erPercent.subtract(pensionPercent)
+                employerPfAmount = epfWages.multiply(erPfPercent)
+                    .divide(new BigDecimal("100"), 0, RoundingMode.HALF_UP)
+
+                // Admin charges on EPF wages
+                adminCharges = epfWages.multiply(adminPercent)
+                    .divide(new BigDecimal("100"), 0, RoundingMode.HALF_UP)
+
+                // EDLI charges on EPF wages
+                edliCharges = epfWages.multiply(edliPercent)
+                    .divide(new BigDecimal("100"), 0, RoundingMode.HALF_UP)
+
+                totalEmployerCost = employerPfAmount.add(employerPensionAmount).add(adminCharges).add(edliCharges)
+            ]]></script>
+        </actions>
+    </service>
+
+    <service verb="calculate" noun="EsiContribution">
+        <description>Calculate ESI (Employees' State Insurance) contributions.
+            Applicable only if gross wages &lt;= ₹21,000/month.
+            Employee: 0.75%, Employer: 3.25%</description>
+        <in-parameters>
+            <parameter name="employeeId" required="true"/>
+            <parameter name="grossPay" type="BigDecimal" required="true"/>
+            <parameter name="organizationPartyId"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="isApplicable" type="Boolean"/>
+            <parameter name="employeeContribution" type="BigDecimal"/>
+            <parameter name="employerContribution" type="BigDecimal"/>
+        </out-parameters>
+        <actions>
+            <!-- Check if employee is ESI applicable -->
+            <entity-find-one entity-name="zenith.erp.india.EmployeeStatutoryDetail" value-field="empStat">
+                <field-map field-name="employeeId"/></entity-find-one>
+
+            <if condition="empStat?.isEsiApplicable == 'N'">
+                <set field="isApplicable" from="false"/>
+                <set field="employeeContribution" from="0" type="BigDecimal"/>
+                <set field="employerContribution" from="0" type="BigDecimal"/>
+                <return/>
+            </if>
+
+            <!-- Get ESI configuration -->
+            <entity-find entity-name="zenith.erp.india.EsiConfiguration" list="esiConfigs">
+                <econdition field-name="isActive" value="Y"/>
+                <econdition field-name="organizationPartyId" from="organizationPartyId" ignore-if-empty="true"/>
+                <order-by field-name="-esiConfigId"/>
+            </entity-find>
+            <set field="config" from="esiConfigs ? esiConfigs[0] : null"/>
+
+            <script><![CDATA[
+                import java.math.BigDecimal
+                import java.math.RoundingMode
+
+                def ceiling = config?.grossWagesCeiling ?: new BigDecimal("21000")
+                def empPercent = config?.employeeContributionPercent ?: new BigDecimal("0.75")
+                def erPercent = config?.employerContributionPercent ?: new BigDecimal("3.25")
+
+                if (grossPay.compareTo(ceiling) <= 0) {
+                    isApplicable = true
+                    employeeContribution = grossPay.multiply(empPercent)
+                        .divide(new BigDecimal("100"), 0, RoundingMode.CEILING)
+                    employerContribution = grossPay.multiply(erPercent)
+                        .divide(new BigDecimal("100"), 0, RoundingMode.CEILING)
+                } else {
+                    isApplicable = false
+                    employeeContribution = BigDecimal.ZERO
+                    employerContribution = BigDecimal.ZERO
+                }
+            ]]></script>
+        </actions>
+    </service>
+
+    <service verb="calculate" noun="ProfessionalTax">
+        <description>Calculate Professional Tax based on state-wise slabs.
+            Looks up ProfessionalTaxSlab for the employee's state and gross salary.</description>
+        <in-parameters>
+            <parameter name="employeeId" required="true"/>
+            <parameter name="grossPay" type="BigDecimal" required="true"/>
+            <parameter name="stateCode" required="true"/>
+            <parameter name="periodMonth" type="Integer"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="professionalTaxAmount" type="BigDecimal"/>
+        </out-parameters>
+        <actions>
+            <!-- Check if employee is PT applicable -->
+            <entity-find-one entity-name="zenith.erp.india.EmployeeStatutoryDetail" value-field="empStat">
+                <field-map field-name="employeeId"/></entity-find-one>
+
+            <if condition="empStat?.isPtApplicable == 'N'">
+                <set field="professionalTaxAmount" from="0" type="BigDecimal"/>
+                <return/>
+            </if>
+
+            <!-- Lookup PT slab -->
+            <entity-find entity-name="zenith.erp.india.ProfessionalTaxSlab" list="slabs">
+                <econdition field-name="stateCode" from="stateCode"/>
+                <econdition field-name="isActive" value="Y"/>
+                <econdition field-name="fromAmount" operator="less-equals" from="grossPay"/>
+                <econdition field-name="toAmount" operator="greater-equals" from="grossPay"/>
+            </entity-find>
+
+            <if condition="slabs">
+                <set field="slab" from="slabs[0]"/>
+                <!-- February has different PT in some states (e.g., Maharashtra) -->
+                <if condition="periodMonth == 2 &amp;&amp; slab.februaryTax">
+                    <set field="professionalTaxAmount" from="slab.februaryTax"/>
+                    <else>
+                        <set field="professionalTaxAmount" from="slab.monthlyTax ?: 0"/>
+                    </else>
+                </if>
+                <else>
+                    <set field="professionalTaxAmount" from="0" type="BigDecimal"/>
+                </else>
+            </if>
+        </actions>
+    </service>
+
+    <service verb="calculate" noun="AllStatutoryDeductions">
+        <description>Calculate all statutory deductions (EPF + ESI + PT) for an employee in one call.</description>
+        <in-parameters>
+            <parameter name="employeeId" required="true"/>
+            <parameter name="basicPay" type="BigDecimal" required="true"/>
+            <parameter name="grossPay" type="BigDecimal" required="true"/>
+            <parameter name="stateCode" required="true"/>
+            <parameter name="periodYear" type="Integer"/>
+            <parameter name="periodMonth" type="Integer"/>
+            <parameter name="organizationPartyId"/>
+            <parameter name="payslipId"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="contributionId"/>
+            <parameter name="totalEmployeeDeductions" type="BigDecimal"/>
+            <parameter name="totalEmployerCost" type="BigDecimal"/>
+        </out-parameters>
+        <actions>
+            <!-- Calculate EPF -->
+            <service-call name="zenith.india.StatutoryPayrollServices.calculate#EpfContribution" out-map="epfOut"
+                in-map="[employeeId: employeeId, basicPay: basicPay, organizationPartyId: organizationPartyId]"/>
+
+            <!-- Calculate ESI -->
+            <service-call name="zenith.india.StatutoryPayrollServices.calculate#EsiContribution" out-map="esiOut"
+                in-map="[employeeId: employeeId, grossPay: grossPay, organizationPartyId: organizationPartyId]"/>
+
+            <!-- Calculate PT -->
+            <service-call name="zenith.india.StatutoryPayrollServices.calculate#ProfessionalTax" out-map="ptOut"
+                in-map="[employeeId: employeeId, grossPay: grossPay, stateCode: stateCode, periodMonth: periodMonth]"/>
+
+            <!-- Save statutory contribution record -->
+            <service-call name="create#zenith.erp.india.StatutoryContribution" out-map="scOut"
+                in-map="[payslipId: payslipId, employeeId: employeeId,
+                         periodYear: periodYear, periodMonth: periodMonth,
+                         basicPay: basicPay, grossPay: grossPay,
+                         epfWages: epfOut.epfWages,
+                         epfEmployeeAmount: epfOut.employeeContribution,
+                         epfEmployerPfAmount: epfOut.employerPfAmount,
+                         epfEmployerPensionAmount: epfOut.employerPensionAmount,
+                         epfAdminCharges: epfOut.adminCharges,
+                         edliCharges: epfOut.edliCharges,
+                         esiEmployeeAmount: esiOut.employeeContribution,
+                         esiEmployerAmount: esiOut.employerContribution,
+                         professionalTaxAmount: ptOut.professionalTaxAmount,
+                         stateCode: stateCode]"/>
+
+            <set field="contributionId" from="scOut.contributionId"/>
+            <set field="totalEmployeeDeductions" from="(epfOut.employeeContribution ?: 0) + (esiOut.employeeContribution ?: 0) + (ptOut.professionalTaxAmount ?: 0)" type="BigDecimal"/>
+            <set field="totalEmployerCost" from="(epfOut.totalEmployerCost ?: 0) + (esiOut.employerContribution ?: 0)" type="BigDecimal"/>
+        </actions>
+    </service>
+
+</services>

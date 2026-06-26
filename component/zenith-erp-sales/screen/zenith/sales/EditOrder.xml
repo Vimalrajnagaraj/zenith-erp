@@ -1,0 +1,235 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
+        default-menu-title="Order" default-menu-include="false">
+
+    <parameter name="orderId" required="true"/>
+
+    <transition name="findOrder"><default-response url="../FindOrder"/></transition>
+    <transition name="updateStatus">
+        <service-call name="update#mantle.order.OrderHeader"/>
+        <default-response url="."/>
+    </transition>
+    <transition name="addItem">
+        <actions>
+            <script>
+                // Sync price with Inventory &amp; Pricing: auto-fill when the user leaves Unit Price blank
+                def price = new BigDecimal(unitAmount ?: 0)
+                if (price.signum() == 0 &amp;&amp; productId) {
+                    def _org = ec.user.getPreference('ACTIVE_ORGANIZATION')
+                    def _qty = new BigDecimal(quantity ?: 1)
+                    try {
+                        def _pr = ec.service.sync().name("zenith.pricing.PricingServices.calculate#Price")
+                                    .parameters([productId:productId, quantity:(_qty.signum()>0?_qty:1), organizationPartyId:_org]).call()
+                        if (_pr?.unitPrice != null &amp;&amp; (_pr.unitPrice as BigDecimal).signum() == 1) price = _pr.unitPrice as BigDecimal
+                    } catch (Exception e) { }
+                    if (price.signum() == 0) {
+                        def _p = ec.entity.find("mantle.product.Product").condition("productId", productId).one()
+                        if (_p?.mrpAmount != null) price = _p.mrpAmount as BigDecimal
+                    }
+                }
+                def inMap = context + [unitAmount: price]
+                ec.service.sync().name("mantle.order.OrderServices.create#OrderItem").parameters(inMap).call()
+            </script>
+        </actions>
+        <default-response url="."/>
+    </transition>
+    <transition name="printOrder" read-only="true">
+        <default-response url="${ec.web.getWebappRootUrl(false, null)}/fop/apps/zenith/sales/OrderPrint" url-type="plain">
+            <parameter name="orderId"/>
+            <parameter name="filename" value="Order-${orderId}.pdf"/>
+        </default-response>
+    </transition>
+    <transition name="convertToInvoice">
+        <actions>
+            <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <script><![CDATA[
+                def parts = ec.entity.find("mantle.order.OrderPart").condition("orderId", orderId).list()
+                def part = parts ? parts.first() : null
+                if (part == null || part.vendorPartyId != activeOrg) {
+                    ec.message.addError("Order not found for your account."); return
+                }
+                def billed = ec.entity.find("mantle.order.OrderItemBilling").condition("orderId", orderId).list()
+                if (billed) {
+                    targetInvoiceId = billed.first().invoiceId
+                    ec.message.addMessage("This order has already been invoiced (" + targetInvoiceId + ").")
+                    return
+                }
+                def oItems = ec.entity.find("mantle.order.OrderItem").condition("orderId", orderId)
+                    .condition("orderPartSeqId", part.orderPartSeqId).orderBy("orderItemSeqId").list()
+                def items = []; def billOItems = []
+                for (oi in oItems) {
+                    if (!oi.productId) continue
+                    items.add([productId:oi.productId, itemDescription:oi.itemDescription,
+                               quantity:oi.quantity, unitAmount:oi.unitAmount])
+                    billOItems.add(oi)
+                }
+                if (!items) { ec.message.addError("Order has no billable product items."); return }
+                def oh = ec.entity.find("mantle.order.OrderHeader").condition("orderId", orderId).one()
+                def inv = ec.service.sync().name("zenith.sales.SalesInvoiceServices.create#SalesInvoice")
+                    .parameters([organizationPartyId:activeOrg, customerPartyId:part.customerPartyId,
+                                 currencyUomId:oh?.currencyUomId, items:items]).call()
+                targetInvoiceId = inv.invoiceId
+                def invItems = ec.entity.find("mantle.account.invoice.InvoiceItem")
+                    .condition("invoiceId", targetInvoiceId).condition("itemTypeEnumId","ItemProduct")
+                    .orderBy("invoiceItemSeqId").list()
+                for (int i = 0; i < billOItems.size() && i < invItems.size(); i++) {
+                    ec.service.sync().name("create#mantle.order.OrderItemBilling").parameters([
+                        orderId:orderId, orderItemSeqId:billOItems[i].orderItemSeqId,
+                        invoiceId:targetInvoiceId, invoiceItemSeqId:invItems[i].invoiceItemSeqId,
+                        quantity:billOItems[i].quantity, amount:billOItems[i].unitAmount]).call()
+                }
+            ]]></script>
+        </actions>
+        <default-response url="../EditInvoice"><parameter name="invoiceId" value="${targetInvoiceId}"/></default-response>
+        <error-response url="."/>
+    </transition>
+
+    <actions>
+        <entity-find-one entity-name="mantle.order.OrderHeader" value-field="order"/>
+        
+        <entity-find entity-name="mantle.order.OrderPart" list="orderParts">
+            <econdition field-name="orderId"/>
+        </entity-find>
+        <set field="orderPart" from="orderParts?.getFirst()"/>
+        
+        <entity-find entity-name="mantle.order.OrderItem" list="orderItems">
+            <econdition field-name="orderId"/>
+            <order-by field-name="orderItemSeqId"/>
+        </entity-find>
+        
+        <entity-find-one entity-name="mantle.party.PartyDetail" value-field="customer">
+            <field-map field-name="partyId" from="orderPart?.customerPartyId"/>
+        </entity-find-one>
+        <entity-find-one entity-name="mantle.party.PartyDetail" value-field="vendor">
+            <field-map field-name="partyId" from="orderPart?.vendorPartyId"/>
+        </entity-find-one>
+    </actions>
+
+    <widgets>
+        <link url="findOrder" text="Back to Orders" link-type="anchor"/>
+        
+        <container style="zenith-profile-banner q-pa-xl bg-white shadow-4 border-radius-xl q-mb-lg zenith-card">
+            <container style="row items-center justify-between no-wrap">
+                <container style="row items-center">
+                    <container style="q-pa-md bg-teal-1 border-radius-md q-mr-md text-teal-8">
+                        <render-mode><text type="html"><![CDATA[<q-icon name="shopping_cart_checkout" class="text-h3"/>]]></text></render-mode>
+                    </container>
+                    <container style="column">
+                        <label text="Order ${order?.displayId ?: orderId}" type="h3" style="text-primary text-weight-bold q-my-none"/>
+                        <label text="${currSymbol}${ec.l10n.format(order.grandTotal ?: 0, '#,##,##0.00')}" type="p" style="text-grey-7 text-h6 q-mt-xs q-mb-none"/>
+                    </container>
+                </container>
+                <container style="row items-center">
+                    <form-single name="StatusForm" transition="updateStatus" map="order">
+                        <field name="orderId"><default-field><hidden/></default-field></field>
+                        <field name="statusId"><default-field title="">
+                            <drop-down current="selected">
+                                <entity-options key="${statusId}" text="${description}">
+                                    <entity-find entity-name="moqui.basic.StatusItem">
+                                        <econdition field-name="statusTypeId" value="OrderHeader"/>
+                                        <order-by field-name="sequenceNum"/>
+                                    </entity-find>
+                                </entity-options>
+                            </drop-down>
+                        </default-field></field>
+                        <field name="submitButton"><default-field title=""><submit text="Update Status" icon="check_circle" style="bg-teal-7 text-white text-weight-bold q-ml-sm border-radius-sm"/></default-field></field>
+                        <field-layout><field-row><field-ref name="statusId"/><field-ref name="submitButton"/></field-row></field-layout>
+                    </form-single>
+                </container>
+            </container>
+            
+            <container style="row items-center q-mt-md justify-end q-gutter-md">
+                <link url="printOrder" text="Download PDF" parameter-map="[orderId:orderId]" target-window="_blank"
+                      icon="picture_as_pdf" style="q-btn q-btn--flat bg-dark text-white text-weight-bold q-px-lg border-radius-sm"/>
+            </container>
+        </container>
+
+        <container-row>
+            <row-col lg="6">
+                <container style="zenith-card q-pa-md bg-white shadow-1 border-radius-md q-mb-md">
+                    <label text="Customer Details" type="h5" style="text-primary text-weight-bold q-mb-md border-bottom q-pb-sm"/>
+                    <container style="row q-col-gutter-md">
+                        <container style="col-12 col-md-6"><label text="Name" type="strong" style="text-grey-7 block"/><label text="${customer?.organizationName ?: ((customer?.firstName ?: '') + ' ' + (customer?.lastName ?: '')).trim()}" type="span" style="text-dark"/></container>
+                        <container style="col-12 col-md-6"><label text="Customer ID" type="strong" style="text-grey-7 block"/>
+                            <section name="CustomerLink" condition="customer?.partyId"><widgets>
+                                <link url="/vapps/zenith/contacts/Contacts/EditContact" text="${customer.partyId}" parameter-map="[partyId:customer.partyId]" link-type="anchor" style="text-primary text-weight-bold"/>
+                            </widgets><fail-widgets><label text="N/A" type="span" style="text-dark"/></fail-widgets></section>
+                        </container>
+                    </container>
+                </container>
+
+                <container style="zenith-card q-pa-md bg-white shadow-1 border-radius-md q-mb-md">
+                    <label text="Order Info" type="h5" style="text-primary text-weight-bold q-mb-md border-bottom q-pb-sm"/>
+                    <container style="row q-col-gutter-md">
+                        <container style="col-12 col-md-6"><label text="Entry Date" type="strong" style="text-grey-7 block"/><label text="${ec.l10n.format(order.entryDate, 'dd MMM yyyy')}" type="span" style="text-dark"/></container>
+                        <container style="col-12 col-md-6"><label text="Placed Date" type="strong" style="text-grey-7 block"/><label text="${order.placedDate ? ec.l10n.format(order.placedDate, 'dd MMM yyyy') : 'N/A'}" type="span" style="text-dark"/></container>
+                        <container style="col-12 col-md-6"><label text="Channel" type="strong" style="text-grey-7 block"/><label text="${order.salesChannelEnumId ?: 'N/A'}" type="span" style="text-dark"/></container>
+                    </container>
+                </container>
+            </row-col>
+            
+            <row-col lg="6">
+                <container style="zenith-card q-pa-md bg-white shadow-1 border-radius-md q-mb-md">
+                    <label text="Your Business (Seller)" type="h5" style="text-primary text-weight-bold q-mb-md border-bottom q-pb-sm"/>
+                    <container style="row q-col-gutter-md">
+                        <container style="col-12 col-md-6"><label text="Name" type="strong" style="text-grey-7 block"/><label text="${vendor?.organizationName ?: ((vendor?.firstName ?: '') + ' ' + (vendor?.lastName ?: '')).trim()}" type="span" style="text-dark"/></container>
+                        <container style="col-12 col-md-6"><label text="Vendor ID" type="strong" style="text-grey-7 block"/>
+                            <section name="VendorLink" condition="vendor?.partyId"><widgets>
+                                <link url="/vapps/zenith/contacts/Contacts/EditContact" text="${vendor.partyId}" parameter-map="[partyId:vendor.partyId]" link-type="anchor" style="text-primary text-weight-bold"/>
+                            </widgets><fail-widgets><label text="N/A" type="span" style="text-dark"/></fail-widgets></section>
+                        </container>
+                    </container>
+                </container>
+
+                <container style="zenith-card q-pa-md bg-white shadow-1 border-radius-md q-mb-md">
+                    <label text="Summary" type="h5" style="text-primary text-weight-bold q-mb-md border-bottom q-pb-sm"/>
+                    <container style="row q-col-gutter-md">
+                        <container style="col-12 col-md-6"><label text="Total Items" type="strong" style="text-grey-7 block"/><label text="${orderItems?.size() ?: 0}" type="span" style="text-dark"/></container>
+                        <container style="col-12 col-md-6"><label text="Grand Total" type="strong" style="text-grey-7 block"/><label text="${currSymbol}${ec.l10n.format(order.grandTotal ?: 0, '#,##,##0.00')}" type="h4" style="text-primary q-my-none"/></container>
+                    </container>
+                </container>
+            </row-col>
+        </container-row>
+
+        <container style="zenith-card q-pa-md bg-white shadow-1 border-radius-md q-mb-lg">
+            <container style="row justify-between items-center q-mb-md border-bottom q-pb-sm">
+                <label text="Order Items" type="h5" style="text-primary text-weight-bold q-my-none"/>
+                
+                <container style="row items-center q-gutter-sm">
+                    <link url="convertToInvoice" text="Convert to Invoice" icon="receipt_long" style="q-btn q-btn--flat bg-indigo-7 text-white text-weight-bold q-px-md border-radius-sm"/>
+                    
+                    <container-dialog id="AddItemDialog" button-text="Add Item" button-icon="add_circle" button-class="q-btn--flat bg-teal-8 text-white text-weight-bold q-px-md border-radius-sm">
+                        <form-single name="AddItemForm" transition="addItem">
+                            <field name="orderId"><default-field><hidden/></default-field></field>
+                            <field name="itemDescription"><default-field title="Description"><text-line size="60"/></default-field></field>
+                            <field name="productId"><default-field title="Product">
+                                <drop-down allow-empty="true">
+                                    <entity-options key="${productId}" text="${pseudoId} - ${productName}">
+                                        <entity-find entity-name="mantle.product.Product"><order-by field-name="productName"/></entity-find>
+                                    </entity-options>
+                                </drop-down>
+                            </default-field></field>
+                            <field name="quantity"><default-field><text-line size="8"/></default-field></field>
+                            <field name="unitAmount"><default-field title="Unit Price"><text-line size="12"/></default-field></field>
+                            <!-- Mock GST fields -->
+                            <field name="hsnSacCode"><default-field title="HSN/SAC Code"><text-line size="8"/></default-field></field>
+                            <field name="mrpAmount"><default-field title="MRP"><text-line size="12"/></default-field></field>
+                            <field name="submitButton"><default-field title="Add Item"><submit/></default-field></field>
+                        </form-single>
+                    </container-dialog>
+                </container>
+            </container>
+            <form-list name="OrderItemsForm" list="orderItems" skip-form="true" header-dialog="true" show-csv-button="true" show-xlsx-button="true" show-page-size="true">
+                <field name="orderItemSeqId"><default-field title="#"><label text="${orderItemSeqId}" type="span" style="text-grey-7"/></default-field></field>
+                <field name="itemDescription"><default-field title="Description"><label text="${itemDescription ?: 'N/A'}" type="strong" style="text-dark"/></default-field></field>
+                <field name="hsnSacCode"><default-field title="HSN/SAC"><label text="${hsnSacCode ?: '-'}" type="span" style="zenith-badge grey"/></default-field></field>
+                <field name="quantity"><default-field><label text="${quantity}" type="span" style="text-dark"/></default-field></field>
+                <field name="unitAmount"><default-field title="Unit Price"><label text="${ec.l10n.format(unitAmount, '#,##,##0.00')}" type="span"/></default-field></field>
+                <field name="mrpAmount"><default-field title="MRP"><label text="${ec.l10n.format(mrpAmount?:0, '#,##,##0.00')}" type="span"/></default-field></field>
+                <field name="total"><default-field title="Total"><label text="${ec.l10n.format((quantity ?: 0) * (unitAmount ?: 0), '#,##,##0.00')}" type="span" style="text-weight-bold"/></default-field></field>
+                <field name="findButton"><header-field title="Find"><submit/></header-field></field>
+                </form-list>
+        </container>
+    </widgets>
+</screen>

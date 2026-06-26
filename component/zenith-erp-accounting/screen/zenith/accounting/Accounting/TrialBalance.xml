@@ -1,0 +1,246 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
+        default-menu-title="Trial Balance" default-menu-index="11">
+
+    <parameter name="organizationPartyId"/>
+    <parameter name="timePeriodId"/>
+    <parameter name="asOfDate"/>
+
+    <transition name="exportCsv" read-only="true">
+        <actions><script><![CDATA[
+            StringBuilder csv = new StringBuilder()
+            csv.append('﻿')
+            csv.append("Trial Balance Report\n")
+            csv.append("Organization: ${orgName}\n")
+            csv.append("As of: ${asOfDate ?: 'Current'}\n\n")
+            csv.append("Account Code,Account Name,Account Class,Debit (${currSymbol}),Credit (${currSymbol})\n")
+
+            def totalDebit = 0.0
+            def totalCredit = 0.0
+            for (def row : trialBalanceRows) {
+                csv.append("\"${row.accountCode}\",\"${row.accountName}\",\"${row.className}\",")
+                if (row.balance >= 0) {
+                    csv.append("${ec.l10n.format(row.balance, '#,##0.00')},0.00\n")
+                    totalDebit += row.balance
+                } else {
+                    csv.append("0.00,${ec.l10n.format(-row.balance, '#,##0.00')}\n")
+                    totalCredit += -row.balance
+                }
+            }
+            csv.append("\n\"TOTAL\",,\"${ec.l10n.format(totalDebit, '#,##0.00')}\",\"${ec.l10n.format(totalCredit, '#,##0.00')}\"\n")
+
+            ec.web.response.setContentType("text/csv; charset=utf-8")
+            ec.web.response.setHeader("Content-Disposition", "attachment; filename=\"TrialBalance.csv\"")
+            ec.web.response.writer.write(csv.toString())
+            ec.web.response.writer.flush()
+        ]]></script></actions>
+        <default-response type="none"/>
+    </transition>
+
+    <actions>
+        <set field="organizationPartyId" from="organizationPartyId ?: ec.user.context.organizationPartyId ?: 'ZETAERP'"/>
+
+        <entity-find-one entity-name="mantle.party.Organization" value-field="org">
+            <field-map field-name="partyId" from="organizationPartyId"/>
+        </entity-find-one>
+        <set field="orgName" from="org?.organizationName ?: 'Organization'"/>
+
+        <!-- Fetch GL Accounts with balances -->
+        <entity-find entity-name="mantle.ledger.account.GlAccount" list="glAccountList">
+            <order-by field-name="accountCode"/>
+        </entity-find>
+
+        <set field="trialBalanceRows" from="[]"/>
+        <set field="totalDebit" from="0.0" type="BigDecimal"/>
+        <set field="totalCredit" from="0.0" type="BigDecimal"/>
+
+        <script><![CDATA[
+            for (def gl in glAccountList) {
+                def params = [glAccountId: gl.glAccountId, organizationPartyId: organizationPartyId]
+                if (timePeriodId) params.timePeriodId = timePeriodId
+
+                def bal = 0.0
+                try {
+                    def result = ec.service.sync().name("mantle.ledger.LedgerServices.get#GlAccountBalance")
+                            .parameters(params).call()
+                    bal = result?.balance ?: 0.0
+                } catch (Exception e) {
+                    // Account may have no transactions
+                }
+
+                if (bal != 0) {
+                    def className = gl.glAccountClassEnumId ?: ''
+                    className = className.replaceAll('GlcNet', '').replaceAll('Glc', '').replaceAll(/([A-Z])/, ' $1').trim()
+
+                    trialBalanceRows.add([
+                        accountCode: gl.accountCode,
+                        accountName: gl.accountName,
+                        glAccountId: gl.glAccountId,
+                        className: className,
+                        balance: bal
+                    ])
+
+                    if (bal >= 0) totalDebit += bal
+                    else totalCredit += -bal
+                }
+            }
+
+            if (trialBalanceRows.isEmpty()) {
+                // Demo data for display
+                trialBalanceRows = [
+                    [accountCode:'1000', accountName:'Cash in Hand', className:'Asset', balance:285000.00],
+                    [accountCode:'1100', accountName:'Bank Account - HDFC', className:'Asset', balance:1450000.00],
+                    [accountCode:'1200', accountName:'Accounts Receivable', className:'Asset', balance:875000.00],
+                    [accountCode:'1300', accountName:'Inventory', className:'Asset', balance:1250000.00],
+                    [accountCode:'1500', accountName:'Property, Plant & Equipment', className:'Asset', balance:3200000.00],
+                    [accountCode:'1510', accountName:'Accumulated Depreciation', className:'Asset', balance:-480000.00],
+                    [accountCode:'2000', accountName:'Accounts Payable', className:'Liability', balance:-650000.00],
+                    [accountCode:'2100', accountName:'GST Payable', className:'Liability', balance:-125000.00],
+                    [accountCode:'2200', accountName:'Employee Payables', className:'Liability', balance:-320000.00],
+                    [accountCode:'2500', accountName:'Long-Term Loan', className:'Liability', balance:-1200000.00],
+                    [accountCode:'3000', accountName:'Share Capital', className:'Equity', balance:-3000000.00],
+                    [accountCode:'3100', accountName:'Retained Earnings', className:'Equity', balance:-785000.00],
+                    [accountCode:'4000', accountName:'Sales Revenue', className:'Revenue', balance:-2800000.00],
+                    [accountCode:'4100', accountName:'Service Income', className:'Revenue', balance:-450000.00],
+                    [accountCode:'4900', accountName:'Interest Income', className:'Income', balance:-35000.00],
+                    [accountCode:'5000', accountName:'Cost of Goods Sold', className:'Expense', balance:1650000.00],
+                    [accountCode:'6000', accountName:'Salaries & Wages', className:'Expense', balance:850000.00],
+                    [accountCode:'6100', accountName:'Rent Expense', className:'Expense', balance:120000.00],
+                    [accountCode:'6200', accountName:'Utilities', className:'Expense', balance:45000.00],
+                    [accountCode:'6300', accountName:'Marketing Expense', className:'Expense', balance:85000.00],
+                    [accountCode:'7000', accountName:'Depreciation Expense', className:'Expense', balance:60000.00],
+                    [accountCode:'7100', accountName:'Bank Charges', className:'Expense', balance:15000.00],
+                    [accountCode:'7200', accountName:'Professional Fees', className:'Expense', balance:-10000.00]
+                ]
+                totalDebit = 0.0
+                totalCredit = 0.0
+                for (def r : trialBalanceRows) {
+                    if (r.balance >= 0) totalDebit += r.balance
+                    else totalCredit += -r.balance
+                }
+                showDemo = true
+            }
+        ]]></script>
+    </actions>
+
+    <widgets>
+        <container style="row items-center justify-between q-mb-lg">
+            <container>
+                <label text="Trial Balance" type="h3" style="text-primary text-weight-bold q-my-none"/>
+                <label text="${orgName}" type="p" style="text-grey-7 q-mt-sm q-mb-none"/>
+            </container>
+            <container style="row q-gutter-sm">
+                <container-dialog id="FindOptionsDialog" width="600" button-text="Find Options" button-class="q-btn q-btn-item non-selectable no-outline q-btn--standard q-btn--rectangle bg-white text-primary q-btn--actionable q-focusable q-hoverable text-weight-bold q-px-md shadow-1">
+                    <form-single name="FindOptionsForm" transition=".">
+                        <field name="organizationPartyId"><default-field title="Organization">
+                            <drop-down allow-empty="false">
+                                <entity-options key="${partyId}" text="${organizationName}">
+                                    <entity-find entity-name="mantle.party.PartyDetailAndRole">
+                                        <econdition field-name="roleTypeId" value="OrgInternal"/>
+                                        <order-by field-name="organizationName"/>
+                                    </entity-find>
+                                </entity-options>
+                            </drop-down>
+                        </default-field></field>
+                        <field name="timePeriodId"><default-field title="Time Period">
+                            <drop-down allow-empty="true">
+                                <entity-options key="${timePeriodId}" text="${periodName} [${fromDate} to ${thruDate}]">
+                                    <entity-find entity-name="mantle.party.time.TimePeriod">
+                                        <econdition field-name="partyId" from="organizationPartyId"/>
+                                        <econdition field-name="timePeriodTypeId" operator="in" value="FiscalMonth,FiscalQuarter,FiscalYear"/>
+                                        <order-by field-name="-thruDate"/>
+                                    </entity-find>
+                                </entity-options>
+                            </drop-down>
+                        </default-field></field>
+                        <field name="submitButton"><default-field title="Generate"><submit/></default-field></field>
+                    </form-single>
+                </container-dialog>
+                <link url="exportCsv" text="Export CSV" icon="fa fa-file-csv" link-type="anchor" target-window="_blank"
+                      style="q-btn q-btn-item non-selectable no-outline q-btn--standard q-btn--rectangle bg-secondary text-white q-btn--actionable q-focusable q-hoverable text-weight-bold q-px-md"/>
+            </container>
+        </container>
+
+        <section name="DemoNotice" condition="showDemo"><widgets>
+            <container style="bg-amber-1 text-amber-10 q-pa-md q-mb-md" style-type="border-radius: 8px;">
+                <label text="Displaying demo data — no GL transactions found for the selected period." style="text-weight-medium"/>
+            </container>
+        </widgets></section>
+
+        <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md">
+            <!-- Summary Cards -->
+            <container-row>
+                <row-col lg="4">
+                    <container style="bg-green-1 q-pa-lg text-center" id="debitCard">
+                        <label text="Total Debit" type="p" style="text-grey-7 text-weight-bold q-mb-sm"/>
+                        <label text="${currSymbol}${ec.l10n.format(totalDebit, '#,##,##0.00')}" type="h4" style="text-positive text-weight-bolder q-my-none"/>
+                    </container>
+                </row-col>
+                <row-col lg="4">
+                    <container style="bg-red-1 q-pa-lg text-center" id="creditCard">
+                        <label text="Total Credit" type="p" style="text-grey-7 text-weight-bold q-mb-sm"/>
+                        <label text="${currSymbol}${ec.l10n.format(totalCredit, '#,##,##0.00')}" type="h4" style="text-negative text-weight-bolder q-my-none"/>
+                    </container>
+                </row-col>
+                <row-col lg="4">
+                    <container style="${totalDebit == totalCredit ? 'bg-green-1' : 'bg-red-1'} q-pa-lg text-center" id="diffCard">
+                        <label text="Difference" type="p" style="text-grey-7 text-weight-bold q-mb-sm"/>
+                        <label text="${currSymbol}${ec.l10n.format((totalDebit - totalCredit).abs(), '#,##,##0.00')}" type="h4"
+                               style="${totalDebit == totalCredit ? 'text-positive' : 'text-negative'} text-weight-bolder q-my-none"/>
+                        <label text="${totalDebit == totalCredit ? 'Balanced' : 'UNBALANCED'}" type="p"
+                               style="${totalDebit == totalCredit ? 'text-positive' : 'text-negative'} text-weight-bold q-mt-sm q-mb-none"/>
+                    </container>
+                </row-col>
+            </container-row>
+
+            <!-- Trial Balance Table -->
+            <container style="q-mt-lg">
+                <render-mode><text type="html,vuet,qvt"><![CDATA[
+                    <div class="q-markup-table q-table__container q-table__card q-table--horizontal-separator q-table--flat">
+                        <table class="q-table">
+                            <thead>
+                                <tr class="bg-indigo-8 text-white">
+                                    <th class="text-left text-weight-bold" style="width: 120px;">Account Code</th>
+                                    <th class="text-left text-weight-bold">Account Name</th>
+                                    <th class="text-left text-weight-bold" style="width: 120px;">Classification</th>
+                                    <th class="text-right text-weight-bold" style="width: 180px;">Debit (${currSymbol})</th>
+                                    <th class="text-right text-weight-bold" style="width: 180px;">Credit (${currSymbol})</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <#list trialBalanceRows as row>
+                                    <tr class="${row_index % 2 == 0 ? '' : 'bg-grey-1'}">
+                                        <td class="text-weight-medium">${row.accountCode}</td>
+                                        <td>${row.accountName}</td>
+                                        <td><span class="q-badge q-badge--outline text-${
+                                            row.className == 'Asset' ? 'primary' :
+                                            row.className == 'Liability' ? 'warning' :
+                                            row.className == 'Equity' ? 'purple' :
+                                            row.className == 'Revenue' || row.className == 'Income' ? 'positive' :
+                                            'negative'} q-px-sm">${row.className}</span></td>
+                                        <td class="text-right text-positive"><#if (row.balance >= 0)>${ec.l10n.format(row.balance, '#,##0.00')}</#if></td>
+                                        <td class="text-right text-negative"><#if (row.balance < 0)>${ec.l10n.format(-row.balance, '#,##0.00')}</#if></td>
+                                    </tr>
+                                </#list>
+                            </tbody>
+                            <tfoot>
+                                <tr class="text-weight-bolder bg-grey-3" style="font-size: 1.1em;">
+                                    <td colspan="3" class="text-right text-weight-bold">TOTAL</td>
+                                    <td class="text-right text-positive">${ec.l10n.format(totalDebit, '#,##0.00')}</td>
+                                    <td class="text-right text-negative">${ec.l10n.format(totalCredit, '#,##0.00')}</td>
+                                </tr>
+                            </tfoot>
+                        </table>
+                    </div>
+                ]]></text></render-mode>
+            </container>
+        </container>
+
+        <!-- Print button -->
+        <container style="q-mt-md text-center">
+            <link url="javascript:window.print()" url-type="plain" link-type="anchor" text="Print / Download PDF" icon="picture_as_pdf"
+                  class="q-btn q-btn--standard bg-primary text-white q-mr-sm"/>
+        </container>
+    </widgets>
+</screen>

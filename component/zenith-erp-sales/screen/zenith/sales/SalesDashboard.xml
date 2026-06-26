@@ -1,0 +1,400 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
+        default-menu-title="Dashboard" default-menu-index="1">
+
+    <transition name="viewOrder"><default-response url="../FindOrder"/></transition>
+    <transition name="viewCustomer"><default-response url="../FindCustomer"/></transition>
+    <transition name="goContacts"><default-response url="/apps/zenith/Contacts/FindContact"/></transition>
+    <transition name="goInventory"><default-response url="/apps/zenith/Inventory/FindProduct"/></transition>
+    <transition name="goPurchase"><default-response url="/apps/zenith/Purchase/RfqList"/></transition>
+    <transition name="goAccounting"><default-response url="/apps/zenith/Accounting/Invoices"/></transition>
+    <transition name="goCrm"><default-response url="/apps/zenith/Crm/Leads"/></transition>
+    <transition name="goPos"><default-response url="/apps/zenith/pos/Terminal"/></transition>
+    <transition name="goEcommerce"><default-response url="/apps/zenith/ecommerce/EcomOrders"/></transition>
+
+    <actions>
+        <set field="orgId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+        <set field="currSymbol" value="₹"/>
+        <!-- Total sales received = sum of all sales invoices (POS-synced + Sales module) -->
+        <entity-find entity-name="zenith.erp.sales.InvoiceSalesSummaryView" list="salesSums">
+            <econdition field-name="fromPartyId" from="orgId"/>
+            <econdition field-name="invoiceTypeEnumId" value="InvoiceSales"/>
+            <econdition field-name="statusId" operator="not-equals" value="InvoiceCancelled"/>
+        </entity-find>
+        <set field="totalSalesAmount" from="0.0" type="BigDecimal"/>
+        <script>salesSums.each { totalSalesAmount += ((it.taxableSum ?: 0G) + (it.taxSum ?: 0G) + (it.roundSum ?: 0G)) }</script>
+
+        <!-- Sales forecast (from the nightly stored forecast) for the dashboard infographic -->
+        <set field="fcToday" from="new java.sql.Date(System.currentTimeMillis())"/>
+        <entity-find entity-name="zenith.erp.sales.SalesRevenueForecast" list="fcRows">
+            <econdition field-name="organizationPartyId" from="orgId"/>
+            <econdition field-name="dimension" value="Overall"/>
+            <econdition field-name="periodDate" operator="greater-equals" from="fcToday"/>
+            <order-by field-name="periodDate"/>
+        </entity-find>
+        <script><![CDATA[
+            def pts = (fcRows ?: [])
+            if (pts.size() > 7) pts = pts.subList(0, 7)
+            def fcLabels = []; def fcVals = []
+            java.math.BigDecimal fcSumBd = java.math.BigDecimal.ZERO
+            double peakD = -1.0; def peakDow = null
+            long confSum = 0; long confN = 0
+            for (r in pts) {
+                def ld = r.periodDate.toLocalDate()
+                def dn = ld.getDayOfWeek().toString(); dn = dn.substring(0,1) + dn.substring(1,3).toLowerCase()
+                fcLabels.add("'" + dn + " " + ld.getDayOfMonth() + "'")
+                java.math.BigDecimal pv = (r.predictedAmount ?: java.math.BigDecimal.ZERO) as java.math.BigDecimal
+                fcVals.add(pv.setScale(0, java.math.RoundingMode.HALF_UP).toPlainString())
+                fcSumBd = fcSumBd.add(pv)
+                double pvd = pv.doubleValue()
+                if (pvd > peakD) { peakD = pvd; peakDow = ld.getDayOfWeek() }
+                if (r.confidencePct != null) { confSum += (r.confidencePct as long); confN++ }
+            }
+            fcLabelsJson = "[" + fcLabels.join(",") + "]"
+            fcValsJson = "[" + fcVals.join(",") + "]"
+            fcHasData = (fcVals.size() > 0)
+            fcNext7 = fcSumBd.setScale(0, java.math.RoundingMode.HALF_UP)
+            if (peakDow != null) { def pd = peakDow.toString(); fcPeakDay = pd.substring(0,1) + pd.substring(1).toLowerCase() } else { fcPeakDay = "—" }
+            fcConfPct = (confN > 0) ? ((long) Math.round((double) confSum / (double) confN)) : null
+            fcConfWord = (fcConfPct == null) ? "Building up" : ((fcConfPct >= 75) ? "Strong" : ((fcConfPct >= 60) ? "Good" : ((fcConfPct >= 45) ? "Fair" : "Early estimate")))
+        ]]></script>
+
+        <!-- Get Total Customers -->
+        <entity-find-count entity-name="mantle.party.PartyDetailAndRole" count-field="totalCustomers">
+            <econdition field-name="roleTypeId" value="Customer"/>
+        </entity-find-count>
+
+        <!-- Get Total Orders (Placed/Approved/Completed) -->
+        <entity-find-count entity-name="mantle.order.OrderHeaderAndPart" count-field="totalOrders">
+            <econdition field-name="statusId" operator="in" value="OrderPlaced,OrderApproved,OrderCompleted"/>
+        </entity-find-count>
+
+        <!-- Get Active Quotes (Proposed) -->
+        <entity-find-count entity-name="mantle.order.OrderHeaderAndPart" count-field="activeQuotes">
+            <econdition field-name="statusId" value="OrderProposed"/>
+        </entity-find-count>
+
+        <!-- Get Total Invoices -->
+        <entity-find-count entity-name="mantle.account.invoice.Invoice" count-field="totalInvoices">
+            <econdition field-name="statusId" operator="not-equals" value="InvoiceCancelled"/>
+        </entity-find-count>
+
+        <!-- Get Recent Orders for Table -->
+        <entity-find entity-name="mantle.order.OrderHeaderAndPart" list="recentOrders" limit="5">
+            <econdition field-name="statusId" operator="not-in" value="OrderProposed,OrderCancelled,OrderRejected"/>
+            <order-by field-name="-entryDate"/>
+        </entity-find>
+        <!-- Real 6-month chart data (org-scoped) + plan-aware related-module flags -->
+        <script><![CDATA[
+            import org.moqui.entity.EntityCondition
+            import java.util.Calendar
+            def nowTs = ec.user.nowTimestamp
+            def revArr = []; def ordArr = []
+            for (int i = 5; i >= 0; i--) {
+                def c = Calendar.getInstance(); c.setTimeInMillis(nowTs.getTime()); c.add(Calendar.MONTH, -i)
+                c.set(Calendar.DAY_OF_MONTH,1); c.set(Calendar.HOUR_OF_DAY,0); c.set(Calendar.MINUTE,0); c.set(Calendar.SECOND,0); c.set(Calendar.MILLISECOND,0)
+                def start = new java.sql.Timestamp(c.getTimeInMillis())
+                def c2 = (Calendar) c.clone(); c2.add(Calendar.MONTH,1)
+                def end = new java.sql.Timestamp(c2.getTimeInMillis())
+                def invs = ec.entity.find("mantle.account.invoice.Invoice").condition("fromPartyId", orgId).condition("invoiceTypeEnumId", "InvoiceSales").condition("statusId", EntityCondition.NOT_EQUAL, "InvoiceCancelled").condition("invoiceDate", EntityCondition.GREATER_THAN_EQUAL_TO, start).condition("invoiceDate", EntityCondition.LESS_THAN, end).selectField("totalTaxableAmount").selectField("totalTaxAmount").selectField("roundOffAmount").list()
+                def rev = 0.0G; invs.each { rev += ((it.totalTaxableAmount ?: 0G) + (it.totalTaxAmount ?: 0G) + (it.roundOffAmount ?: 0G)) }
+                revArr.add(rev.setScale(0, java.math.RoundingMode.HALF_UP).toPlainString())
+                ordArr.add(invs.size())
+            }
+            salesRevJson = "[" + revArr.join(",") + "]"
+            salesOrdJson = "[" + ordArr.join(",") + "]"
+            long onCredit = ec.entity.find("zenith.erp.pos.PosTransaction").condition("organizationPartyId", orgId).condition("statusId","PtCompleted").condition("isCredit","Y").count()
+            long totalSalesCnt = 0
+            for (r in salesSums) { totalSalesCnt += ((r.cnt ?: 0) as long) }
+            long paidCnt = totalSalesCnt - onCredit
+            if (paidCnt < 0) paidCnt = 0
+            salesStatusJson = "[" + paidCnt + "," + onCredit + "]"
+            def isTenant = ec.context.getOrDefault('isSaasTenant', false)
+            def hasAll = ec.context.getOrDefault('saasHasAllAccess', false)
+            def allowed = ec.context.get('saasAllowedModules')
+            def planGate = isTenant && !hasAll && allowed != null
+            def allow = { k -> !planGate || (allowed != null && allowed.contains(k)) }
+            showContacts = allow('contacts'); showInventory = allow('inventory'); showPurchase = allow('purchase')
+            showAccounting = allow('accounting'); showCrm = allow('crm'); showPos = allow('pos'); showEcom = allow('ecommerce')
+        ]]></script>
+    </actions>
+
+    <widgets>
+        <container style="q-mb-lg">
+            <label text="Sales Overview" type="h3" style="text-primary text-weight-bold q-my-none"/>
+            <label text="A quick look at how your sales are doing — orders, quotes, customers and revenue at a glance." type="p" style="text-grey-7 q-mt-sm q-mb-none"/>
+        </container>
+
+        <!-- Metrics Row -->
+        <container-row>
+            <!-- Total Orders -->
+            <row-col lg="3" md="6" sm="12">
+                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-md">
+                    <container style="row items-center justify-between">
+                        <container>
+                            <label text="Total Sales" type="p" style="text-grey-7 text-uppercase text-weight-bold q-mb-xs"/>
+                            <label text="${currSymbol}${ec.l10n.format(totalSalesAmount ?: 0, '#,##,##0')}" type="h4" style="text-dark text-weight-bold q-my-none"/>
+                        </container>
+                        <container style="q-pa-sm bg-indigo-1 border-radius-md text-indigo-8">
+                            <render-mode><text type="html"><![CDATA[<q-icon name="payments" class="text-h4"/>]]></text></render-mode>
+                        </container>
+                    </container>
+                </container>
+            </row-col>
+
+            <!-- Active Quotes -->
+            <row-col lg="3" md="6" sm="12">
+                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-md">
+                    <container style="row items-center justify-between">
+                        <container>
+                            <label text="Active Quotes" type="p" style="text-grey-7 text-uppercase text-weight-bold q-mb-xs"/>
+                            <label text="${activeQuotes}" type="h4" style="text-dark text-weight-bold q-my-none"/>
+                        </container>
+                        <container style="q-pa-sm bg-orange-1 border-radius-md text-orange-8">
+                            <render-mode><text type="html"><![CDATA[<q-icon name="request_quote" class="text-h4"/>]]></text></render-mode>
+                        </container>
+                    </container>
+                </container>
+            </row-col>
+
+            <!-- Total Customers -->
+            <row-col lg="3" md="6" sm="12">
+                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-md">
+                    <container style="row items-center justify-between">
+                        <container>
+                            <label text="Total Customers" type="p" style="text-grey-7 text-uppercase text-weight-bold q-mb-xs"/>
+                            <label text="${totalCustomers}" type="h4" style="text-dark text-weight-bold q-my-none"/>
+                        </container>
+                        <container style="q-pa-sm bg-teal-1 border-radius-md text-teal-8">
+                            <render-mode><text type="html"><![CDATA[<q-icon name="people" class="text-h4"/>]]></text></render-mode>
+                        </container>
+                    </container>
+                </container>
+            </row-col>
+
+            <!-- Total Invoices -->
+            <row-col lg="3" md="6" sm="12">
+                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-md">
+                    <container style="row items-center justify-between">
+                        <container>
+                            <label text="Generated Invoices" type="p" style="text-grey-7 text-uppercase text-weight-bold q-mb-xs"/>
+                            <label text="${totalInvoices}" type="h4" style="text-dark text-weight-bold q-my-none"/>
+                        </container>
+                        <container style="q-pa-sm bg-pink-1 border-radius-md text-pink-8">
+                            <render-mode><text type="html"><![CDATA[<q-icon name="receipt_long" class="text-h4"/>]]></text></render-mode>
+                        </container>
+                    </container>
+                </container>
+            </row-col>
+        </container-row>
+
+        <!-- Charts Row -->
+        <container-row>
+            <row-col lg="8">
+                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md q-mb-md">
+                    <label text="Monthly Sales Trend" type="h6" style="text-primary text-weight-bold q-mb-md"/>
+                    <render-mode><text type="html,vuet,qvt"><![CDATA[
+                        <div id="salesTrendChart"></div>
+                        <script src="https://cdn.jsdelivr.net/npm/apexcharts@3.44.0/dist/apexcharts.min.js"></script>
+                        <script>
+                        (function() {
+                            var months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+                            var now = new Date();
+                            var labels = [];
+                            for (var i = 5; i >= 0; i--) {
+                                var d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+                                labels.push(months[d.getMonth()] + ' ' + d.getFullYear());
+                            }
+                            var salesData = ${salesRevJson};
+                            var ordersData = ${salesOrdJson};
+
+                            new ApexCharts(document.querySelector("#salesTrendChart"), {
+                                chart: { type: 'area', height: 280, toolbar: { show: true }, fontFamily: 'Roboto, sans-serif' },
+                                series: [
+                                    { name: 'Revenue', type: 'area', data: salesData },
+                                    { name: 'Orders', type: 'line', data: ordersData }
+                                ],
+                                xaxis: { categories: labels },
+                                yaxis: [
+                                    { title: { text: 'Revenue' }, labels: { formatter: function(v) { return '${currSymbol!"$"}' + (v/1000).toFixed(0) + 'K'; } } },
+                                    { opposite: true, title: { text: 'Orders' } }
+                                ],
+                                colors: ['#3F51B5', '#FF9800'],
+                                fill: { type: ['gradient', 'solid'], gradient: { shadeIntensity: 1, opacityFrom: 0.4, opacityTo: 0.1 } },
+                                stroke: { width: [2, 3], curve: 'smooth' },
+                                tooltip: { shared: true },
+                                dataLabels: { enabled: false }
+                            }).render();
+                        })();
+                        </script>
+                    ]]></text></render-mode>
+                </container>
+            </row-col>
+            <row-col lg="4">
+                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md q-mb-md">
+                    <label text="Payment Status" type="h6" style="text-primary text-weight-bold q-mb-md"/>
+                    <render-mode><text type="html,vuet,qvt"><![CDATA[
+                        <div id="orderStatusChart"></div>
+                        <script>
+                        (function() {
+                            new ApexCharts(document.querySelector("#orderStatusChart"), {
+                                chart: { type: 'donut', height: 280, fontFamily: 'Roboto, sans-serif' },
+                                series: ${salesStatusJson},
+                                labels: ['Paid', 'On Credit'],
+                                colors: ['#4CAF50', '#F44336'],
+                                legend: { position: 'bottom', fontSize: '12px' },
+                                plotOptions: { pie: { donut: { size: '55%', labels: { show: true, total: { show: true, label: 'Total', fontSize: '14px' } } } } },
+                                dataLabels: { enabled: false }
+                            }).render();
+                        })();
+                        </script>
+                    ]]></text></render-mode>
+                </container>
+            </row-col>
+        </container-row>
+
+        <!-- Sales Forecast Infographic -->
+        <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md q-mb-md">
+            <container style="row items-center justify-between q-mb-sm">
+                <container style="column">
+                    <label text="What's coming — Sales Forecast" type="h6" style="text-primary text-weight-bold q-my-none"/>
+                    <label text="Our best guess of what you'll sell over the next 7 days, learned automatically from your own sales." type="p" style="text-grey-6 text-caption q-mb-none"/>
+                </container>
+                <link url="/apps/zenith/sales/SalesForecast" text="Full forecast" icon="open_in_new" link-type="anchor" style="q-btn q-btn--flat text-indigo-8 text-weight-bold"/>
+            </container>
+            <section name="FcInfographic">
+                <condition><expression>fcHasData</expression></condition>
+                <widgets>
+                    <container-row>
+                        <row-col lg="3" md="6">
+                            <container style="bg-indigo-1 q-pa-md border-radius-md text-center q-mb-sm">
+                                <label text="Next 7 days" type="p" style="text-grey-7 text-caption text-weight-bold q-mb-xs"/>
+                                <label text="${currSymbol}${ec.l10n.format(fcNext7 ?: 0,'#,##,##0')}" type="h5" style="text-indigo-9 text-weight-bolder q-my-none"/>
+                                <label text="about ${currSymbol}${ec.l10n.format((fcNext7 ?: 0)/7,'#,##,##0')} a day" type="p" style="text-grey-6 text-caption q-mb-none"/>
+                            </container>
+                        </row-col>
+                        <row-col lg="3" md="6">
+                            <container style="bg-grey-1 q-pa-md border-radius-md text-center q-mb-sm">
+                                <label text="Busiest day" type="p" style="text-grey-7 text-caption text-weight-bold q-mb-xs"/>
+                                <label text="${fcPeakDay}" type="h6" style="text-dark text-weight-bolder q-my-none q-mt-xs"/>
+                                <label text="plan stock &amp; staff for it" type="p" style="text-grey-6 text-caption q-mb-none"/>
+                            </container>
+                        </row-col>
+                        <row-col lg="3" md="6">
+                            <container style="bg-grey-1 q-pa-md border-radius-md text-center q-mb-sm">
+                                <label text="How sure" type="p" style="text-grey-7 text-caption text-weight-bold q-mb-xs"/>
+                                <label text="${fcConfWord}" type="h6" style="text-dark text-weight-bolder q-my-none q-mt-xs"/>
+                                <label text="${fcConfPct != null ? fcConfPct + '% reliable' : 'getting smarter daily'}" type="p" style="text-grey-6 text-caption q-mb-none"/>
+                            </container>
+                        </row-col>
+                        <row-col lg="3" md="6">
+                            <container style="bg-grey-1 q-pa-md border-radius-md text-center q-mb-sm">
+                                <label text="Updated" type="p" style="text-grey-7 text-caption text-weight-bold q-mb-xs"/>
+                                <label text="Every night" type="h6" style="text-dark text-weight-bolder q-my-none q-mt-xs"/>
+                                <label text="automatically, no effort" type="p" style="text-grey-6 text-caption q-mb-none"/>
+                            </container>
+                        </row-col>
+                    </container-row>
+                    <label text="Expected sales, day by day" type="p" style="text-grey-7 text-weight-bold text-caption q-mt-sm q-mb-xs"/>
+                    <render-mode><text type="html,vuet,qvt"><![CDATA[
+                        <div id="forecastBarChart"></div>
+                        <script src="https://cdn.jsdelivr.net/npm/apexcharts@3.44.0/dist/apexcharts.min.js"></script>
+                        <script>
+                        (function(){
+                            var labels = ${fcLabelsJson};
+                            var vals = ${fcValsJson};
+                            new ApexCharts(document.querySelector("#forecastBarChart"), {
+                                chart: { type: 'bar', height: 250, toolbar: { show: false }, fontFamily: 'Roboto, sans-serif' },
+                                series: [{ name: 'Expected sales', data: vals }],
+                                xaxis: { categories: labels },
+                                yaxis: { labels: { formatter: function(v){ return '${currSymbol!"₹"}' + (v/1000).toFixed(0) + 'K'; } } },
+                                colors: ['#4F46E5'],
+                                plotOptions: { bar: { borderRadius: 6, columnWidth: '55%' } },
+                                dataLabels: { enabled: true, formatter: function(v){ return '${currSymbol!"₹"}' + Math.round(v/1000) + 'K'; }, offsetY: -18, style: { fontSize: '10px', colors: ['#374151'] } },
+                                grid: { borderColor: '#eeeeee' },
+                                tooltip: { y: { formatter: function(v){ return '${currSymbol!"₹"}' + Number(v).toLocaleString(); } } }
+                            }).render();
+                        })();
+                        </script>
+                    ]]></text></render-mode>
+                </widgets>
+                <fail-widgets>
+                    <container style="q-pa-md text-center bg-grey-1 border-radius-md">
+                        <label text="We need a couple of weeks of sales before we can predict reliably." type="p" style="text-grey-7 q-mb-xs"/>
+                        <label text="Keep billing through the POS and your forecast will appear here automatically." type="p" style="text-grey-6 text-caption q-mb-none"/>
+                    </container>
+                </fail-widgets>
+            </section>
+        </container>
+
+        <!-- Recent Activity & Quick Actions -->
+        <container-row>
+            <row-col lg="8">
+                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-none q-mb-md">
+                    <container style="q-pa-md border-bottom">
+                        <label text="Recent Orders" type="h6" style="text-primary text-weight-bold q-my-none"/>
+                    </container>
+                    
+                    <form-list name="RecentOrdersList" list="recentOrders" skip-form="true" header-dialog="true" show-csv-button="true" show-xlsx-button="true" show-page-size="true">
+                        <row-actions>
+                            <entity-find-one entity-name="moqui.basic.StatusItem" value-field="statusItem"/>
+                            <set field="statusColor" from="statusId == 'OrderCompleted' ? 'success' : (statusId == 'OrderApproved' ? 'primary' : 'warning')"/>
+                        </row-actions>
+                        <field name="orderId">
+                            <header-field title="Order #"/>
+                            <default-field><link url="../EditOrder" text="${displayId ?: orderId}" style="text-weight-bold text-indigo-8 text-decoration-none" parameter-map="[orderId:orderId]"/></default-field>
+                        </field>
+                        <field name="entryDate">
+                            <header-field title="Date"/>
+                            <default-field><label text="${ec.l10n.format(entryDate, 'dd MMM yyyy')}" type="span" style="text-grey-9"/></default-field>
+                        </field>
+                        <field name="customerPartyId">
+                            <header-field title="Customer"/>
+                            <default-field><display-entity entity-name="mantle.party.PartyDetail" text="PartyNameTemplate" style="text-dark"/></default-field>
+                        </field>
+                        <field name="grandTotal">
+                            <header-field title="Total"/>
+                            <default-field><label text="${currSymbol}${ec.l10n.format(grandTotal ?: 0, '#,##,##0.00')}" type="span" style="text-weight-bold text-dark"/></default-field>
+                        </field>
+                        <field name="statusId">
+                            <header-field title="Status"/>
+                            <default-field><label text="${statusItem?.description ?: statusId}" type="span" style="zenith-badge ${statusColor}"/></default-field>
+                        </field>
+                        <field name="findButton"><header-field title="Find"><submit/></header-field></field>
+                </form-list>
+                    
+                    <container style="q-pa-md text-center">
+                        <link url="viewOrder" text="View All Orders" style="q-btn--flat text-indigo-8 text-weight-medium"/>
+                    </container>
+                </container>
+            </row-col>
+            
+            <row-col lg="4">
+                <container style="zenith-card bg-indigo-9 shadow-4 border-radius-lg q-pa-xl text-white q-mb-md text-center" id="dashboard-cta">
+                    <render-mode><text type="html"><![CDATA[<q-icon name="rocket_launch" class="q-mb-md text-indigo-2 text-h2"/>]]></text></render-mode>
+                    <label text="Ready to Grow?" type="h4" style="text-white text-weight-bold q-mt-none q-mb-sm"/>
+                    <label text="Quickly generate a new sales quote or invoice right from here." type="p" style="text-indigo-2 q-mb-lg"/>
+                    
+                    <link url="../CreateQuotation" text="New Quotation" icon="request_quote" style="q-btn q-btn-item non-selectable no-outline q-btn--standard q-btn--rectangle bg-white text-indigo-9 text-weight-bold q-mb-md full-width q-py-sm border-radius-md"/>
+                    <link url="../CreateOrder" text="New Sales Order" icon="shopping_cart" style="q-btn q-btn-item non-selectable no-outline q-btn--standard q-btn--rectangle bg-indigo-7 text-white text-weight-bold full-width q-py-sm border-radius-md"/>
+                </container>
+            </row-col>
+        </container-row>
+
+        <!-- Related Modules -->
+        <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-md">
+            <label text="Related Modules" type="h6" style="text-weight-bold q-my-none q-mb-md"/>
+            <container style="row q-gutter-sm">
+                <section name="relContacts"><condition><expression>showContacts</expression></condition><widgets><link url="goContacts" text="Contacts" icon="fa fa-address-book" btn-type="primary" style="q-btn--dense"/></widgets></section>
+                <section name="relInventory"><condition><expression>showInventory</expression></condition><widgets><link url="goInventory" text="Inventory" icon="fa fa-cubes" btn-type="info" style="q-btn--dense"/></widgets></section>
+                <section name="relPurchase"><condition><expression>showPurchase</expression></condition><widgets><link url="goPurchase" text="Purchase" icon="fa fa-shopping-cart" btn-type="warning" style="q-btn--dense"/></widgets></section>
+                <section name="relAccounting"><condition><expression>showAccounting</expression></condition><widgets><link url="goAccounting" text="Accounting" icon="fa fa-calculator" btn-type="success" style="q-btn--dense"/></widgets></section>
+                <section name="relCrm"><condition><expression>showCrm</expression></condition><widgets><link url="goCrm" text="CRM / Leads" icon="fa fa-bullseye" style="q-btn--dense"/></widgets></section>
+                <section name="relPos"><condition><expression>showPos</expression></condition><widgets><link url="goPos" text="POS Terminal" icon="fa fa-desktop" btn-type="danger" style="q-btn--dense"/></widgets></section>
+                <section name="relEcom"><condition><expression>showEcom</expression></condition><widgets><link url="goEcommerce" text="eCommerce" icon="fa fa-globe" btn-type="primary" style="q-btn--dense"/></widgets></section>
+            </container>
+        </container>
+
+    </widgets>
+</screen>

@@ -1,0 +1,147 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <service verb="create" noun="Document">
+        <in-parameters>
+            <parameter name="title" required="true"/>
+            <parameter name="categoryId"/><parameter name="fileType"/>
+            <parameter name="fileName"/><parameter name="filePath"/>
+            <parameter name="fileSizeBytes" type="Integer"/><parameter name="mimeType"/>
+            <parameter name="description"/><parameter name="tags"/>
+            <parameter name="referenceType"/><parameter name="referenceId"/>
+            <parameter name="expiryDate" type="Date"/>
+            <parameter name="isConfidential" default-value="N"/>
+        </in-parameters>
+        <out-parameters><parameter name="documentId"/></out-parameters>
+        <actions><script><![CDATA[
+            import java.time.LocalDate
+
+            def now = LocalDate.now()
+            def fysSetting = ec.entity.find("zenith.erp.base.CompanySettings").condition("organizationPartyId", ec.user.getPreference("ACTIVE_ORGANIZATION")).condition("settingKey", "FY_START_MONTH").one()
+            int fyStartMonth = fysSetting ? (fysSetting.settingValue as int) : 4
+            int fyStart = now.monthValue >= fyStartMonth ? now.year : now.year - 1
+            String fySuffix = String.format("%02d-%02d", fyStart % 100, (fyStart + 1) % 100)
+
+            def last = ec.entity.find("zenith.erp.documents.Document")
+                .condition("documentNumber", "like", "DOC/${fySuffix}/%").orderBy("-documentNumber").limit(1).list()
+            int nextSeq = 1
+            if (last) {
+                def parts = last[0].documentNumber.split("/")
+                if (parts.length == 3) nextSeq = (parts[2] as int) + 1
+            }
+            String documentNumber = "DOC/${fySuffix}/" + String.format("%05d", nextSeq)
+
+            // Calculate retention date from category
+            java.sql.Date retentionDate = null
+            if (categoryId) {
+                def cat = ec.entity.find("zenith.erp.documents.DocumentCategory").condition("categoryId", categoryId).one()
+                if (cat?.retentionMonths) {
+                    retentionDate = java.sql.Date.valueOf(now.plusMonths(cat.retentionMonths as int))
+                }
+            }
+
+            context.documentId = ec.entity.sequencedIdPrimary("zenith.erp.documents.Document", null, null)
+            ec.entity.makeValue("zenith.erp.documents.Document").setAll([
+                documentId: context.documentId, documentNumber: documentNumber,
+                title: title, categoryId: categoryId, fileType: fileType,
+                fileName: fileName, filePath: filePath,
+                fileSizeBytes: fileSizeBytes, mimeType: mimeType,
+                description: description, tags: tags,
+                referenceType: referenceType, referenceId: referenceId,
+                uploadedByPartyId: ec.user.userId,
+                uploadedDate: ec.user.nowTimestamp,
+                currentVersion: 1, statusId: "DocActive",
+                expiryDate: expiryDate, retentionUntilDate: retentionDate,
+                isConfidential: isConfidential
+            ]).create()
+
+            // Create version 1
+            ec.entity.makeValue("zenith.erp.documents.DocumentVersion").setAll([
+                documentId: context.documentId, versionNumber: 1,
+                fileName: fileName, filePath: filePath,
+                fileSizeBytes: fileSizeBytes, changeNotes: "Initial upload",
+                uploadedByPartyId: ec.user.userId,
+                uploadedDate: ec.user.nowTimestamp
+            ]).create()
+        ]]></script></actions>
+    </service>
+
+    <service verb="upload" noun="NewVersion">
+        <in-parameters>
+            <parameter name="documentId" required="true"/>
+            <parameter name="fileName"/><parameter name="filePath"/>
+            <parameter name="fileSizeBytes" type="Integer"/>
+            <parameter name="changeNotes"/>
+        </in-parameters>
+        <actions><script><![CDATA[
+            def doc = ec.entity.find("zenith.erp.documents.Document").condition("documentId", documentId).one()
+            if (!doc) { ec.message.addError("Document not found"); return }
+
+            int newVersion = (doc.currentVersion ?: 1) + 1
+            ec.entity.makeValue("zenith.erp.documents.DocumentVersion").setAll([
+                documentId: documentId, versionNumber: newVersion,
+                fileName: fileName, filePath: filePath,
+                fileSizeBytes: fileSizeBytes, changeNotes: changeNotes,
+                uploadedByPartyId: ec.user.userId,
+                uploadedDate: ec.user.nowTimestamp
+            ]).create()
+
+            doc.set("currentVersion", newVersion)
+            if (fileName) doc.set("fileName", fileName)
+            if (filePath) doc.set("filePath", filePath)
+            if (fileSizeBytes) doc.set("fileSizeBytes", fileSizeBytes)
+            doc.update()
+        ]]></script></actions>
+    </service>
+
+    <service verb="share" noun="Document">
+        <in-parameters>
+            <parameter name="documentId" required="true"/>
+            <parameter name="sharedWithPartyId" required="true"/>
+            <parameter name="permission" default-value="View"/>
+            <parameter name="expiryDate" type="Date"/>
+        </in-parameters>
+        <out-parameters><parameter name="shareId"/></out-parameters>
+        <actions><script><![CDATA[
+            context.shareId = ec.entity.sequencedIdPrimary("zenith.erp.documents.DocumentShare", null, null)
+            ec.entity.makeValue("zenith.erp.documents.DocumentShare").setAll([
+                shareId: context.shareId, documentId: documentId,
+                sharedWithPartyId: sharedWithPartyId, permission: permission,
+                sharedByPartyId: ec.user.userId,
+                sharedDate: ec.user.nowTimestamp,
+                expiryDate: expiryDate, isActive: "Y"
+            ]).create()
+        ]]></script></actions>
+    </service>
+
+    <service verb="log" noun="DocumentAccess">
+        <in-parameters>
+            <parameter name="documentId" required="true"/>
+            <parameter name="accessType" required="true"/>
+        </in-parameters>
+        <actions><script><![CDATA[
+            ec.entity.makeValue("zenith.erp.documents.DocumentAccessLog").setAll([
+                accessId: ec.entity.sequencedIdPrimary("zenith.erp.documents.DocumentAccessLog", null, null),
+                documentId: documentId, accessType: accessType,
+                accessDate: ec.user.nowTimestamp,
+                accessByPartyId: ec.user.userId
+            ]).create()
+        ]]></script></actions>
+    </service>
+
+    <service verb="check" noun="RetentionExpiry">
+        <in-parameters><parameter name="daysAhead" type="Integer" default-value="30"/></in-parameters>
+        <out-parameters><parameter name="expiringCount" type="Integer"/></out-parameters>
+        <actions><script><![CDATA[
+            def cutoff = java.sql.Date.valueOf(java.time.LocalDate.now().plusDays(daysAhead ?: 30))
+            def docs = ec.entity.find("zenith.erp.documents.Document")
+                .condition("statusId", "DocActive")
+                .condition("retentionUntilDate", "<=", cutoff)
+                .condition("retentionUntilDate", "is-not-null", null).list()
+            context.expiringCount = docs.size()
+            ec.message.addMessage("Found ${context.expiringCount} documents with retention period expiring within ${daysAhead} days")
+        ]]></script></actions>
+    </service>
+
+</services>

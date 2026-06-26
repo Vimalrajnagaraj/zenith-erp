@@ -1,0 +1,112 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <service verb="autoDeduct" noun="TdsForInvoice">
+        <description>Checks the vendor's Tax Profile and auto-deducts TDS on an AP Invoice if thresholds are met.</description>
+        <in-parameters>
+            <parameter name="invoiceId" required="true"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="invoice"/>
+            <if condition="invoice == null"><return error="true" message="Invoice ${invoiceId} not found"/></if>
+            <if condition="invoice.invoiceTypeEnumId != 'InvoiceAp'"><return/></if>
+
+            <entity-find-one entity-name="zenith.erp.india.IndiaPartyTaxProfile" value-field="taxProfile">
+                <field-map field-name="partyId" from="invoice.fromPartyId"/>
+            </entity-find-one>
+
+            <if condition="taxProfile != null &amp;&amp; taxProfile.tdsSectionId != null">
+                <entity-find-one entity-name="zenith.erp.india.IndiaTdsSection" value-field="section">
+                    <field-map field-name="tdsSectionId" from="taxProfile.tdsSectionId"/>
+                </entity-find-one>
+
+                <!-- In a real scenario, check if cumulative vendor payments cross section.thresholdAmount -->
+                <!-- Deduct TDS by creating an AcctgTrans / InvoiceItem for TDS liability -->
+                
+                <message>Simulated Auto-TDS Deduction for Invoice ${invoiceId} under Section ${section.sectionCode}.</message>
+            </if>
+        </actions>
+    </service>
+
+    <service verb="checkAndApply" noun="TcsOnSales">
+        <description>Checks if total sales to the customer in the current FY exceeds 50 Lakhs. If yes, apply 0.1% TCS on the invoice.</description>
+        <in-parameters>
+            <parameter name="invoiceId" required="true"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="invoice"/>
+            <if condition="invoice == null"><return error="true" message="Invoice ${invoiceId} not found"/></if>
+            <if condition="invoice.invoiceTypeEnumId != 'InvoiceSales'"><return/></if>
+
+            <!-- TCS 206C(1H) is per-buyer B2B only; never on consolidated walk-in / B2C cash sales -->
+            <if condition="invoice.toPartyId == ('WALKIN_' + invoice.fromPartyId)"><return/></if>
+            <!-- Real cumulative: non-cancelled sales to THIS buyer in the current financial year -->
+            <service-call name="zenith.base.LocalizationServices.get#FinancialYearDates"
+                in-map="[organizationPartyId:invoice.fromPartyId, referenceDate:invoice.invoiceDate]" out-map="fyTcs"/>
+            <set field="cumulativeSales" from="0" type="BigDecimal"/>
+            <entity-find entity-name="mantle.account.invoice.Invoice" list="tcsPriorInv">
+                <econdition field-name="fromPartyId" from="invoice.fromPartyId"/>
+                <econdition field-name="toPartyId" from="invoice.toPartyId"/>
+                <econdition field-name="invoiceTypeEnumId" value="InvoiceSales"/>
+                <econdition field-name="statusId" operator="not-equals" value="InvoiceCancelled"/>
+                <econdition field-name="invoiceDate" operator="greater-equals" from="fyTcs.fyStartDate" ignore-if-empty="true"/>
+            </entity-find>
+            <iterate list="tcsPriorInv" entry="tcsInv">
+                <set field="cumulativeSales" from="cumulativeSales + ((tcsInv.invoiceTotal ?: 0) as BigDecimal)"/>
+            </iterate>
+            <if condition="cumulativeSales &gt; 5000000.00">
+                <set field="tcsAmount" from="((invoice.invoiceTotal ?: 0) as BigDecimal) * 0.001" type="BigDecimal"/>
+                <message>TCS 206C(1H): cumulative FY sales to this buyer (${cumulativeSales}) exceed ₹50L; 0.1% TCS (${tcsAmount}) applies on Invoice ${invoiceId}.</message>
+            </if>
+        </actions>
+    </service>
+
+
+    <service verb="deduct" noun="Tds">
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="deducteePartyId" required="true"/>
+            <parameter name="tdsSectionId" required="true"/>
+            <parameter name="grossAmount" type="BigDecimal" required="true"/>
+            <parameter name="transactionDate" type="Timestamp" default="ec.user.nowTimestamp"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="tdsTransactionId"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.india.IndiaTdsSection" value-field="section"/>
+            <if condition="!section"><return error="true" message="TDS Section not found"/></if>
+            <set field="tdsRate" from="section.rate ?: BigDecimal.ZERO" type="BigDecimal"/>
+            <set field="tdsAmount" from="(grossAmount * tdsRate / 100).setScale(2, java.math.RoundingMode.HALF_UP)" type="BigDecimal"/>
+            <set field="netAmount" from="grossAmount - tdsAmount" type="BigDecimal"/>
+            <entity-find-one entity-name="mantle.party.Party" value-field="deducteeParty">
+                <field-map field-name="partyId" from="deducteePartyId"/>
+            </entity-find-one>
+            <service-call name="create#zenith.erp.india.TdsTransaction" out-map="context"
+                in-map="[organizationPartyId:organizationPartyId, deducteePartyId:deducteePartyId,
+                         sectionCode:section.sectionCode, tdsRate:tdsRate, grossAmount:grossAmount,
+                         tdsAmount:tdsAmount, netAmount:netAmount, transactionDate:transactionDate,
+                         panNumber:deducteeParty?.panNumber, statusId:'TdsPending']"/>
+            <message>TDS of ${tdsAmount} deducted under Section ${section.sectionCode} at ${tdsRate}%</message>
+        </actions>
+    </service>
+
+    <service verb="deposit" noun="TdsChallan">
+        <in-parameters>
+            <parameter name="tdsTransactionId" required="true"/>
+            <parameter name="challanNumber" required="true"/>
+            <parameter name="challanDate" type="Timestamp" default="ec.user.nowTimestamp"/>
+            <parameter name="bsrCode"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.india.TdsTransaction" value-field="txn"/>
+            <if condition="!txn"><return error="true" message="TDS Transaction not found"/></if>
+            <service-call name="update#zenith.erp.india.TdsTransaction"
+                in-map="[tdsTransactionId:tdsTransactionId, challanNumber:challanNumber,
+                         challanDate:challanDate, bsrCode:bsrCode, statusId:'TdsDeposited']"/>
+            <message>TDS Challan ${challanNumber} recorded successfully.</message>
+        </actions>
+    </service>
+
+</services>

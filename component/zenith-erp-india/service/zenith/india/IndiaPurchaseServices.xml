@@ -1,0 +1,219 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <!-- ========== TDS on Purchase Payment (India-specific) ========== -->
+
+    <service verb="create" noun="PurchasePaymentWithTds">
+        <description>Create a purchase payment with optional TDS deduction (India-specific)</description>
+        <in-parameters>
+            <parameter name="invoiceId" required="true"/>
+            <parameter name="tdsSectionId"><description>If provided, TDS will be deducted</description></parameter>
+            <parameter name="paymentDate" type="Timestamp" default="ec.user.nowTimestamp"/>
+            <parameter name="paymentMethodEnumId" default-value="PmtBankAccount"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="paymentId"/>
+            <parameter name="tdsTransactionId"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="invoice"/>
+            <set field="grossAmount" from="invoice.invoiceTotal" type="BigDecimal"/>
+
+            <if condition="tdsSectionId">
+                <service-call name="zenith.erp.india.TdsServices.deduct#Tds" out-map="tdsOut"
+                              in-map="[organizationPartyId:invoice.toPartyId, deducteePartyId:invoice.fromPartyId,
+                                       tdsSectionId:tdsSectionId, grossAmount:invoice.totalTaxableAmount,
+                                       transactionDate:paymentDate, invoiceId:invoiceId]"/>
+                <set field="tdsTransactionId" from="tdsOut.tdsTransactionId"/>
+                <set field="netPayment" from="grossAmount - (tdsOut.tdsAmount ?: 0)"/>
+            <else>
+                <set field="netPayment" from="grossAmount"/>
+            </else></if>
+
+            <service-call name="create#mantle.account.payment.Payment" out-map="pmtOut"
+                          in-map="[paymentTypeEnumId:'PtInvoicePayment', fromPartyId:invoice.toPartyId,
+                                   toPartyId:invoice.fromPartyId, amount:netPayment,
+                                   amountUomId:'INR', paymentMethodEnumId:paymentMethodEnumId,
+                                   effectiveDate:paymentDate, statusId:'PmntPromised',
+                                   paymentInstrumentEnumId:'PiCompanyCheck']"/>
+            <set field="paymentId" from="pmtOut.paymentId"/>
+        </actions>
+    </service>
+
+    <!-- ========== GSTR-2B Reconciliation (India-specific) ========== -->
+
+    <service verb="reconcile" noun="Gstr2b">
+        <description>Match GSTR-2B records against purchase invoices in books</description>
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="returnPeriod" required="true"><description>MMYYYY format</description></parameter>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="matched" type="Integer"/>
+            <parameter name="unmatched" type="Integer"/>
+            <parameter name="missingInBooks" type="Integer"/>
+            <parameter name="missingInPortal" type="Integer"/>
+        </out-parameters>
+        <actions>
+            <set field="matched" from="0" type="Integer"/>
+            <set field="unmatched" from="0" type="Integer"/>
+            <set field="missingInBooks" from="0" type="Integer"/>
+
+            <entity-find entity-name="zenith.erp.india.Gstr2bRecord" list="g2bRecords">
+                <econdition field-name="organizationPartyId"/>
+                <econdition field-name="returnPeriod"/>
+            </entity-find>
+
+            <iterate list="g2bRecords" entry="g2b">
+                <entity-find entity-name="mantle.account.invoice.Invoice" list="matchedInvoices">
+                    <econdition field-name="toPartyId" from="organizationPartyId"/>
+                    <econdition field-name="vendorInvoiceNumber" from="g2b.invoiceNumber"/>
+                </entity-find>
+
+                <if condition="matchedInvoices">
+                    <set field="inv" from="matchedInvoices[0]"/>
+                    <set field="amtDiff" from="((g2b.taxableAmount ?: 0) - (inv.totalTaxableAmount ?: 0)).abs()"/>
+                    <if condition="amtDiff &lt;= 1">
+                        <set field="matchSt" value="Matched"/>
+                        <set field="matched" from="matched + 1"/>
+                    <else>
+                        <set field="matchSt" value="Unmatched"/>
+                        <set field="unmatched" from="unmatched + 1"/>
+                    </else></if>
+
+                    <service-call name="update#zenith.erp.india.Gstr2bRecord"
+                                  in-map="[gstr2bRecordId:g2b.gstr2bRecordId, matchStatus:matchSt,
+                                           matchedInvoiceId:inv.invoiceId, matchDate:ec.user.nowTimestamp,
+                                           mismatchReasons:amtDiff &gt; 1 ? 'Amount mismatch: portal=' + g2b.taxableAmount + ' books=' + inv.totalTaxableAmount : null]"/>
+                <else>
+                    <set field="missingInBooks" from="missingInBooks + 1"/>
+                    <service-call name="update#zenith.erp.india.Gstr2bRecord"
+                                  in-map="[gstr2bRecordId:g2b.gstr2bRecordId, matchStatus:'MissingInBooks',
+                                           matchDate:ec.user.nowTimestamp]"/>
+                </else></if>
+            </iterate>
+
+            <!-- Find invoices in books but not in GSTR-2B -->
+            <set field="periodMonth" from="returnPeriod.substring(0, 2) as int"/>
+            <set field="periodYear" from="returnPeriod.substring(2) as int"/>
+            <set field="periodCal" from="new java.util.GregorianCalendar(periodYear, periodMonth - 1, 1)"/>
+            <set field="periodStart" from="new java.sql.Timestamp(periodCal.getTimeInMillis())"/>
+            <set field="periodCal2" from="new java.util.GregorianCalendar(periodYear, periodMonth - 1, 1)"/>
+            <script>periodCal2.add(java.util.Calendar.MONTH, 1)</script>
+            <set field="periodEnd" from="new java.sql.Timestamp(periodCal2.getTimeInMillis())"/>
+
+            <entity-find entity-name="mantle.account.invoice.Invoice" list="bookInvoices">
+                <econdition field-name="toPartyId" from="organizationPartyId"/>
+                <econdition field-name="invoiceTypeEnumId" value="InvoiceSales"/>
+                <econdition field-name="invoiceDate" operator="greater-equals" from="periodStart"/>
+                <econdition field-name="invoiceDate" operator="less" from="periodEnd"/>
+            </entity-find>
+            <set field="missingInPortal" from="bookInvoices.size()"/>
+        </actions>
+    </service>
+
+    <service verb="importAndReconcile" noun="Gstr2b">
+        <description>Imports a GSTR-2B JSON file and runs reconciliation</description>
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="returnPeriod" required="true"/>
+            <parameter name="gstr2bJsonFile" type="org.apache.commons.fileupload.FileItem" required="true"/>
+        </in-parameters>
+        <actions>
+            <script><![CDATA[
+                import groovy.json.JsonSlurper
+                import java.text.SimpleDateFormat
+                import java.sql.Date
+                import org.apache.commons.fileupload.FileItem
+
+                FileItem fileItem = context.gstr2bJsonFile
+                if (!fileItem || fileItem.size == 0) {
+                    ec.message.addError("Please upload a valid GSTR-2B JSON file.")
+                    return
+                }
+
+                def jsonContent = fileItem.getString("UTF-8")
+                def slurper = new JsonSlurper()
+                def parsedJson
+                try {
+                    parsedJson = slurper.parseText(jsonContent)
+                } catch (Exception e) {
+                    ec.message.addError("Invalid JSON file format: " + e.getMessage())
+                    return
+                }
+
+                def docdata = parsedJson?.data?.docdata
+                if (!docdata || !docdata[0]?.b2b) {
+                    ec.message.addError("Could not find standard GSTR-2B B2B invoice data in the JSON file.")
+                    return
+                }
+
+                SimpleDateFormat sdf = new SimpleDateFormat("dd-MM-yyyy")
+                int importCount = 0
+
+                ec.entity.find("zenith.erp.india.Gstr2bRecord")
+                    .condition("organizationPartyId", organizationPartyId)
+                    .condition("returnPeriod", returnPeriod)
+                    .deleteAll()
+
+                def b2bList = docdata[0].b2b
+                for (def supplier in b2bList) {
+                    def ctin = supplier.ctin
+                    def trdnm = supplier.trdnm
+
+                    for (def inv in supplier.inv) {
+                        def inum = inv.inum
+                        def idt = inv.idt
+                        def val = inv.val ?: 0.0
+                        def pos = inv.pos
+
+                        def invoiceDate = idt ? new Date(sdf.parse(idt).getTime()) : null
+
+                        BigDecimal totalTaxable = 0.0
+                        BigDecimal totalIgst = 0.0
+                        BigDecimal totalCgst = 0.0
+                        BigDecimal totalSgst = 0.0
+                        BigDecimal totalCess = 0.0
+
+                        if (inv.itms) {
+                            for (def item in inv.itms) {
+                                totalTaxable += (item.txval ?: 0.0) as BigDecimal
+                                totalIgst += (item.igst ?: 0.0) as BigDecimal
+                                totalCgst += (item.cgst ?: 0.0) as BigDecimal
+                                totalSgst += (item.sgst ?: 0.0) as BigDecimal
+                                totalCess += (item.cess ?: 0.0) as BigDecimal
+                            }
+                        }
+
+                        ec.service.sync().name("create#zenith.erp.india.Gstr2bRecord").parameters([
+                            organizationPartyId: organizationPartyId,
+                            returnPeriod: returnPeriod,
+                            supplierGstin: ctin,
+                            supplierName: trdnm,
+                            invoiceNumber: inum,
+                            invoiceDate: invoiceDate,
+                            invoiceType: "B2B",
+                            taxableAmount: totalTaxable,
+                            igstAmount: totalIgst,
+                            cgstAmount: totalCgst,
+                            sgstAmount: totalSgst,
+                            cessAmount: totalCess,
+                            totalAmount: val,
+                            placeOfSupply: pos,
+                            matchStatus: "Pending"
+                        ]).call()
+
+                        importCount++
+                    }
+                }
+
+                ec.message.addMessage("Successfully imported ${importCount} GSTR-2B records.", "success")
+            ]]></script>
+
+            <service-call name="zenith.india.IndiaPurchaseServices.reconcile#Gstr2b"
+                          in-map="[organizationPartyId:organizationPartyId, returnPeriod:returnPeriod]"/>
+        </actions>
+    </service>
+
+</services>

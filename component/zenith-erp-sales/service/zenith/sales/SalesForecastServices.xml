@@ -1,0 +1,413 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <!-- ADVANCED SALES (REVENUE) FORECAST.
+         Builds a daily revenue series from completed POS sales, runs an ENSEMBLE of methods
+         (trend+weekly-seasonality, Holt-Winters triple exponential smoothing, seasonal-naive,
+         moving average, and a traffic x AOV driver decomposition), BACKTESTS each via a 7-day
+         holdout and self-selects the most accurate, then projects the horizon with a confidence
+         band derived from backtest error. Also returns the demand DRIVER (traffic vs basket size). -->
+    <service verb="forecast" noun="Sales" allow-remote="true" transaction-timeout="120">
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="horizonDays" type="Integer" default="14"/>
+            <parameter name="lookbackDays" type="Integer" default="120"/>
+            <parameter name="categoryName"><description>Optional: forecast only this product category's sales</description></parameter>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="weeklyPoints" type="List"/>
+            <parameter name="summary"/>
+            <parameter name="result" type="Map"/>
+            <parameter name="historyDays" type="Integer"/>
+            <parameter name="avgDaily" type="BigDecimal"/>
+            <parameter name="projectedNext7" type="BigDecimal"/>
+            <parameter name="projectedHorizon" type="BigDecimal"/>
+            <parameter name="method"/>
+            <parameter name="methodEnumId"/>
+            <parameter name="confidencePct" type="Integer"/>
+            <parameter name="trendLabel"/>
+            <parameter name="peakDay"/>
+            <parameter name="primaryDriver"/>
+            <parameter name="next7Traffic" type="Integer"/>
+            <parameter name="next7Aov" type="BigDecimal"/>
+            <parameter name="narrative"/>
+            <parameter name="points" type="List"/>
+            <parameter name="methodScores" type="List"/>
+        </out-parameters>
+        <actions>
+            <script><![CDATA[
+                import java.time.*
+                import java.time.temporal.ChronoUnit
+                import java.sql.Timestamp
+                import org.moqui.entity.EntityCondition
+
+                def r2 = { x -> (x as BigDecimal).setScale(2, java.math.RoundingMode.HALF_UP) }
+                def nowTs = ec.user.nowTimestamp
+                def today = nowTs.toLocalDateTime().toLocalDate()
+                def fromTs = new Timestamp(nowTs.getTime() - ((lookbackDays ?: 120) as long)*86400000L)
+                int H = (horizonDays ?: 14) as int
+
+                points = []; methodScores = []; weeklyPoints = []; result = [:]
+                def dayTot = [:]; def dayCnt = [:]
+                def minD = today; def maxRaw = today.minusDays(1)
+                if (categoryName) {
+                    def cats = ec.entity.find("mantle.product.category.ProductCategory")
+                        .condition(ec.entity.conditionFactory.makeCondition("categoryName", EntityCondition.LIKE, "%" + categoryName + "%")).selectField("productCategoryId").list()
+                    def catIds = cats.collect { it.productCategoryId }
+                    if (!catIds) { narrative = "No product category matches '" + categoryName + "'."; summary = narrative; confidencePct = null; historyDays = 0; return }
+                    def rows = ec.entity.find("zenith.erp.sales.InvoiceCategorySalesView")
+                        .condition("fromPartyId", organizationPartyId).condition("invoiceTypeEnumId", "InvoiceSales")
+                        .condition(ec.entity.conditionFactory.makeCondition("statusId", EntityCondition.NOT_EQUAL, "InvoiceCancelled"))
+                        .condition(ec.entity.conditionFactory.makeCondition("productCategoryId", EntityCondition.IN, catIds))
+                        .condition(ec.entity.conditionFactory.makeCondition("invoiceDate", EntityCondition.GREATER_THAN_EQUAL_TO, fromTs))
+                        .selectField("invoiceDate").selectField("taxableAmount").selectField("totalTaxAmount").selectField("invoiceId").list()
+                    if (rows == null || rows.size() < 14) { narrative = "Not enough sales history for category '" + categoryName + "' yet."; summary = narrative; confidencePct = null; historyDays = (rows ? rows.size() : 0); return }
+                    def dayTxns = [:]
+                    for (rw in rows) {
+                        def ld = rw.invoiceDate.toLocalDateTime().toLocalDate(); if (!ld.isBefore(today)) continue
+                        dayTot[ld] = ((dayTot[ld] ?: 0.0) as double) + ((rw.taxableAmount ?: 0.0) as double) + ((rw.totalTaxAmount ?: 0.0) as double)
+                        if (!dayTxns[ld]) dayTxns[ld] = new HashSet()
+                        dayTxns[ld].add(rw.invoiceId)
+                        if (ld.isBefore(minD)) minD = ld
+                        if (ld.isAfter(maxRaw)) maxRaw = ld
+                    }
+                    for (e in dayTxns) dayCnt[e.key] = e.value.size()
+                } else {
+                    def txns = ec.entity.find("mantle.account.invoice.Invoice")
+                        .condition("fromPartyId", organizationPartyId).condition("invoiceTypeEnumId", "InvoiceSales")
+                        .condition(ec.entity.conditionFactory.makeCondition("statusId", EntityCondition.NOT_EQUAL, "InvoiceCancelled"))
+                        .condition(ec.entity.conditionFactory.makeCondition("invoiceDate", EntityCondition.GREATER_THAN_EQUAL_TO, fromTs))
+                        .selectField("invoiceDate").selectField("totalTaxableAmount").selectField("totalTaxAmount").selectField("roundOffAmount").list()
+                    if (txns == null || txns.size() < 14) { narrative = "Not enough sales history to forecast yet — need about two weeks of sales."; summary = narrative; confidencePct = null; historyDays = (txns ? txns.size() : 0); return }
+                    for (t in txns) {
+                        def ld = t.invoiceDate.toLocalDateTime().toLocalDate(); if (!ld.isBefore(today)) continue
+                        dayTot[ld] = ((dayTot[ld] ?: 0.0) as double) + ((t.totalTaxableAmount ?: 0.0) as double) + ((t.totalTaxAmount ?: 0.0) as double) + ((t.roundOffAmount ?: 0.0) as double)
+                        dayCnt[ld] = ((dayCnt[ld] ?: 0) as int) + 1
+                        if (ld.isBefore(minD)) minD = ld
+                        if (ld.isAfter(maxRaw)) maxRaw = ld
+                    }
+                }
+                int nRaw = (int) ChronoUnit.DAYS.between(minD, maxRaw) + 1
+                if (nRaw < 14) { narrative = "Not enough continuous sales history to forecast yet."; summary = narrative; confidencePct = null; historyDays = nRaw; return }
+
+                double[] yR = new double[nRaw]; double[] cR = new double[nRaw]
+                for (int i = 0; i < nRaw; i++) { def d = minD.plusDays(i); yR[i] = (dayTot[d] ?: 0.0) as double; cR[i] = (dayCnt[d] ?: 0) as double }
+
+                // ACTIVE-DAY detection: filter out closed / near-empty days (gaps, partial days) using a
+                // fraction of the median selling-day total, so one-off closures don't corrupt the model.
+                def nz = []; for (int i = 0; i < nRaw; i++) if (yR[i] > 0) nz.add(yR[i]); nz.sort()
+                double median = nz ? (nz[(int)(nz.size()/2)] as double) : 0.0
+                double thr = median * 0.15
+                boolean[] activeR = new boolean[nRaw]
+                int lastA = -1
+                for (int i = 0; i < nRaw; i++) { activeR[i] = (yR[i] >= thr && yR[i] > 0); if (activeR[i]) lastA = i }
+                if (lastA < 13) { narrative = "Not enough active selling days to forecast yet."; summary = narrative; confidencePct = null; historyDays = lastA + 1; return }
+
+                // truncate trailing inactive tail -> series ends at last active selling day
+                int n = lastA + 1
+                def maxD = minD.plusDays(lastA)
+                double[] y = new double[n]; double[] c = new double[n]; boolean[] active = new boolean[n]
+                for (int i = 0; i < n; i++) { y[i] = yR[i]; c[i] = cR[i]; active[i] = activeR[i] }
+                double aovMean = 0; int am = 0
+                for (int i = 0; i < n; i++) if (active[i] && c[i] > 0) { aovMean += y[i] / c[i]; am++ }
+                aovMean = am > 0 ? aovMean / am : 0.0
+                double[] aov = new double[n]
+                for (int i = 0; i < n; i++) aov[i] = (c[i] > 0 ? y[i] / c[i] : aovMean)
+
+                def absIdx = { LocalDate d -> (int) ChronoUnit.DAYS.between(minD, d) }
+
+                // ---- builders: each returns a closure fc(LocalDate)->predicted, fit over ACTIVE days with index <= cutoff ----
+                def buildTSarr = { double[] arr, int cutoff ->
+                    double[] ds = new double[7]; int[] dc = new int[7]; double mo = 0; int mc = 0
+                    for (int i = 0; i <= cutoff; i++) if (active[i]) { int dw = minD.plusDays(i).getDayOfWeek().getValue() % 7; ds[dw] += arr[i]; dc[dw]++; mo += arr[i]; mc++ }
+                    if (mc == 0) return null
+                    mo /= mc; double[] f = new double[7]; for (int k = 0; k < 7; k++) { double dm = dc[k] > 0 ? ds[k] / dc[k] : mo; f[k] = mo > 0 ? dm / mo : 1.0 }
+                    double sx = 0, sy = 0, sxx = 0, sxy = 0; int no = 0
+                    for (int i = 0; i <= cutoff; i++) if (active[i]) { int dw = minD.plusDays(i).getDayOfWeek().getValue() % 7; double des = arr[i] / (f[dw] > 0 ? f[dw] : 1); sx += i; sy += des; sxx += (double) i * i; sxy += (double) i * des; no++ }
+                    double den = no * sxx - sx * sx; double sl = den != 0 ? (no * sxy - sx * sy) / den : 0.0; double itc = (sy - sl * sx) / no
+                    double lastLvl = itc + sl * cutoff
+                    return { LocalDate d -> int t = (int) ChronoUnit.DAYS.between(minD, d); int h = t - cutoff; if (h < 1) h = 1; int dw = d.getDayOfWeek().getValue() % 7; double damp = (sl == 0 ? 0.0 : 0.9 * (1 - Math.pow(0.9, h)) / 0.1); Math.max(0.0, (lastLvl + sl * damp) * f[dw]) }
+                }
+                def buildTS = { int cutoff -> buildTSarr(y, cutoff) }
+                def buildDriver = { int cutoff -> def fcC = buildTSarr(c, cutoff); def fcA = buildTSarr(aov, cutoff); (fcC == null || fcA == null) ? null : { LocalDate d -> Math.max(0.0, (fcC.call(d) as double) * (fcA.call(d) as double)) } }
+                def buildSN = { int cutoff -> return { LocalDate d -> for (int i = cutoff; i >= 0; i--) { if (active[i] && minD.plusDays(i).getDayOfWeek() == d.getDayOfWeek()) return y[i] }; return aovMean*0 } }
+                def buildMA = { int cutoff -> double s = 0; int k = 0; for (int i = cutoff; i >= 0 && k < 7; i--) if (active[i]) { s += y[i]; k++ }; double mv = k > 0 ? s / k : 0.0; return { LocalDate d -> mv } }
+                def buildHW = { int cutoff, double alpha, double beta, double gamma ->
+                    int len = cutoff + 1; int m = 7; if (len < 2 * m) return null
+                    double l = 0; for (int i = 0; i < m; i++) l += y[i]; l /= m
+                    double l2 = 0; for (int i = m; i < 2 * m; i++) l2 += y[i]; l2 /= m
+                    double trend = (l2 - l) / m; double[] s = new double[m]; for (int i = 0; i < m; i++) s[i] = l > 0 ? y[i] / l : 1.0
+                    double level = l
+                    for (int i = 0; i < len; i++) { int si = i % m; double seas = s[si] > 0 ? s[si] : 1.0; double nl = alpha * (y[i] / seas) + (1 - alpha) * (level + trend); double nt = beta * (nl - level) + (1 - beta) * trend; double ns = gamma * (y[i] / (nl > 0 ? nl : 1)) + (1 - gamma) * seas; level = nl; trend = nt; s[si] = ns }
+                    final double fl = level, ft = trend; final double[] fs = s; final int fend = cutoff
+                    return { LocalDate d -> int h = (int) ChronoUnit.DAYS.between(minD.plusDays(fend), d); if (h < 1) h = 1; double damp = (ft == 0 ? 0.0 : 0.9 * (1 - Math.pow(0.9, h)) / 0.1); Math.max(0.0, (fl + ft * damp) * fs[(fend + h) % m]) }
+                }
+
+                // ---- backtest: hold out the last up-to-7 active days, score MAPE on active actuals ----
+                int cutBt = n - 8
+                def backtest = { Closure builder ->
+                    if (cutBt < 10) return 9.99d
+                    def f = builder.call(cutBt); if (f == null) return 9.99d
+                    double ape = 0; int cnt = 0
+                    for (int i = cutBt + 1; i < n; i++) if (active[i] && y[i] > 0) { double pred = f.call(minD.plusDays(i)) as double; ape += Math.abs(pred - y[i]) / y[i]; cnt++ }
+                    return cnt > 0 ? ape / cnt : 9.99d
+                }
+
+                double mTs = backtest({ cf -> buildTS(cf) })
+                double mSn = backtest({ cf -> buildSN(cf) })
+                double mMa = backtest({ cf -> buildMA(cf) })
+                double mDrv = backtest({ cf -> buildDriver(cf) })
+                def hwCombos = [[0.3d,0.05d,0.3d],[0.5d,0.1d,0.3d],[0.3d,0.05d,0.5d],[0.5d,0.1d,0.5d]]
+                double mHw = 9.99d; def bestHw = null
+                for (combo in hwCombos) { double mm = backtest({ cf -> buildHW(cf, combo[0], combo[1], combo[2]) }); if (mm < mHw) { mHw = mm; bestHw = combo } }
+
+                def methods = []
+                methods.add([name:"Trend + weekly seasonality", enumId:"FmTrendSeasonal", mape: mTs, fc: buildTS(n - 1)])
+                methods.add([name:"Seasonal-naive (last week)", enumId:"FmSeasonalNaive", mape: mSn, fc: buildSN(n - 1)])
+                methods.add([name:"7-day moving average", enumId:"FmMovingAvg", mape: mMa, fc: buildMA(n - 1)])
+                if (bestHw != null) methods.add([name:"Holt-Winters (triple exponential smoothing)", enumId:"FmHoltWinters", mape: mHw, fc: buildHW(n - 1, bestHw[0], bestHw[1], bestHw[2])])
+                methods.add([name:"Traffic x basket-value decomposition", enumId:"FmDriver", mape: mDrv, fc: buildDriver(n - 1)])
+
+                def best = methods.findAll { it.fc != null }.min { it.mape }
+                for (mth in methods) methodScores.add([method: mth.name, errorPct: (mth.mape >= 9.0 ? null : (int) Math.round(mth.mape * 100))])
+                Integer conf = best.mape >= 9.0 ? null : Math.max(40, Math.min(95, (int) Math.round(100.0 * (1.0 - best.mape))))
+
+                def fcBest = best.fc
+                double band = best.mape >= 9.0 ? 0.4 : Math.min(0.6, best.mape)
+                def fcStart = today
+                double horizonSum = 0; double next7 = 0
+                def fcC2 = buildTSarr(c, n - 1); def fcA2 = buildTSarr(aov, n - 1)
+                double traf7 = 0
+                for (int h = 0; h < H; h++) {
+                    def fd = fcStart.plusDays(h); double pred = fcBest.call(fd) as double
+                    points.add([date: fd.toString(), dow: fd.getDayOfWeek().toString().substring(0,3), predicted: r2(pred), lower: r2(Math.max(0, pred - pred*band)), upper: r2(pred + pred*band)])
+                    horizonSum += pred; if (h < 7) { next7 += pred; traf7 += (fcC2.call(fd) as double) }
+                }
+
+                double meanY = 0; int my = 0; for (int i = 0; i < n; i++) if (active[i]) { meanY += y[i]; my++ }; meanY = my > 0 ? meanY / my : 0
+                double meanC = 0; int mc2 = 0; for (int i = 0; i < n; i++) if (active[i]) { meanC += c[i]; mc2++ }; meanC = mc2 > 0 ? meanC / mc2 : 0
+                // driver direction via deseasonalized slope sign of c and aov
+                def slopeOf = { double[] arr -> double sx=0,sy=0,sxx=0,sxy=0;int no=0; for(int i=0;i<n;i++) if(active[i]){ sx+=i;sy+=arr[i];sxx+=(double)i*i;sxy+=(double)i*arr[i];no++ }; double den=no*sxx-sx*sx; return den!=0?(no*sxy-sx*sy)/den:0.0 }
+                double slC = slopeOf(c); double slA = slopeOf(aov); double slY = slopeOf(y)
+                double relC = meanC > 0 ? Math.abs(slC) / meanC : 0; double relA = aovMean > 0 ? Math.abs(slA) / aovMean : 0
+                def dir = { s -> s > 0 ? "rising" : (s < 0 ? "easing" : "flat") }
+                primaryDriver = (relC >= relA) ? ("customer footfall (" + dir(slC) + ")") : ("average basket value (" + dir(slA) + ")")
+                double relY = meanY > 0 ? slY / meanY : 0
+                trendLabel = relY > 0.01 ? "growing" : (relY < -0.01 ? "softening" : "steady")
+                def tsForPeak = buildTSarr(y, n - 1)
+                double[] pf = new double[7]; for (int k = 0; k < 7; k++) { def dd = maxD.plusDays(1 + k); pf[k] = tsForPeak.call(dd) as double }
+                int pk = 0; for (int k = 1; k < 7; k++) if (pf[k] > pf[pk]) pk = k
+                def dowNames = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+                def peakD = maxD.plusDays(1 + pk).getDayOfWeek().toString()
+                peakDay = peakD.substring(0,1) + peakD.substring(1).toLowerCase()
+
+                historyDays = n; avgDaily = r2(meanY); projectedNext7 = r2(next7); projectedHorizon = r2(horizonSum)
+                method = best.name; methodEnumId = best.enumId; confidencePct = conf
+                next7Traffic = (int) Math.round(traf7); next7Aov = r2(aovMean)
+                def sym = "INR "
+                narrative = "Projected sales for the next 7 days: " + sym + projectedNext7 + " (about " + sym + r2(next7/7) + "/day). " +
+                    "Sales are " + trendLabel + ", busiest on " + peakDay + "; expect ~" + next7Traffic + " bills at ~" + sym + next7Aov + " each. " +
+                    "Main mover: " + primaryDriver + ". " +
+                    (conf != null ? ("Confidence ~" + conf + "% (best of " + methods.findAll{it.fc!=null}.size() + " methods by backtest: " + best.name + ").") : "Confidence limited by short history.")
+
+                // weekly rollup of the daily horizon
+                def weekly = []
+                for (int w = 0; w * 7 < points.size(); w++) {
+                    double sp = 0, slo = 0, sup = 0; def ws = null
+                    for (int k = 0; k < 7 && (w * 7 + k) < points.size(); k++) { def pt = points[w * 7 + k]; if (ws == null) ws = pt.date; sp += (pt.predicted as double); slo += (pt.lower as double); sup += (pt.upper as double) }
+                    weekly.add([weekStart: ws, predicted: r2(sp), lower: r2(slo), upper: r2(sup)])
+                }
+                weeklyPoints = weekly
+                summary = narrative
+                result = [scope: (categoryName ?: "ALL"), projectedNext7: projectedNext7, projectedHorizon: projectedHorizon, perDay: r2(next7 / 7.0),
+                          method: method, confidencePct: confidencePct, trend: trendLabel, peakDay: peakDay, primaryDriver: primaryDriver,
+                          next7Traffic: next7Traffic, next7Aov: next7Aov, weekly: weekly]
+            ]]></script>
+        </actions>
+    </service>
+
+    <!-- Per-CATEGORY sales forecast: picks the top categories by recent revenue and forecasts each
+         (reuses the full ensemble engine via forecast#Sales with a categoryName). -->
+    <service verb="forecast" noun="CategorySales" allow-remote="true" transaction-timeout="300">
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="topN" type="Integer" default="6"/>
+            <parameter name="horizonDays" type="Integer" default="14"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="categories" type="List"/>
+            <parameter name="summary"/>
+            <parameter name="result" type="Map"/>
+        </out-parameters>
+        <actions>
+            <script><![CDATA[
+                import java.sql.Timestamp
+                import org.moqui.entity.EntityCondition
+                def fromTs = new Timestamp(ec.user.nowTimestamp.getTime() - 30L * 86400000L)
+                def rows = ec.entity.find("zenith.erp.sales.InvoiceCategorySalesView")
+                    .condition("fromPartyId", organizationPartyId).condition("invoiceTypeEnumId", "InvoiceSales")
+                    .condition(ec.entity.conditionFactory.makeCondition("statusId", EntityCondition.NOT_EQUAL, "InvoiceCancelled"))
+                    .condition(ec.entity.conditionFactory.makeCondition("invoiceDate", EntityCondition.GREATER_THAN_EQUAL_TO, fromTs))
+                    .selectField("productCategoryId").selectField("taxableAmount").selectField("totalTaxAmount").list()
+                def catRev = [:]
+                for (rw in rows) { def cid = rw.productCategoryId; catRev[cid] = ((catRev[cid] ?: 0.0) as double) + ((rw.taxableAmount ?: 0.0) as double) + ((rw.totalTaxAmount ?: 0.0) as double) }
+                def topCats = catRev.entrySet().sort { -it.value }.take((topN ?: 6) as int)
+                categories = []
+                for (ce in topCats) {
+                    def cat = ec.entity.find("mantle.product.category.ProductCategory").condition("productCategoryId", ce.key).one()
+                    def cname = cat?.categoryName ?: ce.key
+                    def f = ec.service.sync().name("zenith.sales.SalesForecastServices.forecast#Sales")
+                        .parameters([organizationPartyId: organizationPartyId, categoryName: cname, horizonDays: (horizonDays ?: 14)]).call()
+                    categories.add([category: cname, projectedNext7: f.projectedNext7,
+                        perDay: (f.projectedNext7 != null ? (f.projectedNext7 / 7.0).setScale(0, java.math.RoundingMode.HALF_UP) : null),
+                        confidencePct: f.confidencePct, trend: f.trendLabel, method: f.method, recent30: Math.round(ce.value as double)])
+                }
+                def parts = categories.findAll { it.projectedNext7 != null }.collect { it.category + " ~INR " + it.projectedNext7 + " (" + (it.trend ?: '') + ")" }
+                summary = parts ? ("Category outlook for the next 7 days — " + parts.join("; ") + ".") : "Not enough category sales history yet."
+                result = [categories: categories]
+            ]]></script>
+        </actions>
+    </service>
+
+    <!-- AUTOMATIC, SELF-CALIBRATING SALES FORECAST CYCLE.
+         (1) Calibrates: fills actual sales + accuracy for past forecast days now known.
+         (2) Generates a fresh 14-day forecast and stores it. Scheduled daily; safe to re-run. -->
+    <service verb="cycle" noun="SalesForecast" authenticate="false" transaction-timeout="1800">
+        <in-parameters><parameter name="organizationPartyId"/></in-parameters>
+        <out-parameters>
+            <parameter name="orgsProcessed" type="Integer"/>
+            <parameter name="forecastsStored" type="Integer"/>
+            <parameter name="calibrated" type="Integer"/>
+        </out-parameters>
+        <actions>
+            <script><![CDATA[
+                import java.time.*
+                import java.sql.Timestamp
+                import java.sql.Date as SqlDate
+                import org.moqui.entity.EntityCondition
+
+                // Scheduled jobs have no logged-in user. This service is authenticate="false" so it enters,
+                // but it then calls forecast#Sales / update#SalesRevenueForecast (authenticate="true") which
+                // require a user -> AuthenticationRequiredException every cycle. Establish an internal anonymous
+                // user so the nested authenticated calls pass. We do NOT set authenticate="false" on forecast#Sales
+                // because it is allow-remote and that would let anonymous REST callers read any tenant's revenue.
+                ec.user.loginAnonymousIfNoUser()
+
+                def today = ec.user.nowTimestamp.toLocalDateTime().toLocalDate()
+                def todaySql = SqlDate.valueOf(today)
+                orgsProcessed = 0; forecastsStored = 0; calibrated = 0
+
+                def orgs = []
+                if (organizationPartyId) { orgs.add(organizationPartyId) }
+                else {
+                    ec.entity.find("mantle.account.invoice.Invoice").condition("invoiceTypeEnumId","InvoiceSales")
+                        .selectField("fromPartyId").distinct(true).list().each { if (it.fromPartyId) orgs.add(it.fromPartyId) }
+                }
+
+                for (org in orgs) {
+                    if (!org) continue
+                    // 1) calibrate past, not-yet-actualed Overall forecasts
+                    def due = ec.entity.find("zenith.erp.sales.SalesRevenueForecast")
+                        .condition("organizationPartyId", org).condition("dimension", "Overall")
+                        .condition(ec.entity.conditionFactory.makeCondition("actualAmount", EntityCondition.EQUALS, null))
+                        .condition(ec.entity.conditionFactory.makeCondition("periodDate", EntityCondition.LESS_THAN, todaySql))
+                        .list()
+                    for (fc in due) {
+                        def pd = fc.periodDate.toLocalDate()
+                        def ds = Timestamp.valueOf(pd.atStartOfDay()); def de = Timestamp.valueOf(pd.plusDays(1).atStartOfDay())
+                        def acts = ec.entity.find("mantle.account.invoice.Invoice")
+                            .condition("fromPartyId", org).condition("invoiceTypeEnumId", "InvoiceSales")
+                            .condition(ec.entity.conditionFactory.makeCondition("statusId", EntityCondition.NOT_EQUAL, "InvoiceCancelled"))
+                            .condition(ec.entity.conditionFactory.makeCondition("invoiceDate", EntityCondition.GREATER_THAN_EQUAL_TO, ds))
+                            .condition(ec.entity.conditionFactory.makeCondition("invoiceDate", EntityCondition.LESS_THAN, de))
+                            .selectField("totalTaxableAmount").selectField("totalTaxAmount").selectField("roundOffAmount").list()
+                        double act = 0; for (a in acts) act += ((a.totalTaxableAmount ?: 0) as double) + ((a.totalTaxAmount ?: 0) as double) + ((a.roundOffAmount ?: 0) as double)
+                        double pred = (fc.predictedAmount ?: 0) as double
+                        Integer acc = (act > 0) ? Math.max(0, Math.min(100, (int) Math.round(100.0 * (1.0 - Math.abs(pred - act) / act)))) : null
+                        ec.service.sync().name("update#zenith.erp.sales.SalesRevenueForecast")
+                            .parameters([forecastId: fc.forecastId, actualAmount: (act as BigDecimal).setScale(2, java.math.RoundingMode.HALF_UP), accuracyPct: acc]).call()
+                        calibrated++
+                    }
+                    // 2) fresh forecast
+                    def r = ec.service.sync().name("zenith.sales.SalesForecastServices.forecast#Sales")
+                        .parameters([organizationPartyId: org, horizonDays: 14]).call()
+                    if (r.points) {
+                        // clear prior un-actualed future rows for this org to avoid duplicates
+                        ec.entity.find("zenith.erp.sales.SalesRevenueForecast")
+                            .condition("organizationPartyId", org).condition("dimension", "Overall")
+                            .condition(ec.entity.conditionFactory.makeCondition("actualAmount", EntityCondition.EQUALS, null))
+                            .condition(ec.entity.conditionFactory.makeCondition("periodDate", EntityCondition.GREATER_THAN_EQUAL_TO, todaySql))
+                            .deleteAll()
+                        for (p in r.points) {
+                            ec.entity.makeValue("zenith.erp.sales.SalesRevenueForecast").setAll([
+                                organizationPartyId: org, runDate: ec.user.nowTimestamp, granularity: "Daily", dimension: "Overall", dimensionValue: "ALL",
+                                periodDate: SqlDate.valueOf(p.date), predictedAmount: p.predicted, lowerBound: p.lower, upperBound: p.upper,
+                                method: r.method, confidencePct: r.confidencePct, aovForecast: r.next7Aov, createdStamp: ec.user.nowTimestamp]).setSequencedIdPrimary().create()
+                            forecastsStored++
+                        }
+                    }
+                    // ===== CATEGORY dimension: calibrate past + generate fresh =====
+                    def dueCat = ec.entity.find("zenith.erp.sales.SalesRevenueForecast")
+                        .condition("organizationPartyId", org).condition("dimension", "Category")
+                        .condition(ec.entity.conditionFactory.makeCondition("actualAmount", EntityCondition.EQUALS, null))
+                        .condition(ec.entity.conditionFactory.makeCondition("periodDate", EntityCondition.LESS_THAN, todaySql))
+                        .list()
+                    for (fc in dueCat) {
+                        def pd = fc.periodDate.toLocalDate()
+                        def ds = Timestamp.valueOf(pd.atStartOfDay()); def de = Timestamp.valueOf(pd.plusDays(1).atStartOfDay())
+                        def cats = ec.entity.find("mantle.product.category.ProductCategory")
+                            .condition(ec.entity.conditionFactory.makeCondition("categoryName", EntityCondition.LIKE, "%" + fc.dimensionValue + "%")).selectField("productCategoryId").list()
+                        def catIds = cats.collect { it.productCategoryId }
+                        double act = 0
+                        if (catIds) {
+                            def arows = ec.entity.find("zenith.erp.sales.InvoiceCategorySalesView")
+                                .condition("fromPartyId", org).condition("invoiceTypeEnumId", "InvoiceSales")
+                                .condition(ec.entity.conditionFactory.makeCondition("statusId", EntityCondition.NOT_EQUAL, "InvoiceCancelled"))
+                                .condition(ec.entity.conditionFactory.makeCondition("productCategoryId", EntityCondition.IN, catIds))
+                                .condition(ec.entity.conditionFactory.makeCondition("invoiceDate", EntityCondition.GREATER_THAN_EQUAL_TO, ds))
+                                .condition(ec.entity.conditionFactory.makeCondition("invoiceDate", EntityCondition.LESS_THAN, de))
+                                .selectField("taxableAmount").selectField("totalTaxAmount").list()
+                            for (a in arows) act += ((a.taxableAmount ?: 0) as double) + ((a.totalTaxAmount ?: 0) as double)
+                        }
+                        double pr = (fc.predictedAmount ?: 0) as double
+                        Integer acc = (act > 0) ? Math.max(0, Math.min(100, (int) Math.round(100.0 * (1.0 - Math.abs(pr - act) / act)))) : null
+                        ec.service.sync().name("update#zenith.erp.sales.SalesRevenueForecast")
+                            .parameters([forecastId: fc.forecastId, actualAmount: (act as BigDecimal).setScale(2, java.math.RoundingMode.HALF_UP), accuracyPct: acc]).call()
+                        calibrated++
+                    }
+                    def cFrom = Timestamp.valueOf(today.minusDays(30).atStartOfDay())
+                    def crows = ec.entity.find("zenith.erp.sales.InvoiceCategorySalesView")
+                        .condition("fromPartyId", org).condition("invoiceTypeEnumId", "InvoiceSales")
+                        .condition(ec.entity.conditionFactory.makeCondition("statusId", EntityCondition.NOT_EQUAL, "InvoiceCancelled"))
+                        .condition(ec.entity.conditionFactory.makeCondition("invoiceDate", EntityCondition.GREATER_THAN_EQUAL_TO, cFrom))
+                        .selectField("productCategoryId").selectField("taxableAmount").selectField("totalTaxAmount").list()
+                    def catRev = [:]; for (rw in crows) { def cid = rw.productCategoryId; catRev[cid] = ((catRev[cid] ?: 0.0) as double) + ((rw.taxableAmount ?: 0.0) as double) + ((rw.totalTaxAmount ?: 0.0) as double) }
+                    def topCats = catRev.entrySet().sort { -it.value }.take(6)
+                    ec.entity.find("zenith.erp.sales.SalesRevenueForecast")
+                        .condition("organizationPartyId", org).condition("dimension", "Category")
+                        .condition(ec.entity.conditionFactory.makeCondition("actualAmount", EntityCondition.EQUALS, null))
+                        .condition(ec.entity.conditionFactory.makeCondition("periodDate", EntityCondition.GREATER_THAN_EQUAL_TO, todaySql))
+                        .deleteAll()
+                    for (ce in topCats) {
+                        def cat = ec.entity.find("mantle.product.category.ProductCategory").condition("productCategoryId", ce.key).one()
+                        def cname = cat?.categoryName ?: ce.key
+                        def fcat = ec.service.sync().name("zenith.sales.SalesForecastServices.forecast#Sales")
+                            .parameters([organizationPartyId: org, categoryName: cname, horizonDays: 14]).call()
+                        if (fcat.points) {
+                            for (p in fcat.points) {
+                                ec.entity.makeValue("zenith.erp.sales.SalesRevenueForecast").setAll([
+                                    organizationPartyId: org, runDate: ec.user.nowTimestamp, granularity: "Daily", dimension: "Category", dimensionValue: cname,
+                                    periodDate: SqlDate.valueOf(p.date), predictedAmount: p.predicted, lowerBound: p.lower, upperBound: p.upper,
+                                    method: fcat.method, confidencePct: fcat.confidencePct, aovForecast: fcat.next7Aov, createdStamp: ec.user.nowTimestamp]).setSequencedIdPrimary().create()
+                                forecastsStored++
+                            }
+                        }
+                    }
+                    orgsProcessed++
+                }
+            ]]></script>
+        </actions>
+    </service>
+
+</services>

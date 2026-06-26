@@ -1,0 +1,192 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
+        default-menu-title="Purchase Order" default-menu-include="false">
+
+    <parameter name="orderId" required="true"/>
+
+    <transition name="findOrder"><default-response url="../FindPurchaseOrder"/></transition>
+    
+    <transition name="updateOrder">
+        <service-call name="update#mantle.order.OrderHeader"/>
+        <default-response url="."/>
+    </transition>
+
+    <transition name="addItem">
+        <service-call name="create#mantle.order.OrderItem" in-map="context + [itemTypeEnumId:'ItemInventory']"/>
+        <script>ec.service.sync().name("mantle.order.OrderServices.calculate#OrderTotal").parameters([orderId:orderId]).call()</script>
+        <default-response url="."/>
+    </transition>
+
+    <transition name="deleteItem">
+        <service-call name="delete#mantle.order.OrderItem"/>
+        <script>ec.service.sync().name("mantle.order.OrderServices.calculate#OrderTotal").parameters([orderId:orderId]).call()</script>
+        <default-response url="."/>
+    </transition>
+    
+    <transition name="createVendorBill">
+        <!-- Transition to explicitly convert this PO to a Purchase Invoice -->
+        <default-response url="../CreatePurchaseInvoice">
+            <parameter name="purchaseOrderId" value="${orderId}"/>
+            <parameter name="vendorPartyId" value="${vendorPartyId}"/>
+        </default-response>
+    </transition>
+
+    <actions>
+        <entity-find-one entity-name="mantle.order.OrderHeader" value-field="order"/>
+        <entity-find-one entity-name="mantle.order.OrderPart" value-field="orderPart">
+            <field-map field-name="orderId"/>
+            <field-map field-name="orderPartSeqId" value="01"/>
+        </entity-find-one>
+        
+        <entity-find entity-name="mantle.order.OrderItem" list="orderItems">
+            <econdition field-name="orderId"/>
+            <order-by field-name="orderItemSeqId"/>
+        </entity-find>
+
+        <entity-find-one entity-name="mantle.party.PartyDetail" value-field="vendor">
+            <field-map field-name="partyId" from="orderPart?.vendorPartyId"/>
+        </entity-find-one>
+        
+        <set field="statusColorMap" from="[
+            'OrderOpen': 'info',
+            'OrderProposed': 'warning',
+            'OrderPlaced': 'primary',
+            'OrderApproved': 'success',
+            'OrderCompleted': 'dark',
+            'OrderCancelled': 'danger'
+        ]"/>
+        <set field="statusColor" from="statusColorMap[order?.statusId] ?: 'dark'"/>
+    </actions>
+
+    <widgets>
+        <link url="findOrder" text="Back to Purchase Orders" link-type="anchor"/>
+        
+        <!-- Profile Banner -->
+        <container style="zenith-profile-banner q-pa-lg bg-white shadow-1 border-radius-lg q-mb-lg">
+            <container style="row items-center justify-between no-wrap">
+                <container style="row items-center">
+                    <container style="zenith-avatar q-mr-lg text-white; border-radius:12px; background:linear-gradient(135deg, #4f46e5, #3730a3);">
+                        <label text="PO" type="span" style="font-weight:bold; font-size:1.2rem;"/>
+                    </container>
+                    <container style="column">
+                        <label text="Purchase Order #${orderId}" type="h3" style="text-primary text-weight-bold q-my-none"/>
+                        <label text="Date: ${ec.l10n.format(order?.placedDate ?: order?.entryDate, 'dd MMM yyyy')}" type="p" style="text-grey-7 text-subtitle2 q-mt-xs q-mb-none"/>
+                    </container>
+                </container>
+                
+                <container style="row items-center">
+                    <form-single name="StatusForm" transition="updateOrder" map="order">
+                        <field name="orderId"><default-field><hidden/></default-field></field>
+                        <field name="statusId"><default-field title="">
+                            <drop-down current="selected">
+                                <entity-options key="${statusId}" text="${description}">
+                                    <entity-find entity-name="moqui.basic.StatusItem">
+                                        <econdition field-name="statusTypeId" value="OrderHeader"/>
+                                        <order-by field-name="sequenceNum"/>
+                                    </entity-find>
+                                </entity-options>
+                            </drop-down>
+                        </default-field></field>
+                        <field name="submitButton"><default-field title="Update Status"><submit/></default-field></field>
+                        <field-layout><field-row><field-ref name="statusId"/><field-ref name="submitButton"/></field-row></field-layout>
+                    </form-single>
+                </container>
+            </container>
+            
+            <container style="row items-center q-mt-md justify-between">
+                <container style="bg-grey-2 q-pa-sm border-radius-md">
+                    <label text="Supplier: ${vendor?.organizationName ?: vendor?.firstName + ' ' + vendor?.lastName} [${orderPart?.vendorPartyId}]" type="span" style="text-dark text-weight-bold"/>
+                </container>
+                
+                <container>
+                    <label text="${order?.statusId ? order.statusId.replace('Order', '') : 'Open'}" type="span" style="zenith-badge ${statusColor} q-mr-sm"/>
+                    
+                    <!-- Print PO Button -->
+                    <link url="${ec.web.getWebappRootUrl(false, null)}/fop/apps/zenith/Purchase/OrderPrint" url-type="plain" 
+                          text="Print PO" parameter-map="[orderId:orderId]" icon="print" 
+                          class="q-btn q-btn-item non-selectable no-outline q-btn--standard q-btn--rectangle bg-indigo text-white q-btn--actionable q-focusable q-hoverable q-mr-sm"
+                          link-type="anchor" target-window="_blank"/>
+
+                    <!-- Convert to Bill button is enabled if PO is Approved or Completed -->
+                    <link url="createVendorBill" text="Log Vendor Bill (ITC)" parameter-map="[orderId:orderId, vendorPartyId:orderPart?.vendorPartyId]" condition="order?.statusId in ['OrderApproved', 'OrderCompleted']"
+                          icon="receipt" class="q-btn q-btn-item non-selectable no-outline q-btn--standard q-btn--rectangle bg-teal-8 text-white q-btn--actionable q-focusable q-hoverable"/>
+                </container>
+            </container>
+        </container>
+
+        <!-- Main Sections -->
+        <container-row>
+            <row-col lg="8">
+                <!-- PO Items -->
+                <container style="zenith-card q-pa-md bg-white shadow-1 border-radius-md q-mb-lg">
+                    <container style="row justify-between items-center q-mb-md border-bottom q-pb-sm">
+                        <label text="Order Items" type="h5" style="text-primary text-weight-bold q-my-none"/>
+                        
+                        <container-dialog id="AddItemDialog" button-text="Add Item" button-class="q-btn--flat bg-primary text-white border-radius-md" condition="order?.statusId == 'OrderOpen'">
+                            <form-single name="AddItemForm" transition="addItem">
+                                <field name="orderId"><default-field><hidden/></default-field></field>
+                                
+                                <field name="productId"><default-field title="Product">
+                                    <drop-down allow-empty="true">
+                                        <entity-options key="${productId}" text="${pseudoId} - ${productName}">
+                                            <entity-find entity-name="mantle.product.Product"><order-by field-name="productName"/></entity-find>
+                                        </entity-options>
+                                    </drop-down>
+                                </default-field></field>
+                                <field name="itemDescription"><default-field title="Description"><text-line size="60"/></default-field></field>
+                                <field name="quantity"><default-field><text-line size="8"/></default-field></field>
+                                <field name="unitAmount"><default-field title="Unit Price (Estimated)"><text-line size="15"/></default-field></field>
+                                <field name="requiredByDate"><default-field title="Expected Date"><date-time type="date"/></default-field></field>
+                                
+                                <field name="submitButton"><default-field title="Add Item"><submit/></default-field></field>
+                            </form-single>
+                        </container-dialog>
+                    </container>
+
+                    <form-list name="OrderItemsForm" list="orderItems" skip-form="true">
+                        <field name="orderItemSeqId"><default-field title="#"><label text="${orderItemSeqId}" type="span" style="text-grey-7"/></default-field></field>
+                        <field name="itemDescription"><default-field title="Description"><label text="${itemDescription ?: 'N/A'}" type="strong" style="text-dark"/></default-field></field>
+                        <field name="requiredByDate"><default-field title="Expected"><label text="${ec.l10n.format(requiredByDate, 'dd MMM') ?: '-'}" type="span" style="zenith-badge grey"/></default-field></field>
+                        <field name="quantity"><default-field><label text="${quantity}" type="span" style="text-dark"/></default-field></field>
+                        <field name="unitAmount"><default-field title="Unit Price"><label text="${ec.l10n.format(unitAmount ?: 0, '#,##,##0.00')}" type="span"/></default-field></field>
+                        <field name="total"><default-field title="Est. Total">
+                            <label text="${currSymbol}${ec.l10n.format((quantity ?: 0) * (unitAmount ?: 0), '#,##,##0.00')}" type="span" style="text-weight-bold text-dark"/>
+                        </default-field></field>
+                        
+                        <field name="deleteItem">
+                            <default-field title=" ">
+                                <link url="deleteItem" parameter-map="[orderId:orderId, orderItemSeqId:orderItemSeqId]" condition="order?.statusId == 'OrderOpen'" icon="delete" style="text-danger" confirmation="Remove item?"/>
+                            </default-field>
+                        </field>
+                    </form-list>
+                </container>
+            </row-col>
+            
+            <row-col lg="4">
+                <!-- Totals Dashboard -->
+                <container style="zenith-card q-pa-md bg-indigo-9 text-white shadow-1 border-radius-md q-mb-md">
+                    <label text="PO Summary" type="h5" style="text-white text-weight-bold q-mb-md border-bottom q-pb-sm"/>
+                    <container style="row justify-between q-mb-sm">
+                        <label text="Est. Total" type="span" style="text-indigo-2"/>
+                        <label text="${currSymbol}${ec.l10n.format(order?.grandTotal ?: 0, '#,##,##0.00')}" type="strong" style="font-size:1.2rem;"/>
+                    </container>
+                    <container style="q-mt-md border-top q-pt-sm">
+                        <label text="Note: Taxes and final amounts will be reconciled when the Vendor Bill is logged." type="p" style="text-indigo-2 text-caption"/>
+                    </container>
+                </container>
+                
+                <!-- Terms -->
+                <container style="zenith-card q-pa-md bg-white shadow-1 border-radius-md">
+                    <label text="Purchase Details" type="h5" style="text-primary text-weight-bold q-mb-md border-bottom q-pb-sm"/>
+                    <form-single name="OrderDetailsForm" transition="updateOrder" map="order">
+                        <field name="orderId"><default-field><hidden/></default-field></field>
+                        <field name="orderName"><default-field title="Reference / Title"><text-line/></default-field></field>
+                        <field name="submitButton"><default-field title="Save Details"><submit/></default-field></field>
+                    </form-single>
+                </container>
+            </row-col>
+        </container-row>
+
+    </widgets>
+</screen>

@@ -1,0 +1,408 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
+        default-menu-title="Dashboard" default-menu-index="0">
+
+    <actions>
+        <set field="orgId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+        <set field="currSymbol" value="₹"/>
+        <script><![CDATA[
+            import org.moqui.entity.EntityCondition
+            def ef = ec.entity
+
+            // ----- Catalog counts -----
+            totalProducts  = ef.find("mantle.product.Product").condition("ownerPartyId", orgId).count()
+            withPrice      = ef.find("mantle.product.Product").condition("ownerPartyId", orgId).condition("mrpAmount", EntityCondition.GREATER_THAN, 0G).count()
+            missingPrice   = totalProducts - withPrice
+            categoriesCount= ef.find("mantle.product.category.ProductCategory").condition("ownerPartyId", orgId).count()
+            facilitiesCount= ef.find("mantle.facility.Facility").condition("ownerPartyId", orgId).count()
+            trackedCount   = ef.find("mantle.product.Product").condition("ownerPartyId", orgId).condition("inventoryTracked", "Y").count()
+
+            // ----- Stock value + units in hand (across all stores) -----
+            def svRows = ef.find("zenith.erp.inventory.StockByFacilityView").condition("ownerPartyId", orgId).list()
+            java.math.BigDecimal stockValue = 0G
+            java.math.BigDecimal totalUnits = 0G
+            for (r in svRows) { stockValue += (r.totalValue ?: 0G); totalUnits += (r.totalQoh ?: 0G) }
+
+            // ----- Low stock (only for items that actually track quantity) -----
+            int lowStockCnt = 0
+            if (trackedCount > 0) {
+                def psv = ef.find("zenith.erp.inventory.ProductStockView").condition("ownerPartyId", orgId).list()
+                for (r in psv) {
+                    def q = (r.totalQoh ?: 0G); def rp = (r.reorderPoint ?: 0G)
+                    if (rp > 0G && q <= rp) lowStockCnt++
+                }
+            }
+            lowStockCount = lowStockCnt
+
+            // ----- Expiring within 90 days -----
+            def cal = java.util.Calendar.getInstance(); cal.add(java.util.Calendar.DAY_OF_YEAR, 90)
+            def threshold = new java.sql.Timestamp(cal.getTimeInMillis())
+            expiringSoon = ef.find("mantle.product.asset.Asset").condition("ownerPartyId", orgId)
+                             .condition("expiryDate", EntityCondition.LESS_THAN_EQUAL_TO, threshold)
+                             .condition("quantityOnHandTotal", EntityCondition.GREATER_THAN, 0G).count()
+
+            // ----- Activity counts -----
+            adjCount      = ef.find("zenith.erp.inventory.StockAdjustment").condition("organizationPartyId", orgId).count()
+            transferCount = ef.find("zenith.erp.inventory.StockTransfer").condition("organizationPartyId", orgId).count()
+
+            // ----- Products by category (top 8) -----
+            def cats = ef.find("mantle.product.category.ProductCategory").condition("ownerPartyId", orgId).list()
+            def pairs = []
+            for (c in cats) {
+                def n = ef.find("mantle.product.category.ProductCategoryMember").condition("productCategoryId", c.productCategoryId).count()
+                if (n > 0) pairs.add([name: (c.categoryName ?: c.productCategoryId), n: n])
+            }
+            pairs.sort { a, b -> (b.n <=> a.n) }
+            if (pairs.size() > 8) pairs = pairs.subList(0, 8)
+            def lbls = []; def vals = []
+            for (p in pairs) {
+                def nm = p.name.toString().replace("'", " ").replace("\"", " ")
+                lbls.add("'" + nm + "'"); vals.add(p.n.toString())
+            }
+            catLabelsJson = "[" + lbls.join(",") + "]"
+            catValsJson   = "[" + vals.join(",") + "]"
+            catHasData    = (vals.size() > 0)
+
+            // ----- Price coverage donut -----
+            priceCoverageJson = "[" + withPrice + "," + missingPrice + "]"
+
+            // ----- Sample of products missing a price (actionable): mrpAmount is null OR <= 0 -----
+            def cf = ef.conditionFactory
+            def noPriceCond = cf.makeCondition([
+                cf.makeCondition("mrpAmount", EntityCondition.EQUALS, null),
+                cf.makeCondition("mrpAmount", EntityCondition.LESS_THAN_EQUAL_TO, 0G)
+            ], EntityCondition.OR)
+            missingPriceList = ef.find("mantle.product.Product").condition("ownerPartyId", orgId)
+                                 .condition(noPriceCond).orderBy("productName").limit(10).list()
+
+            // ===== Demand Forecast infographic (what you'll likely sell next) =====
+            def today = new java.sql.Date(System.currentTimeMillis())
+            def myPids = ef.find("mantle.product.Product").condition("ownerPartyId", orgId).selectField("productId").list()*.productId
+            if (!myPids) myPids = ['__none__']
+            def dfRows = ef.find("zenith.erp.inventory.DemandForecast")
+                           .condition("productId", EntityCondition.IN, myPids)
+                           .condition("periodEnd", EntityCondition.GREATER_THAN_EQUAL_TO, today).list()
+            // keep the freshest prediction per product
+            def byProd = [:]
+            for (r in dfRows) {
+                def ex = byProd[r.productId]
+                if (ex == null || (r.periodStart != null && (ex.periodStart == null || r.periodStart > ex.periodStart))) byProd[r.productId] = r
+            }
+            dfProductCount = byProd.size()
+            def dlist = new ArrayList(byProd.values())
+            dlist.sort { a, b -> ((b.forecastQuantity ?: 0G) <=> (a.forecastQuantity ?: 0G)) }
+            def topN = dlist.size() > 8 ? dlist.subList(0, 8) : dlist
+            def dfLbls = []; def dfVals = []
+            dfTopName = "—"; dfTopQty = 0
+            for (int i = 0; i < topN.size(); i++) {
+                def r = topN[i]
+                def prod = ef.find("mantle.product.Product").condition("productId", r.productId).one()
+                def nm = (prod?.productName ?: r.productId).toString().replace("'", " ").replace("\"", " ")
+                if (nm.length() > 24) nm = nm.substring(0, 24)
+                def qv = ((r.forecastQuantity ?: 0G) as java.math.BigDecimal).setScale(0, java.math.RoundingMode.HALF_UP)
+                dfLbls.add("'" + nm + "'"); dfVals.add(qv.toPlainString())
+                if (i == 0) { dfTopName = nm; dfTopQty = qv }
+            }
+            dfLabelsJson = "[" + dfLbls.join(",") + "]"
+            dfValsJson   = "[" + dfVals.join(",") + "]"
+            dfHasData    = (dfVals.size() > 0)
+
+            dfAlertCount = ef.find("zenith.erp.inventory.DemandAlert").condition("organizationPartyId", orgId).condition("statusId", "AlertNew").count()
+
+            def accRows = ef.find("zenith.erp.inventory.DemandForecast").condition("productId", EntityCondition.IN, myPids)
+                            .condition("accuracyPercent", EntityCondition.IS_NOT_NULL, null).selectField("accuracyPercent").list()
+            dfHasAcc = (accRows != null && accRows.size() > 0)
+            if (dfHasAcc) {
+                def t = 0.0; for (a in accRows) t += (a.accuracyPercent ?: 0)
+                dfAvgAcc = (t / accRows.size()).setScale(0, java.math.RoundingMode.HALF_UP)
+            } else { dfAvgAcc = null }
+            dfAccWord = !dfHasAcc ? "Still learning" : (dfAvgAcc >= 75 ? "Strong" : (dfAvgAcc >= 60 ? "Good" : (dfAvgAcc >= 45 ? "Fair" : "Still learning")))
+
+            dfPlain = "Based on your recent sales, here's roughly what you'll sell in the week ahead — so you know what to keep stocked. We're predicting " + dfProductCount + " products. " +
+                (dfAlertCount > 0 ? (dfAlertCount + (dfAlertCount == 1 ? " item is" : " items are") + " selling unusually right now — worth a look.") : "Nothing is behaving unusually right now.")
+        ]]></script>
+    </actions>
+
+    <widgets>
+        <!-- Header -->
+        <container style="q-mb-md">
+            <label text="Inventory Overview" type="h3" style="text-primary text-weight-bold q-my-none"/>
+            <label text="A quick look at your products, stock and stores — everything you need to keep your shelves in order, at a glance." type="p" style="text-grey-7 q-mt-sm q-mb-none"/>
+        </container>
+
+        <!-- Hint when stock quantities are not being tracked yet -->
+        <section name="TrackHint">
+            <condition><expression>trackedCount == 0</expression></condition>
+            <widgets>
+                <container style="row items-center bg-blue-1 border-radius-md q-pa-md q-mb-md">
+                    <render-mode><text type="html"><![CDATA[<q-icon name="info" class="text-h5 text-blue-8 q-mr-sm"/>]]></text></render-mode>
+                    <label text="You are not tracking stock quantities yet, so &quot;units in stock&quot; and &quot;stock value&quot; show as zero. To start: open a product and set its Opening Stock, or receive goods on the Receiving screen. Everything below still works." type="p" style="text-blue-9 q-mb-none"/>
+                </container>
+            </widgets>
+        </section>
+
+        <!-- KPI row -->
+        <container-row>
+            <row-col lg="3" md="6" sm="12">
+                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-md">
+                    <container style="row items-center justify-between">
+                        <container>
+                            <label text="Total Products" type="p" style="text-grey-7 text-uppercase text-weight-bold q-mb-xs"/>
+                            <label text="${ec.l10n.format(totalProducts ?: 0, '#,##0')}" type="h4" style="text-dark text-weight-bold q-my-none"/>
+                        </container>
+                        <container style="q-pa-sm bg-indigo-1 border-radius-md text-indigo-8">
+                            <render-mode><text type="html"><![CDATA[<q-icon name="inventory_2" class="text-h4"/>]]></text></render-mode>
+                        </container>
+                    </container>
+                </container>
+            </row-col>
+            <row-col lg="3" md="6" sm="12">
+                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-md">
+                    <container style="row items-center justify-between">
+                        <container>
+                            <label text="Categories" type="p" style="text-grey-7 text-uppercase text-weight-bold q-mb-xs"/>
+                            <label text="${ec.l10n.format(categoriesCount ?: 0, '#,##0')}" type="h4" style="text-dark text-weight-bold q-my-none"/>
+                        </container>
+                        <container style="q-pa-sm bg-teal-1 border-radius-md text-teal-8">
+                            <render-mode><text type="html"><![CDATA[<q-icon name="category" class="text-h4"/>]]></text></render-mode>
+                        </container>
+                    </container>
+                </container>
+            </row-col>
+            <row-col lg="3" md="6" sm="12">
+                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-md">
+                    <container style="row items-center justify-between">
+                        <container>
+                            <label text="Stores / Warehouses" type="p" style="text-grey-7 text-uppercase text-weight-bold q-mb-xs"/>
+                            <label text="${ec.l10n.format(facilitiesCount ?: 0, '#,##0')}" type="h4" style="text-dark text-weight-bold q-my-none"/>
+                        </container>
+                        <container style="q-pa-sm bg-orange-1 border-radius-md text-orange-8">
+                            <render-mode><text type="html"><![CDATA[<q-icon name="store" class="text-h4"/>]]></text></render-mode>
+                        </container>
+                    </container>
+                </container>
+            </row-col>
+            <row-col lg="3" md="6" sm="12">
+                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-md">
+                    <container style="row items-center justify-between">
+                        <container>
+                            <label text="Stock Value" type="p" style="text-grey-7 text-uppercase text-weight-bold q-mb-xs"/>
+                            <label text="${currSymbol}${ec.l10n.format(stockValue ?: 0, '#,##,##0')}" type="h4" style="text-dark text-weight-bold q-my-none"/>
+                            <label text="${ec.l10n.format(totalUnits ?: 0, '#,##0')} units in stock" type="p" style="text-grey-6 text-caption q-mb-none"/>
+                        </container>
+                        <container style="q-pa-sm bg-green-1 border-radius-md text-green-8">
+                            <render-mode><text type="html"><![CDATA[<q-icon name="account_balance_wallet" class="text-h4"/>]]></text></render-mode>
+                        </container>
+                    </container>
+                </container>
+            </row-col>
+        </container-row>
+
+        <!-- Health strip -->
+        <container-row>
+            <row-col lg="3" md="6" sm="12">
+                <container style="zenith-card bg-white shadow-1 border-radius-md q-pa-md q-mb-md row items-center">
+                    <render-mode><text type="html"><![CDATA[<q-icon name="sell" class="text-h5 text-green-7 q-mr-sm"/>]]></text></render-mode>
+                    <container><label text="${ec.l10n.format(withPrice ?: 0, '#,##0')}" type="h6" style="q-my-none text-weight-bold"/><label text="have a selling price" type="p" style="text-grey-7 text-caption q-mb-none"/></container>
+                </container>
+            </row-col>
+            <row-col lg="3" md="6" sm="12">
+                <link url="../FindProduct" link-type="anchor" style="text-decoration-none">
+                    <container style="zenith-card bg-white shadow-1 border-radius-md q-pa-md q-mb-md row items-center">
+                        <render-mode><text type="html"><![CDATA[<q-icon name="error_outline" class="text-h5 text-orange-8 q-mr-sm"/>]]></text></render-mode>
+                        <container><label text="${ec.l10n.format(missingPrice ?: 0, '#,##0')}" type="h6" style="q-my-none text-weight-bold text-orange-9"/><label text="missing a price — fix these" type="p" style="text-grey-7 text-caption q-mb-none"/></container>
+                    </container>
+                </link>
+            </row-col>
+            <row-col lg="3" md="6" sm="12">
+                <link url="../ExpiryDashboard" link-type="anchor" style="text-decoration-none">
+                    <container style="zenith-card bg-white shadow-1 border-radius-md q-pa-md q-mb-md row items-center">
+                        <render-mode><text type="html"><![CDATA[<q-icon name="schedule" class="text-h5 text-red-7 q-mr-sm"/>]]></text></render-mode>
+                        <container><label text="${ec.l10n.format(expiringSoon ?: 0, '#,##0')}" type="h6" style="q-my-none text-weight-bold"/><label text="expiring within 90 days" type="p" style="text-grey-7 text-caption q-mb-none"/></container>
+                    </container>
+                </link>
+            </row-col>
+            <row-col lg="3" md="6" sm="12">
+                <link url="../StockLevels" link-type="anchor" style="text-decoration-none">
+                    <container style="zenith-card bg-white shadow-1 border-radius-md q-pa-md q-mb-md row items-center">
+                        <render-mode><text type="html"><![CDATA[<q-icon name="trending_down" class="text-h5 text-indigo-7 q-mr-sm"/>]]></text></render-mode>
+                        <container><label text="${ec.l10n.format(lowStockCount ?: 0, '#,##0')}" type="h6" style="q-my-none text-weight-bold"/><label text="low on stock" type="p" style="text-grey-7 text-caption q-mb-none"/></container>
+                    </container>
+                </link>
+            </row-col>
+        </container-row>
+
+        <!-- Charts -->
+        <container-row>
+            <row-col lg="8">
+                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md q-mb-md">
+                    <label text="Products by category" type="h6" style="text-primary text-weight-bold q-mb-md"/>
+                    <section name="CatChart">
+                        <condition><expression>catHasData</expression></condition>
+                        <widgets>
+                            <render-mode><text type="html,vuet,qvt"><![CDATA[
+                                <div id="invCatChart"></div>
+                                <script src="https://cdn.jsdelivr.net/npm/apexcharts@3.44.0/dist/apexcharts.min.js"></script>
+                                <script>
+                                (function(){
+                                    var labels = ${catLabelsJson};
+                                    var data = ${catValsJson};
+                                    new ApexCharts(document.querySelector("#invCatChart"), {
+                                        chart: { type:'bar', height: 340, toolbar:{show:false}, fontFamily:'Roboto, sans-serif' },
+                                        series: [{ name:'Products', data: data }],
+                                        plotOptions: { bar: { horizontal:true, borderRadius:4, distributed:true, barHeight:'70%' } },
+                                        xaxis: { categories: labels },
+                                        legend: { show:false },
+                                        colors: ['#3F51B5','#5C6BC0','#7986CB','#26A69A','#66BB6A','#FFA726','#FF7043','#EF5350'],
+                                        dataLabels: { enabled:true }
+                                    }).render();
+                                })();
+                                </script>
+                            ]]></text></render-mode>
+                        </widgets>
+                    </section>
+                    <section name="CatChartEmpty">
+                        <condition><expression>!catHasData</expression></condition>
+                        <widgets><label text="No categories yet. Add categories to your products to see this chart." type="p" style="text-grey-6 q-pa-md"/></widgets>
+                    </section>
+                </container>
+            </row-col>
+            <row-col lg="4">
+                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md q-mb-md">
+                    <label text="Do your products have a price?" type="h6" style="text-primary text-weight-bold q-mb-md"/>
+                    <render-mode><text type="html,vuet,qvt"><![CDATA[
+                        <div id="invPriceChart"></div>
+                        <script>
+                        (function(){
+                            new ApexCharts(document.querySelector("#invPriceChart"), {
+                                chart: { type:'donut', height: 320, fontFamily:'Roboto, sans-serif' },
+                                series: ${priceCoverageJson},
+                                labels: ['Has a price','Missing a price'],
+                                colors: ['#4CAF50','#FF9800'],
+                                legend: { position:'bottom', fontSize:'12px' },
+                                plotOptions: { pie: { donut: { size:'60%', labels: { show:true, total: { show:true, label:'Products' } } } } },
+                                dataLabels: { enabled:true, formatter: function(v){ return Math.round(v) + '%'; } }
+                            }).render();
+                        })();
+                        </script>
+                    ]]></text></render-mode>
+                </container>
+            </row-col>
+        </container-row>
+
+        <!-- ===== Demand Forecast infographic ===== -->
+        <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md q-mb-md">
+            <container style="row items-center justify-between q-mb-sm">
+                <container style="column">
+                    <label text="What you'll likely sell next — Demand Forecast" type="h6" style="text-primary text-weight-bold q-my-none"/>
+                    <label text="${dfPlain}" type="p" style="text-grey-7 q-mb-none"/>
+                </container>
+                <link url="../DemandForecast" text="See full forecast →" link-type="anchor" style="text-indigo-8 text-weight-bold no-wrap"/>
+            </container>
+
+            <section name="DfHasData">
+                <condition><expression>dfHasData</expression></condition>
+                <widgets>
+                    <!-- mini stat cards -->
+                    <container-row>
+                        <row-col lg="3" md="6" sm="12">
+                            <container style="zenith-card bg-indigo-1 border-radius-md q-pa-md q-mb-md text-center">
+                                <label text="Top seller ahead" type="p" style="text-indigo-9 text-caption text-weight-bold q-mb-xs"/>
+                                <label text="${dfTopName}" type="h6" style="text-indigo-10 text-weight-bolder q-my-none"/>
+                                <label text="about ${ec.l10n.format(dfTopQty ?: 0, '#,##0')} units this week" type="p" style="text-grey-7 text-caption q-mb-none"/>
+                            </container>
+                        </row-col>
+                        <row-col lg="3" md="6" sm="12">
+                            <container style="zenith-card bg-white shadow-1 border-radius-md q-pa-md q-mb-md text-center">
+                                <label text="Products predicted" type="p" style="text-grey-7 text-caption text-weight-bold q-mb-xs"/>
+                                <label text="${ec.l10n.format(dfProductCount ?: 0, '#,##0')}" type="h5" style="text-primary text-weight-bolder q-my-none"/>
+                                <label text="we're tracking these" type="p" style="text-grey-6 text-caption q-mb-none"/>
+                            </container>
+                        </row-col>
+                        <row-col lg="3" md="6" sm="12">
+                            <link url="../DemandForecast" link-type="anchor" style="text-decoration-none">
+                                <container style="zenith-card bg-white shadow-1 border-radius-md q-pa-md q-mb-md text-center">
+                                    <label text="Needs a look" type="p" style="text-grey-7 text-caption text-weight-bold q-mb-xs"/>
+                                    <label text="${ec.l10n.format(dfAlertCount ?: 0, '#,##0')}" type="h5" style="text-weight-bolder q-my-none ${dfAlertCount > 0 ? 'text-danger' : 'text-success'}"/>
+                                    <label text="${dfAlertCount > 0 ? 'items selling unusually' : 'all selling normally'}" type="p" style="text-grey-6 text-caption q-mb-none"/>
+                                </container>
+                            </link>
+                        </row-col>
+                        <row-col lg="3" md="6" sm="12">
+                            <container style="zenith-card bg-white shadow-1 border-radius-md q-pa-md q-mb-md text-center">
+                                <label text="How accurate" type="p" style="text-grey-7 text-caption text-weight-bold q-mb-xs"/>
+                                <label text="${dfHasAcc ? dfAvgAcc + '%' : dfAccWord}" type="h5" style="text-info text-weight-bolder q-my-none"/>
+                                <label text="${dfHasAcc ? 'checked against real sales' : 'shows up after a few checks'}" type="p" style="text-grey-6 text-caption q-mb-none"/>
+                            </container>
+                        </row-col>
+                    </container-row>
+
+                    <label text="Top products to keep stocked (next 7 days)" type="p" style="text-grey-8 text-weight-bold q-mb-xs q-mt-sm"/>
+                    <render-mode><text type="html,vuet,qvt"><![CDATA[
+                        <div id="invDemandChart"></div>
+                        <script src="https://cdn.jsdelivr.net/npm/apexcharts@3.44.0/dist/apexcharts.min.js"></script>
+                        <script>
+                        (function(){
+                            var labels = ${dfLabelsJson};
+                            var data = ${dfValsJson};
+                            new ApexCharts(document.querySelector("#invDemandChart"), {
+                                chart: { type:'bar', height: 360, toolbar:{show:false}, fontFamily:'Roboto, sans-serif' },
+                                series: [{ name:'Expected to sell (units)', data: data }],
+                                plotOptions: { bar: { horizontal:true, borderRadius:4, distributed:true, barHeight:'70%' } },
+                                xaxis: { categories: labels, title:{ text:'Units we expect to sell in the next 7 days' } },
+                                legend: { show:false },
+                                colors: ['#5C6BC0','#26A69A','#66BB6A','#FFA726','#FF7043','#EF5350','#AB47BC','#42A5F5'],
+                                dataLabels: { enabled:true }
+                            }).render();
+                        })();
+                        </script>
+                    ]]></text></render-mode>
+                </widgets>
+            </section>
+            <section name="DfNoData">
+                <condition><expression>!dfHasData</expression></condition>
+                <widgets>
+                    <container style="bg-blue-1 q-pa-md border-radius-md text-center">
+                        <label text="No forecast yet — it builds up automatically from your sales each night. Make a few more sales and check back soon." type="p" style="text-blue-9 q-mb-none"/>
+                    </container>
+                </widgets>
+            </section>
+        </container>
+
+        <!-- Quick actions -->
+        <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md q-mb-md">
+            <label text="Quick actions" type="h6" style="text-primary text-weight-bold q-mb-md"/>
+            <container style="row q-gutter-sm">
+                <link url="../FindProduct"     text="Add / find products" icon="inventory_2" btn-type="primary" style="q-btn--dense"/>
+                <link url="../FindReceipt"      text="Receive stock"        icon="login"       btn-type="success" style="q-btn--dense"/>
+                <link url="../StockAdjustments" text="Adjust stock"         icon="tune"        btn-type="warning" style="q-btn--dense"/>
+                <link url="../StockTransfers"   text="Transfer stock"       icon="swap_horiz"  btn-type="info"    style="q-btn--dense"/>
+                <link url="../StockLevels"      text="Stock levels"         icon="bar_chart"   style="q-btn--dense"/>
+                <link url="../DemandForecast"   text="Demand forecast"      icon="insights"    style="q-btn--dense"/>
+            </container>
+        </container>
+
+        <!-- Needs attention: products missing a price -->
+        <section name="MissingPricePanel">
+            <condition><expression>missingPriceList</expression></condition>
+            <widgets>
+                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md q-mb-md">
+                    <label text="Products missing a selling price" type="h6" style="text-primary text-weight-bold q-mb-xs"/>
+                    <label text="These items have no price, so they cannot be sold correctly at the POS or on a bill. Click one to set its price." type="p" style="text-grey-7 q-mb-md"/>
+                    <form-list name="MissingPriceForm" list="missingPriceList" skip-form="true">
+                        <field name="pseudoId"><default-field title="Item Code">
+                            <link url="../EditProduct" text="${pseudoId ?: productId}" parameter-map="[productId:productId]" style="text-indigo-8 text-weight-bold"/>
+                        </default-field></field>
+                        <field name="productName"><default-field title="Product">
+                            <link url="../EditProduct" text="${productName}" parameter-map="[productId:productId]" style="text-dark"/>
+                        </default-field></field>
+                        <field name="fix"><default-field title="">
+                            <link url="../EditProduct" text="Set price →" parameter-map="[productId:productId]" style="text-orange-8 text-weight-bold"/>
+                        </default-field></field>
+                    </form-list>
+                </container>
+            </widgets>
+        </section>
+    </widgets>
+</screen>

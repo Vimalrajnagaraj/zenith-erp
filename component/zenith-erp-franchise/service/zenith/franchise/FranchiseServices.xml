@@ -1,0 +1,111 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <service verb="create" noun="FranchiseAgreement">
+        <in-parameters>
+            <parameter name="franchiseePartyId" required="true"/>
+            <parameter name="franchisorPartyId" required="true"/>
+            <parameter name="storeId" required="true"/>
+            <parameter name="startDate" type="Date" required="true"/>
+            <parameter name="endDate" type="Date"/>
+            <parameter name="royaltyTypeEnumId" required="true"/>
+            <parameter name="royaltyRate" type="BigDecimal"/>
+            <parameter name="fixedRoyalty" type="BigDecimal"/>
+            <parameter name="currencyUomId"/>
+            <parameter name="franchiseFee" type="BigDecimal"/>
+            <parameter name="marketingFeePercent" type="BigDecimal"/>
+            <parameter name="reportingFrequencyEnumId" default-value="RfMonthly"/>
+            <parameter name="territory"/>
+            <parameter name="exclusiveTerritory" default-value="N"/>
+            <parameter name="termsAndConditions"/>
+        </in-parameters>
+        <out-parameters><parameter name="agreementId"/></out-parameters>
+        <actions>
+            <service-call name="create#zenith.erp.franchise.FranchiseAgreement" out-map="context"
+                          in-map="context + [agreementDate:ec.user.nowTimestamp, statusId:'FaDraft']"/>
+        </actions>
+    </service>
+
+    <service verb="calculate" noun="Royalty">
+        <in-parameters>
+            <parameter name="agreementId" required="true"/>
+            <parameter name="periodStart" type="Date" required="true"/>
+            <parameter name="periodEnd" type="Date" required="true"/>
+        </in-parameters>
+        <out-parameters><parameter name="royaltyId"/></out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.franchise.FranchiseAgreement" value-field="agreement"/>
+
+            <!-- Calculate sales for the period at the franchise store -->
+            <entity-find entity-name="zenith.erp.stores.Store" list="stores" limit="1">
+                <econdition field-name="storeId" from="agreement.storeId"/>
+            </entity-find>
+            <set field="store" from="stores ? stores[0] : null"/>
+
+            <set field="salesAmount" from="BigDecimal.ZERO" type="BigDecimal"/>
+            <if condition="store?.facilityId">
+                <entity-find entity-name="mantle.order.OrderHeaderAndPart" list="orders">
+                    <econdition field-name="facilityId" from="store.facilityId"/>
+                    <econdition field-name="statusId" operator="in" value="OrderCompleted,OrderApproved"/>
+                    <econdition field-name="entryDate" operator="greater-equals" from="periodStart"/>
+                    <econdition field-name="entryDate" operator="less" from="periodEnd"/>
+                </entity-find>
+                <iterate list="orders" entry="ord">
+                    <set field="salesAmount" from="salesAmount + ((ord.grandTotal ?: 0) as BigDecimal)"/>
+                </iterate>
+            </if>
+
+            <!-- Calculate royalty based on type -->
+            <set field="royaltyAmount" from="BigDecimal.ZERO" type="BigDecimal"/>
+            <if condition="agreement.royaltyTypeEnumId == 'RtPercentSales'">
+                <set field="royaltyAmount" from="salesAmount * ((agreement.royaltyRate ?: 0) as BigDecimal) / 100" type="BigDecimal"/>
+            <else-if condition="agreement.royaltyTypeEnumId == 'RtFixedMonthly'">
+                <set field="royaltyAmount" from="(agreement.fixedRoyalty ?: 0) as BigDecimal"/>
+            </else-if>
+            <else-if condition="agreement.royaltyTypeEnumId == 'RtHybrid'">
+                <set field="royaltyAmount" from="((agreement.fixedRoyalty ?: 0) as BigDecimal) + (salesAmount * ((agreement.royaltyRate ?: 0) as BigDecimal) / 100)" type="BigDecimal"/>
+            </else-if></if>
+
+            <set field="marketingFeeAmount" from="salesAmount * ((agreement.marketingFeePercent ?: 0) as BigDecimal) / 100" type="BigDecimal"/>
+            <set field="totalDue" from="royaltyAmount + marketingFeeAmount" type="BigDecimal"/>
+
+            <service-call name="create#zenith.erp.franchise.RoyaltyCalculation" out-map="context"
+                          in-map="[agreementId:agreementId, periodStart:periodStart, periodEnd:periodEnd,
+                                   salesAmount:salesAmount, royaltyAmount:royaltyAmount,
+                                   marketingFeeAmount:marketingFeeAmount, totalDue:totalDue,
+                                   currencyUomId:agreement.currencyUomId, calculatedDate:ec.user.nowTimestamp,
+                                   statusId:'RcCalculated']"/>
+        </actions>
+    </service>
+
+    <service verb="create" noun="ComplianceAudit">
+        <in-parameters>
+            <parameter name="agreementId" required="true"/>
+            <parameter name="storeId" required="true"/>
+            <parameter name="auditDate" type="Date" required="true"/>
+            <parameter name="auditorName"/>
+            <parameter name="brandingScore" type="Integer"/>
+            <parameter name="cleanlinessScore" type="Integer"/>
+            <parameter name="serviceScore" type="Integer"/>
+            <parameter name="inventoryScore" type="Integer"/>
+            <parameter name="findings"/>
+            <parameter name="correctiveActions"/>
+            <parameter name="nextAuditDate" type="Date"/>
+        </in-parameters>
+        <out-parameters><parameter name="complianceId"/></out-parameters>
+        <actions>
+            <set field="overallScore" from="0" type="Integer"/>
+            <set field="scoreCount" from="0" type="Integer"/>
+            <if condition="brandingScore != null"><set field="overallScore" from="overallScore + brandingScore"/><set field="scoreCount" from="scoreCount + 1"/></if>
+            <if condition="cleanlinessScore != null"><set field="overallScore" from="overallScore + cleanlinessScore"/><set field="scoreCount" from="scoreCount + 1"/></if>
+            <if condition="serviceScore != null"><set field="overallScore" from="overallScore + serviceScore"/><set field="scoreCount" from="scoreCount + 1"/></if>
+            <if condition="inventoryScore != null"><set field="overallScore" from="overallScore + inventoryScore"/><set field="scoreCount" from="scoreCount + 1"/></if>
+            <if condition="scoreCount > 0"><set field="overallScore" from="(overallScore / scoreCount).intValue()"/></if>
+
+            <service-call name="create#zenith.erp.franchise.FranchiseCompliance" out-map="context"
+                          in-map="context + [overallScore:overallScore, statusId:'FcDraft']"/>
+        </actions>
+    </service>
+
+</services>

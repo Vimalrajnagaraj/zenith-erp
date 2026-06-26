@@ -1,0 +1,222 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
+        default-menu-title="Transaction" default-menu-index="4" default-menu-include="false">
+
+    <parameter name="transactionId" required="true"/>
+
+    <transition name="addItem" begin-transaction="true">
+        <service-call name="zenith.pos.PosServices.add#PosTransactionItem"/>
+        <default-response url="."/>
+    </transition>
+    <transition name="removeItem" begin-transaction="true">
+        <service-call name="zenith.pos.PosServices.remove#PosTransactionItem"/>
+        <default-response url="."/>
+    </transition>
+    <transition name="processPayment" begin-transaction="true">
+        <service-call name="zenith.pos.PosServices.process#PosPayment"/>
+        <default-response url="."/>
+    </transition>
+    <transition name="completeTxn" begin-transaction="true">
+        <service-call name="zenith.pos.PosServices.complete#PosTransaction"/>
+        <default-response url="."/>
+    </transition>
+    <transition name="voidTxn" begin-transaction="true">
+        <service-call name="zenith.pos.PosServices.void#PosTransaction"/>
+        <default-response url="."/>
+    </transition>
+    <transition name="generateUpi" begin-transaction="true">
+        <service-call name="zenith.pos.PosServices.generate#UpiQrString" out-map="context"/>
+        <default-response url="."/>
+    </transition>
+    <transition name="goTransactions"><default-response url="../PosTransactions"/></transition>
+    <transition name="goTerminal"><default-response url="../Terminal"/></transition>
+    <transition name="goDailySummary"><default-response url="../DailySummary"/></transition>
+    <transition name="goReports"><default-response url="../Reports"/></transition>
+    <transition name="goDashboard"><default-response url="../Dashboard"/></transition>
+    <transition name="goPriceOverrides"><default-response url="../PriceOverrides"/></transition>
+
+    <actions>
+        <entity-find-one entity-name="zenith.erp.pos.PosTransaction" value-field="txn"/>
+        <entity-find-one entity-name="zenith.erp.pos.PosSession" value-field="session">
+            <field-map field-name="sessionId" from="txn.sessionId"/></entity-find-one>
+        <entity-find-one entity-name="zenith.erp.pos.PosTerminal" value-field="terminal">
+            <field-map field-name="terminalId" from="session.terminalId"/></entity-find-one>
+        <entity-find entity-name="zenith.erp.pos.PosTransactionItem" list="itemList">
+            <econdition field-name="transactionId"/>
+            <order-by field-name="itemSeqId"/>
+        </entity-find>
+        <entity-find entity-name="zenith.erp.pos.PosPayment" list="paymentList">
+            <econdition field-name="transactionId"/>
+            <order-by field-name="paymentDate"/>
+        </entity-find>
+        <set field="currSymbol" from="'₹'"/>
+        <script>try { def cs = ec.entity.find("zenith.erp.base.CompanySettings").condition("organizationPartyId", txn?.organizationPartyId).condition("settingKey","CURRENCY_UOM_ID").one(); def cur = cs?.settingValue; if (cur=='INR') currSymbol='₹'; else if (cur=='USD') currSymbol='$'; else if (cur=='EUR') currSymbol='€'; else if (cur=='GBP') currSymbol='£'; else if (cur) currSymbol=cur+' ' } catch (Exception e) {}</script>
+        <set field="itemRows" from="itemList"/>
+        <script><![CDATA[
+            if (txn) {
+                def rmode = java.math.RoundingMode.HALF_UP
+                boolean inter = ((txn.igstTotal ?: 0) as BigDecimal) > 0 ||
+                    (txn.originRegionGeoId && txn.destinationRegionGeoId && txn.originRegionGeoId != txn.destinationRegionGeoId)
+                def htax = (txn.totalTaxAmount ?: 0) as BigDecimal
+                if (inter) { txn.igstTotal = htax; txn.cgstTotal = 0G; txn.sgstTotal = 0G }
+                else { def h = (htax / 2).setScale(2, rmode); txn.cgstTotal = h; txn.sgstTotal = htax - h; txn.igstTotal = 0G }
+                itemRows = itemList.collect { it ->
+                    def m = new LinkedHashMap(it)
+                    def taxable = (it.taxableAmount ?: 0) as BigDecimal
+                    def itax = (it.totalTaxAmount ?: 0) as BigDecimal
+                    m.hsnCode = it.productTaxCode ?: ''
+                    m.gstRate = taxable > 0 ? (itax * 100 / taxable).setScale(2, rmode) : 0G
+                    if (inter) { m.igstAmount = itax; m.cgstAmount = 0G; m.sgstAmount = 0G }
+                    else { def ih = (itax / 2).setScale(2, rmode); m.cgstAmount = ih; m.sgstAmount = itax - ih; m.igstAmount = 0G }
+                    m
+                }
+            }
+        ]]></script>
+    </actions>
+
+    <widgets>
+        <container style="row items-center justify-end q-px-md q-pt-md q-gutter-sm">
+            <link url="goTerminal" text="Billing" icon="fa fa-calculator" btn-type="success" style="q-btn--dense"/>
+            <link url="goTransactions" text="Transactions" icon="fa fa-list" btn-type="primary" style="q-btn--dense"/>
+            <link url="goDailySummary" text="Daily Summary" icon="fa fa-calendar" btn-type="info" style="q-btn--dense"/>
+            <link url="goReports" text="Reports" icon="fa fa-bar-chart" btn-type="warning" style="q-btn--dense"/>
+            <link url="goPriceOverrides" text="Price Overrides" icon="fa fa-exchange" btn-type="danger" style="q-btn--dense"/>
+            <link url="goDashboard" text="Dashboard" icon="fa fa-dashboard" style="q-btn--dense"/>
+        </container>
+        <!-- Transaction Header -->
+        <container-row>
+            <row-col lg="4" md="6">
+                <container-box><box-header title="Transaction ${txn.transactionNumber}"/>
+                <box-body>
+                    <form-single name="TxnInfo" map="txn">
+                        <field name="transactionNumber"><default-field title="Number"><display/></default-field></field>
+                        <field name="transactionType"><default-field title="Type"><display/></default-field></field>
+                        <field name="entryDate"><default-field title="Date"><display format="dd-MM-yyyy HH:mm"/></default-field></field>
+                        <field name="statusId"><default-field title="Status">
+                            <display-entity entity-name="moqui.basic.StatusItem"/></default-field></field>
+                        <field name="customerName"><default-field title="Customer"><display/></default-field></field>
+                        <field name="customerGstin"><default-field title="GSTIN"><display/></default-field></field>
+                        <field name="isB2b"><default-field title="B2B"><display text="${(txn.customerGstin) ? 'Yes' : 'No'}"/></default-field></field>
+                    </form-single>
+                </box-body></container-box>
+            </row-col>
+            <row-col lg="4" md="6">
+                <container-box><box-header title="GST Summary"/>
+                <box-body>
+                    <form-single name="GstInfo" map="txn">
+                        <field name="subtotal"><default-field title="Subtotal"><display format="₹#,##,##0.00"/></default-field></field>
+                        <field name="cgstTotal"><default-field title="CGST"><display format="₹#,##0.00"/></default-field></field>
+                        <field name="sgstTotal"><default-field title="SGST"><display format="₹#,##0.00"/></default-field></field>
+                        <field name="igstTotal"><default-field title="IGST"><display format="₹#,##0.00"/></default-field></field>
+                        <field name="discountTotal"><default-field title="Discount"><display format="₹#,##0.00"/></default-field></field>
+                        <field name="grandTotal"><default-field title="Grand Total"><display format="₹#,##,##0.00"/></default-field></field>
+                        <field name="roundOff"><default-field title="Round Off"><display format="₹#,##0.00"/></default-field></field>
+                        <field name="payableAmount"><default-field title="Payable"><display format="₹#,##,##0.00"/></default-field></field>
+                    </form-single>
+                </box-body></container-box>
+            </row-col>
+            <row-col lg="4" md="6">
+                <container-box><box-header title="Payment"/>
+                <box-body>
+                    <form-single name="PayInfo" map="txn">
+                        <field name="paidAmount"><default-field title="Paid"><display format="₹#,##,##0.00"/></default-field></field>
+                        <field name="changeAmount"><default-field title="Change"><display format="₹#,##,##0.00"/></default-field></field>
+                    </form-single>
+                    <section name="TxnActions" condition="txn.statusId == 'PtCreated'">
+                        <widgets>
+                            <container-dialog id="PayDialog" button-text="Add Payment">
+                                <form-single name="PayForm" transition="processPayment">
+                                    <field name="transactionId"><default-field><hidden/></default-field></field>
+                                    <field name="paymentMethod"><default-field title="Method">
+                                        <drop-down>
+                                            <option key="Cash"/><option key="UPI"/>
+                                            <option key="Card"/><option key="Wallet"/>
+                                        </drop-down></default-field></field>
+                                    <field name="amount"><default-field title="Amount (${currSymbol})"><text-line size="12"/></default-field></field>
+                                    <field name="upiTransactionId"><default-field title="UPI Txn ID"><text-line size="20"/></default-field></field>
+                                    <field name="cardLastFour"><default-field title="Card Last 4"><text-line size="6"/></default-field></field>
+                                    <field name="referenceNumber"><default-field title="Reference"><text-line size="20"/></default-field></field>
+                                    <field name="submitButton"><default-field title="Record Payment"><submit/></default-field></field>
+                                </form-single>
+                            </container-dialog>
+                            <link url="completeTxn" text="Complete Transaction"
+                                  parameter-map="[transactionId:transactionId]"
+                                  confirmation="Complete this transaction?"/>
+                            <link url="voidTxn" text="Void" btn-type="danger"
+                                  parameter-map="[transactionId:transactionId]"
+                                  confirmation="Void this transaction? This cannot be undone."/>
+                        </widgets>
+                    </section>
+                </box-body></container-box>
+            </row-col>
+        </container-row>
+
+        <!-- Line Items -->
+        <container-box>
+            <box-header title="Items"/>
+            <box-toolbar>
+                <section name="AddItemSection" condition="txn.statusId == 'PtCreated'">
+                    <widgets>
+                        <container-dialog id="AddItemDialog" button-text="Add Item">
+                            <form-single name="AddItemForm" transition="addItem">
+                                <field name="transactionId"><default-field><hidden/></default-field></field>
+                                <field name="productId"><default-field title="Product">
+                                    <drop-down><entity-options key="${productId}" text="${pseudoId}: ${productName}">
+                                        <entity-find entity-name="mantle.product.Product">
+                                            <econdition field-name="productTypeEnumId" operator="in"
+                                                value="PtAsset,PtDigital,PtFinGood"/>
+                                        </entity-find></entity-options></drop-down></default-field></field>
+                                <field name="quantity"><default-field title="Quantity"><text-line size="6" default-value="1"/></default-field></field>
+                                <field name="unitPrice"><default-field title="Unit Price (₹, blank=list price)"><text-line size="10"/></default-field></field>
+                                <field name="discountPercent"><default-field title="Discount %"><text-line size="5" default-value="0"/></default-field></field>
+                                <field name="gstRate"><default-field title="GST % (blank=product default)"><text-line size="5"/></default-field></field>
+                                <field name="submitButton"><default-field title="Add"><submit/></default-field></field>
+                            </form-single>
+                        </container-dialog>
+                    </widgets>
+                </section>
+            </box-toolbar>
+            <box-body>
+                <form-list name="ItemList" list="itemRows" skip-form="true">
+                    <field name="itemSeqId"><default-field title="#"><display/></default-field></field>
+                    <field name="productName"><default-field title="Product"><display/></default-field></field>
+                    <field name="hsnCode"><default-field title="HSN"><display/></default-field></field>
+                    <field name="quantity"><default-field title="Qty"><display/></default-field></field>
+                    <field name="mrp"><default-field title="MRP"><display format="#,##0.00"/></default-field></field>
+                    <field name="unitPrice"><default-field title="Price"><display format="#,##0.00"/></default-field></field>
+                    <field name="discountPercent"><default-field title="Disc%"><display/></default-field></field>
+                    <field name="discountAmount"><default-field title="Disc Amt"><display format="#,##0.00"/></default-field></field>
+                    <field name="taxableAmount"><default-field title="Taxable"><display format="#,##0.00"/></default-field></field>
+                    <field name="gstRate"><default-field title="GST%"><display/></default-field></field>
+                    <field name="cgstAmount"><default-field title="CGST"><display format="#,##0.00"/></default-field></field>
+                    <field name="sgstAmount"><default-field title="SGST"><display format="#,##0.00"/></default-field></field>
+                    <field name="igstAmount"><default-field title="IGST"><display format="#,##0.00"/></default-field></field>
+                    <field name="lineTotal"><default-field title="Total"><display format="#,##0.00"/></default-field></field>
+                    <field name="removeBtn"><default-field title="">
+                        <section name="RemoveItemBtn" condition="txn.statusId == 'PtCreated'"><widgets>
+                            <link url="removeItem" text="X"
+                                  parameter-map="[transactionId:transactionId, itemSeqId:itemSeqId]"
+                                  confirmation="Remove this item?"/>
+                        </widgets></section></default-field></field>
+                </form-list>
+            </box-body>
+        </container-box>
+
+        <!-- Payments -->
+        <container-box>
+            <box-header title="Payments"/>
+            <box-body>
+                <form-list name="PaymentList" list="paymentList" skip-form="true">
+                    <field name="paymentId"><default-field title="ID"><display/></default-field></field>
+                    <field name="paymentMethod"><default-field title="Method"><display/></default-field></field>
+                    <field name="amount"><default-field title="Amount (${currSymbol})"><display format="#,##,##0.00"/></default-field></field>
+                    <field name="upiTransactionId"><default-field title="UPI Txn"><display/></default-field></field>
+                    <field name="cardLastFour"><default-field title="Card"><display/></default-field></field>
+                    <field name="referenceNumber"><default-field title="Reference"><display/></default-field></field>
+                    <field name="paymentDate"><default-field title="Time"><display format="HH:mm:ss"/></default-field></field>
+                </form-list>
+            </box-body>
+        </container-box>
+    </widgets>
+</screen>

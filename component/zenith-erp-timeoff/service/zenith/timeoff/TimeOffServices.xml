@@ -1,0 +1,263 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <service verb="apply" noun="Leave">
+        <in-parameters>
+            <parameter name="leaveTypeId" required="true"/>
+            <parameter name="fromDate" type="Timestamp" required="true"/>
+            <parameter name="toDate" type="Timestamp" required="true"/>
+            <parameter name="isHalfDay" default-value="N"/>
+            <parameter name="halfDayDate" type="Timestamp"/>
+            <parameter name="halfDaySession"/>
+            <parameter name="reason" required="true"/>
+            <parameter name="contactDuringLeave"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="applicationId"/>
+            <parameter name="applicationNumber"/>
+        </out-parameters>
+        <actions>
+            <set field="now" from="ec.user.nowTimestamp"/>
+            <set field="empId" from="ec.user.userAccount?.partyId"/>
+
+            <!-- Calculate total days -->
+            <set field="diffMs" from="toDate.getTime() - fromDate.getTime()"/>
+            <set field="totalDays" from="(diffMs / (24 * 60 * 60 * 1000)) + 1" type="BigDecimal"/>
+            <if condition="isHalfDay == 'Y'"><set field="totalDays" from="0.5" type="BigDecimal"/></if>
+
+            <!-- Check balance -->
+            <set field="cal" from="java.util.Calendar.getInstance()"/>
+            <script>cal.setTime(fromDate)</script>
+            <set field="year" from="cal.get(java.util.Calendar.YEAR)"/>
+            <set field="month" from="cal.get(java.util.Calendar.MONTH) + 1"/>
+            <set field="fyStart" from="month &gt;= 4 ? year : year - 1"/>
+            <set field="fy" from="String.format('%04d-%02d', fyStart, (fyStart + 1) % 100)"/>
+
+            <entity-find entity-name="zenith.erp.timeoff.LeaveBalance" list="balList">
+                <econdition field-name="employeePartyId" from="empId"/>
+                <econdition field-name="leaveTypeId"/>
+                <econdition field-name="financialYear" from="fy"/>
+                <limit count="1"/>
+            </entity-find>
+
+            <entity-find-one entity-name="zenith.erp.timeoff.LeaveType" value-field="leaveType"/>
+            <if condition="balList">
+                <set field="available" from="(balList[0].openingBalance ?: 0) + (balList[0].entitlement ?: 0) + (balList[0].adjustment ?: 0) - (balList[0].taken ?: 0) - (balList[0].encashed ?: 0)"/>
+                <if condition="totalDays &gt; available &amp;&amp; leaveType?.negativeBalanceAllowed != 'Y'">
+                    <return error="true" message="Insufficient leave balance. Available: ${available} days, Requested: ${totalDays} days"/>
+                </if>
+            </if>
+
+            <!-- Generate number: LV/FY/SEQ -->
+            <set field="fyStr" from="String.format('%02d-%02d', fyStart % 100, (fyStart + 1) % 100)"/>
+            <entity-find entity-name="zenith.erp.timeoff.LeaveApplication" list="existing">
+                <econdition field-name="applicationNumber" operator="like" value="LV/${fyStr}/%"/>
+                <order-by field-name="-applicationNumber"/>
+                <limit count="1"/>
+            </entity-find>
+            <set field="seq" from="1"/>
+            <if condition="existing">
+                <set field="lastNum" from="existing[0].applicationNumber"/>
+                <set field="seq" from="(lastNum.substring(lastNum.lastIndexOf('/') + 1) as Integer) + 1"/>
+            </if>
+            <set field="applicationNumber" from="'LV/' + fyStr + '/' + String.format('%05d', seq)"/>
+
+            <service-call name="create#zenith.erp.timeoff.LeaveApplication"
+                          in-map="[applicationId:applicationId, applicationNumber:applicationNumber,
+                                   employeePartyId:empId, leaveTypeId:leaveTypeId,
+                                   fromDate:fromDate, toDate:toDate, totalDays:totalDays,
+                                   isHalfDay:isHalfDay, halfDayDate:halfDayDate, halfDaySession:halfDaySession,
+                                   reason:reason, contactDuringLeave:contactDuringLeave,
+                                   statusId:'LvApplied', appliedDate:now]" out-map="createOut"/>
+            <set field="applicationId" from="createOut.applicationId"/>
+        </actions>
+    </service>
+
+    <service verb="approve" noun="Leave">
+        <in-parameters>
+            <parameter name="applicationId" required="true"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.timeoff.LeaveApplication" value-field="app"/>
+            <if condition="!app"><return error="true" message="Application not found"/></if>
+            <if condition="app.statusId != 'LvApplied'">
+                <return error="true" message="Only applied leaves can be approved"/>
+            </if>
+
+            <set field="now" from="ec.user.nowTimestamp"/>
+            <set field="app.statusId" value="LvApproved"/>
+            <set field="app.approvedByPartyId" from="ec.user.userAccount?.partyId"/>
+            <set field="app.approvedDate" from="now"/>
+            <entity-update value-field="app"/>
+
+            <!-- Deduct from balance -->
+            <set field="cal" from="java.util.Calendar.getInstance()"/>
+            <script>cal.setTime(app.fromDate)</script>
+            <set field="year" from="cal.get(java.util.Calendar.YEAR)"/>
+            <set field="month" from="cal.get(java.util.Calendar.MONTH) + 1"/>
+            <set field="fyStart" from="month &gt;= 4 ? year : year - 1"/>
+            <set field="fy" from="String.format('%04d-%02d', fyStart, (fyStart + 1) % 100)"/>
+
+            <entity-find entity-name="zenith.erp.timeoff.LeaveBalance" list="balList">
+                <econdition field-name="employeePartyId" from="app.employeePartyId"/>
+                <econdition field-name="leaveTypeId" from="app.leaveTypeId"/>
+                <econdition field-name="financialYear" from="fy"/>
+                <limit count="1"/>
+            </entity-find>
+            <if condition="balList">
+                <set field="bal" from="balList[0]"/>
+                <set field="bal.taken" from="(bal.taken ?: 0) + app.totalDays"/>
+                <set field="bal.closingBalance" from="(bal.openingBalance ?: 0) + (bal.entitlement ?: 0) + (bal.adjustment ?: 0) - (bal.taken) - (bal.encashed ?: 0) - (bal.lapsed ?: 0)"/>
+                <entity-update value-field="bal"/>
+            </if>
+        </actions>
+    </service>
+
+    <service verb="reject" noun="Leave">
+        <in-parameters>
+            <parameter name="applicationId" required="true"/>
+            <parameter name="rejectionReason" required="true"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.timeoff.LeaveApplication" value-field="app"/>
+            <if condition="!app"><return error="true" message="Application not found"/></if>
+
+            <set field="app.statusId" value="LvRejected"/>
+            <set field="app.rejectionReason" from="rejectionReason"/>
+            <set field="app.approvedByPartyId" from="ec.user.userAccount?.partyId"/>
+            <set field="app.approvedDate" from="ec.user.nowTimestamp"/>
+            <entity-update value-field="app"/>
+        </actions>
+    </service>
+
+    <service verb="cancel" noun="Leave">
+        <in-parameters>
+            <parameter name="applicationId" required="true"/>
+            <parameter name="cancelReason" required="true"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.timeoff.LeaveApplication" value-field="app"/>
+            <if condition="!app"><return error="true" message="Application not found"/></if>
+
+            <set field="wasApproved" from="app.statusId == 'LvApproved' || app.statusId == 'LvCancelReq'" type="Boolean"/>
+            <set field="app.statusId" value="LvCancelled"/>
+            <set field="app.cancelReason" from="cancelReason"/>
+            <entity-update value-field="app"/>
+
+            <!-- Restore balance if was approved -->
+            <if condition="wasApproved">
+                <set field="cal" from="java.util.Calendar.getInstance()"/>
+                <script>cal.setTime(app.fromDate)</script>
+                <set field="year" from="cal.get(java.util.Calendar.YEAR)"/>
+                <set field="month" from="cal.get(java.util.Calendar.MONTH) + 1"/>
+                <set field="fyStart" from="month &gt;= 4 ? year : year - 1"/>
+                <set field="fy" from="String.format('%04d-%02d', fyStart, (fyStart + 1) % 100)"/>
+
+                <entity-find entity-name="zenith.erp.timeoff.LeaveBalance" list="balList">
+                    <econdition field-name="employeePartyId" from="app.employeePartyId"/>
+                    <econdition field-name="leaveTypeId" from="app.leaveTypeId"/>
+                    <econdition field-name="financialYear" from="fy"/>
+                    <limit count="1"/>
+                </entity-find>
+                <if condition="balList">
+                    <set field="bal" from="balList[0]"/>
+                    <set field="bal.taken" from="(bal.taken ?: 0) - app.totalDays"/>
+                    <set field="bal.closingBalance" from="(bal.openingBalance ?: 0) + (bal.entitlement ?: 0) + (bal.adjustment ?: 0) - (bal.taken) - (bal.encashed ?: 0) - (bal.lapsed ?: 0)"/>
+                    <entity-update value-field="bal"/>
+                </if>
+            </if>
+        </actions>
+    </service>
+
+    <service verb="initialize" noun="LeaveBalance">
+        <in-parameters>
+            <parameter name="employeePartyId" required="true"/>
+            <parameter name="financialYear" required="true"/>
+            <parameter name="policyId" required="true"/>
+        </in-parameters>
+        <actions>
+            <entity-find entity-name="zenith.erp.timeoff.LeavePolicyType" list="policyTypes">
+                <econdition field-name="policyId"/>
+            </entity-find>
+            <iterate list="policyTypes" entry="pt">
+                <entity-find-one entity-name="zenith.erp.timeoff.LeaveType" value-field="lt">
+                    <field-map field-name="leaveTypeId" from="pt.leaveTypeId"/></entity-find-one>
+
+                <set field="entitlement" from="pt.entitlementOverride ?: lt?.annualEntitlement ?: 0"/>
+
+                <!-- Check for carry forward from previous year -->
+                <set field="parts" from="financialYear.split('-')"/>
+                <set field="prevFyStart" from="(parts[0] as int) - 1"/>
+                <set field="prevFy" from="String.format('%04d-%02d', prevFyStart, prevFyStart + 1 % 100 ?: 100)"/>
+                <set field="carryForward" from="0" type="BigDecimal"/>
+
+                <entity-find entity-name="zenith.erp.timeoff.LeaveBalance" list="prevBal">
+                    <econdition field-name="employeePartyId"/>
+                    <econdition field-name="leaveTypeId" from="pt.leaveTypeId"/>
+                    <econdition field-name="financialYear" from="prevFy"/>
+                    <limit count="1"/>
+                </entity-find>
+                <if condition="prevBal">
+                    <set field="cfLimit" from="pt.carryForwardOverride ?: lt?.carryForwardLimit ?: 0"/>
+                    <set field="prevClosing" from="prevBal[0].closingBalance ?: 0"/>
+                    <set field="carryForward" from="cfLimit &gt; 0 ? Math.min(prevClosing, cfLimit) : 0"/>
+                </if>
+
+                <service-call name="create#zenith.erp.timeoff.LeaveBalance"
+                              in-map="[employeePartyId:employeePartyId, leaveTypeId:pt.leaveTypeId,
+                                       financialYear:financialYear, openingBalance:carryForward,
+                                       entitlement:entitlement, taken:0, adjustment:0, encashed:0, lapsed:0,
+                                       closingBalance:carryForward + entitlement]"/>
+            </iterate>
+        </actions>
+    </service>
+
+    <service verb="encash" noun="Leave">
+        <in-parameters>
+            <parameter name="employeePartyId" required="true"/>
+            <parameter name="leaveTypeId" required="true"/>
+            <parameter name="daysToEncash" type="BigDecimal" required="true"/>
+            <parameter name="dailyRate" type="BigDecimal" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="encashmentId"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.timeoff.LeaveType" value-field="lt"/>
+            <if condition="lt?.encashmentAllowed != 'Y'">
+                <return error="true" message="Encashment not allowed for this leave type"/>
+            </if>
+
+            <set field="now" from="ec.user.nowTimestamp"/>
+            <set field="cal" from="java.util.Calendar.getInstance()"/>
+            <script>cal.setTime(now)</script>
+            <set field="year" from="cal.get(java.util.Calendar.YEAR)"/>
+            <set field="month" from="cal.get(java.util.Calendar.MONTH) + 1"/>
+            <set field="fyStart" from="month &gt;= 4 ? year : year - 1"/>
+            <set field="fy" from="String.format('%04d-%02d', fyStart, (fyStart + 1) % 100)"/>
+
+            <set field="totalAmount" from="daysToEncash * dailyRate"/>
+
+            <service-call name="create#zenith.erp.timeoff.LeaveEncashment"
+                          in-map="[employeePartyId:employeePartyId, leaveTypeId:leaveTypeId,
+                                   financialYear:fy, daysEncashed:daysToEncash, dailyRate:dailyRate,
+                                   totalAmount:totalAmount, encashmentDate:now, statusId:'ExApproved']" out-map="createOut"/>
+            <set field="encashmentId" from="createOut.encashmentId"/>
+
+            <!-- Update balance -->
+            <entity-find entity-name="zenith.erp.timeoff.LeaveBalance" list="balList">
+                <econdition field-name="employeePartyId"/>
+                <econdition field-name="leaveTypeId"/>
+                <econdition field-name="financialYear" from="fy"/>
+                <limit count="1"/>
+            </entity-find>
+            <if condition="balList">
+                <set field="bal" from="balList[0]"/>
+                <set field="bal.encashed" from="(bal.encashed ?: 0) + daysToEncash"/>
+                <set field="bal.closingBalance" from="(bal.openingBalance ?: 0) + (bal.entitlement ?: 0) + (bal.adjustment ?: 0) - (bal.taken ?: 0) - (bal.encashed) - (bal.lapsed ?: 0)"/>
+                <entity-update value-field="bal"/>
+            </if>
+        </actions>
+    </service>
+</services>

@@ -1,0 +1,378 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <!-- ========== Create Promotion ========== -->
+
+    <service verb="create" noun="Promotion">
+        <in-parameters>
+            <parameter name="promotionName" required="true"/>
+            <parameter name="description"/>
+            <parameter name="promotionTypeEnumId" required="true"/>
+            <parameter name="organizationPartyId"/>
+            <parameter name="priority" type="Integer" default="10"/>
+            <parameter name="isStackable" default-value="N"/>
+            <parameter name="isAutoApply" default-value="Y"/>
+            <parameter name="applicableOnEnumId" default-value="PaoOrder"/>
+            <parameter name="validFromDate" type="Timestamp"/>
+            <parameter name="validThruDate" type="Timestamp"/>
+            <parameter name="maxTotalUses" type="Integer"/>
+            <parameter name="maxUsesPerCustomer" type="Integer"/>
+            <parameter name="actions" type="List">
+                <parameter name="actionEntry" type="Map">
+                    <parameter name="actionTypeEnumId" required="true"/>
+                    <parameter name="discountValue" type="BigDecimal"/>
+                    <parameter name="maxDiscount" type="BigDecimal"/>
+                    <parameter name="freeProductId"/>
+                    <parameter name="freeQuantity" type="BigDecimal"/>
+                    <parameter name="buyQuantity" type="BigDecimal"/>
+                    <parameter name="getQuantity" type="BigDecimal"/>
+                </parameter>
+            </parameter>
+            <parameter name="conditions" type="List">
+                <parameter name="condEntry" type="Map">
+                    <parameter name="conditionTypeEnumId" required="true"/>
+                    <parameter name="operator"/>
+                    <parameter name="fieldValue"/>
+                    <parameter name="fieldValueTo"/>
+                </parameter>
+            </parameter>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="promotionId"/>
+        </out-parameters>
+        <actions>
+            <service-call name="create#zenith.erp.promotions.Promotion" out-map="context"
+                          in-map="[promotionName:promotionName, description:description,
+                                   promotionTypeEnumId:promotionTypeEnumId,
+                                   organizationPartyId:organizationPartyId, priority:priority,
+                                   isStackable:isStackable, isAutoApply:isAutoApply,
+                                   applicableOnEnumId:applicableOnEnumId,
+                                   validFromDate:validFromDate, validThruDate:validThruDate,
+                                   maxTotalUses:maxTotalUses, maxUsesPerCustomer:maxUsesPerCustomer]"/>
+
+            <if condition="actions">
+                <iterate list="actions" entry="act">
+                    <service-call name="create#zenith.erp.promotions.PromotionAction"
+                                  in-map="[promotionId:promotionId, actionTypeEnumId:act.actionTypeEnumId,
+                                           discountValue:act.discountValue, maxDiscount:act.maxDiscount,
+                                           freeProductId:act.freeProductId, freeQuantity:act.freeQuantity,
+                                           buyQuantity:act.buyQuantity, getQuantity:act.getQuantity]"/>
+                </iterate>
+            </if>
+            <if condition="conditions">
+                <iterate list="conditions" entry="cond">
+                    <service-call name="create#zenith.erp.promotions.PromotionCondition"
+                                  in-map="[promotionId:promotionId,
+                                           conditionTypeEnumId:cond.conditionTypeEnumId,
+                                           operator:cond.operator ?: 'equals',
+                                           fieldValue:cond.fieldValue,
+                                           fieldValueTo:cond.fieldValueTo]"/>
+                </iterate>
+            </if>
+        </actions>
+    </service>
+
+    <!-- ========== Validate Coupon ========== -->
+
+    <service verb="validate" noun="Coupon">
+        <in-parameters>
+            <parameter name="couponCode" required="true"/>
+            <parameter name="customerPartyId"/>
+            <parameter name="orderAmount" type="BigDecimal"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="isValid" type="Boolean"/>
+            <parameter name="promotionId"/>
+            <parameter name="couponId"/>
+            <parameter name="errorMessage"/>
+        </out-parameters>
+        <actions>
+            <set field="isValid" from="false"/>
+            <entity-find entity-name="zenith.erp.promotions.CouponCode" list="coupons" limit="1">
+                <econdition field-name="couponCode"/>
+            </entity-find>
+            <if condition="!coupons">
+                <set field="errorMessage" value="Invalid coupon code"/>
+                <return/>
+            </if>
+            <set field="coupon" from="coupons[0]"/>
+            <set field="couponId" from="coupon.couponId"/>
+            <set field="promotionId" from="coupon.promotionId"/>
+
+            <if condition="coupon.isActive != 'Y'">
+                <set field="errorMessage" value="Coupon is inactive"/>
+                <return/>
+            </if>
+            <if condition="coupon.validFromDate &amp;&amp; ec.user.nowTimestamp &lt; coupon.validFromDate">
+                <set field="errorMessage" value="Coupon is not yet active"/>
+                <return/>
+            </if>
+            <if condition="coupon.validThruDate &amp;&amp; ec.user.nowTimestamp &gt; coupon.validThruDate">
+                <set field="errorMessage" value="Coupon has expired"/>
+                <return/>
+            </if>
+            <if condition="coupon.maxUses &amp;&amp; coupon.usedCount &gt;= coupon.maxUses">
+                <set field="errorMessage" value="Coupon usage limit reached"/>
+                <return/>
+            </if>
+
+            <!-- Check per-customer usage -->
+            <if condition="customerPartyId &amp;&amp; coupon.maxUsesPerCustomer">
+                <entity-find-count entity-name="zenith.erp.promotions.PromotionUsage" count-field="custUses">
+                    <econdition field-name="couponId"/>
+                    <econdition field-name="customerPartyId"/>
+                </entity-find-count>
+                <if condition="custUses &gt;= coupon.maxUsesPerCustomer">
+                    <set field="errorMessage" value="You have already used this coupon"/>
+                    <return/>
+                </if>
+            </if>
+
+            <!-- Validate the linked promotion is active -->
+            <entity-find-one entity-name="zenith.erp.promotions.Promotion" value-field="promo">
+                <field-map field-name="promotionId" from="coupon.promotionId"/>
+            </entity-find-one>
+            <if condition="!promo || promo.isActive != 'Y'">
+                <set field="errorMessage" value="Promotion is no longer active"/>
+                <return/>
+            </if>
+
+            <set field="isValid" from="true"/>
+        </actions>
+    </service>
+
+    <!-- ========== Create Coupon Code ========== -->
+
+    <service verb="create" noun="CouponCode">
+        <in-parameters>
+            <parameter name="promotionId" required="true"/>
+            <parameter name="couponCode" required="true"/>
+            <parameter name="maxUses" type="Integer"/>
+            <parameter name="maxUsesPerCustomer" type="Integer" default="1"/>
+            <parameter name="validFromDate" type="Timestamp"/>
+            <parameter name="validThruDate" type="Timestamp"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="couponId"/>
+        </out-parameters>
+        <actions>
+            <!-- Check uniqueness -->
+            <entity-find-count entity-name="zenith.erp.promotions.CouponCode" count-field="existing">
+                <econdition field-name="couponCode"/>
+            </entity-find-count>
+            <if condition="existing &gt; 0">
+                <return error="true" message="Coupon code '${couponCode}' already exists"/>
+            </if>
+            <service-call name="create#zenith.erp.promotions.CouponCode" out-map="context"
+                          in-map="context"/>
+        </actions>
+    </service>
+
+    <!-- ========== Evaluate Promotions ========== -->
+
+    <service verb="evaluate" noun="Promotions">
+        <description>Evaluate all applicable promotions for a cart/order. Returns matching promotions sorted by priority.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="customerPartyId"/>
+            <parameter name="customerGroupId"/>
+            <parameter name="salesChannelEnumId"/>
+            <parameter name="items" type="List" required="true">
+                <parameter name="itemEntry" type="Map">
+                    <parameter name="productId"/>
+                    <parameter name="productCategoryId"/>
+                    <parameter name="quantity" type="BigDecimal"/>
+                    <parameter name="unitPrice" type="BigDecimal"/>
+                    <parameter name="lineTotal" type="BigDecimal"/>
+                </parameter>
+            </parameter>
+            <parameter name="orderAmount" type="BigDecimal"/>
+            <parameter name="couponCode"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="applicablePromotions" type="List"/>
+            <parameter name="totalDiscount" type="BigDecimal"/>
+        </out-parameters>
+        <actions>
+            <set field="applicablePromotions" from="[]"/>
+            <set field="totalDiscount" from="BigDecimal.ZERO" type="BigDecimal"/>
+            <set field="now" from="ec.user.nowTimestamp"/>
+
+            <set field="calcOrderAmount" from="orderAmount ?: BigDecimal.ZERO" type="BigDecimal"/>
+            <if condition="!orderAmount &amp;&amp; items">
+                <iterate list="items" entry="itm">
+                    <set field="calcOrderAmount" from="calcOrderAmount + (itm.lineTotal ?: ((itm.quantity ?: 1) * (itm.unitPrice ?: 0)))"/>
+                </iterate>
+            </if>
+
+            <!-- Get auto-apply promotions -->
+            <entity-find entity-name="zenith.erp.promotions.Promotion" list="promos">
+                <econdition field-name="isActive" value="Y"/>
+                <econdition field-name="isAutoApply" value="Y"/>
+                <econditions combine="or">
+                    <econdition field-name="organizationPartyId" from="organizationPartyId"/>
+                    <econdition field-name="organizationPartyId" operator="is-null"/>
+                </econditions>
+                <date-filter/>
+                <order-by field-name="priority"/>
+            </entity-find>
+
+            <!-- If coupon provided, add its promotion too -->
+            <if condition="couponCode">
+                <service-call name="zenith.promotions.PromotionServices.validate#Coupon"
+                              in-map="[couponCode:couponCode, customerPartyId:customerPartyId,
+                                       orderAmount:calcOrderAmount]"
+                              out-map="couponResult"/>
+                <if condition="couponResult.isValid">
+                    <entity-find-one entity-name="zenith.erp.promotions.Promotion" value-field="couponPromo">
+                        <field-map field-name="promotionId" from="couponResult.promotionId"/>
+                    </entity-find-one>
+                    <if condition="couponPromo"><script>promos.add(couponPromo)</script></if>
+                </if>
+            </if>
+
+            <iterate list="promos" entry="promo">
+                <!-- Check usage limits -->
+                <if condition="promo.maxTotalUses &amp;&amp; (promo.currentUseCount ?: 0) &gt;= promo.maxTotalUses">
+                    <continue/>
+                </if>
+
+                <!-- Evaluate conditions -->
+                <entity-find entity-name="zenith.erp.promotions.PromotionCondition" list="conditions">
+                    <econdition field-name="promotionId" from="promo.promotionId"/>
+                </entity-find>
+
+                <set field="allMatch" from="true" type="Boolean"/>
+                <iterate list="conditions" entry="cond">
+                    <if condition="cond.conditionTypeEnumId == 'PcnMinOrderAmount'">
+                        <if condition="calcOrderAmount &lt; (cond.fieldValue as BigDecimal)">
+                            <set field="allMatch" from="false"/></if>
+                    <else-if condition="cond.conditionTypeEnumId == 'PcnMinQuantity'">
+                        <set field="totalQty" from="BigDecimal.ZERO" type="BigDecimal"/>
+                        <iterate list="items" entry="itm">
+                            <set field="totalQty" from="totalQty + (itm.quantity ?: 0)"/>
+                        </iterate>
+                        <if condition="totalQty &lt; (cond.fieldValue as BigDecimal)">
+                            <set field="allMatch" from="false"/></if>
+                    </else-if>
+                    <else-if condition="cond.conditionTypeEnumId == 'PcnProduct'">
+                        <set field="hasProduct" from="items.any { it.productId == cond.fieldValue }"/>
+                        <if condition="!hasProduct"><set field="allMatch" from="false"/></if>
+                    </else-if>
+                    <else-if condition="cond.conditionTypeEnumId == 'PcnProductCategory'">
+                        <set field="hasCat" from="items.any { it.productCategoryId == cond.fieldValue }"/>
+                        <if condition="!hasCat"><set field="allMatch" from="false"/></if>
+                    </else-if>
+                    <else-if condition="cond.conditionTypeEnumId == 'PcnCustomerGroup' &amp;&amp; customerGroupId">
+                        <if condition="cond.fieldValue != customerGroupId"><set field="allMatch" from="false"/></if>
+                    </else-if>
+                    <else-if condition="cond.conditionTypeEnumId == 'PcnChannel' &amp;&amp; salesChannelEnumId">
+                        <if condition="cond.fieldValue != salesChannelEnumId"><set field="allMatch" from="false"/></if>
+                    </else-if></if>
+                </iterate>
+
+                <if condition="allMatch">
+                    <!-- Get actions and calculate discount -->
+                    <entity-find entity-name="zenith.erp.promotions.PromotionAction" list="actions">
+                        <econdition field-name="promotionId" from="promo.promotionId"/>
+                    </entity-find>
+
+                    <set field="promoDiscount" from="BigDecimal.ZERO" type="BigDecimal"/>
+                    <set field="promoDetails" from="[]"/>
+
+                    <iterate list="actions" entry="act">
+                        <if condition="act.actionTypeEnumId == 'PacDiscountPercent'">
+                            <set field="disc" from="(calcOrderAmount * act.discountValue / 100).setScale(2, java.math.RoundingMode.HALF_UP)"/>
+                            <if condition="act.maxDiscount &amp;&amp; disc &gt; act.maxDiscount">
+                                <set field="disc" from="act.maxDiscount"/>
+                            </if>
+                            <set field="promoDiscount" from="promoDiscount + disc"/>
+                            <script>promoDetails.add([type:'DiscountPercent', value:act.discountValue, discount:disc])</script>
+                        <else-if condition="act.actionTypeEnumId == 'PacDiscountAmount'">
+                            <set field="promoDiscount" from="promoDiscount + act.discountValue"/>
+                            <script>promoDetails.add([type:'DiscountAmount', value:act.discountValue, discount:act.discountValue])</script>
+                        </else-if>
+                        <else-if condition="act.actionTypeEnumId == 'PacFreeProduct'">
+                            <script>promoDetails.add([type:'FreeProduct', productId:act.freeProductId, quantity:act.freeQuantity ?: 1])</script>
+                        </else-if>
+                        <else-if condition="act.actionTypeEnumId == 'PacBuyXGetY'">
+                            <script>promoDetails.add([type:'BuyXGetY', buyQuantity:act.buyQuantity, getQuantity:act.getQuantity, freeProductId:act.freeProductId])</script>
+                        </else-if></if>
+                    </iterate>
+
+                    <script>applicablePromotions.add([promotionId:promo.promotionId,
+                        promotionName:promo.promotionName, promotionType:promo.promotionTypeEnumId,
+                        priority:promo.priority, isStackable:promo.isStackable,
+                        discount:promoDiscount, details:promoDetails])</script>
+                    <set field="totalDiscount" from="totalDiscount + promoDiscount"/>
+
+                    <if condition="promo.isStackable != 'Y'"><break/></if>
+                </if>
+            </iterate>
+        </actions>
+    </service>
+
+    <!-- ========== Apply Promotion (record usage) ========== -->
+
+    <service verb="apply" noun="Promotion">
+        <in-parameters>
+            <parameter name="promotionId" required="true"/>
+            <parameter name="couponId"/>
+            <parameter name="orderId"/>
+            <parameter name="posTransactionId"/>
+            <parameter name="customerPartyId"/>
+            <parameter name="discountApplied" type="BigDecimal" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="usageId"/>
+        </out-parameters>
+        <actions>
+            <service-call name="create#zenith.erp.promotions.PromotionUsage" out-map="context"
+                          in-map="[promotionId:promotionId, couponId:couponId,
+                                   orderId:orderId, posTransactionId:posTransactionId,
+                                   customerPartyId:customerPartyId,
+                                   discountApplied:discountApplied,
+                                   usedDate:ec.user.nowTimestamp]"/>
+
+            <!-- Increment counters -->
+            <entity-find-one entity-name="zenith.erp.promotions.Promotion" value-field="promo" for-update="true"/>
+            <set field="promo.currentUseCount" from="(promo.currentUseCount ?: 0) + 1"/>
+            <entity-update value-field="promo"/>
+
+            <if condition="couponId">
+                <entity-find-one entity-name="zenith.erp.promotions.CouponCode" value-field="coupon" for-update="true"/>
+                <set field="coupon.usedCount" from="(coupon.usedCount ?: 0) + 1"/>
+                <entity-update value-field="coupon"/>
+            </if>
+        </actions>
+    </service>
+
+    <!-- ========== Get Applicable Promotions (simple wrapper) ========== -->
+
+    <service verb="get" noun="ApplicablePromotions">
+        <description>Get promotions applicable for a specific product/amount (for POS/cart display)</description>
+        <in-parameters>
+            <parameter name="productId"/>
+            <parameter name="orderAmount" type="BigDecimal"/>
+            <parameter name="customerPartyId"/>
+            <parameter name="organizationPartyId"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="promotions" type="List"/>
+        </out-parameters>
+        <actions>
+            <set field="items" from="[]"/>
+            <if condition="productId">
+                <script>items.add([productId:productId, quantity:1, unitPrice:(orderAmount ?: 0)])</script>
+            </if>
+            <service-call name="zenith.promotions.PromotionServices.evaluate#Promotions"
+                          in-map="[organizationPartyId:organizationPartyId,
+                                   customerPartyId:customerPartyId,
+                                   items:items, orderAmount:orderAmount]"
+                          out-map="evalOut"/>
+            <set field="promotions" from="evalOut.applicablePromotions"/>
+        </actions>
+    </service>
+
+</services>

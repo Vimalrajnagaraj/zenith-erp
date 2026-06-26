@@ -1,0 +1,316 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <service verb="create" noun="Vehicle">
+        <in-parameters>
+            <parameter name="registrationNumber" required="true"/>
+            <parameter name="vehicleType" required="true"/>
+            <parameter name="make"/><parameter name="model"/>
+            <parameter name="yearOfManufacture" type="Integer"/>
+            <parameter name="engineNumber"/><parameter name="chassisNumber"/>
+            <parameter name="fuelType"/><parameter name="color"/>
+            <parameter name="seatingCapacity" type="Integer"/>
+            <parameter name="loadCapacityKg" type="BigDecimal"/>
+            <parameter name="purchaseDate" type="Date"/><parameter name="purchaseAmount" type="BigDecimal"/>
+            <parameter name="ownershipType"/><parameter name="facilityId"/>
+            <parameter name="fastagNumber"/><parameter name="fastagProvider"/>
+        </in-parameters>
+        <out-parameters><parameter name="vehicleId"/></out-parameters>
+        <actions><script><![CDATA[
+            import java.time.LocalDate
+            import java.time.format.DateTimeFormatter
+
+            def now = LocalDate.now()
+            def fysSetting = ec.entity.find("zenith.erp.base.CompanySettings").condition("organizationPartyId", ec.user.getPreference("ACTIVE_ORGANIZATION")).condition("settingKey", "FY_START_MONTH").one()
+            int fyStartMonth = fysSetting ? (fysSetting.settingValue as int) : 4
+            int fyStart = now.monthValue >= fyStartMonth ? now.year : now.year - 1
+            String fySuffix = String.format("%02d-%02d", fyStart % 100, (fyStart + 1) % 100)
+
+            def lastVehicle = ec.entity.find("zenith.erp.fleet.Vehicle")
+                .condition("vehicleNumber", "like", "VH/${fySuffix}/%").orderBy("-vehicleNumber").limit(1).list()
+            int nextSeq = 1
+            if (lastVehicle) {
+                def parts = lastVehicle[0].vehicleNumber.split("/")
+                if (parts.length == 3) nextSeq = (parts[2] as int) + 1
+            }
+            String vehicleNumber = "VH/${fySuffix}/" + String.format("%05d", nextSeq)
+
+            context.vehicleId = vehicleId ?: ec.entity.sequencedIdPrimary("zenith.erp.fleet.Vehicle", null, null)
+            ec.entity.makeValue("zenith.erp.fleet.Vehicle").setAll([
+                vehicleId: context.vehicleId, vehicleNumber: vehicleNumber,
+                registrationNumber: registrationNumber, vehicleType: vehicleType,
+                make: make, model: model, yearOfManufacture: yearOfManufacture,
+                engineNumber: engineNumber, chassisNumber: chassisNumber,
+                fuelType: fuelType, color: color, seatingCapacity: seatingCapacity,
+                loadCapacityKg: loadCapacityKg, currentOdometerKm: 0,
+                statusId: "VhActive", purchaseDate: purchaseDate,
+                purchaseAmount: purchaseAmount, ownershipType: ownershipType,
+                facilityId: facilityId, fastagNumber: fastagNumber,
+                fastagProvider: fastagProvider
+            ]).setSequencedIdPrimary().create()
+        ]]></script></actions>
+    </service>
+
+    <service verb="assign" noun="Vehicle">
+        <in-parameters>
+            <parameter name="vehicleId" required="true"/>
+            <parameter name="driverId" required="true"/>
+            <parameter name="purpose"/>
+            <parameter name="odometerAtAssignment" type="BigDecimal"/>
+        </in-parameters>
+        <out-parameters><parameter name="assignmentId"/></out-parameters>
+        <actions><script><![CDATA[
+            def vehicle = ec.entity.find("zenith.erp.fleet.Vehicle").condition("vehicleId", vehicleId).one()
+            if (!vehicle) { ec.message.addError("Vehicle not found"); return }
+
+            def activeAssignment = ec.entity.find("zenith.erp.fleet.VehicleAssignment")
+                .condition("vehicleId", vehicleId).condition("statusId", "VaAssigned").list()
+            if (activeAssignment) { ec.message.addError("Vehicle is already assigned to a driver"); return }
+
+            context.assignmentId = ec.entity.sequencedIdPrimary("zenith.erp.fleet.VehicleAssignment", null, null)
+            def odometer = odometerAtAssignment ?: vehicle.currentOdometerKm ?: 0
+            ec.entity.makeValue("zenith.erp.fleet.VehicleAssignment").setAll([
+                assignmentId: context.assignmentId, vehicleId: vehicleId, driverId: driverId,
+                assignedDate: ec.user.nowTimestamp, odometerAtAssignment: odometer,
+                purpose: purpose, statusId: "VaAssigned"
+            ]).create()
+
+            vehicle.set("assignedDriverPartyId", driverId)
+            vehicle.update()
+        ]]></script></actions>
+    </service>
+
+    <service verb="return" noun="Vehicle">
+        <in-parameters>
+            <parameter name="assignmentId" required="true"/>
+            <parameter name="odometerAtReturn" type="BigDecimal"/>
+        </in-parameters>
+        <actions><script><![CDATA[
+            def assignment = ec.entity.find("zenith.erp.fleet.VehicleAssignment")
+                .condition("assignmentId", assignmentId).one()
+            if (!assignment) { ec.message.addError("Assignment not found"); return }
+
+            assignment.set("statusId", "VaReturned")
+            assignment.set("returnDate", ec.user.nowTimestamp)
+            if (odometerAtReturn) assignment.set("odometerAtReturn", odometerAtReturn)
+            assignment.update()
+
+            def vehicle = ec.entity.find("zenith.erp.fleet.Vehicle")
+                .condition("vehicleId", assignment.vehicleId).one()
+            if (vehicle) {
+                vehicle.set("assignedDriverPartyId", null)
+                if (odometerAtReturn) vehicle.set("currentOdometerKm", odometerAtReturn)
+                vehicle.update()
+            }
+        ]]></script></actions>
+    </service>
+
+    <service verb="log" noun="Fuel">
+        <in-parameters>
+            <parameter name="vehicleId" required="true"/>
+            <parameter name="driverId"/>
+            <parameter name="fuelDate" type="Timestamp"/>
+            <parameter name="fuelType"/><parameter name="quantityLitres" type="BigDecimal" required="true"/>
+            <parameter name="ratePerLitre" type="BigDecimal" required="true"/>
+            <parameter name="odometerKm" type="BigDecimal"/>
+            <parameter name="fuelStationName"/><parameter name="fuelStationCity"/>
+            <parameter name="receiptNumber"/><parameter name="paymentMode"/>
+            <parameter name="isFullTank" default-value="N"/>
+        </in-parameters>
+        <out-parameters><parameter name="fuelLogId"/></out-parameters>
+        <actions><script><![CDATA[
+            def totalAmount = (quantityLitres ?: 0) * (ratePerLitre ?: 0)
+            context.fuelLogId = ec.entity.sequencedIdPrimary("zenith.erp.fleet.FuelLog", null, null)
+            ec.entity.makeValue("zenith.erp.fleet.FuelLog").setAll([
+                fuelLogId: context.fuelLogId, vehicleId: vehicleId, driverId: driverId,
+                fuelDate: fuelDate ?: ec.user.nowTimestamp, fuelType: fuelType,
+                quantityLitres: quantityLitres, ratePerLitre: ratePerLitre,
+                totalAmount: totalAmount, odometerKm: odometerKm,
+                fuelStationName: fuelStationName, fuelStationCity: fuelStationCity,
+                receiptNumber: receiptNumber, paymentMode: paymentMode, isFullTank: isFullTank
+            ]).create()
+
+            if (odometerKm) {
+                def vehicle = ec.entity.find("zenith.erp.fleet.Vehicle").condition("vehicleId", vehicleId).one()
+                if (vehicle && (!vehicle.currentOdometerKm || odometerKm > vehicle.currentOdometerKm)) {
+                    vehicle.set("currentOdometerKm", odometerKm)
+                    vehicle.update()
+                }
+            }
+        ]]></script></actions>
+    </service>
+
+    <service verb="create" noun="Trip">
+        <in-parameters>
+            <parameter name="vehicleId" required="true"/>
+            <parameter name="driverId"/>
+            <parameter name="fromLocation" required="true"/>
+            <parameter name="toLocation" required="true"/>
+            <parameter name="purpose"/><parameter name="plannedStartDate" type="Timestamp"/>
+        </in-parameters>
+        <out-parameters><parameter name="tripId"/></out-parameters>
+        <actions><script><![CDATA[
+            import java.time.LocalDate
+            def now = LocalDate.now()
+            def fysSetting = ec.entity.find("zenith.erp.base.CompanySettings").condition("organizationPartyId", ec.user.getPreference("ACTIVE_ORGANIZATION")).condition("settingKey", "FY_START_MONTH").one()
+            int fyStartMonth = fysSetting ? (fysSetting.settingValue as int) : 4
+            int fyStart = now.monthValue >= fyStartMonth ? now.year : now.year - 1
+            String fySuffix = String.format("%02d-%02d", fyStart % 100, (fyStart + 1) % 100)
+
+            def lastTrip = ec.entity.find("zenith.erp.fleet.TripLog")
+                .condition("tripNumber", "like", "TRIP/${fySuffix}/%").orderBy("-tripNumber").limit(1).list()
+            int nextSeq = 1
+            if (lastTrip) {
+                def parts = lastTrip[0].tripNumber.split("/")
+                if (parts.length == 3) nextSeq = (parts[2] as int) + 1
+            }
+            String tripNumber = "TRIP/${fySuffix}/" + String.format("%05d", nextSeq)
+
+            context.tripId = ec.entity.sequencedIdPrimary("zenith.erp.fleet.TripLog", null, null)
+            ec.entity.makeValue("zenith.erp.fleet.TripLog").setAll([
+                tripId: context.tripId, tripNumber: tripNumber, vehicleId: vehicleId,
+                driverId: driverId, fromLocation: fromLocation, toLocation: toLocation,
+                purpose: purpose, statusId: "TrPlanned",
+                plannedStartDate: plannedStartDate ?: ec.user.nowTimestamp
+            ]).create()
+        ]]></script></actions>
+    </service>
+
+    <service verb="start" noun="Trip">
+        <in-parameters>
+            <parameter name="tripId" required="true"/>
+            <parameter name="startOdometerKm" type="BigDecimal"/>
+        </in-parameters>
+        <actions><script><![CDATA[
+            def trip = ec.entity.find("zenith.erp.fleet.TripLog").condition("tripId", tripId).one()
+            if (!trip) { ec.message.addError("Trip not found"); return }
+            if (trip.statusId != "TrPlanned") { ec.message.addError("Trip must be in Planned status"); return }
+            trip.set("statusId", "TrInProgress")
+            trip.set("actualStartDate", ec.user.nowTimestamp)
+            if (startOdometerKm) trip.set("startOdometerKm", startOdometerKm)
+            trip.update()
+        ]]></script></actions>
+    </service>
+
+    <service verb="complete" noun="Trip">
+        <in-parameters>
+            <parameter name="tripId" required="true"/>
+            <parameter name="endOdometerKm" type="BigDecimal"/>
+            <parameter name="tollAmount" type="BigDecimal"/>
+            <parameter name="otherExpenses" type="BigDecimal"/>
+            <parameter name="remarks"/>
+        </in-parameters>
+        <actions><script><![CDATA[
+            def trip = ec.entity.find("zenith.erp.fleet.TripLog").condition("tripId", tripId).one()
+            if (!trip) { ec.message.addError("Trip not found"); return }
+            if (trip.statusId != "TrInProgress") { ec.message.addError("Trip must be In Progress"); return }
+
+            trip.set("statusId", "TrCompleted")
+            trip.set("actualEndDate", ec.user.nowTimestamp)
+            if (endOdometerKm) {
+                trip.set("endOdometerKm", endOdometerKm)
+                if (trip.startOdometerKm)
+                    trip.set("distanceKm", endOdometerKm - (trip.startOdometerKm as BigDecimal))
+            }
+            if (tollAmount) trip.set("tollAmount", tollAmount)
+            if (otherExpenses) trip.set("otherExpenses", otherExpenses)
+            if (remarks) trip.set("remarks", remarks)
+            trip.update()
+
+            if (endOdometerKm && trip.vehicleId) {
+                def vehicle = ec.entity.find("zenith.erp.fleet.Vehicle").condition("vehicleId", trip.vehicleId).one()
+                if (vehicle && (!vehicle.currentOdometerKm || endOdometerKm > (vehicle.currentOdometerKm as BigDecimal))) {
+                    vehicle.set("currentOdometerKm", endOdometerKm)
+                    vehicle.update()
+                }
+            }
+        ]]></script></actions>
+    </service>
+
+    <service verb="complete" noun="VehicleService">
+        <in-parameters>
+            <parameter name="serviceId" required="true"/>
+            <parameter name="laborCost" type="BigDecimal"/>
+            <parameter name="partsCost" type="BigDecimal"/>
+            <parameter name="nextServiceDate" type="Date"/>
+            <parameter name="nextServiceOdometerKm" type="BigDecimal"/>
+        </in-parameters>
+        <actions><script><![CDATA[
+            def svc = ec.entity.find("zenith.erp.fleet.VehicleService").condition("serviceId", serviceId).one()
+            if (!svc) { ec.message.addError("Service record not found"); return }
+
+            svc.set("statusId", "VsCompleted")
+            if (laborCost) svc.set("laborCost", laborCost)
+            if (partsCost) svc.set("partsCost", partsCost)
+            svc.set("totalCost", ((laborCost ?: svc.laborCost ?: 0) as BigDecimal) + ((partsCost ?: svc.partsCost ?: 0) as BigDecimal))
+            if (nextServiceDate) svc.set("nextServiceDate", nextServiceDate)
+            if (nextServiceOdometerKm) svc.set("nextServiceOdometerKm", nextServiceOdometerKm)
+            svc.update()
+
+            def vehicle = ec.entity.find("zenith.erp.fleet.Vehicle").condition("vehicleId", svc.vehicleId).one()
+            if (vehicle && vehicle.statusId == "VhInMaintenance") {
+                vehicle.set("statusId", "VhActive")
+                vehicle.update()
+            }
+        ]]></script></actions>
+    </service>
+
+    <service verb="check" noun="DocumentExpiry">
+        <in-parameters><parameter name="daysAhead" type="Integer" default-value="30"/></in-parameters>
+        <out-parameters><parameter name="expiringCount" type="Integer"/></out-parameters>
+        <actions><script><![CDATA[
+            import java.sql.Date as SqlDate
+            import java.time.LocalDate
+
+            def cutoff = SqlDate.valueOf(LocalDate.now().plusDays(daysAhead ?: 30))
+            int count = 0
+
+            def vehicles = ec.entity.find("zenith.erp.fleet.Vehicle")
+                .condition("statusId", "VhActive").list()
+            for (def v : vehicles) {
+                boolean expiring = false
+                if (v.insuranceExpiryDate && v.insuranceExpiryDate <= cutoff) expiring = true
+                if (v.fitnessExpiryDate && v.fitnessExpiryDate <= cutoff) expiring = true
+                if (v.pucExpiryDate && v.pucExpiryDate <= cutoff) expiring = true
+                if (v.permitExpiryDate && v.permitExpiryDate <= cutoff) expiring = true
+                if (v.roadTaxExpiryDate && v.roadTaxExpiryDate <= cutoff) expiring = true
+                if (expiring) count++
+            }
+            context.expiringCount = count
+            ec.message.addMessage("Found ${count} vehicles with documents expiring within ${daysAhead} days")
+        ]]></script></actions>
+    </service>
+
+    <service verb="calculate" noun="FuelEfficiency">
+        <in-parameters>
+            <parameter name="vehicleId" required="true"/>
+            <parameter name="fromDate" type="Timestamp"/>
+            <parameter name="toDate" type="Timestamp"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="totalKm" type="BigDecimal"/>
+            <parameter name="totalLitres" type="BigDecimal"/>
+            <parameter name="kmPerLitre" type="BigDecimal"/>
+        </out-parameters>
+        <actions><script><![CDATA[
+            def finder = ec.entity.find("zenith.erp.fleet.FuelLog").condition("vehicleId", vehicleId)
+            if (fromDate) finder.condition("fuelDate", ">=", fromDate)
+            if (toDate) finder.condition("fuelDate", "<=", toDate)
+            def logs = finder.orderBy("odometerKm").list()
+
+            if (logs.size() < 2) {
+                context.totalKm = 0; context.totalLitres = 0; context.kmPerLitre = 0; return
+            }
+            def firstOdo = logs[0].odometerKm as BigDecimal
+            def lastOdo = logs[-1].odometerKm as BigDecimal
+            context.totalKm = lastOdo - firstOdo
+
+            BigDecimal litres = 0
+            for (int i = 1; i < logs.size(); i++) litres += (logs[i].quantityLitres ?: 0) as BigDecimal
+            context.totalLitres = litres
+            context.kmPerLitre = litres > 0 ? (context.totalKm / litres).setScale(2, java.math.RoundingMode.HALF_UP) : 0
+        ]]></script></actions>
+    </service>
+
+</services>

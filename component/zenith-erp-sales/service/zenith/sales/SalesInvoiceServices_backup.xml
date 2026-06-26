@@ -1,0 +1,389 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <service verb="create" noun="SalesInvoice">
+        <description>Create a GST-compliant sales invoice with auto tax calculation</description>
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="customerPartyId" required="true"/>
+            <parameter name="invoiceDate" type="Timestamp" default="ec.user.nowTimestamp"/>
+            <parameter name="currencyUomId" default-value="INR"/>
+            <parameter name="settlementTermId"/>
+            <parameter name="isReverseCharge" default-value="N"/>
+            <parameter name="isExport" default-value="N"/>
+            <parameter name="isSezSupply" default-value="N"/>
+            <parameter name="lutBondNumber"/>
+            <parameter name="items" type="List" required="true">
+                <parameter name="itemEntry" type="Map">
+                    <parameter name="productId"/>
+                    <parameter name="itemDescription"/>
+                    <parameter name="quantity" type="BigDecimal" required="true"/>
+                    <parameter name="unitAmount" type="BigDecimal" required="true"/>
+                    <parameter name="hsnSacCode"/>
+                    <parameter name="gstSlabId"/>
+                    <parameter name="discountPercent" type="BigDecimal"/>
+                    <parameter name="discountAmount" type="BigDecimal"/>
+                </parameter>
+            </parameter>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="invoiceId"/>
+            <parameter name="gstInvoiceNumber"/>
+        </out-parameters>
+        <actions>
+            <!-- Get supplier GST config -->
+            <entity-find-one entity-name="zenith.erp.india.IndiaGstConfig" value-field="gstConfig">
+                <field-map field-name="organizationPartyId"/>
+            </entity-find-one>
+            <if condition="!gstConfig">
+                <return error="true" message="GST configuration not found for organization ${organizationPartyId}. Please set up GST in Settings."/>
+            </if>
+
+            <!-- Get buyer state from GSTIN or address -->
+            <set field="supplierStateCode" from="gstConfig.stateCode"/>
+            <entity-find entity-name="zenith.erp.india.IndiaGstin" list="buyerGstins">
+                <econdition field-name="partyId" from="customerPartyId"/>
+            </entity-find>
+            <set field="buyerGstin" from="buyerGstins ? buyerGstins[0].gstin : null"/>
+            <set field="buyerStateCode" from="buyerGstin ? buyerGstin.substring(0,2) : supplierStateCode"/>
+
+            <!-- Determine place of supply -->
+            <set field="placeOfSupplyStateCode" from="buyerStateCode"/>
+
+            <!-- Generate GST invoice number -->
+            <service-call name="zenith.base.SequenceServices.get#NextSequence"
+                          in-map="[organizationPartyId:organizationPartyId, sequenceType:'INVOICE']"
+                          out-map="seqResult"/>
+
+            <!-- Create the Mantle Invoice -->
+            <service-call name="mantle.account.InvoiceServices.create#Invoice"
+                          in-map="[invoiceTypeEnumId:'InvoiceSales', fromPartyId:organizationPartyId,
+                                   toPartyId:customerPartyId, invoiceDate:invoiceDate,
+                                   currencyUomId:currencyUomId, settlementTermId:settlementTermId,
+                                   statusId:'InvoiceInProcess']"
+                          out-map="invResult"/>
+            <set field="invoiceId" from="invResult.invoiceId"/>
+            <set field="gstInvoiceNumber" from="seqResult.sequenceValue"/>
+
+            <!-- Calculate financial year prefix -->
+            <set field="calDate" from="new java.util.GregorianCalendar()"/>
+            <script>calDate.setTime(invoiceDate)</script>
+            <set field="year" from="calDate.get(java.util.Calendar.YEAR)"/>
+            <set field="month" from="calDate.get(java.util.Calendar.MONTH) + 1"/>
+            <set field="fyStart" from="month &gt;= 4 ? year : year - 1"/>
+            <set field="fyEnd" from="fyStart + 1"/>
+            <set field="financialYearPrefix" from="(fyStart % 100) + '-' + (fyEnd % 100)"/>
+
+            <!-- Track totals -->
+            <set field="totalCgst" from="BigDecimal.ZERO" type="BigDecimal"/>
+            <set field="totalSgst" from="BigDecimal.ZERO" type="BigDecimal"/>
+            <set field="totalIgst" from="BigDecimal.ZERO" type="BigDecimal"/>
+            <set field="totalCess" from="BigDecimal.ZERO" type="BigDecimal"/>
+            <set field="totalTaxableAmount" from="BigDecimal.ZERO" type="BigDecimal"/>
+
+            <!-- Create each invoice item with GST calculation -->
+            <iterate list="items" entry="item">
+                <set field="lineAmount" from="(item.quantity as BigDecimal) * (item.unitAmount as BigDecimal)" type="BigDecimal"/>
+
+                <!-- Apply discount -->
+                <if condition="item.discountPercent">
+                    <set field="lineDiscount" from="lineAmount * (item.discountPercent as BigDecimal) / 100" type="BigDecimal"/>
+                    <else-if condition="item.discountAmount">
+                        <set field="lineDiscount" from="item.discountAmount as BigDecimal" type="BigDecimal"/>
+                    </else-if>
+                    <else>
+                        <set field="lineDiscount" from="BigDecimal.ZERO" type="BigDecimal"/>
+                    </else>
+                </if>
+                <set field="taxableAmount" from="lineAmount - lineDiscount" type="BigDecimal"/>
+
+                <!-- Calculate GST using India GST engine -->
+                <service-call name="zenith.india.GstServices.calculate#Gst"
+                              in-map="[amount:taxableAmount, gstSlabId:item.gstSlabId,
+                                       supplierStateCode:supplierStateCode, buyerStateCode:placeOfSupplyStateCode,
+                                       isSezSupply:isSezSupply, isExport:isExport]"
+                              out-map="gstResult"/>
+
+                <!-- Create the InvoiceItem -->
+                <service-call name="mantle.account.InvoiceServices.create#InvoiceItem"
+                              in-map="[invoiceId:invoiceId, itemTypeEnumId:'ItemProduct',
+                                       productId:item.productId, description:item.itemDescription,
+                                       quantity:item.quantity, amount:item.unitAmount]"
+                              out-map="itemResult"/>
+
+                <!-- Update with GST details -->
+                <service-call name="update#mantle.account.invoice.InvoiceItem"
+                              in-map="[invoiceId:invoiceId, invoiceItemSeqId:itemResult.invoiceItemSeqId,
+                                       hsnSacCode:item.hsnSacCode, gstSlabId:item.gstSlabId,
+                                       cgstRate:gstResult.cgstRate, cgstAmount:gstResult.cgstAmount,
+                                       sgstRate:gstResult.sgstRate, sgstAmount:gstResult.sgstAmount,
+                                       igstRate:gstResult.igstRate, igstAmount:gstResult.igstAmount,
+                                       cessRate:gstResult.cessRate, cessAmount:gstResult.cessAmount,
+                                       taxableAmount:taxableAmount, discountAmount:lineDiscount,
+                                       discountPercent:item.discountPercent]"/>
+
+                <set field="totalCgst" from="totalCgst + (gstResult.cgstAmount ?: BigDecimal.ZERO)"/>
+                <set field="totalSgst" from="totalSgst + (gstResult.sgstAmount ?: BigDecimal.ZERO)"/>
+                <set field="totalIgst" from="totalIgst + (gstResult.igstAmount ?: BigDecimal.ZERO)"/>
+                <set field="totalCess" from="totalCess + (gstResult.cessAmount ?: BigDecimal.ZERO)"/>
+                <set field="totalTaxableAmount" from="totalTaxableAmount + taxableAmount"/>
+            </iterate>
+
+            <!-- Calculate total and amount in words -->
+            <set field="grandTotal" from="totalTaxableAmount + totalCgst + totalSgst + totalIgst + totalCess" type="BigDecimal"/>
+            <service-call name="zenith.india.GstServices.convert#AmountToIndianWords"
+                          in-map="[amount:grandTotal]" out-map="wordsResult"/>
+
+            <!-- Update Invoice with GST totals -->
+            <service-call name="update#mantle.account.invoice.Invoice"
+                          in-map="[invoiceId:invoiceId, gstInvoiceNumber:gstInvoiceNumber,
+                                   financialYearPrefix:financialYearPrefix,
+                                   placeOfSupplyStateCode:placeOfSupplyStateCode,
+                                   supplierStateCode:supplierStateCode,
+                                   supplierGstin:gstConfig.gstin, buyerGstin:buyerGstin,
+                                   isReverseCharge:isReverseCharge, isExport:isExport, isSezSupply:isSezSupply,
+                                   lutBondNumber:lutBondNumber,
+                                   totalCgst:totalCgst, totalSgst:totalSgst, totalIgst:totalIgst,
+                                   totalCess:totalCess, totalTaxableAmount:totalTaxableAmount,
+                                   amountInWords:wordsResult.amountInWords]"/>
+        </actions>
+    </service>
+
+    <service verb="create" noun="SalesInvoiceHeader">
+        <description>Create a GST sales invoice header (no items yet). Items are added via the detail page.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="customerPartyId" required="true"/>
+            <parameter name="invoiceDate" type="Timestamp" default="ec.user.nowTimestamp"/>
+            <parameter name="currencyUomId" default-value="INR"/>
+            <parameter name="settlementTermId"/>
+            <parameter name="isReverseCharge" default-value="N"/>
+            <parameter name="isExport" default-value="N"/>
+            <parameter name="isSezSupply" default-value="N"/>
+            <parameter name="lutBondNumber"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="invoiceId"/>
+            <parameter name="gstInvoiceNumber"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.india.IndiaGstConfig" value-field="gstConfig">
+                <field-map field-name="organizationPartyId"/>
+            </entity-find-one>
+            <if condition="!gstConfig">
+                <return error="true" message="GST configuration not found for organization ${organizationPartyId}. Please set up GST in Settings."/>
+            </if>
+
+            <set field="supplierStateCode" from="gstConfig.stateCode"/>
+            <entity-find entity-name="zenith.erp.india.IndiaGstin" list="buyerGstins">
+                <econdition field-name="partyId" from="customerPartyId"/>
+            </entity-find>
+            <set field="buyerGstin" from="buyerGstins ? buyerGstins[0].gstin : null"/>
+            <set field="buyerStateCode" from="buyerGstin ? buyerGstin.substring(0,2) : supplierStateCode"/>
+
+            <service-call name="zenith.base.SequenceServices.get#NextSequence"
+                          in-map="[organizationPartyId:organizationPartyId, sequenceType:'INVOICE']"
+                          out-map="seqResult"/>
+
+            <set field="calDate" from="new java.util.GregorianCalendar()"/>
+            <script>calDate.setTime(invoiceDate)</script>
+            <set field="year" from="calDate.get(java.util.Calendar.YEAR)"/>
+            <set field="month" from="calDate.get(java.util.Calendar.MONTH) + 1"/>
+            <set field="fyStart" from="month &gt;= 4 ? year : year - 1"/>
+            <set field="fyEnd" from="fyStart + 1"/>
+            <set field="financialYearPrefix" from="(fyStart % 100) + '-' + (fyEnd % 100)"/>
+
+            <service-call name="mantle.account.InvoiceServices.create#Invoice"
+                          in-map="[invoiceTypeEnumId:'InvoiceSales', fromPartyId:organizationPartyId,
+                                   toPartyId:customerPartyId, invoiceDate:invoiceDate,
+                                   currencyUomId:currencyUomId, settlementTermId:settlementTermId,
+                                   statusId:'InvoiceInProcess']"
+                          out-map="invResult"/>
+            <set field="invoiceId" from="invResult.invoiceId"/>
+            <set field="gstInvoiceNumber" from="seqResult.sequenceValue"/>
+
+            <service-call name="update#mantle.account.invoice.Invoice"
+                          in-map="[invoiceId:invoiceId, gstInvoiceNumber:gstInvoiceNumber,
+                                   financialYearPrefix:financialYearPrefix,
+                                   placeOfSupplyStateCode:buyerStateCode,
+                                   supplierStateCode:supplierStateCode,
+                                   supplierGstin:gstConfig.gstin, buyerGstin:buyerGstin,
+                                   isReverseCharge:isReverseCharge, isExport:isExport, isSezSupply:isSezSupply,
+                                   lutBondNumber:lutBondNumber]"/>
+        </actions>
+    </service>
+
+    <service verb="add" noun="InvoiceItemWithGst">
+        <description>Add a line item to a sales invoice with automatic GST calculation</description>
+        <in-parameters>
+            <parameter name="invoiceId" required="true"/>
+            <parameter name="productId"/>
+            <parameter name="itemDescription"/>
+            <parameter name="quantity" type="BigDecimal" required="true"/>
+            <parameter name="unitAmount" type="BigDecimal" required="true"/>
+            <parameter name="hsnSacCode"/>
+            <parameter name="gstSlabId"/>
+            <parameter name="discountPercent" type="BigDecimal"/>
+            <parameter name="discountAmount" type="BigDecimal"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="invoiceItemSeqId"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="invoice"/>
+            <if condition="!invoice">
+                <return error="true" message="Invoice ${invoiceId} not found"/>
+            </if>
+
+            <set field="lineAmount" from="quantity * unitAmount" type="BigDecimal"/>
+            <if condition="discountPercent">
+                <set field="lineDiscount" from="lineAmount * discountPercent / 100" type="BigDecimal"/>
+                <else-if condition="discountAmount">
+                    <set field="lineDiscount" from="discountAmount" type="BigDecimal"/>
+                </else-if>
+                <else>
+                    <set field="lineDiscount" from="BigDecimal.ZERO" type="BigDecimal"/>
+                </else>
+            </if>
+            <set field="taxableAmount" from="lineAmount - lineDiscount" type="BigDecimal"/>
+
+            <service-call name="zenith.india.GstServices.calculate#Gst"
+                          in-map="[amount:taxableAmount, gstSlabId:gstSlabId,
+                                   supplierStateCode:invoice.supplierStateCode,
+                                   buyerStateCode:invoice.placeOfSupplyStateCode,
+                                   isSezSupply:invoice.isSezSupply, isExport:invoice.isExport]"
+                          out-map="gstResult"/>
+
+            <service-call name="mantle.account.InvoiceServices.create#InvoiceItem"
+                          in-map="[invoiceId:invoiceId, itemTypeEnumId:'ItemProduct',
+                                   productId:productId, description:itemDescription,
+                                   quantity:quantity, amount:unitAmount]"
+                          out-map="itemResult"/>
+            <set field="invoiceItemSeqId" from="itemResult.invoiceItemSeqId"/>
+
+            <service-call name="update#mantle.account.invoice.InvoiceItem"
+                          in-map="[invoiceId:invoiceId, invoiceItemSeqId:invoiceItemSeqId,
+                                   hsnSacCode:hsnSacCode, gstSlabId:gstSlabId,
+                                   cgstRate:gstResult.cgstRate, cgstAmount:gstResult.cgstAmount,
+                                   sgstRate:gstResult.sgstRate, sgstAmount:gstResult.sgstAmount,
+                                   igstRate:gstResult.igstRate, igstAmount:gstResult.igstAmount,
+                                   cessRate:gstResult.cessRate, cessAmount:gstResult.cessAmount,
+                                   taxableAmount:taxableAmount, discountAmount:lineDiscount,
+                                   discountPercent:discountPercent]"/>
+
+            <!-- Recalculate invoice totals -->
+            <entity-find entity-name="mantle.account.invoice.InvoiceItem" list="allItems">
+                <econdition field-name="invoiceId"/>
+            </entity-find>
+            <set field="totalCgst" from="BigDecimal.ZERO" type="BigDecimal"/>
+            <set field="totalSgst" from="BigDecimal.ZERO" type="BigDecimal"/>
+            <set field="totalIgst" from="BigDecimal.ZERO" type="BigDecimal"/>
+            <set field="totalCess" from="BigDecimal.ZERO" type="BigDecimal"/>
+            <set field="totalTaxableAmount" from="BigDecimal.ZERO" type="BigDecimal"/>
+            <iterate list="allItems" entry="ii">
+                <set field="totalCgst" from="totalCgst + (ii.cgstAmount ?: BigDecimal.ZERO)"/>
+                <set field="totalSgst" from="totalSgst + (ii.sgstAmount ?: BigDecimal.ZERO)"/>
+                <set field="totalIgst" from="totalIgst + (ii.igstAmount ?: BigDecimal.ZERO)"/>
+                <set field="totalCess" from="totalCess + (ii.cessAmount ?: BigDecimal.ZERO)"/>
+                <set field="totalTaxableAmount" from="totalTaxableAmount + (ii.taxableAmount ?: BigDecimal.ZERO)"/>
+            </iterate>
+
+            <set field="grandTotal" from="totalTaxableAmount + totalCgst + totalSgst + totalIgst + totalCess" type="BigDecimal"/>
+            <service-call name="zenith.india.GstServices.convert#AmountToIndianWords"
+                          in-map="[amount:grandTotal]" out-map="wordsResult"/>
+
+            <service-call name="update#mantle.account.invoice.Invoice"
+                          in-map="[invoiceId:invoiceId, totalCgst:totalCgst, totalSgst:totalSgst,
+                                   totalIgst:totalIgst, totalCess:totalCess,
+                                   totalTaxableAmount:totalTaxableAmount,
+                                   amountInWords:wordsResult.amountInWords]"/>
+        </actions>
+    </service>
+
+    <service verb="create" noun="CreditNote">
+        <description>Create a GST Credit Note linked to original invoice</description>
+        <in-parameters>
+            <parameter name="originalInvoiceId" required="true"/>
+            <parameter name="reason" required="true"/>
+            <parameter name="items" type="List" required="true">
+                <parameter name="itemEntry" type="Map">
+                    <parameter name="itemDescription"/>
+                    <parameter name="quantity" type="BigDecimal" required="true"/>
+                    <parameter name="unitAmount" type="BigDecimal" required="true"/>
+                    <parameter name="hsnSacCode"/>
+                    <parameter name="gstSlabId"/>
+                </parameter>
+            </parameter>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="invoiceId"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="origInvoice">
+                <field-map field-name="invoiceId" from="originalInvoiceId"/>
+            </entity-find-one>
+            <if condition="!origInvoice">
+                <return error="true" message="Original invoice ${originalInvoiceId} not found"/>
+            </if>
+
+            <service-call name="zenith.sales.SalesInvoiceServices.create#SalesInvoice"
+                          in-map="[organizationPartyId:origInvoice.fromPartyId,
+                                   customerPartyId:origInvoice.toPartyId,
+                                   currencyUomId:origInvoice.currencyUomId,
+                                   items:items]"
+                          out-map="cnResult"/>
+
+            <service-call name="update#mantle.account.invoice.Invoice"
+                          in-map="[invoiceId:cnResult.invoiceId,
+                                   invoiceTypeEnumId:'InvoiceCreditMemo',
+                                   originalInvoiceId:originalInvoiceId,
+                                   creditDebitNoteType:'CREDIT',
+                                   creditDebitNoteReason:reason]"/>
+            <set field="invoiceId" from="cnResult.invoiceId"/>
+        </actions>
+    </service>
+
+    <service verb="create" noun="DebitNote">
+        <description>Create a GST Debit Note linked to original invoice</description>
+        <in-parameters>
+            <parameter name="originalInvoiceId" required="true"/>
+            <parameter name="reason" required="true"/>
+            <parameter name="items" type="List" required="true">
+                <parameter name="itemEntry" type="Map">
+                    <parameter name="itemDescription"/>
+                    <parameter name="quantity" type="BigDecimal" required="true"/>
+                    <parameter name="unitAmount" type="BigDecimal" required="true"/>
+                    <parameter name="hsnSacCode"/>
+                    <parameter name="gstSlabId"/>
+                </parameter>
+            </parameter>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="invoiceId"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="origInvoice">
+                <field-map field-name="invoiceId" from="originalInvoiceId"/>
+            </entity-find-one>
+            <if condition="!origInvoice">
+                <return error="true" message="Original invoice ${originalInvoiceId} not found"/>
+            </if>
+
+            <service-call name="zenith.sales.SalesInvoiceServices.create#SalesInvoice"
+                          in-map="[organizationPartyId:origInvoice.fromPartyId,
+                                   customerPartyId:origInvoice.toPartyId,
+                                   currencyUomId:origInvoice.currencyUomId,
+                                   items:items]"
+                          out-map="dnResult"/>
+
+            <service-call name="update#mantle.account.invoice.Invoice"
+                          in-map="[invoiceId:dnResult.invoiceId,
+                                   originalInvoiceId:originalInvoiceId,
+                                   creditDebitNoteType:'DEBIT',
+                                   creditDebitNoteReason:reason]"/>
+            <set field="invoiceId" from="dnResult.invoiceId"/>
+        </actions>
+    </service>
+
+</services>

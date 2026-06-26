@@ -1,0 +1,582 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <!-- ========== Price List CRUD ========== -->
+
+    <service verb="create" noun="PriceList">
+        <in-parameters>
+            <parameter name="priceListName" required="true"/>
+            <parameter name="description"/>
+            <parameter name="priceListTypeEnumId" required="true"/>
+            <parameter name="currencyUomId" required="true"/>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="parentPriceListId"/>
+            <parameter name="isDefault" default-value="N"/>
+            <parameter name="validFromDate" type="Timestamp"/>
+            <parameter name="validThruDate" type="Timestamp"/>
+            <parameter name="roundingMode" default-value="HALF_UP"/>
+            <parameter name="roundingPrecision" type="Integer" default="2"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="priceListId"/>
+        </out-parameters>
+        <actions>
+            <if condition="isDefault == 'Y'">
+                <entity-find entity-name="zenith.erp.pricing.PriceList" list="existingDefaults">
+                    <econdition field-name="organizationPartyId"/>
+                    <econdition field-name="priceListTypeEnumId"/>
+                    <econdition field-name="isDefault" value="Y"/>
+                </entity-find>
+                <iterate list="existingDefaults" entry="ed">
+                    <service-call name="update#zenith.erp.pricing.PriceList"
+                                  in-map="[priceListId:ed.priceListId, isDefault:'N']"/>
+                </iterate>
+            </if>
+            <service-call name="create#zenith.erp.pricing.PriceList" out-map="context"
+                          in-map="context"/>
+        </actions>
+    </service>
+
+    <!-- ========== Price List Item CRUD ========== -->
+
+    <service verb="set" noun="PriceListItem">
+        <description>Create or update a price list item for a product. Logs price changes.</description>
+        <in-parameters>
+            <parameter name="priceListId" required="true"/>
+            <parameter name="productId" required="true"/>
+            <parameter name="unitPrice" type="BigDecimal" required="true"/>
+            <parameter name="minQuantity" type="BigDecimal" default="1"/>
+            <parameter name="maxQuantity" type="BigDecimal"/>
+            <parameter name="priceTypeEnumId" default-value="PtpFixed"/>
+            <parameter name="discountPercent" type="BigDecimal"/>
+            <parameter name="marginPercent" type="BigDecimal"/>
+            <parameter name="validFromDate" type="Timestamp"/>
+            <parameter name="validThruDate" type="Timestamp"/>
+            <parameter name="changeReason"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="priceListItemId"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.pricing.PriceList" value-field="_pl"><field-map field-name="priceListId"/></entity-find-one>
+            <set field="organizationPartyId" from="_pl?.organizationPartyId"/>
+            <entity-find entity-name="zenith.erp.pricing.PriceListItem" list="existing" limit="1">
+                <econdition field-name="priceListId"/>
+                <econdition field-name="productId"/>
+                <econdition field-name="minQuantity"/>
+            </entity-find>
+
+            <if condition="existing">
+                <then>
+                    <set field="prev" from="existing[0]"/>
+                    <set field="priceListItemId" from="prev.priceListItemId"/>
+                    <if condition="prev.unitPrice != unitPrice">
+                        <service-call name="create#zenith.erp.pricing.PriceChangeLog"
+                                      in-map="[priceListId:priceListId, productId:productId,
+                                               organizationPartyId:organizationPartyId, previousPrice:prev.unitPrice, newPrice:unitPrice,
+                                               changeReason:changeReason, changedByUserId:ec.user.userId,
+                                               changeDate:ec.user.nowTimestamp]"/>
+                    </if>
+                    <service-call name="update#zenith.erp.pricing.PriceListItem"
+                                  in-map="[priceListItemId:priceListItemId, unitPrice:unitPrice,
+                                           maxQuantity:maxQuantity, priceTypeEnumId:priceTypeEnumId,
+                                           discountPercent:discountPercent, marginPercent:marginPercent,
+                                           validFromDate:validFromDate, validThruDate:validThruDate]"/>
+                </then>
+                <else>
+                    <service-call name="create#zenith.erp.pricing.PriceListItem" out-map="context"
+                                  in-map="[organizationPartyId:organizationPartyId, priceListId:priceListId, productId:productId, unitPrice:unitPrice,
+                                           minQuantity:minQuantity, maxQuantity:maxQuantity,
+                                           priceTypeEnumId:priceTypeEnumId, discountPercent:discountPercent,
+                                           marginPercent:marginPercent, validFromDate:validFromDate,
+                                           validThruDate:validThruDate]"/>
+                    <service-call name="create#zenith.erp.pricing.PriceChangeLog"
+                                  in-map="[priceListId:priceListId, productId:productId,
+                                           organizationPartyId:organizationPartyId, previousPrice:0, newPrice:unitPrice,
+                                           changeReason:changeReason ?: 'Initial price set',
+                                           changedByUserId:ec.user.userId,
+                                           changeDate:ec.user.nowTimestamp]"/>
+                </else>
+            </if>
+        </actions>
+    </service>
+
+    <service verb="import" noun="PriceListItems">
+        <description>Bulk import price list items from a list of maps (CSV/Excel upload)</description>
+        <in-parameters>
+            <parameter name="priceListId" required="true"/>
+            <parameter name="items" type="List" required="true">
+                <parameter name="itemEntry" type="Map">
+                    <parameter name="productId" required="true"/>
+                    <parameter name="unitPrice" type="BigDecimal" required="true"/>
+                    <parameter name="minQuantity" type="BigDecimal"/>
+                    <parameter name="maxQuantity" type="BigDecimal"/>
+                </parameter>
+            </parameter>
+            <parameter name="changeReason" default-value="Bulk import"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="importedCount" type="Integer"/>
+            <parameter name="errorCount" type="Integer"/>
+        </out-parameters>
+        <actions>
+            <set field="importedCount" from="0" type="Integer"/>
+            <set field="errorCount" from="0" type="Integer"/>
+            <iterate list="items" entry="item">
+                <service-call name="zenith.pricing.PricingServices.set#PriceListItem" ignore-error="true"
+                              in-map="[priceListId:priceListId, productId:item.productId,
+                                       unitPrice:item.unitPrice, minQuantity:(item.minQuantity ?: 1),
+                                       maxQuantity:item.maxQuantity, changeReason:changeReason]"
+                              out-map="setOut"/>
+                <if condition="setOut?._errorMessage">
+                    <set field="errorCount" from="errorCount + 1"/>
+                <else>
+                    <set field="importedCount" from="importedCount + 1"/>
+                </else></if>
+            </iterate>
+        </actions>
+    </service>
+
+    <!-- ========== Volume Pricing ========== -->
+
+    <service verb="set" noun="VolumePricing">
+        <in-parameters>
+            <parameter name="priceListId" required="true"/>
+            <parameter name="productId" required="true"/>
+            <parameter name="minQuantity" type="BigDecimal" required="true"/>
+            <parameter name="maxQuantity" type="BigDecimal"/>
+            <parameter name="unitPrice" type="BigDecimal"/>
+            <parameter name="discountPercent" type="BigDecimal"/>
+            <parameter name="validFromDate" type="Timestamp"/>
+            <parameter name="validThruDate" type="Timestamp"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="volumePricingId"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.pricing.PriceList" value-field="_plv"><field-map field-name="priceListId"/></entity-find-one>
+            <set field="organizationPartyId" from="_plv?.organizationPartyId"/>
+            <entity-find entity-name="zenith.erp.pricing.VolumePricing" list="existing" limit="1">
+                <econdition field-name="priceListId"/>
+                <econdition field-name="productId"/>
+                <econdition field-name="minQuantity"/>
+            </entity-find>
+            <if condition="existing">
+                <then>
+                    <set field="volumePricingId" from="existing[0].volumePricingId"/>
+                    <service-call name="update#zenith.erp.pricing.VolumePricing"
+                                  in-map="[volumePricingId:volumePricingId, maxQuantity:maxQuantity,
+                                           unitPrice:unitPrice, discountPercent:discountPercent,
+                                           validFromDate:validFromDate, validThruDate:validThruDate]"/>
+                </then>
+                <else>
+                    <service-call name="create#zenith.erp.pricing.VolumePricing" out-map="context"
+                                  in-map="context"/>
+                </else>
+            </if>
+        </actions>
+    </service>
+
+    <!-- ========== Customer Price List Assignment ========== -->
+
+    <service verb="assign" noun="CustomerPriceList">
+        <in-parameters>
+            <parameter name="partyId"/>
+            <parameter name="customerGroupId"/>
+            <parameter name="priceListId" required="true"/>
+            <parameter name="priority" type="Integer" default="10"/>
+            <parameter name="validFromDate" type="Timestamp"/>
+            <parameter name="validThruDate" type="Timestamp"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="customerPriceListId"/>
+        </out-parameters>
+        <actions>
+            <if condition="!partyId &amp;&amp; !customerGroupId">
+                <return error="true" message="Either partyId or customerGroupId is required"/>
+            </if>
+            <entity-find-one entity-name="zenith.erp.pricing.PriceList" value-field="_plc"><field-map field-name="priceListId"/></entity-find-one>
+            <set field="organizationPartyId" from="_plc?.organizationPartyId"/>
+            <service-call name="create#zenith.erp.pricing.CustomerPriceList" out-map="context"
+                          in-map="context"/>
+        </actions>
+    </service>
+
+    <!-- ========== Pricing Rule CRUD ========== -->
+
+    <service verb="create" noun="PricingRule">
+        <in-parameters>
+            <parameter name="ruleName" required="true"/>
+            <parameter name="description"/>
+            <parameter name="priority" type="Integer" default="10"/>
+            <parameter name="isStackable" default-value="N"/>
+            <parameter name="organizationPartyId"/>
+            <parameter name="validFromDate" type="Timestamp"/>
+            <parameter name="validThruDate" type="Timestamp"/>
+            <parameter name="actionType" required="true"/>
+            <parameter name="actionValue" type="BigDecimal" required="true"/>
+            <parameter name="maxDiscount" type="BigDecimal"/>
+            <parameter name="minimumPrice" type="BigDecimal"/>
+            <parameter name="conditions" type="List">
+                <parameter name="condEntry" type="Map">
+                    <parameter name="conditionTypeEnumId" required="true"/>
+                    <parameter name="operator" default-value="equals"/>
+                    <parameter name="fieldValue" required="true"/>
+                    <parameter name="fieldValueTo"/>
+                </parameter>
+            </parameter>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="pricingRuleId"/>
+        </out-parameters>
+        <actions>
+            <service-call name="create#zenith.erp.pricing.PricingRule" out-map="context"
+                          in-map="[ruleName:ruleName, description:description, priority:priority,
+                                   isStackable:isStackable, organizationPartyId:organizationPartyId,
+                                   validFromDate:validFromDate, validThruDate:validThruDate,
+                                   actionType:actionType, actionValue:actionValue,
+                                   maxDiscount:maxDiscount, minimumPrice:minimumPrice]"/>
+
+            <if condition="conditions">
+                <iterate list="conditions" entry="cond">
+                    <service-call name="create#zenith.erp.pricing.PricingRuleCondition"
+                                  in-map="[pricingRuleId:pricingRuleId,
+                                           conditionTypeEnumId:cond.conditionTypeEnumId,
+                                           operator:cond.operator ?: 'equals',
+                                           fieldValue:cond.fieldValue,
+                                           fieldValueTo:cond.fieldValueTo]"/>
+                </iterate>
+            </if>
+        </actions>
+    </service>
+
+    <!-- ========== Price Calculation Engine ========== -->
+
+    <service verb="calculate" noun="Price">
+        <description>Calculate the effective price for a product given customer, quantity, and context.
+            Resolution order: 1) Customer-specific price list, 2) Customer group price list,
+            3) Volume pricing, 4) Pricing rules, 5) Default price list, 6) Product list price.</description>
+        <in-parameters>
+            <parameter name="productId" required="true"/>
+            <parameter name="quantity" type="BigDecimal" default="1"/>
+            <parameter name="customerPartyId"/>
+            <parameter name="customerGroupId"/>
+            <parameter name="organizationPartyId"/>
+            <parameter name="currencyUomId"/>
+            <parameter name="priceListId"/>
+            <parameter name="salesChannelEnumId"/>
+            <parameter name="regionGeoId"/>
+            <parameter name="orderDate" type="Timestamp" default="ec.user.nowTimestamp"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="unitPrice" type="BigDecimal"/>
+            <parameter name="listPrice" type="BigDecimal"/>
+            <parameter name="priceSource"/>
+            <parameter name="appliedRules" type="List"/>
+            <parameter name="currencyUomId"/>
+        </out-parameters>
+        <actions>
+            <set field="now" from="orderDate"/>
+            <set field="appliedRules" from="[]"/>
+
+            <!-- Get product base price -->
+            <entity-find-one entity-name="mantle.product.Product" value-field="product"/>
+            <if condition="!product">
+                <return error="true" message="Product ${productId} not found"/>
+            </if>
+            <set field="listPrice" from="product.mrpAmount ?: BigDecimal.ZERO" type="BigDecimal"/>
+            <set field="unitPrice" from="listPrice"/>
+            <set field="priceSource" value="ProductListPrice"/>
+
+            <!-- Step 1: Resolve price list -->
+            <set field="effectivePriceListId" from="priceListId"/>
+
+            <!-- 1a: If customer has a direct price list assignment -->
+            <if condition="!effectivePriceListId &amp;&amp; customerPartyId">
+                <entity-find entity-name="zenith.erp.pricing.CustomerPriceList" list="custPls">
+                    <econdition field-name="partyId" from="customerPartyId"/>
+                    <date-filter from-field-name="validFromDate" thru-field-name="validThruDate"/>
+                    <order-by field-name="priority"/>
+                </entity-find>
+                <if condition="custPls">
+                    <set field="effectivePriceListId" from="custPls[0].priceListId"/>
+                </if>
+            </if>
+
+            <!-- 1b: If customer has priceListId on Party record -->
+            <if condition="!effectivePriceListId &amp;&amp; customerPartyId">
+                <entity-find-one entity-name="mantle.party.Party" value-field="custParty">
+                    <field-map field-name="partyId" from="customerPartyId"/>
+                </entity-find-one>
+                <set field="effectivePriceListId" from="custParty?.priceListId"/>
+            </if>
+
+            <!-- 1c: Customer group price list -->
+            <if condition="!effectivePriceListId &amp;&amp; customerGroupId">
+                <entity-find entity-name="zenith.erp.pricing.CustomerPriceList" list="groupPls">
+                    <econdition field-name="customerGroupId"/>
+                    <date-filter from-field-name="validFromDate" thru-field-name="validThruDate"/>
+                    <order-by field-name="priority"/>
+                </entity-find>
+                <if condition="groupPls">
+                    <set field="effectivePriceListId" from="groupPls[0].priceListId"/>
+                </if>
+            </if>
+
+            <!-- 1d: Organization default price list -->
+            <if condition="!effectivePriceListId &amp;&amp; organizationPartyId">
+                <entity-find entity-name="zenith.erp.pricing.PriceList" list="defPls" limit="1">
+                    <econdition field-name="organizationPartyId"/>
+                    <econdition field-name="priceListTypeEnumId" value="PltSelling"/>
+                    <econdition field-name="isDefault" value="Y"/>
+                    <econdition field-name="isActive" value="Y"/>
+                </entity-find>
+                <if condition="defPls">
+                    <set field="effectivePriceListId" from="defPls[0].priceListId"/>
+                </if>
+            </if>
+
+            <!-- Step 2: Look up price from price list -->
+            <if condition="effectivePriceListId">
+                <entity-find entity-name="zenith.erp.pricing.PriceListItem" list="plItems">
+                    <econdition field-name="priceListId" from="effectivePriceListId"/>
+                    <econdition field-name="productId"/>
+                    <econdition field-name="minQuantity" operator="less-equals" from="quantity"/>
+                    <econditions combine="or">
+                        <econdition field-name="maxQuantity" operator="is-null"/>
+                        <econdition field-name="maxQuantity" operator="greater-equals" from="quantity"/>
+                    </econditions>
+                    <date-filter from-field-name="validFromDate" thru-field-name="validThruDate"/>
+                    <order-by field-name="-minQuantity"/>
+                </entity-find>
+                <if condition="plItems">
+                    <set field="plItem" from="plItems[0]"/>
+                    <if condition="plItem.priceTypeEnumId == 'PtpFixed'">
+                        <set field="unitPrice" from="plItem.unitPrice" type="BigDecimal"/>
+                        <set field="priceSource" value="PriceList"/>
+                    <else-if condition="plItem.priceTypeEnumId == 'PtpDiscount' &amp;&amp; plItem.discountPercent">
+                        <set field="unitPrice" from="(listPrice * (100 - plItem.discountPercent) / 100).setScale(2, java.math.RoundingMode.HALF_UP)" type="BigDecimal"/>
+                        <set field="priceSource" value="PriceListDiscount"/>
+                    </else-if></if>
+                </if>
+
+                <!-- Check for parent price list fallback -->
+                <if condition="!plItems">
+                    <entity-find-one entity-name="zenith.erp.pricing.PriceList" value-field="pl">
+                        <field-map field-name="priceListId" from="effectivePriceListId"/>
+                    </entity-find-one>
+                    <if condition="pl?.parentPriceListId">
+                        <service-call name="zenith.pricing.PricingServices.calculate#Price"
+                                      in-map="[productId:productId, quantity:quantity,
+                                               priceListId:pl.parentPriceListId, orderDate:orderDate]"
+                                      out-map="parentResult"/>
+                        <if condition="parentResult.priceSource != 'ProductListPrice'">
+                            <set field="unitPrice" from="parentResult.unitPrice"/>
+                            <set field="priceSource" from="'ParentPriceList:' + parentResult.priceSource"/>
+                        </if>
+                    </if>
+                </if>
+            </if>
+
+            <!-- Step 3: Volume pricing override -->
+            <if condition="effectivePriceListId &amp;&amp; quantity &gt; 1">
+                <entity-find entity-name="zenith.erp.pricing.VolumePricing" list="volPrices">
+                    <econdition field-name="priceListId" from="effectivePriceListId"/>
+                    <econdition field-name="productId"/>
+                    <econdition field-name="minQuantity" operator="less-equals" from="quantity"/>
+                    <econditions combine="or">
+                        <econdition field-name="maxQuantity" operator="is-null"/>
+                        <econdition field-name="maxQuantity" operator="greater-equals" from="quantity"/>
+                    </econditions>
+                    <date-filter from-field-name="validFromDate" thru-field-name="validThruDate"/>
+                    <order-by field-name="-minQuantity"/>
+                </entity-find>
+                <if condition="volPrices">
+                    <set field="vp" from="volPrices[0]"/>
+                    <if condition="vp.unitPrice">
+                        <set field="unitPrice" from="vp.unitPrice" type="BigDecimal"/>
+                        <set field="priceSource" value="VolumePricing"/>
+                    <else-if condition="vp.discountPercent">
+                        <set field="unitPrice" from="(unitPrice * (100 - vp.discountPercent) / 100).setScale(2, java.math.RoundingMode.HALF_UP)" type="BigDecimal"/>
+                        <set field="priceSource" value="VolumeDiscount"/>
+                    </else-if></if>
+                </if>
+            </if>
+
+            <!-- Step 4: Apply pricing rules -->
+            <entity-find entity-name="zenith.erp.pricing.PricingRule" list="rules">
+                <econdition field-name="isActive" value="Y"/>
+                <econditions combine="or">
+                    <econdition field-name="organizationPartyId" from="organizationPartyId"/>
+                    <econdition field-name="organizationPartyId" operator="is-null"/>
+                </econditions>
+                <date-filter from-field-name="validFromDate" thru-field-name="validThruDate"/>
+                <order-by field-name="priority"/>
+            </entity-find>
+            <iterate list="rules" entry="rule">
+                <entity-find entity-name="zenith.erp.pricing.PricingRuleCondition" list="conditions">
+                    <econdition field-name="pricingRuleId" from="rule.pricingRuleId"/>
+                </entity-find>
+
+                <set field="allMatch" from="true" type="Boolean"/>
+                <iterate list="conditions" entry="cond">
+                    <if condition="cond.conditionTypeEnumId == 'PctProduct'">
+                        <if condition="cond.fieldValue != productId"><set field="allMatch" from="false"/></if>
+                    <else-if condition="cond.conditionTypeEnumId == 'PctProductCategory'">
+                        <entity-find entity-name="mantle.product.category.ProductCategoryMember" list="catMembers" limit="1">
+                            <econdition field-name="productId"/>
+                            <econdition field-name="productCategoryId" from="cond.fieldValue"/>
+                            <date-filter/>
+                        </entity-find>
+                        <if condition="!catMembers"><set field="allMatch" from="false"/></if>
+                    </else-if>
+                    <else-if condition="cond.conditionTypeEnumId == 'PctMinQuantity'">
+                        <if condition="quantity &lt; (cond.fieldValue as BigDecimal)"><set field="allMatch" from="false"/></if>
+                    </else-if>
+                    <else-if condition="cond.conditionTypeEnumId == 'PctMinAmount'">
+                        <if condition="(unitPrice * quantity) &lt; (cond.fieldValue as BigDecimal)"><set field="allMatch" from="false"/></if>
+                    </else-if>
+                    <else-if condition="cond.conditionTypeEnumId == 'PctChannel'">
+                        <if condition="cond.fieldValue != salesChannelEnumId"><set field="allMatch" from="false"/></if>
+                    </else-if>
+                    <else-if condition="cond.conditionTypeEnumId == 'PctCustomerGroup'">
+                        <if condition="cond.fieldValue != customerGroupId"><set field="allMatch" from="false"/></if>
+                    </else-if>
+                    <else-if condition="cond.conditionTypeEnumId == 'PctRegion'">
+                        <if condition="!regionGeoId || cond.fieldValue != regionGeoId"><set field="allMatch" from="false"/></if>
+                    </else-if>
+                    <else-if condition="cond.conditionTypeEnumId == 'PctDayOfWeek'">
+                        <script><![CDATA[
+                            def ldt = new java.sql.Timestamp(((java.util.Date)now).getTime()).toLocalDateTime()
+                            def fv = (cond.fieldValue ?: '').toUpperCase()
+                            def dn = ldt.getDayOfWeek().name().substring(0,3)
+                            def di = '' + ldt.getDayOfWeek().getValue()
+                            def days = fv.replace(' ','').split(',')
+                            if (!(fv.contains(dn) || days.contains(di))) allMatch = false
+                        ]]></script>
+                    </else-if>
+                    <else-if condition="cond.conditionTypeEnumId == 'PctTimeRange'">
+                        <script><![CDATA[
+                            def fv = (cond.fieldValue ?: '').trim()
+                            if (fv.contains('-')) {
+                                try {
+                                    def parts = fv.split('-')
+                                    def lt = new java.sql.Timestamp(((java.util.Date)now).getTime()).toLocalDateTime().toLocalTime()
+                                    def st = java.time.LocalTime.parse(parts[0].trim())
+                                    def en = java.time.LocalTime.parse(parts[1].trim())
+                                    if (lt.isBefore(st) || lt.isAfter(en)) allMatch = false
+                                } catch (Exception ex) { allMatch = false }
+                            } else { allMatch = false }
+                        ]]></script>
+                    </else-if>
+                    <else>
+                        <set field="allMatch" from="false"/>
+                    </else>
+                    </if>
+                </iterate>
+
+                <if condition="allMatch">
+                    <set field="preBefore" from="unitPrice"/>
+                    <if condition="rule.actionType == 'PatDiscountPercent'">
+                        <set field="discount" from="(unitPrice * rule.actionValue / 100).setScale(2, java.math.RoundingMode.HALF_UP)"/>
+                        <if condition="rule.maxDiscount &amp;&amp; discount &gt; rule.maxDiscount">
+                            <set field="discount" from="rule.maxDiscount"/>
+                        </if>
+                        <set field="unitPrice" from="unitPrice - discount"/>
+                    <else-if condition="rule.actionType == 'PatDiscountAmount'">
+                        <set field="discAmt" from="rule.actionValue"/>
+                        <if condition="rule.maxDiscount &amp;&amp; discAmt &gt; rule.maxDiscount">
+                            <set field="discAmt" from="rule.maxDiscount"/>
+                        </if>
+                        <set field="unitPrice" from="unitPrice - discAmt"/>
+                    </else-if>
+                    <else-if condition="rule.actionType == 'PatFixedPrice'">
+                        <set field="unitPrice" from="rule.actionValue" type="BigDecimal"/>
+                    </else-if></if>
+
+                    <if condition="rule.minimumPrice &amp;&amp; unitPrice &lt; rule.minimumPrice">
+                        <set field="unitPrice" from="rule.minimumPrice" type="BigDecimal"/>
+                    </if>
+                    <if condition="unitPrice &lt; 0">
+                        <set field="unitPrice" from="BigDecimal.ZERO" type="BigDecimal"/>
+                    </if>
+
+                    <script>appliedRules.add([ruleId:rule.pricingRuleId, ruleName:rule.ruleName,
+                        priceBefore:preBefore, priceAfter:unitPrice])</script>
+
+                    <if condition="rule.isStackable != 'Y'"><break/></if>
+                </if>
+            </iterate>
+
+            <!-- Resolve currency -->
+            <if condition="!currencyUomId &amp;&amp; effectivePriceListId">
+                <entity-find-one entity-name="zenith.erp.pricing.PriceList" value-field="plForCurr">
+                    <field-map field-name="priceListId" from="effectivePriceListId"/>
+                </entity-find-one>
+                <set field="currencyUomId" from="plForCurr?.currencyUomId"/>
+            </if>
+
+            <!-- Honor the price list's configured rounding mode/precision -->
+            <set field="roundMode" value="HALF_UP"/>
+            <set field="roundPrec" from="2" type="Integer"/>
+            <if condition="effectivePriceListId">
+                <entity-find-one entity-name="zenith.erp.pricing.PriceList" value-field="plRound">
+                    <field-map field-name="priceListId" from="effectivePriceListId"/></entity-find-one>
+                <if condition="plRound?.roundingMode"><set field="roundMode" from="plRound.roundingMode"/></if>
+                <if condition="plRound?.roundingPrecision != null"><set field="roundPrec" from="plRound.roundingPrecision" type="Integer"/></if>
+            </if>
+            <script><![CDATA[
+                try { unitPrice = (unitPrice as BigDecimal).setScale((roundPrec as int), java.math.RoundingMode.valueOf(roundMode as String)) }
+                catch (Exception e) { unitPrice = (unitPrice as BigDecimal).setScale(2, java.math.RoundingMode.HALF_UP) }
+            ]]></script>
+        </actions>
+    </service>
+
+    <!-- ========== Convenience: Get Customer Price ========== -->
+
+    <service verb="get" noun="CustomerPrice">
+        <description>Shorthand to get the effective price for a customer+product combination</description>
+        <in-parameters>
+            <parameter name="productId" required="true"/>
+            <parameter name="customerPartyId" required="true"/>
+            <parameter name="quantity" type="BigDecimal" default="1"/>
+            <parameter name="organizationPartyId"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="unitPrice" type="BigDecimal"/>
+            <parameter name="listPrice" type="BigDecimal"/>
+            <parameter name="priceSource"/>
+            <parameter name="currencyUomId"/>
+        </out-parameters>
+        <actions>
+            <service-call name="zenith.pricing.PricingServices.calculate#Price"
+                          in-map="[productId:productId, customerPartyId:customerPartyId,
+                                   quantity:quantity, organizationPartyId:organizationPartyId]"
+                          out-map="context"/>
+        </actions>
+    </service>
+
+    <!-- ========== Get Product Prices Across Lists ========== -->
+
+    <service verb="get" noun="ProductPrices">
+        <description>Get all prices for a product across all active price lists</description>
+        <in-parameters>
+            <parameter name="productId" required="true"/>
+            <parameter name="organizationPartyId"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="prices" type="List"/>
+        </out-parameters>
+        <actions>
+            <entity-find entity-name="zenith.erp.pricing.PriceListItemDetail" list="items">
+                <econdition field-name="productId"/>
+                <econdition field-name="isActive" value="Y"/>
+                <date-filter from-field-name="validFromDate" thru-field-name="validThruDate"/>
+                <order-by field-name="priceListName"/>
+            </entity-find>
+            <set field="prices" from="items"/>
+        </actions>
+    </service>
+
+</services>

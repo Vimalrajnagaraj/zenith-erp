@@ -1,0 +1,246 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <!-- Generate GSTR-2 Data (Purchase Register / ITC Claims) -->
+    <service verb="generate" noun="Gstr2Data">
+        <description>Aggregate all purchase invoices for a return period into GSTR-2 format.
+            Matches supplier invoices against GSTR-2A/2B auto-populated data.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="returnPeriod" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="totalInvoices" type="Integer"/>
+            <parameter name="totalTaxableValue" type="BigDecimal"/>
+            <parameter name="totalIgst" type="BigDecimal"/>
+            <parameter name="totalCgst" type="BigDecimal"/>
+            <parameter name="totalSgst" type="BigDecimal"/>
+            <parameter name="totalCess" type="BigDecimal"/>
+            <parameter name="matchedCount" type="Integer"/>
+            <parameter name="unmatchedCount" type="Integer"/>
+            <parameter name="reportData" type="List"/>
+        </out-parameters>
+        <actions>
+            <set field="periodYear" from="returnPeriod.substring(2)"/>
+            <set field="periodMonth" from="returnPeriod.substring(0, 2)"/>
+            <script><![CDATA[
+                def cal = Calendar.getInstance()
+                cal.set(Calendar.YEAR, Integer.parseInt(periodYear))
+                cal.set(Calendar.MONTH, Integer.parseInt(periodMonth) - 1)
+                cal.set(Calendar.DAY_OF_MONTH, 1)
+                def fromDate = new java.sql.Timestamp(cal.timeInMillis)
+                cal.add(Calendar.MONTH, 1)
+                cal.add(Calendar.MILLISECOND, -1)
+                def toDate = new java.sql.Timestamp(cal.timeInMillis)
+            ]]></script>
+
+            <entity-find entity-name="zenith.erp.purchase.PurchaseInvoice" list="invoices">
+                <econdition field-name="organizationPartyId"/>
+                <econdition field-name="invoiceDate" operator="greater-equals" from="fromDate"/>
+                <econdition field-name="invoiceDate" operator="less-equals" from="toDate"/>
+                <econdition field-name="statusId" operator="in" value="InvApproved,InvPaid"/>
+            </entity-find>
+
+            <set field="totalInvoices" from="invoices?.size() ?: 0"/>
+            <set field="totalTaxableValue" from="0" type="BigDecimal"/>
+            <set field="totalIgst" from="0" type="BigDecimal"/>
+            <set field="totalCgst" from="0" type="BigDecimal"/>
+            <set field="totalSgst" from="0" type="BigDecimal"/>
+            <set field="totalCess" from="0" type="BigDecimal"/>
+            <set field="matchedCount" from="0" type="Integer"/>
+            <set field="unmatchedCount" from="0" type="Integer"/>
+            <set field="reportData" from="[]"/>
+
+            <iterate list="invoices" entry="inv">
+                <entity-find entity-name="zenith.erp.tax.TaxLineDetail" list="taxLines">
+                    <econdition field-name="referenceType" value="PurchaseInvoice"/>
+                    <econdition field-name="referenceId" from="inv.purchaseInvoiceId"/>
+                </entity-find>
+                <set field="invIgst" from="0" type="BigDecimal"/>
+                <set field="invCgst" from="0" type="BigDecimal"/>
+                <set field="invSgst" from="0" type="BigDecimal"/>
+                <set field="invCess" from="0" type="BigDecimal"/>
+                <iterate list="taxLines" entry="tl">
+                    <if condition="tl.taxName == 'IGST'"><set field="invIgst" from="invIgst + (tl.taxAmount ?: 0)"/>
+                    <else-if condition="tl.taxName == 'CGST'"><set field="invCgst" from="invCgst + (tl.taxAmount ?: 0)"/>
+                    </else-if><else-if condition="tl.taxName == 'SGST'"><set field="invSgst" from="invSgst + (tl.taxAmount ?: 0)"/>
+                    </else-if><else-if condition="tl.taxName == 'CESS'"><set field="invCess" from="invCess + (tl.taxAmount ?: 0)"/>
+                    </else-if></if>
+                </iterate>
+                <set field="totalTaxableValue" from="totalTaxableValue + (inv.totalTaxableAmount ?: 0)"/>
+                <set field="totalIgst" from="totalIgst + invIgst"/>
+                <set field="totalCgst" from="totalCgst + invCgst"/>
+                <set field="totalSgst" from="totalSgst + invSgst"/>
+                <set field="totalCess" from="totalCess + invCess"/>
+
+                <!-- Check GSTR-2B matching -->
+                <entity-find entity-name="zenith.erp.india.Gstr2bRecord" list="matches" limit="1">
+                    <econdition field-name="supplierGstin" from="inv.vendorGstin"/>
+                    <econdition field-name="invoiceNumber" from="inv.vendorInvoiceNumber"/>
+                </entity-find>
+                <set field="isMatched" from="matches ? true : false"/>
+                <if condition="isMatched"><set field="matchedCount" from="matchedCount + 1"/>
+                <else><set field="unmatchedCount" from="unmatchedCount + 1"/></else></if>
+
+                <set field="reportData" from="reportData + [[
+                    invoiceId:inv.purchaseInvoiceId, vendorName:inv.vendorPartyId,
+                    invoiceNumber:inv.vendorInvoiceNumber, invoiceDate:inv.invoiceDate,
+                    taxableValue:inv.totalTaxableAmount, igst:invIgst, cgst:invCgst,
+                    sgst:invSgst, cess:invCess, matched:isMatched]]"/>
+            </iterate>
+        </actions>
+    </service>
+
+    <!-- Generate GSTR-3B Summary -->
+    <service verb="generate" noun="Gstr3bData">
+        <description>Generate GSTR-3B summary return combining outward supplies (GSTR-1),
+            inward supplies (GSTR-2), and ITC for a given period.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="returnPeriod" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="table31" type="Map"/>
+            <parameter name="table32" type="Map"/>
+            <parameter name="table4" type="Map"/>
+            <parameter name="table5" type="Map"/>
+            <parameter name="netTaxPayable" type="Map"/>
+        </out-parameters>
+        <actions>
+            <set field="periodYear" from="returnPeriod.substring(2)"/>
+            <set field="periodMonth" from="returnPeriod.substring(0, 2)"/>
+            <script><![CDATA[
+                def cal = Calendar.getInstance()
+                cal.set(Calendar.YEAR, Integer.parseInt(periodYear))
+                cal.set(Calendar.MONTH, Integer.parseInt(periodMonth) - 1)
+                cal.set(Calendar.DAY_OF_MONTH, 1)
+                def fromDate = new java.sql.Timestamp(cal.timeInMillis)
+                cal.add(Calendar.MONTH, 1)
+                cal.add(Calendar.MILLISECOND, -1)
+                def toDate = new java.sql.Timestamp(cal.timeInMillis)
+            ]]></script>
+
+            <!-- Table 3.1: Outward supplies -->
+            <entity-find entity-name="zenith.erp.tax.TaxLineDetail" list="outwardTax">
+                <econdition field-name="referenceType" value="SalesInvoice"/>
+                <econdition field-name="createdDate" operator="greater-equals" from="fromDate"/>
+                <econdition field-name="createdDate" operator="less-equals" from="toDate"/>
+            </entity-find>
+            <set field="outIgst" from="0" type="BigDecimal"/>
+            <set field="outCgst" from="0" type="BigDecimal"/>
+            <set field="outSgst" from="0" type="BigDecimal"/>
+            <set field="outCess" from="0" type="BigDecimal"/>
+            <iterate list="outwardTax" entry="tl">
+                <if condition="tl.taxName == 'IGST'"><set field="outIgst" from="outIgst + (tl.taxAmount ?: 0)"/>
+                <else-if condition="tl.taxName == 'CGST'"><set field="outCgst" from="outCgst + (tl.taxAmount ?: 0)"/>
+                </else-if><else-if condition="tl.taxName == 'SGST'"><set field="outSgst" from="outSgst + (tl.taxAmount ?: 0)"/>
+                </else-if><else-if condition="tl.taxName == 'CESS'"><set field="outCess" from="outCess + (tl.taxAmount ?: 0)"/>
+                </else-if></if>
+            </iterate>
+            <set field="table31" from="[igst:outIgst, cgst:outCgst, sgst:outSgst, cess:outCess]"/>
+
+            <!-- Table 3.2: Inter-state supplies to unregistered/composition -->
+            <set field="table32" from="[igst:0, cgst:0, sgst:0, cess:0]"/>
+
+            <!-- Table 4: ITC (Input Tax Credit) -->
+            <entity-find entity-name="zenith.erp.tax.TaxLineDetail" list="inwardTax">
+                <econdition field-name="referenceType" value="PurchaseInvoice"/>
+                <econdition field-name="createdDate" operator="greater-equals" from="fromDate"/>
+                <econdition field-name="createdDate" operator="less-equals" from="toDate"/>
+            </entity-find>
+            <set field="inIgst" from="0" type="BigDecimal"/>
+            <set field="inCgst" from="0" type="BigDecimal"/>
+            <set field="inSgst" from="0" type="BigDecimal"/>
+            <set field="inCess" from="0" type="BigDecimal"/>
+            <iterate list="inwardTax" entry="tl">
+                <if condition="tl.taxName == 'IGST'"><set field="inIgst" from="inIgst + (tl.taxAmount ?: 0)"/>
+                <else-if condition="tl.taxName == 'CGST'"><set field="inCgst" from="inCgst + (tl.taxAmount ?: 0)"/>
+                </else-if><else-if condition="tl.taxName == 'SGST'"><set field="inSgst" from="inSgst + (tl.taxAmount ?: 0)"/>
+                </else-if><else-if condition="tl.taxName == 'CESS'"><set field="inCess" from="inCess + (tl.taxAmount ?: 0)"/>
+                </else-if></if>
+            </iterate>
+            <set field="table4" from="[igst:inIgst, cgst:inCgst, sgst:inSgst, cess:inCess]"/>
+
+            <!-- Table 5: Exempt/Nil-rated/Non-GST -->
+            <set field="table5" from="[interState:0, intraState:0]"/>
+
+            <!-- Net Tax Payable -->
+            <set field="netTaxPayable" from="[
+                igst: outIgst - inIgst,
+                cgst: outCgst - inCgst,
+                sgst: outSgst - inSgst,
+                cess: outCess - inCess
+            ]"/>
+        </actions>
+    </service>
+
+
+    <service verb="importAndReconcile" noun="Gstr2b">
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="returnPeriod" required="true"/>
+            <parameter name="gstr2bJsonFile" type="org.apache.commons.fileupload2.core.FileItem"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="matchedCount" type="Integer"/>
+            <parameter name="unmatchedCount" type="Integer"/>
+            <parameter name="missingInBooksCount" type="Integer"/>
+        </out-parameters>
+        <actions>
+            <script><![CDATA[
+                int matched = 0, unmatched = 0, missingInBooks = 0
+                String fileContent = ""
+                if (gstr2bJsonFile) {
+                    try { fileContent = new String(gstr2bJsonFile.get(), "UTF-8") }
+                    catch (Exception e) { fileContent = "" }
+                }
+                if (!fileContent) {
+                    ec.message.addMessage("No file uploaded or file is empty. Please upload a valid GSTR-2B JSON.", "warning")
+                    matchedCount = 0; unmatchedCount = 0; missingInBooksCount = 0
+                    return
+                }
+                try {
+                    def jsonSlurper = new groovy.json.JsonSlurper()
+                    def gstr2b = jsonSlurper.parseText(fileContent)
+                    def b2b = gstr2b?.data?.docdata?.b2b ?: gstr2b?.b2b ?: []
+                    for (supplier in b2b) {
+                        String supplierGstin = supplier.ctin ?: supplier.gstin ?: ""
+                        def invoices = supplier.inv ?: []
+                        for (inv in invoices) {
+                            String invNum = inv.inum ?: inv.val?.toString() ?: ""
+                            BigDecimal taxable = (inv.val ?: 0) as BigDecimal
+                            BigDecimal igst = 0, cgst = 0, sgst = 0
+                            for (item in (inv.items ?: inv.itms ?: [])) {
+                                def det = item.itm_det ?: item
+                                igst += (det.iamt ?: 0) as BigDecimal
+                                cgst += (det.camt ?: 0) as BigDecimal
+                                sgst += (det.samt ?: 0) as BigDecimal
+                                taxable = (det.txval ?: taxable) as BigDecimal
+                            }
+                            def existing = ec.entity.find("zenith.erp.india.Gstr2bRecord")
+                                .condition("supplierGstin", supplierGstin)
+                                .condition("invoiceNumber", invNum).one()
+                            if (!existing) {
+                                ec.entity.makeValue("zenith.erp.india.Gstr2bRecord").setAll([
+                                    supplierGstin:supplierGstin, invoiceNumber:invNum,
+                                    taxableAmount:taxable, igstAmount:igst, cgstAmount:cgst, sgstAmount:sgst,
+                                    returnPeriod:returnPeriod, matchStatus:"MissingInBooks"
+                                ]).setSequencedIdPrimary().create()
+                                missingInBooks++
+                            } else {
+                                if (existing.matchStatus == "Matched") matched++
+                                else unmatched++
+                            }
+                        }
+                    }
+                } catch (Exception e) {
+                    ec.message.addError("Error parsing GSTR-2B JSON: " + e.message)
+                }
+                matchedCount = matched; unmatchedCount = unmatched; missingInBooksCount = missingInBooks
+                ec.message.addMessage("GSTR-2B reconciliation complete: ${matched} matched, ${unmatched} unmatched, ${missingInBooks} missing in books.", "success")
+            ]]></script>
+        </actions>
+    </service>
+
+</services>

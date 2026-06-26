@@ -1,0 +1,129 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: zenith-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-zenith_saas}
+      POSTGRES_USER: ${DB_USER:-zenith}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - pgbackups:/backups
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-zenith} -d ${DB_NAME:-zenith_saas}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  zenith:
+    build:
+      context: ../..
+      dockerfile: zenith-erp-saas/docker/Dockerfile
+    container_name: zenith-app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ZENITH_PORT: 8080
+      ZENITH_DB_HOST: postgres
+      ZENITH_DB_PORT: 5432
+      ZENITH_DB_NAME: ${DB_NAME:-zenith_saas}
+      ZENITH_DB_USER: ${DB_USER:-zenith}
+      ZENITH_DB_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
+      ZENITH_CRYPT_PASS: ${CRYPT_PASS:?Set CRYPT_PASS in .env}
+      JAVA_OPTS: >-
+        -Xms${JAVA_XMS:-512m}
+        -Xmx${JAVA_XMX:-2g}
+        -XX:+UseG1GC
+        -XX:MaxGCPauseMillis=200
+        -Djava.security.egd=file:/dev/./urandom
+    volumes:
+      - zenith-log:/opt/zenith/runtime/log
+      - zenith-sessions:/opt/zenith/runtime/sessions
+      - zenith-txlog:/opt/zenith/runtime/txlog
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8080/status"]
+      interval: 30s
+      timeout: 10s
+      start_period: 120s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 3G
+
+  nginx:
+    image: nginx:alpine
+    container_name: zenith-proxy
+    restart: unless-stopped
+    depends_on:
+      zenith:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - certbot-conf:/etc/nginx/certs:ro
+      - certbot-www:/var/www/certbot:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:80/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # Let's Encrypt certificate management
+  certbot:
+    image: certbot/certbot
+    container_name: zenith-certbot
+    volumes:
+      - certbot-conf:/etc/letsencrypt
+      - certbot-www:/var/www/certbot
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep 12h & wait $${!}; done;'"
+
+  # Automated daily backup at 2:00 AM
+  backup:
+    image: postgres:16-alpine
+    container_name: zenith-backup
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGUSER: ${DB_USER:-zenith}
+      PGPASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
+      PGDATABASE: ${DB_NAME:-zenith_saas}
+      BACKUP_RETAIN_DAYS: ${BACKUP_RETAIN_DAYS:-30}
+    volumes:
+      - pgbackups:/backups
+      - ./backup.sh:/backup.sh:ro
+      - ./crontab:/etc/crontabs/root:ro
+    entrypoint: ["/bin/sh", "-c", "chmod +x /backup.sh && crond -f -l 2"]
+
+volumes:
+  pgdata:
+    driver: local
+  pgbackups:
+    driver: local
+  zenith-log:
+    driver: local
+  zenith-sessions:
+    driver: local
+  zenith-txlog:
+    driver: local
+  certbot-conf:
+    driver: local
+  certbot-www:
+    driver: local

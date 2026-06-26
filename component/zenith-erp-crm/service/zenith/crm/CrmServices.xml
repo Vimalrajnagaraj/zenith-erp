@@ -1,0 +1,504 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <!-- ========== Lead Services ========== -->
+
+    <service verb="create" noun="Lead">
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="firstName" required="true"/>
+            <parameter name="lastName"/>
+            <parameter name="companyName"/>
+            <parameter name="designation"/>
+            <parameter name="email"/>
+            <parameter name="phone"/>
+            <parameter name="mobile"/>
+            <parameter name="website"/>
+            <parameter name="address"/>
+            <parameter name="city"/>
+            <parameter name="regionCode"/>
+            <parameter name="postalCode"/>
+            <parameter name="countryGeoId"/>
+            <parameter name="taxRegistrationNumber"/>
+            <parameter name="taxIdNumber"/>
+            <parameter name="leadSourceId"/>
+            <parameter name="rating"/>
+            <parameter name="assignedToUserId"/>
+            <parameter name="estimatedAmount" type="BigDecimal"/>
+            <parameter name="estimatedCloseDate" type="Date"/>
+            <parameter name="description"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="leadId"/>
+        </out-parameters>
+        <actions>
+            <service-call name="create#zenith.erp.crm.Lead" out-map="ldOut"
+                          in-map="[organizationPartyId:organizationPartyId, firstName:firstName,
+                                   lastName:lastName, companyName:companyName, designation:designation,
+                                   email:email, phone:phone, mobile:mobile, website:website,
+                                   address:address, city:city, regionCode:regionCode, postalCode:postalCode,
+                                   countryGeoId:countryGeoId, taxRegistrationNumber:taxRegistrationNumber,
+                                   taxIdNumber:taxIdNumber, leadSourceId:leadSourceId,
+                                   statusId:'LeadNew', rating:rating ?: 'Warm', score:0,
+                                   assignedToUserId:assignedToUserId ?: ec.user.userId,
+                                   estimatedAmount:estimatedAmount, estimatedCloseDate:estimatedCloseDate,
+                                   description:description, createdDate:ec.user.nowTimestamp]"/>
+            <set field="leadId" from="ldOut.leadId"/>
+
+            <service-call name="zenith.crm.CrmServices.score#Lead" in-map="[leadId:leadId]" ignore-error="true"/>
+        </actions>
+    </service>
+
+    <service verb="score" noun="Lead">
+        <in-parameters>
+            <parameter name="leadId" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="score" type="Integer"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.crm.Lead" value-field="lead"/>
+            <set field="score" from="0" type="Integer"/>
+
+            <if condition="lead.email"><set field="score" from="score + 10"/></if>
+            <if condition="lead.phone || lead.mobile"><set field="score" from="score + 10"/></if>
+            <if condition="lead.companyName"><set field="score" from="score + 15"/></if>
+            <if condition="lead.taxRegistrationNumber"><set field="score" from="score + 20"/></if>
+            <if condition="lead.estimatedAmount &amp;&amp; lead.estimatedAmount &gt; 0"><set field="score" from="score + 15"/></if>
+            <if condition="lead.estimatedAmount &amp;&amp; lead.estimatedAmount &gt; 100000"><set field="score" from="score + 10"/></if>
+            <if condition="lead.city"><set field="score" from="score + 5"/></if>
+
+            <entity-find entity-name="zenith.erp.crm.LeadScoringRule" list="rules">
+                <econdition field-name="isActive" value="Y"/></entity-find>
+            <iterate list="rules" entry="rule">
+                <set field="fieldVal" from="lead.get(rule.fieldName)"/>
+                <if condition="rule.operator == 'equals' &amp;&amp; fieldVal == rule.fieldValue">
+                    <set field="score" from="score + rule.scorePoints"/>
+                <else-if condition="rule.operator == 'contains' &amp;&amp; fieldVal?.toString()?.contains(rule.fieldValue)">
+                    <set field="score" from="score + rule.scorePoints"/>
+                </else-if></if>
+            </iterate>
+
+            <if condition="score &gt; 100"><set field="score" from="100"/></if>
+            <service-call name="update#zenith.erp.crm.Lead" in-map="[leadId:leadId, score:score]"/>
+        </actions>
+    </service>
+
+    <service verb="convert" noun="Lead">
+        <description>Convert a qualified lead into a Contact (Party) and optionally a Sales Opportunity</description>
+        <in-parameters>
+            <parameter name="leadId" required="true"/>
+            <parameter name="createOpportunity" default-value="Y"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="partyId"/>
+            <parameter name="salesOpportunityId"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.crm.Lead" value-field="lead"/>
+            <if condition="lead.statusId == 'LeadConverted'">
+                <return error="true" message="Lead is already converted"/></if>
+
+            <!-- Get organization's currency -->
+            <entity-find-one entity-name="zenith.erp.base.CompanySettings" value-field="currSetting">
+                <field-map field-name="organizationPartyId" from="lead.organizationPartyId"/>
+                <field-map field-name="settingKey" value="CURRENCY_UOM_ID"/>
+            </entity-find-one>
+            <set field="currencyUomId" from="currSetting?.settingValue ?: 'USD'"/>
+
+            <set field="contactType" from="lead.companyName ? 'Organization' : 'Person'"/>
+            <if condition="contactType == 'Organization'">
+                <service-call name="zenith.contacts.ContactServices.create#Contact" out-map="cOut"
+                              in-map="[partyTypeEnumId:'PtyOrganization', organizationName:lead.companyName,
+                                       emailAddress:lead.email, contactNumber:lead.mobile ?: lead.phone,
+                                       taxRegistrationNumber:lead.taxRegistrationNumber,
+                                       countryGeoId:lead.countryGeoId, regionGeoId:lead.regionCode]"/>
+            <else>
+                <service-call name="zenith.contacts.ContactServices.create#Contact" out-map="cOut"
+                              in-map="[partyTypeEnumId:'PtyPerson', firstName:lead.firstName,
+                                       lastName:lead.lastName, emailAddress:lead.email,
+                                       contactNumber:lead.mobile ?: lead.phone,
+                                       taxRegistrationNumber:lead.taxRegistrationNumber,
+                                       countryGeoId:lead.countryGeoId, regionGeoId:lead.regionCode]"/>
+            </else></if>
+            <set field="partyId" from="cOut.partyId"/>
+
+            <if condition="createOpportunity == 'Y'">
+                <service-call name="create#mantle.sales.opportunity.SalesOpportunity" out-map="oppOut"
+                              in-map="[opportunityName:(lead.companyName ?: (lead.firstName + ' ' + (lead.lastName ?: ''))) + ' - Opportunity',
+                                       accountPartyId:partyId, estimatedAmount:lead.estimatedAmount,
+                                       estimatedCloseDate:lead.estimatedCloseDate, estimatedProbability:0.25,
+                                       currencyUomId:currencyUomId, opportunityStageId:'SoProspecting',
+                                       leadId:leadId, assignedToUserId:lead.assignedToUserId,
+                                       pipelineId:'DefaultPipeline',
+                                       expectedRevenue:(lead.estimatedAmount ?: 0) * 0.25]"/>
+                <set field="salesOpportunityId" from="oppOut.salesOpportunityId"/>
+            </if>
+
+            <service-call name="update#zenith.erp.crm.Lead"
+                          in-map="[leadId:leadId, statusId:'LeadConverted', convertedDate:ec.user.nowTimestamp,
+                                   convertedPartyId:partyId, convertedOpportunityId:salesOpportunityId]"/>
+        </actions>
+    </service>
+
+    <!-- ========== Activity Services ========== -->
+
+    <service verb="log" noun="Activity">
+        <in-parameters>
+            <parameter name="activityType" required="true"/>
+            <parameter name="subject" required="true"/>
+            <parameter name="description"/>
+            <parameter name="activityDate" type="Timestamp" default="ec.user.nowTimestamp"/>
+            <parameter name="durationMinutes" type="Integer"/>
+            <parameter name="leadId"/>
+            <parameter name="salesOpportunityId"/>
+            <parameter name="contactPartyId"/>
+            <parameter name="outcome"/>
+            <parameter name="nextFollowUpDate" type="Timestamp"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="activityId"/>
+        </out-parameters>
+        <actions>
+            <service-call name="create#zenith.erp.crm.CrmActivity" out-map="actOut"
+                          in-map="[activityType:activityType, subject:subject, description:description,
+                                   activityDate:activityDate, durationMinutes:durationMinutes,
+                                   leadId:leadId, salesOpportunityId:salesOpportunityId,
+                                   contactPartyId:contactPartyId, performedByUserId:ec.user.userId,
+                                   outcome:outcome, nextFollowUpDate:nextFollowUpDate]"/>
+            <set field="activityId" from="actOut.activityId"/>
+
+            <if condition="leadId">
+                <entity-find-one entity-name="zenith.erp.crm.Lead" value-field="lead"/>
+                <if condition="lead?.statusId == 'LeadNew'">
+                    <service-call name="update#zenith.erp.crm.Lead"
+                                  in-map="[leadId:leadId, statusId:'LeadContacted']"/>
+                </if>
+            </if>
+        </actions>
+    </service>
+
+    <!-- ========== Opportunity Services ========== -->
+
+    <service verb="advance" noun="OpportunityStage">
+        <in-parameters>
+            <parameter name="salesOpportunityId" required="true"/>
+            <parameter name="opportunityStageId" required="true"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="mantle.sales.opportunity.SalesOpportunityStage" value-field="stage">
+                <field-map field-name="opportunityStageId"/></entity-find-one>
+
+            <set field="updateMap" from="[salesOpportunityId:salesOpportunityId,
+                                          opportunityStageId:opportunityStageId,
+                                          estimatedProbability:stage?.defaultProbability]"/>
+
+            <entity-find-one entity-name="mantle.sales.opportunity.SalesOpportunity" value-field="opp"/>
+            <if condition="opp.estimatedAmount &amp;&amp; stage?.defaultProbability">
+                <set field="updateMap.expectedRevenue" from="opp.estimatedAmount * stage.defaultProbability"/>
+            </if>
+
+            <service-call name="update#mantle.sales.opportunity.SalesOpportunity" in-map="updateMap"/>
+        </actions>
+    </service>
+
+    <!-- ========== Customer Segment Services ========== -->
+
+    <service verb="create" noun="CustomerSegment">
+        <in-parameters>
+            <parameter name="segmentName" required="true"/>
+            <parameter name="description"/>
+            <parameter name="segmentTypeEnumId" required="true"/>
+            <parameter name="isAutoEvaluate" default-value="N"/>
+            <parameter name="criteria" type="List"><description>List of maps: criteriaTypeEnumId, operator, fieldValue, fieldValueTo</description></parameter>
+        </in-parameters>
+        <out-parameters><parameter name="segmentId"/></out-parameters>
+        <actions>
+            <service-call name="create#zenith.erp.crm.CustomerSegment" out-map="segOut"
+                          in-map="[segmentName:segmentName, description:description,
+                                   segmentTypeEnumId:segmentTypeEnumId, isAutoEvaluate:isAutoEvaluate,
+                                   memberCount:0]"/>
+            <set field="segmentId" from="segOut.segmentId"/>
+
+            <if condition="criteria">
+                <set field="seqNum" from="1" type="Integer"/>
+                <iterate list="criteria" entry="crit">
+                    <service-call name="create#zenith.erp.crm.SegmentCriteria"
+                                  in-map="[segmentId:segmentId, criteriaTypeEnumId:crit.criteriaTypeEnumId,
+                                           operator:crit.operator, fieldValue:crit.fieldValue,
+                                           fieldValueTo:crit.fieldValueTo, sequenceNum:seqNum]"/>
+                    <set field="seqNum" from="seqNum + 1"/>
+                </iterate>
+            </if>
+        </actions>
+    </service>
+
+    <service verb="update" noun="CustomerSegment">
+        <in-parameters>
+            <parameter name="segmentId" required="true"/>
+            <parameter name="segmentName"/>
+            <parameter name="description"/>
+            <parameter name="segmentTypeEnumId"/>
+            <parameter name="isAutoEvaluate"/>
+            <parameter name="isActive"/>
+        </in-parameters>
+        <actions>
+            <service-call name="update#zenith.erp.crm.CustomerSegment" in-map="context"/>
+        </actions>
+    </service>
+
+    <service verb="add" noun="SegmentCriteria">
+        <in-parameters>
+            <parameter name="segmentId" required="true"/>
+            <parameter name="criteriaTypeEnumId" required="true"/>
+            <parameter name="operator" required="true"/>
+            <parameter name="fieldValue" required="true"/>
+            <parameter name="fieldValueTo"/>
+        </in-parameters>
+        <out-parameters><parameter name="criteriaId"/></out-parameters>
+        <actions>
+            <entity-find entity-name="zenith.erp.crm.SegmentCriteria" list="existing">
+                <econdition field-name="segmentId"/></entity-find>
+            <set field="nextSeq" from="(existing*.sequenceNum?.max() ?: 0) + 1" type="Integer"/>
+            <service-call name="create#zenith.erp.crm.SegmentCriteria" out-map="context"
+                          in-map="[segmentId:segmentId, criteriaTypeEnumId:criteriaTypeEnumId,
+                                   operator:operator, fieldValue:fieldValue, fieldValueTo:fieldValueTo,
+                                   sequenceNum:nextSeq]"/>
+        </actions>
+    </service>
+
+    <service verb="add" noun="SegmentMember">
+        <in-parameters>
+            <parameter name="segmentId" required="true"/>
+            <parameter name="partyId" required="true"/>
+        </in-parameters>
+        <actions>
+            <service-call name="store#zenith.erp.crm.SegmentMember"
+                          in-map="[segmentId:segmentId, partyId:partyId,
+                                   addedDate:ec.user.nowTimestamp, addedMethod:'Manual']"/>
+            <!-- Update member count -->
+            <entity-find-count entity-name="zenith.erp.crm.SegmentMember" count-field="cnt">
+                <econdition field-name="segmentId"/></entity-find-count>
+            <service-call name="update#zenith.erp.crm.CustomerSegment"
+                          in-map="[segmentId:segmentId, memberCount:cnt]"/>
+        </actions>
+    </service>
+
+    <service verb="remove" noun="SegmentMember">
+        <in-parameters>
+            <parameter name="segmentId" required="true"/>
+            <parameter name="partyId" required="true"/>
+        </in-parameters>
+        <actions>
+            <service-call name="delete#zenith.erp.crm.SegmentMember"
+                          in-map="[segmentId:segmentId, partyId:partyId]"/>
+            <entity-find-count entity-name="zenith.erp.crm.SegmentMember" count-field="cnt">
+                <econdition field-name="segmentId"/></entity-find-count>
+            <service-call name="update#zenith.erp.crm.CustomerSegment"
+                          in-map="[segmentId:segmentId, memberCount:cnt]"/>
+        </actions>
+    </service>
+
+    <service verb="evaluate" noun="Segment">
+        <description>Evaluate segment criteria against customers and auto-populate members</description>
+        <in-parameters><parameter name="segmentId" required="true"/></in-parameters>
+        <out-parameters><parameter name="membersAdded" type="Integer"/></out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.crm.CustomerSegment" value-field="segment"/>
+            <entity-find entity-name="zenith.erp.crm.SegmentCriteria" list="criteriaList">
+                <econdition field-name="segmentId"/>
+                <order-by field-name="sequenceNum"/>
+            </entity-find>
+
+            <!-- Start with all customers -->
+            <entity-find entity-name="mantle.party.PartyRole" list="customers">
+                <econdition field-name="roleTypeId" value="Customer"/>
+            </entity-find>
+            <set field="qualifiedPartyIds" from="customers*.partyId" type="List"/>
+
+            <iterate list="criteriaList" entry="crit">
+                <set field="filteredIds" from="[]" type="List"/>
+
+                <if condition="crit.criteriaTypeEnumId == 'SctCustomerGroup'">
+                    <entity-find entity-name="zenith.erp.contacts.CustomerGroupMember" list="groupMembers">
+                        <econdition field-name="customerGroupId" from="crit.fieldValue"/>
+                        <date-filter/>
+                    </entity-find>
+                    <iterate list="groupMembers" entry="gm">
+                        <if condition="qualifiedPartyIds.contains(gm.partyId)">
+                            <script>filteredIds.add(gm.partyId)</script>
+                        </if>
+                    </iterate>
+                    <set field="qualifiedPartyIds" from="filteredIds"/>
+
+                <else-if condition="crit.criteriaTypeEnumId == 'SctCountry'">
+                    <entity-find entity-name="mantle.party.contact.PartyContactMechPostalAddress" list="addrs">
+                        <econdition field-name="countryGeoId" from="crit.fieldValue"/>
+                        <date-filter/>
+                    </entity-find>
+                    <iterate list="addrs" entry="addr">
+                        <if condition="qualifiedPartyIds.contains(addr.partyId)">
+                            <script>filteredIds.add(addr.partyId)</script>
+                        </if>
+                    </iterate>
+                    <set field="qualifiedPartyIds" from="filteredIds"/>
+
+                <else-if condition="crit.criteriaTypeEnumId == 'SctTotalSpend'">
+                    <iterate list="qualifiedPartyIds" entry="pid">
+                        <entity-find entity-name="mantle.order.OrderHeaderAndPart" list="orders">
+                            <econdition field-name="customerPartyId" from="pid"/>
+                            <econdition field-name="statusId" operator="in" value="OrderCompleted,OrderApproved"/>
+                        </entity-find>
+                        <set field="totalSpend" from="BigDecimal.ZERO" type="BigDecimal"/>
+                        <iterate list="orders" entry="ord">
+                            <set field="totalSpend" from="totalSpend + (ord.grandTotal ?: 0)"/>
+                        </iterate>
+                        <set field="threshold" from="new BigDecimal(crit.fieldValue)" type="BigDecimal"/>
+                        <if condition="(crit.operator == 'gte' &amp;&amp; totalSpend &gt;= threshold) ||
+                                       (crit.operator == 'gt' &amp;&amp; totalSpend &gt; threshold) ||
+                                       (crit.operator == 'lte' &amp;&amp; totalSpend &lt;= threshold) ||
+                                       (crit.operator == 'lt' &amp;&amp; totalSpend &lt; threshold)">
+                            <script>filteredIds.add(pid)</script>
+                        </if>
+                    </iterate>
+                    <set field="qualifiedPartyIds" from="filteredIds"/>
+
+                <else-if condition="crit.criteriaTypeEnumId == 'SctOrderCount'">
+                    <iterate list="qualifiedPartyIds" entry="pid">
+                        <entity-find-count entity-name="mantle.order.OrderHeaderAndPart" count-field="orderCount">
+                            <econdition field-name="customerPartyId" from="pid"/>
+                            <econdition field-name="statusId" operator="in" value="OrderCompleted,OrderApproved"/>
+                        </entity-find-count>
+                        <set field="threshold" from="Integer.parseInt(crit.fieldValue)" type="Integer"/>
+                        <if condition="(crit.operator == 'gte' &amp;&amp; orderCount &gt;= threshold) ||
+                                       (crit.operator == 'gt' &amp;&amp; orderCount &gt; threshold) ||
+                                       (crit.operator == 'lte' &amp;&amp; orderCount &lt;= threshold) ||
+                                       (crit.operator == 'lt' &amp;&amp; orderCount &lt; threshold)">
+                            <script>filteredIds.add(pid)</script>
+                        </if>
+                    </iterate>
+                    <set field="qualifiedPartyIds" from="filteredIds"/>
+                </else-if></else-if></else-if></if>
+            </iterate>
+
+            <!-- Add qualified parties as segment members -->
+            <set field="membersAdded" from="0" type="Integer"/>
+            <iterate list="qualifiedPartyIds" entry="qualifiedPartyId">
+                <service-call name="store#zenith.erp.crm.SegmentMember"
+                              in-map="[segmentId:segmentId, partyId:qualifiedPartyId,
+                                       addedDate:ec.user.nowTimestamp, addedMethod:'Auto']"/>
+                <set field="membersAdded" from="membersAdded + 1"/>
+            </iterate>
+
+            <service-call name="update#zenith.erp.crm.CustomerSegment"
+                          in-map="[segmentId:segmentId, memberCount:qualifiedPartyIds.size(),
+                                   lastEvaluatedDate:ec.user.nowTimestamp]"/>
+        </actions>
+    </service>
+
+    <service verb="get" noun="CustomerAnalytics">
+        <description>Get purchase analytics for a customer</description>
+        <in-parameters><parameter name="partyId" required="true"/></in-parameters>
+        <out-parameters>
+            <parameter name="totalOrders" type="Integer"/>
+            <parameter name="totalSpend" type="BigDecimal"/>
+            <parameter name="avgOrderValue" type="BigDecimal"/>
+            <parameter name="lastOrderDate" type="Timestamp"/>
+            <parameter name="daysSinceLastOrder" type="Integer"/>
+            <parameter name="groups" type="List"/>
+            <parameter name="segments" type="List"/>
+        </out-parameters>
+        <actions>
+            <entity-find entity-name="mantle.order.OrderHeaderAndPart" list="orders">
+                <econdition field-name="customerPartyId" from="partyId"/>
+                <econdition field-name="statusId" operator="in" value="OrderCompleted,OrderApproved"/>
+                <order-by field-name="-entryDate"/>
+            </entity-find>
+            <set field="totalOrders" from="orders.size()" type="Integer"/>
+            <set field="totalSpend" from="BigDecimal.ZERO" type="BigDecimal"/>
+            <iterate list="orders" entry="ord">
+                <set field="totalSpend" from="totalSpend + (ord.grandTotal ?: 0)"/>
+            </iterate>
+            <set field="avgOrderValue" from="totalOrders ? totalSpend / totalOrders : BigDecimal.ZERO" type="BigDecimal"/>
+            <set field="lastOrderDate" from="orders ? orders[0].entryDate : null"/>
+            <set field="daysSinceLastOrder" from="lastOrderDate ?
+                ((ec.user.nowTimestamp.time - lastOrderDate.time) / 86400000L).intValue() : null" type="Integer"/>
+
+            <entity-find entity-name="zenith.erp.contacts.CustomerGroupMemberDetail" list="groups">
+                <econdition field-name="partyId"/><date-filter/></entity-find>
+            <entity-find entity-name="zenith.erp.crm.SegmentMemberDetail" list="segments">
+                <econdition field-name="partyId"/></entity-find>
+        </actions>
+    </service>
+    <!-- ========== GDPR / Data Privacy Tools ========== -->
+    <service verb="anonymize" noun="CustomerData" authenticate="true">
+        <description>
+            "Right to be Forgotten" protocol.
+            Irreversibly anonymizes Personally Identifiable Information (PII) on a Party record 
+            while preserving the Party ID so historical financial ledgers and invoices remain perfectly intact.
+        </description>
+        <in-parameters>
+            <parameter name="partyId" required="true"/>
+            <parameter name="reason" type="String"/>
+        </in-parameters>
+        <actions>
+            <!-- 1. Scramble Person Record (Name, DOB) -->
+            <entity-find-one entity-name="mantle.party.Person" value-field="person">
+                <field-map field-name="partyId"/>
+            </entity-find-one>
+            <script><![CDATA[
+                import org.slf4j.LoggerFactory
+                def logger = LoggerFactory.getLogger("GdprServices")
+                
+                String scrambledHash = "ANON_" + java.util.UUID.randomUUID().toString().substring(0, 8).toUpperCase()
+                
+                if (person) {
+                    person.firstName = scrambledHash
+                    person.lastName = "Redacted"
+                    person.birthDate = null
+                    person.maritalStatusEnumId = null
+                    person.employmentStatusEnumId = null
+                    person.update()
+                    logger.info("GDPR: Person Name/DOB anonymized for Party [${partyId}]")
+                }
+            ]]></script>
+
+            <!-- 2. Scramble Telecom Numbers -->
+            <entity-find entity-name="mantle.party.contact.PartyContactMechTelecomNumber" list="telecoms">
+                <econdition field-name="partyId"/>
+            </entity-find>
+            <iterate list="telecoms" entry="telecom">
+                <entity-find-one entity-name="mantle.party.contact.TelecomNumber" value-field="tn">
+                    <field-map field-name="contactMechId" from="telecom.contactMechId"/>
+                </entity-find-one>
+                <if condition="tn">
+                    <script><![CDATA[
+                        tn.contactNumber = "555-0000"
+                        tn.areaCode = "000"
+                        tn.update()
+                    ]]></script>
+                </if>
+            </iterate>
+            
+            <!-- 3. Scramble Email Addresses -->
+            <entity-find entity-name="mantle.party.contact.PartyContactMech" list="pcms">
+                <econdition field-name="partyId"/>
+            </entity-find>
+            <iterate list="pcms" entry="pcm">
+                <entity-find-one entity-name="mantle.party.contact.ContactMech" value-field="cm">
+                    <field-map field-name="contactMechId" from="pcm.contactMechId"/>
+                </entity-find-one>
+                <if condition="cm &amp;&amp; cm.contactMechTypeEnumId == 'CmtEmailAddress'">
+                    <script><![CDATA[
+                        cm.infoString = scrambledHash + "@anonymized.local"
+                        cm.update()
+                    ]]></script>
+                </if>
+            </iterate>
+            
+            <message>Customer Data Irreversibly Anonymized (Ledger Intact).</message>
+        </actions>
+    </service>
+
+</services>

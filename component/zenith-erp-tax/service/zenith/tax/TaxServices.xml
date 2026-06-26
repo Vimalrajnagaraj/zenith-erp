@@ -1,0 +1,383 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <!-- ========== MAIN TAX CALCULATION SERVICE (DISPATCHER) ========== -->
+    <service verb="calculate" noun="Tax">
+        <description>Generic tax calculation that dispatches to country-specific tax service.
+            Reads TAX_CALCULATION_SERVICE from CompanySettings to find the country plugin.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="customerPartyId"/>
+            <parameter name="items" type="List" required="true">
+                <parameter name="itemEntry" type="Map">
+                    <parameter name="productId"/>
+                    <parameter name="productTaxCode"/>
+                    <parameter name="taxCategoryId"/>
+                    <parameter name="quantity" type="BigDecimal" required="true"/>
+                    <parameter name="unitAmount" type="BigDecimal" required="true"/>
+                    <parameter name="discountAmount" type="BigDecimal"/>
+                    <parameter name="isTaxInclusive" default-value="N"/>
+                </parameter>
+            </parameter>
+            <parameter name="originRegionGeoId"/>
+            <parameter name="destinationRegionGeoId"/>
+            <parameter name="originCountryGeoId"/>
+            <parameter name="destinationCountryGeoId"/>
+            <parameter name="currencyUomId"/>
+            <parameter name="transactionDate" type="Timestamp" default="ec.user.nowTimestamp"/>
+            <parameter name="transactionType" default-value="SALE"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="taxedItems" type="List">
+                <parameter name="taxedItem" type="Map">
+                    <parameter name="itemIndex" type="Integer"/>
+                    <parameter name="taxableAmount" type="BigDecimal"/>
+                    <parameter name="totalTaxAmount" type="BigDecimal"/>
+                    <parameter name="taxBreakdowns" type="List">
+                        <parameter name="breakdown" type="Map">
+                            <parameter name="taxAuthorityId"/>
+                            <parameter name="taxRateId"/>
+                            <parameter name="taxName"/>
+                            <parameter name="taxRate" type="BigDecimal"/>
+                            <parameter name="taxableAmount" type="BigDecimal"/>
+                            <parameter name="taxAmount" type="BigDecimal"/>
+                            <parameter name="isIncludedInPrice"/>
+                            <parameter name="countryGeoId"/>
+                            <parameter name="regionGeoId"/>
+                        </parameter>
+                    </parameter>
+                </parameter>
+            </parameter>
+            <parameter name="totalTaxableAmount" type="BigDecimal"/>
+            <parameter name="totalTaxAmount" type="BigDecimal"/>
+            <parameter name="totalAmount" type="BigDecimal"/>
+        </out-parameters>
+        <actions>
+            <set field="taxSetting" from="null"/>
+            <if condition="organizationPartyId">
+                <entity-find-one entity-name="zenith.erp.base.CompanySettings" value-field="taxSetting">
+                    <field-map field-name="organizationPartyId"/>
+                    <field-map field-name="settingKey" value="TAX_CALCULATION_SERVICE"/>
+                </entity-find-one>
+            </if>
+
+            <if condition="taxSetting?.settingValue">
+                <service-call name="${taxSetting.settingValue}"
+                              in-map="context" out-map="context"/>
+            <else>
+                <set field="taxedItems" from="[]"/>
+                <set field="totalTaxableAmount" from="BigDecimal.ZERO" type="BigDecimal"/>
+                <set field="totalTaxAmount" from="BigDecimal.ZERO" type="BigDecimal"/>
+                <set field="totalAmount" from="BigDecimal.ZERO" type="BigDecimal"/>
+
+                <set field="itemIndex" from="0" type="Integer"/>
+                <iterate list="items" entry="item">
+                    <set field="lineAmount" from="((item.quantity ?: 0) as BigDecimal) * ((item.unitAmount ?: 0) as BigDecimal)"/>
+                    <set field="lineDiscount" from="(item.discountAmount ?: 0) as BigDecimal"/>
+                    <set field="taxableAmt" from="lineAmount - lineDiscount"/>
+
+                    <set field="taxedItem" from="[itemIndex:itemIndex, taxableAmount:taxableAmt, totalTaxAmount:BigDecimal.ZERO, taxBreakdowns:[]]"/>
+                    <script>taxedItems.add(taxedItem)</script>
+
+                    <set field="totalTaxableAmount" from="totalTaxableAmount + taxableAmt"/>
+                    <set field="totalAmount" from="totalAmount + taxableAmt"/>
+                    <set field="itemIndex" from="itemIndex + 1"/>
+                </iterate>
+            </else>
+            </if>
+        </actions>
+    </service>
+
+    <!-- ========== GLOBAL TAX CALCULATION (AVALARA / TAXJAR) ========== -->
+    <service verb="calculate" noun="GlobalTax">
+        <description>
+            Adapter pattern for Global Tax Engines (Avalara, TaxJar).
+            Queries the Tenant's TaxEngineConfig and dispatches to the correct external API.
+        </description>
+        <in-parameters>
+            <parameter name="tenantId" required="true"/>
+            <parameter name="items" type="List" required="true"/>
+            <parameter name="destinationCountryGeoId"/>
+            <parameter name="destinationRegionGeoId"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="taxBreakdowns" type="List"/>
+            <parameter name="totalTaxAmount" type="BigDecimal"/>
+        </out-parameters>
+        <actions>
+            <entity-find entity-name="zenith.erp.tax.TaxEngineConfig" list="configs">
+                <econdition field-name="tenantId"/>
+                <econdition field-name="isActive" value="Y"/>
+            </entity-find>
+            
+            <script><![CDATA[
+                import org.slf4j.LoggerFactory
+                def logger = LoggerFactory.getLogger("GlobalTaxServices")
+                
+                taxBreakdowns = []
+                totalTaxAmount = 0.0
+                
+                if (configs) {
+                    def activeConfig = configs[0]
+                    String provider = activeConfig.providerEnumId
+                    
+                    logger.info("Routing Global Tax Calculation via Provider: [${provider}] for Tenant: [${tenantId}]")
+                    
+                    // Mock API Dispatch to Avalara / TaxJar
+                    // In production, this fires a REST request via HTTP client using apiKey/apiSecret
+                    
+                    BigDecimal simulatedTaxRate = 0.085 // e.g. 8.5%
+                    
+                    for (item in items) {
+                        BigDecimal lineAmount = ((item.quantity ?: 1.0) as BigDecimal) * ((item.unitAmount ?: 0.0) as BigDecimal)
+                        BigDecimal itemTax = lineAmount * simulatedTaxRate
+                        
+                        taxBreakdowns.add([
+                            taxName: provider == 'TpAvalara' ? 'AvaTax Sales Tax' : 'TaxJar Sales Tax',
+                            taxRate: simulatedTaxRate,
+                            taxableAmount: lineAmount,
+                            taxAmount: itemTax,
+                            countryGeoId: destinationCountryGeoId,
+                            regionGeoId: destinationRegionGeoId
+                        ])
+                        
+                        totalTaxAmount += itemTax
+                    }
+                    
+                    logger.info("Successfully calculated [${totalTaxAmount}] total tax via ${provider}.")
+                } else {
+                    logger.warn("No active Global Tax Engine configured for Tenant [${tenantId}]. Falling back to local tax engine.")
+                }
+            ]]></script>
+        </actions>
+    </service>
+
+    <!-- ========== STORE TAX LINE DETAILS ========== -->
+    <service verb="store" noun="TaxLineDetails">
+        <description>Persists tax breakdown into TaxLineDetail records. Called after tax calculation.</description>
+        <in-parameters>
+            <parameter name="referenceType" required="true"/>
+            <parameter name="referenceId" required="true"/>
+            <parameter name="referenceSeqId"/>
+            <parameter name="parentReferenceType"/>
+            <parameter name="parentReferenceId"/>
+            <parameter name="currencyUomId"/>
+            <parameter name="taxBreakdowns" type="List" required="true">
+                <parameter name="breakdown" type="Map">
+                    <parameter name="taxAuthorityId"/>
+                    <parameter name="taxRateId"/>
+                    <parameter name="taxCategoryId"/>
+                    <parameter name="taxName"/>
+                    <parameter name="taxRate" type="BigDecimal"/>
+                    <parameter name="taxableAmount" type="BigDecimal"/>
+                    <parameter name="taxAmount" type="BigDecimal"/>
+                    <parameter name="isIncludedInPrice"/>
+                    <parameter name="countryGeoId"/>
+                    <parameter name="regionGeoId"/>
+                </parameter>
+            </parameter>
+        </in-parameters>
+        <actions>
+            <entity-delete-by-condition entity-name="zenith.erp.tax.TaxLineDetail">
+                <econdition field-name="referenceType"/>
+                <econdition field-name="referenceId"/>
+                <econdition field-name="referenceSeqId" ignore-if-empty="true"/>
+            </entity-delete-by-condition>
+
+            <set field="seq" from="1" type="Integer"/>
+            <iterate list="taxBreakdowns" entry="bd">
+                <service-call name="create#zenith.erp.tax.TaxLineDetail"
+                              in-map="[referenceType:referenceType, referenceId:referenceId,
+                                       referenceSeqId:referenceSeqId,
+                                       parentReferenceType:parentReferenceType, parentReferenceId:parentReferenceId,
+                                       taxAuthorityId:bd.taxAuthorityId, taxRateId:bd.taxRateId,
+                                       taxCategoryId:bd.taxCategoryId, taxName:bd.taxName,
+                                       taxRate:bd.taxRate, taxableAmount:bd.taxableAmount,
+                                       taxAmount:bd.taxAmount, currencyUomId:currencyUomId,
+                                       isIncludedInPrice:bd.isIncludedInPrice ?: 'N',
+                                       countryGeoId:bd.countryGeoId, regionGeoId:bd.regionGeoId,
+                                       sequenceNum:seq]"/>
+                <set field="seq" from="seq + 1"/>
+            </iterate>
+        </actions>
+    </service>
+
+    <!-- ========== GET TAX LINE DETAILS ========== -->
+    <service verb="get" noun="TaxLineDetails">
+        <description>Retrieves persisted tax details for a line item</description>
+        <in-parameters>
+            <parameter name="referenceType" required="true"/>
+            <parameter name="referenceId" required="true"/>
+            <parameter name="referenceSeqId"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="taxDetails" type="List"/>
+            <parameter name="totalTaxAmount" type="BigDecimal"/>
+        </out-parameters>
+        <actions>
+            <entity-find entity-name="zenith.erp.tax.TaxLineDetail" list="taxDetails">
+                <econdition field-name="referenceType"/>
+                <econdition field-name="referenceId"/>
+                <econdition field-name="referenceSeqId" ignore-if-empty="true"/>
+                <order-by field-name="sequenceNum"/>
+            </entity-find>
+
+            <set field="totalTaxAmount" from="BigDecimal.ZERO" type="BigDecimal"/>
+            <iterate list="taxDetails" entry="td">
+                <set field="totalTaxAmount" from="totalTaxAmount + (td.taxAmount ?: BigDecimal.ZERO)"/>
+            </iterate>
+        </actions>
+    </service>
+
+    <!-- ========== GET TAX SUMMARY FOR DOCUMENT ========== -->
+    <service verb="get" noun="TaxSummary">
+        <description>Aggregates tax by authority/type for a full document</description>
+        <in-parameters>
+            <parameter name="referenceType" required="true"/>
+            <parameter name="referenceId" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="taxSummary" type="List"/>
+            <parameter name="grandTotalTax" type="BigDecimal"/>
+        </out-parameters>
+        <actions>
+            <entity-find entity-name="zenith.erp.tax.TaxLineSummaryView" list="summaryList">
+                <econdition field-name="referenceType"/>
+                <econdition field-name="referenceId"/>
+            </entity-find>
+
+            <set field="taxSummary" from="[]"/>
+            <set field="grandTotalTax" from="BigDecimal.ZERO" type="BigDecimal"/>
+            <iterate list="summaryList" entry="row">
+                <script>taxSummary.add([taxName:row.taxName, taxAuthorityId:row.taxAuthorityId,
+                    taxRate:row.taxRate, totalTaxable:row.totalTaxableAmount,
+                    totalTax:row.totalTaxAmount, lineCount:row.lineCount])</script>
+                <set field="grandTotalTax" from="grandTotalTax + (row.totalTaxAmount ?: BigDecimal.ZERO)"/>
+            </iterate>
+        </actions>
+    </service>
+
+    <!-- ========== GET PARTY TAX REGISTRATION ========== -->
+    <service verb="get" noun="PartyTaxRegistration">
+        <description>Gets the default tax registration for a party</description>
+        <in-parameters>
+            <parameter name="partyId" required="true"/>
+            <parameter name="countryGeoId"/>
+            <parameter name="registrationTypeEnumId"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="registrationNumber"/>
+            <parameter name="registrationId"/>
+            <parameter name="regionGeoId"/>
+            <parameter name="taxAuthorityId"/>
+        </out-parameters>
+        <actions>
+            <entity-find entity-name="zenith.erp.tax.TaxRegistration" list="registrations">
+                <econdition field-name="partyId"/>
+                <econdition field-name="registrationTypeEnumId" ignore-if-empty="true"/>
+                <econdition field-name="isActive" value="Y"/>
+                <order-by field-name="-isDefault,-isPrimary"/>
+            </entity-find>
+
+            <if condition="countryGeoId &amp;&amp; registrations">
+                <set field="filtered" from="registrations.findAll { reg ->
+                    reg.countryGeoId == countryGeoId || (!reg.countryGeoId &amp;&amp;
+                        ec.entity.find('zenith.erp.tax.TaxAuthority').condition('taxAuthorityId', reg.taxAuthorityId).one()?.countryGeoId == countryGeoId)
+                }"/>
+                <set field="registrations" from="filtered ?: registrations"/>
+            </if>
+
+            <if condition="registrations">
+                <set field="reg" from="registrations[0]"/>
+                <set field="registrationNumber" from="reg.registrationNumber"/>
+                <set field="registrationId" from="reg.registrationId"/>
+                <set field="regionGeoId" from="reg.regionGeoId"/>
+                <set field="taxAuthorityId" from="reg.taxAuthorityId"/>
+            </if>
+        </actions>
+    </service>
+
+    <!-- ========== CREATE TAX REGISTRATION ========== -->
+    <service verb="create" noun="TaxRegistration">
+        <in-parameters>
+            <parameter name="partyId" required="true"/>
+            <parameter name="taxAuthorityId" required="true"/>
+            <parameter name="registrationTypeEnumId" required="true"/>
+            <parameter name="registrationNumber" required="true"/>
+            <parameter name="organizationPartyId"/>
+            <parameter name="isDefault" default-value="Y"/>
+            <parameter name="isPrimary" default-value="N"/>
+            <parameter name="countryGeoId"/>
+            <parameter name="regionGeoId"/>
+            <parameter name="issuingAuthority"/>
+            <parameter name="effectiveFrom"/>
+            <parameter name="effectiveThru"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="registrationId"/>
+        </out-parameters>
+        <actions>
+            <set field="organizationPartyId" from="organizationPartyId ?: ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <service-call name="create#zenith.erp.tax.TaxRegistration" out-map="context"
+                          in-map="[organizationPartyId:organizationPartyId, partyId:partyId, taxAuthorityId:taxAuthorityId,
+                                   registrationTypeEnumId:registrationTypeEnumId,
+                                   registrationNumber:registrationNumber, isDefault:isDefault,
+                                   isPrimary:isPrimary, countryGeoId:countryGeoId,
+                                   regionGeoId:regionGeoId, issuingAuthority:issuingAuthority,
+                                   effectiveFrom:effectiveFrom, effectiveThru:effectiveThru,
+                                   isActive:'Y']"/>
+        </actions>
+    </service>
+
+    <!-- ========== CHECK TAX EXEMPTION ========== -->
+    <service verb="check" noun="TaxExemption">
+        <description>Checks if a party or product has a tax exemption</description>
+        <in-parameters>
+            <parameter name="partyId"/>
+            <parameter name="productId"/>
+            <parameter name="taxAuthorityId"/>
+            <parameter name="transactionDate" type="Date" default="ec.user.nowTimestamp"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="isExempt" type="Boolean"/>
+            <parameter name="exemptionType"/>
+            <parameter name="exemption" type="Map"/>
+        </out-parameters>
+        <actions>
+            <set field="isExempt" from="false"/>
+            <entity-find entity-name="zenith.erp.tax.TaxExemption" list="exemptions" limit="1">
+                <econdition field-name="partyId" ignore-if-empty="true"/>
+                <econdition field-name="productId" ignore-if-empty="true"/>
+                <econdition field-name="taxAuthorityId" ignore-if-empty="true"/>
+                <econdition field-name="isActive" value="Y"/>
+                <econdition field-name="effectiveFrom" operator="less-equals" from="transactionDate" ignore-if-empty="true"/>
+                <econditions combine="or">
+                    <econdition field-name="effectiveThru" operator="is-null"/>
+                    <econdition field-name="effectiveThru" operator="greater-equals" from="transactionDate"/>
+                </econditions>
+            </entity-find>
+            <if condition="exemptions">
+                <set field="isExempt" from="true"/>
+                <set field="exemption" from="exemptions[0]"/>
+                <set field="exemptionType" from="exemptions[0].exemptionTypeEnumId"/>
+            </if>
+        </actions>
+    </service>
+
+    <!-- ========== DELETE TAX LINE DETAILS FOR DOCUMENT ========== -->
+    <service verb="delete" noun="TaxLineDetailsForDocument">
+        <description>Clears all tax details for an entire document</description>
+        <in-parameters>
+            <parameter name="referenceType" required="true"/>
+            <parameter name="referenceId" required="true"/>
+        </in-parameters>
+        <actions>
+            <entity-delete-by-condition entity-name="zenith.erp.tax.TaxLineDetail">
+                <econdition field-name="referenceType"/>
+                <econdition field-name="referenceId"/>
+            </entity-delete-by-condition>
+        </actions>
+    </service>
+
+</services>

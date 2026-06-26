@@ -1,0 +1,583 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <!-- ============================================================================
+         forecast#ProductDemand : single-product demand forecast.
+         Tries TWO methods and self-selects the one with the better weekly cross-
+         validation accuracy on this product's own history:
+           A) trend (least squares) x multiplicative day-of-week seasonality
+           B) seasonal-naive (same weekday last week)
+         + statistical safety stock / reorder point (Z x sigma x sqrt(leadTime)).
+       ============================================================================ -->
+    <service verb="forecast" noun="ProductDemand" allow-remote="true" transaction-timeout="120">
+        <in-parameters>
+            <parameter name="productName"/>
+            <parameter name="productId"/>
+            <parameter name="organizationPartyId"/>
+            <parameter name="horizonDays" type="Integer" default-value="14"/>
+            <parameter name="leadTimeDays" type="Integer" default-value="7"/>
+            <parameter name="serviceLevel" type="BigDecimal" default-value="0.95"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="summary"/>
+            <parameter name="result" type="Map"/>
+        </out-parameters>
+        <actions>
+            <script><![CDATA[
+                import org.moqui.context.ExecutionContext
+                ExecutionContext ec = context.ec
+                def res = [:]
+                boolean _d = ec.artifactExecution.disableAuthz()
+                try {
+                    int horizon = (horizonDays ?: 14) as int
+                    int leadTime = (leadTimeDays ?: 7) as int
+                    double sl = (serviceLevel ?: 0.95) as double
+                    if (horizon < 1) horizon = 14
+                    if (horizon > 120) horizon = 120
+                    if (leadTime < 1) leadTime = 7
+
+                    def orgId = organizationPartyId ?: ec.user.getPreference("ACTIVE_ORGANIZATION")
+                    if (!orgId) { summary = "No active organization in context; cannot forecast."; result = res; return }
+
+                    def prod = null
+                    if (productId) prod = ec.entity.find("mantle.product.Product").condition("productId", productId).condition("ownerPartyId", orgId).one()
+                    if (!prod && productName) {
+                        def pl = ec.entity.find("mantle.product.Product").condition("ownerPartyId", orgId)
+                            .condition("productName", "like", "%" + productName + "%").orderBy("productName").limit(1).list()
+                        if (pl) prod = pl[0]
+                    }
+                    if (!prod) { summary = "Product not found for '" + (productName ?: productId) + "'. Ask the user to confirm the exact product name."; result = res; return }
+                    def pid = prod.productId
+                    def pname = prod.productName
+
+                    def txnDate = [:]
+                    ec.entity.find("zenith.erp.pos.PosTransaction").condition("organizationPartyId", orgId)
+                        .selectField("transactionId").selectField("entryDate").list().each {
+                            if (it.entryDate != null) txnDate[it.transactionId] = it.entryDate.toLocalDateTime().toLocalDate()
+                        }
+                    def daily = [:]
+                    ec.entity.find("zenith.erp.pos.PosTransactionItem").condition("productId", pid)
+                        .selectField("transactionId").selectField("quantity").list().each {
+                            def ld = txnDate[it.transactionId]
+                            if (ld != null) { double q = (it.quantity ?: 0) as double; daily[ld] = ((daily[ld] ?: 0.0d) as double) + q }
+                        }
+                    if (daily.isEmpty()) { summary = "No sales history found for '" + pname + "', so a demand forecast cannot be produced yet."; result = [productName: pname]; return }
+
+                    def dts = new ArrayList(daily.keySet()); Collections.sort(dts)
+                    def minD = dts.get(0); def maxD = dts.get(dts.size()-1)
+                    def series = []
+                    def cur = minD
+                    while (!cur.isAfter(maxD)) { series.add(((daily[cur] ?: 0.0d) as double)); cur = cur.plusDays(1) }
+                    int n = series.size()
+
+                    double sum = 0.0; for (v in series) sum += v
+                    double mean = sum / n
+                    double varSum = 0.0; for (v in series) varSum += (v - mean) * (v - mean)
+                    double sd = Math.sqrt(varSum / Math.max(1, n - 1))
+
+                    def fit = { int len ->
+                        double sx=0, sy=0, sxx=0, sxy=0
+                        for (int i = 0; i < len; i++) { sx += i; sy += series[i]; sxx += i*i; sxy += i*series[i] }
+                        double den = (len*sxx - sx*sx)
+                        double slope = den != 0 ? (len*sxy - sx*sy) / den : 0.0
+                        double intercept = (sy - slope*sx) / len
+                        double mn = sy / len
+                        double[] ds = new double[7]; int[] dc = new int[7]; def c = minD
+                        for (int i = 0; i < len; i++) { int dw = c.getDayOfWeek().getValue() % 7; ds[dw] += series[i]; dc[dw]++; c = c.plusDays(1) }
+                        double[] df = new double[7]
+                        for (int k = 0; k < 7; k++) { double a = dc[k] > 0 ? ds[k]/dc[k] : mn; df[k] = mn > 0 ? Math.max(0.3, Math.min(2.5, a/mn)) : 1.0 }
+                        return [intercept, slope, df]
+                    }
+
+                    // predictors: trained on [0,trainEnd), predict day index i
+                    def predA = { int trainEnd, int i -> def f = fit(trainEnd); int dw = minD.plusDays(i).getDayOfWeek().getValue()%7; return Math.max(0.0, (((double)f[0]) + ((double)f[1])*i) * ((double[])f[2])[dw]) }
+                    def predB = { int trainEnd, int i -> if (i >= 7) return series[i-7]; double s=0; for(int k=0;k<trainEnd;k++) s+=series[k]; return trainEnd>0 ? s/trainEnd : 0.0 }
+
+                    def cv = { Closure pred ->
+                        int period = 7; int periods = (int)(n / period)
+                        if (periods < 3) return null
+                        int testCount = Math.min(4, periods - 1); double apeSum = 0.0; int apeN = 0
+                        for (int p = periods - testCount; p < periods; p++) {
+                            int trainEnd = p * period; if (trainEnd < period) continue
+                            double predTot = 0.0, actTot = 0.0
+                            for (int i = trainEnd; i < trainEnd + period && i < n; i++) { predTot += Math.max(0.0, pred(trainEnd, i)); actTot += series[i] }
+                            if (actTot > 0) { apeSum += Math.abs(actTot - predTot) / actTot; apeN++ }
+                        }
+                        if (apeN == 0) return null
+                        double mape = apeSum / apeN; return Math.max(40, Math.min(96, (int)Math.round(100.0*(1.0 - mape))))
+                    }
+
+                    Integer accA = cv(predA); Integer accB = cv(predB)
+                    boolean useB = (accB != null) && (accA == null || accB > accA)
+                    Integer confidence = useB ? accB : accA
+
+                    def full = fit(n)
+                    double intercept = full[0]; double slope = full[1]; double[] dowF = full[2]
+                    def dowNames = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"]
+                    int peakDow = 0; for (int k = 1; k < 7; k++) if (dowF[k] > dowF[peakDow]) peakDow = k
+
+                    // horizon forecast using the chosen method
+                    double fTotal = 0.0; def fcur = maxD.plusDays(1)
+                    for (int h = 0; h < horizon; h++) {
+                        double f
+                        if (useB) { f = (n >= 7) ? series[n - 7 + (h % 7)] : mean }
+                        else { int dw = fcur.getDayOfWeek().getValue() % 7; f = Math.max(0.0, (intercept + slope*(n + h)) * dowF[dw]) }
+                        fTotal += Math.max(0.0, f); fcur = fcur.plusDays(1)
+                    }
+                    String methodLabel = useB ? "seasonal-naive (last week)" : "trend + weekly seasonality"
+                    String methodEnum = useB ? "FmSeasonal" : "FmExponential"
+
+                    double z = sl >= 0.99 ? 2.33 : (sl >= 0.975 ? 1.96 : (sl >= 0.95 ? 1.645 : (sl >= 0.90 ? 1.28 : 1.04)))
+                    double safety = z * sd * Math.sqrt((double) leadTime)
+                    double dailyDemand = useB ? (mean) : Math.max(0.0, intercept + slope*n)
+                    double rop = dailyDemand * leadTime + safety
+                    double suggestedOrder = fTotal + safety
+
+                    def r2 = { double v -> (Math.round(v*100.0)/100.0) }
+                    def trendTxt = slope > 0.02 ? "rising" : (slope < -0.02 ? "declining" : "stable")
+                    res = [
+                        productName: pname, productId: pid,
+                        historyDays: n, avgDailyDemand: r2(mean), trendPerDay: r2(slope), peakWeekday: dowNames[peakDow],
+                        horizonDays: horizon, forecastDemand: (int)Math.round(fTotal),
+                        leadTimeDays: leadTime, serviceLevel: sl,
+                        reorderPoint: (int)Math.round(rop), safetyStock: (int)Math.round(safety),
+                        suggestedOrderQty: (int)Math.round(suggestedOrder),
+                        confidencePct: confidence, method: methodLabel, methodEnumId: methodEnum
+                    ]
+                    summary = "For '" + pname + "', expect about " + ((int)Math.round(fTotal)) + " units over the next " + horizon + " days" +
+                        " (around " + ((int)Math.round(mean)) + " a day, a " + trendTxt + " trend, busiest on " + dowNames[peakDow] + "). " +
+                        "At " + ((int)Math.round(sl*100)) + "% service level with a " + leadTime + "-day lead time, reorder at about " + ((int)Math.round(rop)) +
+                        " units (incl. ~" + ((int)Math.round(safety)) + " safety stock), and order about " + ((int)Math.round(suggestedOrder)) + " units. " +
+                        (confidence != null ? ("Confidence ~" + confidence + "% using the " + methodLabel + " method") : "Confidence limited by short history") +
+                        ", based on " + n + " days of real sales."
+                    result = res
+                } catch (Exception e) {
+                    ec.logger.error("forecast#ProductDemand failed: " + e.message, e)
+                    summary = "The forecast could not be completed due to a data error."; result = res
+                } finally { if (!_d) ec.artifactExecution.enableAuthz() }
+            ]]></script>
+        </actions>
+    </service>
+
+    <!-- ============================================================================
+         cycle#DemandForecast : AUTOMATIC self-calibrating loop (run on a schedule).
+         For each active tenant's top-selling products:
+           1) CALIBRATE: any stored forecast whose period has ended gets its real
+              actualQuantity + accuracyPercent filled in (forecast vs reality).
+           2) FORECAST: create a fresh next-period forecast (method self-selected).
+         Over time the DemandForecast table accumulates accuracy history, and the
+         per-product method selection keeps the forecasts honest and improving.
+       ============================================================================ -->
+    <service verb="cycle" noun="DemandForecast" allow-remote="true" authenticate="false" transaction-timeout="1800">
+        <in-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="periodDays" type="Integer" default-value="7"/>
+            <parameter name="topN" type="Integer" default-value="1000"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="summary"/>
+            <parameter name="productsProcessed" type="Integer"/>
+            <parameter name="calibrated" type="Integer"/>
+            <parameter name="created" type="Integer"/>
+            <parameter name="alertsCreated" type="Integer"/>
+        </out-parameters>
+        <actions>
+            <script><![CDATA[
+                import org.moqui.context.ExecutionContext
+                ExecutionContext ec = context.ec
+                boolean _d = ec.artifactExecution.disableAuthz()
+                int prc = 0, cal = 0, fc = 0, alerts = 0
+                try {
+                    int period = (periodDays ?: 7) as int; if (period < 1) period = 7
+                    int top = (topN ?: 50) as int
+                    def today = ec.user.nowTimestamp.toLocalDateTime().toLocalDate()
+                    def todaySql = java.sql.Date.valueOf(today)
+                    def orgs = []
+                    if (organizationPartyId) orgs.add(organizationPartyId)
+                    else ec.entity.find("zenith.erp.saas.SaasTenant").condition("statusId","SaasTenantActive").selectField("organizationPartyId").list().each { if (it.organizationPartyId) orgs.add(it.organizationPartyId) }
+
+                    for (org in orgs) {
+                        def topRows = ec.entity.find("zenith.erp.pos.ProductDemandView").condition("organizationPartyId", org).orderBy("-unitsSold").limit(top).list()
+                        if (!topRows) continue
+                        def txnDate = [:]
+                        ec.entity.find("zenith.erp.pos.PosTransaction").condition("organizationPartyId", org).selectField("transactionId").selectField("entryDate").list().each { if (it.entryDate != null) txnDate[it.transactionId] = it.entryDate.toLocalDateTime().toLocalDate() }
+                        // category maps for category-level demand aggregation/detection
+                        def catOfProduct = [:]; def catNameMap = [:]; def catDaily = [:]
+                        ec.entity.find("mantle.product.category.ProductCategoryMember").selectField("productCategoryId").selectField("productId").list().each { if (it.productId != null && !catOfProduct.containsKey(it.productId)) catOfProduct[it.productId] = it.productCategoryId }
+                        ec.entity.find("mantle.product.category.ProductCategory").selectField("productCategoryId").selectField("categoryName").list().each { catNameMap[it.productCategoryId] = it.categoryName }
+                        for (row in topRows) {
+                            def pid = row.productId; if (!pid) continue
+                            prc++
+                            // product's daily sales map (shared by calibration + anomaly detection)
+                            def prodDaily = [:]
+                            ec.entity.find("zenith.erp.pos.PosTransactionItem").condition("productId", pid).selectField("transactionId").selectField("quantity").list().each {
+                                def ld = txnDate[it.transactionId]; if (ld != null) { double q = (it.quantity ?: 0) as double; prodDaily[ld] = ((prodDaily[ld] ?: 0.0d) as double) + q }
+                            }
+                            // accumulate into this product's category (for category-level detection after the loop)
+                            def _cat = catOfProduct[pid]
+                            if (_cat != null) { def cd = catDaily[_cat]; if (cd == null) { cd = [:]; catDaily[_cat] = cd }; prodDaily.each { k, v -> cd[k] = ((cd[k] ?: 0.0d) as double) + (v as double) } }
+                            // ---- 1) calibrate past-due forecasts for this product ----
+                            def due = ec.entity.find("zenith.erp.inventory.DemandForecast").condition("productId", pid)
+                                .condition("periodEnd", "<", todaySql).list().findAll { it.accuracyPercent == null && it.periodStart != null && it.periodEnd != null }
+                            if (due) {
+                                for (f in due) {
+                                    def ps = f.periodStart instanceof java.sql.Date ? f.periodStart.toLocalDate() : f.periodStart
+                                    def pe = f.periodEnd instanceof java.sql.Date ? f.periodEnd.toLocalDate() : f.periodEnd
+                                    double act = 0.0; def c = ps
+                                    while (c != null && !c.isAfter(pe)) { act += ((prodDaily[c] ?: 0.0d) as double); c = c.plusDays(1) }
+                                    double fq = (f.forecastQuantity ?: 0) as double
+                                    Integer acc = act > 0 ? Math.max(0, Math.min(100, (int)Math.round(100.0*(1.0 - Math.abs(fq - act)/act)))) : (fq > 0 ? 0 : 100)
+                                    f.actualQuantity = act; f.accuracyPercent = acc; f.update(); cal++
+                                }
+                            }
+                            // ---- 1b) demand-shift anomaly detection (threshold = 2 sigma of the product's own daily volatility) ----
+                            try {
+                                if (prodDaily.size() >= 2) {
+                                    def adts = new ArrayList(prodDaily.keySet()); Collections.sort(adts)
+                                    def amin = adts.get(0); def amax = adts.get(adts.size()-1)
+                                    def aser = []; def ac = amin
+                                    while (!ac.isAfter(amax)) { aser.add(((prodDaily[ac] ?: 0.0d) as double)); ac = ac.plusDays(1) }
+                                    int an = aser.size()
+                                    if (an >= 14) {
+                                        int rc = 7
+                                        double rSum = 0.0; for (int i = an-rc; i < an; i++) rSum += aser[i]; double recentAvg = rSum / rc
+                                        int bn = an - rc; double bSum = 0.0; for (int i = 0; i < bn; i++) bSum += aser[i]; double baseAvg = bSum / bn
+                                        double bVar = 0.0; for (int i = 0; i < bn; i++) bVar += (aser[i]-baseAvg)*(aser[i]-baseAvg); double baseStd = Math.sqrt(bVar / Math.max(1, bn-1))
+                                        if (baseAvg >= 1.0 && baseStd > 0.0001) {
+                                            double zc = (recentAvg - baseAvg) / baseStd
+                                            String dir = zc >= 2.0 ? "Increase" : (zc <= -2.0 ? "Decrease" : null)
+                                            if (dir != null) {
+                                                def dup = ec.entity.find("zenith.erp.inventory.DemandAlert").condition("productId", pid).condition("alertDate", todaySql).condition("alertType", "Shift").list()
+                                                if (!dup) {
+                                                    int pct = (int)Math.round(100.0*(recentAvg-baseAvg)/baseAvg)
+                                                    def pn = row.productName ?: pid
+                                                    String amsg = "Demand for '" + pn + "' has " + (dir=="Increase" ? "jumped" : "dropped") + " " + Math.abs(pct) + "% recently (last week about " + ((int)Math.round(recentAvg)) + "/day vs usual " + ((int)Math.round(baseAvg)) + "/day), beyond its normal range (" + (Math.round(zc*10)/10.0) + " sigma)."
+                                                    ec.service.sync().name("create#zenith.erp.inventory.DemandAlert").parameters([
+                                                        organizationPartyId: org, productId: pid, productName: pn, alertDate: todaySql, alertType: "Shift", direction: dir,
+                                                        recentAvgDaily: recentAvg, baselineAvgDaily: baseAvg, pctChange: pct, zScore: (Math.round(zc*100)/100.0),
+                                                        message: amsg, statusId: "AlertNew", createdStamp: ec.user.nowTimestamp
+                                                    ]).call()
+                                                    alerts++
+                                                    try {
+                                                        def uids = ec.entity.find("moqui.security.UserPreference").condition("preferenceKey","ACTIVE_ORGANIZATION").condition("preferenceValue", org).selectField("userId").list().collect { it.userId }.unique()
+                                                        for (uid in uids) {
+                                                            def nm = ec.makeNotificationMessage().topic("DemandAlert").title("Demand alert: " + pn).message([productName: pn, direction: dir, pctChange: pct, text: amsg])
+                                                            nm.userId(uid); nm.send()
+                                                        }
+                                                    } catch (Exception ne) { ec.logger.warn("DemandAlert notify failed: " + ne.message) }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            } catch (Exception de) { ec.logger.warn("DemandAlert detection failed for " + pid + ": " + de.message) }
+
+                            // ---- 2) forecast (always, for reorder point) + store fresh forecast if none today ----
+                            def out = ec.service.sync().name("zenith.inventory.AdvancedForecastServices.forecast#ProductDemand").parameter("productId", pid).parameter("horizonDays", period).parameter("organizationPartyId", org).call()
+                            def r = out?.result
+                            if (r && r.forecastDemand != null) {
+                                def existing = ec.entity.find("zenith.erp.inventory.DemandForecast").condition("productId", pid).condition("periodStart", todaySql).list()
+                                if (!existing) {
+                                    ec.service.sync().name("create#zenith.erp.inventory.DemandForecast").parameters([
+                                        productId: pid, periodStart: todaySql, periodEnd: java.sql.Date.valueOf(today.plusDays(period)),
+                                        forecastQuantity: r.forecastDemand, forecastMethodEnumId: (r.methodEnumId ?: "FmSeasonal"), actualQuantity: null, accuracyPercent: null
+                                    ]).call()
+                                    fc++
+                                }
+                                // ---- 3) REORDER alert: compare real stock-on-hand vs the forecast reorder point ----
+                                try {
+                                    double rop = (r.reorderPoint ?: 0) as double
+                                    double ss = (r.safetyStock ?: 0) as double
+                                    int sugg = (r.suggestedOrderQty ?: 0) as int
+                                    if (rop > 0) {
+                                        double soh = 0.0; boolean tracked = false
+                                        ec.entity.find("mantle.product.asset.Asset").condition("productId", pid).condition("ownerPartyId", org)
+                                            .selectField("quantityOnHandTotal").selectField("hasQuantity").selectField("originalQuantity").list().each {
+                                                soh += ((it.quantityOnHandTotal ?: 0) as double)
+                                                if (((it.originalQuantity ?: 0) as double) > 0) tracked = true
+                                            }
+                                        // only alert when stock is actually being tracked (avoids false 'reorder all' when stock is unknown/0)
+                                        if (tracked) {
+                                            String rdir = null
+                                            if (soh <= ss || soh <= 0) rdir = "Critical"
+                                            else if (soh <= rop) rdir = "Reorder"
+                                            else if (soh <= rop * 1.2) rdir = "LowStock"
+                                            if (rdir != null) {
+                                                def rdup = ec.entity.find("zenith.erp.inventory.DemandAlert").condition("productId", pid).condition("alertDate", todaySql).condition("alertType", "Reorder").list()
+                                                if (!rdup) {
+                                                    def pn = row.productName ?: pid
+                                                    String lvl = rdir == "Critical" ? "critically low" : (rdir == "Reorder" ? "at the reorder point" : "getting low")
+                                                    String rmsg = "Stock of '" + pn + "' is " + lvl + ": " + ((int)Math.round(soh)) + " units on hand vs a reorder point of " + ((int)Math.round(rop)) + " units (safety stock " + ((int)Math.round(ss)) + "). Suggested order about " + sugg + " units."
+                                                    ec.service.sync().name("create#zenith.erp.inventory.DemandAlert").parameters([
+                                                        organizationPartyId: org, productId: pid, productName: pn, alertDate: todaySql, alertType: "Reorder", direction: rdir,
+                                                        reorderPoint: rop, stockOnHand: soh, message: rmsg, statusId: "AlertNew", createdStamp: ec.user.nowTimestamp
+                                                    ]).call()
+                                                    alerts++
+                                                    try {
+                                                        def uids = ec.entity.find("moqui.security.UserPreference").condition("preferenceKey","ACTIVE_ORGANIZATION").condition("preferenceValue", org).selectField("userId").list().collect { it.userId }.unique()
+                                                        for (uid in uids) {
+                                                            def nm = ec.makeNotificationMessage().topic("DemandAlert").title("Reorder alert: " + pn).message([productName: pn, type: "Reorder", level: rdir, stockOnHand: (int)Math.round(soh), reorderPoint: (int)Math.round(rop), text: rmsg])
+                                                            nm.userId(uid); nm.send()
+                                                        }
+                                                    } catch (Exception ne2) { ec.logger.warn("Reorder notify failed: " + ne2.message) }
+                                                }
+                                            }
+                                        }
+                                    }
+                                } catch (Exception re) { ec.logger.warn("Reorder check failed for " + pid + ": " + re.message) }
+                            }
+                        }
+                        // ---- category-level demand-shift detection (aggregate of member products) ----
+                        try {
+                            catDaily.each { catId, cmap ->
+                                try {
+                                    if (cmap && cmap.size() >= 2) {
+                                        def cdts = new ArrayList(cmap.keySet()); Collections.sort(cdts)
+                                        def cmin = cdts.get(0); def cmax = cdts.get(cdts.size()-1)
+                                        def cser = []; def cc = cmin
+                                        while (!cc.isAfter(cmax)) { cser.add(((cmap[cc] ?: 0.0d) as double)); cc = cc.plusDays(1) }
+                                        int cn = cser.size()
+                                        if (cn >= 14) {
+                                            int rc2 = 7
+                                            double rS = 0.0; for (int i = cn-rc2; i < cn; i++) rS += cser[i]; double cRecent = rS / rc2
+                                            int cbn = cn - rc2; double bS = 0.0; for (int i = 0; i < cbn; i++) bS += cser[i]; double cBase = bS / cbn
+                                            double cV = 0.0; for (int i = 0; i < cbn; i++) cV += (cser[i]-cBase)*(cser[i]-cBase); double cStd = Math.sqrt(cV / Math.max(1, cbn-1))
+                                            if (cBase >= 1.0 && cStd > 0.0001) {
+                                                double cz = (cRecent - cBase) / cStd
+                                                String cdir = cz >= 2.0 ? "Increase" : (cz <= -2.0 ? "Decrease" : null)
+                                                if (cdir != null) {
+                                                    def cdup = ec.entity.find("zenith.erp.inventory.DemandAlert").condition("productId", catId).condition("alertDate", todaySql).condition("alertType", "CategoryShift").list()
+                                                    if (!cdup) {
+                                                        int cpct = (int)Math.round(100.0*(cRecent-cBase)/cBase)
+                                                        def cnm2 = catNameMap[catId] ?: catId
+                                                        String cmsg = "Category '" + cnm2 + "' demand has " + (cdir=="Increase" ? "jumped" : "dropped") + " " + Math.abs(cpct) + "% recently (last week about " + ((int)Math.round(cRecent)) + "/day vs usual " + ((int)Math.round(cBase)) + "/day), beyond its normal range (" + (Math.round(cz*10)/10.0) + " sigma)."
+                                                        ec.service.sync().name("create#zenith.erp.inventory.DemandAlert").parameters([
+                                                            organizationPartyId: org, productId: catId, productName: cnm2, alertDate: todaySql, alertType: "CategoryShift", direction: cdir,
+                                                            recentAvgDaily: cRecent, baselineAvgDaily: cBase, pctChange: cpct, zScore: (Math.round(cz*100)/100.0),
+                                                            message: cmsg, statusId: "AlertNew", createdStamp: ec.user.nowTimestamp
+                                                        ]).call()
+                                                        alerts++
+                                                        try {
+                                                            def uids2 = ec.entity.find("moqui.security.UserPreference").condition("preferenceKey","ACTIVE_ORGANIZATION").condition("preferenceValue", org).selectField("userId").list().collect { it.userId }.unique()
+                                                            for (uid in uids2) { def nm3 = ec.makeNotificationMessage().topic("DemandAlert").title("Category alert: " + cnm2).message([category: cnm2, direction: cdir, pctChange: cpct, text: cmsg]); nm3.userId(uid); nm3.send() }
+                                                        } catch (Exception cne) { ec.logger.warn("Category notify failed: " + cne.message) }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                } catch (Exception cie) { ec.logger.warn("Category detect failed for " + catId + ": " + cie.message) }
+                            }
+                        } catch (Exception ce2) { ec.logger.warn("Category loop failed: " + ce2.message) }
+                    }
+                    productsProcessed = prc; calibrated = cal; created = fc; alertsCreated = alerts
+                    summary = "Forecast cycle done: " + prc + " products across " + orgs.size() + " tenant(s); calibrated " + cal + " finished forecasts against real sales; created " + fc + " new forecasts; raised " + alerts + " demand-shift alerts."
+                } catch (Exception e) {
+                    ec.logger.error("cycle#DemandForecast failed: " + e.message, e)
+                    productsProcessed = prc; calibrated = cal; created = fc; alertsCreated = alerts
+                    summary = "Forecast cycle hit an error after processing " + prc + " products: " + e.message
+                } finally { if (!_d) ec.artifactExecution.enableAuthz() }
+            ]]></script>
+        </actions>
+    </service>
+
+    <!-- ============================================================================
+         explain#ForecastVariance : returns the latest forecast-vs-actual comparison
+         and the actual daily sales pattern in that period, so the AI Copilot can
+         diagnose WHY the forecast and reality differed.
+       ============================================================================ -->
+    <service verb="explain" noun="ForecastVariance" allow-remote="true" transaction-timeout="120">
+        <in-parameters>
+            <parameter name="productName"/>
+            <parameter name="productId"/>
+            <parameter name="organizationPartyId"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="summary"/>
+            <parameter name="result" type="Map"/>
+        </out-parameters>
+        <actions>
+            <script><![CDATA[
+                import org.moqui.context.ExecutionContext
+                ExecutionContext ec = context.ec
+                def res = [:]
+                boolean _d = ec.artifactExecution.disableAuthz()
+                try {
+                    def orgId = organizationPartyId ?: ec.user.getPreference("ACTIVE_ORGANIZATION")
+                    if (!orgId) { summary = "No active organization in context."; result = res; return }
+                    def prod = null
+                    if (productId) prod = ec.entity.find("mantle.product.Product").condition("productId", productId).condition("ownerPartyId", orgId).one()
+                    if (!prod && productName) {
+                        def pl = ec.entity.find("mantle.product.Product").condition("ownerPartyId", orgId).condition("productName", "like", "%" + productName + "%").orderBy("productName").limit(1).list()
+                        if (pl) prod = pl[0]
+                    }
+                    if (!prod) { summary = "Product not found for '" + (productName ?: productId) + "'."; result = res; return }
+                    def pid = prod.productId; def pname = prod.productName
+
+                    def fcs = ec.entity.find("zenith.erp.inventory.DemandForecast").condition("productId", pid).orderBy("-periodEnd").list().findAll { it.accuracyPercent != null }
+                    if (!fcs) { summary = "There is no completed (calibrated) forecast for '" + pname + "' yet, so there is nothing to compare. Forecasts are checked against real sales automatically once their period ends."; result = [productName: pname]; return }
+                    def f = fcs[0]
+                    def ps = f.periodStart instanceof java.sql.Date ? f.periodStart.toLocalDate() : f.periodStart
+                    def pe = f.periodEnd instanceof java.sql.Date ? f.periodEnd.toLocalDate() : f.periodEnd
+                    double fq = (f.forecastQuantity ?: 0) as double
+                    double act = (f.actualQuantity ?: 0) as double
+                    def acc = f.accuracyPercent
+                    double variance = act - fq
+                    Integer varPct = fq > 0 ? (int)Math.round(100.0*variance/fq) : null
+
+                    // actual daily pattern in the period (to spot spikes / dips)
+                    def txnDate = [:]
+                    ec.entity.find("zenith.erp.pos.PosTransaction").condition("organizationPartyId", orgId).condition("entryDate", ">=", new java.sql.Timestamp(ps.atStartOfDay(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli())).selectField("transactionId").selectField("entryDate").list().each { if (it.entryDate != null) txnDate[it.transactionId] = it.entryDate.toLocalDateTime().toLocalDate() }
+                    def prodDaily = [:]
+                    ec.entity.find("zenith.erp.pos.PosTransactionItem").condition("productId", pid).selectField("transactionId").selectField("quantity").list().each { def ld = txnDate[it.transactionId]; if (ld != null && !ld.isBefore(ps) && !ld.isAfter(pe)) { double q = (it.quantity ?: 0) as double; prodDaily[ld] = ((prodDaily[ld] ?: 0.0d) as double) + q } }
+                    def pattern = []; def c = ps; def peakDay = null; double peakQty = -1
+                    while (c != null && !c.isAfter(pe)) { double q = (prodDaily[c] ?: 0.0d) as double; pattern.add([date: c.toString(), weekday: c.getDayOfWeek().toString().substring(0,3), units: (int)Math.round(q)]); if (q > peakQty) { peakQty = q; peakDay = c }; c = c.plusDays(1) }
+
+                    res = [productName: pname, periodStart: ps.toString(), periodEnd: pe.toString(), forecast: (int)Math.round(fq), actual: (int)Math.round(act), accuracyPercent: acc, variancePct: varPct, dailyPattern: pattern, peakDay: (peakDay != null ? peakDay.toString() : null), peakUnits: (int)Math.round(peakQty)]
+                    String dir = variance > 0 ? "higher than" : (variance < 0 ? "lower than" : "in line with")
+                    summary = "Forecast vs actual for '" + pname + "' over " + ps + " to " + pe + ": forecast " + ((int)Math.round(fq)) + " units, actual " + ((int)Math.round(act)) + " units (" + (varPct != null ? (Math.abs(varPct) + "% " + dir + " forecast") : dir + " forecast") + "; accuracy " + (acc != null ? acc + "%" : "n/a") + "). Daily actuals in the period: " + pattern.collect { it.weekday + " " + it.units }.join(", ") + "."
+                    result = res
+                } catch (Exception e) {
+                    ec.logger.error("explain#ForecastVariance failed: " + e.message, e)
+                    summary = "Could not load the forecast comparison."; result = res
+                } finally { if (!_d) ec.artifactExecution.enableAuthz() }
+            ]]></script>
+        </actions>
+    </service>
+
+    <!-- get#DemandAlerts : active demand-shift alerts for the tenant (for the Copilot). -->
+    <service verb="get" noun="DemandAlerts" allow-remote="true" transaction-timeout="60">
+        <in-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="direction"/>
+            <parameter name="maxAlerts" type="Integer" default-value="15"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="summary"/>
+            <parameter name="result" type="Map"/>
+            <parameter name="alertCount" type="Integer"/>
+        </out-parameters>
+        <actions>
+            <script><![CDATA[
+                import org.moqui.context.ExecutionContext
+                ExecutionContext ec = context.ec
+                boolean _d = ec.artifactExecution.disableAuthz()
+                try {
+                    def orgId = organizationPartyId ?: ec.user.getPreference("ACTIVE_ORGANIZATION")
+                    if (!orgId) { summary = "No active organization."; alertCount = 0; result = [:]; return }
+                    def ef = ec.entity.find("zenith.erp.inventory.DemandAlert").condition("organizationPartyId", orgId).condition("statusId", "AlertNew")
+                    if (direction) ef.condition("direction", direction)
+                    def list = ef.orderBy("alertType").orderBy("-alertDate").limit((maxAlerts ?: 20) as int).list()
+                    alertCount = list.size()
+                    def items = list.collect { [productName: it.productName, alertType: it.alertType, direction: it.direction, message: it.message] }
+                    result = [alerts: items, count: alertCount]
+                    int reorderN = items.count { it.alertType == "Reorder" }
+                    int shiftN = alertCount - reorderN
+                    if (!items) { summary = "No active alerts right now - all tracked products are selling within their normal range and stock is above reorder levels." }
+                    else { summary = "There " + (alertCount==1 ? "is " : "are ") + alertCount + " active alert" + (alertCount==1 ? "" : "s") + " (" + reorderN + " stock/reorder, " + shiftN + " demand-shift): " + items.collect { it.message }.join(" | ") }
+                } catch (Exception e) { ec.logger.error("get#DemandAlerts failed: " + e.message, e); summary = "Could not load demand alerts."; alertCount = 0; result = [:] } finally { if (!_d) ec.artifactExecution.enableAuthz() }
+            ]]></script>
+        </actions>
+    </service>
+
+    <!-- forecast#CategoryDemand : same engine as products, but aggregated across all
+         products in a category (tenant-scoped). For "forecast the Stationery category". -->
+    <service verb="forecast" noun="CategoryDemand" allow-remote="true" transaction-timeout="120">
+        <in-parameters>
+            <parameter name="categoryName"/>
+            <parameter name="categoryId"/>
+            <parameter name="organizationPartyId"/>
+            <parameter name="horizonDays" type="Integer" default-value="14"/>
+            <parameter name="leadTimeDays" type="Integer" default-value="7"/>
+            <parameter name="serviceLevel" type="BigDecimal" default-value="0.95"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="summary"/>
+            <parameter name="result" type="Map"/>
+        </out-parameters>
+        <actions>
+            <script><![CDATA[
+                import org.moqui.context.ExecutionContext
+                ExecutionContext ec = context.ec
+                def res = [:]
+                boolean _d = ec.artifactExecution.disableAuthz()
+                try {
+                    int horizon = (horizonDays ?: 14) as int; int leadTime = (leadTimeDays ?: 7) as int; double sl = (serviceLevel ?: 0.95) as double
+                    if (horizon < 1) horizon = 14; if (horizon > 120) horizon = 120; if (leadTime < 1) leadTime = 7
+                    def orgId = organizationPartyId ?: ec.user.getPreference("ACTIVE_ORGANIZATION")
+                    if (!orgId) { summary = "No active organization."; result = res; return }
+                    // resolve category (prefer ones that actually have this org's products)
+                    def cat = null
+                    if (categoryId) cat = ec.entity.find("mantle.product.category.ProductCategory").condition("productCategoryId", categoryId).one()
+                    if (!cat && categoryName) {
+                        def want = categoryName.trim().toLowerCase()
+                        def cl = ec.entity.find("mantle.product.category.ProductCategory").selectField("productCategoryId").selectField("categoryName").list()
+                        cat = cl.find { (it.categoryName ?: "").toLowerCase() == want } ?: cl.find { (it.categoryName ?: "").toLowerCase().contains(want) } ?: cl.find { want.contains((it.categoryName ?: "x").toLowerCase()) }
+                    }
+                    if (!cat) { summary = "Category not found for '" + (categoryName ?: categoryId) + "'. Ask the user to confirm the category name."; result = res; return }
+                    def catId = cat.productCategoryId; def catNm = cat.categoryName
+                    // member products owned by this org
+                    def memberPids = ec.entity.find("mantle.product.category.ProductCategoryMember").condition("productCategoryId", catId).selectField("productId").list().collect { it.productId }.unique()
+                    def ownedPids = []
+                    if (memberPids) ec.entity.find("mantle.product.Product").condition("productId", "in", memberPids).condition("ownerPartyId", orgId).selectField("productId").list().each { ownedPids.add(it.productId) }
+                    if (!ownedPids) { summary = "The '" + catNm + "' category has no products for your business yet."; result = [categoryName: catNm]; return }
+                    // aggregate daily demand across member products
+                    def txnDate = [:]
+                    ec.entity.find("zenith.erp.pos.PosTransaction").condition("organizationPartyId", orgId).selectField("transactionId").selectField("entryDate").list().each { if (it.entryDate != null) txnDate[it.transactionId] = it.entryDate.toLocalDateTime().toLocalDate() }
+                    def daily = [:]
+                    ec.entity.find("zenith.erp.pos.PosTransactionItem").condition("productId", "in", ownedPids).selectField("transactionId").selectField("quantity").list().each {
+                        def ld = txnDate[it.transactionId]; if (ld != null) { double q = (it.quantity ?: 0) as double; daily[ld] = ((daily[ld] ?: 0.0d) as double) + q }
+                    }
+                    if (daily.isEmpty()) { summary = "No sales history for the '" + catNm + "' category yet."; result = [categoryName: catNm]; return }
+                    def dts = new ArrayList(daily.keySet()); Collections.sort(dts)
+                    def minD = dts.get(0); def maxD = dts.get(dts.size()-1)
+                    def series = []; def cur = minD
+                    while (!cur.isAfter(maxD)) { series.add(((daily[cur] ?: 0.0d) as double)); cur = cur.plusDays(1) }
+                    int n = series.size()
+                    double sum = 0.0; for (v in series) sum += v; double mean = sum / n
+                    double varSum = 0.0; for (v in series) varSum += (v - mean)*(v - mean); double sd = Math.sqrt(varSum / Math.max(1, n-1))
+                    double sx=0, sy=0, sxx=0, sxy=0
+                    for (int i = 0; i < n; i++) { sx += i; sy += series[i]; sxx += i*i; sxy += i*series[i] }
+                    double den = (n*sxx - sx*sx); double slope = den != 0 ? (n*sxy - sx*sy)/den : 0.0; double intercept = (sy - slope*sx)/n
+                    double[] ds = new double[7]; int[] dc = new int[7]; def c2 = minD
+                    for (int i = 0; i < n; i++) { int dw = c2.getDayOfWeek().getValue()%7; ds[dw] += series[i]; dc[dw]++; c2 = c2.plusDays(1) }
+                    double[] dowF = new double[7]; for (int k=0;k<7;k++){ double a = dc[k]>0?ds[k]/dc[k]:mean; dowF[k] = mean>0?Math.max(0.3,Math.min(2.5,a/mean)):1.0 }
+                    def dowNames = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"]; int peakDow=0; for(int k=1;k<7;k++) if(dowF[k]>dowF[peakDow]) peakDow=k
+                    double fTotal = 0.0; def fcur = maxD.plusDays(1)
+                    for (int h=0; h<horizon; h++){ int dw=fcur.getDayOfWeek().getValue()%7; fTotal += Math.max(0.0,(intercept+slope*(n+h))*dowF[dw]); fcur=fcur.plusDays(1) }
+                    double z = sl>=0.99?2.33:(sl>=0.975?1.96:(sl>=0.95?1.645:(sl>=0.90?1.28:1.04)))
+                    double safety = z*sd*Math.sqrt((double)leadTime); double dailyDemand = Math.max(0.0, intercept+slope*n)
+                    double rop = dailyDemand*leadTime + safety
+                    // weekly cross-validation confidence (predict each recent week's TOTAL, same as products)
+                    Integer confidence = null
+                    def fitC = { int len ->
+                        double fsx=0, fsy=0, fsxx=0, fsxy=0
+                        for (int i=0;i<len;i++){ fsx+=i; fsy+=series[i]; fsxx+=i*i; fsxy+=i*series[i] }
+                        double fden=(len*fsxx-fsx*fsx); double fslp= fden!=0?(len*fsxy-fsx*fsy)/fden:0.0; double fin=(fsy-fslp*fsx)/len; double fmn=fsy/len
+                        double[] fds=new double[7]; int[] fdc=new int[7]; def fcc=minD
+                        for (int i=0;i<len;i++){ int dw=fcc.getDayOfWeek().getValue()%7; fds[dw]+=series[i]; fdc[dw]++; fcc=fcc.plusDays(1) }
+                        double[] fdf=new double[7]; for(int k=0;k<7;k++){ double a=fdc[k]>0?fds[k]/fdc[k]:fmn; fdf[k]= fmn>0?Math.max(0.3,Math.min(2.5,a/fmn)):1.0 }
+                        return [fin, fslp, fdf]
+                    }
+                    int cvPeriods=(int)(n/7)
+                    if (cvPeriods >= 3) {
+                        int tcnt=Math.min(4,cvPeriods-1); double apeSum=0.0; int apeN=0
+                        for (int p=cvPeriods-tcnt; p<cvPeriods; p++){
+                            int trainEnd=p*7; if(trainEnd<7) continue
+                            def ff=fitC(trainEnd); double fi=ff[0]; double fsl2=ff[1]; double[] fdf=ff[2]
+                            double predTot=0.0, actTot=0.0; def pc=minD.plusDays(trainEnd)
+                            for (int i=trainEnd; i<trainEnd+7 && i<n; i++){ int dw=pc.getDayOfWeek().getValue()%7; predTot+=Math.max(0.0,(fi+fsl2*i)*fdf[dw]); actTot+=series[i]; pc=pc.plusDays(1) }
+                            if (actTot>0){ apeSum+=Math.abs(actTot-predTot)/actTot; apeN++ }
+                        }
+                        if (apeN>0){ double mape=apeSum/apeN; confidence=Math.max(40,Math.min(96,(int)Math.round(100.0*(1.0-mape)))) }
+                    }
+                    def trendTxt = slope>0.02?"rising":(slope<-0.02?"declining":"stable")
+                    res = [categoryName: catNm, products: ownedPids.size(), historyDays: n, avgDailyDemand: (Math.round(mean*100)/100.0), trendPerDay: (Math.round(slope*100)/100.0), peakWeekday: dowNames[peakDow], horizonDays: horizon, forecastDemand: (int)Math.round(fTotal), reorderPoint: (int)Math.round(rop), safetyStock: (int)Math.round(safety), confidencePct: confidence]
+                    summary = "Category '" + catNm + "' (" + ownedPids.size() + " products): expect about " + ((int)Math.round(fTotal)) + " units of total demand over the next " + horizon + " days (around " + ((int)Math.round(mean)) + "/day, " + trendTxt + " trend, busiest on " + dowNames[peakDow] + "). " + (confidence != null ? ("Back-tested confidence about " + confidence + "%. ") : "") + "Based on " + n + " days of sales."
+                    result = res
+                } catch (Exception e) { ec.logger.error("forecast#CategoryDemand failed: " + e.message, e); summary = "The category forecast could not be completed."; result = res } finally { if (!_d) ec.artifactExecution.enableAuthz() }
+            ]]></script>
+        </actions>
+    </service>
+
+</services>

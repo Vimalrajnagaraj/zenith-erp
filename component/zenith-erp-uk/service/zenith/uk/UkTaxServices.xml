@@ -1,0 +1,138 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <!-- UK VAT Calculator: implements the pluggable tax engine interface -->
+    <service verb="calculate" noun="Tax">
+        <description>UK VAT calculation (standard 20%, reduced 5%, zero-rated, exempt).
+            Registered as TAX_CALCULATION_SERVICE for UK companies.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="customerPartyId"/>
+            <parameter name="items" type="List" required="true">
+                <parameter name="itemEntry" type="Map">
+                    <parameter name="productId"/>
+                    <parameter name="productTaxCode"/>
+                    <parameter name="taxCategoryId"/>
+                    <parameter name="quantity" type="BigDecimal" required="true"/>
+                    <parameter name="unitAmount" type="BigDecimal" required="true"/>
+                    <parameter name="discountAmount" type="BigDecimal"/>
+                    <parameter name="isTaxInclusive" default-value="N"/>
+                </parameter>
+            </parameter>
+            <parameter name="originRegionGeoId"/>
+            <parameter name="destinationRegionGeoId"/>
+            <parameter name="originCountryGeoId"/>
+            <parameter name="destinationCountryGeoId"/>
+            <parameter name="currencyUomId"/>
+            <parameter name="transactionDate" type="Timestamp" default="ec.user.nowTimestamp"/>
+            <parameter name="transactionType" default-value="SALE"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="taxedItems" type="List"/>
+            <parameter name="totalTaxableAmount" type="BigDecimal"/>
+            <parameter name="totalTaxAmount" type="BigDecimal"/>
+            <parameter name="totalAmount" type="BigDecimal"/>
+        </out-parameters>
+        <actions>
+            <set field="taxedItems" from="[]"/>
+            <set field="totalTaxableAmount" from="BigDecimal.ZERO" type="BigDecimal"/>
+            <set field="totalTaxAmount" from="BigDecimal.ZERO" type="BigDecimal"/>
+            <set field="totalAmount" from="BigDecimal.ZERO" type="BigDecimal"/>
+
+            <!-- Get standard VAT rate -->
+            <entity-find entity-name="zenith.erp.uk.UkVatRate" list="stdRates">
+                <econdition field-name="vatRateTypeEnumId" value="UkVatStandard"/>
+                <econdition field-name="effectiveDate" operator="less-equals" from="ec.user.nowTimestamp"/>
+                <order-by field-name="-effectiveDate"/>
+            </entity-find>
+            <set field="standardRate" from="stdRates ? stdRates[0].rate : 20" type="BigDecimal"/>
+
+            <set field="itemIndex" from="0" type="Integer"/>
+            <iterate list="items" entry="item">
+                <set field="lineAmount" from="((item.quantity ?: 0) as BigDecimal) * ((item.unitAmount ?: 0) as BigDecimal)" type="BigDecimal"/>
+                <set field="lineDiscount" from="(item.discountAmount ?: 0) as BigDecimal"/>
+                <set field="taxableAmount" from="lineAmount - lineDiscount" type="BigDecimal"/>
+
+                <set field="vatRate" from="standardRate" type="BigDecimal"/>
+
+                <!-- Check product tax code for reduced/zero/exempt -->
+                <if condition="item.productTaxCode == 'UK_REDUCED'">
+                    <set field="vatRate" from="5" type="BigDecimal"/>
+                </if>
+                <if condition="item.productTaxCode == 'UK_ZERO'">
+                    <set field="vatRate" from="BigDecimal.ZERO" type="BigDecimal"/>
+                </if>
+                <if condition="item.productTaxCode == 'UK_EXEMPT'">
+                    <set field="vatRate" from="BigDecimal.ZERO" type="BigDecimal"/>
+                </if>
+
+                <!-- Handle tax-inclusive pricing -->
+                <if condition="item.isTaxInclusive == 'Y' &amp;&amp; vatRate &gt; 0">
+                    <set field="taxableAmount" from="(taxableAmount / (1 + vatRate / 100)).setScale(2, java.math.RoundingMode.HALF_UP)" type="BigDecimal"/>
+                </if>
+
+                <!-- Check customer VAT exemption -->
+                <if condition="customerPartyId">
+                    <service-call name="zenith.tax.TaxServices.check#TaxExemption" ignore-error="true"
+                                  in-map="[partyId:customerPartyId, productId:item.productId,
+                                           transactionDate:transactionDate]"
+                                  out-map="exemptResult"/>
+                    <if condition="exemptResult?.isExempt"><set field="vatRate" from="BigDecimal.ZERO" type="BigDecimal"/></if>
+                </if>
+
+                <set field="vatAmount" from="(taxableAmount * vatRate / 100).setScale(2, java.math.RoundingMode.HALF_UP)" type="BigDecimal"/>
+                <set field="breakdowns" from="[]"/>
+                <if condition="vatRate &gt; 0">
+                    <script>breakdowns.add([taxName:'VAT', taxRate:vatRate,
+                        taxableAmount:taxableAmount, taxAmount:vatAmount,
+                        taxAuthorityId:'GBR_HMRC', countryGeoId:'GBR',
+                        isIncludedInPrice:item.isTaxInclusive ?: 'N'])</script>
+                </if>
+
+                <script>taxedItems.add([itemIndex:itemIndex, taxableAmount:taxableAmount,
+                    totalTaxAmount:vatAmount, taxBreakdowns:breakdowns])</script>
+                <set field="totalTaxableAmount" from="totalTaxableAmount + taxableAmount"/>
+                <set field="totalTaxAmount" from="totalTaxAmount + vatAmount"/>
+                <set field="totalAmount" from="totalAmount + taxableAmount + vatAmount"/>
+                <set field="itemIndex" from="itemIndex + 1"/>
+            </iterate>
+        </actions>
+    </service>
+
+    <!-- Generate VAT Return -->
+    <service verb="generate" noun="VatReturn">
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="periodStart" type="Date" required="true"/>
+            <parameter name="periodEnd" type="Date" required="true"/>
+        </in-parameters>
+        <out-parameters><parameter name="vatReturnId"/></out-parameters>
+        <actions>
+            <service-call name="create#zenith.erp.uk.VatReturn"
+                          in-map="[organizationPartyId:organizationPartyId, periodStart:periodStart,
+                                   periodEnd:periodEnd, statusId:'VrDraft']"
+                          out-map="context"/>
+        </actions>
+    </service>
+
+    <!-- Submit to MTD (placeholder for HMRC API integration) -->
+    <service verb="submit" noun="VatReturnToHmrc">
+        <in-parameters>
+            <parameter name="vatReturnId" required="true"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.uk.VatReturn" value-field="vatReturn" for-update="true"/>
+
+            <service-call name="create#zenith.erp.uk.MtdSubmission"
+                          in-map="[vatReturnId:vatReturnId, submissionType:'VAT_RETURN',
+                                   submittedDate:ec.user.nowTimestamp, isSuccess:'N',
+                                   requestPayload:'MTD API integration placeholder']"/>
+
+            <set field="vatReturn.statusId" value="VrSubmitted"/>
+            <set field="vatReturn.submittedDate" from="ec.user.nowTimestamp"/>
+            <entity-update value-field="vatReturn"/>
+        </actions>
+    </service>
+
+</services>

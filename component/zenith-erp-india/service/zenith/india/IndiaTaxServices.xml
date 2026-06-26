@@ -1,0 +1,180 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <!-- ========== INDIA TAX CALCULATION — implements zenith.tax.TaxServices.calculate#Tax interface ========== -->
+
+    <service verb="calculate" noun="Tax">
+        <description>India-specific tax calculation implementing the generic calculate#Tax interface.
+            Determines CGST+SGST (intra-state) or IGST (inter-state) plus cess.
+            Dispatched via CompanySettings key TAX_CALCULATION_SERVICE.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="customerPartyId"/>
+            <parameter name="items" type="List" required="true">
+                <parameter name="itemEntry" type="Map">
+                    <parameter name="productId"/>
+                    <parameter name="productTaxCode"/>
+                    <parameter name="taxCategoryId"/>
+                    <parameter name="quantity" type="BigDecimal" required="true"/>
+                    <parameter name="unitAmount" type="BigDecimal" required="true"/>
+                    <parameter name="discountAmount" type="BigDecimal"/>
+                    <parameter name="isTaxInclusive" default-value="N"/>
+                </parameter>
+            </parameter>
+            <parameter name="originRegionGeoId"/>
+            <parameter name="destinationRegionGeoId"/>
+            <parameter name="originCountryGeoId"/>
+            <parameter name="destinationCountryGeoId"/>
+            <parameter name="currencyUomId"/>
+            <parameter name="transactionDate" type="Timestamp" default="ec.user.nowTimestamp"/>
+            <parameter name="transactionType" default-value="SALE"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="taxedItems" type="List"/>
+            <parameter name="totalTaxableAmount" type="BigDecimal"/>
+            <parameter name="totalTaxAmount" type="BigDecimal"/>
+            <parameter name="totalAmount" type="BigDecimal"/>
+        </out-parameters>
+        <actions>
+            <!-- Resolve seller state code -->
+            <set field="supplierStateCode" from="originRegionGeoId"/>
+            <if condition="!supplierStateCode">
+                <entity-find entity-name="zenith.erp.india.IndiaGstConfig" list="gstConfigs" limit="1">
+                    <econdition field-name="organizationPartyId"/>
+                </entity-find>
+                <set field="supplierStateCode" from="gstConfigs ? gstConfigs[0].stateCode : null"/>
+            </if>
+
+            <!-- Resolve buyer state code -->
+            <set field="buyerStateCode" from="destinationRegionGeoId"/>
+            <if condition="!buyerStateCode &amp;&amp; customerPartyId">
+                <entity-find entity-name="zenith.erp.india.IndiaGstin" list="buyerGstins" limit="1">
+                    <econdition field-name="partyId" from="customerPartyId"/>
+                </entity-find>
+                <if condition="buyerGstins">
+                    <set field="buyerStateCode" from="buyerGstins[0].gstin?.substring(0,2)"/>
+                </if>
+            </if>
+            <if condition="!buyerStateCode">
+                <set field="buyerStateCode" from="supplierStateCode"/>
+            </if>
+
+            <!-- Check for SEZ/export -->
+            <set field="isSezSupply" value="N"/>
+            <set field="isExport" value="N"/>
+            <if condition="destinationCountryGeoId &amp;&amp; destinationCountryGeoId != 'IND'">
+                <set field="isExport" value="Y"/>
+            </if>
+
+            <!-- Process each item -->
+            <set field="taxedItems" from="[]"/>
+            <set field="totalTaxableAmount" from="BigDecimal.ZERO" type="BigDecimal"/>
+            <set field="totalTaxAmount" from="BigDecimal.ZERO" type="BigDecimal"/>
+            <set field="totalAmount" from="BigDecimal.ZERO" type="BigDecimal"/>
+            <set field="itemIndex" from="0" type="Integer"/>
+
+            <iterate list="items" entry="item">
+                <!-- Calculate line amount -->
+                <set field="lineAmount" from="((item.quantity ?: 0) as BigDecimal) * ((item.unitAmount ?: 0) as BigDecimal)" type="BigDecimal"/>
+                <set field="lineDiscount" from="(item.discountAmount ?: 0) as BigDecimal"/>
+                <set field="taxableAmount" from="lineAmount - lineDiscount" type="BigDecimal"/>
+
+                <!-- Resolve GST slab from productTaxCode (HSN) or taxCategoryId or product -->
+                <set field="gstSlabId" from="item.taxCategoryId"/>
+                <if condition="!gstSlabId &amp;&amp; item.productTaxCode">
+                    <entity-find-one entity-name="zenith.erp.india.IndiaHsnCode" value-field="hsnRecord">
+                        <field-map field-name="hsnCode" from="item.productTaxCode"/>
+                    </entity-find-one>
+                    <set field="gstSlabId" from="hsnRecord?.defaultGstSlabId"/>
+                </if>
+                <if condition="!gstSlabId &amp;&amp; item.productId">
+                    <entity-find-one entity-name="mantle.product.Product" value-field="product">
+                        <field-map field-name="productId" from="item.productId"/>
+                    </entity-find-one>
+                    <!-- Explicit GST-exempt flag wins -->
+                    <if condition="product?.isGstExempt == 'Y'"><set field="gstSlabId" value="GST_EXEMPT"/></if>
+                    <!-- Native product GST slab (set via product screen), else generic tax category -->
+                    <if condition="!gstSlabId"><set field="gstSlabId" from="product?.gstSlabId ?: product?.taxCategoryId"/></if>
+                    <!-- Native HSN code (set via product screen), else generic tax code -> HSN master -> slab -->
+                    <if condition="!gstSlabId &amp;&amp; (product?.hsnCode ?: product?.productTaxCode)">
+                        <entity-find-one entity-name="zenith.erp.india.IndiaHsnCode" value-field="hsnRec2">
+                            <field-map field-name="hsnCode" from="product.hsnCode ?: product.productTaxCode"/>
+                        </entity-find-one>
+                        <set field="gstSlabId" from="hsnRec2?.defaultGstSlabId"/>
+                    </if>
+                </if>
+
+                <if condition="!gstSlabId">
+                    <!-- No GST slab found — zero tax -->
+                    <script>taxedItems.add([itemIndex:itemIndex, taxableAmount:taxableAmount,
+                        totalTaxAmount:BigDecimal.ZERO, taxBreakdowns:[]])</script>
+                    <set field="totalTaxableAmount" from="totalTaxableAmount + taxableAmount"/>
+                    <set field="totalAmount" from="totalAmount + taxableAmount"/>
+                    <set field="itemIndex" from="itemIndex + 1"/>
+                    <continue/>
+                </if>
+
+                <!-- Handle tax-inclusive pricing -->
+                <if condition="item.isTaxInclusive == 'Y'">
+                    <service-call name="zenith.india.GstServices.calculate#TaxInclusive"
+                                  in-map="[inclusiveAmount:taxableAmount, gstRate:0]" out-map="inclResult"/>
+                    <entity-find-one entity-name="zenith.erp.india.IndiaGstSlab" value-field="slabForRate">
+                        <field-map field-name="gstSlabId"/>
+                    </entity-find-one>
+                    <if condition="slabForRate">
+                        <service-call name="zenith.india.GstServices.calculate#TaxInclusive"
+                                      in-map="[inclusiveAmount:taxableAmount, gstRate:slabForRate.gstRate]"
+                                      out-map="inclResult"/>
+                        <set field="taxableAmount" from="inclResult.taxableAmount" type="BigDecimal"/>
+                    </if>
+                </if>
+
+                <!-- Calculate GST using existing engine -->
+                <service-call name="zenith.india.GstServices.calculate#Gst"
+                              in-map="[supplierStateCode:supplierStateCode, buyerStateCode:buyerStateCode,
+                                       gstSlabId:gstSlabId, taxableAmount:taxableAmount,
+                                       isSezSupply:isSezSupply]"
+                              out-map="gstResult"/>
+
+                <!-- Build generic tax breakdowns -->
+                <set field="breakdowns" from="[]"/>
+                <if condition="(gstResult.cgstAmount ?: 0) &gt; 0">
+                    <script>breakdowns.add([taxName:'CGST', taxRate:gstResult.cgstRate,
+                        taxableAmount:taxableAmount, taxAmount:gstResult.cgstAmount,
+                        taxAuthorityId:'IND_CENTRAL', countryGeoId:'IND',
+                        regionGeoId:supplierStateCode, isIncludedInPrice:item.isTaxInclusive])</script>
+                </if>
+                <if condition="(gstResult.sgstAmount ?: 0) &gt; 0">
+                    <script>breakdowns.add([taxName:'SGST', taxRate:gstResult.sgstRate,
+                        taxableAmount:taxableAmount, taxAmount:gstResult.sgstAmount,
+                        taxAuthorityId:'IND_' + supplierStateCode, countryGeoId:'IND',
+                        regionGeoId:supplierStateCode, isIncludedInPrice:item.isTaxInclusive])</script>
+                </if>
+                <if condition="(gstResult.igstAmount ?: 0) &gt; 0">
+                    <script>breakdowns.add([taxName:'IGST', taxRate:gstResult.igstRate,
+                        taxableAmount:taxableAmount, taxAmount:gstResult.igstAmount,
+                        taxAuthorityId:'IND_CENTRAL', countryGeoId:'IND',
+                        isIncludedInPrice:item.isTaxInclusive])</script>
+                </if>
+                <if condition="(gstResult.cessAmount ?: 0) &gt; 0">
+                    <script>breakdowns.add([taxName:'CESS', taxRate:gstResult.cessRate,
+                        taxableAmount:taxableAmount, taxAmount:gstResult.cessAmount,
+                        taxAuthorityId:'IND_CENTRAL', countryGeoId:'IND',
+                        isIncludedInPrice:'N'])</script>
+                </if>
+
+                <set field="itemTotalTax" from="gstResult.totalTaxAmount ?: BigDecimal.ZERO" type="BigDecimal"/>
+
+                <script>taxedItems.add([itemIndex:itemIndex, taxableAmount:taxableAmount,
+                    totalTaxAmount:itemTotalTax, taxBreakdowns:breakdowns])</script>
+
+                <set field="totalTaxableAmount" from="totalTaxableAmount + taxableAmount"/>
+                <set field="totalTaxAmount" from="totalTaxAmount + itemTotalTax"/>
+                <set field="totalAmount" from="totalAmount + taxableAmount + itemTotalTax"/>
+                <set field="itemIndex" from="itemIndex + 1"/>
+            </iterate>
+        </actions>
+    </service>
+
+</services>

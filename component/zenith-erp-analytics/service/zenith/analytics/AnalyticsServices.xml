@@ -1,0 +1,176 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <!-- Generate Daily Sales Snapshot -->
+    <service verb="generate" noun="DailySalesSnapshot">
+        <in-parameters>
+            <parameter name="storeId" required="true"/>
+            <parameter name="snapshotDate" type="Date" required="true"/>
+        </in-parameters>
+        <out-parameters><parameter name="snapshotId"/></out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.analytics.DailySalesSnapshot" value-field="existing">
+                <field-map field-name="storeId"/>
+                <field-map field-name="snapshotDate"/>
+            </entity-find-one>
+            <if condition="existing">
+                <set field="snapshotId" from="existing.snapshotId"/>
+                <return message="Snapshot already exists for this store and date"/>
+            </if>
+
+            <entity-find-one entity-name="zenith.erp.stores.Store" value-field="store"/>
+            <set field="facilityId" from="store?.facilityId"/>
+
+            <!-- Count POS transactions for the day -->
+            <entity-find entity-name="zenith.erp.pos.PosTransaction" list="transactions">
+                <econdition field-name="facilityId" ignore-if-empty="true"/>
+                <econdition field-name="transactionDate" operator="greater-equals" from="snapshotDate"/>
+                <econdition field-name="transactionDate" operator="less" from="snapshotDate + 1"/>
+                <econdition field-name="statusId" value="PtCompleted"/>
+            </entity-find>
+
+            <set field="totalSales" from="0" type="BigDecimal"/>
+            <set field="totalTax" from="0" type="BigDecimal"/>
+            <set field="totalDiscount" from="0" type="BigDecimal"/>
+            <set field="itemsSold" from="0" type="Integer"/>
+            <set field="transactionCount" from="transactions.size()" type="Integer"/>
+
+            <iterate list="transactions" entry="txn">
+                <set field="totalSales" from="totalSales + (txn.grandTotal ?: 0)"/>
+                <set field="totalTax" from="totalTax + (txn.totalTaxAmount ?: 0)"/>
+                <set field="totalDiscount" from="totalDiscount + (txn.totalDiscount ?: 0)"/>
+            </iterate>
+
+            <set field="avgBasketValue" from="transactionCount > 0 ? totalSales / transactionCount : 0"/>
+
+            <service-call name="create#zenith.erp.analytics.DailySalesSnapshot"
+                          in-map="[storeId:storeId, snapshotDate:snapshotDate, totalSales:totalSales,
+                                   totalReturns:0, netSales:totalSales, totalTax:totalTax,
+                                   totalDiscount:totalDiscount, transactionCount:transactionCount,
+                                   itemsSold:itemsSold, avgBasketValue:avgBasketValue,
+                                   avgItemsPerTransaction:0, uniqueCustomers:0, newCustomers:0,
+                                   cashSales:0, cardSales:0, upiSales:0, otherSales:0]"
+                          out-map="context"/>
+        </actions>
+    </service>
+
+    <!-- Record Footfall -->
+    <service verb="record" noun="Footfall">
+        <in-parameters>
+            <parameter name="storeId" required="true"/>
+            <parameter name="counterDate" type="Date" required="true"/>
+            <parameter name="hourOfDay" type="Integer" required="true"/>
+            <parameter name="footfallCount" type="Integer" required="true"/>
+            <parameter name="conversionCount" type="Integer" default-value="0"/>
+        </in-parameters>
+        <out-parameters><parameter name="footfallId"/></out-parameters>
+        <actions>
+            <set field="conversionRate" from="footfallCount > 0 ? (conversionCount * 100.0 / footfallCount) : 0"/>
+            <service-call name="create#zenith.erp.analytics.FootfallCounter"
+                          in-map="[storeId:storeId, counterDate:counterDate, hourOfDay:hourOfDay,
+                                   footfallCount:footfallCount, conversionCount:conversionCount,
+                                   conversionRate:conversionRate]"
+                          out-map="context"/>
+        </actions>
+    </service>
+
+    <!-- Set Sales Target -->
+    <service verb="set" noun="SalesTarget">
+        <in-parameters>
+            <parameter name="targetTypeEnumId" required="true"/>
+            <parameter name="storeId"/>
+            <parameter name="partyId"/>
+            <parameter name="periodEnumId" required="true"/>
+            <parameter name="periodStart" type="Date" required="true"/>
+            <parameter name="periodEnd" type="Date" required="true"/>
+            <parameter name="targetAmount" type="BigDecimal" required="true"/>
+            <parameter name="targetTransactions" type="Integer"/>
+            <parameter name="currencyUomId"/>
+        </in-parameters>
+        <out-parameters><parameter name="salesTargetId"/></out-parameters>
+        <actions>
+            <service-call name="create#zenith.erp.analytics.SalesTarget" in-map="context" out-map="context"/>
+        </actions>
+    </service>
+
+    <!-- Update Target Actuals -->
+    <service verb="update" noun="TargetActuals">
+        <in-parameters>
+            <parameter name="salesTargetId" required="true"/>
+            <parameter name="actualAmount" type="BigDecimal" required="true"/>
+            <parameter name="actualTransactions" type="Integer"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.analytics.SalesTarget" value-field="target" for-update="true"/>
+            <set field="target.actualAmount" from="actualAmount"/>
+            <if condition="actualTransactions"><set field="target.actualTransactions" from="actualTransactions"/></if>
+            <set field="target.achievementPercent" from="target.targetAmount > 0 ? (actualAmount * 100 / target.targetAmount) : 0"/>
+            <entity-update value-field="target"/>
+        </actions>
+    </service>
+
+    <!-- Calculate Product Performance -->
+    <service verb="calculate" noun="ProductPerformance">
+        <in-parameters>
+            <parameter name="productId" required="true"/>
+            <parameter name="storeId"/>
+            <parameter name="periodStart" type="Date" required="true"/>
+            <parameter name="periodEnd" type="Date" required="true"/>
+        </in-parameters>
+        <out-parameters><parameter name="performanceId"/></out-parameters>
+        <actions>
+            <service-call name="create#zenith.erp.analytics.ProductPerformance"
+                          in-map="[productId:productId, storeId:storeId, periodStart:periodStart,
+                                   periodEnd:periodEnd, quantitySold:0, revenue:0, costOfGoods:0,
+                                   grossMargin:0, grossMarginPercent:0, sellThroughRate:0,
+                                   stockTurnover:0, daysOfSupply:0, gmroi:0]"
+                          out-map="context"/>
+        </actions>
+    </service>
+
+    <!-- Get Analytics Dashboard -->
+    <service verb="get" noun="AnalyticsDashboard">
+        <in-parameters>
+            <parameter name="storeId"/>
+            <parameter name="periodDays" type="Integer" default-value="30"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="totalRevenue" type="BigDecimal"/>
+            <parameter name="totalTransactions" type="Integer"/>
+            <parameter name="avgBasketValue" type="BigDecimal"/>
+            <parameter name="recentSnapshots" type="List"/>
+            <parameter name="topProducts" type="List"/>
+            <parameter name="targetAchievement" type="List"/>
+        </out-parameters>
+        <actions>
+            <set field="fromDate" from="new java.sql.Date(System.currentTimeMillis() - (periodDays * 86400000L))"/>
+
+            <entity-find entity-name="zenith.erp.analytics.DailySalesSnapshot" list="recentSnapshots">
+                <econdition field-name="snapshotDate" operator="greater-equals" from="fromDate"/>
+                <econdition field-name="storeId" ignore-if-empty="true"/>
+                <order-by field-name="-snapshotDate"/>
+            </entity-find>
+
+            <set field="totalRevenue" from="0" type="BigDecimal"/>
+            <set field="totalTransactions" from="0" type="Integer"/>
+            <iterate list="recentSnapshots" entry="snap">
+                <set field="totalRevenue" from="totalRevenue + (snap.netSales ?: 0)"/>
+                <set field="totalTransactions" from="totalTransactions + (snap.transactionCount ?: 0)"/>
+            </iterate>
+            <set field="avgBasketValue" from="totalTransactions > 0 ? totalRevenue / totalTransactions : 0"/>
+
+            <entity-find entity-name="zenith.erp.analytics.ProductPerformance" list="topProducts" limit="10">
+                <econdition field-name="storeId" ignore-if-empty="true"/>
+                <order-by field-name="-revenue"/>
+            </entity-find>
+
+            <entity-find entity-name="zenith.erp.analytics.SalesTarget" list="targetAchievement">
+                <econdition field-name="periodEnd" operator="greater-equals" from="ec.user.nowTimestamp.clearTime()"/>
+                <econdition field-name="storeId" ignore-if-empty="true"/>
+                <order-by field-name="-achievementPercent"/>
+            </entity-find>
+        </actions>
+    </service>
+
+</services>

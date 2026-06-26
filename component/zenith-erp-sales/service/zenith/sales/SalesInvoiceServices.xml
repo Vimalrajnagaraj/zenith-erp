@@ -1,0 +1,416 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <service verb="create" noun="SalesInvoice">
+        <description>Create a sales invoice with automatic tax calculation via pluggable tax engine</description>
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="customerPartyId" required="true"/>
+            <parameter name="invoiceDate" type="Timestamp" default="ec.user.nowTimestamp"/>
+            <parameter name="currencyUomId"/>
+            <parameter name="settlementTermId"/>
+            <parameter name="documentType"/>
+            <parameter name="transporterId"/>
+            <parameter name="transporterName"/>
+            <parameter name="vehicleNumber"/>
+            <parameter name="lrNumber"/>
+            <parameter name="distanceKm" type="Long"/>
+            <parameter name="items" type="List" required="true">
+                <parameter name="itemEntry" type="Map">
+                    <parameter name="productId"/>
+                    <parameter name="itemDescription"/>
+                    <parameter name="quantity" type="BigDecimal" required="true"/>
+                    <parameter name="unitAmount" type="BigDecimal" required="true"/>
+                    <parameter name="mrpAmount" type="BigDecimal"/>
+                    <parameter name="isTaxInclusive" default-value="N"/>
+                    <parameter name="productTaxCode"/>
+                    <parameter name="taxCategoryId"/>
+                    <parameter name="discountPercent" type="BigDecimal"/>
+                    <parameter name="discountAmount" type="BigDecimal"/>
+                </parameter>
+            </parameter>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="invoiceId"/>
+            <parameter name="customInvoiceNumber"/>
+        </out-parameters>
+        <actions>
+            <!-- Get company currency -->
+            <entity-find-one entity-name="zenith.erp.base.CompanySettings" value-field="currSetting">
+                <field-map field-name="organizationPartyId"/>
+                <field-map field-name="settingKey" value="CURRENCY_UOM_ID"/>
+            </entity-find-one>
+            <if condition="!currencyUomId">
+                <set field="currencyUomId" from="currSetting?.settingValue ?: 'USD'"/>
+            </if>
+
+            <!-- Get seller and buyer tax registrations -->
+            <service-call name="zenith.tax.TaxServices.get#PartyTaxRegistration"
+                          in-map="[partyId:organizationPartyId]" out-map="sellerTaxReg"/>
+            <service-call name="zenith.tax.TaxServices.get#PartyTaxRegistration"
+                          in-map="[partyId:customerPartyId]" out-map="buyerTaxReg" ignore-error="true"/>
+
+            <!-- Get financial year prefix -->
+            <service-call name="zenith.base.LocalizationServices.get#FinancialYearDates"
+                          in-map="[organizationPartyId:organizationPartyId, referenceDate:invoiceDate]"
+                          out-map="fyResult"/>
+            <set field="financialYearPrefix" from="fyResult.fyLabel"/>
+
+            <!-- Generate invoice number -->
+            <service-call name="zenith.base.SequenceServices.get#NextSequence"
+                          in-map="[organizationPartyId:organizationPartyId, sequenceType:documentType ?: 'INVOICE']"
+                          out-map="seqResult"/>
+            <set field="customInvoiceNumber" from="seqResult.sequenceValue"/>
+
+            <!-- Create the Mantle Invoice -->
+            <service-call name="mantle.account.InvoiceServices.create#Invoice"
+                          in-map="[invoiceTypeEnumId:'InvoiceSales', fromPartyId:organizationPartyId,
+                                   toPartyId:customerPartyId, invoiceDate:invoiceDate,
+                                   currencyUomId:currencyUomId, settlementTermId:settlementTermId,
+                                   statusId:'InvoiceInProcess']"
+                          out-map="invResult"/>
+            <set field="invoiceId" from="invResult.invoiceId"/>
+
+            <!-- Prepare items for tax engine -->
+            <set field="taxItems" from="[]"/>
+            <iterate list="items" entry="item">
+                <set field="lineAmount" from="((item.quantity ?: 0) as BigDecimal) * ((item.unitAmount ?: 0) as BigDecimal)"/>
+                <if condition="item.discountPercent">
+                    <set field="lineDiscount" from="lineAmount * ((item.discountPercent ?: 0) as BigDecimal) / 100" type="BigDecimal"/>
+                    <else-if condition="item.discountAmount">
+                        <set field="lineDiscount" from="(item.discountAmount ?: 0) as BigDecimal"/>
+                    </else-if>
+                    <else>
+                        <set field="lineDiscount" from="BigDecimal.ZERO" type="BigDecimal"/>
+                    </else>
+                </if>
+
+                <script>taxItems.add([productId:item.productId, productTaxCode:item.productTaxCode,
+                    taxCategoryId:item.taxCategoryId, quantity:item.quantity, unitAmount:item.unitAmount,
+                    discountAmount:lineDiscount, isTaxInclusive:item.isTaxInclusive ?: 'N'])</script>
+            </iterate>
+
+            <!-- Calculate tax via pluggable tax engine -->
+            <service-call name="zenith.tax.TaxServices.calculate#Tax"
+                          in-map="[organizationPartyId:organizationPartyId, customerPartyId:customerPartyId,
+                                   items:taxItems, originRegionGeoId:sellerTaxReg.regionGeoId,
+                                   destinationRegionGeoId:buyerTaxReg?.regionGeoId ?: sellerTaxReg.regionGeoId,
+                                   currencyUomId:currencyUomId, transactionDate:invoiceDate,
+                                   transactionType:'SALE']"
+                          out-map="taxResult"/>
+
+            <!-- Create each invoice item with tax -->
+            <set field="totalTaxableAmount" from="BigDecimal.ZERO" type="BigDecimal"/>
+            <set field="totalTaxAmount" from="BigDecimal.ZERO" type="BigDecimal"/>
+            <set field="itemIdx" from="0" type="Integer"/>
+            <iterate list="items" entry="item">
+                <set field="taxedItem" from="taxResult.taxedItems[itemIdx]"/>
+
+                <service-call name="mantle.account.InvoiceServices.create#InvoiceItem"
+                              in-map="[invoiceId:invoiceId, itemTypeEnumId:'ItemProduct',
+                                       productId:item.productId, description:item.itemDescription,
+                                       quantity:item.quantity, amount:item.unitAmount]"
+                              out-map="itemResult"/>
+
+                <service-call name="update#mantle.account.invoice.InvoiceItem"
+                              in-map="[invoiceId:invoiceId, invoiceItemSeqId:itemResult.invoiceItemSeqId,
+                                       productTaxCode:item.productTaxCode,
+                                       taxableAmount:taxedItem.taxableAmount,
+                                       totalTaxAmount:taxedItem.totalTaxAmount,
+                                       discountAmount:taxItems[itemIdx].discountAmount,
+                                       discountPercent:item.discountPercent,
+                                       mrpAmount:item.mrpAmount, isTaxInclusive:item.isTaxInclusive]"/>
+
+                <!-- Persist per-line tax breakdown -->
+                <if condition="taxedItem.taxBreakdowns">
+                    <service-call name="zenith.tax.TaxServices.store#TaxLineDetails"
+                                  in-map="[referenceType:'InvoiceItem', referenceId:invoiceId,
+                                           referenceSeqId:itemResult.invoiceItemSeqId,
+                                           currencyUomId:currencyUomId,
+                                           taxBreakdowns:taxedItem.taxBreakdowns]"/>
+                </if>
+
+                <set field="totalTaxableAmount" from="totalTaxableAmount + (taxedItem.taxableAmount ?: BigDecimal.ZERO)"/>
+                <set field="totalTaxAmount" from="totalTaxAmount + (taxedItem.totalTaxAmount ?: BigDecimal.ZERO)"/>
+                <set field="itemIdx" from="itemIdx + 1"/>
+            </iterate>
+
+            <!-- Round-off and amount in words -->
+            <set field="grandTotal" from="totalTaxableAmount + totalTaxAmount" type="BigDecimal"/>
+            <set field="roundOffAmount" from="grandTotal.setScale(0, java.math.RoundingMode.HALF_UP) - grandTotal" type="BigDecimal"/>
+            <service-call name="zenith.base.LocalizationServices.convert#AmountToWords"
+                          in-map="[amount:grandTotal + roundOffAmount, organizationPartyId:organizationPartyId]"
+                          out-map="wordsResult" ignore-error="true"/>
+
+            <!-- Update Invoice header with totals -->
+            <service-call name="update#mantle.account.invoice.Invoice"
+                          in-map="[invoiceId:invoiceId, customInvoiceNumber:customInvoiceNumber,
+                                   financialYearPrefix:financialYearPrefix, documentType:documentType,
+                                   totalTaxableAmount:totalTaxableAmount, totalTaxAmount:totalTaxAmount,
+                                   roundOffAmount:roundOffAmount, amountInWords:wordsResult?.amountInWords,
+                                   transporterId:transporterId, transporterName:transporterName,
+                                   vehicleNumber:vehicleNumber, lrNumber:lrNumber, distanceKm:distanceKm]"/>
+        </actions>
+    </service>
+
+    <service verb="create" noun="SalesInvoiceHeader">
+        <description>Create a sales invoice header (no items). Items are added via the detail page.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="customerPartyId" required="true"/>
+            <parameter name="invoiceDate" type="Timestamp" default="ec.user.nowTimestamp"/>
+            <parameter name="currencyUomId"/>
+            <parameter name="settlementTermId"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="invoiceId"/>
+            <parameter name="customInvoiceNumber"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.base.CompanySettings" value-field="currSetting">
+                <field-map field-name="organizationPartyId"/>
+                <field-map field-name="settingKey" value="CURRENCY_UOM_ID"/>
+            </entity-find-one>
+            <if condition="!currencyUomId">
+                <set field="currencyUomId" from="currSetting?.settingValue ?: 'USD'"/>
+            </if>
+
+            <service-call name="zenith.base.LocalizationServices.get#FinancialYearDates"
+                          in-map="[organizationPartyId:organizationPartyId, referenceDate:invoiceDate]"
+                          out-map="fyResult"/>
+
+            <service-call name="zenith.base.SequenceServices.get#NextSequence"
+                          in-map="[organizationPartyId:organizationPartyId, sequenceType:'INVOICE']"
+                          out-map="seqResult"/>
+            <set field="customInvoiceNumber" from="seqResult.sequenceValue"/>
+
+            <service-call name="mantle.account.InvoiceServices.create#Invoice"
+                          in-map="[invoiceTypeEnumId:'InvoiceSales', fromPartyId:organizationPartyId,
+                                   toPartyId:customerPartyId, invoiceDate:invoiceDate,
+                                   currencyUomId:currencyUomId, settlementTermId:settlementTermId,
+                                   statusId:'InvoiceInProcess']"
+                          out-map="invResult"/>
+            <set field="invoiceId" from="invResult.invoiceId"/>
+
+            <service-call name="update#mantle.account.invoice.Invoice"
+                          in-map="[invoiceId:invoiceId, customInvoiceNumber:customInvoiceNumber,
+                                   financialYearPrefix:fyResult.fyLabel]"/>
+        </actions>
+    </service>
+
+    <service verb="add" noun="InvoiceItem">
+        <description>Add a line item to a sales invoice with automatic tax calculation</description>
+        <in-parameters>
+            <parameter name="invoiceId" required="true"/>
+            <parameter name="productId"/>
+            <parameter name="itemDescription"/>
+            <parameter name="quantity" type="BigDecimal" required="true"/>
+            <parameter name="unitAmount" type="BigDecimal" required="true"/>
+            <parameter name="productTaxCode"/>
+            <parameter name="taxCategoryId"/>
+            <parameter name="discountPercent" type="BigDecimal"/>
+            <parameter name="discountAmount" type="BigDecimal"/>
+            <parameter name="mrpAmount" type="BigDecimal"/>
+            <parameter name="isTaxInclusive" default-value="N"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="invoiceItemSeqId"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="invoice"/>
+            <if condition="!invoice">
+                <return error="true" message="Invoice ${invoiceId} not found"/>
+            </if>
+
+            <set field="lineAmount" from="quantity * unitAmount" type="BigDecimal"/>
+            <if condition="discountPercent">
+                <set field="lineDiscount" from="lineAmount * discountPercent / 100" type="BigDecimal"/>
+                <else-if condition="discountAmount">
+                    <set field="lineDiscount" from="discountAmount" type="BigDecimal"/>
+                </else-if>
+                <else>
+                    <set field="lineDiscount" from="BigDecimal.ZERO" type="BigDecimal"/>
+                </else>
+            </if>
+
+            <!-- Get seller/buyer regions -->
+            <service-call name="zenith.tax.TaxServices.get#PartyTaxRegistration"
+                          in-map="[partyId:invoice.fromPartyId]" out-map="sellerTaxReg"/>
+            <service-call name="zenith.tax.TaxServices.get#PartyTaxRegistration"
+                          in-map="[partyId:invoice.toPartyId]" out-map="buyerTaxReg" ignore-error="true"/>
+
+            <!-- Calculate tax for this single item -->
+            <service-call name="zenith.tax.TaxServices.calculate#Tax"
+                          in-map="[organizationPartyId:invoice.fromPartyId, customerPartyId:invoice.toPartyId,
+                                   items:[[productId:productId, productTaxCode:productTaxCode,
+                                           taxCategoryId:taxCategoryId, quantity:quantity,
+                                           unitAmount:unitAmount, discountAmount:lineDiscount,
+                                           isTaxInclusive:isTaxInclusive]],
+                                   originRegionGeoId:sellerTaxReg.regionGeoId,
+                                   destinationRegionGeoId:buyerTaxReg?.regionGeoId ?: sellerTaxReg.regionGeoId,
+                                   currencyUomId:invoice.currencyUomId, transactionType:'SALE']"
+                          out-map="taxResult"/>
+            <set field="taxedItem" from="taxResult.taxedItems[0]"/>
+
+            <service-call name="mantle.account.InvoiceServices.create#InvoiceItem"
+                          in-map="[invoiceId:invoiceId, itemTypeEnumId:'ItemProduct',
+                                   productId:productId, description:itemDescription,
+                                   quantity:quantity, amount:unitAmount]"
+                          out-map="itemResult"/>
+            <set field="invoiceItemSeqId" from="itemResult.invoiceItemSeqId"/>
+
+            <service-call name="update#mantle.account.invoice.InvoiceItem"
+                          in-map="[invoiceId:invoiceId, invoiceItemSeqId:invoiceItemSeqId,
+                                   productTaxCode:productTaxCode, taxableAmount:taxedItem.taxableAmount,
+                                   totalTaxAmount:taxedItem.totalTaxAmount, discountAmount:lineDiscount,
+                                   discountPercent:discountPercent, mrpAmount:mrpAmount,
+                                   isTaxInclusive:isTaxInclusive]"/>
+
+            <if condition="taxedItem.taxBreakdowns">
+                <service-call name="zenith.tax.TaxServices.store#TaxLineDetails"
+                              in-map="[referenceType:'InvoiceItem', referenceId:invoiceId,
+                                       referenceSeqId:invoiceItemSeqId, currencyUomId:invoice.currencyUomId,
+                                       taxBreakdowns:taxedItem.taxBreakdowns]"/>
+            </if>
+
+            <!-- Recalculate invoice totals from all items -->
+            <entity-find entity-name="mantle.account.invoice.InvoiceItem" list="allItems">
+                <econdition field-name="invoiceId"/>
+            </entity-find>
+            <set field="totalTaxableAmount" from="BigDecimal.ZERO" type="BigDecimal"/>
+            <set field="totalTaxAmount" from="BigDecimal.ZERO" type="BigDecimal"/>
+            <iterate list="allItems" entry="ii">
+                <set field="totalTaxableAmount" from="totalTaxableAmount + (ii.taxableAmount ?: BigDecimal.ZERO)"/>
+                <set field="totalTaxAmount" from="totalTaxAmount + (ii.totalTaxAmount ?: BigDecimal.ZERO)"/>
+            </iterate>
+
+            <set field="grandTotal" from="totalTaxableAmount + totalTaxAmount" type="BigDecimal"/>
+            <set field="roundOffAmount" from="grandTotal.setScale(0, java.math.RoundingMode.HALF_UP) - grandTotal" type="BigDecimal"/>
+            <service-call name="zenith.base.LocalizationServices.convert#AmountToWords"
+                          in-map="[amount:grandTotal + roundOffAmount, organizationPartyId:invoice.fromPartyId]"
+                          out-map="wordsResult" ignore-error="true"/>
+
+            <service-call name="update#mantle.account.invoice.Invoice"
+                          in-map="[invoiceId:invoiceId, totalTaxableAmount:totalTaxableAmount,
+                                   totalTaxAmount:totalTaxAmount, roundOffAmount:roundOffAmount,
+                                   amountInWords:wordsResult?.amountInWords]"/>
+        </actions>
+    </service>
+
+    <service verb="create" noun="CreditNote">
+        <description>Create a Credit Note linked to original invoice</description>
+        <in-parameters>
+            <parameter name="originalInvoiceId" required="true"/>
+            <parameter name="reason" required="true"/>
+            <parameter name="items" type="List" required="true">
+                <parameter name="itemEntry" type="Map">
+                    <parameter name="itemDescription"/>
+                    <parameter name="quantity" type="BigDecimal" required="true"/>
+                    <parameter name="unitAmount" type="BigDecimal" required="true"/>
+                    <parameter name="productTaxCode"/>
+                    <parameter name="taxCategoryId"/>
+                </parameter>
+            </parameter>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="invoiceId"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="origInvoice">
+                <field-map field-name="invoiceId" from="originalInvoiceId"/>
+            </entity-find-one>
+            <if condition="!origInvoice">
+                <return error="true" message="Original invoice ${originalInvoiceId} not found"/>
+            </if>
+
+            <service-call name="zenith.sales.SalesInvoiceServices.create#SalesInvoice"
+                          in-map="[organizationPartyId:origInvoice.fromPartyId,
+                                   customerPartyId:origInvoice.toPartyId,
+                                   currencyUomId:origInvoice.currencyUomId,
+                                   items:items]"
+                          out-map="cnResult"/>
+
+            <service-call name="update#mantle.account.invoice.Invoice"
+                          in-map="[invoiceId:cnResult.invoiceId,
+                                   invoiceTypeEnumId:'InvoiceCreditMemo',
+                                   originalInvoiceId:originalInvoiceId,
+                                   creditDebitNoteType:'CREDIT',
+                                   creditDebitNoteReason:reason]"/>
+            <set field="invoiceId" from="cnResult.invoiceId"/>
+        </actions>
+    </service>
+
+    <service verb="create" noun="DebitNote">
+        <description>Create a Debit Note linked to original invoice</description>
+        <in-parameters>
+            <parameter name="originalInvoiceId" required="true"/>
+            <parameter name="reason" required="true"/>
+            <parameter name="items" type="List" required="true">
+                <parameter name="itemEntry" type="Map">
+                    <parameter name="itemDescription"/>
+                    <parameter name="quantity" type="BigDecimal" required="true"/>
+                    <parameter name="unitAmount" type="BigDecimal" required="true"/>
+                    <parameter name="productTaxCode"/>
+                    <parameter name="taxCategoryId"/>
+                </parameter>
+            </parameter>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="invoiceId"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="origInvoice">
+                <field-map field-name="invoiceId" from="originalInvoiceId"/>
+            </entity-find-one>
+            <if condition="!origInvoice">
+                <return error="true" message="Original invoice ${originalInvoiceId} not found"/>
+            </if>
+
+            <service-call name="zenith.sales.SalesInvoiceServices.create#SalesInvoice"
+                          in-map="[organizationPartyId:origInvoice.fromPartyId,
+                                   customerPartyId:origInvoice.toPartyId,
+                                   currencyUomId:origInvoice.currencyUomId,
+                                   items:items]"
+                          out-map="dnResult"/>
+
+            <service-call name="update#mantle.account.invoice.Invoice"
+                          in-map="[invoiceId:dnResult.invoiceId,
+                                   originalInvoiceId:originalInvoiceId,
+                                   creditDebitNoteType:'DEBIT',
+                                   creditDebitNoteReason:reason]"/>
+            <set field="invoiceId" from="dnResult.invoiceId"/>
+        </actions>
+    </service>
+
+    <service verb="create" noun="SalesOrder">
+        <description>Create a sales order</description>
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="customerPartyId" required="true"/>
+            <parameter name="orderDate" type="Timestamp" default="ec.user.nowTimestamp"/>
+            <parameter name="currencyUomId"/>
+            <parameter name="settlementTermId"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="orderId"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.base.CompanySettings" value-field="currSetting">
+                <field-map field-name="organizationPartyId"/>
+                <field-map field-name="settingKey" value="CURRENCY_UOM_ID"/>
+            </entity-find-one>
+            <if condition="!currencyUomId">
+                <set field="currencyUomId" from="currSetting?.settingValue ?: 'USD'"/>
+            </if>
+
+            <service-call name="mantle.order.OrderServices.create#Order"
+                          in-map="[vendorPartyId:organizationPartyId, customerPartyId:customerPartyId,
+                                   placedDate:orderDate, currencyUomId:currencyUomId,
+                                   settlementTermId:settlementTermId,
+                                   productStoreId:'DEFAULT_STORE']" out-map="orderRes"/>
+            <set field="orderId" from="orderRes.orderId"/>
+        </actions>
+    </service>
+
+</services>

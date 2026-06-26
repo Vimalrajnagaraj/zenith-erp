@@ -1,0 +1,286 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <service verb="get" noun="ExpiryRisk">
+        <out-parameters>
+            <parameter name="totalExpiryValue" type="BigDecimal"/>
+            <parameter name="expiringAssets" type="List"/>
+        </out-parameters>
+        <actions>
+            <script><![CDATA[
+                import java.sql.Timestamp
+                
+                Calendar cal = Calendar.getInstance()
+                cal.add(Calendar.DAY_OF_YEAR, 90)
+                Timestamp thresholdDate = new Timestamp(cal.getTimeInMillis())
+
+                def assetList = ec.entity.find("mantle.product.asset.Asset")
+                    .condition("expiryDate", org.moqui.entity.EntityCondition.LESS_THAN_EQUAL_TO, thresholdDate)
+                    .condition("quantityOnHandTotal", org.moqui.entity.EntityCondition.GREATER_THAN, BigDecimal.ZERO)
+                    .list()
+
+                BigDecimal totalVal = BigDecimal.ZERO
+                List expList = []
+                for (def asset : assetList) {
+                    def valRate = asset.valuationRate ?: BigDecimal.ZERO
+                    def qoh = asset.quantityOnHandTotal ?: BigDecimal.ZERO
+                    def val = valRate.multiply(qoh)
+                    totalVal = totalVal.add(val)
+                    
+                    def product = ec.entity.find("mantle.product.Product").condition("productId", asset.productId).one()
+                    expList.add([
+                        assetId: asset.assetId,
+                        productName: product?.productName ?: 'Unknown',
+                        expiryDate: asset.expiryDate,
+                        quantity: qoh,
+                        value: val,
+                        batchNumber: asset.batchNumber ?: 'N/A'
+                    ])
+                }
+                
+                totalExpiryValue = totalVal
+                expiringAssets = expList
+            ]]></script>
+        </actions>
+    </service>
+    <service verb="create" noun="Product">
+        <in-parameters>
+            <parameter name="productName" required="true"/>
+            <parameter name="pseudoId"/>
+            <parameter name="productTypeEnumId" default-value="PtAsset"/>
+            <parameter name="hsnCode"/>
+            <parameter name="sacCode"/>
+            <parameter name="mrpAmount" type="BigDecimal"/>
+            <parameter name="gstSlabId"/>
+            <parameter name="uqcEnumId"/>
+            <parameter name="isGstExempt" default-value="N"/>
+            <parameter name="enableBatchTracking" default-value="N"/>
+            <parameter name="reorderPoint" type="BigDecimal"/>
+            <parameter name="reorderQuantity" type="BigDecimal"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="productId"/>
+        </out-parameters>
+        <actions>
+            <service-call name="create#mantle.product.Product" in-map="[productName:productName, pseudoId:pseudoId,
+                productTypeEnumId:productTypeEnumId, hsnCode:hsnCode, sacCode:sacCode, mrpAmount:mrpAmount,
+                gstSlabId:gstSlabId, uqcEnumId:uqcEnumId, isGstExempt:isGstExempt,
+                enableBatchTracking:enableBatchTracking, reorderPoint:reorderPoint, reorderQuantity:reorderQuantity, ownerPartyId:ec.user.getPreference('ACTIVE_ORGANIZATION')]"
+                out-map="productOut"/>
+            <set field="productId" from="productOut.productId"/>
+        </actions>
+    </service>
+
+    <service verb="create" noun="StockTransfer">
+        <in-parameters>
+            <auto-parameters entity-name="zenith.erp.inventory.StockTransfer" include="nonpk"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="stockTransferId" type="id"/>
+        </out-parameters>
+        <actions>
+            <set field="organizationPartyId" from="organizationPartyId ?: ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <entity-find-one entity-name="mantle.facility.Facility" value-field="fromFac">
+                <field-map field-name="facilityId" from="fromFacilityId"/>
+            </entity-find-one>
+            <entity-find-one entity-name="mantle.facility.Facility" value-field="toFac">
+                <field-map field-name="facilityId" from="toFacilityId"/>
+            </entity-find-one>
+            
+            <script><![CDATA[
+                String fromGstin = fromFac?.taxRegistrationNumber
+                String toGstin = toFac?.taxRegistrationNumber
+                String igstInvoiceIdOut = null
+                
+                // If they have different GSTINs, it's an inter-state transfer, treated as a sale requiring IGST
+                if (fromGstin && toGstin && fromGstin != toGstin) {
+                    // Create IGST Invoice
+                    def invoiceOut = ec.service.sync().name("create#mantle.account.invoice.Invoice")
+                        .parameters([
+                            invoiceTypeEnumId: 'InvoiceSales',
+                            statusId: 'InvoiceInProcess',
+                            fromPartyId: organizationPartyId,
+                            toPartyId: organizationPartyId,
+                            invoiceDate: ec.user.nowTimestamp,
+                            description: 'IGST Invoice for Branch Transfer'
+                        ]).call()
+                    igstInvoiceIdOut = invoiceOut.invoiceId
+                }
+                
+                // Determine totalValue placeholder logic
+                BigDecimal val = totalValue ?: BigDecimal.ZERO
+                String ewayRequired = (val > new BigDecimal("50000")) ? "Y" : "N"
+                
+                // Create the StockTransfer
+                def result = ec.service.sync().name("create#zenith.erp.inventory.StockTransfer")
+                    .parameters(context + [statusId: 'StxDraft', igstInvoiceId: igstInvoiceIdOut, ewayBillRequired: ewayRequired])
+                    .call()
+                stockTransferId = result.stockTransferId
+            ]]></script>
+        </actions>
+    </service>
+
+    <!-- Add a product line to a stock transfer -->
+    <service verb="add" noun="StockTransferItem">
+        <in-parameters>
+            <parameter name="stockTransferId" required="true"/>
+            <parameter name="productId" required="true"/>
+            <parameter name="quantity" type="BigDecimal" required="true"/>
+            <parameter name="unitAmount" type="BigDecimal"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="mantle.product.Product" value-field="prod"><field-map field-name="productId"/></entity-find-one>
+            <service-call name="create#zenith.erp.inventory.StockTransferItem"
+                in-map="[stockTransferId:stockTransferId, productId:productId, quantity:quantity,
+                         unitAmount:(unitAmount ?: prod?.mrpAmount), productTaxCode:prod?.productTaxCode]"/>
+        </actions>
+    </service>
+
+    <service verb="ship" noun="StockTransfer">
+        <in-parameters>
+            <parameter name="stockTransferId" required="true"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.inventory.StockTransfer" value-field="stx"/>
+            <if condition="stx.statusId != 'StxDraft'">
+                <return error="true" message="Can only ship from Draft status"/>
+            </if>
+            
+            <script><![CDATA[
+                // Check eWay Bill requirement
+                if (stx.ewayBillRequired == 'Y') {
+                    if (!stx.transporterGstin || !stx.vehicleNumber) {
+                        ec.message.addError("E-Way Bill is required: Transporter GSTIN and Vehicle Number must be provided before shipping.")
+                        return
+                    }
+                }
+                
+                // Update status
+                ec.service.sync().name("update#zenith.erp.inventory.StockTransfer")
+                    .parameters([stockTransferId: stockTransferId, statusId: 'StxInTransit']).call()
+                // Remove the shipped stock from the SOURCE facility (per line)
+                def org = stx.organizationPartyId ?: ec.user.getPreference('ACTIVE_ORGANIZATION')
+                def shipItems = ec.entity.find("zenith.erp.inventory.StockTransferItem").condition("stockTransferId", stockTransferId).list()
+                for (li in shipItems) {
+                    if (li.productId && li.quantity) {
+                        ec.service.sync().name("zenith.inventory.InventoryStockServices.adjust#AssetOnHand")
+                            .parameters([organizationPartyId:org, productId:li.productId, facilityId:stx.fromFacilityId,
+                                         quantityDiff:(-((li.quantity ?: 0) as BigDecimal)), reason:("Transfer out " + stockTransferId)]).call()
+                    }
+                }
+            ]]></script>
+        </actions>
+    </service>
+
+    <service verb="receive" noun="StockTransfer">
+        <in-parameters>
+            <parameter name="stockTransferId" required="true"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.inventory.StockTransfer" value-field="stx"/>
+            <if condition="stx.statusId != 'StxInTransit'">
+                <return error="true" message="Can only receive if In Transit"/>
+            </if>
+            
+            <script><![CDATA[
+                // Update status
+                ec.service.sync().name("update#zenith.erp.inventory.StockTransfer")
+                    .parameters([stockTransferId: stockTransferId, statusId: 'StxReceived']).call()
+                // Add the received stock to the DESTINATION facility (per line)
+                def org = stx.organizationPartyId ?: ec.user.getPreference('ACTIVE_ORGANIZATION')
+                def recItems = ec.entity.find("zenith.erp.inventory.StockTransferItem").condition("stockTransferId", stockTransferId).list()
+                for (li in recItems) {
+                    def qr = (li.quantityReceived != null) ? li.quantityReceived : li.quantity
+                    if (li.productId && qr) {
+                        ec.service.sync().name("zenith.inventory.InventoryStockServices.adjust#AssetOnHand")
+                            .parameters([organizationPartyId:org, productId:li.productId, facilityId:stx.toFacilityId,
+                                         quantityDiff:((qr ?: 0) as BigDecimal), reason:("Transfer in " + stockTransferId)]).call()
+                        if (li.quantityReceived == null) {
+                            ec.service.sync().name("update#zenith.erp.inventory.StockTransferItem")
+                                .parameters([stockTransferId:stockTransferId, transferItemSeqId:li.transferItemSeqId, quantityReceived:li.quantity]).call()
+                        }
+                    }
+                }
+            ]]></script>
+        </actions>
+    </service>
+
+    <service verb="create" noun="StockAdjustment">
+        <in-parameters>
+            <parameter name="facilityId" required="true"/>
+            <parameter name="adjustmentType" required="true"/>
+            <parameter name="adjustmentDate" type="Timestamp" default="ec.user.nowTimestamp"/>
+            <parameter name="remarks"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="stockAdjustmentId"/>
+        </out-parameters>
+        <actions>
+            <service-call name="create#zenith.erp.inventory.StockAdjustment" out-map="context"
+                in-map="[facilityId:facilityId, adjustmentType:adjustmentType, adjustmentDate:adjustmentDate, remarks:remarks, statusId:'AdjPending', adjustedBy:ec.user.userId, organizationPartyId:ec.user.getPreference('ACTIVE_ORGANIZATION')]"/>
+        </actions>
+    </service>
+
+    <!-- Add a product line to an adjustment: captures current system qty + computes the difference -->
+    <service verb="add" noun="StockAdjustmentItem">
+        <in-parameters>
+            <parameter name="stockAdjustmentId" required="true"/>
+            <parameter name="productId" required="true"/>
+            <parameter name="actualQuantity" type="BigDecimal" required="true"/>
+            <parameter name="remarks"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.inventory.StockAdjustment" value-field="adj"/>
+            <if condition="!adj"><return error="true" message="Adjustment not found"/></if>
+            <set field="org" from="adj.organizationPartyId ?: ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <entity-find entity-name="mantle.product.asset.Asset" list="assets" limit="1">
+                <econdition field-name="ownerPartyId" from="org"/>
+                <econdition field-name="productId"/>
+                <order-by field-name="assetId"/>
+            </entity-find>
+            <set field="sysQty" from="assets ? ((assets[0].quantityOnHandTotal ?: 0) as BigDecimal) : (0 as BigDecimal)"/>
+            <set field="diff" from="((actualQuantity ?: 0) as BigDecimal) - sysQty"/>
+            <service-call name="create#zenith.erp.inventory.StockAdjustmentItem"
+                in-map="[stockAdjustmentId:stockAdjustmentId, productId:productId, assetId:(assets ? assets[0].assetId : null),
+                         systemQuantity:sysQty, actualQuantity:actualQuantity, differenceQuantity:diff, remarks:remarks]"/>
+        </actions>
+    </service>
+
+    <service verb="apply" noun="StockAdjustment">
+        <in-parameters>
+            <parameter name="stockAdjustmentId" required="true"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.inventory.StockAdjustment" value-field="adj"/>
+            <if condition="!adj"><return error="true" message="Adjustment not found"/></if>
+            <if condition="adj.statusId == 'AdjApplied'"><return error="true" message="Already applied"/></if>
+            <set field="org" from="adj.organizationPartyId ?: ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <entity-find entity-name="zenith.erp.inventory.StockAdjustmentItem" list="adjItems">
+                <econdition field-name="stockAdjustmentId" from="stockAdjustmentId"/>
+            </entity-find>
+            <if condition="!adjItems"><return error="true" message="Add at least one product line before applying."/></if>
+            <set field="applied" from="0" type="Integer"/>
+            <iterate list="adjItems" entry="ai">
+                <if condition="ai.productId">
+                    <set field="d" from="ai.differenceQuantity"/>
+                    <if condition="d == null">
+                        <set field="d" from="((ai.actualQuantity ?: 0) as BigDecimal) - ((ai.systemQuantity ?: 0) as BigDecimal)"/>
+                    </if>
+                    <if condition="d != null &amp;&amp; (d as BigDecimal).compareTo(BigDecimal.ZERO) != 0">
+                        <service-call name="zenith.inventory.InventoryStockServices.adjust#AssetOnHand"
+                            in-map="[organizationPartyId:org, productId:ai.productId, quantityDiff:(d as BigDecimal),
+                                     reason:('Stock adjustment ' + stockAdjustmentId + ' (' + (adj.adjustmentType ?: '') + ')'),
+                                     effectiveDate:(adj.adjustmentDate ?: ec.user.nowTimestamp)]"/>
+                    </if>
+                    <!-- mark the product stock-tracked so future sales deplete it -->
+                    <service-call name="update#mantle.product.Product" in-map="[productId:ai.productId, inventoryTracked:'Y']"/>
+                    <set field="applied" from="applied + 1"/>
+                </if>
+            </iterate>
+            <service-call name="update#zenith.erp.inventory.StockAdjustment"
+                in-map="[stockAdjustmentId:stockAdjustmentId, statusId:'AdjApplied']"/>
+            <message>Stock adjustment applied — on-hand updated for ${applied} product(s).</message>
+        </actions>
+    </service>
+
+</services>

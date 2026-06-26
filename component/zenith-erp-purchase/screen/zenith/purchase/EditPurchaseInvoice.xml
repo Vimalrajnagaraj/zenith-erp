@@ -1,0 +1,334 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
+        default-menu-title="Vendor Bill" default-menu-include="false">
+
+    <parameter name="invoiceId" required="true"/>
+
+    <transition name="findInvoice"><default-response url="../FindPurchaseInvoice"/></transition>
+    
+    <transition name="updateInvoice">
+        <service-call name="update#mantle.account.invoice.Invoice"/>
+        <default-response url="."/>
+    </transition>
+
+    <transition name="addItem">
+        <script>
+            if (!hsnSacCode) {
+                ec.message.addError("HSN/SAC Code is strictly required under Indian GST Law.")
+                return
+            }
+        
+            // Get state codes
+            def invoice = ec.entity.find("mantle.account.invoice.Invoice").condition("invoiceId", invoiceId).one()
+            
+            def vendorAddress = ec.entity.find("mantle.party.contact.PartyContactMechInfo")
+                                .condition("partyId", invoice.fromPartyId)
+                                .condition("contactMechTypeEnumId", "CmtPostalAddress").list().first()
+            def buyerAddress = ec.entity.find("mantle.party.contact.PartyContactMechInfo")
+                                .condition("partyId", invoice.toPartyId)
+                                .condition("contactMechTypeEnumId", "CmtPostalAddress").list().first()
+            
+            def isInterstate = true
+            if (vendorAddress &amp;&amp; buyerAddress &amp;&amp; vendorAddress.stateProvinceGeoId == buyerAddress.stateProvinceGeoId) {
+                isInterstate = false
+            }
+
+            def qty = new BigDecimal(quantity ?: 0)
+            def price = new BigDecimal(amount ?: 0)
+            def taxableVal = qty.multiply(price)
+            def taxPct = new BigDecimal(taxPercentage ?: 0)
+
+            def igstRate = 0.0
+            def cgstRate = 0.0
+            def sgstRate = 0.0
+            def igstAmount = 0.0
+            def cgstAmount = 0.0
+            def sgstAmount = 0.0
+
+            if (taxPct > 0) {
+                if (isInterstate) {
+                    igstRate = taxPct
+                    igstAmount = taxableVal.multiply(taxPct).divide(new BigDecimal(100), 2, java.math.RoundingMode.HALF_UP)
+                } else {
+                    cgstRate = taxPct.divide(new BigDecimal(2), 2, java.math.RoundingMode.HALF_UP)
+                    sgstRate = cgstRate
+                    cgstAmount = taxableVal.multiply(cgstRate).divide(new BigDecimal(100), 2, java.math.RoundingMode.HALF_UP)
+                    sgstAmount = cgstAmount
+                }
+            }
+
+            def inMap = context + [
+                itemTypeEnumId: 'ItemInventory',
+                taxableAmount: taxableVal,
+                igstRate: igstRate, igstAmount: igstAmount,
+                cgstRate: cgstRate, cgstAmount: cgstAmount,
+                sgstRate: sgstRate, sgstAmount: sgstAmount
+            ]
+            ec.service.sync().name("create#mantle.account.invoice.InvoiceItem").parameters(inMap).call()
+            
+            // Trigger recalculation of totals
+            ec.service.sync().name("mantle.account.InvoiceServices.calculate#InvoiceTotal").parameters([invoiceId:invoiceId]).call()
+        </script>
+        
+        <!-- Custom script to aggregate Indian GST values -->
+        <script>
+            def invItems = ec.entity.find("mantle.account.invoice.InvoiceItem").condition("invoiceId", invoiceId).list()
+            def tCgst = 0.0, tSgst = 0.0, tIgst = 0.0, tTaxable = 0.0
+            for (def it : invItems) {
+                tCgst += (it.cgstAmount ?: 0.0)
+                tSgst += (it.sgstAmount ?: 0.0)
+                tIgst += (it.igstAmount ?: 0.0)
+                tTaxable += (it.taxableAmount ?: ((it.quantity?:1)*(it.amount?:0)))
+            }
+            ec.service.sync().name("update#mantle.account.invoice.Invoice").parameters([
+                invoiceId: invoiceId,
+                totalCgst: tCgst, totalSgst: tSgst, totalIgst: tIgst, totalTaxableAmount: tTaxable
+            ]).call()
+        </script>
+
+        <default-response url="."/>
+    </transition>
+
+    <transition name="deleteItem">
+        <service-call name="delete#mantle.account.invoice.InvoiceItem"/>
+        <script>
+            ec.service.sync().name("mantle.account.InvoiceServices.calculate#InvoiceTotal").parameters([invoiceId:invoiceId]).call()
+            
+            // Re-aggregate GST values
+            def invItems = ec.entity.find("mantle.account.invoice.InvoiceItem").condition("invoiceId", invoiceId).list()
+            def tCgst = 0.0, tSgst = 0.0, tIgst = 0.0, tTaxable = 0.0
+            for (def it : invItems) {
+                tCgst += (it.cgstAmount ?: 0.0)
+                tSgst += (it.sgstAmount ?: 0.0)
+                tIgst += (it.igstAmount ?: 0.0)
+                tTaxable += (it.taxableAmount ?: ((it.quantity?:1)*(it.amount?:0)))
+            }
+            ec.service.sync().name("update#mantle.account.invoice.Invoice").parameters([
+                invoiceId: invoiceId,
+                totalCgst: tCgst, totalSgst: tSgst, totalIgst: tIgst, totalTaxableAmount: tTaxable
+            ]).call()
+        </script>
+        <default-response url="."/>
+    </transition>
+
+    <actions>
+        <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="invoice"/>
+        
+        <entity-find entity-name="mantle.account.invoice.InvoiceItem" list="invoiceItems">
+            <econdition field-name="invoiceId"/>
+            <order-by field-name="invoiceItemSeqId"/>
+        </entity-find>
+
+        <entity-find-one entity-name="mantle.party.PartyDetail" value-field="vendor">
+            <field-map field-name="partyId" from="invoice?.fromPartyId"/>
+        </entity-find-one>
+        <entity-find-one entity-name="mantle.party.PartyDetail" value-field="buyer">
+            <field-map field-name="partyId" from="invoice?.toPartyId"/>
+        </entity-find-one>
+        
+        <entity-find-one entity-name="zenith.erp.india.IndiaPartyTaxProfile" value-field="taxProfile">
+            <field-map field-name="partyId" from="invoice?.fromPartyId"/>
+        </entity-find-one>
+        <set field="isMsme" from="taxProfile?.isMsme == 'Y'"/>
+        <set field="msmeDebugText" from="'Now: ' + ec.user.nowTimestamp.time + ' InvDate: ' + invoice?.invoiceDate?.time + ' Diff: ' + (invoice?.invoiceDate ? (ec.user.nowTimestamp.time - invoice.invoiceDate.time) : 'N/A')"/>
+        <set field="isOverdueMsme" from="false"/>
+
+        <set field="statusColorMap" from="[
+            'InvoiceIn-Process': 'grey',
+            'InvoiceApproved': 'primary',
+            'InvoiceReceived': 'warning',
+            'InvoicePaid': 'success',
+            'InvoiceCancelled': 'danger'
+        ]"/>
+        <set field="statusColor" from="statusColorMap[invoice?.statusId] ?: 'dark'"/>
+        <set field="itcColor" from="invoice?.itcEligible == 'Y' ? 'text-success' : 'text-danger'"/>
+    </actions>
+
+    <widgets>
+        <link url="findInvoice" text="Back to Vendor Bills" link-type="anchor"/>
+        
+        <container style="bg-negative text-white q-pa-md border-radius-md q-mb-lg" condition="isOverdueMsme">
+            <label text="⚠ MSME PAYMENT OVERDUE! (Sec 43B(h) Violation Risk)" type="h5" style="text-weight-bold q-my-none text-white"/>
+            <label text="This vendor is registered as an MSME${taxProfile?.udyamRegistrationNumber ? ' (Udyam: ' + taxProfile.udyamRegistrationNumber + ')' : ''}. The payment has crossed the 45-day statutory limit. This expense will be disallowed in the Income Tax Audit if not paid before March 31st." type="p" style="q-my-none q-mt-sm text-white"/>
+        </container>
+
+        <!-- Profile Banner -->
+        <container style="zenith-profile-banner q-pa-lg bg-white shadow-1 border-radius-lg q-mb-lg">
+            <container style="row items-center justify-between no-wrap">
+                <container style="row items-center">
+                    <container style="zenith-avatar q-mr-lg text-white; border-radius:12px; background:linear-gradient(135deg, #1d4ed8, #1e40af);">
+                        <label text="BILL" type="span" style="font-weight:bold; font-size:1.2rem;"/>
+                    </container>
+                    <container style="column">
+                        <label text="Vendor Bill: ${invoice?.vendorInvoiceNumber ?: invoiceId}" type="h3" style="text-primary text-weight-bold q-my-none"/>
+                        <label text="Total: ₹ ${ec.l10n.format(invoice?.invoiceTotal ?: 0, '#,##,##0.00')} - Date: ${invoice?.invoiceDate ? ec.l10n.format(invoice.invoiceDate, 'dd MMM yyyy') : 'N/A'}" type="p" style="text-grey-7 text-subtitle2 q-mt-xs q-mb-none"/>
+                    </container>
+                </container>
+                
+                <container style="row items-center">
+                    <form-single name="StatusForm" transition="updateInvoice" map="invoice">
+                        <field name="invoiceId"><default-field><hidden/></default-field></field>
+                        <field name="statusId"><default-field title="">
+                            <drop-down current="selected">
+                                <option key="InvoiceIn-Process" text="In Process"/>
+                                <option key="InvoiceApproved" text="Approved"/>
+                                <option key="InvoiceReceived" text="Received"/>
+                                <option key="InvoicePaid" text="Paid"/>
+                                <option key="InvoiceCancelled" text="Cancelled"/>
+                            </drop-down>
+                        </default-field></field>
+                        <field name="submitButton"><default-field title="Update Status"><submit/></default-field></field>
+                        <field-layout><field-row><field-ref name="statusId"/><field-ref name="submitButton"/></field-row></field-layout>
+                    </form-single>
+                </container>
+            </container>
+            
+            <container style="row items-center q-mt-md justify-between">
+                <container style="bg-grey-2 q-pa-sm border-radius-md">
+                    <label text="Supplier: ${vendor?.organizationName ?: (vendor?.firstName ? vendor.firstName + ' ' + (vendor.lastName?:'') : 'Unknown Vendor')} [${invoice?.fromPartyId ?: 'N/A'}]" type="span" style="text-dark text-weight-bold"/>
+                    <label text=" | PO No: ${invoice?.purchaseOrderNumber ?: 'None'}" type="span" style="text-grey-7"/>
+                </container>
+                <container>
+                    <label text="${invoice?.statusId ? invoice.statusId.replace('Invoice', '') : 'In Process'}" type="span" style="zenith-badge ${statusColor} q-mr-sm"/>
+                    <label text="ITC: ${invoice?.itcEligible == 'Y' ? 'Eligible' : 'Ineligible'}" type="span" style="zenith-badge ${invoice?.itcEligible == 'Y' ? 'success' : 'danger'}"/>
+                </container>
+            </container>
+        </container>
+
+        <!-- Main Sections -->
+        <container-row>
+            <row-col lg="6">
+                <!-- Vendor & Statutory Details -->
+                <container style="zenith-card q-pa-md bg-white shadow-1 border-radius-md q-mb-md">
+                    <label text="Vendor &amp; Statutory Details" type="h5" style="text-primary text-weight-bold q-mb-md border-bottom q-pb-sm"/>
+                    <form-single name="StatutoryForm" transition="updateInvoice" map="invoice">
+                        <field name="invoiceId"><default-field><hidden/></default-field></field>
+                        
+                        <field name="vendorInvoiceNumber"><default-field title="Vendor Invoice No."><text-line size="20"/></default-field></field>
+                        <field name="supplierGstin"><default-field title="Supplier GSTIN"><text-line size="20"/></default-field></field>
+                        <field name="isReverseCharge">
+                            <default-field title="Reverse Charge (RCM)">
+                                <drop-down><option key="N" text="No"/><option key="Y" text="Yes"/></drop-down>
+                            </default-field>
+                        </field>
+                        <field name="itcEligible">
+                            <default-field title="Claim ITC?">
+                                <drop-down><option key="Y" text="Yes - Eligible for Credit"/><option key="N" text="No - Ineligible"/></drop-down>
+                            </default-field>
+                        </field>
+                        
+                        <field name="dueDate">
+                            <default-field title="Payment Due Date (Max 45 Days for MSME)"><date-time type="date"/></default-field>
+                        </field>
+                        
+                        <field name="submitButton"><default-field title="Save Details"><submit/></default-field></field>
+                    </form-single>
+                </container>
+            </row-col>
+            
+            <row-col lg="6">
+                <!-- ITC Dashboard -->
+                <container style="zenith-card q-pa-md bg-indigo-9 text-white shadow-1 border-radius-md q-mb-md">
+                    <label text="Input Tax Credit (ITC) Summary" type="h5" style="text-white text-weight-bold q-mb-md border-bottom q-pb-sm"/>
+                    <container style="row q-col-gutter-md text-center">
+                        <container style="col-3"><label text="Taxable Base" type="strong" style="text-indigo-2 block"/><label text="${currSymbol}${ec.l10n.format(invoice.totalTaxableAmount ?: 0, '#,##0.00')}" type="p" style="q-my-none"/></container>
+                        <container style="col-3"><label text="IGST Paid" type="strong" style="text-indigo-2 block"/><label text="${currSymbol}${ec.l10n.format(invoice.totalIgst ?: 0, '#,##0.00')}" type="p" style="q-my-none ${itcColor}"/></container>
+                        <container style="col-3"><label text="CGST Paid" type="strong" style="text-indigo-2 block"/><label text="${currSymbol}${ec.l10n.format(invoice.totalCgst ?: 0, '#,##0.00')}" type="p" style="q-my-none ${itcColor}"/></container>
+                        <container style="col-3"><label text="SGST Paid" type="strong" style="text-indigo-2 block"/><label text="${currSymbol}${ec.l10n.format(invoice.totalSgst ?: 0, '#,##0.00')}" type="p" style="q-my-none ${itcColor}"/></container>
+                    </container>
+                </container>
+                
+                <!-- GSTR-2B Matching Widget -->
+                <container style="zenith-card q-pa-md bg-white shadow-1 border-radius-md q-mb-md">
+                    <label text="GSTR-2B Reconciliation Status" type="h5" style="text-primary text-weight-bold q-mb-md border-bottom q-pb-sm"/>
+                    <container style="row items-center justify-between">
+                        <label text="${invoice.gstr2bMatchStatus ?: 'Unmatched'}" type="h4" style="text-weight-bold ${invoice.gstr2bMatchStatus == 'Matched' ? 'text-success' : 'text-warning'} q-my-none"/>
+                        <label text="Verified against Government Portal." type="p" style="text-grey-7 q-my-none" condition="invoice.gstr2bMatchStatus == 'Matched'"/>
+                        <label text="Pending portal sync." type="p" style="text-grey-7 q-my-none" condition="invoice.gstr2bMatchStatus != 'Matched'"/>
+                    </container>
+                </container>
+            </row-col>
+        </container-row>
+
+        <!-- Bill Items -->
+        <container style="zenith-card q-pa-md bg-white shadow-1 border-radius-md q-mb-lg">
+            <container style="row justify-between items-center q-mb-md border-bottom q-pb-sm">
+                <label text="Bill Items (Expenses/Assets)" type="h5" style="text-primary text-weight-bold q-my-none"/>
+                
+                <container-dialog id="AddItemDialog" button-text="Add Item" button-class="q-btn--flat bg-primary text-white border-radius-md">
+                    <form-single name="AddItemForm" transition="addItem">
+                        <field name="invoiceId"><default-field><hidden/></default-field></field>
+                        
+                        <field name="productId"><default-field title="Product">
+                            <drop-down allow-empty="true">
+                                <entity-options key="${productId}" text="${pseudoId} - ${productName}">
+                                    <entity-find entity-name="mantle.product.Product"><order-by field-name="productName"/></entity-find>
+                                </entity-options>
+                            </drop-down>
+                        </default-field></field>
+                        <field name="description"><default-field title="Description"><text-line size="60"/></default-field></field>
+                        
+                        <field name="hsnSacCode"><default-field title="HSN/SAC Code"><text-line size="10"/></default-field></field>
+                        <field name="quantity"><default-field title="Quantity"><text-line size="8"/></default-field></field>
+                        <field name="amount"><default-field title="Unit Price"><text-line size="15"/></default-field></field>
+                        
+                        <!-- GST Field -->
+                        <field name="taxPercentage"><default-field title="GST Rate (%)">
+                            <drop-down no-current-selected-key="18">
+                                <option key="0" text="0% (Exempt)"/>
+                                <option key="5" text="5%"/>
+                                <option key="12" text="12%"/>
+                                <option key="18" text="18%"/>
+                                <option key="28" text="28%"/>
+                            </drop-down>
+                        </default-field></field>
+                        
+                        <field name="submitButton"><default-field title="Add Item"><submit icon="fa fa-plus" type="primary"/></default-field></field>
+                        
+                        <field-layout>
+                            <field-ref name="productId"/>
+                            <field-ref name="description"/>
+                            <field-row>
+                                <field-ref name="hsnSacCode"/>
+                                <field-ref name="quantity"/>
+                            </field-row>
+                            <field-row>
+                                <field-ref name="amount"/>
+                                <field-ref name="taxPercentage"/>
+                            </field-row>
+                            <field-ref name="submitButton"/>
+                        </field-layout>
+                    </form-single>
+                </container-dialog>
+            </container>
+
+            <form-list name="InvoiceItemsForm" list="invoiceItems" skip-form="true">
+                <field name="invoiceItemSeqId"><default-field title="#"><label text="${invoiceItemSeqId}" type="span" style="text-grey-7"/></default-field></field>
+                <field name="description"><default-field title="Description"><label text="${description ?: 'N/A'}" type="strong" style="text-dark"/></default-field></field>
+                <field name="hsnSacCode"><default-field title="HSN/SAC"><label text="${hsnSacCode ?: '-'}" type="span" style="zenith-badge grey"/></default-field></field>
+                <field name="quantity"><default-field><label text="${quantity}" type="span" style="text-dark"/></default-field></field>
+                <field name="amount"><default-field title="Unit Price"><label text="${ec.l10n.format(amount ?: 0, '#,##,##0.00')}" type="span"/></default-field></field>
+                
+                <!-- GST Breakdown -->
+                <field name="gstBreakdown"><default-field title="Tax Paid">
+                    <label text="${igstRate ? ('IGST: ' + igstRate + '% (₹' + igstAmount + ')') : ''}" type="span" style="block text-grey-8 text-caption"/>
+                    <label text="${cgstRate ? ('CGST: ' + cgstRate + '% (₹' + cgstAmount + ')') : ''}" type="span" style="block text-grey-8 text-caption"/>
+                    <label text="${sgstRate ? ('SGST: ' + sgstRate + '% (₹' + sgstAmount + ')') : ''}" type="span" style="block text-grey-8 text-caption"/>
+                    <label text="${!igstRate &amp;&amp; !cgstRate ? '-' : ''}" type="span" style="block text-grey-8 text-caption"/>
+                </default-field></field>
+
+                <field name="total"><default-field title="Total (Inc Tax)">
+                    <label text="${currSymbol}${ec.l10n.format(((quantity ?: 0) * (amount ?: 0)) + (igstAmount ?: 0) + (cgstAmount ?: 0) + (sgstAmount ?: 0), '#,##,##0.00')}" type="span" style="text-weight-bold text-dark"/>
+                </default-field></field>
+                
+                <field name="deleteItem">
+                    <default-field title=" ">
+                        <link url="deleteItem" parameter-map="[invoiceId:invoiceId, invoiceItemSeqId:invoiceItemSeqId]" icon="fa fa-trash" style="text-danger" confirmation="Remove item?"/>
+                    </default-field>
+                </field>
+            </form-list>
+        </container>
+
+    </widgets>
+</screen>

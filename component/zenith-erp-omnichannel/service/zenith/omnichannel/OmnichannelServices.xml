@@ -1,0 +1,217 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <!-- Create Fulfillment Option -->
+    <service verb="create" noun="FulfillmentOption">
+        <in-parameters>
+            <parameter name="optionName" required="true"/>
+            <parameter name="fulfillmentTypeEnumId" required="true"/>
+            <parameter name="requiresPickup" default-value="N"/>
+            <parameter name="requiresShipping" default-value="N"/>
+            <parameter name="estimatedMinutes" type="Integer"/>
+            <parameter name="description"/>
+        </in-parameters>
+        <out-parameters><parameter name="fulfillmentOptionId"/></out-parameters>
+        <actions>
+            <service-call name="create#zenith.erp.omnichannel.FulfillmentOption" in-map="context" out-map="context"/>
+        </actions>
+    </service>
+
+    <!-- Sync Store Inventory Visibility -->
+    <service verb="sync" noun="StoreInventory">
+        <in-parameters>
+            <parameter name="storeId" required="true"/>
+            <parameter name="productId" required="true"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.stores.Store" value-field="store"/>
+            <if condition="!store"><return message="Store not found" error="true"/></if>
+
+            <set field="facilityId" from="store.facilityId"/>
+            <entity-find entity-name="mantle.product.asset.Asset" list="assets">
+                <econdition field-name="facilityId"/>
+                <econdition field-name="productId"/>
+            </entity-find>
+            <set field="totalQty" from="0" type="BigDecimal"/>
+            <iterate list="assets" entry="asset">
+                <set field="totalQty" from="totalQty + (asset.availableToPromiseTotal ?: 0)"/>
+            </iterate>
+
+            <entity-find-one entity-name="zenith.erp.omnichannel.StoreInventoryVisibility" value-field="siv"
+                             for-update="true">
+                <field-map field-name="storeId"/>
+                <field-map field-name="productId"/>
+            </entity-find-one>
+            <if condition="siv">
+                <set field="siv.availableQuantity" from="totalQty"/>
+                <set field="siv.sellableQuantity" from="totalQty - (siv.reservedQuantity ?: 0) - (siv.safetyStock ?: 0)"/>
+                <set field="siv.lastSyncTime" from="ec.user.nowTimestamp"/>
+                <entity-update value-field="siv"/>
+                <else>
+                    <service-call name="create#zenith.erp.omnichannel.StoreInventoryVisibility"
+                                  in-map="[storeId:storeId, productId:productId, availableQuantity:totalQty,
+                                           reservedQuantity:0, safetyStock:0, sellableQuantity:totalQty,
+                                           lastSyncTime:ec.user.nowTimestamp]"/>
+                </else>
+            </if>
+        </actions>
+    </service>
+
+    <!-- Create Pickup Slots (batch for a date) -->
+    <service verb="create" noun="PickupSlots">
+        <in-parameters>
+            <parameter name="storeId" required="true"/>
+            <parameter name="slotDate" type="Date" required="true"/>
+            <parameter name="startHour" type="Integer" default-value="9"/>
+            <parameter name="endHour" type="Integer" default-value="21"/>
+            <parameter name="slotDurationMinutes" type="Integer" default-value="60"/>
+            <parameter name="maxOrdersPerSlot" type="Integer" default-value="10"/>
+        </in-parameters>
+        <out-parameters><parameter name="slotsCreated" type="Integer"/></out-parameters>
+        <actions>
+            <set field="slotsCreated" from="0" type="Integer"/>
+            <set field="currentHour" from="startHour" type="Integer"/>
+            <while condition="currentHour &lt; endHour">
+                <set field="fromMinutes" from="currentHour * 60"/>
+                <set field="toMinutes" from="fromMinutes + slotDurationMinutes"/>
+                <set field="timeFrom" from="String.format('%02d:%02d:00', (int)(fromMinutes/60), fromMinutes%60)"/>
+                <set field="timeTo" from="String.format('%02d:%02d:00', (int)(toMinutes/60), toMinutes%60)"/>
+                <service-call name="create#zenith.erp.omnichannel.PickupSlot"
+                              in-map="[storeId:storeId, slotDate:slotDate, timeFrom:timeFrom, timeTo:timeTo,
+                                       maxOrders:maxOrdersPerSlot, bookedOrders:0, isAvailable:'Y']"/>
+                <set field="slotsCreated" from="slotsCreated + 1"/>
+                <set field="currentHour" from="currentHour + (slotDurationMinutes / 60)"/>
+            </while>
+        </actions>
+    </service>
+
+    <!-- Create Store Pick Order (BOPIS / Ship From Store) -->
+    <service verb="create" noun="StorePickOrder">
+        <in-parameters>
+            <parameter name="orderId" required="true"/>
+            <parameter name="storeId" required="true"/>
+            <parameter name="fulfillmentTypeEnumId" required="true"/>
+            <parameter name="pickupSlotId"/>
+            <parameter name="customerName"/>
+            <parameter name="customerPhone"/>
+            <parameter name="items" type="List"/>
+        </in-parameters>
+        <out-parameters><parameter name="pickOrderId"/></out-parameters>
+        <actions>
+            <service-call name="create#zenith.erp.omnichannel.StorePickOrder"
+                          in-map="[orderId:orderId, storeId:storeId, fulfillmentTypeEnumId:fulfillmentTypeEnumId,
+                                   pickupSlotId:pickupSlotId, statusId:'SpPending',
+                                   assignedDate:ec.user.nowTimestamp, customerName:customerName,
+                                   customerPhone:customerPhone]"
+                          out-map="context"/>
+
+            <if condition="pickupSlotId">
+                <entity-find-one entity-name="zenith.erp.omnichannel.PickupSlot" value-field="slot" for-update="true"/>
+                <set field="slot.bookedOrders" from="(slot.bookedOrders ?: 0) + 1"/>
+                <if condition="slot.bookedOrders >= slot.maxOrders">
+                    <set field="slot.isAvailable" value="N"/>
+                </if>
+                <entity-update value-field="slot"/>
+            </if>
+
+            <if condition="items">
+                <set field="seqNum" from="1" type="Integer"/>
+                <iterate list="items" entry="item">
+                    <service-call name="create#zenith.erp.omnichannel.StorePickOrderItem"
+                                  in-map="[pickOrderId:pickOrderId, pickItemSeqId:String.format('%05d', seqNum),
+                                           productId:item.productId, orderedQuantity:item.quantity ?: 1]"/>
+                    <set field="seqNum" from="seqNum + 1"/>
+                </iterate>
+            </if>
+        </actions>
+    </service>
+
+    <!-- Assign Picker -->
+    <service verb="assign" noun="Picker">
+        <in-parameters>
+            <parameter name="pickOrderId" required="true"/>
+            <parameter name="pickerPartyId" required="true"/>
+        </in-parameters>
+        <actions>
+            <service-call name="update#zenith.erp.omnichannel.StorePickOrder"
+                          in-map="[pickOrderId:pickOrderId, pickerPartyId:pickerPartyId, statusId:'SpAssigned']"/>
+        </actions>
+    </service>
+
+    <!-- Mark Pick Order Ready -->
+    <service verb="ready" noun="PickOrder">
+        <in-parameters>
+            <parameter name="pickOrderId" required="true"/>
+        </in-parameters>
+        <actions>
+            <service-call name="update#zenith.erp.omnichannel.StorePickOrder"
+                          in-map="[pickOrderId:pickOrderId, statusId:'SpReady', readyDate:ec.user.nowTimestamp,
+                                   customerNotified:'Y']"/>
+        </actions>
+    </service>
+
+    <!-- Complete Pickup (customer collected) -->
+    <service verb="complete" noun="Pickup">
+        <in-parameters>
+            <parameter name="pickOrderId" required="true"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.omnichannel.StorePickOrder" value-field="po"/>
+            <set field="newStatus" from="po.fulfillmentTypeEnumId == 'FtShipFromStore' ? 'SpShipped' : 'SpCollected'"/>
+            <service-call name="update#zenith.erp.omnichannel.StorePickOrder"
+                          in-map="[pickOrderId:pickOrderId, statusId:newStatus, collectedDate:ec.user.nowTimestamp]"/>
+        </actions>
+    </service>
+
+    <!-- Get Available Pickup Slots -->
+    <service verb="get" noun="AvailableSlots">
+        <in-parameters>
+            <parameter name="storeId" required="true"/>
+            <parameter name="slotDate" type="Date" required="true"/>
+        </in-parameters>
+        <out-parameters><parameter name="slots" type="List"/></out-parameters>
+        <actions>
+            <entity-find entity-name="zenith.erp.omnichannel.PickupSlot" list="slots">
+                <econdition field-name="storeId"/>
+                <econdition field-name="slotDate"/>
+                <econdition field-name="isAvailable" value="Y"/>
+                <order-by field-name="timeFrom"/>
+            </entity-find>
+        </actions>
+    </service>
+
+    <!-- Get Omnichannel Dashboard -->
+    <service verb="get" noun="OmnichannelDashboard">
+        <in-parameters>
+            <parameter name="storeId"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="pendingPicks" type="Integer"/>
+            <parameter name="readyForPickup" type="Integer"/>
+            <parameter name="completedToday" type="Integer"/>
+            <parameter name="todaySlots" type="List"/>
+        </out-parameters>
+        <actions>
+            <entity-find-count entity-name="zenith.erp.omnichannel.StorePickOrder" count-field="pendingPicks">
+                <econdition field-name="statusId" operator="in" value="SpPending,SpAssigned,SpPicking"/>
+                <econdition field-name="storeId" ignore-if-empty="true"/>
+            </entity-find-count>
+            <entity-find-count entity-name="zenith.erp.omnichannel.StorePickOrder" count-field="readyForPickup">
+                <econdition field-name="statusId" value="SpReady"/>
+                <econdition field-name="storeId" ignore-if-empty="true"/>
+            </entity-find-count>
+            <entity-find-count entity-name="zenith.erp.omnichannel.StorePickOrder" count-field="completedToday">
+                <econdition field-name="statusId" operator="in" value="SpCollected,SpShipped"/>
+                <econdition field-name="collectedDate" operator="greater-equals" from="ec.user.nowTimestamp.clearTime()"/>
+                <econdition field-name="storeId" ignore-if-empty="true"/>
+            </entity-find-count>
+            <entity-find entity-name="zenith.erp.omnichannel.PickupSlot" list="todaySlots">
+                <econdition field-name="slotDate" from="ec.user.nowTimestamp.clearTime()"/>
+                <econdition field-name="storeId" ignore-if-empty="true"/>
+                <order-by field-name="timeFrom"/>
+            </entity-find>
+        </actions>
+    </service>
+
+</services>

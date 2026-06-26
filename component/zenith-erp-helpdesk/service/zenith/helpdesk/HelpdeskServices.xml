@@ -1,0 +1,185 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <!-- ========== Ticket Management ========== -->
+
+    <service verb="create" noun="Ticket">
+        <in-parameters>
+            <parameter name="categoryId"/>
+            <parameter name="departmentId"/>
+            <parameter name="customerPartyId"/>
+            <parameter name="customerName"/>
+            <parameter name="customerEmail"/>
+            <parameter name="customerPhone"/>
+            <parameter name="subject" required="true"/>
+            <parameter name="description"/>
+            <parameter name="priority" default-value="Medium"/>
+            <parameter name="channel" default-value="Portal"/>
+            <parameter name="assignedToPartyId"/>
+        </in-parameters>
+        <out-parameters><parameter name="ticketId"/><parameter name="ticketNumber"/></out-parameters>
+        <actions>
+            <!-- Auto ticket number: TKT/FY/SEQ -->
+            <script><![CDATA[
+                def now = ec.user.nowTimestamp
+                def cal = Calendar.getInstance()
+                cal.setTime(now)
+                def year = cal.get(Calendar.YEAR)
+                def month = cal.get(Calendar.MONTH) + 1
+                def fysSetting = ec.entity.find("zenith.erp.base.CompanySettings").condition("organizationPartyId", ec.user.getPreference("ACTIVE_ORGANIZATION")).condition("settingKey", "FY_START_MONTH").one()
+                int fyStartMonth = fysSetting ? (fysSetting.settingValue as int) : 4
+                def fyStart = month >= fyStartMonth ? year : year - 1
+                def fyEnd = (fyStart + 1) % 100
+                def fyStr = String.format("%02d-%02d", fyStart % 100, fyEnd)
+
+                def existing = ec.entity.find("zenith.erp.helpdesk.Ticket")
+                    .condition("ticketNumber", "like", "TKT/${fyStr}/%").count()
+                def seqNum = String.format("%05d", existing + 1)
+                ticketNumber = "TKT/${fyStr}/${seqNum}"
+            ]]></script>
+
+            <!-- Get department from category if not provided -->
+            <if condition="categoryId &amp;&amp; !departmentId">
+                <entity-find-one entity-name="zenith.erp.helpdesk.TicketCategory" value-field="cat">
+                    <field-map field-name="categoryId"/></entity-find-one>
+                <set field="departmentId" from="cat?.departmentId"/>
+                <if condition="!priority || priority == 'Medium'">
+                    <set field="priority" from="cat?.defaultPriority ?: 'Medium'"/></if>
+            </if>
+
+            <!-- Calculate SLA deadlines -->
+            <script><![CDATA[
+                def slaResponseDeadline = null
+                def slaResolutionDeadline = null
+
+                // Look up SLA policy by category or priority
+                def slaQuery = ec.entity.find("zenith.erp.helpdesk.SlaPolicy")
+                    .condition("priorityLevel", priority)
+                    .condition("isActive", "Y")
+                if (categoryId) {
+                    def cat = ec.entity.find("zenith.erp.helpdesk.TicketCategory")
+                        .condition("categoryId", categoryId).one()
+                    if (cat?.slaPolicyId) {
+                        def sla = ec.entity.find("zenith.erp.helpdesk.SlaPolicy")
+                            .condition("policyId", cat.slaPolicyId).one()
+                        if (sla) {
+                            def respHrs = sla.firstResponseHours ?: 4
+                            def resHrs = sla.resolutionHours ?: 24
+                            slaResponseDeadline = new java.sql.Timestamp(
+                                ec.user.nowTimestamp.getTime() + (respHrs * 3600000L))
+                            slaResolutionDeadline = new java.sql.Timestamp(
+                                ec.user.nowTimestamp.getTime() + (resHrs * 3600000L))
+                        }
+                    }
+                }
+                if (!slaResponseDeadline) {
+                    def defaultHrs = priority == 'Critical' ? 1 : priority == 'High' ? 4 : priority == 'Medium' ? 8 : 24
+                    def defaultResHrs = priority == 'Critical' ? 4 : priority == 'High' ? 12 : priority == 'Medium' ? 24 : 48
+                    slaResponseDeadline = new java.sql.Timestamp(
+                        ec.user.nowTimestamp.getTime() + (defaultHrs * 3600000L))
+                    slaResolutionDeadline = new java.sql.Timestamp(
+                        ec.user.nowTimestamp.getTime() + (defaultResHrs * 3600000L))
+                }
+            ]]></script>
+
+            <service-call name="create#zenith.erp.helpdesk.Ticket" out-map="context"
+                in-map="[ticketNumber:ticketNumber, categoryId:categoryId,
+                         departmentId:departmentId, assignedToPartyId:assignedToPartyId,
+                         customerPartyId:customerPartyId, customerName:customerName,
+                         customerEmail:customerEmail, customerPhone:customerPhone,
+                         subject:subject, description:description, priority:priority,
+                         channel:channel, statusId:'TkNew', entryDate:ec.user.nowTimestamp,
+                         slaResponseDeadline:slaResponseDeadline,
+                         slaResolutionDeadline:slaResolutionDeadline, slaBreached:'N']"/>
+        </actions>
+    </service>
+
+    <service verb="assign" noun="Ticket">
+        <in-parameters>
+            <parameter name="ticketId" required="true"/>
+            <parameter name="assignedToPartyId" required="true"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.helpdesk.Ticket" value-field="ticket"/>
+            <service-call name="update#zenith.erp.helpdesk.Ticket"
+                in-map="[ticketId:ticketId, assignedToPartyId:assignedToPartyId,
+                         statusId:ticket.statusId == 'TkNew' ? 'TkOpen' : ticket.statusId]"/>
+            <service-call name="zenith.helpdesk.HelpdeskServices.add#TicketComment"
+                in-map="[ticketId:ticketId, commentText:'Ticket assigned to ' + assignedToPartyId,
+                         commentType:'Internal']"/>
+        </actions>
+    </service>
+
+    <service verb="add" noun="TicketComment">
+        <in-parameters>
+            <parameter name="ticketId" required="true"/>
+            <parameter name="commentText" required="true"/>
+            <parameter name="commentType" default-value="Public"/>
+        </in-parameters>
+        <out-parameters><parameter name="commentId"/></out-parameters>
+        <actions>
+            <service-call name="create#zenith.erp.helpdesk.TicketComment" out-map="context"
+                in-map="[ticketId:ticketId, commentText:commentText, commentType:commentType,
+                         authorPartyId:ec.user.userAccount?.partyId,
+                         commentDate:ec.user.nowTimestamp]"/>
+
+            <!-- Record first response if this is the first public reply -->
+            <entity-find-one entity-name="zenith.erp.helpdesk.Ticket" value-field="ticket"/>
+            <if condition="commentType == 'Public' &amp;&amp; !ticket.firstResponseDate">
+                <service-call name="update#zenith.erp.helpdesk.Ticket"
+                    in-map="[ticketId:ticketId, firstResponseDate:ec.user.nowTimestamp]"/>
+            </if>
+        </actions>
+    </service>
+
+    <service verb="updateStatus" noun="Ticket">
+        <in-parameters>
+            <parameter name="ticketId" required="true"/>
+            <parameter name="statusId" required="true"/>
+        </in-parameters>
+        <actions>
+            <set field="updateMap" from="[ticketId:ticketId, statusId:statusId]"/>
+            <if condition="statusId == 'TkResolved'">
+                <set field="updateMap.resolvedDate" from="ec.user.nowTimestamp"/></if>
+            <if condition="statusId == 'TkClosed'">
+                <set field="updateMap.closedDate" from="ec.user.nowTimestamp"/></if>
+            <service-call name="update#zenith.erp.helpdesk.Ticket" in-map="updateMap"/>
+        </actions>
+    </service>
+
+    <service verb="rate" noun="Ticket">
+        <in-parameters>
+            <parameter name="ticketId" required="true"/>
+            <parameter name="satisfaction" type="Integer" required="true"/>
+            <parameter name="satisfactionComment"/>
+        </in-parameters>
+        <actions>
+            <service-call name="update#zenith.erp.helpdesk.Ticket"
+                in-map="[ticketId:ticketId, satisfaction:satisfaction,
+                         satisfactionComment:satisfactionComment]"/>
+        </actions>
+    </service>
+
+    <service verb="check" noun="SlaBreach">
+        <description>Finds tickets that have breached SLA deadlines</description>
+        <out-parameters><parameter name="breachedTickets" type="List"/></out-parameters>
+        <actions>
+            <entity-find entity-name="zenith.erp.helpdesk.Ticket" list="openTickets">
+                <econdition field-name="statusId" operator="in" value="TkNew,TkOpen,TkInProgress,TkWaiting,TkEscalated"/>
+                <econdition field-name="slaBreached" value="N"/>
+            </entity-find>
+            <set field="breachedTickets" from="[]"/>
+            <set field="now" from="ec.user.nowTimestamp"/>
+            <iterate list="openTickets" entry="ticket">
+                <if condition="(ticket.slaResolutionDeadline &amp;&amp; now.after(ticket.slaResolutionDeadline)) ||
+                               (ticket.slaResponseDeadline &amp;&amp; !ticket.firstResponseDate &amp;&amp; now.after(ticket.slaResponseDeadline))">
+                    <script>breachedTickets.add(ticket.ticketId)</script>
+                    <service-call name="update#zenith.erp.helpdesk.Ticket"
+                        in-map="[ticketId:ticket.ticketId, slaBreached:'Y']"/>
+                </if>
+            </iterate>
+        </actions>
+    </service>
+
+</services>

@@ -1,0 +1,185 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
+        default-menu-title="Product Prices" default-menu-index="17">
+
+    <parameter name="searchTerm"/>
+    <parameter name="catId"/>
+    <parameter name="pageIndex"/>
+
+    <!-- Save one product's Retail / Wholesale / Employee prices (AJAX, returns JSON). -->
+    <transition name="savePrices" begin-transaction="true">
+        <actions>
+            <script><![CDATA[
+                def p = ec.web.parameters
+                try {
+                    if (!p.productId) { ec.web.sendJsonResponse([success:false, error:'Missing product']); return }
+                    // Retail price = product MRP; only update when a positive value was entered.
+                    if (p.retailPrice != null && p.retailPrice.toString().trim() != '')
+                        ec.service.sync().name("zenith.pos.PosServices.set#PosModePrice")
+                            .parameters([productId:p.productId, salesModeId:'RETAIL', price:(p.retailPrice as BigDecimal)]).call()
+                    // Wholesale / Employee: empty clears the price (=> product blocked in that mode).
+                    ec.service.sync().name("zenith.pos.PosServices.set#PosModePrice")
+                        .parameters([productId:p.productId, salesModeId:'WHOLESALE',
+                                     price:(p.wholesalePrice != null && p.wholesalePrice.toString().trim() != '' ? (p.wholesalePrice as BigDecimal) : null)]).call()
+                    ec.service.sync().name("zenith.pos.PosServices.set#PosModePrice")
+                        .parameters([productId:p.productId, salesModeId:'EMPLOYEE',
+                                     price:(p.employeePrice != null && p.employeePrice.toString().trim() != '' ? (p.employeePrice as BigDecimal) : null)]).call()
+                    if (ec.message.hasError()) { def em = ec.message.errorsString; ec.message.clearErrors(); ec.web.sendJsonResponse([success:false, error:em]); return }
+                    ec.web.sendJsonResponse([success:true])
+                } catch (Exception e) { ec.web.sendJsonResponse([success:false, error:e.message]) }
+            ]]></script>
+        </actions>
+        <default-response type="none"/>
+    </transition>
+
+    <actions>
+        <script><![CDATA[
+            def posOrg = ec.user.getPreference('ACTIVE_ORGANIZATION')
+            def pageSize = 60
+            def pIdx = 0
+            try { if (pageIndex) pIdx = (pageIndex as Integer) } catch (Exception ig) { pIdx = 0 }
+            if (pIdx < 0) pIdx = 0
+
+            // Categories for the filter dropdown (tenant-scoped when an org is active).
+            def catFinder = ec.entity.find("mantle.product.category.ProductCategory")
+            if (posOrg) catFinder.condition("ownerPartyId", posOrg)
+            categories = catFinder.orderBy("categoryName").list()
+
+            // Product ids that belong to the selected category (if filtering).
+            def catProdIds = null
+            if (catId) {
+                catProdIds = [] as Set
+                ec.entity.find("mantle.product.category.ProductCategoryMember").condition("productCategoryId", catId).list().each { catProdIds.add(it.productId) }
+            }
+
+            // Load candidate products (tenant-scoped), then filter by search/category in memory.
+            def pf = ec.entity.find("mantle.product.Product").condition("productTypeEnumId", "PtAsset")
+            if (posOrg) pf.condition("ownerPartyId", posOrg)
+            def candidates = pf.orderBy("productName").limit(5000).list()
+            def termLower = (searchTerm ?: '').toLowerCase().trim()
+            def filtered = candidates.findAll { pr ->
+                (termLower == '' || (pr.productName ?: '').toLowerCase().contains(termLower) || (pr.pseudoId ?: '').toLowerCase().contains(termLower)) &&
+                (catProdIds == null || catProdIds.contains(pr.productId))
+            }
+            totalCount = filtered.size()
+            pageCount = (int) Math.ceil(totalCount / (double) pageSize)
+            if (pageCount < 1) pageCount = 1
+            if (pIdx >= pageCount) pIdx = pageCount - 1
+            curPage = pIdx
+            def from = pIdx * pageSize
+            def to = Math.min(from + pageSize, totalCount)
+            def pageProds = (from < totalCount) ? filtered.subList(from, to) : []
+
+            // Existing wholesale/employee prices for the page's products.
+            def pageIds = pageProds.collect { it.productId }
+            def wMap = [:]; def eMap = [:]
+            if (pageIds) {
+                ec.entity.find("zenith.erp.pos.PosProductModePrice").condition("productId", "in", pageIds).list().each { mp ->
+                    if (mp.salesModeId == 'WHOLESALE') wMap[mp.productId] = mp.price
+                    else if (mp.salesModeId == 'EMPLOYEE') eMap[mp.productId] = mp.price
+                }
+            }
+            rows = pageProds.collect { pr -> [productId: pr.productId, pseudoId: (pr.pseudoId ?: ''), productName: (pr.productName ?: pr.productId),
+                                              retail: (pr.mrpAmount != null ? (pr.mrpAmount as BigDecimal).toPlainString() : ''),
+                                              wholesale: (wMap[pr.productId] != null ? (wMap[pr.productId] as BigDecimal).toPlainString() : ''),
+                                              employee: (eMap[pr.productId] != null ? (eMap[pr.productId] as BigDecimal).toPlainString() : '')] }
+        ]]></script>
+    </actions>
+
+    <widgets>
+        <render-mode><text type="html,qvt" template="true"><![CDATA[
+        <div style="padding:14px 16px;max-width:1100px;margin:0 auto;font-family:'Segoe UI',Arial,sans-serif">
+            <div style="font-size:22px;font-weight:800;color:#1a237e;margin-bottom:2px">&#128178; Product Prices</div>
+            <div style="font-size:13px;color:#5f6368;margin-bottom:12px">Set what each type of customer pays for every product &mdash; Retail, Wholesale and Employee.</div>
+
+            <details open style="background:#e8f0fe;border:1px solid #4285f4;border-left:6px solid #1a73e8;border-radius:10px;padding:10px 16px;margin-bottom:14px">
+                <summary style="cursor:pointer;font-weight:800;font-size:15px;color:#174ea6;outline:none">&#127991;&#65039; New here? Read this first <span style="font-weight:600;color:#5f6368;font-size:12px">(click to hide / show)</span></summary>
+                <div style="font-size:13.5px;color:#202124;line-height:1.85;margin-top:10px">
+                    <div style="margin-bottom:8px">Each product can have <b>three prices</b>. While billing, the cashier picks a mode and that price is charged automatically.</div>
+                    <table style="border-collapse:collapse;margin:4px 0 10px 0;font-size:13px">
+                        <tr><td style="padding:3px 12px 3px 0;font-weight:700;color:#1565c0;white-space:nowrap;vertical-align:top">Retail</td><td style="padding:3px 0">The normal walk-in price &mdash; this <b>is</b> the product's MRP. Changing it here changes the MRP.</td></tr>
+                        <tr><td style="padding:3px 12px 3px 0;font-weight:700;color:#1565c0;white-space:nowrap;vertical-align:top">Wholesale</td><td style="padding:3px 0">A lower price for bulk / shop buyers. <b>You type the exact price</b> &mdash; there is no automatic discount.</td></tr>
+                        <tr><td style="padding:3px 12px 3px 0;font-weight:700;color:#1565c0;white-space:nowrap;vertical-align:top">Employee</td><td style="padding:3px 0">A staff price. Same idea &mdash; <b>type the exact price</b> you want staff to pay.</td></tr>
+                    </table>
+                    <div style="background:#fff3cd;border:1px solid #ffe082;border-radius:7px;padding:8px 11px;margin-bottom:9px;color:#6d4c00">
+                        &#9888;&#65039; <b>Leave Wholesale or Employee blank to block it.</b> A product with no Wholesale price simply can't be sold in Wholesale mode until you set one. Retail (MRP) always works.
+                    </div>
+                    <div style="font-weight:700;color:#174ea6;margin-bottom:3px">How to set a price</div>
+                    <div style="margin-bottom:6px">1&nbsp; Find the product with the search box below &nbsp;&rarr;&nbsp; 2&nbsp; Type the price into the Wholesale or Employee box &nbsp;&rarr;&nbsp; 3&nbsp; Click that row's green <b>Save</b>.</div>
+                    <div style="font-size:12.5px;color:#5f6368">Example: a Coffee Mug with MRP &#8377;100 &rarr; you set Wholesale &#8377;80 and Employee &#8377;70. Walk-in customers still pay &#8377;100.</div>
+                </div>
+            </details>
+
+            <form method="get" action="ProductPricing" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px">
+                <input type="text" name="searchTerm" value="${(searchTerm!'')?html}" placeholder="Search name or SKU..." style="flex:1;min-width:200px;padding:9px 12px;border:1px solid #bbb;border-radius:7px;font-size:14px"/>
+                <select name="catId" style="padding:9px 10px;border:1px solid #bbb;border-radius:7px;font-size:14px">
+                    <option value="">All categories</option>
+                    <#list (categories![]) as c>
+                        <option value="${c.productCategoryId}" <#if (catId!'') == c.productCategoryId>selected</#if>>${(c.categoryName!c.productCategoryId)?html}</option>
+                    </#list>
+                </select>
+                <input type="hidden" name="pageIndex" value="0"/>
+                <button type="submit" style="padding:9px 20px;background:#1565c0;color:#fff;border:none;border-radius:7px;font-size:14px;font-weight:700;cursor:pointer">Search</button>
+            </form>
+
+            <div style="font-size:13px;color:#555;margin-bottom:6px">${totalCount!0} product(s) — page ${(curPage!0)+1} of ${pageCount!1}</div>
+
+            <table style="width:100%;border-collapse:collapse;font-size:14px">
+                <thead>
+                    <tr style="background:#1565c0;color:#fff">
+                        <th style="text-align:left;padding:9px 8px">Product</th>
+                        <th style="text-align:left;padding:9px 8px;width:110px">SKU</th>
+                        <th style="text-align:right;padding:9px 8px;width:120px">Retail (MRP)<div style="font-weight:400;font-size:11px;opacity:0.85">walk-in customers</div></th>
+                        <th style="text-align:right;padding:9px 8px;width:120px">Wholesale<div style="font-weight:400;font-size:11px;opacity:0.85">bulk buyers</div></th>
+                        <th style="text-align:right;padding:9px 8px;width:120px">Employee<div style="font-weight:400;font-size:11px;opacity:0.85">staff</div></th>
+                        <th style="text-align:center;padding:9px 8px;width:90px">Save</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <#list (rows![]) as r>
+                    <tr data-pid="${(r.productId)?html}" style="border-bottom:1px solid #e0e0e0">
+                        <td style="padding:7px 8px;color:#222">${(r.productName)?html}</td>
+                        <td style="padding:7px 8px;color:#777;font-size:12px">${(r.pseudoId)?html}</td>
+                        <td style="padding:5px 8px"><input class="pp-retail" type="number" step="0.01" value="${r.retail}" style="width:100%;text-align:right;padding:6px;border:1px solid #ccc;border-radius:5px;font-size:14px;box-sizing:border-box"/></td>
+                        <td style="padding:5px 8px"><input class="pp-wholesale" type="number" step="0.01" value="${r.wholesale}" placeholder="blank = blocked" style="width:100%;text-align:right;padding:6px;border:1px solid #ccc;border-radius:5px;font-size:14px;box-sizing:border-box"/></td>
+                        <td style="padding:5px 8px"><input class="pp-employee" type="number" step="0.01" value="${r.employee}" placeholder="blank = blocked" style="width:100%;text-align:right;padding:6px;border:1px solid #ccc;border-radius:5px;font-size:14px;box-sizing:border-box"/></td>
+                        <td style="padding:5px 8px;text-align:center"><button type="button" class="pp-save" style="padding:7px 14px;background:#2e7d32;color:#fff;border:none;border-radius:6px;font-size:13px;font-weight:700;cursor:pointer">Save</button></td>
+                    </tr>
+                    </#list>
+                    <#if !(rows?has_content)>
+                    <tr><td colspan="6" style="padding:24px;text-align:center;color:#888">No products match your search. Clear the search box and click Search to see all products.</td></tr>
+                    </#if>
+                </tbody>
+            </table>
+
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-top:14px">
+                <#assign baseQ = "ProductPricing?searchTerm=" + (searchTerm!'')?url('UTF-8') + "&catId=" + (catId!'')?url('UTF-8')>
+                <#if (curPage!0) gt 0><a href="${baseQ}&pageIndex=${(curPage!0)-1}" style="padding:8px 16px;background:#eceff1;border-radius:7px;text-decoration:none;color:#1565c0;font-weight:700">&#8592; Prev</a><#else><span></span></#if>
+                <#if (curPage!0)+1 lt (pageCount!1)><a href="${baseQ}&pageIndex=${(curPage!0)+1}" style="padding:8px 16px;background:#eceff1;border-radius:7px;text-decoration:none;color:#1565c0;font-weight:700">Next &#8594;</a><#else><span></span></#if>
+            </div>
+        </div>
+
+        <script>
+        (function(){
+            function tok(){ try{ if(window.moqui&&window.moqui.webrootVue&&window.moqui.webrootVue.moquiSessionToken) return window.moqui.webrootVue.moquiSessionToken; }catch(e){} return ''; }
+            function note(btn,msg,ok){ var o=btn.textContent,c=btn.style.background; btn.textContent=msg; btn.style.background=ok?'#1b5e20':'#c62828'; setTimeout(function(){ btn.textContent=o; btn.style.background=c; },1800); }
+            document.addEventListener('click',function(ev){
+                var btn=ev.target.closest&&ev.target.closest('.pp-save'); if(!btn) return;
+                var tr=btn.closest('tr'); if(!tr) return;
+                btn.disabled=true; var ot=btn.textContent; btn.textContent='...';
+                var body=new URLSearchParams({ productId:tr.getAttribute('data-pid'),
+                    retailPrice:(tr.querySelector('.pp-retail')||{}).value||'',
+                    wholesalePrice:(tr.querySelector('.pp-wholesale')||{}).value||'',
+                    employeePrice:(tr.querySelector('.pp-employee')||{}).value||'',
+                    moquiSessionToken:tok() });
+                fetch('ProductPricing/savePrices',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body,credentials:'same-origin'})
+                    .then(function(r){return r.json();})
+                    .then(function(d){ btn.disabled=false; if(d&&d.success){ note(btn,'✓ Saved',true); } else { note(btn,'✗ '+((d&&d.error)||'Error'),false); } })
+                    .catch(function(e){ btn.disabled=false; note(btn,'✗ '+e.message,false); });
+            });
+        })();
+        </script>
+        ]]></text></render-mode>
+    </widgets>
+</screen>

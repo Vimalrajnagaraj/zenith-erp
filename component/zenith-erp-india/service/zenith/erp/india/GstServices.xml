@@ -1,0 +1,195 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <service verb="extract" noun="Gstr1Data">
+        <description>Builds GSTR-1 (B2B / B2CS / HSN) for a period from POS sales + AR invoices.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="returnPeriod" required="true"/>
+            <parameter name="financialYear" required="true"/>
+        </in-parameters>
+        <out-parameters><parameter name="filingId"/></out-parameters>
+        <actions>
+            <script><![CDATA[
+                import java.math.RoundingMode
+                def RM = RoundingMode.HALF_UP
+                def two = { v -> ((v ?: 0) as BigDecimal).setScale(2, RM) }
+
+                def monthStr = returnPeriod.substring(0,2); def yearStr = returnPeriod.substring(2,6)
+                def startTs = java.sql.Timestamp.valueOf(yearStr + "-" + monthStr + "-01 00:00:00")
+                def cal = java.util.Calendar.getInstance(); cal.setTime(startTs)
+                cal.set(java.util.Calendar.DAY_OF_MONTH, cal.getActualMaximum(java.util.Calendar.DAY_OF_MONTH))
+                cal.set(java.util.Calendar.HOUR_OF_DAY,23); cal.set(java.util.Calendar.MINUTE,59); cal.set(java.util.Calendar.SECOND,59)
+                def endTs = new java.sql.Timestamp(cal.getTimeInMillis())
+
+                def stateMap = ['IND_JK':'01','IND_HP':'02','IND_PB':'03','IND_CH':'04','IND_UT':'05','IND_UK':'05','IND_HR':'06','IND_DL':'07','IND_RJ':'08','IND_UP':'09','IND_BR':'10','IND_SK':'11','IND_AR':'12','IND_NL':'13','IND_MN':'14','IND_MZ':'15','IND_TR':'16','IND_ML':'17','IND_AS':'18','IND_WB':'19','IND_JH':'20','IND_OR':'21','IND_OD':'21','IND_CT':'22','IND_CG':'22','IND_MP':'23','IND_GJ':'24','IND_DD':'26','IND_DN':'26','IND_MH':'27','IND_KA':'29','IND_GA':'30','IND_LD':'31','IND_KL':'32','IND_TN':'33','IND_PY':'34','IND_AN':'35','IND_TG':'36','IND_TS':'36','IND_AP':'37','IND_LA':'38']
+                def gstin = ''; def homeState = ''
+                def terms = ec.entity.find("zenith.erp.pos.PosTerminal").condition("organizationPartyId", organizationPartyId).list()
+                for (def t : terms) { if (t.taxRegistrationNumber) { gstin = t.taxRegistrationNumber; break } }
+                if (gstin && gstin.length() >= 2) homeState = gstin.substring(0,2)
+                if (!homeState) { for (def t : terms) { if (t.regionGeoId && stateMap[t.regionGeoId]) { homeState = stateMap[t.regionGeoId]; break } } }
+                if (!homeState) homeState = '33'
+
+                def slabs = ec.entity.find("zenith.erp.india.IndiaGstSlab").condition("isActive","Y").list().collect { ((it.gstRate ?: 0) as BigDecimal) }.unique().sort()
+                if (!slabs) slabs = [0G,5G,12G,18G,28G]
+                def snapToSlab = { effRate ->
+                    def e = (effRate ?: 0) as BigDecimal; def best = slabs[0]; def bd = (e - best).abs()
+                    for (def sl : slabs) { def d = (e - sl).abs(); if (d < bd) { bd = d; best = sl } }
+                    best
+                }
+
+                def filing = ec.entity.makeValue("zenith.erp.india.gstr1.Gstr1Filing")
+                filing.filingId = ec.entity.sequencedIdPrimary("zenith.erp.india.gstr1.Gstr1Filing", null, null)
+                filing.organizationPartyId = organizationPartyId; filing.returnPeriod = returnPeriod
+                filing.financialYear = financialYear; filing.filingDate = ec.user.nowTimestamp; filing.statusId = 'DRAFT'
+                filing.create(); filingId = filing.filingId
+
+                def b2csMap = [:]; def hsnMap = [:]; def b2bRecs = []
+
+                // ===== POS completed sales =====
+                def posTxns = ec.entity.find("zenith.erp.pos.PosTransaction")
+                    .condition("organizationPartyId", organizationPartyId).condition("statusId", "PtCompleted")
+                    .condition("entryDate", ">=", startTs).condition("entryDate", "<=", endTs).list()
+                def txnIds = posTxns.collect { it.transactionId }
+                def itemsByTxn = [:]
+                if (txnIds) ec.entity.find("zenith.erp.pos.PosTransactionItem").condition("transactionId","in",txnIds).list().each { it ->
+                    (itemsByTxn[it.transactionId] = itemsByTxn[it.transactionId] ?: []) << it
+                }
+                for (def tx : posTxns) {
+                    def items = itemsByTxn[tx.transactionId] ?: []
+                    def hdrTax = (tx.totalTaxAmount ?: 0) as BigDecimal
+                    def hdrSub = (tx.subtotal ?: 0) as BigDecimal
+                    if (hdrSub <= 0G) hdrSub = (items.sum { (it.taxableAmount ?: 0) as BigDecimal } ?: 0G) as BigDecimal
+                    boolean inter = (tx.destinationRegionGeoId && stateMap[tx.destinationRegionGeoId] && stateMap[tx.destinationRegionGeoId] != homeState)
+                    def pos = inter ? (stateMap[tx.destinationRegionGeoId] ?: homeState) : homeState
+                    def custGstin = (tx.customerGstin && tx.customerGstin.trim()) ? tx.customerGstin.trim() : null
+                    def perRate = [:]
+                    def itemTaxSum = (items.sum { (it.totalTaxAmount ?: 0) as BigDecimal } ?: 0G) as BigDecimal
+                    // migrated rows carry tax only on the header -> snap the whole-bill effective rate to a real slab
+                    def hdrRate = (itemTaxSum <= 0G && hdrSub > 0G && hdrTax > 0G) ? snapToSlab(hdrTax * 100 / hdrSub) : null
+                    for (def it : items) {
+                        def itxbl = (it.taxableAmount ?: 0) as BigDecimal
+                        def rate; def itax
+                        if (itemTaxSum > 0G) {
+                            def raw = (it.totalTaxAmount ?: 0) as BigDecimal
+                            rate = (itxbl > 0G && raw > 0G) ? snapToSlab(raw * 100 / itxbl) : 0G
+                            itax = raw
+                        } else if (hdrRate != null) {
+                            rate = hdrRate
+                            itax = (hdrSub > 0G) ? two(itxbl * hdrTax / hdrSub) : 0G
+                        } else {
+                            rate = 0G; itax = 0G   // exempt / nil-rated
+                        }
+                        if (rate == 0G) itax = 0G   // a 0% supply cannot carry tax (GSTN-valid)
+                        def hsn = (it.productTaxCode && it.productTaxCode.trim()) ? it.productTaxCode.trim() : 'NA'
+                        def hk = hsn + "|" + rate
+                        def ha = hsnMap[hk] ?: [hsn:hsn, rate:rate, qty:0G, txval:0G, tax:0G, value:0G]
+                        ha.qty += ((it.quantity ?: 0) as BigDecimal); ha.txval += itxbl; ha.tax += itax; ha.value += ((it.lineTotal ?: itxbl) as BigDecimal)
+                        hsnMap[hk] = ha
+                        def pr = perRate[rate] ?: [txval:0G, tax:0G]; pr.txval += itxbl; pr.tax += itax; perRate[rate] = pr
+                    }
+                    if (custGstin) {
+                        perRate.each { rate, v ->
+                            def r = ec.entity.makeValue("zenith.erp.india.gstr1.Gstr1B2bRecord")
+                            r.recordId = ec.entity.sequencedIdPrimary("zenith.erp.india.gstr1.Gstr1B2bRecord", null, null)
+                            r.filingId = filingId; r.buyerGstin = custGstin; r.buyerName = (tx.customerName ?: '')
+                            r.invoiceNumber = (tx.transactionNumber ?: tx.transactionId)
+                            r.invoiceDate = new java.sql.Date(((java.util.Date)tx.entryDate).getTime())
+                            r.invoiceValue = two(tx.payableAmount ?: tx.grandTotal ?: 0); r.placeOfSupply = pos
+                            r.rate = rate; r.taxableValue = two(v.txval)
+                            if (inter) r.igstAmount = two(v.tax) else { r.cgstAmount = two(v.tax/2); r.sgstAmount = two(v.tax/2) }
+                            r.create()
+                        }
+                    } else {
+                        perRate.each { rate, v ->
+                            def k = pos + "|" + rate
+                            def a = b2csMap[k] ?: [pos:pos, rate:rate, txval:0G, cgst:0G, sgst:0G, igst:0G]
+                            a.txval += v.txval
+                            if (inter) a.igst += v.tax else { a.cgst += (v.tax/2); a.sgst += (v.tax/2) }
+                            b2csMap[k] = a
+                        }
+                    }
+                }
+
+                // ===== write B2CS =====
+                b2csMap.each { k, a ->
+                    def r = ec.entity.makeValue("zenith.erp.india.gstr1.Gstr1B2csRecord")
+                    r.recordId = ec.entity.sequencedIdPrimary("zenith.erp.india.gstr1.Gstr1B2csRecord", null, null)
+                    r.filingId = filingId; r.placeOfSupply = a.pos; r.rate = a.rate; r.taxableValue = two(a.txval)
+                    r.cgstAmount = two(a.cgst); r.sgstAmount = two(a.sgst); r.igstAmount = two(a.igst); r.create()
+                }
+                // ===== write HSN =====
+                hsnMap.each { k, a ->
+                    def r = ec.entity.makeValue("zenith.erp.india.gstr1.Gstr1HsnSummary")
+                    r.recordId = ec.entity.sequencedIdPrimary("zenith.erp.india.gstr1.Gstr1HsnSummary", null, null)
+                    r.filingId = filingId; r.hsnSacCode = a.hsn; r.uom = 'NOS'; r.totalQuantity = a.qty
+                    r.taxableValue = two(a.txval); r.totalValue = two(a.value)
+                    r.cgstAmount = two(a.tax/2); r.sgstAmount = two(a.tax/2); r.igstAmount = 0G; r.create()
+                }
+
+                // ===== JSON payload (GSTN-style) =====
+                def df = new java.text.SimpleDateFormat("dd-MM-yyyy")
+                def b2bOut = []
+                ec.entity.find("zenith.erp.india.gstr1.Gstr1B2bRecord").condition("filingId", filingId).list().each { b ->
+                    b2bOut << [ctin:b.buyerGstin, inv:[[inum:b.invoiceNumber, idt:(b.invoiceDate ? df.format(b.invoiceDate) : ''), val:b.invoiceValue, pos:b.placeOfSupply,
+                        itms:[[num:1, itm_det:[rt:b.rate, txval:b.taxableValue, iamt:(b.igstAmount ?: 0), camt:(b.cgstAmount ?: 0), samt:(b.sgstAmount ?: 0)]]]]]]
+                }
+                def b2csOut = []
+                ec.entity.find("zenith.erp.india.gstr1.Gstr1B2csRecord").condition("filingId", filingId).list().each { b ->
+                    b2csOut << [sply_ty:(((b.igstAmount ?: 0) as BigDecimal) > 0G ? 'INTER' : 'INTRA'), pos:b.placeOfSupply, typ:'OE', rt:b.rate,
+                        txval:b.taxableValue, iamt:(b.igstAmount ?: 0), camt:(b.cgstAmount ?: 0), samt:(b.sgstAmount ?: 0)]
+                }
+                def hsnOut = []; int hidx = 1
+                ec.entity.find("zenith.erp.india.gstr1.Gstr1HsnSummary").condition("filingId", filingId).list().each { h ->
+                    hsnOut << [num:(hidx++), hsn_sc:h.hsnSacCode, uqc:(h.uom ?: 'NOS'), qty:h.totalQuantity, txval:h.taxableValue,
+                        iamt:(h.igstAmount ?: 0), camt:(h.cgstAmount ?: 0), samt:(h.sgstAmount ?: 0)]
+                }
+                def payload = [gstin:(gstin ?: ''), fp:returnPeriod, gt:0, version:'GST3.0.1', b2b:b2bOut, b2cs:b2csOut, hsn:[data:hsnOut]]
+                filing.jsonPayload = new groovy.json.JsonBuilder(payload).toString(); filing.update()
+            ]]></script>
+        </actions>
+    </service>
+
+    <service verb="create" noun="ReverseChargeMechanismEntry">
+        <description>Auto-creates accounting entries to book GST liability and claim ITC for RCM applicable vendor invoices.</description>
+        <in-parameters>
+            <parameter name="invoiceId" required="true"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="invoice"/>
+            <if condition="invoice == null"><return error="true" message="Invoice ${invoiceId} not found"/></if>
+            
+            <!-- Check if Invoice requires RCM -->
+            <!-- Typically an RCM flag is set on the Invoice or InvoiceItem. 
+                 For now, we mock the service logic. -->
+                 
+            <message>RCM journals simulated for Invoice ${invoiceId}. In production, this generates AcctgTrans for RCM liability.</message>
+        </actions>
+    </service>
+
+    <service verb="apply" noun="CrossChargeIgst">
+        <description>Inter-branch cross-charge IGST: acts only when a finalized sales invoice is between two
+            INTERNAL organizations in different states. No-op for ordinary customer / B2C sales.</description>
+        <in-parameters><parameter name="invoiceId" required="true"/></in-parameters>
+        <actions>
+            <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="invoice"/>
+            <if condition="invoice == null"><return/></if>
+            <entity-find-count entity-name="mantle.party.PartyRole" count-field="fromInternal">
+                <econdition field-name="partyId" from="invoice.fromPartyId"/><econdition field-name="roleTypeId" value="OrgInternal"/>
+            </entity-find-count>
+            <entity-find-count entity-name="mantle.party.PartyRole" count-field="toInternal">
+                <econdition field-name="partyId" from="invoice.toPartyId"/><econdition field-name="roleTypeId" value="OrgInternal"/>
+            </entity-find-count>
+            <if condition="!(fromInternal &gt; 0 &amp;&amp; toInternal &gt; 0)"><return/></if>
+            <entity-find-one entity-name="zenith.erp.india.IndiaGstConfig" value-field="fromCfg">
+                <field-map field-name="organizationPartyId" from="invoice.fromPartyId"/></entity-find-one>
+            <entity-find-one entity-name="zenith.erp.india.IndiaGstConfig" value-field="toCfg">
+                <field-map field-name="organizationPartyId" from="invoice.toPartyId"/></entity-find-one>
+            <if condition="fromCfg?.stateCode &amp;&amp; toCfg?.stateCode &amp;&amp; fromCfg.stateCode != toCfg.stateCode">
+                <log level="info" message="Cross-charge IGST applicable for inter-state internal invoice ${invoiceId} (${fromCfg.stateCode} -> ${toCfg.stateCode})."/>
+            </if>
+        </actions>
+    </service>
+
+</services>

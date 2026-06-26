@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <!-- Move a product's on-hand quantity by quantityDiff (negative = issue/sale, positive = receipt).
+         Updates the Asset and writes an AssetDetail audit row. Creates the Asset if missing. -->
+    <service verb="adjust" noun="AssetOnHand" authenticate="false">
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="productId" required="true"/>
+            <parameter name="quantityDiff" type="BigDecimal" required="true"/>
+            <parameter name="reason"/>
+            <parameter name="effectiveDate" type="Timestamp" default="ec.user.nowTimestamp"/>
+            <parameter name="facilityId"><description>Optional: track stock per facility (for multi-store transfers)</description></parameter>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="assetId"/>
+            <parameter name="newQoh" type="BigDecimal"/>
+        </out-parameters>
+        <actions>
+            <entity-find entity-name="mantle.product.asset.Asset" list="assets" limit="1">
+                <econdition field-name="ownerPartyId" from="organizationPartyId"/>
+                <econdition field-name="productId"/>
+                <econdition field-name="facilityId" from="facilityId" ignore-if-empty="true"/>
+                <order-by field-name="assetId"/>
+            </entity-find>
+            <set field="asset" from="assets ? assets[0] : null"/>
+            <if condition="asset == null">
+                <service-call name="create#mantle.product.asset.Asset" out-map="createAsset"
+                    in-map="[assetTypeEnumId:'AstTpInventory', statusId:'AstAvailable', ownerPartyId:organizationPartyId,
+                             productId:productId, facilityId:facilityId, hasQuantity:'Y', quantityOnHandTotal:0, availableToPromiseTotal:0]"/>
+                <entity-find-one entity-name="mantle.product.asset.Asset" value-field="asset">
+                    <field-map field-name="assetId" from="createAsset.assetId"/>
+                </entity-find-one>
+            </if>
+            <set field="newQoh" from="((asset.quantityOnHandTotal ?: 0) as BigDecimal) + quantityDiff" type="BigDecimal"/>
+            <set field="newAtp" from="((asset.availableToPromiseTotal ?: 0) as BigDecimal) + quantityDiff" type="BigDecimal"/>
+            <service-call name="update#mantle.product.asset.Asset"
+                in-map="[assetId:asset.assetId, quantityOnHandTotal:newQoh, availableToPromiseTotal:newAtp]"/>
+            <service-call name="create#mantle.product.asset.AssetDetail"
+                in-map="[assetId:asset.assetId, productId:productId, effectiveDate:effectiveDate,
+                         quantityOnHandDiff:quantityDiff, availableToPromiseDiff:quantityDiff, description:reason]"/>
+            <set field="assetId" from="asset.assetId"/>
+        </actions>
+    </service>
+
+    <!-- Load opening stock: set each product's on-hand to the supplied absolute quantity (as an
+         adjustment from current), then switch INVENTORY_TRACKING_ENABLED on so sales start depleting. -->
+    <service verb="load" noun="OpeningStock" authenticate="false" transaction-timeout="1800">
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="effectiveDate" type="Timestamp" default="ec.user.nowTimestamp"/>
+            <parameter name="enableTracking" default-value="Y"/>
+            <parameter name="items" type="List" required="true">
+                <parameter name="itemEntry" type="Map">
+                    <parameter name="productId" required="true"/>
+                    <parameter name="quantity" type="BigDecimal" required="true"/>
+                </parameter>
+            </parameter>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="updatedCount" type="Integer"/>
+        </out-parameters>
+        <actions>
+            <set field="updatedCount" from="0" type="Integer"/>
+            <iterate list="items" entry="row">
+                <entity-find entity-name="mantle.product.asset.Asset" list="curAssets" limit="1">
+                    <econdition field-name="ownerPartyId" from="organizationPartyId"/>
+                    <econdition field-name="productId" from="row.productId"/>
+                    <order-by field-name="assetId"/>
+                </entity-find>
+                <set field="curQoh" from="curAssets ? ((curAssets[0].quantityOnHandTotal ?: 0) as BigDecimal) : (0 as BigDecimal)"/>
+                <set field="diff" from="((row.quantity ?: 0) as BigDecimal) - curQoh" type="BigDecimal"/>
+                <service-call name="zenith.inventory.InventoryStockServices.adjust#AssetOnHand"
+                    in-map="[organizationPartyId:organizationPartyId, productId:row.productId, quantityDiff:diff,
+                             reason:'Opening stock', effectiveDate:effectiveDate]"/>
+                <service-call name="update#mantle.product.Product" in-map="[productId:row.productId, inventoryTracked:'Y']"/>
+                <set field="updatedCount" from="updatedCount + 1"/>
+            </iterate>
+            <if condition="enableTracking == 'Y'">
+                <entity-find-one entity-name="zenith.erp.base.CompanySettings" value-field="ts">
+                    <field-map field-name="organizationPartyId"/>
+                    <field-map field-name="settingKey" value="INVENTORY_TRACKING_ENABLED"/>
+                </entity-find-one>
+                <if condition="ts">
+                    <service-call name="update#zenith.erp.base.CompanySettings"
+                        in-map="[organizationPartyId:organizationPartyId, settingKey:'INVENTORY_TRACKING_ENABLED', settingValue:'Y']"/>
+                <else>
+                    <service-call name="create#zenith.erp.base.CompanySettings"
+                        in-map="[organizationPartyId:organizationPartyId, settingKey:'INVENTORY_TRACKING_ENABLED', settingValue:'Y']"/>
+                </else></if>
+            </if>
+        </actions>
+    </service>
+
+</services>

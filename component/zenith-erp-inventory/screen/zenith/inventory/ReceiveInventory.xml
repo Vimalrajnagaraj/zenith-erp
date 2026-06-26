@@ -1,0 +1,188 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
+        default-menu-title="Receive Inventory" default-menu-include="false">
+
+    <parameter name="orderId" required="true"/>
+
+    <transition name="findReceipt"><default-response url="../FindReceipt"/></transition>
+    
+    <transition name="receiveItem">
+        <script>
+            // Simple retail flow: received stock is immediately in-stock and sellable
+            def rcvQty = new BigDecimal(quantityAccepted ?: 0)
+            if (rcvQty > 0 &amp;&amp; facilityId &amp;&amp; productId) {
+                def inMap = [
+                    assetTypeEnumId: 'AstTpInventory',
+                    classEnumId: 'AsClsInventory',
+                    statusId: 'AstAvailable', // In stock and ready to sell
+                    productId: productId,
+                    facilityId: facilityId,
+                    quantityOnHandTotal: rcvQty,
+                    availableToPromiseTotal: rcvQty,
+                    acquireCost: new BigDecimal(unitAmount ?: 0),
+                    acquireCostUomId: (ec.entity.find('mantle.order.OrderHeader').condition('orderId', orderId).one()?.currencyUomId ?: 'USD'),
+                    acquireOrderId: orderId,
+                    acquireOrderItemSeqId: orderItemSeqId,
+                    receivedDate: ec.user.nowTimestamp
+                ]
+                
+                // Add batch info if provided
+                if (batchNumber) inMap.batchNumber = batchNumber
+                if (mrpAmount) inMap.mrpAmount = new BigDecimal(mrpAmount)
+                if (manufacturingDate) inMap.manufacturingDate = manufacturingDate
+                if (expiryDate) inMap.expiryDate = expiryDate
+                
+                def _rcvAsset = ec.service.sync().name("create#mantle.product.asset.Asset").parameters(inMap).call()
+                // Record the receipt in the asset ledger. Mantle recomputes on-hand from AssetDetail entries on each
+                // change, so an asset with a direct qoh but no ledger receipt gets zeroed on the first sale.
+                ec.service.sync().name("create#mantle.product.asset.AssetDetail").parameters([
+                    assetId:_rcvAsset.assetId, productId:productId, effectiveDate:ec.user.nowTimestamp,
+                    quantityOnHandDiff:rcvQty, availableToPromiseDiff:rcvQty,
+                    description:('Goods received ' + (orderId ?: ''))]).call()
+                ec.message.addMessage("Received ${rcvQty} units of ${productId}. They are now in stock at this location and ready to sell.")
+            } else {
+                ec.message.addError("Quantity Accepted and Facility are required.")
+            }
+        </script>
+        <default-response url="."/>
+    </transition>
+
+    <actions>
+        <entity-find-one entity-name="mantle.order.OrderHeader" value-field="order"/>
+        
+        <entity-find entity-name="mantle.order.OrderPart" list="orderParts">
+            <econdition field-name="orderId"/>
+        </entity-find>
+        <set field="orderPart" from="orderParts?.getFirst()"/>
+        
+        <entity-find entity-name="mantle.order.OrderItem" list="orderItems">
+            <econdition field-name="orderId"/>
+            <econdition field-name="productId" operator="is-not-null"/>
+            <order-by field-name="orderItemSeqId"/>
+        </entity-find>
+
+        <entity-find-one entity-name="mantle.party.PartyDetail" value-field="vendor">
+            <field-map field-name="partyId" from="orderPart?.vendorPartyId"/>
+        </entity-find-one>
+        
+        <!-- Pre-fetch facilities for dropdown -->
+        <entity-find entity-name="mantle.facility.Facility" list="facilityList">
+            <order-by field-name="facilityName"/>
+        </entity-find>
+    </actions>
+
+    <widgets>
+        <container style="row items-center justify-between no-wrap q-mb-md">
+            <link url="findReceipt" text="← Back to Receiving List" link-type="anchor"/>
+            <label text="Received items go straight into stock and are ready to sell." type="span" style="text-grey-7 text-caption"/>
+        </container>
+        
+        <!-- Header Banner -->
+        <container style="zenith-profile-banner q-pa-lg bg-white shadow-1 border-radius-lg q-mb-lg">
+            <container style="row items-center justify-between no-wrap">
+                <container style="row items-center">
+                    <container style="zenith-avatar q-mr-lg text-white; border-radius:12px; background:linear-gradient(135deg, #0ea5e9, #0284c7);">
+                        <label text="GRN" type="span" style="font-weight:bold; font-size:1.2rem;"/>
+                    </container>
+                    <container style="column">
+                        <label text="Receive Goods for Order #${orderId}" type="h3" style="text-primary text-weight-bold q-my-none"/>
+                        <label text="Supplier: ${vendor?.organizationName ?: vendor?.firstName + ' ' + vendor?.lastName}" type="p" style="text-grey-7 text-subtitle2 q-mt-xs q-mb-none"/>
+                    </container>
+                </container>
+            </container>
+        </container>
+
+        <!-- Items to Receive -->
+        <container style="zenith-card q-pa-md bg-white shadow-1 border-radius-md q-mb-lg">
+            <label text="Items to Receive" type="h5" style="text-primary text-weight-bold q-mb-md border-bottom q-pb-sm"/>
+            <label text="For each item, enter how many actually arrived and which store to put them in, then press Confirm." type="p" style="text-grey-7 q-mb-md"/>
+            
+            <form-list name="ReceiveItemsForm" list="orderItems" skip-form="true">
+                <row-actions>
+                    <entity-find-one entity-name="mantle.product.Product" value-field="product">
+                        <field-map field-name="productId"/>
+                    </entity-find-one>
+                    
+                    <!-- Calculate how many have already been received against this PO line -->
+                    <entity-find entity-name="mantle.product.asset.Asset" list="existingAssets">
+                        <econdition field-name="acquireOrderId" from="orderId"/>
+                        <econdition field-name="acquireOrderItemSeqId" from="orderItemSeqId"/>
+                    </entity-find>
+                    
+                    <set field="qtyReceived" from="0"/>
+                    <script>
+                        for (def a : existingAssets) { qtyReceived += (a.quantityOnHandTotal ?: 0) }
+                        qtyRemaining = (quantity ?: 0) - qtyReceived
+                        if (qtyRemaining &lt; 0) qtyRemaining = 0
+                    </script>
+                </row-actions>
+
+                <field name="orderItemSeqId"><default-field title="#"><label text="${orderItemSeqId}" type="span" style="text-grey-7"/></default-field></field>
+                
+                <field name="productInfo"><default-field title="Product">
+                    <label text="${product?.pseudoId ?: productId}" type="strong" style="block text-indigo-8"/>
+                    <label text="${itemDescription ?: product?.productName}" type="span" style="block text-dark"/>
+                </default-field></field>
+
+                <field name="quantities"><default-field title="Order vs Received">
+                    <label text="Ordered: ${quantity ?: 0}" type="span" style="block text-dark"/>
+                    <label text="Received: ${qtyReceived}" type="span" style="block text-success text-weight-bold"/>
+                    <label text="Pending: ${qtyRemaining}" type="span" style="block text-warning text-weight-bold"/>
+                </default-field></field>
+                
+                <field name="receiveAction">
+                    <default-field title="Receive">
+                        <container-dialog id="ReceiveDialog_${orderItemSeqId}" button-text="Process Receipt" button-class="q-btn--flat bg-primary text-white border-radius-md" condition="qtyRemaining > 0">
+                            <form-single name="ReceiveForm_${orderItemSeqId}" transition="receiveItem">
+                                <field name="orderId"><default-field><hidden/></default-field></field>
+                                <field name="orderItemSeqId"><default-field><hidden/></default-field></field>
+                                <field name="productId"><default-field><hidden/></default-field></field>
+                                <field name="unitAmount"><default-field><hidden/></default-field></field>
+                                
+                                <field name="facilityId">
+                                    <default-field title="Put stock into (store / warehouse)">
+                                        <drop-down allow-empty="false">
+                                            <list-options list="facilityList" key="${facilityId}" text="${facilityName}"/>
+                                        </drop-down>
+                                    </default-field>
+                                </field>
+                                
+                                <field name="quantityAccepted">
+                                    <default-field title="Quantity Received">
+                                        <text-line size="10" default-value="${qtyRemaining}"/>
+                                    </default-field>
+                                </field>
+                                
+                                <field name="batchNumber">
+                                    <default-field title="Batch / Lot Number (Optional)">
+                                        <text-line size="20"/>
+                                    </default-field>
+                                </field>
+                                
+                                <field name="manufacturingDate">
+                                    <default-field title="Manufacturing Date"><date-time type="date"/></default-field>
+                                </field>
+                                
+                                <field name="expiryDate">
+                                    <default-field title="Expiry Date"><date-time type="date"/></default-field>
+                                </field>
+                                
+                                <field name="mrpAmount">
+                                    <default-field title="Batch MRP (Optional)">
+                                        <text-line size="10" default-value="${product?.mrpAmount ?: ''}"/>
+                                    </default-field>
+                                </field>
+                                
+                                <field name="submitButton"><default-field title="Confirm Receipt"><submit/></default-field></field>
+                            </form-single>
+                        </container-dialog>
+                        
+                        <label text="Fully Received" type="span" style="zenith-badge success" condition="qtyRemaining &lt;= 0"/>
+                    </default-field>
+                </field>
+            </form-list>
+        </container>
+
+    </widgets>
+</screen>

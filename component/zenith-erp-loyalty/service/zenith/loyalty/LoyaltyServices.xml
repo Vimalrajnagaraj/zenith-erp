@@ -1,0 +1,258 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <!-- ========== Program Management ========== -->
+
+    <service verb="create" noun="LoyaltyProgram">
+        <in-parameters>
+            <parameter name="programName" required="true"/>
+            <parameter name="description"/>
+            <parameter name="organizationPartyId"/>
+            <parameter name="pointsPerCurrencyUnit" type="BigDecimal" default="1"/>
+            <parameter name="pointRedemptionValue" type="BigDecimal" default="0.01"/>
+            <parameter name="minRedemptionPoints" type="Integer" default="100"/>
+            <parameter name="pointExpiryDays" type="Integer"/>
+            <parameter name="tierEnabled" default-value="N"/>
+        </in-parameters>
+        <out-parameters><parameter name="programId"/></out-parameters>
+        <actions>
+            <service-call name="create#zenith.erp.loyalty.LoyaltyProgram" out-map="context" in-map="context"/>
+        </actions>
+    </service>
+
+    <!-- ========== Member Enrollment ========== -->
+
+    <service verb="enroll" noun="Member">
+        <in-parameters>
+            <parameter name="programId" required="true"/>
+            <parameter name="partyId" required="true"/>
+            <parameter name="memberNumber"/>
+            <parameter name="welcomeBonus" type="Integer" default="0"/>
+        </in-parameters>
+        <out-parameters><parameter name="memberId"/></out-parameters>
+        <actions>
+            <entity-find entity-name="zenith.erp.loyalty.LoyaltyMember" list="existing" limit="1">
+                <econdition field-name="programId"/>
+                <econdition field-name="partyId"/>
+            </entity-find>
+            <if condition="existing">
+                <set field="memberId" from="existing[0].memberId"/>
+                <return message="Customer is already enrolled"/>
+            </if>
+
+            <if condition="!memberNumber">
+                <set field="memberNumber" from="'LY' + System.currentTimeMillis().toString().substring(5)"/>
+            </if>
+
+            <service-call name="create#zenith.erp.loyalty.LoyaltyMember" out-map="context"
+                          in-map="[programId:programId, partyId:partyId, memberNumber:memberNumber,
+                                   enrollDate:ec.user.nowTimestamp, statusId:'LmActive']"/>
+
+            <if condition="welcomeBonus &amp;&amp; welcomeBonus &gt; 0">
+                <service-call name="zenith.loyalty.LoyaltyServices.earn#Points"
+                              in-map="[memberId:memberId, points:welcomeBonus,
+                                       referenceTypeEnumId:'PrtWelcome',
+                                       description:'Welcome bonus on enrollment']"/>
+            </if>
+        </actions>
+    </service>
+
+    <!-- ========== Earn Points ========== -->
+
+    <service verb="earn" noun="Points">
+        <in-parameters>
+            <parameter name="memberId" required="true"/>
+            <parameter name="points" type="Integer" required="true"/>
+            <parameter name="referenceTypeEnumId" default-value="PrtSale"/>
+            <parameter name="referenceId"/>
+            <parameter name="description"/>
+        </in-parameters>
+        <out-parameters><parameter name="transactionId"/></out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.loyalty.LoyaltyMember" value-field="member" for-update="true"/>
+            <if condition="!member || member.statusId != 'LmActive'">
+                <return error="true" message="Member not found or inactive"/>
+            </if>
+
+            <entity-find-one entity-name="zenith.erp.loyalty.LoyaltyProgram" value-field="program">
+                <field-map field-name="programId" from="member.programId"/>
+            </entity-find-one>
+
+            <!-- Apply tier multiplier -->
+            <set field="earnedPoints" from="points" type="Integer"/>
+            <if condition="member.tierId">
+                <entity-find-one entity-name="zenith.erp.loyalty.LoyaltyTier" value-field="tier">
+                    <field-map field-name="tierId" from="member.tierId"/>
+                </entity-find-one>
+                <if condition="tier?.pointMultiplier &amp;&amp; tier.pointMultiplier &gt; 1">
+                    <set field="earnedPoints" from="(points * tier.pointMultiplier).intValue()"/>
+                </if>
+            </if>
+
+            <!-- Calculate expiry -->
+            <set field="expiryDate" from="null"/>
+            <if condition="program.pointExpiryDays">
+                <script>expiryDate = new java.sql.Timestamp(ec.user.nowTimestamp.time + (program.pointExpiryDays * 86400000L))</script>
+            </if>
+
+            <service-call name="create#zenith.erp.loyalty.PointTransaction" out-map="context"
+                          in-map="[memberId:memberId, transactionTypeEnumId:'PttEarn',
+                                   points:earnedPoints, referenceTypeEnumId:referenceTypeEnumId,
+                                   referenceId:referenceId, description:description,
+                                   transactionDate:ec.user.nowTimestamp, expiryDate:expiryDate]"/>
+
+            <set field="member.currentPoints" from="(member.currentPoints ?: 0) + earnedPoints"/>
+            <set field="member.lifetimePoints" from="(member.lifetimePoints ?: 0) + earnedPoints"/>
+            <entity-update value-field="member"/>
+
+            <!-- Check tier upgrade -->
+            <if condition="program.tierEnabled == 'Y'">
+                <service-call name="zenith.loyalty.LoyaltyServices.evaluate#Tier"
+                              in-map="[memberId:memberId]" ignore-error="true"/>
+            </if>
+        </actions>
+    </service>
+
+    <!-- ========== Redeem Points ========== -->
+
+    <service verb="redeem" noun="Points">
+        <in-parameters>
+            <parameter name="memberId" required="true"/>
+            <parameter name="points" type="Integer" required="true"/>
+            <parameter name="referenceTypeEnumId" default-value="PrtSale"/>
+            <parameter name="referenceId"/>
+            <parameter name="description"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="transactionId"/>
+            <parameter name="redemptionValue" type="BigDecimal"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.loyalty.LoyaltyMember" value-field="member" for-update="true"/>
+            <if condition="!member || member.statusId != 'LmActive'">
+                <return error="true" message="Member not found or inactive"/>
+            </if>
+
+            <entity-find-one entity-name="zenith.erp.loyalty.LoyaltyProgram" value-field="program">
+                <field-map field-name="programId" from="member.programId"/>
+            </entity-find-one>
+
+            <if condition="points &lt; (program.minRedemptionPoints ?: 0)">
+                <return error="true" message="Minimum ${program.minRedemptionPoints} points required for redemption"/>
+            </if>
+            <if condition="points &gt; (member.currentPoints ?: 0)">
+                <return error="true" message="Insufficient points. Available: ${member.currentPoints}"/>
+            </if>
+
+            <set field="redemptionValue" from="(points * (program.pointRedemptionValue ?: 0.01)).setScale(2, java.math.RoundingMode.HALF_UP)" type="BigDecimal"/>
+
+            <service-call name="create#zenith.erp.loyalty.PointTransaction" out-map="context"
+                          in-map="[memberId:memberId, transactionTypeEnumId:'PttRedeem',
+                                   points:-points, referenceTypeEnumId:referenceTypeEnumId,
+                                   referenceId:referenceId,
+                                   description:description ?: ('Redeemed ' + points + ' points'),
+                                   transactionDate:ec.user.nowTimestamp]"/>
+
+            <set field="member.currentPoints" from="member.currentPoints - points"/>
+            <entity-update value-field="member"/>
+        </actions>
+    </service>
+
+    <!-- ========== Evaluate Tier ========== -->
+
+    <service verb="evaluate" noun="Tier">
+        <in-parameters><parameter name="memberId" required="true"/></in-parameters>
+        <out-parameters><parameter name="tierId"/><parameter name="tierName"/></out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.loyalty.LoyaltyMember" value-field="member" for-update="true"/>
+            <entity-find entity-name="zenith.erp.loyalty.LoyaltyTier" list="tiers">
+                <econdition field-name="programId" from="member.programId"/>
+                <order-by field-name="-minPoints"/>
+            </entity-find>
+            <iterate list="tiers" entry="tier">
+                <if condition="(member.lifetimePoints ?: 0) &gt;= tier.minPoints">
+                    <if condition="member.tierId != tier.tierId">
+                        <set field="member.tierId" from="tier.tierId"/>
+                        <entity-update value-field="member"/>
+                    </if>
+                    <set field="tierId" from="tier.tierId"/>
+                    <set field="tierName" from="tier.tierName"/>
+                    <return/>
+                </if>
+            </iterate>
+        </actions>
+    </service>
+
+    <!-- ========== Earn Points from Sale Amount ========== -->
+
+    <service verb="earn" noun="PointsFromSale">
+        <description>Calculate and award points based on sale amount. Called from POS/Sales after payment.</description>
+        <in-parameters>
+            <parameter name="partyId" required="true"/>
+            <parameter name="saleAmount" type="BigDecimal" required="true"/>
+            <parameter name="referenceId"/>
+            <parameter name="organizationPartyId"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="pointsEarned" type="Integer"/>
+            <parameter name="memberId"/>
+        </out-parameters>
+        <actions>
+            <set field="pointsEarned" from="0" type="Integer"/>
+
+            <!-- Find active membership -->
+            <entity-find entity-name="zenith.erp.loyalty.LoyaltyMember" list="members" limit="1">
+                <econdition field-name="partyId"/>
+                <econdition field-name="statusId" value="LmActive"/>
+            </entity-find>
+            <if condition="!members"><return/></if>
+            <set field="member" from="members[0]"/>
+            <set field="memberId" from="member.memberId"/>
+
+            <entity-find-one entity-name="zenith.erp.loyalty.LoyaltyProgram" value-field="program">
+                <field-map field-name="programId" from="member.programId"/>
+            </entity-find-one>
+            <if condition="!program || program.isActive != 'Y'"><return/></if>
+
+            <set field="points" from="(saleAmount * (program.pointsPerCurrencyUnit ?: 1)).intValue()" type="Integer"/>
+            <if condition="points &gt; 0">
+                <service-call name="zenith.loyalty.LoyaltyServices.earn#Points"
+                              in-map="[memberId:memberId, points:points,
+                                       referenceTypeEnumId:'PrtSale', referenceId:referenceId,
+                                       description:'Points earned on purchase']"/>
+                <set field="pointsEarned" from="points"/>
+            </if>
+        </actions>
+    </service>
+
+    <!-- ========== Get Member Dashboard ========== -->
+
+    <service verb="get" noun="MemberDashboard">
+        <in-parameters><parameter name="memberId" required="true"/></in-parameters>
+        <out-parameters>
+            <parameter name="member" type="Map"/>
+            <parameter name="program" type="Map"/>
+            <parameter name="tier" type="Map"/>
+            <parameter name="recentTransactions" type="List"/>
+            <parameter name="redemptionValue" type="BigDecimal"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.loyalty.LoyaltyMember" value-field="member"/>
+            <entity-find-one entity-name="zenith.erp.loyalty.LoyaltyProgram" value-field="program">
+                <field-map field-name="programId" from="member.programId"/>
+            </entity-find-one>
+            <if condition="member.tierId">
+                <entity-find-one entity-name="zenith.erp.loyalty.LoyaltyTier" value-field="tier">
+                    <field-map field-name="tierId" from="member.tierId"/>
+                </entity-find-one>
+            </if>
+            <entity-find entity-name="zenith.erp.loyalty.PointTransaction" list="recentTransactions" limit="20">
+                <econdition field-name="memberId"/>
+                <order-by field-name="-transactionDate"/>
+            </entity-find>
+            <set field="redemptionValue" from="((member.currentPoints ?: 0) * (program.pointRedemptionValue ?: 0.01)).setScale(2, java.math.RoundingMode.HALF_UP)" type="BigDecimal"/>
+        </actions>
+    </service>
+
+</services>

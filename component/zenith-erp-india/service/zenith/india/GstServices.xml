@@ -1,0 +1,427 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <service verb="create" noun="GstConfig">
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="gstin" required="true"/>
+            <parameter name="legalName"/>
+            <parameter name="stateCode"/>
+            <parameter name="registrationType" default-value="Regular"/>
+            <parameter name="isCompositionScheme" default-value="N"/>
+            <parameter name="compositionRate" type="BigDecimal"/>
+        </in-parameters>
+        <actions>
+            <service-call name="zenith.india.GstServices.validate#Gstin" in-map="[gstin:gstin]" out-map="valOut"/>
+            <if condition="!valOut.isValid">
+                <return error="true" message="Invalid GSTIN format: ${gstin}"/>
+            </if>
+
+            <set field="derivedStateCode" from="gstin.substring(0, 2)"/>
+            <if condition="!stateCode"><set field="stateCode" from="derivedStateCode"/></if>
+
+            <service-call name="create#zenith.erp.india.IndiaGstConfig"
+                          in-map="context"/>
+
+            <service-call name="create#zenith.erp.india.IndiaGstin"
+                          in-map="[partyId:organizationPartyId, gstin:gstin,
+                                   gstRegistrationType:registrationType, stateCode:stateCode,
+                                   isCompositionScheme:isCompositionScheme]"/>
+        </actions>
+    </service>
+
+    <service verb="validate" noun="Gstin">
+        <description>Validates GSTIN format: 2-digit state code + 10-char PAN + 1 entity code + 1 alpha + 1 checksum</description>
+        <in-parameters>
+            <parameter name="gstin" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="isValid" type="Boolean"/>
+            <parameter name="stateCode"/>
+            <parameter name="panNumber"/>
+            <parameter name="errorMessage"/>
+        </out-parameters>
+        <actions>
+            <set field="isValid" from="false"/>
+
+            <if condition="!gstin || gstin.length() != 15">
+                <set field="errorMessage" value="GSTIN must be exactly 15 characters"/>
+                <return/>
+            </if>
+
+            <set field="gstinUpper" from="gstin.toUpperCase()"/>
+            <set field="pattern" from="'^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}[Z]{1}[0-9A-Z]{1}$'"/>
+            <if condition="!gstinUpper.matches(pattern)">
+                <set field="errorMessage" value="GSTIN format invalid. Expected: 2 digits + 5 letters + 4 digits + 1 letter + 1 alphanumeric + Z + 1 checksum"/>
+                <return/>
+            </if>
+
+            <set field="stateCode" from="gstinUpper.substring(0, 2)"/>
+            <entity-find-one entity-name="zenith.erp.india.IndiaState" value-field="stateRecord">
+                <field-map field-name="stateCode"/>
+            </entity-find-one>
+            <if condition="!stateRecord">
+                <set field="errorMessage" value="Invalid state code: ${stateCode}"/>
+                <return/>
+            </if>
+
+            <set field="panNumber" from="gstinUpper.substring(2, 12)"/>
+            <set field="isValid" from="true"/>
+        </actions>
+    </service>
+
+    <service verb="calculate" noun="Gst">
+        <description>Calculates GST breakdown (CGST+SGST or IGST) based on supplier and buyer states</description>
+        <in-parameters>
+            <parameter name="supplierStateCode" required="true"/>
+            <parameter name="buyerStateCode" required="true"/>
+            <parameter name="gstSlabId" required="true"/>
+            <parameter name="taxableAmount" type="BigDecimal" required="true"/>
+            <parameter name="isReverseCharge" default-value="N"/>
+            <parameter name="isSezSupply" default-value="N"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="cgstRate" type="BigDecimal"/>
+            <parameter name="cgstAmount" type="BigDecimal"/>
+            <parameter name="sgstRate" type="BigDecimal"/>
+            <parameter name="sgstAmount" type="BigDecimal"/>
+            <parameter name="igstRate" type="BigDecimal"/>
+            <parameter name="igstAmount" type="BigDecimal"/>
+            <parameter name="cessRate" type="BigDecimal"/>
+            <parameter name="cessAmount" type="BigDecimal"/>
+            <parameter name="totalTaxAmount" type="BigDecimal"/>
+            <parameter name="totalAmount" type="BigDecimal"/>
+            <parameter name="supplyType"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.india.IndiaGstSlab" value-field="slab"/>
+            <if condition="!slab">
+                <return error="true" message="GST slab ${gstSlabId} not found"/>
+            </if>
+
+            <entity-find-one entity-name="zenith.erp.india.IndiaState" value-field="supplierState">
+                <field-map field-name="stateCode" from="supplierStateCode"/>
+            </entity-find-one>
+            <entity-find-one entity-name="zenith.erp.india.IndiaState" value-field="buyerState">
+                <field-map field-name="stateCode" from="buyerStateCode"/>
+            </entity-find-one>
+
+            <set field="isIntraState" from="supplierStateCode == buyerStateCode"/>
+            <set field="isUtSupply" from="supplierState?.isUnionTerritory == 'Y' || buyerState?.isUnionTerritory == 'Y'"/>
+
+            <if condition="isSezSupply == 'Y'">
+                <then>
+                    <set field="supplyType" value="SEZ"/>
+                    <set field="cgstRate" from="0" type="BigDecimal"/>
+                    <set field="sgstRate" from="0" type="BigDecimal"/>
+                    <set field="igstRate" from="slab.igstRate"/>
+                    <set field="cgstAmount" from="0" type="BigDecimal"/>
+                    <set field="sgstAmount" from="0" type="BigDecimal"/>
+                    <set field="igstAmount" from="(taxableAmount * igstRate / 100).setScale(2, java.math.RoundingMode.HALF_UP)"/>
+                </then>
+                <else-if condition="isIntraState">
+                    <set field="supplyType" value="INTRA_STATE"/>
+                    <set field="cgstRate" from="slab.cgstRate"/>
+                    <set field="sgstRate" from="slab.sgstRate"/>
+                    <set field="igstRate" from="0" type="BigDecimal"/>
+                    <set field="cgstAmount" from="(taxableAmount * cgstRate / 100).setScale(2, java.math.RoundingMode.HALF_UP)"/>
+                    <set field="sgstAmount" from="(taxableAmount * sgstRate / 100).setScale(2, java.math.RoundingMode.HALF_UP)"/>
+                    <set field="igstAmount" from="0" type="BigDecimal"/>
+                </else-if>
+                <else>
+                    <set field="supplyType" value="INTER_STATE"/>
+                    <set field="cgstRate" from="0" type="BigDecimal"/>
+                    <set field="sgstRate" from="0" type="BigDecimal"/>
+                    <set field="igstRate" from="slab.igstRate"/>
+                    <set field="cgstAmount" from="0" type="BigDecimal"/>
+                    <set field="sgstAmount" from="0" type="BigDecimal"/>
+                    <set field="igstAmount" from="(taxableAmount * igstRate / 100).setScale(2, java.math.RoundingMode.HALF_UP)"/>
+                </else>
+            </if>
+
+            <set field="cessRate" from="slab.cessRate ?: 0"/>
+            <if condition="cessRate &gt; 0 &amp;&amp; slab.cessType == 'PERCENTAGE'">
+                <then>
+                    <set field="cessAmount" from="(taxableAmount * cessRate / 100).setScale(2, java.math.RoundingMode.HALF_UP)"/>
+                </then>
+                <else>
+                    <set field="cessAmount" from="0" type="BigDecimal"/>
+                </else>
+            </if>
+
+            <set field="totalTaxAmount" from="(cgstAmount + sgstAmount + igstAmount + cessAmount).setScale(2, java.math.RoundingMode.HALF_UP)"/>
+            <set field="totalAmount" from="(taxableAmount + totalTaxAmount).setScale(2, java.math.RoundingMode.HALF_UP)"/>
+        </actions>
+    </service>
+
+    <service verb="convert" noun="AmountToIndianWords">
+        <description>Converts a numeric amount to Indian English words (Rupees X Lakhs Y Thousand Only)</description>
+        <in-parameters>
+            <parameter name="amount" type="BigDecimal" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="amountInWords"/>
+        </out-parameters>
+        <actions>
+            <set field="amt" from="amount.setScale(2, java.math.RoundingMode.HALF_UP)"/>
+            <set field="rupees" from="amt.longValue()"/>
+            <set field="paise" from="((amt - rupees) * 100).intValue()"/>
+
+            <script><![CDATA[
+                String[] ones = ["", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine",
+                    "Ten", "Eleven", "Twelve", "Thirteen", "Fourteen", "Fifteen", "Sixteen", "Seventeen",
+                    "Eighteen", "Nineteen"]
+                String[] tens = ["", "", "Twenty", "Thirty", "Forty", "Fifty", "Sixty", "Seventy", "Eighty", "Ninety"]
+
+                def twoDigits = { long n ->
+                    if (n < 20) return ones[(int)n]
+                    String s = tens[(int)(n / 10)]
+                    if (n % 10 > 0) s += " " + ones[(int)(n % 10)]
+                    return s
+                }
+
+                def threeDigits = { long n ->
+                    if (n == 0) return ""
+                    String s = ""
+                    if (n >= 100) { s = ones[(int)(n / 100)] + " Hundred"; n = n % 100; if (n > 0) s += " and " }
+                    s += twoDigits(n)
+                    return s
+                }
+
+                def result = new StringBuilder()
+                long r = rupees
+
+                if (r == 0) {
+                    result.append("Zero")
+                } else {
+                    if (r >= 10000000) { result.append(threeDigits(r / 10000000)).append(" Crore "); r = r % 10000000 }
+                    if (r >= 100000) { result.append(twoDigits(r / 100000)).append(" Lakh "); r = r % 100000 }
+                    if (r >= 1000) { result.append(twoDigits(r / 1000)).append(" Thousand "); r = r % 1000 }
+                    if (r > 0) { result.append(threeDigits(r)) }
+                }
+
+                String words = "Rupees " + result.toString().trim()
+                if (paise > 0) {
+                    words += " and " + twoDigits(paise) + " Paise"
+                }
+                words += " Only"
+                amountInWords = words
+            ]]></script>
+        </actions>
+    </service>
+
+    <service verb="format" noun="IndianNumber">
+        <description>Formats a number in Indian notation (Lakhs/Crores): 1,00,00,000</description>
+        <in-parameters>
+            <parameter name="amount" type="BigDecimal" required="true"/>
+            <parameter name="decimalPlaces" type="Integer" default="2"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="formattedAmount"/>
+        </out-parameters>
+        <actions>
+            <script><![CDATA[
+                BigDecimal amt = amount.setScale(decimalPlaces, java.math.RoundingMode.HALF_UP)
+                String[] parts = amt.toPlainString().split("\\.")
+                String intPart = parts[0]
+                String decPart = parts.length > 1 ? parts[1] : ""
+
+                boolean negative = intPart.startsWith("-")
+                if (negative) intPart = intPart.substring(1)
+
+                StringBuilder formatted = new StringBuilder()
+                int len = intPart.length()
+
+                if (len <= 3) {
+                    formatted.append(intPart)
+                } else {
+                    formatted.append(intPart.substring(len - 3))
+                    int remaining = len - 3
+                    String rest = intPart.substring(0, remaining)
+                    int restLen = rest.length()
+                    for (int i = restLen; i > 0; i -= 2) {
+                        int start = Math.max(i - 2, 0)
+                        formatted.insert(0, ",")
+                        formatted.insert(0, rest.substring(start, i))
+                    }
+                }
+
+                if (negative) formatted.insert(0, "-")
+                if (decPart) formatted.append(".").append(decPart)
+
+                formattedAmount = formatted.toString()
+            ]]></script>
+        </actions>
+    </service>
+
+    <service verb="determine" noun="DocumentType">
+        <in-parameters>
+            <parameter name="supplierComposition" default-value="N"/>
+            <parameter name="buyerGstin"/>
+            <parameter name="buyerRegistrationType"/>
+            <parameter name="isExport" default-value="N"/>
+            <parameter name="isSezSupply" default-value="N"/>
+            <parameter name="invoiceAmount" type="BigDecimal"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="documentType"/>
+            <parameter name="b2bB2cType"/>
+        </out-parameters>
+        <actions>
+            <script><![CDATA[
+                if (supplierComposition == 'Y') {
+                    documentType = 'BILL_OF_SUPPLY'
+                } else if (isExport == 'Y' || isSezSupply == 'Y') {
+                    documentType = 'EXPORT_INVOICE'
+                } else {
+                    documentType = 'TAX_INVOICE'
+                }
+
+                if (!buyerGstin) {
+                    if (invoiceAmount != null && invoiceAmount > 250000) {
+                        b2bB2cType = 'B2C_LARGE'
+                    } else {
+                        b2bB2cType = 'B2C_SMALL'
+                    }
+                } else {
+                    b2bB2cType = 'B2B'
+                }
+            ]]></script>
+        </actions>
+    </service>
+
+    <service verb="validate" noun="HsnSacCode">
+        <in-parameters>
+            <parameter name="hsnSacCode" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="isValid" type="Boolean"/>
+            <parameter name="defaultGstSlabId"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.india.IndiaHsnCode" value-field="hsnRecord">
+                <field-map field-name="hsnCode" from="hsnSacCode"/>
+            </entity-find-one>
+            <if condition="hsnRecord">
+                <then>
+                    <set field="isValid" from="true"/>
+                    <set field="defaultGstSlabId" from="hsnRecord.defaultGstSlabId"/>
+                </then>
+                <else>
+                    <set field="isValid" from="false"/>
+                </else>
+            </if>
+        </actions>
+    </service>
+
+    <service verb="calculate" noun="TcsOnSales">
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="customerPartyId" required="true"/>
+            <parameter name="invoiceAmount" type="BigDecimal" required="true"/>
+            <parameter name="financialYear" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="tcsApplicable" default-value="N"/>
+            <parameter name="tcsAmount" type="BigDecimal"/>
+        </out-parameters>
+        <actions>
+            <set field="tcsApplicable" value="N"/>
+            <set field="tcsAmount" from="0" type="BigDecimal"/>
+
+            <entity-find-one entity-name="zenith.erp.india.TcsCumulativeTracker" value-field="tracker">
+                <field-map field-name="organizationPartyId"/>
+                <field-map field-name="customerPartyId"/>
+                <field-map field-name="financialYear"/>
+            </entity-find-one>
+
+            <set field="cumulativeSalesAmount" from="tracker?.cumulativeSalesAmount ?: 0.0" type="BigDecimal"/>
+            <set field="limit" from="5000000" type="BigDecimal"/>
+            
+            <script><![CDATA[
+                BigDecimal newTotal = cumulativeSalesAmount + invoiceAmount
+                if (newTotal > limit) {
+                    tcsApplicable = 'Y'
+                    BigDecimal applicableAmount = 0.0
+                    if (cumulativeSalesAmount >= limit) {
+                        applicableAmount = invoiceAmount
+                    } else {
+                        applicableAmount = newTotal - limit
+                    }
+                    tcsAmount = (applicableAmount * 0.001).setScale(2, java.math.RoundingMode.HALF_UP)
+                }
+            ]]></script>
+        </actions>
+    </service>
+
+    <service verb="validate" noun="MrpCompliance">
+        <in-parameters>
+            <parameter name="unitAmount" type="BigDecimal" required="true"/>
+            <parameter name="gstRate" type="BigDecimal" required="true"/>
+            <parameter name="mrpAmount" type="BigDecimal" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="isCompliant"/>
+        </out-parameters>
+        <actions>
+            <script><![CDATA[
+                BigDecimal expectedMax = unitAmount * (1 + gstRate / 100)
+                if (expectedMax <= mrpAmount) {
+                    isCompliant = 'Y'
+                } else {
+                    isCompliant = 'N'
+                }
+            ]]></script>
+        </actions>
+    </service>
+
+    <service verb="calculate" noun="TaxInclusive">
+        <in-parameters>
+            <parameter name="inclusiveAmount" type="BigDecimal" required="true"/>
+            <parameter name="gstRate" type="BigDecimal" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="taxableAmount" type="BigDecimal"/>
+            <parameter name="taxAmount" type="BigDecimal"/>
+        </out-parameters>
+        <actions>
+            <script><![CDATA[
+                taxableAmount = (inclusiveAmount * 100 / (100 + gstRate)).setScale(2, java.math.RoundingMode.HALF_UP)
+                taxAmount = inclusiveAmount - taxableAmount
+            ]]></script>
+        </actions>
+    </service>
+
+    <service verb="update" noun="TcsCumulativeTracker">
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="customerPartyId" required="true"/>
+            <parameter name="financialYear" required="true"/>
+            <parameter name="invoiceAmount" type="BigDecimal" required="true"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.india.TcsCumulativeTracker" value-field="tracker" for-update="true">
+                <field-map field-name="organizationPartyId"/>
+                <field-map field-name="customerPartyId"/>
+                <field-map field-name="financialYear"/>
+            </entity-find-one>
+            
+            <if condition="tracker">
+                <then>
+                    <set field="tracker.cumulativeSalesAmount" from="(tracker.cumulativeSalesAmount ?: 0.0) + invoiceAmount"/>
+                    <entity-update value-field="tracker"/>
+                </then>
+                <else>
+                    <entity-make-value entity-name="zenith.erp.india.TcsCumulativeTracker" value-field="newTracker"/>
+                    <set field="newTracker.organizationPartyId" from="organizationPartyId"/>
+                    <set field="newTracker.customerPartyId" from="customerPartyId"/>
+                    <set field="newTracker.financialYear" from="financialYear"/>
+                    <set field="newTracker.cumulativeSalesAmount" from="invoiceAmount"/>
+                    <entity-create value-field="newTracker"/>
+                </else>
+            </if>
+        </actions>
+    </service>
+
+</services>

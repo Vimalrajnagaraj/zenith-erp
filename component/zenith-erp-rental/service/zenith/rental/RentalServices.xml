@@ -1,0 +1,131 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <!-- Create Rental Agreement -->
+    <service verb="create" noun="RentalAgreement">
+        <in-parameters>
+            <parameter name="customerPartyId" required="true"/>
+            <parameter name="billingTypeEnumId" required="true"/>
+            <parameter name="startDate" type="Date" required="true"/>
+            <parameter name="expectedReturnDate" type="Date" required="true"/>
+            <parameter name="currencyUomId"/>
+            <parameter name="termsAndConditions"/>
+            <parameter name="notes"/>
+            <parameter name="items" type="List">
+                <parameter name="entry" type="Map">
+                    <parameter name="rentalAssetId" required="true"/>
+                    <parameter name="quantity" type="BigDecimal" default-value="1"/>
+                </parameter>
+            </parameter>
+        </in-parameters>
+        <out-parameters><parameter name="rentalAgreementId"/></out-parameters>
+        <actions>
+            <service-call name="create#zenith.erp.rental.RentalAgreement"
+                          in-map="context + [statusId:'RgDraft']" out-map="context"/>
+            <if condition="items">
+                <set field="seqNum" from="0" type="Integer"/>
+                <set field="totalRental" from="0" type="BigDecimal"/>
+                <set field="totalDeposit" from="0" type="BigDecimal"/>
+                <iterate list="items" entry="item">
+                    <set field="seqNum" from="seqNum + 1"/>
+                    <entity-find-one entity-name="zenith.erp.rental.RentalAsset" value-field="asset">
+                        <field-map field-name="rentalAssetId" from="item.rentalAssetId"/></entity-find-one>
+                    <!-- Calculate rate based on billing type -->
+                    <set field="rate" from="billingTypeEnumId == 'RbtDaily' ? asset.dailyRate :
+                                           (billingTypeEnumId == 'RbtWeekly' ? asset.weeklyRate :
+                                           (billingTypeEnumId == 'RbtMonthly' ? asset.monthlyRate : asset.dailyRate))"/>
+                    <set field="qty" from="item.quantity ?: 1" type="BigDecimal"/>
+                    <set field="rentalAmt" from="(rate ?: 0) * qty" type="BigDecimal"/>
+                    <set field="depAmt" from="(asset.securityDeposit ?: 0) * qty" type="BigDecimal"/>
+                    <service-call name="create#zenith.erp.rental.RentalAgreementItem"
+                                  in-map="[rentalAgreementId:rentalAgreementId,
+                                           itemSeqId:String.format('%05d', seqNum),
+                                           rentalAssetId:item.rentalAssetId, quantity:qty,
+                                           rateApplied:rate, rentalAmount:rentalAmt,
+                                           depositAmount:depAmt, conditionAtRent:asset.conditionEnumId]"/>
+                    <set field="totalRental" from="totalRental + rentalAmt"/>
+                    <set field="totalDeposit" from="totalDeposit + depAmt"/>
+                </iterate>
+                <service-call name="update#zenith.erp.rental.RentalAgreement"
+                              in-map="[rentalAgreementId:rentalAgreementId,
+                                       totalRentalAmount:totalRental, totalDepositAmount:totalDeposit,
+                                       totalAmount:totalRental + totalDeposit]"/>
+            </if>
+        </actions>
+    </service>
+
+    <!-- Activate Rental (marks assets as rented) -->
+    <service verb="activate" noun="RentalAgreement">
+        <in-parameters><parameter name="rentalAgreementId" required="true"/></in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.rental.RentalAgreement" value-field="agreement" for-update="true"/>
+            <set field="agreement.statusId" value="RgActive"/>
+            <entity-update value-field="agreement"/>
+            <entity-find entity-name="zenith.erp.rental.RentalAgreementItem" list="items">
+                <econdition field-name="rentalAgreementId"/></entity-find>
+            <iterate list="items" entry="item">
+                <service-call name="update#zenith.erp.rental.RentalAsset"
+                              in-map="[rentalAssetId:item.rentalAssetId, statusId:'RaRented']"/>
+            </iterate>
+        </actions>
+    </service>
+
+    <!-- Return Rental -->
+    <service verb="return" noun="RentalAgreement">
+        <in-parameters>
+            <parameter name="rentalAgreementId" required="true"/>
+            <parameter name="damageCharges" type="BigDecimal" default-value="0"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.rental.RentalAgreement" value-field="agreement" for-update="true"/>
+            <set field="agreement.statusId" value="RgReturned"/>
+            <set field="agreement.actualReturnDate" from="ec.l10n.format(ec.user.nowTimestamp, 'yyyy-MM-dd')"/>
+            <set field="agreement.damageCharges" from="damageCharges"/>
+            <!-- Calculate late charges -->
+            <set field="lateCharges" from="0" type="BigDecimal"/>
+            <if condition="agreement.expectedReturnDate &amp;&amp; agreement.actualReturnDate">
+                <set field="expected" from="java.sql.Date.valueOf(agreement.expectedReturnDate.toString())"/>
+                <set field="actual" from="ec.user.nowTimestamp"/>
+                <if condition="actual.after(expected)">
+                    <set field="diffMs" from="actual.time - expected.time"/>
+                    <set field="lateDays" from="(long)(diffMs / (1000 * 60 * 60 * 24))" type="Integer"/>
+                    <if condition="lateDays &gt; 0">
+                        <set field="lateCharges" from="lateDays * (agreement.totalRentalAmount / 30)" type="BigDecimal"/>
+                    </if>
+                </if>
+            </if>
+            <set field="agreement.lateCharges" from="lateCharges"/>
+            <set field="agreement.totalAmount" from="(agreement.totalRentalAmount ?: 0) + (agreement.totalDepositAmount ?: 0) + damageCharges + lateCharges - (agreement.depositRefundedAmount ?: 0)"/>
+            <entity-update value-field="agreement"/>
+            <entity-find entity-name="zenith.erp.rental.RentalAgreementItem" list="items">
+                <econdition field-name="rentalAgreementId"/></entity-find>
+            <iterate list="items" entry="item">
+                <service-call name="update#zenith.erp.rental.RentalAsset"
+                              in-map="[rentalAssetId:item.rentalAssetId, statusId:'RaAvailable']"/>
+            </iterate>
+        </actions>
+    </service>
+
+    <!-- Generate Rental Invoice -->
+    <service verb="generate" noun="RentalInvoice">
+        <in-parameters>
+            <parameter name="rentalAgreementId" required="true"/>
+            <parameter name="periodFrom" type="Date" required="true"/>
+            <parameter name="periodTo" type="Date" required="true"/>
+            <parameter name="dueDate" type="Date" required="true"/>
+        </in-parameters>
+        <out-parameters><parameter name="rentalInvoiceId"/></out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.rental.RentalAgreement" value-field="agreement"/>
+            <service-call name="create#zenith.erp.rental.RentalInvoice"
+                          in-map="[rentalAgreementId:rentalAgreementId,
+                                   periodFrom:periodFrom, periodTo:periodTo,
+                                   rentalAmount:agreement.totalRentalAmount,
+                                   taxAmount:0, totalAmount:agreement.totalRentalAmount,
+                                   statusId:'RiDraft', dueDate:dueDate]"
+                          out-map="context"/>
+        </actions>
+    </service>
+
+</services>

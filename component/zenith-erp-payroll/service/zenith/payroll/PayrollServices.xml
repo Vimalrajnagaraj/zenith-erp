@@ -1,0 +1,585 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <!-- ========== Payroll Run Management ========== -->
+
+    <service verb="create" noun="PayrollRun">
+        <in-parameters>
+            <parameter name="periodYear" type="Integer" required="true"/>
+            <parameter name="periodMonth" type="Integer" required="true"/>
+            <parameter name="totalWorkingDays" type="Integer" default-value="26"/>
+        </in-parameters>
+        <out-parameters><parameter name="payrollRunId"/></out-parameters>
+        <actions>
+            <set field="monthNames" from="['','January','February','March','April','May','June','July','August','September','October','November','December']"/>
+            <set field="runName" value="${monthNames[periodMonth]} ${periodYear}"/>
+
+            <set field="cal" from="java.util.Calendar.getInstance()"/>
+            <script>cal.set(periodYear, periodMonth - 1, 1)</script>
+            <set field="fromDate" from="new java.sql.Date(cal.getTimeInMillis())"/>
+            <script>cal.set(java.util.Calendar.DAY_OF_MONTH, cal.getActualMaximum(java.util.Calendar.DAY_OF_MONTH))</script>
+            <set field="toDate" from="new java.sql.Date(cal.getTimeInMillis())"/>
+
+            <service-call name="create#zenith.erp.payroll.PayrollRun" out-map="context"
+                in-map="[runName:runName, periodYear:periodYear, periodMonth:periodMonth,
+                         fromDate:fromDate, toDate:toDate, totalWorkingDays:totalWorkingDays,
+                         statusId:'PrDraft', employeeCount:0,
+                         totalGrossEarnings:0, totalDeductions:0, totalNetPay:0, totalEmployerCost:0]"/>
+        </actions>
+    </service>
+
+    <service verb="process" noun="PayrollRun">
+        <in-parameters><parameter name="payrollRunId" required="true"/></in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.payroll.PayrollRun" value-field="run"/>
+            <if condition="run.statusId != 'PrDraft'">
+                <return error="true" message="Payroll run must be in Draft status to process"/></if>
+
+            <entity-find entity-name="zenith.erp.hr.Employee" list="employees">
+                <econdition field-name="statusId" operator="in" value="EmpActive,EmpProbation"/>
+                <econdition field-name="ctcAnnual" operator="is-not-null"/>
+                <order-by field-name="employeeCode"/>
+            </entity-find>
+
+            <iterate list="employees" entry="emp">
+                <entity-find entity-name="zenith.erp.payroll.Payslip" list="existingList">
+                    <econdition field-name="payrollRunId"/>
+                    <econdition field-name="employeeId" from="emp.employeeId"/>
+                </entity-find>
+                <if condition="existingList"><continue/></if>
+
+                <!-- Count LWP days from approved leave applications in this period -->
+                <entity-find entity-name="zenith.erp.hr.LeaveApplication" list="lwpLeaves">
+                    <econdition field-name="employeeId" from="emp.employeeId"/>
+                    <econdition field-name="leaveType" value="LWP"/>
+                    <econdition field-name="statusId" value="LvApproved"/>
+                    <econdition field-name="fromDate" operator="less-equals" from="run.toDate"/>
+                    <econdition field-name="toDate" operator="greater-equals" from="run.fromDate"/>
+                </entity-find>
+                <set field="lwpDays" from="0" type="BigDecimal"/>
+                <iterate list="lwpLeaves" entry="lv">
+                    <set field="lwpDays" from="lwpDays + (lv.totalDays ?: 0)"/>
+                </iterate>
+
+                <service-call name="zenith.payroll.PayrollServices.calculate#Payslip"
+                    in-map="[employeeId:emp.employeeId, payrollRunId:payrollRunId,
+                             periodYear:run.periodYear, periodMonth:run.periodMonth,
+                             workingDays:run.totalWorkingDays, lwpDays:lwpDays]"/>
+            </iterate>
+
+            <!-- Sum totals -->
+            <entity-find entity-name="zenith.erp.payroll.Payslip" list="payslips">
+                <econdition field-name="payrollRunId"/></entity-find>
+            <set field="totalGross" from="0" type="BigDecimal"/>
+            <set field="totalDed" from="0" type="BigDecimal"/>
+            <set field="totalNet" from="0" type="BigDecimal"/>
+            <set field="totalCost" from="0" type="BigDecimal"/>
+            <iterate list="payslips" entry="ps">
+                <set field="totalGross" from="totalGross + (ps.grossEarnings ?: 0)"/>
+                <set field="totalDed" from="totalDed + (ps.totalDeductions ?: 0)"/>
+                <set field="totalNet" from="totalNet + (ps.netPay ?: 0)"/>
+                <set field="totalCost" from="totalCost + (ps.totalEmployerCost ?: 0)"/>
+            </iterate>
+
+            <service-call name="update#zenith.erp.payroll.PayrollRun"
+                in-map="[payrollRunId:payrollRunId, statusId:'PrProcessed',
+                         processedDate:ec.user.nowTimestamp,
+                         totalGrossEarnings:totalGross, totalDeductions:totalDed,
+                         totalNetPay:totalNet, totalEmployerCost:totalCost,
+                         employeeCount:payslips.size()]"/>
+        </actions>
+    </service>
+
+    <service verb="finalize" noun="PayrollRun">
+        <in-parameters><parameter name="payrollRunId" required="true"/></in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.payroll.PayrollRun" value-field="run"/>
+            <if condition="run.statusId != 'PrProcessed'">
+                <return error="true" message="Run must be Processed to finalize"/></if>
+
+            <entity-find entity-name="zenith.erp.payroll.Payslip" list="payslips">
+                <econdition field-name="payrollRunId"/></entity-find>
+            <iterate list="payslips" entry="ps">
+                <service-call name="update#zenith.erp.payroll.Payslip"
+                    in-map="[payslipId:ps.payslipId, statusId:'PsApproved']"/>
+            </iterate>
+
+            <service-call name="update#zenith.erp.payroll.PayrollRun"
+                in-map="[payrollRunId:payrollRunId, statusId:'PrFinalized',
+                         finalizedDate:ec.user.nowTimestamp]"/>
+        </actions>
+    </service>
+
+    <service verb="markPaid" noun="PayrollRun">
+        <in-parameters><parameter name="payrollRunId" required="true"/></in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.payroll.PayrollRun" value-field="run"/>
+            <if condition="run.statusId != 'PrFinalized'">
+                <return error="true" message="Run must be Finalized to mark as paid"/></if>
+
+            <entity-find entity-name="zenith.erp.payroll.Payslip" list="payslips">
+                <econdition field-name="payrollRunId"/></entity-find>
+            <iterate list="payslips" entry="ps">
+                <service-call name="update#zenith.erp.payroll.Payslip"
+                    in-map="[payslipId:ps.payslipId, statusId:'PsPaid']"/>
+            </iterate>
+
+            <!-- Deduct salary advance recoveries -->
+            <iterate list="payslips" entry="ps">
+                <if condition="ps.advanceRecovery &amp;&amp; ps.advanceRecovery > 0">
+                    <entity-find entity-name="zenith.erp.payroll.SalaryAdvance" list="advances">
+                        <econdition field-name="employeeId" from="ps.employeeId"/>
+                        <econdition field-name="statusId" operator="in" value="SaApproved,SaRecovering"/>
+                    </entity-find>
+                    <iterate list="advances" entry="adv">
+                        <set field="newRecovered" from="(adv.totalRecovered ?: 0) + (adv.monthlyRecoveryAmount ?: 0)"/>
+                        <set field="newBalance" from="(adv.amount ?: 0) - newRecovered"/>
+                        <if condition="newBalance &lt;= 0">
+                            <set field="newBalance" from="0"/>
+                            <set field="newStatus" value="SaCompleted"/>
+                        <else><set field="newStatus" value="SaRecovering"/></else></if>
+                        <service-call name="update#zenith.erp.payroll.SalaryAdvance"
+                            in-map="[salaryAdvanceId:adv.salaryAdvanceId, totalRecovered:newRecovered,
+                                     balanceAmount:newBalance, statusId:newStatus]"/>
+                    </iterate>
+                </if>
+            </iterate>
+
+            <service-call name="update#zenith.erp.payroll.PayrollRun"
+                in-map="[payrollRunId:payrollRunId, statusId:'PrPaid',
+                         paidDate:ec.user.nowTimestamp]"/>
+        </actions>
+    </service>
+
+    <!-- ========== Core Payslip Calculation Engine ========== -->
+
+    <service verb="calculate" noun="Payslip">
+        <in-parameters>
+            <parameter name="employeeId" required="true"/>
+            <parameter name="payrollRunId"/>
+            <parameter name="periodYear" type="Integer" required="true"/>
+            <parameter name="periodMonth" type="Integer" required="true"/>
+            <parameter name="workingDays" type="Integer" default-value="26"/>
+            <parameter name="lwpDays" type="BigDecimal" default-value="0"/>
+        </in-parameters>
+        <out-parameters><parameter name="payslipId"/></out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.hr.Employee" value-field="emp"/>
+            <if condition="!emp"><return error="true" message="Employee not found"/></if>
+            <if condition="!emp.ctcAnnual"><return error="true" message="CTC not configured for ${employeeId}"/></if>
+
+            <!-- Fetch salary structure (employee's or default) -->
+            <if condition="emp.salaryStructureId">
+                <entity-find-one entity-name="zenith.erp.payroll.SalaryStructure" value-field="ss">
+                    <field-map field-name="salaryStructureId" from="emp.salaryStructureId"/></entity-find-one>
+            </if>
+            <if condition="!ss">
+                <entity-find entity-name="zenith.erp.payroll.SalaryStructure" list="defList">
+                    <econdition field-name="isDefault" value="Y"/>
+                    <econdition field-name="isActive" value="Y"/>
+                </entity-find>
+                <set field="ss" from="defList ? defList[0] : null"/>
+            </if>
+            <if condition="!ss"><return error="true" message="No salary structure found"/></if>
+
+            <script><![CDATA[
+                def ctcAnnual = emp.ctcAnnual as BigDecimal
+                def ctcMonthly = ctcAnnual / 12
+                def basicPct = (ss.basicPercentOfGross ?: 40) as BigDecimal
+
+                // --- Step 1: Derive Gross from CTC by subtracting employer contributions ---
+                def estBasic = ctcMonthly * basicPct / 100
+                def pfEligible = emp.pfApplicable == 'Y' ? Math.min(estBasic as double, 15000.0) as BigDecimal : 0
+                def empPfCost = pfEligible * 0.12     // employer PF 12%
+                def empPfAdmin = pfEligible * 0.005   // admin 0.5%
+                def empEdli = pfEligible * 0.005      // EDLI 0.5%
+                def empGratuity = ss.includeGratuityInCtc == 'Y' ? estBasic * 15 / 26 / 12 : 0
+
+                def totalEmployerEst = empPfCost + empPfAdmin + empEdli + empGratuity
+                def grossMonthly = ctcMonthly - totalEmployerEst
+
+                // Recalculate with actual gross-based basic
+                def basic = grossMonthly * basicPct / 100
+                pfEligible = emp.pfApplicable == 'Y' ? Math.min(basic as double, 15000.0) as BigDecimal : 0
+                empPfCost = pfEligible * 0.12
+                empPfAdmin = pfEligible * 0.005
+                empEdli = pfEligible * 0.005
+                empGratuity = ss.includeGratuityInCtc == 'Y' ? basic * 15 / 26 / 12 : 0
+
+                // ESI check: applicable if monthly gross <= 21000
+                def esiEmployerRate = 0.0325 as BigDecimal
+                def esiEmployeeRate = 0.0075 as BigDecimal
+                def esiEmployerAmt = 0 as BigDecimal
+                if (emp.esiApplicable == 'Y' && grossMonthly <= 21000) {
+                    if (ss.includeEsiInCtc == 'Y') {
+                        esiEmployerAmt = grossMonthly * esiEmployerRate
+                    }
+                }
+                totalEmployerEst = empPfCost + empPfAdmin + empEdli + empGratuity + esiEmployerAmt
+                grossMonthly = ctcMonthly - totalEmployerEst
+
+                // --- Step 2: Break down gross into components ---
+                basic = grossMonthly * basicPct / 100
+                def hraPct = emp.isMetroCity == 'Y' ? 50 : ((ss.hraPercentOfBasic ?: 40) as BigDecimal)
+                def hraAmt = basic * hraPct / 100
+                def daAmt = basic * ((ss.daPercentOfBasic ?: 0) as BigDecimal) / 100
+                def convAmt = (ss.conveyanceMonthly ?: 0) as BigDecimal
+                def medAmt = (ss.medicalMonthly ?: 0) as BigDecimal
+                def ltaAmt = basic * ((ss.ltaPercentOfBasic ?: 0) as BigDecimal) / 100
+                def specAmt = grossMonthly - basic - hraAmt - daAmt - convAmt - medAmt - ltaAmt
+                if (specAmt < 0) specAmt = 0
+
+                // --- Step 3: LWP adjustment ---
+                def lwp = (lwpDays ?: 0) as BigDecimal
+                def wDays = (workingDays ?: 26) as BigDecimal
+                def pDays = wDays - lwp
+                def proRate = wDays > 0 ? pDays / wDays : 1
+                def lwpDeduction = grossMonthly - (grossMonthly * proRate)
+
+                basic = (basic * proRate).setScale(0, java.math.RoundingMode.HALF_UP)
+                hraAmt = (hraAmt * proRate).setScale(0, java.math.RoundingMode.HALF_UP)
+                daAmt = (daAmt * proRate).setScale(0, java.math.RoundingMode.HALF_UP)
+                convAmt = (convAmt * proRate).setScale(0, java.math.RoundingMode.HALF_UP)
+                medAmt = (medAmt * proRate).setScale(0, java.math.RoundingMode.HALF_UP)
+                specAmt = (specAmt * proRate).setScale(0, java.math.RoundingMode.HALF_UP)
+                ltaAmt = (ltaAmt * proRate).setScale(0, java.math.RoundingMode.HALF_UP)
+                def actualGross = basic + hraAmt + daAmt + convAmt + medAmt + specAmt + ltaAmt
+
+                // --- Step 4: Employee deductions ---
+                def pfBase = basic + daAmt
+                def pfCeiling = Math.min(pfBase as double, 15000.0) as BigDecimal
+                def epfEmp = emp.pfApplicable == 'Y' ? (pfCeiling * 0.12).setScale(0, java.math.RoundingMode.HALF_UP) : 0
+                def esiEmp = (emp.esiApplicable == 'Y' && grossMonthly <= 21000) ?
+                    (actualGross * esiEmployeeRate).setScale(0, java.math.RoundingMode.HALF_UP) : 0
+
+                // Salary advance recovery
+                def advRecovery = 0 as BigDecimal
+
+                // Store values for PT and TDS calculation (done after script via service calls)
+                context.calcBasic = basic
+                context.calcHra = hraAmt
+                context.calcDa = daAmt
+                context.calcConveyance = convAmt
+                context.calcMedical = medAmt
+                context.calcSpecial = specAmt
+                context.calcLta = ltaAmt
+                context.calcGross = actualGross
+                context.calcEpfEmp = epfEmp
+                context.calcEsiEmp = esiEmp
+                context.calcGrossMonthlyFull = grossMonthly
+                context.calcPaidDays = pDays
+                context.calcLwpDeduction = lwpDeduction.setScale(0, java.math.RoundingMode.HALF_UP)
+
+                // --- Step 5: Employer contributions ---
+                def epfEmpr = emp.pfApplicable == 'Y' ? (pfCeiling * 0.0367).setScale(0, java.math.RoundingMode.HALF_UP) : 0
+                def epsEmpr = emp.pfApplicable == 'Y' ? (pfCeiling * 0.0833).setScale(0, java.math.RoundingMode.HALF_UP) : 0
+                def adminCh = emp.pfApplicable == 'Y' ? (pfCeiling * 0.005).setScale(0, java.math.RoundingMode.HALF_UP) : 0
+                def edliCh = emp.pfApplicable == 'Y' ? (pfCeiling * 0.005).setScale(0, java.math.RoundingMode.HALF_UP) : 0
+                def esiEmpr = (emp.esiApplicable == 'Y' && grossMonthly <= 21000) ?
+                    (actualGross * esiEmployerRate).setScale(0, java.math.RoundingMode.HALF_UP) : 0
+                def gratProv = (basic * 15 / 26 / 12).setScale(0, java.math.RoundingMode.HALF_UP)
+
+                context.calcEpfEmpr = epfEmpr
+                context.calcEpsEmpr = epsEmpr
+                context.calcAdminCh = adminCh
+                context.calcEdliCh = edliCh
+                context.calcEsiEmpr = esiEmpr
+                context.calcGratProv = gratProv
+                context.calcAdvRecovery = advRecovery
+            ]]></script>
+
+            <!-- Professional Tax lookup -->
+            <set field="ptAmount" from="0" type="BigDecimal"/>
+            <if condition="emp.ptApplicable == 'Y' &amp;&amp; emp.stateCode">
+                <service-call name="zenith.payroll.PayrollServices.lookup#ProfessionalTax" out-map="ptOut"
+                    in-map="[stateCode:emp.stateCode, monthlyGross:calcGross, periodMonth:periodMonth]"/>
+                <set field="ptAmount" from="ptOut.taxAmount ?: 0"/>
+            </if>
+
+            <!-- Income Tax (TDS) calculation -->
+            <service-call name="zenith.payroll.PayrollServices.calculate#MonthlyTds" out-map="tdsOut"
+                in-map="[employeeId:employeeId, periodYear:periodYear, periodMonth:periodMonth,
+                         monthlyGross:calcGrossMonthlyFull, annualEpfEmployee:calcEpfEmp * 12]"/>
+            <set field="tdsAmount" from="tdsOut.monthlyTds ?: 0"/>
+
+            <!-- Salary advance recovery -->
+            <entity-find entity-name="zenith.erp.payroll.SalaryAdvance" list="advances">
+                <econdition field-name="employeeId"/>
+                <econdition field-name="statusId" operator="in" value="SaApproved,SaRecovering"/>
+            </entity-find>
+            <set field="advRecovery" from="0" type="BigDecimal"/>
+            <iterate list="advances" entry="adv">
+                <set field="advRecovery" from="advRecovery + (adv.monthlyRecoveryAmount ?: 0)"/>
+            </iterate>
+
+            <!-- Final totals -->
+            <set field="totalDeductions" from="(calcEpfEmp as BigDecimal) + (calcEsiEmp as BigDecimal) + ptAmount + tdsAmount + advRecovery"/>
+            <set field="netPay" from="(calcGross as BigDecimal) - totalDeductions"/>
+            <set field="totalEmployerCost" from="(calcGross as BigDecimal) + (calcEpfEmpr as BigDecimal) + (calcEpsEmpr as BigDecimal) + (calcAdminCh as BigDecimal) + (calcEdliCh as BigDecimal) + (calcEsiEmpr as BigDecimal) + (calcGratProv as BigDecimal)"/>
+
+            <!-- Get total days in month -->
+            <script><![CDATA[
+                def calObj = java.util.Calendar.getInstance()
+                calObj.set(periodYear as int, (periodMonth as int) - 1, 1)
+                context.totalDaysInMonth = calObj.getActualMaximum(java.util.Calendar.DAY_OF_MONTH)
+            ]]></script>
+
+            <service-call name="create#zenith.erp.payroll.Payslip" out-map="psOut"
+                in-map="[payrollRunId:payrollRunId, employeeId:employeeId,
+                         periodYear:periodYear, periodMonth:periodMonth,
+                         totalDaysInMonth:totalDaysInMonth, workingDays:workingDays,
+                         presentDays:calcPaidDays, lwpDays:lwpDays, paidDays:calcPaidDays,
+                         basicPay:calcBasic, hra:calcHra, da:calcDa,
+                         conveyance:calcConveyance, medicalAllowance:calcMedical,
+                         specialAllowance:calcSpecial, lta:calcLta,
+                         otherEarnings:0, grossEarnings:calcGross,
+                         epfEmployee:calcEpfEmp, esiEmployee:calcEsiEmp,
+                         professionalTax:ptAmount, incomeTax:tdsAmount,
+                         advanceRecovery:advRecovery, otherDeductions:0,
+                         totalDeductions:totalDeductions, netPay:netPay,
+                         epfEmployer:calcEpfEmpr, epsEmployer:calcEpsEmpr,
+                         epfAdminCharges:calcAdminCh, edliContribution:calcEdliCh,
+                         esiEmployer:calcEsiEmpr, gratuityProvision:calcGratProv,
+                         totalEmployerCost:totalEmployerCost,
+                         statusId:'PsCalculated']"/>
+            <set field="payslipId" from="psOut.payslipId"/>
+        </actions>
+    </service>
+
+    <!-- ========== Professional Tax Lookup ========== -->
+
+    <service verb="lookup" noun="ProfessionalTax">
+        <in-parameters>
+            <parameter name="stateCode" required="true"/>
+            <parameter name="monthlyGross" type="BigDecimal" required="true"/>
+            <parameter name="periodMonth" type="Integer" required="true"/>
+        </in-parameters>
+        <out-parameters><parameter name="taxAmount" type="BigDecimal"/></out-parameters>
+        <actions>
+            <entity-find entity-name="zenith.erp.payroll.ProfessionalTaxSlab" list="slabs">
+                <econdition field-name="stateCode"/>
+                <econdition field-name="isActive" value="Y"/>
+                <econdition field-name="fromAmount" operator="less-equals" from="monthlyGross"/>
+                <econdition field-name="toAmount" operator="greater-equals" from="monthlyGross"/>
+            </entity-find>
+            <if condition="slabs">
+                <set field="slab" from="slabs[0]"/>
+                <set field="taxAmount" from="periodMonth == 2 ? (slab.februaryTax ?: slab.monthlyTax) : slab.monthlyTax"/>
+            <else>
+                <set field="taxAmount" from="0"/>
+            </else></if>
+        </actions>
+    </service>
+
+    <!-- ========== Monthly TDS (Income Tax) Calculation ========== -->
+
+    <service verb="calculate" noun="MonthlyTds">
+        <in-parameters>
+            <parameter name="employeeId" required="true"/>
+            <parameter name="periodYear" type="Integer" required="true"/>
+            <parameter name="periodMonth" type="Integer" required="true"/>
+            <parameter name="monthlyGross" type="BigDecimal" required="true"/>
+            <parameter name="annualEpfEmployee" type="BigDecimal" default-value="0"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="monthlyTds" type="BigDecimal"/>
+            <parameter name="annualTaxProjected" type="BigDecimal"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.hr.Employee" value-field="emp"/>
+
+            <!-- Determine financial year -->
+            <script><![CDATA[
+                def fysSetting = ec.entity.find("zenith.erp.base.CompanySettings").condition("organizationPartyId", ec.user.getPreference("ACTIVE_ORGANIZATION")).condition("settingKey", "FY_START_MONTH").one()
+                int fyStartMonth = fysSetting ? (fysSetting.settingValue as int) : 4
+                int fyStart = periodMonth >= fyStartMonth ? periodYear : periodYear - 1
+                def fy = "${fyStart}-${((fyStart+1) % 100).toString().padLeft(2, '0')}"
+                context.financialYear = fy
+            ]]></script>
+
+            <!-- Check for tax declaration -->
+            <entity-find entity-name="zenith.erp.payroll.IncomeTaxDeclaration" list="decList">
+                <econdition field-name="employeeId"/>
+                <econdition field-name="financialYear"/>
+            </entity-find>
+            <set field="declaration" from="decList ? decList[0] : null"/>
+            <set field="regime" from="declaration?.selectedRegime ?: (emp.incomeTaxRegime ?: 'New')"/>
+
+            <!-- Fetch applicable tax slabs -->
+            <entity-find entity-name="zenith.erp.payroll.IncomeTaxSlab" list="slabs">
+                <econdition field-name="regime"/>
+                <econdition field-name="financialYear"/>
+                <econdition field-name="isActive" value="Y"/>
+                <order-by field-name="fromAmount"/>
+            </entity-find>
+
+            <script><![CDATA[
+                def gross = monthlyGross as BigDecimal
+                def annualGross = gross * 12
+
+                // Standard deduction
+                def stdDeduction = regime == 'New' ? 75000 : 50000
+                def taxableIncome = annualGross - stdDeduction
+
+                // Old regime: subtract declared deductions
+                if (regime == 'Old' && declaration) {
+                    def sec80c = Math.min((declaration.section80c ?: 0) as double, 150000.0) as BigDecimal
+                    // Employee EPF is part of 80C
+                    sec80c = Math.min(sec80c + (annualEpfEmployee ?: 0), 150000) as BigDecimal
+                    taxableIncome -= sec80c
+                    taxableIncome -= Math.min((declaration.section80d ?: 0) as double, 100000.0) as BigDecimal
+                    taxableIncome -= (declaration.section80e ?: 0) as BigDecimal
+                    taxableIncome -= (declaration.section80g ?: 0) as BigDecimal
+                    taxableIncome -= Math.min((declaration.section80tta ?: 0) as double, 10000.0) as BigDecimal
+                    taxableIncome -= (declaration.hraExemptionClaimed ?: 0) as BigDecimal
+                    taxableIncome -= (declaration.ltaExemptionClaimed ?: 0) as BigDecimal
+                    taxableIncome -= Math.min((declaration.homeLoanInterest ?: 0) as double, 200000.0) as BigDecimal
+                    taxableIncome -= Math.min((declaration.npsContribution ?: 0) as double, 50000.0) as BigDecimal
+                    taxableIncome -= (declaration.otherExemptions ?: 0) as BigDecimal
+                } else if (regime == 'New') {
+                    // New regime: no deductions except standard deduction (already applied)
+                    // NPS employer contribution up to 14% of salary is exempt but that's complex
+                }
+
+                if (taxableIncome < 0) taxableIncome = 0
+
+                // Calculate tax using slab rates
+                def annualTax = 0 as BigDecimal
+                for (slab in slabs) {
+                    def slabFrom = (slab.fromAmount ?: 0) as BigDecimal
+                    def slabTo = (slab.toAmount ?: 999999999) as BigDecimal
+                    def rate = (slab.taxRatePercent ?: 0) as BigDecimal
+
+                    if (taxableIncome > slabFrom && rate > 0) {
+                        def taxableInSlab = Math.min(taxableIncome as double, slabTo as double) as BigDecimal
+                        taxableInSlab = taxableInSlab - slabFrom + 1
+                        annualTax += taxableInSlab * rate / 100
+                    }
+                }
+
+                // Apply rebate u/s 87A
+                if (regime == 'New' && taxableIncome <= 1200000) {
+                    def rebate = Math.min(annualTax as double, 60000.0) as BigDecimal
+                    annualTax -= rebate
+                } else if (regime == 'Old' && taxableIncome <= 500000) {
+                    annualTax = 0
+                }
+
+                // Health & Education Cess 4%
+                if (annualTax > 0) {
+                    annualTax = (annualTax * 1.04).setScale(0, java.math.RoundingMode.HALF_UP)
+                }
+
+                context.annualTaxProjected = annualTax
+                context.monthlyTds = annualTax > 0 ?
+                    (annualTax / 12).setScale(0, java.math.RoundingMode.HALF_UP) : 0
+            ]]></script>
+        </actions>
+    </service>
+
+    <!-- ========== Salary Advance ========== -->
+
+    <service verb="create" noun="SalaryAdvance">
+        <in-parameters>
+            <parameter name="employeeId" required="true"/>
+            <parameter name="amount" type="BigDecimal" required="true"/>
+            <parameter name="reason"/>
+            <parameter name="monthlyRecoveryAmount" type="BigDecimal" required="true"/>
+        </in-parameters>
+        <out-parameters><parameter name="salaryAdvanceId"/></out-parameters>
+        <actions>
+            <service-call name="create#zenith.erp.payroll.SalaryAdvance" out-map="context"
+                in-map="[employeeId:employeeId, advanceDate:ec.user.nowTimestamp,
+                         amount:amount, reason:reason,
+                         monthlyRecoveryAmount:monthlyRecoveryAmount,
+                         totalRecovered:0, balanceAmount:amount,
+                         statusId:'SaApproved']"/>
+        </actions>
+    </service>
+
+    <!-- ========== CTC Projection (Calculator) ========== -->
+
+    <service verb="project" noun="CtcBreakdown">
+        <in-parameters>
+            <parameter name="ctcAnnual" type="BigDecimal" required="true"/>
+            <parameter name="salaryStructureId"/>
+            <parameter name="isMetroCity" default-value="N"/>
+            <parameter name="pfApplicable" default-value="Y"/>
+            <parameter name="esiApplicable" default-value="N"/>
+            <parameter name="ptApplicable" default-value="N"/>
+            <parameter name="stateCode"/>
+            <parameter name="incomeTaxRegime" default-value="New"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="breakdown" type="Map"/>
+        </out-parameters>
+        <actions>
+            <if condition="salaryStructureId">
+                <entity-find-one entity-name="zenith.erp.payroll.SalaryStructure" value-field="ss"/>
+            </if>
+            <if condition="!ss">
+                <entity-find entity-name="zenith.erp.payroll.SalaryStructure" list="defList">
+                    <econdition field-name="isDefault" value="Y"/><econdition field-name="isActive" value="Y"/>
+                </entity-find>
+                <set field="ss" from="defList ? defList[0] : null"/>
+            </if>
+            <if condition="!ss"><return error="true" message="No salary structure found"/></if>
+
+            <script><![CDATA[
+                def ctc = ctcAnnual as BigDecimal
+                def ctcM = ctc / 12
+                def bPct = (ss.basicPercentOfGross ?: 40) as BigDecimal
+
+                def estBasic = ctcM * bPct / 100
+                def pfBase = pfApplicable == 'Y' ? Math.min(estBasic as double, 15000.0) as BigDecimal : 0
+                def ePf = pfBase * 0.12
+                def eAdmin = pfBase * 0.005
+                def eEdli = pfBase * 0.005
+                def eGrat = ss.includeGratuityInCtc == 'Y' ? estBasic * 15 / 26 / 12 : 0
+                def eEsi = 0
+                def totalEmp = ePf + eAdmin + eEdli + eGrat
+                def gM = ctcM - totalEmp
+
+                def basic = gM * bPct / 100
+                def hraPct = isMetroCity == 'Y' ? 50 : ((ss.hraPercentOfBasic ?: 40) as BigDecimal)
+                def hra = basic * hraPct / 100
+                def da = basic * ((ss.daPercentOfBasic ?: 0) as BigDecimal) / 100
+                def conv = (ss.conveyanceMonthly ?: 0) as BigDecimal
+                def med = (ss.medicalMonthly ?: 0) as BigDecimal
+                def lta = basic * ((ss.ltaPercentOfBasic ?: 0) as BigDecimal) / 100
+                def spec = gM - basic - hra - da - conv - med - lta
+                if (spec < 0) spec = 0
+
+                pfBase = pfApplicable == 'Y' ? Math.min(basic as double, 15000.0) as BigDecimal : 0
+                def deductPf = (pfBase * 0.12).setScale(0, java.math.RoundingMode.HALF_UP)
+                def grossCheck = gM
+                def deductEsi = (esiApplicable == 'Y' && grossCheck <= 21000) ?
+                    (gM * 0.0075).setScale(0, java.math.RoundingMode.HALF_UP) : 0
+                eEsi = (esiApplicable == 'Y' && grossCheck <= 21000) ?
+                    (gM * 0.0325).setScale(0, java.math.RoundingMode.HALF_UP) : 0
+
+                def net = gM - deductPf - deductEsi
+
+                context.breakdown = [
+                    ctcAnnual: ctc, ctcMonthly: ctcM.setScale(0, java.math.RoundingMode.HALF_UP),
+                    grossMonthly: gM.setScale(0, java.math.RoundingMode.HALF_UP),
+                    basic: basic.setScale(0, java.math.RoundingMode.HALF_UP),
+                    hra: hra.setScale(0, java.math.RoundingMode.HALF_UP),
+                    da: da.setScale(0, java.math.RoundingMode.HALF_UP),
+                    conveyance: conv, medical: med,
+                    lta: lta.setScale(0, java.math.RoundingMode.HALF_UP),
+                    specialAllowance: spec.setScale(0, java.math.RoundingMode.HALF_UP),
+                    epfEmployee: deductPf, esiEmployee: deductEsi,
+                    epfEmployer: (pfBase * 0.0367).setScale(0, java.math.RoundingMode.HALF_UP),
+                    epsEmployer: (pfBase * 0.0833).setScale(0, java.math.RoundingMode.HALF_UP),
+                    esiEmployer: eEsi,
+                    gratuityProvision: (basic * 15 / 26 / 12).setScale(0, java.math.RoundingMode.HALF_UP),
+                    estimatedNetMonthly: net.setScale(0, java.math.RoundingMode.HALF_UP),
+                    estimatedNetAnnual: (net * 12).setScale(0, java.math.RoundingMode.HALF_UP)
+                ]
+            ]]></script>
+        </actions>
+    </service>
+
+</services>

@@ -1,0 +1,119 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <!-- Read-only: build the bill-number register (every number from first to last issued in each org+FY
+         sequence, classified, with the gaps). Optional date window (period or custom from/thru) and a
+         running sales-value total. Shared by the BillNumberRegister screen and its print view. -->
+    <service verb="get" noun="BillNumberRegister">
+        <in-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="viewMode" default-value="all"/>
+            <parameter name="period" default-value="all"/><!-- all | thisMonth | lastMonth | custom -->
+            <parameter name="fromDate"/><!-- yyyy-MM-dd when period=custom -->
+            <parameter name="thruDate"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="registerList" type="List"/>
+            <parameter name="seqList" type="List"/>
+            <parameter name="grandSalesValue" type="BigDecimal"/>
+            <parameter name="periodLabel"/>
+        </out-parameters>
+        <actions>
+            <script><![CDATA[
+                import java.util.Calendar
+                registerList = []
+                seqList = []
+                grandSalesValue = 0G
+                // ---- resolve the date window ----
+                def nowTs = ec.user.nowTimestamp
+                def fromTs = null; def thruTs = null
+                periodLabel = 'All dates'
+                if (period == 'thisMonth' || period == 'lastMonth') {
+                    def cal = Calendar.getInstance(); cal.setTime(nowTs)
+                    cal.set(Calendar.DAY_OF_MONTH, 1); cal.set(Calendar.HOUR_OF_DAY, 0)
+                    cal.set(Calendar.MINUTE, 0); cal.set(Calendar.SECOND, 0); cal.set(Calendar.MILLISECOND, 0)
+                    if (period == 'lastMonth') cal.add(Calendar.MONTH, -1)
+                    fromTs = new java.sql.Timestamp(cal.getTimeInMillis())
+                    def c2 = (Calendar) cal.clone(); c2.add(Calendar.MONTH, 1)
+                    thruTs = new java.sql.Timestamp(c2.getTimeInMillis() - 1)
+                    periodLabel = new java.text.SimpleDateFormat("MMMM yyyy").format(fromTs)
+                } else if (period == 'custom') {
+                    def parseDay = { s ->
+                        if (!s) return null
+                        def str = s.toString().trim().take(10)
+                        for (fmt in ["yyyy-MM-dd", "dd/MM/yyyy", "dd-MM-yyyy", "MM/dd/yyyy"]) {
+                            try { def b = ec.l10n.parseTimestamp(str, fmt); if (b) return b } catch (e) {}
+                        }
+                        return null
+                    }
+                    def fb = parseDay(fromDate); if (fb) fromTs = new java.sql.Timestamp(fb.getTime())
+                    def tb = parseDay(thruDate); if (tb) thruTs = new java.sql.Timestamp(tb.getTime() + 86400000L - 1)
+                    periodLabel = (fromTs ? ec.l10n.format(fromTs, 'dd-MM-yyyy') : 'start') + ' to ' + (thruTs ? ec.l10n.format(thruTs, 'dd-MM-yyyy') : 'now')
+                }
+                def hasDate = (fromTs != null || thruTs != null)
+                def inWindow = { d ->
+                    if (!hasDate) return true
+                    if (d == null) return false
+                    if (fromTs != null && d.compareTo(fromTs) < 0) return false
+                    if (thruTs != null && d.compareTo(thruTs) > 0) return false
+                    return true
+                }
+                def gapsOnly = (viewMode == 'gaps')
+                def finder = ec.entity.find("zenith.erp.pos.PosTransaction").condition("transactionNumber", "like", "POS/%/%")
+                if (organizationPartyId) finder.condition("organizationPartyId", organizationPartyId)
+                def txns = finder.selectField("transactionNumber").selectField("statusId").selectField("entryDate")
+                    .selectField("grandTotal").selectField("organizationPartyId").list()
+                // Group by (organization + prefix) so two stores reusing the same number never collide.
+                def groups = [:]
+                for (t in txns) {
+                    def mtch = (t.transactionNumber =~ /^(POS\/.*)\/(\d+)$/)
+                    if (mtch.find()) {
+                        def prefix = mtch.group(1); def num = mtch.group(2) as int
+                        def org = t.organizationPartyId ?: '(none)'
+                        def key = org + '|' + prefix
+                        if (!groups.containsKey(key)) groups[key] = [org:org, prefix:prefix, nums:[:]]
+                        groups[key].nums[num] = t
+                    }
+                }
+                def orgNameCache = [:]
+                def orgNameOf = { org ->
+                    if (orgNameCache.containsKey(org)) return orgNameCache[org]
+                    def nm = org
+                    def o = ec.entity.find("mantle.party.Organization").condition("partyId", org).one()
+                    if (o?.organizationName) nm = o.organizationName
+                    orgNameCache[org] = nm; return nm
+                }
+                def lbl = [PtCompleted:'Sale issued', PtHeld:'Held (parked)', PtCreated:'Incomplete cart', PtVoided:'Voided']
+                for (key in groups.keySet().sort()) {
+                    def g = groups[key]; def numMap = g.nums; def orgNm = orgNameOf(g.org)
+                    // Numbers issued inside the date window define the block to show. No window => all issued.
+                    def inRange = numMap.keySet().findAll { n -> inWindow(numMap[n].entryDate) }
+                    if (!inRange) continue
+                    def mn = inRange.min(); def mx = inRange.max()
+                    def big = (mx - mn) > 2000
+                    def c = [sale:0, held:0, inc:0, voided:0, gap:0]
+                    def seqSales = 0G
+                    for (int n = mn; n <= mx; n++) {
+                        def t = numMap[n]
+                        def status = t ? t.statusId : 'GAP'
+                        if (status == 'PtCompleted') { c.sale++; seqSales += ((t.grandTotal ?: 0) as BigDecimal) }
+                        else if (status == 'PtHeld') c.held++
+                        else if (status == 'PtCreated') c.inc++
+                        else if (status == 'PtVoided') c.voided++
+                        else c.gap++
+                        if (!(big && status == 'PtCompleted') && (!gapsOnly || status == 'GAP')) {
+                            registerList.add([orgName: orgNm, fullNumber: g.prefix + '/' + String.format('%05d', n),
+                                statusLabel: (t ? (lbl[status] ?: status) : 'UNUSED - no bill issued'),
+                                entryDate: (t ? t.entryDate : null), amount: (t ? t.grandTotal : null)])
+                        }
+                    }
+                    grandSalesValue += seqSales
+                    seqList.add([orgName:orgNm, prefix:g.prefix, rangeText:String.format('%05d',mn) + ' to ' + String.format('%05d',mx),
+                        total:(mx - mn + 1), sale:c.sale, held:c.held, inc:c.inc, voided:c.voided, gap:c.gap, salesValue:seqSales,
+                        note:(big ? 'Large sequence: individual sales not listed below' : '')])
+                }
+            ]]></script>
+        </actions>
+    </service>
+</services>

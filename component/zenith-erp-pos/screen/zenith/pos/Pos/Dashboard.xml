@@ -1,0 +1,503 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
+        default-menu-title="Dashboard" default-menu-index="0">
+
+    <parameter name="dashDate"/>
+
+    <transition name="changeDashDate">
+        <default-response url="." parameter-map="[dashDate:dashDate]"/>
+    </transition>
+    <transition name="goTerminal"><default-response url="../Terminal"/></transition>
+    <transition name="goTransactions"><default-response url="../PosTransactions"/></transition>
+    <transition name="goDailySummary"><default-response url="../DailySummary"/></transition>
+    <transition name="goReports"><default-response url="../Reports"/></transition>
+    <transition name="goExpenses"><default-response url="../Expenses"/></transition>
+    <transition name="goCashEntry"><default-response url="../CashEntry"/></transition>
+    <transition name="goStock"><default-response url="../Stock"/></transition>
+    <transition name="goWastage"><default-response url="../Wastage"/></transition>
+    <transition name="goKitchen"><default-response url="../Kitchen"/></transition>
+    <transition name="goSessions"><default-response url="../PosSessions"/></transition>
+    <transition name="goTerminals"><default-response url="../PosTerminals"/></transition>
+    <transition name="goReceipts"><default-response url="../ReceiptConfig"/></transition>
+    <transition name="goImport"><default-response url="../ProductImport"/></transition>
+    <transition name="goSalesMode"><default-response url="../SalesMode"/></transition>
+    <transition name="goPriceOverrides"><default-response url="../PriceOverrides"/></transition>
+    <transition name="goCreditBills"><default-response url="../CreditBills"/></transition>
+    <transition name="goErpSales"><default-response url="/apps/zenith/sales/SalesDashboard"/></transition>
+    <transition name="goErpInventory"><default-response url="/apps/zenith/Inventory/FindProduct"/></transition>
+    <transition name="goErpContacts"><default-response url="/apps/zenith/Contacts/Customers"/></transition>
+    <transition name="goErpAccounting"><default-response url="/apps/zenith/Accounting/AcctgDashboard"/></transition>
+    <transition name="goErpPurchase"><default-response url="/apps/zenith/Purchase/RfqList"/></transition>
+
+    <actions>
+        <script><![CDATA[
+            def sdf = new java.text.SimpleDateFormat("yyyy-MM-dd")
+            def now = ec.user.nowTimestamp
+            if (!dashDate) dashDate = sdf.format(now)
+
+            def dayStart = java.sql.Timestamp.valueOf(dashDate + " 00:00:00")
+            def dayEnd = java.sql.Timestamp.valueOf(dashDate + " 23:59:59")
+
+            displayDate = new java.text.SimpleDateFormat("dd MMM yyyy, EEEE").format(java.sql.Date.valueOf(dashDate))
+        ]]></script>
+
+        <entity-find entity-name="zenith.erp.pos.PosTransaction" list="completedTxns">
+            <econdition field-name="statusId" value="PtCompleted"/>
+            <econdition field-name="entryDate" operator="greater-equals" from="dayStart"/>
+            <econdition field-name="entryDate" operator="less-equals" from="dayEnd"/>
+            <order-by field-name="entryDate"/>
+        </entity-find>
+
+        <entity-find entity-name="zenith.erp.pos.PosTransaction" list="voidedTxns">
+            <econdition field-name="statusId" value="PtVoided"/>
+            <econdition field-name="entryDate" operator="greater-equals" from="dayStart"/>
+            <econdition field-name="entryDate" operator="less-equals" from="dayEnd"/>
+        </entity-find>
+
+        <script><![CDATA[
+            totalSales = completedTxns.sum { (it.payableAmount ?: 0) as BigDecimal } ?: BigDecimal.ZERO
+            totalOrders = completedTxns.size()
+            avgOrderValue = totalOrders > 0 ? (totalSales / totalOrders).setScale(2, java.math.RoundingMode.HALF_UP) : BigDecimal.ZERO
+            totalDiscount = completedTxns.sum { (it.discountTotal ?: 0) as BigDecimal } ?: BigDecimal.ZERO
+            totalTax = completedTxns.sum { (it.totalTaxAmount ?: 0) as BigDecimal } ?: BigDecimal.ZERO
+            cancelledBills = voidedTxns.size()
+            cancelledAmount = voidedTxns.sum { (it.payableAmount ?: 0) as BigDecimal } ?: BigDecimal.ZERO
+
+            txnIds = completedTxns.collect { it.transactionId }
+
+            // Payment breakdown
+            def allPayments = txnIds ? ec.entity.find("zenith.erp.pos.PosPayment")
+                .condition("transactionId", "in", txnIds).list() : []
+
+            def pmColorMap = [Cash:'#4caf50', Card:'#2196f3', UPI:'#9c27b0', BankTransfer:'#ff9800', Cheque:'#607d8b']
+            def paymentTotals = new LinkedHashMap()
+            allPayments.each { p ->
+                def method = p.paymentMethod ?: 'Other'
+                paymentTotals[method] = (paymentTotals[method] ?: BigDecimal.ZERO) + ((p.amount ?: 0) as BigDecimal)
+            }
+            paymentBars = []
+            def totalPaymentAmt = paymentTotals.values().sum() ?: BigDecimal.ONE
+            paymentTotals.each { method, amt ->
+                def pct = totalPaymentAmt > 0 ? (amt * 100 / totalPaymentAmt).intValue() : 0
+                paymentBars.add([method: method, amount: ec.l10n.format(amt, '#,##0'),
+                    pct: pct, color: pmColorMap[method] ?: '#999'])
+            }
+
+            // Hourly sales breakdown
+            def hourlySales = new BigDecimal[24]
+            for (int i = 0; i < 24; i++) hourlySales[i] = BigDecimal.ZERO
+            completedTxns.each { t ->
+                if (t.entryDate) {
+                    def cal = java.util.Calendar.getInstance()
+                    cal.setTime(t.entryDate)
+                    def hour = cal.get(java.util.Calendar.HOUR_OF_DAY)
+                    hourlySales[hour] = hourlySales[hour] + ((t.payableAmount ?: 0) as BigDecimal)
+                }
+            }
+            def maxH = hourlySales.max() ?: BigDecimal.ONE
+            if (maxH == BigDecimal.ZERO) maxH = BigDecimal.ONE
+
+            hourlyBars = []
+            for (int h = 0; h < 24; h++) {
+                def val = hourlySales[h]
+                def pct = (val * 100 / maxH).intValue()
+                if (pct < 3 && val > 0) pct = 3
+                def label = ''
+                if (val > 0) {
+                    label = val >= 1000 ? ec.l10n.format(val / 1000, '#0.#') + 'k' : ec.l10n.format(val, '#,##0')
+                }
+                hourlyBars.add([hour: String.format("%d", h), pct: pct, label: label,
+                    hasValue: val > BigDecimal.ZERO])
+            }
+
+            // Top selling products
+            def barColors = ['#e91e63','#2196f3','#ff9800','#4caf50','#9c27b0','#00bcd4','#f44336','#3f51b5','#ff5722','#607d8b']
+            topProductBars = []
+            if (txnIds) {
+                def itemList = ec.entity.find("zenith.erp.pos.PosTransactionItem")
+                    .condition("transactionId", "in", txnIds).list()
+                def productMap = [:]
+                itemList.each { item ->
+                    def pid = item.productName ?: item.productId
+                    if (!productMap[pid]) productMap[pid] = [name: pid, qty: BigDecimal.ZERO, total: BigDecimal.ZERO]
+                    productMap[pid].qty = productMap[pid].qty + ((item.quantity ?: 0) as BigDecimal)
+                    productMap[pid].total = productMap[pid].total + ((item.lineTotal ?: 0) as BigDecimal)
+                }
+                def sorted = productMap.values().sort { -(it.total as BigDecimal) }.take(10)
+                def maxP = sorted ? (sorted[0].total as BigDecimal) : BigDecimal.ONE
+                if (maxP == BigDecimal.ZERO) maxP = BigDecimal.ONE
+                sorted.eachWithIndex { p, idx ->
+                    def pct = (p.total * 100 / maxP).intValue()
+                    topProductBars.add([name: p.name, total: ec.l10n.format(p.total, '#,##0'),
+                        qty: ec.l10n.format(p.qty, '#,##0'), pct: pct,
+                        color: barColors[idx % barColors.size()]])
+                }
+            }
+
+            lastBillNumber = completedTxns ? completedTxns.last().transactionNumber : '-'
+            lastBillAmount = completedTxns ? ec.l10n.format(completedTxns.last().payableAmount ?: 0, '#,##0.00') : '0.00'
+
+            // Expenses today
+            todayExpenses = BigDecimal.ZERO
+            try {
+                def expList = ec.entity.find("zenith.erp.pos.PosExpense")
+                    .condition("expenseDate", "greater-equals", dayStart)
+                    .condition("expenseDate", "less-equals", dayEnd).list()
+                todayExpenses = expList.sum { (it.amount ?: 0) as BigDecimal } ?: BigDecimal.ZERO
+            } catch (Exception e) { /* entity may not exist yet */ }
+
+            // Cash In/Out today
+            todayCashIn = BigDecimal.ZERO
+            todayCashOut = BigDecimal.ZERO
+            try {
+                def cashList = ec.entity.find("zenith.erp.pos.PosCashEntry")
+                    .condition("entryDate", "greater-equals", dayStart)
+                    .condition("entryDate", "less-equals", dayEnd).list()
+                todayCashIn = cashList.findAll { it.entryType == 'CashIn' }.sum { (it.amount ?: 0) as BigDecimal } ?: BigDecimal.ZERO
+                todayCashOut = cashList.findAll { it.entryType == 'CashOut' }.sum { (it.amount ?: 0) as BigDecimal } ?: BigDecimal.ZERO
+            } catch (Exception e) { /* entity may not exist yet */ }
+
+            // Stock alerts
+            zeroStockCount = 0
+            lowStockCount = 0
+            try {
+                def stockList = ec.entity.find("zenith.erp.inventory.ProductStockView").list()
+                zeroStockCount = stockList.count { (it.totalQoh ?: 0) <= 0 }
+                lowStockCount = stockList.count { def qoh = (it.totalQoh ?: 0) as BigDecimal; def rp = (it.reorderPoint ?: 0) as BigDecimal; qoh > 0 && rp > 0 && qoh <= rp }
+            } catch (Exception e) { /* view may not exist */ }
+
+            // Active KOTs
+            activeKotCount = 0
+            try {
+                activeKotCount = ec.entity.find("zenith.erp.pos.KitchenOrderTicket")
+                    .condition("statusId", "in", ["KotNew", "KotPreparing", "KotReady"]).count() as int
+            } catch (Exception e) { /* entity may not exist */ }
+
+            // Wastage today
+            todayWastage = BigDecimal.ZERO
+            try {
+                def wList = ec.entity.find("zenith.erp.pos.PosStockWastage")
+                    .condition("wastageDate", "greater-equals", dayStart)
+                    .condition("wastageDate", "less-equals", dayEnd).list()
+                todayWastage = wList.sum { (it.totalLoss ?: 0) as BigDecimal } ?: BigDecimal.ZERO
+            } catch (Exception e) { /* entity may not exist */ }
+
+            // Active sessions
+            activeSessions = 0
+            try {
+                activeSessions = ec.entity.find("zenith.erp.pos.PosSession")
+                    .condition("statusId", "PsOpen").count() as int
+            } catch (Exception e) {}
+
+            // SaaS module-access flags: hide ERP-module links not in the tenant's plan
+            def _mods = context.saasAllowedModules
+            boolean _allMod = (context.saasHasAllAccess == true) || (context.isSaasTenant != true)
+            modSales = _allMod || (_mods != null && _mods.contains('sales'))
+            modInventory = _allMod || (_mods != null && _mods.contains('inventory'))
+            modContacts = _allMod || (_mods != null && _mods.contains('contacts'))
+            modAccounting = _allMod || (_mods != null && _mods.contains('accounting'))
+            modPurchase = _allMod || (_mods != null && _mods.contains('purchase'))
+        ]]></script>
+    </actions>
+
+    <widgets>
+        <render-mode><text type="html,qvt" template="true"><![CDATA[<details id="posHelp_dashboard" open style="background:#e8f0fe;border:1px solid #4285f4;border-left:6px solid #1a73e8;border-radius:10px;padding:10px 16px;margin:0 0 14px 0;font-family:Segoe UI,Arial,sans-serif"><summary style="cursor:pointer;font-weight:800;font-size:15px;color:#174ea6;outline:none">&#128202; New here? POS Dashboard &mdash; quick help <span style="font-weight:600;color:#5f6368;font-size:12px">(click to hide / show)</span></summary><div style="font-size:13px;color:#202124;line-height:1.9;margin-top:8px">This screen is your day at a glance &mdash; total sales, number of bills, how customers paid, the busiest hours and your best-selling items.<br><b>1</b>&nbsp;Change the <b>date</b> at the top to look at any day.<br><b>2</b>&nbsp;Click any coloured <b>tile</b> (Billing, Transactions, Reports, Cash&hellip;) to open that screen.<br><b>3</b>&nbsp;Keep an eye on the <b>Stock</b>, <b>Cash</b> and <b>Expenses</b> boxes during the day.</div></details>]]></text></render-mode>
+        <!-- Dashboard Header -->
+        <container style="row items-center justify-between q-px-lg q-py-sm q-mb-md bg-primary text-white border-radius-lg">
+            <container style="row items-center q-gutter-md">
+                <render-mode><text type="html"><![CDATA[<q-icon name="dashboard" class="text-h4"/>]]></text></render-mode>
+                <container>
+                    <label text="POS Dashboard" type="h5" style="text-weight-bold q-my-none"/>
+                    <label text="${displayDate}" style="text-caption text-white-7"/>
+                </container>
+            </container>
+            <container style="row items-center q-gutter-sm">
+                <form-single name="DateForm" transition="changeDashDate">
+                    <field name="dashDate"><default-field title="">
+                        <date-time type="date" default-value="${dashDate}"/>
+                    </default-field></field>
+                    <field name="goBtn"><default-field title="">
+                        <submit text="Go" icon="fa fa-refresh"/>
+                    </default-field></field>
+                </form-single>
+                <link url="goTerminal" text="Billing" icon="fa fa-calculator" btn-type="success" style="q-ml-md"/>
+            </container>
+        </container>
+
+        <!-- KPI Cards Row 1: Sales -->
+        <container-row>
+            <row-col lg="2" md="4" sm="6">
+                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md q-mb-md text-center cursor-pointer">
+                    <label text="${ec.l10n.format(totalSales, '#,##0.00')}" type="h5" style="text-weight-bold text-positive q-my-xs"/>
+                    <label text="${totalOrders} Orders" style="text-positive text-caption"/>
+                    <label text="TOTAL SALES" style="text-grey-6 text-caption text-weight-bold q-mt-xs"/>
+                </container>
+            </row-col>
+            <row-col lg="2" md="4" sm="6">
+                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md q-mb-md text-center">
+                    <label text="${ec.l10n.format(avgOrderValue, '#,##0.00')}" type="h5" style="text-weight-bold text-blue-8 q-my-xs"/>
+                    <label text="Per Order" style="text-blue-7 text-caption"/>
+                    <label text="AVG TICKET" style="text-grey-6 text-caption text-weight-bold q-mt-xs"/>
+                </container>
+            </row-col>
+            <row-col lg="2" md="4" sm="6">
+                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md q-mb-md text-center">
+                    <label text="${ec.l10n.format(totalTax, '#,##0.00')}" type="h5" style="text-weight-bold text-teal-8 q-my-xs"/>
+                    <label text="Collected" style="text-teal-7 text-caption"/>
+                    <label text="TAX" style="text-grey-6 text-caption text-weight-bold q-mt-xs"/>
+                </container>
+            </row-col>
+            <row-col lg="2" md="4" sm="6">
+                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md q-mb-md text-center">
+                    <label text="${ec.l10n.format(totalDiscount, '#,##0.00')}" type="h5" style="text-weight-bold text-orange-8 q-my-xs"/>
+                    <label text="Given" style="text-orange-7 text-caption"/>
+                    <label text="DISCOUNTS" style="text-grey-6 text-caption text-weight-bold q-mt-xs"/>
+                </container>
+            </row-col>
+            <row-col lg="2" md="4" sm="6">
+                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md q-mb-md text-center">
+                    <label text="${cancelledBills}" type="h5" style="text-weight-bold text-negative q-my-xs"/>
+                    <label text="${ec.l10n.format(cancelledAmount, '#,##0.00')}" style="text-red-7 text-caption"/>
+                    <label text="CANCELLED" style="text-grey-6 text-caption text-weight-bold q-mt-xs"/>
+                </container>
+            </row-col>
+            <row-col lg="2" md="4" sm="6">
+                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md q-mb-md text-center">
+                    <label text="${activeSessions}" type="h5" style="text-weight-bold text-purple-8 q-my-xs"/>
+                    <label text="Active Now" style="text-purple-7 text-caption"/>
+                    <label text="SESSIONS" style="text-grey-6 text-caption text-weight-bold q-mt-xs"/>
+                </container>
+            </row-col>
+        </container-row>
+
+        <!-- KPI Cards Row 2: Operations -->
+        <container-row>
+            <row-col lg="2" md="4" sm="6">
+                <container style="zenith-card bg-green-1 shadow-1 border-radius-lg q-pa-md q-mb-md text-center">
+                    <label text="${ec.l10n.format(todayCashIn, '#,##0.00')}" type="h6" style="text-weight-bold text-green-8 q-my-xs"/>
+                    <label text="CASH IN" style="text-green-7 text-caption text-weight-bold"/>
+                </container>
+            </row-col>
+            <row-col lg="2" md="4" sm="6">
+                <container style="zenith-card bg-red-1 shadow-1 border-radius-lg q-pa-md q-mb-md text-center">
+                    <label text="${ec.l10n.format(todayCashOut, '#,##0.00')}" type="h6" style="text-weight-bold text-red-8 q-my-xs"/>
+                    <label text="CASH OUT" style="text-red-7 text-caption text-weight-bold"/>
+                </container>
+            </row-col>
+            <row-col lg="2" md="4" sm="6">
+                <container style="zenith-card bg-orange-1 shadow-1 border-radius-lg q-pa-md q-mb-md text-center">
+                    <label text="${ec.l10n.format(todayExpenses, '#,##0.00')}" type="h6" style="text-weight-bold text-orange-8 q-my-xs"/>
+                    <label text="EXPENSES" style="text-orange-7 text-caption text-weight-bold"/>
+                </container>
+            </row-col>
+            <row-col lg="2" md="4" sm="6">
+                <container style="zenith-card bg-deep-orange-1 shadow-1 border-radius-lg q-pa-md q-mb-md text-center">
+                    <label text="${ec.l10n.format(todayWastage, '#,##0.00')}" type="h6" style="text-weight-bold text-deep-orange-8 q-my-xs"/>
+                    <label text="WASTAGE" style="text-deep-orange-7 text-caption text-weight-bold"/>
+                </container>
+            </row-col>
+            <row-col lg="2" md="4" sm="6">
+                <container style="zenith-card bg-amber-1 shadow-1 border-radius-lg q-pa-md q-mb-md text-center">
+                    <label text="${zeroStockCount} / ${lowStockCount}" type="h6" style="text-weight-bold text-amber-9 q-my-xs"/>
+                    <label text="OUT / LOW STOCK" style="text-amber-8 text-caption text-weight-bold"/>
+                </container>
+            </row-col>
+            <row-col lg="2" md="4" sm="6">
+                <container style="zenith-card bg-blue-1 shadow-1 border-radius-lg q-pa-md q-mb-md text-center">
+                    <label text="${activeKotCount}" type="h6" style="text-weight-bold text-blue-8 q-my-xs"/>
+                    <label text="ACTIVE KOTs" style="text-blue-7 text-caption text-weight-bold"/>
+                </container>
+            </row-col>
+        </container-row>
+
+        <container-row>
+            <!-- LEFT: Charts -->
+            <row-col lg="8" md="7" sm="12">
+                <!-- Hourly Sales -->
+                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-md">
+                    <label text="TIME WISE SALES" type="h6" style="text-weight-bold q-mt-none q-mb-md"/>
+                    <render-mode><text type="html,qvt" template="true"><![CDATA[
+<div style="width:100%;overflow-x:auto;">
+<div style="display:flex;align-items:flex-end;height:180px;gap:3px;min-width:580px;padding:0 2px;">
+<#list hourlyBars as bar>
+<div style="flex:1;display:flex;flex-direction:column;align-items:center;">
+<#if bar.hasValue><div style="font-size:8px;color:#666;margin-bottom:2px;white-space:nowrap;">${bar.label}</div></#if>
+<div style="width:100%;max-width:28px;height:${bar.pct}%;background:${bar.hasValue?then('#e91e63','#f5f5f5')};border-radius:3px 3px 0 0;min-height:2px;transition:height 0.3s;"></div>
+<div style="font-size:8px;color:#999;margin-top:3px;">${bar.hour}</div>
+</div>
+</#list>
+</div>
+</div>
+                    ]]></text></render-mode>
+                </container>
+
+                <!-- Top Selling Products -->
+                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-md">
+                    <label text="TOP SELLING PRODUCTS" type="h6" style="text-weight-bold q-mt-none q-mb-md"/>
+                    <section name="TopProductsSection" condition="topProductBars">
+                        <widgets>
+                            <render-mode><text type="html,qvt" template="true"><![CDATA[
+<#list topProductBars as p>
+<div style="display:flex;align-items:center;margin-bottom:8px;">
+<div style="width:140px;font-size:12px;color:#333;text-align:right;padding-right:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${p.name}">${p.name}</div>
+<div style="flex:1;background:#f5f5f5;border-radius:4px;height:22px;">
+<div style="width:${p.pct}%;background:${p.color};height:100%;border-radius:4px;min-width:4px;"></div>
+</div>
+<div style="width:70px;text-align:right;font-size:12px;font-weight:600;color:#333;padding-left:8px;">${p.total}</div>
+<div style="width:45px;text-align:right;font-size:11px;color:#888;padding-left:4px;">x${p.qty}</div>
+</div>
+</#list>
+                            ]]></text></render-mode>
+                        </widgets>
+                    </section>
+                    <section name="NoProductsSection" condition="!topProductBars">
+                        <widgets>
+                            <container style="text-center q-py-lg">
+                                <label text="No sales data for this date" style="text-grey-5"/>
+                            </container>
+                        </widgets>
+                    </section>
+                </container>
+            </row-col>
+
+            <!-- RIGHT: Payment + Quick Actions -->
+            <row-col lg="4" md="5" sm="12">
+                <!-- Payment Breakdown -->
+                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-md">
+                    <container style="row items-center q-mb-md">
+                        <label text="Payment Breakdown" type="h6" style="text-weight-bold q-my-none"/>
+                    </container>
+                    <container style="text-center q-mb-sm">
+                        <label text="${ec.l10n.format(totalSales, '#,##0.00')}" type="h4" style="text-weight-bold text-positive q-my-none"/>
+                    </container>
+                    <section name="PaymentSection" condition="paymentBars">
+                        <widgets>
+                            <render-mode><text type="html,qvt" template="true"><![CDATA[
+<#list paymentBars as pb>
+<div style="display:flex;align-items:center;margin-bottom:10px;">
+<div style="width:85px;font-size:13px;color:${pb.color};font-weight:600;">${pb.method}</div>
+<div style="flex:1;background:#f0f0f0;border-radius:4px;height:20px;margin:0 8px;">
+<div style="width:${pb.pct}%;background:${pb.color};height:100%;border-radius:4px;min-width:4px;"></div>
+</div>
+<div style="min-width:65px;text-align:right;font-size:11px;font-weight:700;background:${pb.color};color:#fff;padding:2px 8px;border-radius:3px;">${pb.amount}</div>
+</div>
+</#list>
+                            ]]></text></render-mode>
+                        </widgets>
+                    </section>
+                    <section name="NoPaymentSection" condition="!paymentBars">
+                        <widgets><label text="No payments recorded" style="text-grey-5"/></widgets>
+                    </section>
+                </container>
+
+                <!-- Info Panel -->
+                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-md">
+                    <render-mode><text type="html,qvt" template="true"><![CDATA[
+<div style="font-size:13px;">
+<div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #f0f0f0;">
+<span style="color:#555;">Last Bill</span>
+<span style="font-weight:600;">${lastBillNumber} &mdash; ${lastBillAmount}</span>
+</div>
+<div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #f0f0f0;">
+<span style="color:#555;">Net Cash Position</span>
+<span style="font-weight:600;color:#2E7D32;">${ec.l10n.format(todayCashIn - todayCashOut, '#,##0.00')}</span>
+</div>
+<div style="display:flex;justify-content:space-between;padding:8px 0;">
+<span style="color:#555;">Profit (Sales - Exp - Wastage)</span>
+<span style="font-weight:600;color:#1565C0;">${ec.l10n.format(totalSales - todayExpenses - todayWastage, '#,##0.00')}</span>
+</div>
+</div>
+                    ]]></text></render-mode>
+                </container>
+
+                <!-- Quick Actions -->
+                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-md">
+                    <label text="Quick Actions" type="h6" style="text-weight-bold q-my-none q-mb-md"/>
+                    <container style="column q-gutter-sm">
+                        <link url="goTerminal" text="Open Billing Terminal" icon="fa fa-calculator"
+                              btn-type="success" style="full-width"/>
+                        <link url="goDailySummary" text="Daily Summary" icon="fa fa-calendar"
+                              btn-type="primary" style="full-width"/>
+                        <link url="goTransactions" text="View Transactions" icon="fa fa-list"
+                              btn-type="primary" style="full-width"/>
+                        <link url="goReports" text="Sales Reports" icon="fa fa-bar-chart"
+                              btn-type="info" style="full-width"/>
+                    </container>
+                </container>
+
+                <!-- Module Links -->
+                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-md">
+                    <label text="Manage" type="h6" style="text-weight-bold q-my-none q-mb-md"/>
+                    <render-mode><text type="html,qvt" template="true"><![CDATA[
+<div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
+    <a href="goExpenses" style="display:flex;align-items:center;padding:10px;background:#FFF3E0;border-radius:8px;text-decoration:none;color:#E65100;font-size:13px;font-weight:500;">
+        <span style="margin-right:8px;font-size:18px;">&#128176;</span> Expenses
+    </a>
+    <a href="goCashEntry" style="display:flex;align-items:center;padding:10px;background:#E8F5E9;border-radius:8px;text-decoration:none;color:#2E7D32;font-size:13px;font-weight:500;">
+        <span style="margin-right:8px;font-size:18px;">&#128178;</span> Cash Entry
+    </a>
+    <a href="goStock" style="display:flex;align-items:center;padding:10px;background:#E3F2FD;border-radius:8px;text-decoration:none;color:#1565C0;font-size:13px;font-weight:500;">
+        <span style="margin-right:8px;font-size:18px;">&#128230;</span> Stock
+    </a>
+    <a href="goWastage" style="display:flex;align-items:center;padding:10px;background:#FFEBEE;border-radius:8px;text-decoration:none;color:#C62828;font-size:13px;font-weight:500;">
+        <span style="margin-right:8px;font-size:18px;">&#128465;</span> Wastage
+    </a>
+    <a href="goKitchen" style="display:flex;align-items:center;padding:10px;background:#FCE4EC;border-radius:8px;text-decoration:none;color:#AD1457;font-size:13px;font-weight:500;">
+        <span style="margin-right:8px;font-size:18px;">&#127859;</span> Kitchen
+    </a>
+    <a href="goImport" style="display:flex;align-items:center;padding:10px;background:#F3E5F5;border-radius:8px;text-decoration:none;color:#6A1B9A;font-size:13px;font-weight:500;">
+        <span style="margin-right:8px;font-size:18px;">&#128228;</span> Import
+    </a>
+    <a href="goSalesMode" style="display:flex;align-items:center;padding:10px;background:#E0F2F1;border-radius:8px;text-decoration:none;color:#00695C;font-size:13px;font-weight:500;">
+        <span style="margin-right:8px;font-size:18px;">&#127991;</span> Sales Mode
+    </a>
+    <a href="goReceipts" style="display:flex;align-items:center;padding:10px;background:#ECEFF1;border-radius:8px;text-decoration:none;color:#37474F;font-size:13px;font-weight:500;">
+        <span style="margin-right:8px;font-size:18px;">&#128424;</span> Receipts
+    </a>
+    <a href="goSessions" style="display:flex;align-items:center;padding:10px;background:#EDE7F6;border-radius:8px;text-decoration:none;color:#4527A0;font-size:13px;font-weight:500;">
+        <span style="margin-right:8px;font-size:18px;">&#128337;</span> Sessions
+    </a>
+    <a href="goTerminals" style="display:flex;align-items:center;padding:10px;background:#E8EAF6;border-radius:8px;text-decoration:none;color:#283593;font-size:13px;font-weight:500;">
+        <span style="margin-right:8px;font-size:18px;">&#128424;</span> Terminals
+    </a>
+    <a href="goPriceOverrides" style="display:flex;align-items:center;padding:10px;background:#FBE9E7;border-radius:8px;text-decoration:none;color:#BF360C;font-size:13px;font-weight:500;">
+        <span style="margin-right:8px;font-size:18px;">&#128200;</span> Price Overrides
+    </a>
+    <a href="goCreditBills" style="display:flex;align-items:center;padding:10px;background:#FFF3E0;border-radius:8px;text-decoration:none;color:#E65100;font-size:13px;font-weight:600;">
+        <span style="margin-right:8px;font-size:18px;">&#128196;</span> Credit Bills
+    </a>
+</div>
+                    ]]></text></render-mode>
+                </container>
+
+                <!-- ERP Module Links -->
+                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-md">
+                    <label text="ERP Modules" type="h6" style="text-weight-bold q-my-none q-mb-md"/>
+                    <container style="column q-gutter-sm">
+                        <section name="ErpSalesLink" condition="modSales"><widgets>
+                        <link url="goErpSales" text="Sales Orders &amp; Invoices" icon="fa fa-line-chart"
+                              btn-type="primary" style="full-width q-btn--dense"/>
+                        </widgets></section>
+                        <section name="ErpInventoryLink" condition="modInventory"><widgets>
+                        <link url="goErpInventory" text="Product Catalog" icon="fa fa-cubes"
+                              btn-type="info" style="full-width q-btn--dense"/>
+                        </widgets></section>
+                        <section name="ErpContactsLink" condition="modContacts"><widgets>
+                        <link url="goErpContacts" text="Customers" icon="fa fa-users"
+                              btn-type="success" style="full-width q-btn--dense"/>
+                        </widgets></section>
+                        <section name="ErpAccountingLink" condition="modAccounting"><widgets>
+                        <link url="goErpAccounting" text="Accounting" icon="fa fa-calculator"
+                              btn-type="warning" style="full-width q-btn--dense"/>
+                        </widgets></section>
+                        <section name="ErpPurchaseLink" condition="modPurchase"><widgets>
+                        <link url="goErpPurchase" text="Purchase Orders" icon="fa fa-shopping-cart"
+                              btn-type="danger" style="full-width q-btn--dense"/>
+                        </widgets></section>
+                    </container>
+                </container>
+            </row-col>
+        </container-row>
+    </widgets>
+</screen>

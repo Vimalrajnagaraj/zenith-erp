@@ -1,0 +1,258 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <service verb="clockIn" noun="Attendance">
+        <in-parameters>
+            <parameter name="employeePartyId"/>
+            <parameter name="shiftId"/>
+            <parameter name="source" default-value="AttSrc_WEB"/>
+            <parameter name="deviceId"/>
+            <parameter name="locationName"/>
+            <parameter name="notes"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="recordId"/>
+        </out-parameters>
+        <actions>
+            <set field="now" from="ec.user.nowTimestamp"/>
+            <set field="empId" from="employeePartyId ?: ec.user.userAccount?.partyId"/>
+
+            <!-- Check if already clocked in today -->
+            <set field="cal" from="java.util.Calendar.getInstance()"/>
+            <script>cal.setTime(now); cal.set(java.util.Calendar.HOUR_OF_DAY, 0); cal.set(java.util.Calendar.MINUTE, 0); cal.set(java.util.Calendar.SECOND, 0)</script>
+            <set field="todayStart" from="new java.sql.Timestamp(cal.getTimeInMillis())"/>
+            <script>cal.add(java.util.Calendar.DAY_OF_MONTH, 1)</script>
+            <set field="todayEnd" from="new java.sql.Timestamp(cal.getTimeInMillis())"/>
+
+            <entity-find entity-name="zenith.erp.attendance.AttendanceRecord" list="existing">
+                <econdition field-name="employeePartyId" from="empId"/>
+                <econdition field-name="attendanceDate" operator="greater-equals" from="todayStart"/>
+                <econdition field-name="attendanceDate" operator="less" from="todayEnd"/>
+                <econdition field-name="clockOut" operator="equals" from="null"/>
+            </entity-find>
+            <if condition="existing">
+                <return error="true" message="Already clocked in today. Please clock out first."/>
+            </if>
+
+            <!-- Determine late status -->
+            <set field="isLate" value="N"/>
+            <set field="lateMinutes" from="0"/>
+            <if condition="shiftId">
+                <entity-find-one entity-name="zenith.erp.attendance.WorkShift" value-field="shift">
+                    <field-map field-name="shiftId"/></entity-find-one>
+                <if condition="shift?.startTime">
+                    <set field="parts" from="shift.startTime.split(':')"/>
+                    <script>cal.setTime(now); cal.set(java.util.Calendar.HOUR_OF_DAY, parts[0] as int); cal.set(java.util.Calendar.MINUTE, parts[1] as int); cal.set(java.util.Calendar.SECOND, 0)</script>
+                    <set field="shiftStart" from="new java.sql.Timestamp(cal.getTimeInMillis())"/>
+                    <set field="graceMs" from="(shift.graceMinutes ?: 15) * 60 * 1000L"/>
+                    <if condition="now.getTime() &gt; (shiftStart.getTime() + graceMs)">
+                        <set field="isLate" value="Y"/>
+                        <set field="lateMinutes" from="((now.getTime() - shiftStart.getTime()) / 60000) as int"/>
+                    </if>
+                </if>
+            </if>
+
+            <service-call name="create#zenith.erp.attendance.AttendanceRecord"
+                          in-map="[recordId:recordId, employeePartyId:empId, attendanceDate:todayStart,
+                                   shiftId:shiftId, clockIn:now, attendanceStatus:'AttSt_PRESENT',
+                                   isLate:isLate, lateMinutes:lateMinutes, source:source,
+                                   deviceId:deviceId, locationName:locationName, notes:notes]" out-map="createOut"/>
+            <set field="recordId" from="createOut.recordId"/>
+        </actions>
+    </service>
+
+    <service verb="clockOut" noun="Attendance">
+        <in-parameters>
+            <parameter name="recordId"/>
+            <parameter name="employeePartyId"/>
+            <parameter name="notes"/>
+        </in-parameters>
+        <actions>
+            <set field="now" from="ec.user.nowTimestamp"/>
+            <set field="empId" from="employeePartyId ?: ec.user.userAccount?.partyId"/>
+
+            <if condition="recordId">
+                <entity-find-one entity-name="zenith.erp.attendance.AttendanceRecord" value-field="record"/>
+            <else>
+                <!-- Find today's open record -->
+                <set field="cal" from="java.util.Calendar.getInstance()"/>
+                <script>cal.setTime(now); cal.set(java.util.Calendar.HOUR_OF_DAY, 0); cal.set(java.util.Calendar.MINUTE, 0); cal.set(java.util.Calendar.SECOND, 0)</script>
+                <set field="todayStart" from="new java.sql.Timestamp(cal.getTimeInMillis())"/>
+                <script>cal.add(java.util.Calendar.DAY_OF_MONTH, 1)</script>
+                <set field="todayEnd" from="new java.sql.Timestamp(cal.getTimeInMillis())"/>
+
+                <entity-find entity-name="zenith.erp.attendance.AttendanceRecord" list="openRecords">
+                    <econdition field-name="employeePartyId" from="empId"/>
+                    <econdition field-name="attendanceDate" operator="greater-equals" from="todayStart"/>
+                    <econdition field-name="attendanceDate" operator="less" from="todayEnd"/>
+                    <econdition field-name="clockOut" operator="equals" from="null"/>
+                    <limit count="1"/>
+                </entity-find>
+                <set field="record" from="openRecords ? openRecords[0] : null"/>
+            </else></if>
+
+            <if condition="!record"><return error="true" message="No open attendance record found"/></if>
+            <if condition="record.clockOut"><return error="true" message="Already clocked out"/></if>
+
+            <set field="record.clockOut" from="now"/>
+            <if condition="notes"><set field="record.notes" from="(record.notes ? record.notes + '; ' : '') + notes"/></if>
+
+            <!-- Calculate total hours -->
+            <set field="diffMs" from="now.getTime() - record.clockIn.getTime()"/>
+            <set field="totalMinutes" from="(diffMs / 60000) as int"/>
+            <set field="record.totalHours" from="Math.round((totalMinutes / 60.0) * 100) / 100.0"/>
+
+            <!-- Determine half day vs full day -->
+            <if condition="record.totalHours &lt; 4">
+                <set field="record.attendanceStatus" value="AttSt_HALFDAY"/>
+            </if>
+
+            <!-- Calculate overtime -->
+            <entity-find entity-name="zenith.erp.attendance.EmployeeShift" list="empShifts">
+                <econdition field-name="employeePartyId" from="empId"/>
+                <date-filter/>
+                <limit count="1"/>
+            </entity-find>
+            <if condition="empShifts">
+                <entity-find-one entity-name="zenith.erp.attendance.AttendancePolicy" value-field="policy">
+                    <field-map field-name="policyId" from="empShifts[0].policyId"/></entity-find-one>
+                <if condition="policy &amp;&amp; record.totalHours &gt; (policy.overtimeAfterHours ?: 9)">
+                    <set field="record.overtimeHours" from="Math.round((record.totalHours - (policy.overtimeAfterHours ?: 9)) * 100) / 100.0"/>
+                </if>
+            </if>
+
+            <entity-update value-field="record"/>
+        </actions>
+    </service>
+
+    <service verb="mark" noun="Attendance">
+        <in-parameters>
+            <parameter name="employeePartyId" required="true"/>
+            <parameter name="attendanceDate" type="Timestamp" required="true"/>
+            <parameter name="attendanceStatus" required="true"/>
+            <parameter name="shiftId"/>
+            <parameter name="notes"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="recordId"/>
+        </out-parameters>
+        <actions>
+            <service-call name="create#zenith.erp.attendance.AttendanceRecord"
+                          in-map="[recordId:recordId, employeePartyId:employeePartyId,
+                                   attendanceDate:attendanceDate, shiftId:shiftId,
+                                   attendanceStatus:attendanceStatus, source:'AttSrc_MANUAL',
+                                   notes:notes]" out-map="createOut"/>
+            <set field="recordId" from="createOut.recordId"/>
+        </actions>
+    </service>
+
+    <service verb="regularize" noun="Attendance">
+        <in-parameters>
+            <parameter name="requestId" required="true"/>
+            <parameter name="approve" type="Boolean" required="true"/>
+            <parameter name="rejectionReason"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.attendance.RegularizationRequest" value-field="req"/>
+            <if condition="!req"><return error="true" message="Request not found"/></if>
+            <if condition="req.statusId != 'RgPending'">
+                <return error="true" message="Request already processed"/>
+            </if>
+
+            <set field="now" from="ec.user.nowTimestamp"/>
+            <set field="approverPartyId" from="ec.user.userAccount?.partyId"/>
+
+            <if condition="approve">
+                <set field="req.statusId" value="RgApproved"/>
+                <set field="req.approvedByPartyId" from="approverPartyId"/>
+                <set field="req.approvedDate" from="now"/>
+                <entity-update value-field="req"/>
+
+                <!-- Update the attendance record -->
+                <if condition="req.recordId">
+                    <entity-find-one entity-name="zenith.erp.attendance.AttendanceRecord" value-field="record">
+                        <field-map field-name="recordId" from="req.recordId"/></entity-find-one>
+                    <if condition="record">
+                        <set field="record.clockIn" from="req.requestedClockIn"/>
+                        <set field="record.clockOut" from="req.requestedClockOut"/>
+                        <if condition="req.requestedClockIn &amp;&amp; req.requestedClockOut">
+                            <set field="diffMs" from="req.requestedClockOut.getTime() - req.requestedClockIn.getTime()"/>
+                            <set field="record.totalHours" from="Math.round(((diffMs / 60000) / 60.0) * 100) / 100.0"/>
+                        </if>
+                        <set field="record.source" value="AttSrc_REGULARIZE"/>
+                        <set field="record.regularizedByPartyId" from="approverPartyId"/>
+                        <set field="record.regularizedDate" from="now"/>
+                        <set field="record.attendanceStatus" value="AttSt_PRESENT"/>
+                        <set field="record.isLate" value="N"/>
+                        <set field="record.lateMinutes" from="0"/>
+                        <entity-update value-field="record"/>
+                    </if>
+                </if>
+            <else>
+                <set field="req.statusId" value="RgRejected"/>
+                <set field="req.rejectionReason" from="rejectionReason"/>
+                <set field="req.approvedByPartyId" from="approverPartyId"/>
+                <set field="req.approvedDate" from="now"/>
+                <entity-update value-field="req"/>
+            </else></if>
+        </actions>
+    </service>
+
+    <service verb="generate" noun="MonthlyReport">
+        <in-parameters>
+            <parameter name="employeePartyId" required="true"/>
+            <parameter name="year" type="Integer" required="true"/>
+            <parameter name="month" type="Integer" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="presentDays" type="Integer"/>
+            <parameter name="absentDays" type="Integer"/>
+            <parameter name="halfDays" type="Integer"/>
+            <parameter name="leaveDays" type="Integer"/>
+            <parameter name="holidays" type="Integer"/>
+            <parameter name="weekOffs" type="Integer"/>
+            <parameter name="wfhDays" type="Integer"/>
+            <parameter name="totalHours" type="BigDecimal"/>
+            <parameter name="overtimeHours" type="BigDecimal"/>
+            <parameter name="lateCount" type="Integer"/>
+        </out-parameters>
+        <actions>
+            <set field="cal" from="java.util.Calendar.getInstance()"/>
+            <script>cal.set(year, month - 1, 1, 0, 0, 0)</script>
+            <set field="monthStart" from="new java.sql.Timestamp(cal.getTimeInMillis())"/>
+            <script>cal.add(java.util.Calendar.MONTH, 1)</script>
+            <set field="monthEnd" from="new java.sql.Timestamp(cal.getTimeInMillis())"/>
+
+            <entity-find entity-name="zenith.erp.attendance.AttendanceRecord" list="records">
+                <econdition field-name="employeePartyId"/>
+                <econdition field-name="attendanceDate" operator="greater-equals" from="monthStart"/>
+                <econdition field-name="attendanceDate" operator="less" from="monthEnd"/>
+            </entity-find>
+
+            <set field="presentDays" from="0"/>
+            <set field="absentDays" from="0"/>
+            <set field="halfDays" from="0"/>
+            <set field="leaveDays" from="0"/>
+            <set field="holidays" from="0"/>
+            <set field="weekOffs" from="0"/>
+            <set field="wfhDays" from="0"/>
+            <set field="totalHours" from="0" type="BigDecimal"/>
+            <set field="overtimeHours" from="0" type="BigDecimal"/>
+            <set field="lateCount" from="0"/>
+
+            <iterate list="records" entry="rec">
+                <if condition="rec.attendanceStatus == 'AttSt_PRESENT' || rec.attendanceStatus == 'AttSt_ONDUTY'"><set field="presentDays" from="presentDays + 1"/></if>
+                <if condition="rec.attendanceStatus == 'AttSt_ABSENT'"><set field="absentDays" from="absentDays + 1"/></if>
+                <if condition="rec.attendanceStatus == 'AttSt_HALFDAY'"><set field="halfDays" from="halfDays + 1"/></if>
+                <if condition="rec.attendanceStatus == 'AttSt_ONLEAVE'"><set field="leaveDays" from="leaveDays + 1"/></if>
+                <if condition="rec.attendanceStatus == 'AttSt_HOLIDAY'"><set field="holidays" from="holidays + 1"/></if>
+                <if condition="rec.attendanceStatus == 'AttSt_WEEKOFF'"><set field="weekOffs" from="weekOffs + 1"/></if>
+                <if condition="rec.attendanceStatus == 'AttSt_WFH'"><set field="wfhDays" from="wfhDays + 1"/></if>
+                <set field="totalHours" from="totalHours + (rec.totalHours ?: 0)"/>
+                <set field="overtimeHours" from="overtimeHours + (rec.overtimeHours ?: 0)"/>
+                <if condition="rec.isLate == 'Y'"><set field="lateCount" from="lateCount + 1"/></if>
+            </iterate>
+        </actions>
+    </service>
+</services>

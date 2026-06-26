@@ -1,0 +1,271 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
+        default-menu-title="Receipt PDF" default-menu-include="false"
+        render-mode="xsl-fo">
+
+    <parameter name="transactionId" required="true"/>
+
+    <actions>
+        <entity-find-one entity-name="zenith.erp.pos.PosTransaction" value-field="txn"/>
+        <if condition="!txn"><return error="true" message="Transaction not found"/></if>
+
+        <entity-find entity-name="zenith.erp.pos.PosTransactionItem" list="items">
+            <econdition field-name="transactionId"/><order-by field-name="itemSeqId"/></entity-find>
+        <entity-find entity-name="zenith.erp.pos.PosPayment" list="payments">
+            <econdition field-name="transactionId"/></entity-find>
+
+        <entity-find-one entity-name="zenith.erp.pos.PosSession" value-field="session">
+            <field-map field-name="sessionId" from="txn.sessionId"/></entity-find-one>
+        <entity-find-one entity-name="zenith.erp.pos.PosTerminal" value-field="terminal">
+            <field-map field-name="terminalId" from="session.terminalId"/></entity-find-one>
+
+        <!-- Receipt template -->
+        <entity-find entity-name="zenith.erp.pos.PosReceiptTemplate" list="rTplList" limit="1">
+            <econdition field-name="isDefault" value="Y"/><econdition field-name="isActive" value="Y"/>
+        </entity-find>
+        <set field="rTpl" from="rTplList ? rTplList[0] : null"/>
+        <if condition="!rTpl">
+            <entity-find entity-name="zenith.erp.pos.PosReceiptTemplate" list="rTplList2" limit="1">
+                <econdition field-name="isActive" value="Y"/></entity-find>
+            <set field="rTpl" from="rTplList2 ? rTplList2[0] : null"/>
+        </if>
+
+        <!-- Operator name -->
+        <script><![CDATA[
+            operatorName = ''
+            if (session?.operatorPartyId) {
+                def opPerson = ec.entity.find("mantle.party.Person")
+                        .condition("partyId", session.operatorPartyId).one()
+                if (opPerson) operatorName = [(opPerson.firstName ?: ''), (opPerson.lastName ?: '')].findAll{it}.join(' ')
+            }
+
+            storeAddr = ''
+            if (rTpl) {
+                storeAddr = [rTpl.addressLine1, rTpl.addressLine2, rTpl.city, rTpl.state, rTpl.pincode].findAll{it}.join(', ')
+            }
+
+            storeName = rTpl?.companyName ?: terminal?.terminalName ?: 'Store'
+            storePhone = rTpl?.phone ?: ''
+            storeEmail = rTpl?.email ?: ''
+            taxReg = rTpl?.taxRegistrationNumber ?: terminal?.taxRegistrationNumber ?: ''
+            headerText = rTpl?.headerText ?: ''
+            footerText = rTpl?.footerText ?: ''
+            termsText = rTpl?.termsText ?: ''
+
+            cs = '₹'
+            billNo = txn.transactionNumber ?: txn.transactionId
+            billDate = ec.l10n.format(txn.entryDate, 'dd/MM/yyyy hh:mm a')
+            customerName = txn.customerName ?: 'Walk-In Customer'
+            customerPhone = txn.customerPhone ?: ''
+
+            totalQty = items.sum { (it.quantity ?: 0) as BigDecimal } ?: 0
+            totalSaving = BigDecimal.ZERO
+            items.each {
+                def mrp = (it.mrp ?: it.unitPrice ?: 0) as BigDecimal
+                def rate = (it.unitPrice ?: 0) as BigDecimal
+                def qty = (it.quantity ?: 0) as BigDecimal
+                def saving = (mrp - rate) * qty
+                if (saving > 0) totalSaving += saving
+            }
+            paidTotal = payments.sum { (it.amount ?: 0) as BigDecimal } ?: 0
+        ]]></script>
+    </actions>
+
+    <widgets>
+        <render-mode><text type="xsl-fo" template="true"><![CDATA[
+<fo:root xmlns:fo="http://www.w3.org/1999/XSL/Format">
+    <fo:layout-master-set>
+        <fo:simple-page-master master-name="receipt" page-width="80mm" page-height="297mm"
+                margin-top="3mm" margin-bottom="3mm" margin-left="3mm" margin-right="3mm">
+            <fo:region-body/>
+        </fo:simple-page-master>
+    </fo:layout-master-set>
+
+    <fo:page-sequence master-reference="receipt">
+        <fo:flow flow-name="xsl-before-body-region-body">
+
+            <#-- Header Text -->
+            <#if headerText?has_content>
+            <fo:block font-size="7pt" text-align="center" color="#666" space-after="1mm">${headerText}</fo:block>
+            </#if>
+
+            <#-- Store Name -->
+            <fo:block font-size="12pt" font-weight="bold" text-align="center" space-after="0.5mm">${storeName}</fo:block>
+
+            <#-- Store Address -->
+            <#if storeAddr?has_content>
+            <fo:block font-size="7pt" text-align="center" color="#444">${storeAddr}</fo:block>
+            </#if>
+            <#if storePhone?has_content>
+            <fo:block font-size="7pt" text-align="center" color="#444">Ph: ${storePhone}</fo:block>
+            </#if>
+            <#if storeEmail?has_content>
+            <fo:block font-size="7pt" text-align="center" color="#444">${storeEmail}</fo:block>
+            </#if>
+            <#if taxReg?has_content>
+            <fo:block font-size="7pt" text-align="center" color="#444">Tax Reg: ${taxReg}</fo:block>
+            </#if>
+
+            <#-- Separator -->
+            <fo:block space-before="1.5mm" space-after="1.5mm" border-bottom="0.5pt dashed #000"/>
+
+            <#-- Invoice Header -->
+            <fo:block font-size="9pt" font-weight="bold" text-align="center" space-after="1mm">TAX INVOICE</fo:block>
+
+            <fo:table table-layout="fixed" width="100%">
+                <fo:table-column column-width="25mm"/><fo:table-column column-width="proportional-column-width(1)"/>
+                <fo:table-body>
+                    <fo:table-row><fo:table-cell><fo:block font-size="7pt" color="#666">Invoice No:</fo:block></fo:table-cell>
+                        <fo:table-cell><fo:block font-size="7pt" font-weight="bold">${billNo}</fo:block></fo:table-cell></fo:table-row>
+                    <fo:table-row><fo:table-cell><fo:block font-size="7pt" color="#666">Date:</fo:block></fo:table-cell>
+                        <fo:table-cell><fo:block font-size="7pt">${billDate}</fo:block></fo:table-cell></fo:table-row>
+                    <#if operatorName?has_content>
+                    <fo:table-row><fo:table-cell><fo:block font-size="7pt" color="#666">Cashier:</fo:block></fo:table-cell>
+                        <fo:table-cell><fo:block font-size="7pt">${operatorName}</fo:block></fo:table-cell></fo:table-row>
+                    </#if>
+                    <fo:table-row><fo:table-cell><fo:block font-size="7pt" color="#666">Customer:</fo:block></fo:table-cell>
+                        <fo:table-cell><fo:block font-size="7pt">${customerName}</fo:block></fo:table-cell></fo:table-row>
+                    <#if customerPhone?has_content>
+                    <fo:table-row><fo:table-cell><fo:block font-size="7pt" color="#666">Mobile:</fo:block></fo:table-cell>
+                        <fo:table-cell><fo:block font-size="7pt">${customerPhone}</fo:block></fo:table-cell></fo:table-row>
+                    </#if>
+                </fo:table-body>
+            </fo:table>
+
+            <#-- Separator -->
+            <fo:block space-before="1.5mm" space-after="1mm" border-bottom="0.5pt solid #000"/>
+
+            <#-- Items Table Header -->
+            <fo:table table-layout="fixed" width="100%">
+                <fo:table-column column-width="proportional-column-width(3)"/>
+                <fo:table-column column-width="10mm"/>
+                <fo:table-column column-width="14mm"/>
+                <fo:table-column column-width="16mm"/>
+                <fo:table-header>
+                    <fo:table-row background-color="#f0f0f0">
+                        <fo:table-cell padding="1pt"><fo:block font-size="7pt" font-weight="bold">Item</fo:block></fo:table-cell>
+                        <fo:table-cell padding="1pt"><fo:block font-size="7pt" font-weight="bold" text-align="center">Qty</fo:block></fo:table-cell>
+                        <fo:table-cell padding="1pt"><fo:block font-size="7pt" font-weight="bold" text-align="right">Rate</fo:block></fo:table-cell>
+                        <fo:table-cell padding="1pt"><fo:block font-size="7pt" font-weight="bold" text-align="right">Total</fo:block></fo:table-cell>
+                    </fo:table-row>
+                </fo:table-header>
+                <fo:table-body>
+                    <#list items as item>
+                    <fo:table-row>
+                        <fo:table-cell padding="1pt"><fo:block font-size="7pt">${item.productName!item.productId!''}</fo:block></fo:table-cell>
+                        <fo:table-cell padding="1pt"><fo:block font-size="7pt" text-align="center">${ec.l10n.format(item.quantity!0, '#,##0.##')}</fo:block></fo:table-cell>
+                        <fo:table-cell padding="1pt"><fo:block font-size="7pt" text-align="right">${ec.l10n.format(item.unitPrice!0, '#,##0.00')}</fo:block></fo:table-cell>
+                        <fo:table-cell padding="1pt"><fo:block font-size="7pt" text-align="right">${ec.l10n.format(item.lineTotal!0, '#,##0.00')}</fo:block></fo:table-cell>
+                    </fo:table-row>
+                    <#if ((item.discountAmount!0) as number) gt 0>
+                    <fo:table-row>
+                        <fo:table-cell number-columns-spanned="4" padding="0pt">
+                            <fo:block font-size="6pt" color="#666" margin-left="3mm">Disc: -${cs}${ec.l10n.format(item.discountAmount!0, '#,##0.00')}</fo:block>
+                        </fo:table-cell>
+                    </fo:table-row>
+                    </#if>
+                    </#list>
+                </fo:table-body>
+            </fo:table>
+
+            <#-- Separator -->
+            <fo:block space-before="1mm" space-after="1mm" border-bottom="0.5pt dashed #000"/>
+
+            <#-- Summary -->
+            <fo:table table-layout="fixed" width="100%">
+                <fo:table-column column-width="proportional-column-width(1)"/><fo:table-column column-width="20mm"/>
+                <fo:table-body>
+                    <fo:table-row>
+                        <fo:table-cell><fo:block font-size="7pt">Total Qty: ${ec.l10n.format(totalQty, '#,##0.##')} | Items: ${items.size()}</fo:block></fo:table-cell>
+                        <fo:table-cell><fo:block/></fo:table-cell>
+                    </fo:table-row>
+                </fo:table-body>
+            </fo:table>
+
+            <fo:table table-layout="fixed" width="100%" space-before="1mm">
+                <fo:table-column column-width="proportional-column-width(1)"/><fo:table-column column-width="24mm"/>
+                <fo:table-body>
+                    <fo:table-row>
+                        <fo:table-cell><fo:block font-size="7pt">Subtotal</fo:block></fo:table-cell>
+                        <fo:table-cell><fo:block font-size="7pt" text-align="right">${cs}${ec.l10n.format(txn.subtotal!0, '#,##0.00')}</fo:block></fo:table-cell>
+                    </fo:table-row>
+                    <#if ((txn.discountTotal!0) as number) gt 0>
+                    <fo:table-row>
+                        <fo:table-cell><fo:block font-size="7pt">Discount</fo:block></fo:table-cell>
+                        <fo:table-cell><fo:block font-size="7pt" text-align="right">-${cs}${ec.l10n.format(txn.discountTotal!0, '#,##0.00')}</fo:block></fo:table-cell>
+                    </fo:table-row>
+                    </#if>
+                    <#if ((txn.totalTaxAmount!0) as number) gt 0>
+                    <fo:table-row>
+                        <fo:table-cell><fo:block font-size="7pt">Tax</fo:block></fo:table-cell>
+                        <fo:table-cell><fo:block font-size="7pt" text-align="right">${cs}${ec.l10n.format(txn.totalTaxAmount!0, '#,##0.00')}</fo:block></fo:table-cell>
+                    </fo:table-row>
+                    </#if>
+                    <#if ((txn.roundOff!0) as number) != 0>
+                    <fo:table-row>
+                        <fo:table-cell><fo:block font-size="6pt" color="#666">Round Off</fo:block></fo:table-cell>
+                        <fo:table-cell><fo:block font-size="6pt" text-align="right" color="#666">${ec.l10n.format(txn.roundOff!0, '#,##0.00')}</fo:block></fo:table-cell>
+                    </fo:table-row>
+                    </#if>
+                </fo:table-body>
+            </fo:table>
+
+            <#-- Grand Total -->
+            <fo:block space-before="1mm" space-after="0.5mm" border-bottom="1pt solid #000"/>
+            <fo:table table-layout="fixed" width="100%">
+                <fo:table-column column-width="proportional-column-width(1)"/><fo:table-column column-width="24mm"/>
+                <fo:table-body>
+                    <fo:table-row>
+                        <fo:table-cell><fo:block font-size="10pt" font-weight="bold">TOTAL</fo:block></fo:table-cell>
+                        <fo:table-cell><fo:block font-size="10pt" font-weight="bold" text-align="right">${cs}${ec.l10n.format(txn.payableAmount!0, '#,##0.00')}</fo:block></fo:table-cell>
+                    </fo:table-row>
+                </fo:table-body>
+            </fo:table>
+            <fo:block space-before="0.5mm" space-after="1mm" border-bottom="1pt solid #000"/>
+
+            <#-- Payment Breakdown -->
+            <fo:table table-layout="fixed" width="100%">
+                <fo:table-column column-width="proportional-column-width(1)"/><fo:table-column column-width="24mm"/>
+                <fo:table-body>
+                    <#list payments as pmt>
+                    <fo:table-row>
+                        <fo:table-cell><fo:block font-size="7pt">${pmt.paymentMethod!''}</fo:block></fo:table-cell>
+                        <fo:table-cell><fo:block font-size="7pt" text-align="right">${cs}${ec.l10n.format(pmt.amount!0, '#,##0.00')}</fo:block></fo:table-cell>
+                    </fo:table-row>
+                    </#list>
+                    <#if ((txn.changeAmount!0) as number) gt 0>
+                    <fo:table-row>
+                        <fo:table-cell><fo:block font-size="7pt" font-weight="bold">Change</fo:block></fo:table-cell>
+                        <fo:table-cell><fo:block font-size="7pt" text-align="right" font-weight="bold">${cs}${ec.l10n.format(txn.changeAmount!0, '#,##0.00')}</fo:block></fo:table-cell>
+                    </fo:table-row>
+                    </#if>
+                </fo:table-body>
+            </fo:table>
+
+            <#-- Savings -->
+            <#if (totalSaving gt 0)>
+            <fo:block space-before="1.5mm" space-after="1mm" border-bottom="0.5pt dashed #000"/>
+            <fo:block font-size="8pt" font-weight="bold" text-align="center">You Saved: ${cs}${ec.l10n.format(totalSaving, '#,##0.00')}</fo:block>
+            </#if>
+
+            <#-- Terms -->
+            <#if termsText?has_content>
+            <fo:block space-before="1.5mm" space-after="1mm" border-bottom="0.5pt dashed #000"/>
+            <fo:block font-size="6pt" text-align="center" color="#666" linefeed-treatment="preserve">${termsText}</fo:block>
+            </#if>
+
+            <#-- Footer -->
+            <#if footerText?has_content>
+            <fo:block space-before="1mm" border-bottom="0.5pt dashed #000"/>
+            <fo:block font-size="6pt" text-align="center" color="#666" space-before="1mm" linefeed-treatment="preserve">${footerText}</fo:block>
+            </#if>
+
+            <fo:block font-size="9pt" font-weight="bold" text-align="center" space-before="2mm">Thank You !!</fo:block>
+
+        </fo:flow>
+    </fo:page-sequence>
+</fo:root>
+        ]]></text></render-mode>
+    </widgets>
+</screen>

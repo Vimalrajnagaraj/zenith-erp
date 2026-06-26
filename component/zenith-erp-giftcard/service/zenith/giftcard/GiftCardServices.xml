@@ -1,0 +1,282 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <!-- ========== Issue Gift Card ========== -->
+
+    <service verb="issue" noun="GiftCard">
+        <in-parameters>
+            <parameter name="initialBalance" type="BigDecimal" required="true"/>
+            <parameter name="currencyUomId" required="true"/>
+            <parameter name="organizationPartyId"/>
+            <parameter name="issuedToPartyId"/>
+            <parameter name="purchasedByPartyId"/>
+            <parameter name="isPhysical" default-value="N"/>
+            <parameter name="expiryDays" type="Integer"/>
+            <parameter name="notes"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="giftCardId"/>
+            <parameter name="cardNumber"/>
+            <parameter name="pin"/>
+        </out-parameters>
+        <actions>
+            <!-- Generate unique card number and PIN -->
+            <script><![CDATA[
+                def rng = new java.security.SecureRandom()
+                cardNumber = String.format("GC%012d", rng.nextLong().abs() % 1000000000000L)
+                pin = String.format("%04d", rng.nextInt(10000))
+            ]]></script>
+
+            <set field="expiryDate" from="null"/>
+            <if condition="expiryDays">
+                <script>expiryDate = new java.sql.Timestamp(ec.user.nowTimestamp.time + (expiryDays * 86400000L))</script>
+            </if>
+
+            <service-call name="create#zenith.erp.giftcard.GiftCard" out-map="context"
+                          in-map="[cardNumber:cardNumber, pin:pin, initialBalance:initialBalance,
+                                   currentBalance:initialBalance, currencyUomId:currencyUomId,
+                                   issuedDate:ec.user.nowTimestamp, expiryDate:expiryDate,
+                                   isPhysical:isPhysical, issuedToPartyId:issuedToPartyId,
+                                   purchasedByPartyId:purchasedByPartyId,
+                                   organizationPartyId:organizationPartyId, statusId:'GcActive',
+                                   notes:notes]"/>
+
+            <service-call name="create#zenith.erp.giftcard.GiftCardTransaction"
+                          in-map="[giftCardId:giftCardId, transactionTypeEnumId:'GctLoad',
+                                   amount:initialBalance, balanceAfter:initialBalance,
+                                   referenceType:'INITIAL', transactionDate:ec.user.nowTimestamp,
+                                   performedByUserId:ec.user.userId, notes:'Initial load']"/>
+        </actions>
+    </service>
+
+    <!-- ========== Load / Top-up Gift Card ========== -->
+
+    <service verb="load" noun="GiftCard">
+        <in-parameters>
+            <parameter name="giftCardId" required="true"/>
+            <parameter name="amount" type="BigDecimal" required="true"/>
+            <parameter name="referenceType"/>
+            <parameter name="referenceId"/>
+            <parameter name="notes"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="newBalance" type="BigDecimal"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.giftcard.GiftCard" value-field="card" for-update="true"/>
+            <if condition="!card || card.statusId != 'GcActive'">
+                <return error="true" message="Gift card not found or not active"/>
+            </if>
+            <if condition="amount &lt;= 0">
+                <return error="true" message="Amount must be positive"/>
+            </if>
+
+            <set field="newBalance" from="(card.currentBalance ?: BigDecimal.ZERO) + amount" type="BigDecimal"/>
+            <set field="card.currentBalance" from="newBalance"/>
+            <entity-update value-field="card"/>
+
+            <service-call name="create#zenith.erp.giftcard.GiftCardTransaction"
+                          in-map="[giftCardId:giftCardId, transactionTypeEnumId:'GctLoad',
+                                   amount:amount, balanceAfter:newBalance,
+                                   referenceType:referenceType, referenceId:referenceId,
+                                   transactionDate:ec.user.nowTimestamp,
+                                   performedByUserId:ec.user.userId, notes:notes]"/>
+        </actions>
+    </service>
+
+    <!-- ========== Redeem Gift Card ========== -->
+
+    <service verb="redeem" noun="GiftCard">
+        <in-parameters>
+            <parameter name="giftCardId"/>
+            <parameter name="cardNumber"/>
+            <parameter name="pin"/>
+            <parameter name="amount" type="BigDecimal" required="true"/>
+            <parameter name="referenceType"/>
+            <parameter name="referenceId"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="redeemedAmount" type="BigDecimal"/>
+            <parameter name="remainingBalance" type="BigDecimal"/>
+            <parameter name="giftCardId"/>
+        </out-parameters>
+        <actions>
+            <!-- Lookup by card number if giftCardId not provided -->
+            <if condition="!giftCardId &amp;&amp; cardNumber">
+                <entity-find entity-name="zenith.erp.giftcard.GiftCard" list="cards" limit="1">
+                    <econdition field-name="cardNumber"/>
+                </entity-find>
+                <if condition="!cards">
+                    <return error="true" message="Gift card not found"/>
+                </if>
+                <set field="card" from="cards[0]"/>
+                <set field="giftCardId" from="card.giftCardId"/>
+            <else>
+                <entity-find-one entity-name="zenith.erp.giftcard.GiftCard" value-field="card" for-update="true"/>
+            </else></if>
+
+            <if condition="!card">
+                <return error="true" message="Gift card not found"/>
+            </if>
+            <if condition="pin &amp;&amp; card.pin != pin">
+                <return error="true" message="Invalid PIN"/>
+            </if>
+            <if condition="card.statusId != 'GcActive'">
+                <return error="true" message="Gift card is ${card.statusId}"/>
+            </if>
+            <if condition="card.expiryDate &amp;&amp; ec.user.nowTimestamp &gt; card.expiryDate">
+                <service-call name="update#zenith.erp.giftcard.GiftCard"
+                              in-map="[giftCardId:giftCardId, statusId:'GcExpired']"/>
+                <return error="true" message="Gift card has expired"/>
+            </if>
+
+            <set field="available" from="card.currentBalance ?: BigDecimal.ZERO" type="BigDecimal"/>
+            <set field="redeemedAmount" from="amount &lt;= available ? amount : available" type="BigDecimal"/>
+            <set field="remainingBalance" from="available - redeemedAmount" type="BigDecimal"/>
+
+            <!-- Re-fetch for update if we looked up by card number -->
+            <entity-find-one entity-name="zenith.erp.giftcard.GiftCard" value-field="cardForUpdate" for-update="true"/>
+            <set field="cardForUpdate.currentBalance" from="remainingBalance"/>
+            <if condition="remainingBalance &lt;= 0">
+                <set field="cardForUpdate.statusId" value="GcUsed"/>
+            </if>
+            <entity-update value-field="cardForUpdate"/>
+
+            <service-call name="create#zenith.erp.giftcard.GiftCardTransaction"
+                          in-map="[giftCardId:giftCardId, transactionTypeEnumId:'GctRedeem',
+                                   amount:redeemedAmount, balanceAfter:remainingBalance,
+                                   referenceType:referenceType, referenceId:referenceId,
+                                   transactionDate:ec.user.nowTimestamp,
+                                   performedByUserId:ec.user.userId]"/>
+        </actions>
+    </service>
+
+    <!-- ========== Check Balance ========== -->
+
+    <service verb="check" noun="Balance">
+        <in-parameters>
+            <parameter name="cardNumber" required="true"/>
+            <parameter name="pin"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="giftCardId"/>
+            <parameter name="currentBalance" type="BigDecimal"/>
+            <parameter name="currencyUomId"/>
+            <parameter name="statusId"/>
+            <parameter name="expiryDate" type="Timestamp"/>
+        </out-parameters>
+        <actions>
+            <entity-find entity-name="zenith.erp.giftcard.GiftCard" list="cards" limit="1">
+                <econdition field-name="cardNumber"/>
+            </entity-find>
+            <if condition="!cards">
+                <return error="true" message="Gift card not found"/>
+            </if>
+            <set field="card" from="cards[0]"/>
+            <if condition="pin &amp;&amp; card.pin != pin">
+                <return error="true" message="Invalid PIN"/>
+            </if>
+            <set field="giftCardId" from="card.giftCardId"/>
+            <set field="currentBalance" from="card.currentBalance"/>
+            <set field="currencyUomId" from="card.currencyUomId"/>
+            <set field="statusId" from="card.statusId"/>
+            <set field="expiryDate" from="card.expiryDate"/>
+        </actions>
+    </service>
+
+    <!-- ========== Issue Store Credit ========== -->
+
+    <service verb="issue" noun="StoreCredit">
+        <in-parameters>
+            <parameter name="partyId" required="true"/>
+            <parameter name="amount" type="BigDecimal" required="true"/>
+            <parameter name="currencyUomId" required="true"/>
+            <parameter name="reasonEnumId" required="true"/>
+            <parameter name="organizationPartyId"/>
+            <parameter name="expiryDays" type="Integer"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="creditId"/>
+        </out-parameters>
+        <actions>
+            <set field="expiryDate" from="null"/>
+            <if condition="expiryDays">
+                <script>expiryDate = new java.sql.Timestamp(ec.user.nowTimestamp.time + (expiryDays * 86400000L))</script>
+            </if>
+
+            <service-call name="create#zenith.erp.giftcard.StoreCredit" out-map="context"
+                          in-map="[partyId:partyId, balance:amount, currencyUomId:currencyUomId,
+                                   reasonEnumId:reasonEnumId, organizationPartyId:organizationPartyId,
+                                   createdDate:ec.user.nowTimestamp, expiryDate:expiryDate]"/>
+
+            <service-call name="create#zenith.erp.giftcard.StoreCreditTransaction"
+                          in-map="[creditId:creditId, transactionTypeEnumId:'SctCredit',
+                                   amount:amount, balanceAfter:amount,
+                                   transactionDate:ec.user.nowTimestamp,
+                                   performedByUserId:ec.user.userId]"/>
+        </actions>
+    </service>
+
+    <!-- ========== Use Store Credit ========== -->
+
+    <service verb="use" noun="StoreCredit">
+        <in-parameters>
+            <parameter name="creditId" required="true"/>
+            <parameter name="amount" type="BigDecimal" required="true"/>
+            <parameter name="referenceType"/>
+            <parameter name="referenceId"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="usedAmount" type="BigDecimal"/>
+            <parameter name="remainingBalance" type="BigDecimal"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.giftcard.StoreCredit" value-field="credit" for-update="true"/>
+            <if condition="!credit">
+                <return error="true" message="Store credit not found"/>
+            </if>
+            <if condition="credit.expiryDate &amp;&amp; ec.user.nowTimestamp &gt; credit.expiryDate">
+                <return error="true" message="Store credit has expired"/>
+            </if>
+
+            <set field="available" from="credit.balance ?: BigDecimal.ZERO" type="BigDecimal"/>
+            <set field="usedAmount" from="amount &lt;= available ? amount : available" type="BigDecimal"/>
+            <set field="remainingBalance" from="available - usedAmount" type="BigDecimal"/>
+
+            <set field="credit.balance" from="remainingBalance"/>
+            <entity-update value-field="credit"/>
+
+            <service-call name="create#zenith.erp.giftcard.StoreCreditTransaction"
+                          in-map="[creditId:creditId, transactionTypeEnumId:'SctDebit',
+                                   amount:usedAmount, balanceAfter:remainingBalance,
+                                   referenceType:referenceType, referenceId:referenceId,
+                                   transactionDate:ec.user.nowTimestamp,
+                                   performedByUserId:ec.user.userId]"/>
+        </actions>
+    </service>
+
+    <!-- ========== Get Customer Store Credits ========== -->
+
+    <service verb="get" noun="CustomerStoreCredits">
+        <in-parameters>
+            <parameter name="partyId" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="credits" type="List"/>
+            <parameter name="totalBalance" type="BigDecimal"/>
+        </out-parameters>
+        <actions>
+            <entity-find entity-name="zenith.erp.giftcard.StoreCredit" list="credits">
+                <econdition field-name="partyId"/>
+                <econdition field-name="balance" operator="greater" from="0"/>
+                <order-by field-name="-createdDate"/>
+            </entity-find>
+            <set field="totalBalance" from="BigDecimal.ZERO" type="BigDecimal"/>
+            <iterate list="credits" entry="cr">
+                <set field="totalBalance" from="totalBalance + (cr.balance ?: 0)"/>
+            </iterate>
+        </actions>
+    </service>
+
+</services>

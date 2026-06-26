@@ -1,0 +1,300 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <service verb="ask" noun="Copilot" allow-remote="true" transaction-timeout="300">
+        <in-parameters>
+            <parameter name="query" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="response" required="true"/>
+        </out-parameters>
+        <actions>
+            <script><![CDATA[
+                import org.moqui.context.ExecutionContext
+                import groovy.json.JsonOutput
+                import groovy.json.JsonSlurper
+
+                ExecutionContext ec = context.ec
+                String resp = null
+                boolean _d = ec.artifactExecution.disableAuthz()
+                try {
+                    def key = ec.entity.find("zenith.erp.base.CompanySettings")
+                        .condition("organizationPartyId", "ZETAERP")
+                        .condition("settingKey", "GROQ_API_KEY").one()?.settingValue
+                    def orgId = ec.user.getPreference("ACTIVE_ORGANIZATION")
+                    if (!key) {
+                        ec.logger.warn("Copilot: GROQ_API_KEY not set for ZETAERP")
+                    } else {
+                        String ctx = ""
+                        try {
+                            if (orgId) {
+                                def now = ec.user.nowTimestamp
+                                def zone = java.time.ZoneId.systemDefault()
+                                def ld = now.toLocalDateTime().toLocalDate()
+                                def msTs = new java.sql.Timestamp(ld.withDayOfMonth(1).atStartOfDay(zone).toInstant().toEpochMilli())
+                                def tdTs = new java.sql.Timestamp(ld.atStartOfDay(zone).toInstant().toEpochMilli())
+                                def tenant = ec.entity.find("zenith.erp.saas.SaasTenant").condition("organizationPartyId", orgId).list()
+                                def orgName = tenant ? tenant[0].tenantName : "your business"
+                                def monthTx = ec.entity.find("zenith.erp.pos.PosTransaction")
+                                    .condition("organizationPartyId", orgId).condition("entryDate", ">=", msTs)
+                                    .selectField("grandTotal").selectField("entryDate").selectField("transactionId").list()
+                                BigDecimal mAll=0.0, mImp=0.0, mLive=0.0, tAll=0.0, tLive=0.0
+                                int cAll=0, cImp=0, cLive=0, tcAll=0, tcLive=0
+                                monthTx.each { t ->
+                                    def g = (t.grandTotal ?: 0.0) as BigDecimal
+                                    boolean imported = (t.transactionId ?: "").startsWith("MTCT")
+                                    boolean today = (t.entryDate != null && !t.entryDate.before(tdTs))
+                                    mAll += g; cAll++
+                                    if (imported) { mImp += g; cImp++ } else { mLive += g; cLive++ }
+                                    if (today) { tAll += g; tcAll++; if (!imported) { tLive += g; tcLive++ } }
+                                }
+                                def r0 = { BigDecimal v -> v.setScale(0, java.math.RoundingMode.HALF_UP).toString() }
+                                def productCount = ec.entity.find("mantle.product.Product").condition("productTypeEnumId","PtAsset").condition("ownerPartyId", orgId).count()
+                                def termCount = ec.entity.find("zenith.erp.pos.PosTerminal").condition("organizationPartyId", orgId).count()
+                                def topDemand = ""
+                                try {
+                                    def tp = ec.entity.find("zenith.erp.pos.ProductDemandView").condition("organizationPartyId", orgId).orderBy("-unitsSold").limit(8).list()
+                                    if (tp) topDemand = tp.collect { (it.productName ?: it.productId) + " (" + ((it.unitsSold ?: 0) as BigDecimal).setScale(0, java.math.RoundingMode.HALF_UP) + " units)" }.join("; ")
+                                } catch (Exception te) { ec.logger.warn("Copilot demand query failed: " + te.message) }
+                                int alertCnt = 0
+                                try { alertCnt = ec.entity.find("zenith.erp.inventory.DemandAlert").condition("organizationPartyId", orgId).condition("statusId", "AlertNew").count() as int } catch (Exception ae) { }
+                                ctx = "\n\nLive business data for " + orgName + " (today is " + ld.toString() + "):\n" +
+                                      "- This month total sales: INR " + r0(mAll) + " from " + cAll + " bills.\n" +
+                                      "    * Imported from previous system (MarG POS): INR " + r0(mImp) + " from " + cImp + " bills.\n" +
+                                      "    * New sales billed live in ZetaERP: INR " + r0(mLive) + " from " + cLive + " bills.\n" +
+                                      "- Today's sales: INR " + r0(tAll) + " from " + tcAll + " bills (of which live in ZetaERP: INR " + r0(tLive) + " from " + tcLive + ").\n" +
+                                      "- Products in catalog: " + productCount + ". POS terminals: " + termCount + ".\n" +
+                                      (topDemand ? ("- Top-selling products by total units sold (highest first): " + topDemand + ". ") : "") +
+                                      (alertCnt > 0 ? ("\n- DEMAND ALERTS: " + alertCnt + " product(s) currently show unusual demand shifts beyond their normal range. If the user's question relates to demand/stock/sales, proactively mention this and offer to show the alerts.") : "")
+                            }
+                        } catch (Exception ce) { ec.logger.warn("Copilot context build failed: " + ce.message); ctx = "" }
+
+                        String system = "You are ZetaERP Copilot, a warm, friendly and concise business assistant inside a retail ERP used by small shops in India. Currency is Indian Rupees (INR). Always reply in natural, conversational, plain language - speak to the owner like a helpful advisor, never as a robotic report." + ctx +
+                            " TOOLS: (1) For predicting/forecasting a product's future demand, how many units to order/stock, reorder points, safety stock, or run-out questions, you MUST call forecastProductDemand (never guess). Pick its inputs from the user's words (horizonDays, leadTimeDays, serviceLevel; defaults 14/7/0.95). For a whole product CATEGORY or group (e.g. Stationery, Fancy Item, Masalas) call forecastCategoryDemand instead. (1b) For total SALES REVENUE in money — how sales are doing, expected revenue/turnover for the coming days or next week, the overall sales trend, or a whole category's revenue outlook — call forecastSales (rupees, not units). (2) For why a past forecast was wrong/off, how accurate the forecasts are, or comparing forecast vs actual sales for a product, call explainForecastVariance. (3) For alerts, what to reorder, what is running low on stock, what is spiking or dropping, or unusual sales changes, call getDemandAlerts. (4) For ANY other question about the shop's data — customers, vendors, products, stock on hand, sales orders, invoices, payments, expenses, price lists, tax, facilities — call queryErpData with the right table (it only ever returns this shop's data and never security/user data). After a tool returns data, do NOT list raw fields - reply in 3 to 5 warm natural sentences. For forecasts: lead with the recommendation (how many to order, when to reorder), weave in expected demand, busiest day, trend, and mention confidence honestly. For variance: explain WHY forecast and reality differed - point to the specific days that drove it (a spike or quiet days), weekend or trend effects - and give one practical takeaway. If a question needs data you do not have, say so plainly."
+
+                        def tools = [
+                            [type: "function", function: [
+                                name: "forecastProductDemand",
+                                description: "Forecast a specific product's future demand from real POS sales history (trend + weekly seasonality, self-selected best method) and compute reorder point, safety stock and suggested order quantity. Use for predict/forecast demand, how much to order/stock, reorder point, safety stock, run-out questions.",
+                                parameters: [type: "object", properties: [
+                                    productName: [type: "string", description: "the product name or a distinctive part of it"],
+                                    horizonDays: [type: "integer", description: "how many days ahead to forecast; default 14"],
+                                    leadTimeDays: [type: "integer", description: "supplier lead / restock time in days; default 7"],
+                                    serviceLevel: [type: "number", description: "desired service level 0-1, e.g. 0.95; default 0.95"]
+                                ], required: ["productName"]]
+                            ]],
+                            [type: "function", function: [
+                                name: "forecastCategoryDemand",
+                                description: "Forecast total future demand for a whole product CATEGORY (aggregated across all products in it), e.g. Stationery, Fancy Item, Masalas. Use when the user asks about demand/forecast for a category or product group rather than a single product.",
+                                parameters: [type: "object", properties: [
+                                    categoryName: [type: "string", description: "the category name or a distinctive part of it"],
+                                    horizonDays: [type: "integer", description: "how many days ahead to forecast; default 14"]
+                                ], required: ["categoryName"]]
+                            ]],
+                            [type: "function", function: [
+                                name: "explainForecastVariance",
+                                description: "Get the most recent forecast-vs-actual comparison and daily sales pattern for a product, to diagnose WHY the forecast and real sales differed. Use when the user asks why a forecast was wrong/off, how accurate forecasts are, or to compare forecast vs actual for a product.",
+                                parameters: [type: "object", properties: [
+                                    productName: [type: "string", description: "the product name or a distinctive part of it"]
+                                ], required: ["productName"]]
+                            ]],
+                            [type: "function", function: [
+                                name: "getDemandAlerts",
+                                description: "List products that need attention: (a) unusual demand shifts (spike up or drop down beyond normal range) and (b) stock/reorder alerts (stock at, near, or below the forecast reorder point). Use when the user asks about alerts, what to reorder, what is running low / low stock, what is spiking or dropping, unusual sales changes, or what they should pay attention to.",
+                                parameters: [type: "object", properties: [:], required: []]
+                            ]],
+                            [type: "function", function: [
+                                name: "forecastSales",
+                                description: "Forecast the shop's total SALES REVENUE (money/turnover, not units) for the coming days or weeks from POS sales — overall or for one product category. Uses an ensemble (Holt-Winters, trend+seasonality, traffic x basket) and self-selects the most accurate; reports expected revenue, busiest day, trend, the footfall-vs-basket driver, and confidence. Use for: how are sales doing, expected revenue/turnover next week, sales trend, a category's revenue outlook.",
+                                parameters: [type: "object", properties: [
+                                    categoryName: [type: "string", description: "optional product category to forecast revenue for; omit for whole-shop sales"],
+                                    horizonDays: [type: "integer", description: "days ahead; default 14"]
+                                ], required: []]
+                            ]],
+                            [type: "function", function: [
+                                name: "queryErpData",
+                                description: "Read the shop's own business data from any ERP table to answer questions the other tools do not cover. Common tables: customers &amp; vendors = mantle.party.Party; products = mantle.product.Product; stock on hand = mantle.product.asset.Asset; sales orders = mantle.order.OrderPart; invoices = mantle.account.invoice.Invoice; payments = mantle.account.payment.Payment; POS sales = zenith.erp.pos.PosTransaction; POS sessions = zenith.erp.pos.PosSession; expenses = zenith.erp.pos.PosExpense; price lists = zenith.erp.pricing.PriceList; tax registrations = zenith.erp.tax.TaxRegistration; facilities = mantle.facility.Facility. Results are automatically limited to THIS shop's data; security, users and passwords are never accessible.",
+                                parameters: [type: "object", properties: [
+                                    entityName: [type: "string", description: "the ERP table/entity name, e.g. mantle.party.Party"],
+                                    filters: [type: "string", description: "optional JSON of field=value filters, e.g. {\"statusId\":\"PmnpReceived\"}"]
+                                ], required: ["entityName"]]
+                            ]]
+                        ]
+
+                        def callGroq = { List msgs ->
+                            def models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+                            for (m in models) {
+                                int attempt = 0
+                                while (attempt < 2) {
+                                    attempt++
+                                    try {
+                                        def reqMap = [model: m, messages: msgs, tools: tools, tool_choice: "auto", temperature: 0.4, max_tokens: 700]
+                                        def body = JsonOutput.toJson(reqMap)
+                                        def conn = new java.net.URL("https://api.groq.com/openai/v1/chat/completions").openConnection()
+                                        conn.setRequestMethod("POST")
+                                        conn.setRequestProperty("Content-Type", "application/json")
+                                        conn.setRequestProperty("Authorization", "Bearer " + key)
+                                        conn.setConnectTimeout(10000); conn.setReadTimeout(45000); conn.setDoOutput(true)
+                                        conn.getOutputStream().withWriter("UTF-8") { it.write(body) }
+                                        int code = conn.responseCode
+                                        def stream = (code >= 200 && code < 300) ? conn.getInputStream() : conn.getErrorStream()
+                                        def txt = stream != null ? stream.getText("UTF-8") : ""
+                                        if (code >= 200 && code < 300) {
+                                            def j = new JsonSlurper().parseText(txt)
+                                            return j?.choices?.getAt(0)?.message
+                                        } else if (code == 429 || code == 503 || code >= 500) {
+                                            ec.logger.warn("Groq " + m + " HTTP " + code + " attempt " + attempt)
+                                            if (attempt < 2) Thread.sleep(500)
+                                        } else {
+                                            ec.logger.warn("Groq " + m + " HTTP " + code + ": " + (txt != null ? txt.take(200) : "")); break
+                                        }
+                                    } catch (Exception ie) { ec.logger.warn("Groq " + m + " attempt " + attempt + ": " + ie.message); if (attempt < 2) Thread.sleep(500) }
+                                }
+                            }
+                            return null
+                        }
+
+                        def msgs = [[role: "system", content: system], [role: "user", content: query]]
+                        def msg1 = callGroq(msgs)
+                        def toolCalls = msg1?.tool_calls
+                        if (toolCalls) {
+                            def tc = toolCalls[0]
+                            def fname = tc.function?.name
+                            def args = [:]
+                            try { def _a = new JsonSlurper().parseText(tc.function?.arguments ?: "{}"); if (_a instanceof Map) args = _a } catch (Exception ae) { args = [:] }
+                            String fnText = "I couldn't process that request - please confirm the product name."
+                            try {
+                                def svcOut
+                                if (fname == "queryErpData") {
+                                    def flt = [:]
+                                    try { if (args.filters) { def pf = new JsonSlurper().parseText(args.filters instanceof String ? args.filters : JsonOutput.toJson(args.filters)); if (pf instanceof Map) flt = pf } } catch (Exception pfe) { }
+                                    svcOut = ec.service.sync().name("zenith.base.AiServices.query#ErpData")
+                                        .parameter("entityName", args.entityName).parameter("filters", flt)
+                                        .parameter("maxRows", 8).call()
+                                } else if (fname == "getDemandAlerts") {
+                                    svcOut = ec.service.sync().name("zenith.inventory.AdvancedForecastServices.get#DemandAlerts")
+                                        .parameter("direction", args.direction).parameter("organizationPartyId", orgId).call()
+                                } else if (fname == "forecastCategoryDemand") {
+                                    svcOut = ec.service.sync().name("zenith.inventory.AdvancedForecastServices.forecast#CategoryDemand")
+                                        .parameter("categoryName", args.categoryName)
+                                        .parameter("horizonDays", (args.horizonDays != null ? args.horizonDays : 14) as Integer)
+                                        .parameter("organizationPartyId", orgId).call()
+                                } else if (fname == "forecastSales") {
+                                    def sb = ec.service.sync().name("zenith.sales.SalesForecastServices.forecast#Sales")
+                                        .parameter("organizationPartyId", orgId)
+                                        .parameter("horizonDays", (args.horizonDays != null ? args.horizonDays : 14) as Integer)
+                                    if (args.categoryName) sb.parameter("categoryName", args.categoryName)
+                                    svcOut = sb.call()
+                                } else if (fname == "explainForecastVariance") {
+                                    svcOut = ec.service.sync().name("zenith.inventory.AdvancedForecastServices.explain#ForecastVariance")
+                                        .parameter("productName", args.productName).parameter("organizationPartyId", orgId).call()
+                                } else {
+                                    svcOut = ec.service.sync().name("zenith.inventory.AdvancedForecastServices.forecast#ProductDemand")
+                                        .parameter("productName", args.productName)
+                                        .parameter("horizonDays", (args.horizonDays != null ? args.horizonDays : 14) as Integer)
+                                        .parameter("leadTimeDays", (args.leadTimeDays != null ? args.leadTimeDays : 7) as Integer)
+                                        .parameter("serviceLevel", (args.serviceLevel != null ? args.serviceLevel : 0.95) as BigDecimal)
+                                        .parameter("organizationPartyId", orgId).call()
+                                }
+                                fnText = svcOut?.summary ?: fnText
+                                def msgs2 = [
+                                    [role: "system", content: system],
+                                    [role: "user", content: query],
+                                    [role: "assistant", content: (msg1.content ?: ""), tool_calls: toolCalls],
+                                    [role: "tool", tool_call_id: tc.id, name: fname, content: JsonOutput.toJson(svcOut?.result ?: [:])]
+                                ]
+                                def msg2 = callGroq(msgs2)
+                                resp = msg2?.content?.trim() ?: fnText
+                            } catch (Exception fe) {
+                                ec.logger.warn("Copilot tool call failed: " + fe.message)
+                                resp = fnText
+                            }
+                        } else {
+                            resp = msg1?.content?.trim()
+                        }
+                    }
+                } catch (Exception e) {
+                    ec.logger.warn("Copilot LLM call failed: " + e.message)
+                } finally { if (!_d) ec.artifactExecution.enableAuthz() }
+                response = resp ?: "Sorry, the assistant is busy right now. Please try again in a moment."
+            ]]></script>
+        </actions>
+    </service>
+
+    <!-- query#ErpData : lets the Copilot read any tenant business data. SAFE BY DESIGN:
+         runs with authorization ENABLED so Moqui row-level entity filters auto-scope every
+         result to the caller's organization (no cross-tenant leak); only entities that have
+         such an org filter (plus Asset, scoped by ownerPartyId) are allowed; security and
+         secret entities are hard-denied. Read-only, row-capped. -->
+    <service verb="query" noun="ErpData" allow-remote="true" transaction-timeout="60">
+        <in-parameters>
+            <parameter name="entityName" required="true"/>
+            <parameter name="filters" type="Map"/>
+            <parameter name="fields"/>
+            <parameter name="maxRows" type="Integer" default-value="25"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="summary"/>
+            <parameter name="result" type="Map"/>
+        </out-parameters>
+        <actions>
+            <script><![CDATA[
+                import org.moqui.context.ExecutionContext
+                ExecutionContext ec = context.ec
+                def en = (entityName ?: "").trim()
+                def lc = en.toLowerCase()
+                def denySub = ["password","credential","login","session","token","authz","useraccount","usergroup","userpreference","userpermission","security","companysettings","secret","apikey","visit","externaluser"]
+                if (en == "" || denySub.any { lc.contains(it) }) {
+                    summary = "That data is not accessible to the assistant."; result = [count: 0, rows: []]; return
+                }
+                def allowed = new HashSet()
+                try { ec.entity.find("moqui.entity.EntityFilter").selectField("entityName").list().each { if (it.entityName) allowed.add(it.entityName) } } catch (Exception fe) { }
+                if (allowed.isEmpty()) {
+                    allowed.addAll(["mantle.party.Party","mantle.product.Product","mantle.product.category.ProductCategory","mantle.account.invoice.Invoice","mantle.account.payment.Payment","mantle.order.OrderPart","mantle.order.return.ReturnHeader","mantle.shipment.Shipment","mantle.account.financial.FinancialAccount","mantle.ledger.transaction.AcctgTrans","mantle.facility.Facility","mantle.product.store.ProductStore","zenith.erp.pos.PosTransaction","zenith.erp.pos.PosSession","zenith.erp.pos.PosTerminal","zenith.erp.pos.PosExpense","zenith.erp.pos.PosCashEntry","zenith.erp.pricing.PriceList","zenith.erp.pricing.PricingRule","zenith.erp.pricing.CustomerPriceList","zenith.erp.tax.TaxRegistration","zenith.erp.india.gstr1.Gstr1Filing","zenith.erp.barcode.ProductBarcode"])
+                }
+                allowed.add("mantle.product.asset.Asset")
+                allowed.add("moqui.basic.Enumeration"); allowed.add("moqui.basic.Uom")
+                if (!allowed.contains(en)) { summary = "The data set '" + en + "' is not available to the assistant (only your business data is, never security data)."; result = [count: 0, rows: []]; return }
+
+                import org.moqui.entity.EntityCondition
+                def orgId = ec.user.getPreference("ACTIVE_ORGANIZATION")
+                def refSet = ["moqui.basic.Enumeration", "moqui.basic.Uom"]
+                boolean _qd = ec.artifactExecution.disableAuthz()
+                try {
+                    def ed = null; try { ed = ec.entity.getEntityDefinition(en) } catch (Exception ee) { }
+                    if (ed == null) { summary = "No such data set: " + en; result = [count: 0, rows: []]; return }
+                    def fnames = ed.getAllFieldNames()
+                    def cf = ec.entity.conditionFactory
+                    // build the SAME org-scoping the row-level entity filters use, applied manually
+                    def orgCond = null
+                    if (!refSet.contains(en)) {
+                        if (!orgId) { summary = "No active organization."; result = [count: 0, rows: []]; return }
+                        if (fnames.contains("ownerPartyId")) orgCond = cf.makeCondition("ownerPartyId", EntityCondition.IN, ["_NA_", orgId])
+                        else if (fnames.contains("organizationPartyId")) orgCond = cf.makeCondition("organizationPartyId", EntityCondition.EQUALS, orgId)
+                        else {
+                            def ors = []
+                            for (pf in ["fromPartyId","toPartyId","vendorPartyId","customerPartyId"]) if (fnames.contains(pf)) ors.add(cf.makeCondition(pf, EntityCondition.EQUALS, orgId))
+                            if (ors) orgCond = cf.makeCondition(ors, EntityCondition.OR)
+                            else if (fnames.contains("partyId")) orgCond = cf.makeCondition("partyId", EntityCondition.EQUALS, orgId)
+                        }
+                        if (orgCond == null) { summary = "The data set '" + en + "' cannot be safely scoped to your business, so it is not available."; result = [count: 0, rows: []]; return }
+                    }
+                    def ef = ec.entity.find(en)
+                    if (orgCond != null) ef.condition(orgCond)
+                    if (filters instanceof Map) filters.each { k, v -> if (fnames.contains(k)) ef.condition(k, v) }
+                    if (fields) fields.split(",").each { def fld = it.trim(); if (fnames.contains(fld)) ef.selectField(fld) }
+                    int cap = Math.min((maxRows ?: 25) as int, 50)
+                    int trueCount = ef.count()
+                    def list = ef.limit(cap).list()
+                    def rows = list.collect { new LinkedHashMap(it) }
+                    result = [count: trueCount, returned: rows.size(), rows: rows]
+                    summary = "There are " + trueCount + " " + en + " record(s)" + (rows.size() < trueCount ? " (showing the first " + rows.size() + ")" : "") + "."
+                } catch (Exception qe) {
+                    ec.logger.warn("query#ErpData failed for " + en + ": " + qe.message)
+                    summary = "Could not read " + en + "."; result = [count: 0, rows: []]
+                } finally { if (!_qd) ec.artifactExecution.enableAuthz() }
+            ]]></script>
+        </actions>
+    </service>
+
+</services>

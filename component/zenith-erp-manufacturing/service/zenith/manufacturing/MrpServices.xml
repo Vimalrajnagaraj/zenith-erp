@@ -1,0 +1,299 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <!-- ========== Material Requirements Planning (MRP) ========== -->
+
+    <service verb="run" noun="MrpCalculation">
+        <description>Run MRP calculation: explode BOMs, check available stock, generate planned orders for shortages.
+            For items with BOMs, creates manufacture planned orders. For raw materials, creates purchase planned orders.</description>
+        <in-parameters>
+            <parameter name="facilityId"/>
+            <parameter name="planningHorizonDays" type="Integer" default-value="30"/>
+            <parameter name="includeExistingOrders" type="Boolean" default-value="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="mrpRunId"/>
+            <parameter name="productsAnalyzed" type="Integer"/>
+            <parameter name="plannedOrdersCreated" type="Integer"/>
+            <parameter name="purchaseOrdersCreated" type="Integer"/>
+        </out-parameters>
+        <actions>
+            <set field="productsAnalyzed" from="0"/>
+            <set field="plannedOrdersCreated" from="0"/>
+            <set field="purchaseOrdersCreated" from="0"/>
+
+            <!-- Create MRP Run record -->
+            <service-call name="create#zenith.erp.manufacturing.MrpRun" out-map="mrpRunOut"
+                in-map="[facilityId: facilityId, runDate: ec.user.nowTimestamp,
+                         planningHorizonDays: planningHorizonDays,
+                         runByUserId: ec.user.userId]"/>
+            <set field="mrpRunId" from="mrpRunOut.mrpRunId"/>
+
+            <set field="horizonDate" from="new java.sql.Date(System.currentTimeMillis() + ((long)planningHorizonDays * 86400000L))"/>
+
+            <script><![CDATA[
+                import java.math.BigDecimal
+                import java.math.RoundingMode
+
+                // Get all products that have BOMs (manufactured items)
+                def bomList = ec.entity.find("zenith.erp.manufacturing.BillOfMaterial")
+                    .condition("isActive", "Y")
+                    .list()
+
+                def processedProducts = new HashSet()
+                def totalShortage = BigDecimal.ZERO
+
+                for (def bom : bomList) {
+                    if (processedProducts.contains(bom.productId)) continue
+                    processedProducts.add(bom.productId)
+
+                    // Get current stock
+                    def assets = ec.entity.find("mantle.product.asset.Asset")
+                        .condition("productId", bom.productId)
+                    if (facilityId) assets.condition("facilityId", facilityId)
+                    def assetList = assets.list()
+
+                    def currentStock = BigDecimal.ZERO
+                    for (def a : assetList) {
+                        currentStock = currentStock.add(a.availableToPromiseTotal ?: BigDecimal.ZERO)
+                    }
+
+                    // Get pending work orders (already in pipeline)
+                    def pendingWoQty = BigDecimal.ZERO
+                    if (includeExistingOrders) {
+                        def pendingWos = ec.entity.find("zenith.erp.manufacturing.WorkOrder")
+                            .condition("productId", bom.productId)
+                            .condition("statusId", "in", ["WoDraft", "WoReleased", "WoInProgress"])
+                            .list()
+                        for (def wo : pendingWos) {
+                            pendingWoQty = pendingWoQty.add((wo.quantity ?: BigDecimal.ZERO).subtract(wo.completedQuantity ?: BigDecimal.ZERO))
+                        }
+                    }
+
+                    // Get demand from forecasts
+                    def forecastDemand = BigDecimal.ZERO
+                    def forecasts = ec.entity.find("zenith.erp.inventory.DemandForecast")
+                        .condition("productId", bom.productId)
+                        .condition("periodStart", "less-equals", horizonDate)
+                        .condition("periodEnd", "greater-equals", new java.sql.Date(System.currentTimeMillis()))
+                        .list()
+                    for (def fc : forecasts) {
+                        forecastDemand = forecastDemand.add(fc.forecastQuantity ?: BigDecimal.ZERO)
+                    }
+
+                    // Check reorder point
+                    def product = ec.entity.find("mantle.product.Product")
+                        .condition("productId", bom.productId).one()
+                    def reorderPoint = product?.reorderPoint ?: BigDecimal.ZERO
+                    def reorderQty = product?.reorderQuantity ?: new BigDecimal("100")
+
+                    // Net requirement = max(demand, reorderPoint) - currentStock - pendingOrders
+                    def totalDemand = forecastDemand.max(reorderPoint)
+                    def netRequirement = totalDemand.subtract(currentStock).subtract(pendingWoQty)
+
+                    if (netRequirement.compareTo(BigDecimal.ZERO) > 0) {
+                        // Round up to reorder quantity
+                        def plannedQty = netRequirement.max(reorderQty)
+                        totalShortage = totalShortage.add(netRequirement)
+
+                        // Create planned manufacturing order
+                        ec.entity.makeValue("zenith.erp.manufacturing.PlannedOrder")
+                            .setAll([productId: bom.productId, bomId: bom.bomId,
+                                     facilityId: facilityId, requiredQuantity: totalDemand,
+                                     availableStock: currentStock.add(pendingWoQty),
+                                     netRequirement: netRequirement, plannedQuantity: plannedQty,
+                                     requiredDate: horizonDate,
+                                     plannedStartDate: new java.sql.Date(System.currentTimeMillis() + (7L * 86400000L)),
+                                     leadTimeDays: 7, orderType: "Manufacture",
+                                     sourceType: "MRP", mrpRunId: mrpRunId,
+                                     statusId: "PoPlanned", priority: "Normal"])
+                            .setSequencedIdPrimary().create()
+                        plannedOrdersCreated++
+
+                        // Explode BOM to check raw material availability
+                        def bomItems = ec.entity.find("zenith.erp.manufacturing.BomItem")
+                            .condition("bomId", bom.bomId).list()
+
+                        for (def bi : bomItems) {
+                            def materialQtyNeeded = (bi.quantity ?: BigDecimal.ONE).multiply(plannedQty)
+                                .divide(bom.outputQuantity ?: BigDecimal.ONE, 2, RoundingMode.HALF_UP)
+
+                            // Add waste factor
+                            if (bi.wastePercent && bi.wastePercent > 0) {
+                                materialQtyNeeded = materialQtyNeeded.multiply(
+                                    BigDecimal.ONE.add(bi.wastePercent.divide(new BigDecimal("100"), 4, RoundingMode.HALF_UP)))
+                            }
+
+                            // Check raw material stock
+                            def rmAssets = ec.entity.find("mantle.product.asset.Asset")
+                                .condition("productId", bi.productId)
+                            if (facilityId) rmAssets.condition("facilityId", facilityId)
+                            def rmStock = BigDecimal.ZERO
+                            for (def rma : rmAssets.list()) {
+                                rmStock = rmStock.add(rma.availableToPromiseTotal ?: BigDecimal.ZERO)
+                            }
+
+                            def rmShortage = materialQtyNeeded.subtract(rmStock)
+                            if (rmShortage.compareTo(BigDecimal.ZERO) > 0) {
+                                // Check if this material has its own BOM (sub-assembly)
+                                def subBom = ec.entity.find("zenith.erp.manufacturing.BillOfMaterial")
+                                    .condition("productId", bi.productId)
+                                    .condition("isActive", "Y")
+                                    .condition("isDefault", "Y").one()
+
+                                def ot = subBom ? "Manufacture" : "Purchase"
+                                ec.entity.makeValue("zenith.erp.manufacturing.PlannedOrder")
+                                    .setAll([productId: bi.productId, bomId: subBom?.bomId,
+                                             facilityId: facilityId, requiredQuantity: materialQtyNeeded,
+                                             availableStock: rmStock, netRequirement: rmShortage,
+                                             plannedQuantity: rmShortage,
+                                             requiredDate: new java.sql.Date(System.currentTimeMillis() + (5L * 86400000L)),
+                                             plannedStartDate: new java.sql.Date(System.currentTimeMillis() + (2L * 86400000L)),
+                                             leadTimeDays: subBom ? 5 : 10,
+                                             orderType: ot, sourceType: "MRP", mrpRunId: mrpRunId,
+                                             statusId: "PoPlanned", priority: "Normal"])
+                                    .setSequencedIdPrimary().create()
+
+                                if (ot == "Purchase") purchaseOrdersCreated++
+                                else plannedOrdersCreated++
+                            }
+                        }
+                    }
+
+                    productsAnalyzed++
+                }
+
+                // Update MRP Run totals
+                def mrpRun = ec.entity.find("zenith.erp.manufacturing.MrpRun")
+                    .condition("mrpRunId", mrpRunId).one()
+                mrpRun.productsAnalyzed = productsAnalyzed
+                mrpRun.plannedOrdersCreated = plannedOrdersCreated
+                mrpRun.purchaseOrdersCreated = purchaseOrdersCreated
+                mrpRun.totalShortage = totalShortage
+                mrpRun.update()
+            ]]></script>
+        </actions>
+    </service>
+
+    <service verb="convert" noun="PlannedOrderToWorkOrder">
+        <description>Convert a firmed planned manufacturing order into an actual work order.</description>
+        <in-parameters>
+            <parameter name="plannedOrderId" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="workOrderId"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.manufacturing.PlannedOrder" value-field="plannedOrder"/>
+            <if condition="!plannedOrder"><return error="true" message="Planned order not found"/></if>
+            <if condition="plannedOrder.orderType != 'Manufacture'">
+                <return error="true" message="Only manufacture planned orders can be converted to work orders"/>
+            </if>
+
+            <!-- Find routing for the product -->
+            <entity-find-one entity-name="zenith.erp.manufacturing.Routing" value-field="routing">
+                <field-map field-name="productId" from="plannedOrder.productId"/>
+                <field-map field-name="isDefault" value="Y"/>
+            </entity-find-one>
+
+            <service-call name="create#zenith.erp.manufacturing.WorkOrder" out-map="woOut"
+                in-map="[productId: plannedOrder.productId, bomId: plannedOrder.bomId,
+                         routingId: routing?.routingId, quantity: plannedOrder.plannedQuantity,
+                         plannedStartDate: plannedOrder.plannedStartDate,
+                         plannedEndDate: plannedOrder.requiredDate,
+                         facilityId: plannedOrder.facilityId,
+                         statusId: 'WoDraft', priority: plannedOrder.priority ?: 'Normal',
+                         notes: 'Auto-generated from MRP Run ' + (plannedOrder.mrpRunId ?: '')]"/>
+            <set field="workOrderId" from="woOut.workOrderId"/>
+
+            <!-- Explode BOM to create work order materials -->
+            <if condition="plannedOrder.bomId">
+                <entity-find entity-name="zenith.erp.manufacturing.BomItem" list="bomItems">
+                    <econdition field-name="bomId" from="plannedOrder.bomId"/>
+                </entity-find>
+                <iterate list="bomItems" entry="bi">
+                    <set field="matQty" from="(bi.quantity ?: 1) * (plannedOrder.plannedQuantity ?: 1)"/>
+                    <service-call name="create#zenith.erp.manufacturing.WorkOrderMaterial"
+                        in-map="[workOrderId: workOrderId, productId: bi.productId,
+                                 plannedQuantity: matQty, uomId: bi.uomId]"/>
+                </iterate>
+            </if>
+
+            <!-- Update planned order status -->
+            <set field="plannedOrder.statusId" value="PoConverted"/>
+            <set field="plannedOrder.convertedToId" from="workOrderId"/>
+            <entity-update value-field="plannedOrder"/>
+        </actions>
+    </service>
+
+    <service verb="calculate" noun="CapacityPlan">
+        <description>Calculate work center capacity utilization for the planning period.</description>
+        <in-parameters>
+            <parameter name="planningDays" type="Integer" default-value="14"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="workCentersAnalyzed" type="Integer"/>
+            <parameter name="overloadedCenters" type="Integer"/>
+        </out-parameters>
+        <actions>
+            <set field="workCentersAnalyzed" from="0"/>
+            <set field="overloadedCenters" from="0"/>
+
+            <entity-find entity-name="zenith.erp.manufacturing.WorkCenter" list="workCenters">
+                <econdition field-name="isActive" value="Y"/>
+            </entity-find>
+
+            <iterate list="workCenters" entry="wc">
+                <script><![CDATA[
+                    import java.math.BigDecimal
+                    import java.math.RoundingMode
+
+                    def today = new java.sql.Date(System.currentTimeMillis())
+                    def endDate = new java.sql.Date(System.currentTimeMillis() + ((long)planningDays * 86400000L))
+
+                    // Get all active/released work orders using this work center
+                    def woOps = ec.entity.find("zenith.erp.manufacturing.WorkOrderOperation")
+                        .condition("workCenterId", wc.workCenterId)
+                        .condition("statusId", "in", ["OpPending", "OpInProgress"])
+                        .list()
+
+                    def totalPlannedMinutes = 0
+                    for (def op : woOps) {
+                        totalPlannedMinutes += (op.plannedMinutes ?: 0)
+                    }
+
+                    def plannedHours = new BigDecimal(totalPlannedMinutes).divide(new BigDecimal("60"), 2, RoundingMode.HALF_UP)
+                    def availableHours = (wc.capacityPerHour ?: new BigDecimal("8")).multiply(new BigDecimal(planningDays))
+                    def utilization = availableHours > 0 ?
+                        plannedHours.divide(availableHours, 4, RoundingMode.HALF_UP).multiply(new BigDecimal("100")).setScale(1, RoundingMode.HALF_UP) :
+                        BigDecimal.ZERO
+                    def overloaded = utilization.compareTo(new BigDecimal("100")) > 0 ? "Y" : "N"
+
+                    // Upsert capacity plan
+                    def existing = ec.entity.find("zenith.erp.manufacturing.CapacityPlan")
+                        .condition("workCenterId", wc.workCenterId)
+                        .condition("planDate", today).one()
+
+                    if (existing) {
+                        existing.availableHours = availableHours
+                        existing.plannedHours = plannedHours
+                        existing.utilizationPercent = utilization
+                        existing.overloadFlag = overloaded
+                        existing.update()
+                    } else {
+                        ec.entity.makeValue("zenith.erp.manufacturing.CapacityPlan")
+                            .setAll([workCenterId: wc.workCenterId, planDate: today,
+                                     availableHours: availableHours, plannedHours: plannedHours,
+                                     utilizationPercent: utilization, overloadFlag: overloaded])
+                            .setSequencedIdPrimary().create()
+                    }
+
+                    workCentersAnalyzed++
+                    if (overloaded == "Y") overloadedCenters++
+                ]]></script>
+            </iterate>
+        </actions>
+    </service>
+
+</services>

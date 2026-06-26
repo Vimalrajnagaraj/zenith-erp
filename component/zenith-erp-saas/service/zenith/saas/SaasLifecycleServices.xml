@@ -1,0 +1,376 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <!-- ==================== TRIAL EXPIRY CHECK ==================== -->
+    <service verb="check" noun="TrialExpiry" authenticate="anonymous-all">
+        <description>Checks all tenants with expired trials and suspends them. Runs daily via cron.</description>
+        <actions>
+            <script><![CDATA[
+                import java.time.LocalDate
+
+                def today = java.sql.Date.valueOf(LocalDate.now())
+                def expiredSubs = ec.entity.find("zenith.erp.saas.SaasSubscription")
+                    .condition("statusId", "SubTrial")
+                    .condition("trialEndDate", "<", today)
+                    .list()
+
+                int expiredCount = 0
+                expiredSubs.each { sub ->
+                    // Expire the subscription
+                    ec.service.sync().name("update#zenith.erp.saas.SaasSubscription")
+                        .parameter("subscriptionId", sub.subscriptionId)
+                        .parameter("statusId", "SubExpired")
+                        .parameter("endDate", today)
+                        .disableAuthz().call()
+
+                    // Suspend the tenant
+                    ec.service.sync().name("update#zenith.erp.saas.SaasTenant")
+                        .parameter("tenantId", sub.tenantId)
+                        .parameter("statusId", "SaasTenantSuspended")
+                        .disableAuthz().call()
+
+                    // Audit log
+                    ec.service.sync().name("create#zenith.erp.saas.SaasAuditLog")
+                        .parameter("tenantId", sub.tenantId)
+                        .parameter("eventType", "TRIAL_EXPIRED")
+                        .parameter("eventDate", ec.user.nowTimestamp)
+                        .parameter("description", "Trial expired on ${sub.trialEndDate}. Tenant suspended.")
+                        .disableAuthz().call()
+
+                    expiredCount++
+                }
+                if (expiredCount > 0) ec.logger.info("SaaS trial expiry: suspended ${expiredCount} tenant(s)")
+            ]]></script>
+        </actions>
+    </service>
+
+    <!-- ==================== SUBSCRIPTION RENEWAL CHECK ==================== -->
+    <service verb="check" noun="SubscriptionRenewal" authenticate="anonymous-all">
+        <description>Checks active subscriptions due for renewal and creates invoices. Runs daily via cron.</description>
+        <actions>
+            <script><![CDATA[
+                import java.time.LocalDate
+
+                def today = java.sql.Date.valueOf(LocalDate.now())
+                def dueSubs = ec.entity.find("zenith.erp.saas.SaasSubscription")
+                    .condition("statusId", "SubActive")
+                    .condition("renewalDate", "<=", today)
+                    .condition("autoRenew", "Y")
+                    .list()
+
+                int renewedCount = 0
+                dueSubs.each { sub ->
+                    def tenant = ec.entity.find("zenith.erp.saas.SaasTenant")
+                        .condition("tenantId", sub.tenantId).one()
+                    def plan = ec.entity.find("zenith.erp.saas.SaasPlan")
+                        .condition("planId", sub.planId).one()
+                    if (!tenant || !plan) return
+
+                    // Create invoice for the renewal period
+                    def periodFrom = sub.renewalDate
+                    def periodToDate = sub.billingCycle == 'Yearly' ?
+                        LocalDate.parse(periodFrom.toString()).plusYears(1) :
+                        LocalDate.parse(periodFrom.toString()).plusMonths(1)
+                    def periodTo = java.sql.Date.valueOf(periodToDate)
+                    def amount = sub.billingCycle == 'Yearly' ? plan.yearlyPrice : plan.monthlyPrice
+
+                    // Generate invoice number
+                    def invoiceCount = ec.entity.find("zenith.erp.saas.SaasInvoice").disableAuthz().count()
+                    def invoiceNumber = 'SAAS-' + java.time.LocalDate.now().format(java.time.format.DateTimeFormatter.ofPattern('yyyyMM')) + '-' + String.format('%04d', invoiceCount + 1)
+
+                    def invResult = ec.service.sync().name("create#zenith.erp.saas.SaasInvoice")
+                        .parameter("tenantId", sub.tenantId)
+                        .parameter("subscriptionId", sub.subscriptionId)
+                        .parameter("invoiceNumber", invoiceNumber)
+                        .parameter("invoiceDate", today)
+                        .parameter("dueDate", java.sql.Date.valueOf(LocalDate.now().plusDays(7)))
+                        .parameter("periodFrom", periodFrom)
+                        .parameter("periodTo", periodTo)
+                        .parameter("subtotal", amount)
+                        .parameter("taxAmount", 0)
+                        .parameter("totalAmount", amount)
+                        .parameter("currencyUomId", sub.currencyUomId ?: tenant.currencyUomId)
+                        .parameter("statusId", "SiSent")
+                        .disableAuthz().call()
+
+                    // Update subscription renewal date
+                    ec.service.sync().name("update#zenith.erp.saas.SaasSubscription")
+                        .parameter("subscriptionId", sub.subscriptionId)
+                        .parameter("renewalDate", periodTo)
+                        .disableAuthz().call()
+
+                    // Audit log
+                    ec.service.sync().name("create#zenith.erp.saas.SaasAuditLog")
+                        .parameter("tenantId", sub.tenantId)
+                        .parameter("eventType", "RENEWAL_INVOICE")
+                        .parameter("eventDate", ec.user.nowTimestamp)
+                        .parameter("description", "Renewal invoice created: ${amount} ${sub.currencyUomId ?: 'INR'} for ${periodFrom} to ${periodTo}")
+                        .disableAuthz().call()
+
+                    renewedCount++
+                }
+                if (renewedCount > 0) ec.logger.info("SaaS renewal: created ${renewedCount} invoice(s)")
+            ]]></script>
+        </actions>
+    </service>
+
+    <!-- ==================== SEND RENEWAL REMINDERS ==================== -->
+    <service verb="send" noun="RenewalReminders" authenticate="anonymous-all">
+        <description>Sends email reminders for subscriptions expiring in 3 days and 1 day. Runs daily.</description>
+        <actions>
+            <script><![CDATA[
+                import java.time.LocalDate
+
+                // Read configurable reminder days
+                def renewalDaysSetting = ec.entity.find("zenith.erp.base.CompanySettings")
+                    .condition("organizationPartyId", "ZETAERP")
+                    .condition("settingKey", "SAAS_RENEWAL_REMINDER_DAYS").disableAuthz().one()?.settingValue
+                def trialDaysSetting = ec.entity.find("zenith.erp.base.CompanySettings")
+                    .condition("organizationPartyId", "ZETAERP")
+                    .condition("settingKey", "SAAS_TRIAL_REMINDER_DAYS").disableAuthz().one()?.settingValue
+                def renewalReminderDays = (renewalDaysSetting ?: '7') as int
+                def trialReminderDays = (trialDaysSetting ?: '3') as int
+
+                def renewalDate = java.sql.Date.valueOf(LocalDate.now().plusDays(renewalReminderDays))
+                def oneDayOut = java.sql.Date.valueOf(LocalDate.now().plusDays(1))
+                def trialDate = java.sql.Date.valueOf(LocalDate.now().plusDays(trialReminderDays))
+
+                // Find subscriptions renewing in N days
+                def threeDaySubs = ec.entity.find("zenith.erp.saas.SaasSubscription")
+                    .condition("statusId", "SubActive")
+                    .condition("renewalDate", renewalDate)
+                    .disableAuthz().list()
+
+                // Find subscriptions renewing tomorrow
+                def oneDaySubs = ec.entity.find("zenith.erp.saas.SaasSubscription")
+                    .condition("statusId", "SubActive")
+                    .condition("renewalDate", oneDayOut)
+                    .disableAuthz().list()
+
+                // Find trials expiring in N days
+                def trialExpiring = ec.entity.find("zenith.erp.saas.SaasSubscription")
+                    .condition("statusId", "SubTrial")
+                    .condition("trialEndDate", trialDate)
+                    .disableAuthz().list()
+
+                int sent = 0
+                // Read email config from settings
+                def smtpHost = ec.entity.find("zenith.erp.base.CompanySettings")
+                    .condition("organizationPartyId", "ZETAERP").condition("settingKey", "SAAS_SMTP_HOST").one()?.settingValue
+                def smtpPort = ec.entity.find("zenith.erp.base.CompanySettings")
+                    .condition("organizationPartyId", "ZETAERP").condition("settingKey", "SAAS_SMTP_PORT").one()?.settingValue ?: '587'
+                def smtpUser = ec.entity.find("zenith.erp.base.CompanySettings")
+                    .condition("organizationPartyId", "ZETAERP").condition("settingKey", "SAAS_SMTP_USER").one()?.settingValue
+                def smtpPass = ec.entity.find("zenith.erp.base.CompanySettings")
+                    .condition("organizationPartyId", "ZETAERP").condition("settingKey", "SAAS_SMTP_PASSWORD").one()?.settingValue
+                def fromEmail = ec.entity.find("zenith.erp.base.CompanySettings")
+                    .condition("organizationPartyId", "ZETAERP").condition("settingKey", "SAAS_FROM_EMAIL").one()?.settingValue ?: 'noreply@zenitherp.com'
+                def fromName = ec.entity.find("zenith.erp.base.CompanySettings")
+                    .condition("organizationPartyId", "ZETAERP").condition("settingKey", "SAAS_FROM_NAME").one()?.settingValue ?: 'ZenithERP'
+                def emailEnabled = smtpHost && smtpUser
+
+                def sendReminder = { sub, String reminderType ->
+                    def tenant = ec.entity.find("zenith.erp.saas.SaasTenant")
+                        .condition("tenantId", sub.tenantId).one()
+                    if (!tenant || !tenant.adminEmail) return
+                    def plan = ec.entity.find("zenith.erp.saas.SaasPlan")
+                        .condition("planId", sub.planId).one()
+
+                    if (emailEnabled) {
+                        try {
+                            def subject = ""
+                            def body = ""
+                            if (reminderType.contains("Trial")) {
+                                subject = "Your ZenithERP trial is expiring soon"
+                                body = """Dear ${tenant.tenantName},
+
+Your free trial of ZenithERP ${plan?.planName ?: ''} plan expires on ${sub.trialEndDate}.
+
+To continue using ZenithERP without interruption, please upgrade to a paid plan before your trial ends.
+
+Log in to your account and visit My Subscription to choose a plan.
+
+Thank you,
+${fromName}"""
+                            } else {
+                                subject = "ZenithERP subscription ${reminderType.toLowerCase()}"
+                                body = """Dear ${tenant.tenantName},
+
+Your ZenithERP ${plan?.planName ?: ''} subscription (${sub.billingCycle}) is up for renewal on ${sub.renewalDate}.
+
+Amount: ${sub.currencyUomId ?: 'INR'} ${sub.amount}
+
+If you have auto-pay enabled, no action is needed. Otherwise, please ensure payment is made before the renewal date to avoid service interruption.
+
+Thank you,
+${fromName}"""
+                            }
+
+                            def props = new Properties()
+                            props.setProperty("mail.smtp.host", smtpHost)
+                            props.setProperty("mail.smtp.port", smtpPort)
+                            props.setProperty("mail.smtp.auth", "true")
+                            props.setProperty("mail.smtp.starttls.enable", "true")
+                            def session = jakarta.mail.Session.getInstance(props,
+                                new jakarta.mail.Authenticator() {
+                                    protected jakarta.mail.PasswordAuthentication getPasswordAuthentication() {
+                                        return new jakarta.mail.PasswordAuthentication(smtpUser, smtpPass)
+                                    }
+                                })
+                            def msg = new jakarta.mail.internet.MimeMessage(session)
+                            msg.setFrom(new jakarta.mail.internet.InternetAddress(fromEmail, fromName))
+                            msg.setRecipient(jakarta.mail.Message.RecipientType.TO,
+                                new jakarta.mail.internet.InternetAddress(tenant.adminEmail))
+                            msg.setSubject(subject)
+                            msg.setText(body)
+                            jakarta.mail.Transport.send(msg)
+                        } catch (Exception emailEx) {
+                            ec.logger.warn("Failed to send reminder email to ${tenant.adminEmail}: ${emailEx.message}")
+                        }
+                    }
+
+                    ec.service.sync().name("create#zenith.erp.saas.SaasAuditLog")
+                        .parameter("tenantId", sub.tenantId)
+                        .parameter("eventType", "REMINDER_SENT")
+                        .parameter("eventDate", ec.user.nowTimestamp)
+                        .parameter("description", "${reminderType} reminder ${emailEnabled ? 'sent' : 'logged (SMTP not configured)'} to ${tenant.adminEmail}")
+                        .disableAuthz().call()
+
+                    ec.logger.info("SaaS reminder: ${reminderType} for tenant ${tenant.tenantName} (${tenant.adminEmail})")
+                    sent++
+                }
+
+                threeDaySubs.each { sendReminder(it, "Renewal in 3 days") }
+                oneDaySubs.each { sendReminder(it, "Renewal tomorrow") }
+                trialExpiring.each { sendReminder(it, "Trial expires in 3 days") }
+
+                if (sent > 0) ec.logger.info("SaaS reminders: sent ${sent} reminder(s)")
+            ]]></script>
+        </actions>
+    </service>
+
+    <!-- ==================== AUTO-SUSPEND OVERDUE ==================== -->
+    <service verb="suspend" noun="OverdueTenants" authenticate="anonymous-all">
+        <description>Suspends tenants with overdue invoices past the grace period. Runs daily.</description>
+        <actions>
+            <script><![CDATA[
+                import java.time.LocalDate
+
+                def today = java.sql.Date.valueOf(LocalDate.now())
+
+                // Read configurable grace period
+                def graceDaysSetting = ec.entity.find("zenith.erp.base.CompanySettings")
+                    .condition("organizationPartyId", "ZETAERP")
+                    .condition("settingKey", "SAAS_OVERDUE_GRACE_DAYS").disableAuthz().one()?.settingValue
+                def graceDays = (graceDaysSetting ?: '7') as int
+                def graceDate = java.sql.Date.valueOf(LocalDate.now().minusDays(graceDays))
+
+                // Find invoices past due date (mark as overdue)
+                def pastDueInvoices = ec.entity.find("zenith.erp.saas.SaasInvoice")
+                    .condition("statusId", "SiSent")
+                    .condition("dueDate", "<", today)
+                    .disableAuthz().list()
+                pastDueInvoices.each { inv ->
+                    ec.service.sync().name("update#zenith.erp.saas.SaasInvoice")
+                        .parameter("saasInvoiceId", inv.saasInvoiceId)
+                        .parameter("statusId", "SiOverdue")
+                        .disableAuthz().call()
+                }
+
+                // Find invoices past grace period for suspension
+                def overdueInvoices = ec.entity.find("zenith.erp.saas.SaasInvoice")
+                    .condition("statusId", "SiOverdue")
+                    .condition("dueDate", "<", graceDate)
+                    .disableAuthz().list()
+
+                def tenantsToSuspend = new HashSet()
+                overdueInvoices.each { inv -> tenantsToSuspend.add(inv.tenantId) }
+
+                int suspended = 0
+                tenantsToSuspend.each { tenantId ->
+                    def tenant = ec.entity.find("zenith.erp.saas.SaasTenant")
+                        .condition("tenantId", tenantId).one()
+                    if (!tenant || tenant.statusId != 'SaasTenantActive') return
+
+                    // Suspend tenant
+                    ec.service.sync().name("update#zenith.erp.saas.SaasTenant")
+                        .parameter("tenantId", tenantId)
+                        .parameter("statusId", "SaasTenantSuspended")
+                        .disableAuthz().call()
+
+                    // Update subscription to past due
+                    def activeSubs = ec.entity.find("zenith.erp.saas.SaasSubscription")
+                        .condition("tenantId", tenantId)
+                        .condition("statusId", "SubActive")
+                        .list()
+                    activeSubs.each { sub ->
+                        ec.service.sync().name("update#zenith.erp.saas.SaasSubscription")
+                            .parameter("subscriptionId", sub.subscriptionId)
+                            .parameter("statusId", "SubPastDue")
+                            .disableAuthz().call()
+                    }
+
+                    // Audit log
+                    ec.service.sync().name("create#zenith.erp.saas.SaasAuditLog")
+                        .parameter("tenantId", tenantId)
+                        .parameter("eventType", "AUTO_SUSPEND")
+                        .parameter("eventDate", ec.user.nowTimestamp)
+                        .parameter("description", "Auto-suspended due to overdue payment")
+                        .disableAuthz().call()
+
+                    ec.logger.info("SaaS auto-suspend: suspended tenant ${tenant.tenantName} (overdue payment)")
+                    suspended++
+                }
+                if (suspended > 0) ec.logger.info("SaaS auto-suspend: suspended ${suspended} tenant(s)")
+            ]]></script>
+        </actions>
+    </service>
+
+    <!-- ==================== REACTIVATE AFTER PAYMENT ==================== -->
+    <service verb="reactivate" noun="AfterPayment">
+        <description>Reactivates a suspended tenant after successful payment.</description>
+        <in-parameters>
+            <parameter name="tenantId" required="true"/>
+            <parameter name="paymentId"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.saas.SaasTenant" value-field="tenant"/>
+            <if condition="tenant.statusId != 'SaasTenantSuspended'">
+                <return message="Tenant is not suspended."/>
+            </if>
+
+            <!-- Reactivate tenant -->
+            <service-call name="update#zenith.erp.saas.SaasTenant"
+                in-map="[tenantId:tenantId, statusId:'SaasTenantActive']"/>
+
+            <!-- Reactivate subscription -->
+            <entity-find entity-name="zenith.erp.saas.SaasSubscription" list="pastDueSubs">
+                <econdition field-name="tenantId"/>
+                <econdition field-name="statusId" value="SubPastDue"/>
+            </entity-find>
+            <iterate list="pastDueSubs" entry="sub">
+                <service-call name="update#zenith.erp.saas.SaasSubscription"
+                    in-map="[subscriptionId:sub.subscriptionId, statusId:'SubActive']"/>
+            </iterate>
+
+            <!-- Mark overdue invoices as paid -->
+            <entity-find entity-name="zenith.erp.saas.SaasInvoice" list="overdueInvs">
+                <econdition field-name="tenantId"/>
+                <econdition field-name="statusId" value="SiOverdue"/>
+            </entity-find>
+            <iterate list="overdueInvs" entry="inv">
+                <service-call name="update#zenith.erp.saas.SaasInvoice"
+                    in-map="[saasInvoiceId:inv.saasInvoiceId, statusId:'SiPaid', paidDate:ec.user.nowTimestamp]"/>
+            </iterate>
+
+            <!-- Audit log -->
+            <service-call name="create#zenith.erp.saas.SaasAuditLog"
+                in-map="[tenantId:tenantId, eventType:'REACTIVATED', eventDate:ec.user.nowTimestamp,
+                         userId:ec.user.userId, description:'Reactivated after payment' + (paymentId ? ' (payment: ' + paymentId + ')' : '')]"/>
+
+            <message type="success">Tenant reactivated successfully.</message>
+        </actions>
+    </service>
+
+</services>

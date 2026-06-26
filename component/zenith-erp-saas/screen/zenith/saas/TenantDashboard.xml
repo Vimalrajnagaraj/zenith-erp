@@ -1,0 +1,597 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
+        default-menu-title="My Subscription" default-menu-include="true" require-authentication="true">
+
+    <transition name="changePlan">
+        <actions>
+            <script><![CDATA[
+                boolean d = ec.artifactExecution.disableAuthz()
+                try {
+                    def orgId = ec.user.getPreference("ACTIVE_ORGANIZATION")
+                    def tenantList = ec.entity.find("zenith.erp.saas.SaasTenant")
+                        .condition("organizationPartyId", orgId)
+                        .condition("statusId", "SaasTenantActive").list()
+                    if (!tenantList) {
+                        ec.message.addError("Tenant not found")
+                        return
+                    }
+                    ec.service.sync().name("zenith.saas.SaasServices.change#Plan")
+                        .parameter("tenantId", tenantList[0].tenantId)
+                        .parameter("newPlanId", newPlanId)
+                        .parameter("billingCycle", billingCycle ?: "Monthly")
+                        .call()
+                } finally { if (!d) ec.artifactExecution.enableAuthz() }
+            ]]></script>
+        </actions>
+        <default-response url="."/>
+    </transition>
+
+    <transition name="cancelSubscription">
+        <actions>
+            <script><![CDATA[
+                boolean d = ec.artifactExecution.disableAuthz()
+                try {
+                    def orgId = ec.user.getPreference("ACTIVE_ORGANIZATION")
+                    def tenantList = ec.entity.find("zenith.erp.saas.SaasTenant")
+                        .condition("organizationPartyId", orgId).list()
+                    if (!tenantList) {
+                        ec.message.addError("Tenant not found")
+                        return
+                    }
+                    ec.service.sync().name("zenith.saas.SaasServices.cancel#Subscription")
+                        .parameter("tenantId", tenantList[0].tenantId)
+                        .parameter("reason", reason ?: "Self-service cancellation")
+                        .call()
+                } finally { if (!d) ec.artifactExecution.enableAuthz() }
+            ]]></script>
+        </actions>
+        <default-response url="."/>
+    </transition>
+
+    <transition name="initiatePayment" read-only="true">
+        <actions>
+            <script><![CDATA[
+                boolean d = ec.artifactExecution.disableAuthz()
+                try {
+                    def invId = ec.web.getRequest().getParameter("saasInvoiceId")
+                    def _orgId = ec.user.getPreference("ACTIVE_ORGANIZATION")
+                    def _myTenant = ec.entity.find("zenith.erp.saas.SaasTenant").condition("organizationPartyId", _orgId).list()
+                    def _inv = ec.entity.find("zenith.erp.saas.SaasInvoice").condition("saasInvoiceId", invId).one()
+                    if (!_inv || !_myTenant || _inv.tenantId != _myTenant[0].tenantId) {
+                        ec.web.sendJsonResponse([errors: "Invoice not found for your account."])
+                        return
+                    }
+                    def result = ec.service.sync().name("zenith.saas.SaasPaymentServices.create#RazorpayOrder")
+                        .parameter("saasInvoiceId", invId).call()
+                    if (ec.message.hasError()) {
+                        def msg = ec.message.getErrors().join('; ')
+                        ec.message.clearErrors()
+                        ec.web.sendJsonResponse([errors: msg])
+                        return
+                    }
+                    ec.web.sendJsonResponse(result)
+                } finally { if (!d) ec.artifactExecution.enableAuthz() }
+            ]]></script>
+        </actions>
+        <default-response type="none"/>
+    </transition>
+
+    <transition name="verifyPayment">
+        <actions>
+            <script><![CDATA[
+                boolean d = ec.artifactExecution.disableAuthz()
+                try {
+                    def invId = ec.web.getRequest().getParameter("saasInvoiceId")
+                    def _orgId = ec.user.getPreference("ACTIVE_ORGANIZATION")
+                    def _myTenant = ec.entity.find("zenith.erp.saas.SaasTenant").condition("organizationPartyId", _orgId).list()
+                    def _inv = ec.entity.find("zenith.erp.saas.SaasInvoice").condition("saasInvoiceId", invId).one()
+                    if (!_inv || !_myTenant || _inv.tenantId != _myTenant[0].tenantId) {
+                        ec.message.addError("Invoice not found for your account.")
+                        return
+                    }
+                    def result = ec.service.sync().name("zenith.saas.SaasPaymentServices.verify#RazorpayPayment")
+                        .parameter("razorpay_order_id", ec.web.getRequest().getParameter("razorpay_order_id"))
+                        .parameter("razorpay_payment_id", ec.web.getRequest().getParameter("razorpay_payment_id"))
+                        .parameter("razorpay_signature", ec.web.getRequest().getParameter("razorpay_signature"))
+                        .parameter("saasInvoiceId", ec.web.getRequest().getParameter("saasInvoiceId"))
+                        .call()
+                    if (result.success) {
+                        ec.web.session.setAttribute("moqui.message.validationErrors", null)
+                        ec.message.addMessage("Payment successful! Your account has been updated.", "success")
+                    }
+                } finally { if (!d) ec.artifactExecution.enableAuthz() }
+            ]]></script>
+        </actions>
+        <default-response url="."/>
+    </transition>
+
+    <actions>
+        <script><![CDATA[
+            def orgId = ec.user.getPreference("ACTIVE_ORGANIZATION")
+            context.isSaasManaged = false
+
+            if (orgId) {
+                boolean wasDisabled = ec.artifactExecution.disableAuthz()
+                try {
+                    def tenantList = ec.entity.find("zenith.erp.saas.SaasTenant")
+                        .condition("organizationPartyId", orgId)
+                        .condition("statusId", "SaasTenantActive").list()
+                    if (tenantList) {
+                        context.isSaasManaged = true
+                        def tenant = tenantList[0]
+                        context.tenantId = tenant.tenantId
+                        context.tenantName = tenant.tenantName
+                        context.subdomain = tenant.subdomain
+
+                        // Load plan info
+                        def plan = ec.entity.find("zenith.erp.saas.SaasPlan")
+                            .condition("planId", tenant.planId).one()
+                        context.plan = plan
+
+                        // Load current subscription. startDate is date-granularity, so same-day plan
+                        // changes tie — break the tie with lastUpdatedStamp so the newest one wins
+                        // (otherwise the dashboard can show a stale/expired subscription).
+                        def subList = ec.entity.find("zenith.erp.saas.SaasSubscription")
+                            .condition("tenantId", tenant.tenantId)
+                            .orderBy("-startDate").orderBy("-lastUpdatedStamp").limit(1).list()
+                        context.subscription = subList ? subList[0] : null
+
+                        // Load allowed modules
+                        def planModules = ec.entity.find("zenith.erp.saas.SaasPlanModule")
+                            .condition("planId", tenant.planId).list()
+                        context.moduleList = planModules
+
+                        // Count users in org
+                        def relCount = ec.entity.find("mantle.party.PartyRelationship")
+                            .condition("toPartyId", orgId)
+                            .condition("toRoleTypeId", "OrgInternal").count()
+                        context.userCount = relCount as int
+
+                        // Plan limits
+                        context.maxUsers = plan?.maxUsers ?: 0
+                        context.maxPos = plan?.maxPosTerminals ?: 0
+                        context.maxProducts = plan?.maxProductsSku ?: 0
+                        context.maxTxn = plan?.maxMonthlyTransactions ?: 0
+                        context.maxStores = plan?.maxStores ?: 0
+                        context.maxLoyalty = plan?.maxLoyaltyMembers ?: 0
+                        context.maxPromos = plan?.maxPromotions ?: 0
+                        // Actual org-scoped usage (entity filters scope these to the tenant)
+                        try {
+                            context.usedProducts = ec.entity.find("mantle.product.Product").condition("productTypeEnumId","PtAsset").condition("ownerPartyId", orgId).count() as int
+                            context.usedTerminals = ec.entity.find("zenith.erp.pos.PosTerminal").condition("organizationPartyId", orgId).count() as int
+                            def _ms = java.sql.Timestamp.valueOf(new java.text.SimpleDateFormat("yyyy-MM").format(ec.user.nowTimestamp) + "-01 00:00:00")
+                            context.usedTxn = ec.entity.find("zenith.erp.pos.PosTransaction").condition("organizationPartyId", orgId).condition("entryDate",">=",_ms).count() as int
+                        } catch (Exception _e) { context.usedProducts = 0; context.usedTerminals = 0; context.usedTxn = 0 }
+
+                        // Pending invoices
+                        def invList = ec.entity.find("zenith.erp.saas.SaasInvoice")
+                            .condition("tenantId", tenant.tenantId)
+                            .condition("statusId", "in", ["SiSent", "SiOverdue"])
+                            .orderBy("-invoiceDate").list()
+                        context.pendingInvoices = invList
+
+                        // Razorpay key for client-side checkout
+                        def rzpKey = ec.entity.find("zenith.erp.base.CompanySettings")
+                            .condition("organizationPartyId", "ZETAERP")
+                            .condition("settingKey", "RAZORPAY_KEY_ID").one()
+                        context.razorpayKeyId = rzpKey?.settingValue ?: ''
+
+                        // Payment history
+                        def payHistory = ec.entity.find("zenith.erp.saas.SaasPayment")
+                            .condition("tenantId", tenant.tenantId)
+                            .orderBy("-paymentDate").limit(10).list()
+                        context.paymentHistory = payHistory
+
+                        // All plans for upgrade comparison
+                        def allPlans = ec.entity.find("zenith.erp.saas.SaasPlan")
+                            .condition("isActive", "Y").orderBy("sortOrder").list()
+                        context.allPlans = allPlans
+                        context.currentPlanSortOrder = plan?.sortOrder ?: 0
+                    }
+                } catch (Exception e) { /* SaaS entities may not exist */ }
+                finally { if (!wasDisabled) ec.artifactExecution.enableAuthz() }
+            }
+        ]]></script>
+    </actions>
+
+    <widgets>
+        <!-- This screen was authored with Quasar utility classes, but /apps renders with Bootstrap
+             (where q-pa-*, q-mb-*, shadow-2, text-h6, etc. don't exist). Define the ones used here so
+             the layout has proper padding/spacing instead of clipping flush against the viewport edge. -->
+        <render-mode><text type="html"><![CDATA[
+<style>
+.q-pa-xs{padding:4px}.q-pa-sm{padding:8px}.q-pa-md{padding:16px}.q-pa-lg{padding:24px}.q-pa-xl{padding:32px}
+.q-px-sm{padding-left:8px;padding-right:8px}.q-px-md{padding-left:16px;padding-right:16px}.q-pt-md{padding-top:16px}
+.q-mb-xs{margin-bottom:4px}.q-mb-sm{margin-bottom:8px}.q-mb-md{margin-bottom:16px}.q-mb-lg{margin-bottom:24px}
+.q-mt-xs{margin-top:4px}.q-mt-md{margin-top:16px}.q-mt-lg{margin-top:24px}
+.q-ml-lg{margin-left:24px}.q-mr-xs{margin-right:4px}.q-mr-sm{margin-right:8px}
+.q-gutter-sm{display:flex;flex-wrap:wrap}.q-gutter-sm>*{margin:4px;width:auto}
+.q-gutter-md>*{margin:8px}.q-gutter-lg>*{margin:12px}
+.items-center{align-items:center}.text-h6{font-size:1.25rem;font-weight:500;line-height:1.4}
+.text-weight-bold{font-weight:700}.text-weight-medium{font-weight:500}
+.text-caption{font-size:.75rem}.text-body2{font-size:.875rem}.text-capitalize{text-transform:capitalize}
+.text-primary{color:#1a237e}.text-positive{color:#21a35a}.text-negative{color:#c10015}.text-warning{color:#e8870c}
+.text-grey-6{color:#9e9e9e}.text-grey-7{color:#616161}
+.bg-primary{background:#1a237e}.bg-amber-1{background:#fff8e1}.bg-blue-1{background:#e3f2fd}.bg-green-1{background:#e8f5e9}.bg-grey-1{background:#fafafa}
+.shadow-2{box-shadow:0 1px 5px rgba(0,0,0,.18),0 2px 2px rgba(0,0,0,.12)}
+.border-radius-md{border-radius:6px}.border-radius-lg{border-radius:12px}
+</style>
+        ]]></text></render-mode>
+        <section name="NotSaasSection" condition="!isSaasManaged">
+            <widgets>
+                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-xl text-center" style-sm="max-width:500px;margin:60px auto">
+                    <render-mode><text type="html"><![CDATA[<q-icon name="info" class="text-h2 text-info"/>]]></text></render-mode>
+                    <label text="Self-Hosted Installation" type="h5" style="text-weight-bold q-mt-md"/>
+                    <label text="This installation is not managed by ZetaERP SaaS." type="p" style="text-grey-7"/>
+                </container>
+            </widgets>
+        </section>
+
+        <section name="SaasSection" condition="isSaasManaged">
+            <widgets>
+              <container style="q-pa-lg">
+                <label text="My Subscription" type="h5" style="text-weight-bold q-mb-lg"/>
+
+                <container style="row q-gutter-lg">
+                    <!-- Subscription Info Card -->
+                    <container style="col-6">
+                        <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg">
+                            <container style="row items-center q-mb-md">
+                                <render-mode><text type="html"><![CDATA[<q-icon name="card_membership" class="text-primary q-mr-sm"/>]]></text></render-mode>
+                                <label text="Subscription Details" type="h6" style="text-weight-bold"/>
+                            </container>
+                            <container style="q-mb-sm">
+                                <label text="Plan: " style="text-grey-7"/>
+                                <label text="${plan?.planName ?: 'N/A'}" style="text-weight-bold text-primary text-h6"/>
+                            </container>
+                            <container style="q-mb-sm">
+                                <label text="Organization: " style="text-grey-7"/>
+                                <label text="${tenantName ?: ''}" style="text-weight-bold"/>
+                            </container>
+                            <container style="q-mb-sm">
+                                <label text="Subdomain: " style="text-grey-7"/>
+                                <label text="${subdomain ?: ''}.zetaclantech.com" style="text-weight-bold"/>
+                            </container>
+                            <container style="q-mb-sm" condition="subscription">
+                                <label text="Status: " style="text-grey-7"/>
+                                <label text="${subscription.statusId == 'SubTrial' ? 'Trial' : subscription.statusId == 'SubActive' ? 'Active' : subscription.statusId}" style="text-weight-bold ${subscription.statusId == 'SubTrial' ? 'text-warning' : 'text-positive'}"/>
+                            </container>
+                            <container style="q-mb-sm" condition="subscription?.trialEndDate">
+                                <label text="Trial Ends: " style="text-grey-7"/>
+                                <label text="${ec.l10n.format(subscription.trialEndDate, 'dd-MMM-yyyy')}" style="text-weight-bold text-warning"/>
+                            </container>
+                            <container style="q-mb-sm" condition="subscription?.renewalDate">
+                                <label text="Next Renewal: " style="text-grey-7"/>
+                                <label text="${ec.l10n.format(subscription.renewalDate, 'dd-MMM-yyyy')}" style="text-weight-bold"/>
+                            </container>
+                            <container style="q-mb-sm" condition="subscription?.amount">
+                                <label text="Amount: " style="text-grey-7"/>
+                                <label text="${subscription.currencyUomId ?: ''} ${subscription.amount}/${subscription.billingCycle ?: 'Monthly'}" style="text-weight-bold"/>
+                            </container>
+                            <section name="CancelSection" condition="subscription?.statusId != 'SubCancelled'">
+                                <widgets>
+                                    <container style="q-mt-md q-pt-md" style-sm="border-top:1px solid #e0e0e0">
+                                        <container-dialog id="CancelDialog" button-text="Cancel Subscription" type="danger">
+                                            <label text="Are you sure you want to cancel?" type="h6" style="text-weight-bold text-negative q-mb-md"/>
+                                            <label text="Your access will continue until the end of the current billing period." type="p" style="text-grey-7 q-mb-md"/>
+                                            <form-single name="CancelForm" transition="cancelSubscription">
+                                                <field name="reason"><default-field title="Reason for cancellation">
+                                                    <text-area rows="3" cols="40"/>
+                                                </default-field></field>
+                                                <field name="submitBtn"><default-field title="">
+                                                    <submit text="Confirm Cancellation" type="danger"/>
+                                                </default-field></field>
+                                            </form-single>
+                                        </container-dialog>
+                                    </container>
+                                </widgets>
+                            </section>
+                            <section name="CancelledNotice" condition="subscription?.statusId == 'SubCancelled'">
+                                <widgets>
+                                    <container style="q-mt-md q-pa-md bg-amber-1 border-radius-md">
+                                        <render-mode><text type="html"><![CDATA[<q-icon name="warning" class="text-warning q-mr-sm"/>]]></text></render-mode>
+                                        <label text="Your subscription has been cancelled." style="text-weight-bold"/>
+                                    </container>
+                                </widgets>
+                            </section>
+                        </container>
+                    </container>
+
+                    <!-- Usage Card -->
+                    <container style="col-6">
+                        <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg">
+                            <container style="row items-center q-mb-md">
+                                <render-mode><text type="html"><![CDATA[<q-icon name="bar_chart" class="text-primary q-mr-sm"/>]]></text></render-mode>
+                                <label text="Current Usage" type="h6" style="text-weight-bold"/>
+                            </container>
+                            <container style="q-mb-md">
+                                <container style="row items-center q-mb-xs">
+                                    <render-mode><text type="html"><![CDATA[<q-icon name="people" class="text-grey-7 q-mr-sm"/>]]></text></render-mode>
+                                    <label text="Users: " style="text-grey-7"/>
+                                    <label text="${userCount}" style="text-weight-bold"/>
+                                    <label text=" / ${maxUsers == 0 ? 'Unlimited' : maxUsers}" style="text-grey-6"/>
+                                </container>
+                                <section name="UserWarning" condition="maxUsers > 0 &amp;&amp; userCount >= maxUsers">
+                                    <widgets>
+                                        <label text="User limit reached!" style="text-negative text-caption q-ml-lg"/>
+                                    </widgets>
+                                </section>
+                            </container>
+                            <container style="q-mb-md">
+                                <container style="row items-center q-mb-xs">
+                                    <render-mode><text type="html"><![CDATA[<q-icon name="point_of_sale" class="text-grey-7 q-mr-sm"/>]]></text></render-mode>
+                                    <label text="POS Terminals: " style="text-grey-7"/>
+                                    <label text="${usedTerminals}" style="text-weight-bold"/>
+                                    <label text=" / ${maxPos == 0 ? 'Unlimited' : maxPos}" style="text-grey-6"/>
+                                </container>
+                            </container>
+                            <container style="q-mb-md">
+                                <container style="row items-center q-mb-xs">
+                                    <render-mode><text type="html"><![CDATA[<q-icon name="inventory_2" class="text-grey-7 q-mr-sm"/>]]></text></render-mode>
+                                    <label text="Products: " style="text-grey-7"/>
+                                    <label text="${usedProducts}" style="text-weight-bold ${(maxProducts > 0 &amp;&amp; usedProducts > maxProducts) ? 'text-negative' : ''}"/>
+                                    <label text=" / ${maxProducts == 0 ? 'Unlimited' : maxProducts}" style="text-grey-6"/>
+                                </container>
+                            </container>
+                            <container style="q-mb-md">
+                                <container style="row items-center q-mb-xs">
+                                    <render-mode><text type="html"><![CDATA[<q-icon name="receipt_long" class="text-grey-7 q-mr-sm"/>]]></text></render-mode>
+                                    <label text="Monthly Transactions: " style="text-grey-7"/>
+                                    <label text="${usedTxn}" style="text-weight-bold"/>
+                                    <label text=" / ${maxTxn == 0 ? 'Unlimited' : maxTxn}" style="text-grey-6"/>
+                                </container>
+                            </container>
+                            <container style="q-mb-md">
+                                <container style="row items-center q-mb-xs">
+                                    <render-mode><text type="html"><![CDATA[<q-icon name="store" class="text-grey-7 q-mr-sm"/>]]></text></render-mode>
+                                    <label text="Stores: " style="text-grey-7"/>
+                                    <label text="${maxStores == 0 ? 'Unlimited' : maxStores}" style="text-weight-bold"/>
+                                </container>
+                            </container>
+                            <container style="q-mb-md">
+                                <container style="row items-center q-mb-xs">
+                                    <render-mode><text type="html"><![CDATA[<q-icon name="loyalty" class="text-grey-7 q-mr-sm"/>]]></text></render-mode>
+                                    <label text="Loyalty Members: " style="text-grey-7"/>
+                                    <label text="${maxLoyalty == 0 ? 'Unlimited' : ec.l10n.format(maxLoyalty, '#,##0')}" style="text-weight-bold"/>
+                                </container>
+                            </container>
+                            <container style="q-mb-md">
+                                <container style="row items-center q-mb-xs">
+                                    <render-mode><text type="html"><![CDATA[<q-icon name="local_offer" class="text-grey-7 q-mr-sm"/>]]></text></render-mode>
+                                    <label text="Active Promotions: " style="text-grey-7"/>
+                                    <label text="${maxPromos == 0 ? 'Unlimited' : maxPromos}" style="text-weight-bold"/>
+                                </container>
+                            </container>
+                        </container>
+                    </container>
+                </container>
+
+                <!-- Included Modules -->
+                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mt-lg">
+                    <container style="row items-center q-mb-md">
+                        <render-mode><text type="html"><![CDATA[<q-icon name="apps" class="text-primary q-mr-sm"/>]]></text></render-mode>
+                        <label text="Included Modules" type="h6" style="text-weight-bold"/>
+                    </container>
+                    <section name="AllAccessSection" condition="moduleList?.find{it.moduleId == 'ALL'}">
+                        <widgets>
+                            <container style="q-pa-md bg-green-1 border-radius-md">
+                                <render-mode><text type="html"><![CDATA[<q-icon name="check_circle" class="text-positive q-mr-sm"/>]]></text></render-mode>
+                                <label text="All modules included with your ${plan?.planName} plan!" style="text-weight-bold text-positive"/>
+                            </container>
+                        </widgets>
+                    </section>
+                    <section name="ModuleListSection" condition="!moduleList?.find{it.moduleId == 'ALL'}">
+                        <widgets>
+                            <container style="row q-gutter-sm">
+                                <section-iterate name="ModuleChips" list="moduleList" entry="mod">
+                                    <widgets>
+                                        <container style="q-pa-sm q-px-md bg-blue-1 border-radius-md">
+                                            <render-mode><text type="html"><![CDATA[<q-icon name="check" class="text-positive q-mr-xs"/>]]></text></render-mode>
+                                            <label text="${mod.moduleId}" style="text-weight-medium text-capitalize"/>
+                                        </container>
+                                    </widgets>
+                                </section-iterate>
+                            </container>
+                        </widgets>
+                    </section>
+                </container>
+
+                <!-- Pending Invoices -->
+                <section name="PendingInvoicesSection" condition="pendingInvoices">
+                    <widgets>
+                        <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mt-lg">
+                            <container style="row items-center q-mb-md">
+                                <render-mode><text type="html"><![CDATA[<q-icon name="receipt_long" class="text-negative q-mr-sm"/>]]></text></render-mode>
+                                <label text="Pending Payments" type="h6" style="text-weight-bold"/>
+                            </container>
+                            <form-list name="PendingInvoicesList" list="pendingInvoices" skip-form="true">
+                                <field name="saasInvoiceId"><default-field title="Invoice"><display/></default-field></field>
+                                <field name="invoiceDate"><default-field title="Date"><display format="dd-MMM-yyyy"/></default-field></field>
+                                <field name="dueDate"><default-field title="Due"><display format="dd-MMM-yyyy"/></default-field></field>
+                                <field name="periodFrom"><default-field title="Period"><display format="dd-MMM"/></default-field></field>
+                                <field name="periodTo"><default-field title="To"><display format="dd-MMM-yyyy"/></default-field></field>
+                                <field name="totalAmount"><default-field title="Amount"><display format="#,##0.00"/></default-field></field>
+                                <field name="statusId"><default-field title="Status"><display/></default-field></field>
+                                <field name="payBtn"><default-field title="">
+                                    <render-mode><text type="html"><![CDATA[
+                                        <button class="btn btn-sm btn-success saas-pay-btn"
+                                            data-invoice-id="${saasInvoiceId}"
+                                            data-amount="${totalAmount}"
+                                            onclick="initiateSaasPayment('${saasInvoiceId}')">
+                                            <i class="fa fa-credit-card"></i> Pay Now
+                                        </button>
+                                    ]]></text><text type="qvt"><![CDATA[
+                                        <q-btn color="positive" size="sm" label="Pay Now" icon="payment"
+                                            @click="initiateSaasPayment('${saasInvoiceId}')"/>
+                                    ]]></text></render-mode>
+                                </default-field></field>
+                            </form-list>
+                        </container>
+                    </widgets>
+                </section>
+
+                <!-- Payment History -->
+                <section name="PaymentHistorySection" condition="paymentHistory">
+                    <widgets>
+                        <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mt-lg">
+                            <container style="row items-center q-mb-md">
+                                <render-mode><text type="html"><![CDATA[<q-icon name="history" class="text-primary q-mr-sm"/>]]></text></render-mode>
+                                <label text="Payment History" type="h6" style="text-weight-bold"/>
+                            </container>
+                            <form-list name="PaymentHistoryList" list="paymentHistory" skip-form="true">
+                                <field name="saasPaymentId"><default-field title="ID"><display/></default-field></field>
+                                <field name="paymentDate"><default-field title="Date"><display format="dd-MMM-yyyy HH:mm"/></default-field></field>
+                                <field name="amount"><default-field title="Amount"><display format="#,##0.00"/></default-field></field>
+                                <field name="paymentGateway"><default-field title="Gateway"><display/></default-field></field>
+                                <field name="paymentMethod"><default-field title="Method"><display/></default-field></field>
+                                <field name="statusId"><default-field title="Status"><display/></default-field></field>
+                            </form-list>
+                        </container>
+                    </widgets>
+                </section>
+
+                <!-- Plan Comparison & Upgrade -->
+                <section name="PlanComparison" condition="allPlans">
+                    <widgets>
+                        <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mt-lg">
+                            <container style="row items-center q-mb-md">
+                                <render-mode><text type="html"><![CDATA[<q-icon name="compare_arrows" class="text-primary q-mr-sm"/>]]></text></render-mode>
+                                <label text="Available Plans" type="h6" style="text-weight-bold"/>
+                            </container>
+                            <container style="row q-gutter-md">
+                                <section-iterate name="PlanCards" list="allPlans" entry="p">
+                                    <widgets>
+                                        <container style="col">
+                                            <container style="q-pa-lg border-radius-lg text-center ${p.planId == plan?.planId ? 'bg-blue-1' : 'bg-grey-1'}" style-sm="border: ${p.planId == plan?.planId ? '2px solid #1a237e' : '1px solid #e0e0e0'}">
+                                                <label text="${p.planName}" type="h6" style="text-weight-bold ${p.planId == plan?.planId ? 'text-primary' : ''}"/>
+                                                <section name="CurrentBadge_${p_index}" condition="p.planId == plan?.planId">
+                                                    <widgets>
+                                                        <container style="q-mt-xs">
+                                                            <label text="Current Plan" style="text-caption text-white bg-primary q-pa-xs q-px-sm border-radius-md"/>
+                                                        </container>
+                                                    </widgets>
+                                                </section>
+                                                <container style="q-mt-md">
+                                                    <label text="₹${ec.l10n.format(p.monthlyPrice, '#,##0')}" type="h5" style="text-weight-bold"/>
+                                                    <label text="/month" style="text-grey-6"/>
+                                                </container>
+                                                <container style="q-mt-xs text-caption text-grey-6">
+                                                    <label text="₹${ec.l10n.format(p.yearlyPrice, '#,##0')}/year"/>
+                                                </container>
+                                                <container style="q-mt-md text-left q-px-sm">
+                                                    <container style="q-mb-xs">
+                                                        <render-mode><text type="html"><![CDATA[<q-icon name="people" class="text-grey-7 q-mr-xs"/>]]></text></render-mode>
+                                                        <label text="${p.maxUsers == 0 ? 'Unlimited' : p.maxUsers} users" style="text-body2"/>
+                                                    </container>
+                                                    <container style="q-mb-xs">
+                                                        <render-mode><text type="html"><![CDATA[<q-icon name="point_of_sale" class="text-grey-7 q-mr-xs"/>]]></text></render-mode>
+                                                        <label text="${p.maxPosTerminals == 0 ? 'Unlimited' : p.maxPosTerminals} POS terminals" style="text-body2"/>
+                                                    </container>
+                                                    <container style="q-mb-xs">
+                                                        <render-mode><text type="html"><![CDATA[<q-icon name="inventory_2" class="text-grey-7 q-mr-xs"/>]]></text></render-mode>
+                                                        <label text="${p.maxProductsSku == 0 ? 'Unlimited' : ec.l10n.format(p.maxProductsSku, '#,##0')} products" style="text-body2"/>
+                                                    </container>
+                                                    <container style="q-mb-xs">
+                                                        <render-mode><text type="html"><![CDATA[<q-icon name="receipt_long" class="text-grey-7 q-mr-xs"/>]]></text></render-mode>
+                                                        <label text="${p.maxMonthlyTransactions == 0 ? 'Unlimited' : ec.l10n.format(p.maxMonthlyTransactions, '#,##0')} txn/month" style="text-body2"/>
+                                                    </container>
+                                                    <container style="q-mb-xs">
+                                                        <render-mode><text type="html"><![CDATA[<q-icon name="store" class="text-grey-7 q-mr-xs"/>]]></text></render-mode>
+                                                        <label text="${p.maxStores == 0 ? 'Unlimited' : p.maxStores} stores" style="text-body2"/>
+                                                    </container>
+                                                    <container style="q-mb-xs">
+                                                        <render-mode><text type="html"><![CDATA[<q-icon name="loyalty" class="text-grey-7 q-mr-xs"/>]]></text></render-mode>
+                                                        <label text="${p.maxLoyaltyMembers == 0 ? 'Unlimited' : ec.l10n.format(p.maxLoyaltyMembers, '#,##0')} loyalty members" style="text-body2"/>
+                                                    </container>
+                                                    <container style="q-mb-xs">
+                                                        <render-mode><text type="html"><![CDATA[<q-icon name="local_offer" class="text-grey-7 q-mr-xs"/>]]></text></render-mode>
+                                                        <label text="${p.maxPromotions == 0 ? 'Unlimited' : p.maxPromotions} promotions" style="text-body2"/>
+                                                    </container>
+                                                </container>
+                                                <section name="UpgradeBtn_${p_index}" condition="p.sortOrder > currentPlanSortOrder">
+                                                    <widgets>
+                                                        <container style="q-mt-md">
+                                                            <link url="changePlan" text="Upgrade" btn-type="success" icon="fa fa-arrow-up"
+                                                                parameter-map="[newPlanId:p.planId, billingCycle:'Monthly']"
+                                                                confirmation="Upgrade to ${p.planName} (₹${ec.l10n.format(p.monthlyPrice, '#,##0')}/mo)? Your current plan will be replaced immediately."/>
+                                                        </container>
+                                                    </widgets>
+                                                </section>
+                                                <section name="DowngradeBtn_${p_index}" condition="p.sortOrder &lt; currentPlanSortOrder &amp;&amp; p.planId != plan?.planId">
+                                                    <widgets>
+                                                        <container style="q-mt-md">
+                                                            <link url="changePlan" text="Downgrade" btn-type="warning" icon="fa fa-arrow-down"
+                                                                parameter-map="[newPlanId:p.planId, billingCycle:'Monthly']"
+                                                                confirmation="Downgrade to ${p.planName}? You may lose access to some modules and features."/>
+                                                        </container>
+                                                    </widgets>
+                                                </section>
+                                            </container>
+                                        </container>
+                                    </widgets>
+                                </section-iterate>
+                            </container>
+                        </container>
+                    </widgets>
+                </section>
+
+                <!-- Razorpay Checkout Script -->
+                <render-mode><text type="html"><![CDATA[
+                    <script src="https://checkout.razorpay.com/v1/checkout.js"></script>
+                    <script>
+                    function initiateSaasPayment(invoiceId) {
+                        $.ajax({
+                            url: 'initiatePayment?saasInvoiceId=' + invoiceId,
+                            type: 'GET',
+                            dataType: 'json',
+                            success: function(data) {
+                                if (!data.razorpayOrderId) {
+                                    alert('Could not create payment order. ' + (data.errors || 'Please try again.'));
+                                    return;
+                                }
+                                var options = {
+                                    key: data.razorpayKeyId,
+                                    amount: data.amount,
+                                    currency: data.currency || 'INR',
+                                    name: 'ZetaERP',
+                                    description: 'Subscription Payment',
+                                    order_id: data.razorpayOrderId,
+                                    prefill: { email: data.adminEmail || '', contact: '' },
+                                    handler: function(response) {
+                                        // Payment successful, verify on server
+                                        var form = document.createElement('form');
+                                        form.method = 'POST';
+                                        form.action = 'verifyPayment';
+                                        var fields = {
+                                            razorpay_order_id: response.razorpay_order_id,
+                                            razorpay_payment_id: response.razorpay_payment_id,
+                                            razorpay_signature: response.razorpay_signature,
+                                            saasInvoiceId: invoiceId,
+                                            moquiSessionToken: document.querySelector('[name=moquiSessionToken]')?.value || ''
+                                        };
+                                        for (var k in fields) {
+                                            var input = document.createElement('input');
+                                            input.type = 'hidden';
+                                            input.name = k;
+                                            input.value = fields[k];
+                                            form.appendChild(input);
+                                        }
+                                        document.body.appendChild(form);
+                                        form.submit();
+                                    },
+                                    theme: { color: '#1a237e' }
+                                };
+                                var rzp = new Razorpay(options);
+                                rzp.open();
+                            },
+                            error: function() { alert('Error connecting to payment gateway.'); }
+                        });
+                    }
+                    </script>
+                ]]></text></render-mode>
+              </container>
+            </widgets>
+        </section>
+    </widgets>
+</screen>

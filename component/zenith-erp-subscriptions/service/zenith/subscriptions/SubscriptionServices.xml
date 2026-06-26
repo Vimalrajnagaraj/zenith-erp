@@ -1,0 +1,370 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <service verb="create" noun="Subscription">
+        <in-parameters>
+            <parameter name="customerPartyId" required="true"/>
+            <parameter name="planId" required="true"/>
+            <parameter name="paymentMethodId"/>
+            <parameter name="discountCode"/>
+            <parameter name="notes"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="subscriptionId"/>
+            <parameter name="subscriptionNumber"/>
+        </out-parameters>
+        <actions>
+            <set field="now" from="ec.user.nowTimestamp"/>
+            <set field="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <!-- A subscription is a tenant-owned billing record: refuse to create an orphan (no active org).
+                 Tenant users always have a valid active org; super-admins must switch into an org first. -->
+            <if condition="!organizationPartyId">
+                <return error="true" message="No active organization is selected. Please switch to the organization that should own this subscription before creating it, so it is billed under the correct tenant."/>
+            </if>
+            <entity-find-one entity-name="zenith.erp.subscriptions.SubscriptionPlan" value-field="plan"/>
+            <if condition="!plan"><return error="true" message="Plan not found"/></if>
+
+            <!-- Generate SUB/FY/SEQ number -->
+            <set field="cal" from="java.util.Calendar.getInstance()"/>
+            <script>cal.setTime(now)</script>
+            <set field="year" from="cal.get(java.util.Calendar.YEAR)"/>
+            <set field="month" from="cal.get(java.util.Calendar.MONTH) + 1"/>
+            <set field="fyStart" from="month &gt;= 4 ? year : year - 1"/>
+            <set field="fyStr" from="String.format('%02d-%02d', fyStart % 100, (fyStart + 1) % 100)"/>
+
+            <entity-find entity-name="zenith.erp.subscriptions.Subscription" list="existing">
+                <econdition field-name="subscriptionNumber" operator="like" value="SUB/${fyStr}/%"/>
+                <order-by field-name="-subscriptionNumber"/>
+                <limit count="1"/>
+            </entity-find>
+            <set field="seq" from="1"/>
+            <if condition="existing">
+                <set field="lastNum" from="existing[0].subscriptionNumber"/>
+                <set field="seq" from="(lastNum.substring(lastNum.lastIndexOf('/') + 1) as Integer) + 1"/>
+            </if>
+            <set field="subscriptionNumber" from="'SUB/' + fyStr + '/' + String.format('%05d', seq)"/>
+
+            <!-- Calculate dates -->
+            <set field="startDate" from="now"/>
+            <set field="trialDays" from="plan.trialDays ?: 0" type="Integer"/>
+            <set field="hasTrial" from="trialDays &gt; 0" type="Boolean"/>
+
+            <set field="calEnd" from="java.util.Calendar.getInstance()"/>
+            <script>calEnd.setTime(now)</script>
+            <if condition="hasTrial">
+                <script>calEnd.add(java.util.Calendar.DAY_OF_MONTH, trialDays as int)</script>
+                <set field="trialEndDate" from="new java.sql.Timestamp(calEnd.getTimeInMillis())"/>
+            </if>
+
+            <!-- Calculate end date based on billing frequency -->
+            <set field="calBill" from="java.util.Calendar.getInstance()"/>
+            <script>calBill.setTime(hasTrial ? trialEndDate : now)</script>
+            <if condition="plan.billingFrequency == 'BfMonthly'">
+                <script>calBill.add(java.util.Calendar.MONTH, 1)</script>
+                <else-if condition="plan.billingFrequency == 'BfQuarterly'">
+                    <script>calBill.add(java.util.Calendar.MONTH, 3)</script>
+                </else-if>
+                <else-if condition="plan.billingFrequency == 'BfHalfYearly'">
+                    <script>calBill.add(java.util.Calendar.MONTH, 6)</script>
+                </else-if>
+                <else-if condition="plan.billingFrequency == 'BfAnnually'">
+                    <script>calBill.add(java.util.Calendar.YEAR, 1)</script>
+                </else-if>
+            </if>
+            <set field="nextBillingDate" from="hasTrial ? trialEndDate : new java.sql.Timestamp(calBill.getTimeInMillis())"/>
+            <set field="endDate" from="new java.sql.Timestamp(calBill.getTimeInMillis())"/>
+
+            <!-- Calculate GST -->
+            <set field="billingAmount" from="plan.billingAmount"/>
+            <set field="gstRate" from="plan.taxRate ?: 18"/>
+            <set field="gstAmount" from="(billingAmount * gstRate / 100).setScale(2, java.math.RoundingMode.HALF_UP)"/>
+            <set field="totalAmount" from="billingAmount + gstAmount"/>
+
+            <!-- Apply discount if any (only within validity window and use limit, scoped to this tenant) -->
+            <if condition="discountCode">
+                <entity-find entity-name="zenith.erp.subscriptions.SubscriptionDiscount" list="discList">
+                    <econdition field-name="discountCode"/>
+                    <econdition field-name="isActive" value="Y"/>
+                    <econdition field-name="organizationPartyId" from="organizationPartyId" ignore-if-empty="true"/>
+                    <limit count="1"/>
+                </entity-find>
+                <if condition="discList">
+                    <set field="disc" from="discList[0]"/>
+                    <set field="discValid" from="true" type="Boolean"/>
+                    <if condition="disc.validFrom != null &amp;&amp; now.before(disc.validFrom)"><set field="discValid" from="false" type="Boolean"/></if>
+                    <if condition="disc.validTo != null &amp;&amp; now.after(disc.validTo)"><set field="discValid" from="false" type="Boolean"/></if>
+                    <if condition="disc.maxUses != null &amp;&amp; (disc.usedCount ?: 0) &gt;= disc.maxUses"><set field="discValid" from="false" type="Boolean"/></if>
+                    <if condition="!discValid">
+                        <return error="true" message="Discount code '${discountCode}' is not valid (expired, not yet active, or usage limit reached)."/>
+                    </if>
+                    <if condition="disc.discountType == 'DtPercentage'">
+                        <set field="discAmt" from="(billingAmount * disc.discountValue / 100).setScale(2, java.math.RoundingMode.HALF_UP)"/>
+                        <set field="billingAmount" from="billingAmount - discAmt"/>
+                        <else-if condition="disc.discountType == 'DtFlat'">
+                            <set field="billingAmount" from="billingAmount - disc.discountValue"/>
+                        </else-if>
+                    </if>
+                    <set field="gstAmount" from="(billingAmount * gstRate / 100).setScale(2, java.math.RoundingMode.HALF_UP)"/>
+                    <set field="totalAmount" from="billingAmount + gstAmount"/>
+                    <set field="disc.usedCount" from="(disc.usedCount ?: 0) + 1"/>
+                    <entity-update value-field="disc"/>
+                </if>
+            </if>
+
+            <set field="statusId" from="hasTrial ? 'SubTrial' : 'SubActive'"/>
+
+            <service-call name="create#zenith.erp.subscriptions.Subscription"
+                          in-map="[subscriptionId:subscriptionId, subscriptionNumber:subscriptionNumber,
+                                   customerPartyId:customerPartyId, planId:planId, statusId:statusId,
+                                   organizationPartyId:organizationPartyId,
+                                   startDate:startDate, endDate:endDate, trialEndDate:trialEndDate,
+                                   nextBillingDate:nextBillingDate, billingAmount:billingAmount,
+                                   currencyUomId:(plan.currencyUomId ?: 'USD'), gstAmount:gstAmount, totalAmount:totalAmount,
+                                   paymentMethodId:paymentMethodId, autoRenew:plan.autoRenew, notes:notes]"
+                          out-map="createOut"/>
+            <set field="subscriptionId" from="createOut.subscriptionId"/>
+
+            <!-- Log activity -->
+            <service-call name="create#zenith.erp.subscriptions.SubscriptionActivity"
+                          in-map="[subscriptionId:subscriptionId, activityType:'SaCreated',
+                                   activityDate:now, description:'Subscription created on plan ' + plan.planName,
+                                   performedByPartyId:ec.user.userAccount?.partyId]"/>
+        </actions>
+    </service>
+
+    <service verb="activate" noun="Subscription">
+        <in-parameters>
+            <parameter name="subscriptionId" required="true"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.subscriptions.Subscription" value-field="sub"/>
+            <if condition="!sub"><return error="true" message="Subscription not found"/></if>
+            <if condition="sub.statusId != 'SubTrial'">
+                <return error="true" message="Only trial subscriptions can be activated"/>
+            </if>
+
+            <set field="now" from="ec.user.nowTimestamp"/>
+            <set field="sub.statusId" value="SubActive"/>
+            <entity-update value-field="sub"/>
+
+            <service-call name="create#zenith.erp.subscriptions.SubscriptionActivity"
+                          in-map="[subscriptionId:subscriptionId, activityType:'SaActivated',
+                                   activityDate:now, description:'Subscription activated from trial',
+                                   performedByPartyId:ec.user.userAccount?.partyId,
+                                   oldValue:'SubTrial', newValue:'SubActive']"/>
+        </actions>
+    </service>
+
+    <service verb="pause" noun="Subscription">
+        <in-parameters>
+            <parameter name="subscriptionId" required="true"/>
+            <parameter name="reason"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.subscriptions.Subscription" value-field="sub"/>
+            <if condition="!sub"><return error="true" message="Subscription not found"/></if>
+            <if condition="sub.statusId != 'SubActive'">
+                <return error="true" message="Only active subscriptions can be paused"/>
+            </if>
+
+            <set field="now" from="ec.user.nowTimestamp"/>
+            <set field="sub.statusId" value="SubPaused"/>
+            <entity-update value-field="sub"/>
+
+            <service-call name="create#zenith.erp.subscriptions.SubscriptionActivity"
+                          in-map="[subscriptionId:subscriptionId, activityType:'SaPaused',
+                                   activityDate:now, description:reason ?: 'Subscription paused',
+                                   performedByPartyId:ec.user.userAccount?.partyId,
+                                   oldValue:'SubActive', newValue:'SubPaused']"/>
+        </actions>
+    </service>
+
+    <service verb="resume" noun="Subscription">
+        <in-parameters>
+            <parameter name="subscriptionId" required="true"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.subscriptions.Subscription" value-field="sub"/>
+            <if condition="!sub"><return error="true" message="Subscription not found"/></if>
+            <if condition="sub.statusId != 'SubPaused'">
+                <return error="true" message="Only paused subscriptions can be resumed"/>
+            </if>
+
+            <set field="now" from="ec.user.nowTimestamp"/>
+            <set field="sub.statusId" value="SubActive"/>
+            <entity-update value-field="sub"/>
+
+            <service-call name="create#zenith.erp.subscriptions.SubscriptionActivity"
+                          in-map="[subscriptionId:subscriptionId, activityType:'SaResumed',
+                                   activityDate:now, description:'Subscription resumed',
+                                   performedByPartyId:ec.user.userAccount?.partyId,
+                                   oldValue:'SubPaused', newValue:'SubActive']"/>
+        </actions>
+    </service>
+
+    <service verb="cancel" noun="Subscription">
+        <in-parameters>
+            <parameter name="subscriptionId" required="true"/>
+            <parameter name="cancelReason" required="true"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.subscriptions.Subscription" value-field="sub"/>
+            <if condition="!sub"><return error="true" message="Subscription not found"/></if>
+            <if condition="sub.statusId == 'SubCancelled' || sub.statusId == 'SubExpired'">
+                <return error="true" message="Subscription is already cancelled or expired"/>
+            </if>
+
+            <set field="now" from="ec.user.nowTimestamp"/>
+            <set field="oldStatus" from="sub.statusId"/>
+            <set field="sub.statusId" value="SubCancelled"/>
+            <set field="sub.cancelReason" from="cancelReason"/>
+            <set field="sub.cancelDate" from="now"/>
+            <entity-update value-field="sub"/>
+
+            <service-call name="create#zenith.erp.subscriptions.SubscriptionActivity"
+                          in-map="[subscriptionId:subscriptionId, activityType:'SaCancelled',
+                                   activityDate:now, description:cancelReason,
+                                   performedByPartyId:ec.user.userAccount?.partyId,
+                                   oldValue:oldStatus, newValue:'SubCancelled']"/>
+        </actions>
+    </service>
+
+    <service verb="renew" noun="Subscription">
+        <in-parameters>
+            <parameter name="subscriptionId" required="true"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.subscriptions.Subscription" value-field="sub"/>
+            <if condition="!sub"><return error="true" message="Subscription not found"/></if>
+            <entity-find-one entity-name="zenith.erp.subscriptions.SubscriptionPlan" value-field="plan">
+                <field-map field-name="planId" from="sub.planId"/>
+            </entity-find-one>
+
+            <set field="now" from="ec.user.nowTimestamp"/>
+            <set field="sub.lastBillingDate" from="now"/>
+            <set field="sub.statusId" value="SubActive"/>
+
+            <!-- Advance end date and next billing -->
+            <set field="calNext" from="java.util.Calendar.getInstance()"/>
+            <script>calNext.setTime(sub.endDate ?: now)</script>
+            <if condition="plan.billingFrequency == 'BfMonthly'">
+                <script>calNext.add(java.util.Calendar.MONTH, 1)</script>
+                <else-if condition="plan.billingFrequency == 'BfQuarterly'">
+                    <script>calNext.add(java.util.Calendar.MONTH, 3)</script>
+                </else-if>
+                <else-if condition="plan.billingFrequency == 'BfHalfYearly'">
+                    <script>calNext.add(java.util.Calendar.MONTH, 6)</script>
+                </else-if>
+                <else-if condition="plan.billingFrequency == 'BfAnnually'">
+                    <script>calNext.add(java.util.Calendar.YEAR, 1)</script>
+                </else-if>
+            </if>
+            <set field="sub.endDate" from="new java.sql.Timestamp(calNext.getTimeInMillis())"/>
+            <set field="sub.nextBillingDate" from="new java.sql.Timestamp(calNext.getTimeInMillis())"/>
+            <entity-update value-field="sub"/>
+
+            <service-call name="create#zenith.erp.subscriptions.SubscriptionActivity"
+                          in-map="[subscriptionId:subscriptionId, activityType:'SaRenewed',
+                                   activityDate:now, description:'Subscription renewed',
+                                   performedByPartyId:ec.user.userAccount?.partyId]"/>
+        </actions>
+    </service>
+
+    <service verb="generate" noun="Invoice">
+        <in-parameters>
+            <parameter name="subscriptionId" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="subInvoiceId"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.subscriptions.Subscription" value-field="sub"/>
+            <if condition="!sub"><return error="true" message="Subscription not found"/></if>
+            <entity-find-one entity-name="zenith.erp.subscriptions.SubscriptionPlan" value-field="plan">
+                <field-map field-name="planId" from="sub.planId"/>
+            </entity-find-one>
+
+            <set field="now" from="ec.user.nowTimestamp"/>
+
+            <!-- Generate invoice number: SINV/FY/SEQ -->
+            <set field="cal" from="java.util.Calendar.getInstance()"/>
+            <script>cal.setTime(now)</script>
+            <set field="year" from="cal.get(java.util.Calendar.YEAR)"/>
+            <set field="month" from="cal.get(java.util.Calendar.MONTH) + 1"/>
+            <set field="fyStart" from="month &gt;= 4 ? year : year - 1"/>
+            <set field="fyStr" from="String.format('%02d-%02d', fyStart % 100, (fyStart + 1) % 100)"/>
+
+            <entity-find entity-name="zenith.erp.subscriptions.SubscriptionInvoice" list="existingInv">
+                <econdition field-name="invoiceNumber" operator="like" value="SINV/${fyStr}/%"/>
+                <order-by field-name="-invoiceNumber"/>
+                <limit count="1"/>
+            </entity-find>
+            <set field="seq" from="1"/>
+            <if condition="existingInv">
+                <set field="lastNum" from="existingInv[0].invoiceNumber"/>
+                <set field="seq" from="(lastNum.substring(lastNum.lastIndexOf('/') + 1) as Integer) + 1"/>
+            </if>
+            <set field="invoiceNumber" from="'SINV/' + fyStr + '/' + String.format('%05d', seq)"/>
+
+            <!-- One-time setup fee is charged on the FIRST invoice only -->
+            <entity-find entity-name="zenith.erp.subscriptions.SubscriptionInvoice" list="priorInv">
+                <econdition field-name="subscriptionId"/>
+                <limit count="1"/>
+            </entity-find>
+            <set field="setupFee" from="!priorInv ? (plan.setupFee ?: 0) : 0"/>
+            <set field="baseAmount" from="(sub.billingAmount ?: 0) + setupFee"/>
+            <set field="taxableAmount" from="baseAmount"/>
+            <set field="gstRate" from="plan.taxRate ?: 18"/>
+            <set field="taxAmount" from="(taxableAmount * gstRate / 100).setScale(2, java.math.RoundingMode.HALF_UP)"/>
+            <set field="totalAmount" from="taxableAmount + taxAmount"/>
+
+            <set field="periodFrom" from="sub.lastBillingDate ?: sub.startDate"/>
+            <set field="periodTo" from="sub.nextBillingDate ?: sub.endDate"/>
+
+            <service-call name="create#zenith.erp.subscriptions.SubscriptionInvoice"
+                          in-map="[subscriptionId:subscriptionId, invoiceNumber:invoiceNumber,
+                                   invoiceDate:now, periodFrom:periodFrom, periodTo:periodTo,
+                                   baseAmount:baseAmount, discountAmount:0, taxableAmount:taxableAmount,
+                                   totalTaxAmount:taxAmount,
+                                   totalAmount:totalAmount, currencyUomId:sub.currencyUomId,
+                                   organizationPartyId:sub.organizationPartyId, statusId:'SiDraft']"
+                          out-map="invOut"/>
+            <set field="subInvoiceId" from="invOut.subInvoiceId"/>
+        </actions>
+    </service>
+
+    <service verb="changePlan" noun="Subscription">
+        <in-parameters>
+            <parameter name="subscriptionId" required="true"/>
+            <parameter name="newPlanId" required="true"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.subscriptions.Subscription" value-field="sub"/>
+            <if condition="!sub"><return error="true" message="Subscription not found"/></if>
+            <entity-find-one entity-name="zenith.erp.subscriptions.SubscriptionPlan" value-field="newPlan">
+                <field-map field-name="planId" from="newPlanId"/>
+            </entity-find-one>
+            <if condition="!newPlan"><return error="true" message="New plan not found"/></if>
+
+            <set field="now" from="ec.user.nowTimestamp"/>
+            <set field="oldPlanId" from="sub.planId"/>
+            <set field="oldBillingAmount" from="sub.billingAmount ?: 0"/>
+            <set field="sub.planId" from="newPlanId"/>
+            <set field="sub.billingAmount" from="newPlan.billingAmount"/>
+            <set field="gstRate" from="newPlan.taxRate ?: 18"/>
+            <set field="sub.gstAmount" from="(newPlan.billingAmount * gstRate / 100).setScale(2, java.math.RoundingMode.HALF_UP)"/>
+            <set field="sub.totalAmount" from="sub.billingAmount + sub.gstAmount"/>
+            <entity-update value-field="sub"/>
+
+            <set field="isUpgrade" from="newPlan.billingAmount &gt; oldBillingAmount" type="Boolean"/>
+            <service-call name="create#zenith.erp.subscriptions.SubscriptionActivity"
+                          in-map="[subscriptionId:subscriptionId,
+                                   activityType:isUpgrade ? 'SaUpgraded' : 'SaDowngraded',
+                                   activityDate:now, description:'Plan changed to ' + newPlan.planName,
+                                   performedByPartyId:ec.user.userAccount?.partyId,
+                                   oldValue:oldPlanId, newValue:newPlanId]"/>
+        </actions>
+    </service>
+
+</services>

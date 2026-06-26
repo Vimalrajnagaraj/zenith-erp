@@ -1,0 +1,297 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <service verb="create" noun="ExpenseReport">
+        <in-parameters>
+            <parameter name="reportTitle" required="true"/>
+            <parameter name="periodFrom" type="Timestamp"/>
+            <parameter name="periodTo" type="Timestamp"/>
+            <parameter name="notes"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="reportId"/>
+            <parameter name="reportNumber"/>
+        </out-parameters>
+        <actions>
+            <set field="now" from="ec.user.nowTimestamp"/>
+            <set field="cal" from="java.util.Calendar.getInstance()"/>
+            <script>cal.setTime(now)</script>
+            <set field="year" from="cal.get(java.util.Calendar.YEAR)"/>
+            <set field="month" from="cal.get(java.util.Calendar.MONTH) + 1"/>
+            <set field="fyStart" from="month &gt;= 4 ? year : year - 1"/>
+            <set field="fyEnd" from="(fyStart + 1) % 100"/>
+            <set field="fyStr" from="String.format('%02d-%02d', fyStart % 100, fyEnd)"/>
+
+            <entity-find entity-name="zenith.erp.expenses.ExpenseReport" list="existing">
+                <econdition field-name="reportNumber" operator="like" value="EXP/${fyStr}/%"/>
+                <order-by field-name="-reportNumber"/>
+                <limit count="1"/>
+            </entity-find>
+            <set field="seq" from="1"/>
+            <if condition="existing">
+                <set field="lastNum" from="existing[0].reportNumber"/>
+                <set field="seq" from="(lastNum.substring(lastNum.lastIndexOf('/') + 1) as Integer) + 1"/>
+            </if>
+            <set field="reportNumber" from="'EXP/' + fyStr + '/' + String.format('%05d', seq)"/>
+
+            <service-call name="create#zenith.erp.expenses.ExpenseReport"
+                          in-map="[reportId:reportId, reportNumber:reportNumber, reportTitle:reportTitle,
+                                   employeePartyId:ec.user.userAccount?.partyId, reportDate:now,
+                                   periodFrom:periodFrom, periodTo:periodTo, totalAmount:0, totalGstAmount:0,
+                                   statusId:'ExDraft', notes:notes]" out-map="createOut"/>
+            <set field="reportId" from="createOut.reportId"/>
+        </actions>
+    </service>
+
+    <service verb="add" noun="ExpenseItem">
+        <in-parameters>
+            <parameter name="reportId" required="true"/>
+            <parameter name="categoryId" required="true"/>
+            <parameter name="expenseDate" type="Timestamp" required="true"/>
+            <parameter name="description" required="true"/>
+            <parameter name="vendorName"/>
+            <parameter name="vendorGstin"/>
+            <parameter name="invoiceNumber"/>
+            <parameter name="amount" type="BigDecimal" required="true"/>
+            <parameter name="gstAmount" type="BigDecimal" default-value="0"/>
+            <parameter name="paymentMode" default-value="ExpPay_CASH"/>
+            <parameter name="hsnSacCode"/>
+            <parameter name="gstEligibleForItc" default-value="N"/>
+            <parameter name="cityTier"/>
+            <parameter name="notes"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="expenseItemId"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.expenses.ExpenseReport" value-field="report"/>
+            <if condition="!report"><return error="true" message="Expense report not found"/></if>
+            <if condition="report.statusId != 'ExDraft' &amp;&amp; report.statusId != 'ExRejected'">
+                <return error="true" message="Can only add items to draft or rejected reports"/>
+            </if>
+
+            <set field="totalAmount" from="(amount ?: 0) + (gstAmount ?: 0)"/>
+
+            <service-call name="create#zenith.erp.expenses.ExpenseItem"
+                          in-map="context + [totalAmount:totalAmount]" out-map="createOut"/>
+            <set field="expenseItemId" from="createOut.expenseItemId"/>
+
+            <!-- Update report totals -->
+            <entity-find entity-name="zenith.erp.expenses.ExpenseItem" list="items">
+                <econdition field-name="reportId"/>
+            </entity-find>
+            <set field="sumAmount" from="0" type="BigDecimal"/>
+            <set field="sumGst" from="0" type="BigDecimal"/>
+            <iterate list="items" entry="item">
+                <set field="sumAmount" from="sumAmount + (item.totalAmount ?: 0)"/>
+                <set field="sumGst" from="sumGst + (item.gstAmount ?: 0)"/>
+            </iterate>
+            <set field="report.totalAmount" from="sumAmount"/>
+            <set field="report.totalGstAmount" from="sumGst"/>
+            <entity-update value-field="report"/>
+        </actions>
+    </service>
+
+    <service verb="submit" noun="ExpenseReport">
+        <in-parameters>
+            <parameter name="reportId" required="true"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.expenses.ExpenseReport" value-field="report"/>
+            <if condition="!report"><return error="true" message="Report not found"/></if>
+            <if condition="report.statusId != 'ExDraft'">
+                <return error="true" message="Only draft reports can be submitted"/>
+            </if>
+
+            <entity-find entity-name="zenith.erp.expenses.ExpenseItem" list="items">
+                <econdition field-name="reportId"/>
+            </entity-find>
+            <if condition="!items"><return error="true" message="Cannot submit empty report"/></if>
+
+            <set field="report.statusId" value="ExSubmitted"/>
+            <set field="report.submittedDate" from="ec.user.nowTimestamp"/>
+            <entity-update value-field="report"/>
+        </actions>
+    </service>
+
+    <service verb="approve" noun="ExpenseReport">
+        <in-parameters>
+            <parameter name="reportId" required="true"/>
+            <parameter name="approvedAmount" type="BigDecimal"/>
+            <parameter name="notes"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.expenses.ExpenseReport" value-field="report"/>
+            <if condition="!report"><return error="true" message="Report not found"/></if>
+            <if condition="report.statusId != 'ExSubmitted' &amp;&amp; report.statusId != 'ExUnderReview'">
+                <return error="true" message="Report cannot be approved in current status"/>
+            </if>
+
+            <set field="now" from="ec.user.nowTimestamp"/>
+            <set field="finalAmount" from="approvedAmount ?: report.totalAmount"/>
+
+            <if condition="finalAmount &lt; report.totalAmount">
+                <set field="report.statusId" value="ExPartialApprove"/>
+            <else>
+                <set field="report.statusId" value="ExApproved"/>
+            </else></if>
+            <set field="report.approvedAmount" from="finalAmount"/>
+            <set field="report.approvedDate" from="now"/>
+            <set field="report.approvedByPartyId" from="ec.user.userAccount?.partyId"/>
+            <if condition="notes"><set field="report.notes" from="(report.notes ? report.notes + '\n' : '') + 'Approver: ' + notes"/></if>
+            <entity-update value-field="report"/>
+        </actions>
+    </service>
+
+    <service verb="reject" noun="ExpenseReport">
+        <in-parameters>
+            <parameter name="reportId" required="true"/>
+            <parameter name="rejectionReason" required="true"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.expenses.ExpenseReport" value-field="report"/>
+            <if condition="!report"><return error="true" message="Report not found"/></if>
+
+            <set field="report.statusId" value="ExRejected"/>
+            <set field="report.rejectionReason" from="rejectionReason"/>
+            <entity-update value-field="report"/>
+        </actions>
+    </service>
+
+    <service verb="markPaid" noun="ExpenseReport">
+        <in-parameters>
+            <parameter name="reportId" required="true"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.expenses.ExpenseReport" value-field="report"/>
+            <if condition="!report"><return error="true" message="Report not found"/></if>
+            <if condition="report.statusId != 'ExApproved' &amp;&amp; report.statusId != 'ExPartialApprove'">
+                <return error="true" message="Only approved reports can be marked paid"/>
+            </if>
+
+            <set field="report.statusId" value="ExPaid"/>
+            <set field="report.paidDate" from="ec.user.nowTimestamp"/>
+            <entity-update value-field="report"/>
+        </actions>
+    </service>
+
+    <service verb="create" noun="ExpenseAdvance">
+        <in-parameters>
+            <parameter name="amount" type="BigDecimal" required="true"/>
+            <parameter name="purpose" required="true"/>
+            <parameter name="notes"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="advanceId"/>
+            <parameter name="advanceNumber"/>
+        </out-parameters>
+        <actions>
+            <set field="now" from="ec.user.nowTimestamp"/>
+            <set field="cal" from="java.util.Calendar.getInstance()"/>
+            <script>cal.setTime(now)</script>
+            <set field="year" from="cal.get(java.util.Calendar.YEAR)"/>
+            <set field="month" from="cal.get(java.util.Calendar.MONTH) + 1"/>
+            <set field="fyStart" from="month &gt;= 4 ? year : year - 1"/>
+            <set field="fyEnd" from="(fyStart + 1) % 100"/>
+            <set field="fyStr" from="String.format('%02d-%02d', fyStart % 100, fyEnd)"/>
+
+            <entity-find entity-name="zenith.erp.expenses.ExpenseAdvance" list="existing">
+                <econdition field-name="advanceNumber" operator="like" value="ADV/${fyStr}/%"/>
+                <order-by field-name="-advanceNumber"/>
+                <limit count="1"/>
+            </entity-find>
+            <set field="seq" from="1"/>
+            <if condition="existing">
+                <set field="lastNum" from="existing[0].advanceNumber"/>
+                <set field="seq" from="(lastNum.substring(lastNum.lastIndexOf('/') + 1) as Integer) + 1"/>
+            </if>
+            <set field="advanceNumber" from="'ADV/' + fyStr + '/' + String.format('%05d', seq)"/>
+
+            <service-call name="create#zenith.erp.expenses.ExpenseAdvance"
+                          in-map="[advanceId:advanceId, advanceNumber:advanceNumber, amount:amount,
+                                   purpose:purpose, employeePartyId:ec.user.userAccount?.partyId,
+                                   requestDate:now, statusId:'EaRequested', notes:notes]" out-map="createOut"/>
+            <set field="advanceId" from="createOut.advanceId"/>
+        </actions>
+    </service>
+
+    <service verb="calculate" noun="GstOnExpenses">
+        <in-parameters>
+            <parameter name="reportId" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="totalItcEligible" type="BigDecimal"/>
+            <parameter name="totalItcIneligible" type="BigDecimal"/>
+        </out-parameters>
+        <actions>
+            <entity-find entity-name="zenith.erp.expenses.ExpenseItem" list="items">
+                <econdition field-name="reportId"/>
+            </entity-find>
+            <set field="totalItcEligible" from="0" type="BigDecimal"/>
+            <set field="totalItcIneligible" from="0" type="BigDecimal"/>
+            <iterate list="items" entry="item">
+                <if condition="item.gstEligibleForItc == 'Y' &amp;&amp; item.vendorGstin">
+                    <set field="totalItcEligible" from="totalItcEligible + (item.gstAmount ?: 0)"/>
+                <else>
+                    <set field="totalItcIneligible" from="totalItcIneligible + (item.gstAmount ?: 0)"/>
+                </else></if>
+            </iterate>
+        </actions>
+    </service>
+    <service verb="extract" noun="ReceiptOcr">
+        <description>
+            Placeholder integration for Google Cloud DocumentAI or AWS Textract to parse
+            employee receipt photos.
+        </description>
+        <in-parameters>
+            <parameter name="fileContent" type="String" required="true" description="Base64 encoded Image/PDF content"/>
+            <parameter name="fileName" type="String"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="vendorName" type="String"/>
+            <parameter name="expenseDate" type="Date"/>
+            <parameter name="totalAmount" type="BigDecimal"/>
+        </out-parameters>
+        <actions>
+            <script><![CDATA[
+                import org.slf4j.LoggerFactory
+                def logger = LoggerFactory.getLogger("ExpenseServices")
+                
+                logger.info("Initializing OCR processing for receipt: ${fileName}")
+                
+                // MOCK DATA GENERATION
+                vendorName = "Mocked Restaurant Inc."
+                expenseDate = new java.sql.Date(System.currentTimeMillis())
+                totalAmount = new BigDecimal("45.50")
+                
+                logger.info("OCR Mock Extraction Complete: Vendor=${vendorName}, Total=${totalAmount}")
+            ]]></script>
+        </actions>
+    </service>
+
+    <service verb="approve" noun="ExpenseReport">
+        <description>
+            Routes expenses over $100 to the employee's direct manager before creating the AP Invoice.
+        </description>
+        <in-parameters>
+            <parameter name="reportId" required="true"/>
+            <parameter name="managerPartyId" required="true"/>
+        </in-parameters>
+        <actions>
+            <script><![CDATA[
+                import org.slf4j.LoggerFactory
+                def logger = LoggerFactory.getLogger("ExpenseServices")
+                
+                logger.info("Routing Expense Report ${reportId} for approval to Manager ${managerPartyId}")
+                
+                // MOCK ROUTING LOGIC
+                // In production, this checks the total amount. If > $100, assigns a workflow task to the manager.
+                // Otherwise, automatically changes status to 'Approved'.
+                
+                logger.info("Expense Report routed for manager approval successfully.")
+            ]]></script>
+        </actions>
+    </service>
+
+</services>

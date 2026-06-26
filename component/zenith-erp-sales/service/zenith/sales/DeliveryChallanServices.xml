@@ -1,0 +1,155 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <!-- Create Delivery Challan -->
+    <service verb="create" noun="DeliveryChallan">
+        <in-parameters>
+            <parameter name="customerPartyId" required="true"/>
+            <parameter name="facilityId"/>
+            <parameter name="vehicleNumber"/>
+            <parameter name="transporterName"/>
+            <parameter name="lrNumber"/>
+            <parameter name="challanDate" type="Timestamp" default="ec.user.nowTimestamp"/>
+            <parameter name="notes"/>
+            <parameter name="items" type="List">
+                <parameter name="entry" type="Map">
+                    <parameter name="productId" required="true"/>
+                    <parameter name="quantity" type="BigDecimal" required="true"/>
+                    <parameter name="unitPrice" type="BigDecimal"/>
+                    <parameter name="batchNumber"/>
+                </parameter>
+            </parameter>
+        </in-parameters>
+        <out-parameters><parameter name="deliveryChallanId"/></out-parameters>
+        <actions>
+            <service-call name="create#zenith.erp.sales.DeliveryChallan"
+                          in-map="context + [statusId:'DcDraft', challanDate:challanDate]" out-map="context"/>
+            <if condition="items">
+                <set field="seqNum" from="0" type="Integer"/>
+                <iterate list="items" entry="item">
+                    <set field="seqNum" from="seqNum + 1"/>
+                    <service-call name="create#zenith.erp.sales.DeliveryChallanItem"
+                                  in-map="[deliveryChallanId:deliveryChallanId,
+                                           challanItemSeqId:String.format('%05d', seqNum),
+                                           productId:item.productId, quantity:item.quantity,
+                                           unitPrice:item.unitPrice, batchNumber:item.batchNumber]"/>
+                </iterate>
+            </if>
+        </actions>
+    </service>
+
+    <!-- Issue Delivery Challan -->
+    <service verb="issue" noun="DeliveryChallan">
+        <in-parameters><parameter name="deliveryChallanId" required="true"/></in-parameters>
+        <actions>
+            <service-call name="update#zenith.erp.sales.DeliveryChallan"
+                          in-map="[deliveryChallanId:deliveryChallanId, statusId:'DcIssued']"/>
+        </actions>
+    </service>
+
+    <!-- Convert Delivery Challan to Invoice -->
+    <service verb="convert" noun="ChallanToInvoice">
+        <in-parameters><parameter name="deliveryChallanId" required="true"/></in-parameters>
+        <out-parameters><parameter name="invoiceId"/></out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.sales.DeliveryChallan" value-field="dc"/>
+            <entity-find entity-name="zenith.erp.sales.DeliveryChallanItem" list="dcItems">
+                <econdition field-name="deliveryChallanId"/></entity-find>
+            <!-- Create sales invoice from DC items -->
+            <set field="invoiceItems" from="[]"/>
+            <iterate list="dcItems" entry="di">
+                <set field="invoiceItems" from="invoiceItems + [[productId:di.productId,
+                    quantity:di.quantity, unitPrice:di.unitPrice ?: 0]]"/>
+            </iterate>
+            <service-call name="zenith.sales.SalesInvoiceServices.create#SalesInvoice"
+                          in-map="[customerPartyId:dc.customerPartyId, items:invoiceItems]"
+                          out-map="invoiceResult"/>
+            <set field="invoiceId" from="invoiceResult.invoiceId"/>
+            <service-call name="update#zenith.erp.sales.DeliveryChallan"
+                          in-map="[deliveryChallanId:deliveryChallanId,
+                                   statusId:'DcConverted', convertedToInvoiceId:invoiceId]"/>
+        </actions>
+    </service>
+
+    <!-- Create Warranty Policy -->
+    <service verb="create" noun="WarrantyPolicy">
+        <in-parameters>
+            <parameter name="policyName" required="true"/>
+            <parameter name="warrantyTypeEnumId" required="true"/>
+            <parameter name="durationMonths" type="Integer" required="true"/>
+            <parameter name="productCategoryId"/>
+            <parameter name="isExtendable" default-value="N"/>
+            <parameter name="extendedMonths" type="Integer"/>
+            <parameter name="extendedCost" type="BigDecimal"/>
+            <parameter name="termsAndConditions"/>
+        </in-parameters>
+        <out-parameters><parameter name="warrantyPolicyId"/></out-parameters>
+        <actions>
+            <service-call name="create#zenith.erp.sales.WarrantyPolicy" in-map="context" out-map="context"/>
+        </actions>
+    </service>
+
+    <!-- Register Warranty -->
+    <service verb="register" noun="Warranty">
+        <in-parameters>
+            <parameter name="warrantyPolicyId" required="true"/>
+            <parameter name="customerPartyId" required="true"/>
+            <parameter name="productId" required="true"/>
+            <parameter name="serialNumber"/>
+            <parameter name="purchaseDate" type="Date" required="true"/>
+            <parameter name="invoiceId"/>
+        </in-parameters>
+        <out-parameters><parameter name="warrantyRegId"/></out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.sales.WarrantyPolicy" value-field="policy"/>
+            <set field="warrantyStartDate" from="purchaseDate"/>
+            <script><![CDATA[
+                def cal = Calendar.getInstance()
+                cal.time = java.sql.Date.valueOf(purchaseDate.toString())
+                cal.add(Calendar.MONTH, policy.durationMonths ?: 12)
+                warrantyEndDate = new java.sql.Date(cal.timeInMillis)
+            ]]></script>
+            <service-call name="create#zenith.erp.sales.WarrantyRegistration"
+                          in-map="context + [warrantyStartDate:warrantyStartDate,
+                                             warrantyEndDate:warrantyEndDate,
+                                             isExtended:'N', statusId:'WrActive']"
+                          out-map="context"/>
+        </actions>
+    </service>
+
+    <!-- File Warranty Claim -->
+    <service verb="file" noun="WarrantyClaim">
+        <in-parameters>
+            <parameter name="warrantyRegId" required="true"/>
+            <parameter name="issueDescription" required="true"/>
+        </in-parameters>
+        <out-parameters><parameter name="warrantyClaimId"/></out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.sales.WarrantyRegistration" value-field="reg"/>
+            <if condition="reg.statusId != 'WrActive'">
+                <return error="true" message="Warranty is not active"/>
+            </if>
+            <service-call name="create#zenith.erp.sales.WarrantyClaim"
+                          in-map="context + [claimDate:ec.user.nowTimestamp, statusId:'WcFiled']"
+                          out-map="context"/>
+        </actions>
+    </service>
+
+    <!-- Resolve Warranty Claim -->
+    <service verb="resolve" noun="WarrantyClaim">
+        <in-parameters>
+            <parameter name="warrantyClaimId" required="true"/>
+            <parameter name="resolutionEnumId" required="true"/>
+            <parameter name="resolutionNotes"/>
+            <parameter name="serviceCost" type="BigDecimal" default-value="0"/>
+        </in-parameters>
+        <actions>
+            <service-call name="update#zenith.erp.sales.WarrantyClaim"
+                          in-map="[warrantyClaimId:warrantyClaimId, statusId:'WcResolved',
+                                   resolutionEnumId:resolutionEnumId, resolutionNotes:resolutionNotes,
+                                   serviceCost:serviceCost, resolvedDate:ec.user.nowTimestamp]"/>
+        </actions>
+    </service>
+
+</services>

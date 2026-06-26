@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <service verb="trigger" noun="OutboundWebhook">
+        <description>
+            Main entry point for webhooks. Finds active subscriptions for the given topic
+            and dispatches the payload to the configured adapter asynchronously to prevent UI blocking.
+        </description>
+        <in-parameters>
+            <parameter name="topic" type="String" required="true"/>
+            <parameter name="payload" type="Map" required="true"/>
+        </in-parameters>
+        <actions>
+            <entity-find entity-name="zenith.erp.integrations.webhook.WebhookSubscription" list="subscriptions">
+                <econdition field-name="topic"/>
+                <econdition field-name="isActive" value="Y"/>
+            </entity-find>
+
+            <iterate list="subscriptions" entry="sub">
+                <!-- Asynchronous Execution: Decouples HTTP Post from the main thread to prevent UI blocking -->
+                <service-call name="zenith.integrations.WebhookServices.dispatch#WebhookAdapter"
+                              in-map="[subscriptionId:sub.subscriptionId, endpointUrl:sub.endpointUrl, payload:payload]" 
+                              async="true"/>
+            </iterate>
+        </actions>
+    </service>
+
+    <service verb="dispatch" noun="WebhookAdapter">
+        <description>
+            Adapter Pattern: Currently uses Direct HTTP POST. In the future, this service 
+            can be swapped to push to AWS SQS or Kafka without changing the core trigger logic.
+        </description>
+        <in-parameters>
+            <parameter name="subscriptionId" type="String" required="true"/>
+            <parameter name="endpointUrl" type="String" required="true"/>
+            <parameter name="payload" type="Map" required="true"/>
+        </in-parameters>
+        <actions>
+            <script><![CDATA[
+                import org.slf4j.LoggerFactory
+                import groovy.json.JsonOutput
+                def logger = LoggerFactory.getLogger("WebhookServices")
+                
+                String jsonPayload = JsonOutput.toJson(payload)
+                int responseCode = 0
+                String responseMessage = ""
+                String isSuccess = "N"
+                
+                try {
+                    logger.info("Dispatching Webhook to ${endpointUrl} (Subscription: ${subscriptionId})")
+                    
+                    // Direct HTTP POST Adapter with Strict Timeouts
+                    URL url = new URL(endpointUrl)
+                    HttpURLConnection conn = (HttpURLConnection) url.openConnection()
+                    conn.setRequestMethod("POST")
+                    conn.setRequestProperty("Content-Type", "application/json")
+                    conn.setDoOutput(true)
+                    
+                    // STRICT TIMEOUTS: 3 seconds to connect, 5 seconds to read
+                    // Prevents poorly performing external servers from draining our resources
+                    conn.setConnectTimeout(3000) 
+                    conn.setReadTimeout(5000)
+                    
+                    conn.getOutputStream().withWriter("UTF-8") { writer ->
+                        writer.write(jsonPayload)
+                    }
+                    
+                    responseCode = conn.getResponseCode()
+                    responseMessage = conn.getResponseMessage()
+                    
+                    if (responseCode >= 200 && responseCode < 300) {
+                        isSuccess = "Y"
+                        logger.info("Webhook delivered successfully: ${responseCode}")
+                    } else {
+                        logger.warn("Webhook delivery failed: HTTP ${responseCode} ${responseMessage}")
+                    }
+                    
+                } catch (java.net.SocketTimeoutException e) {
+                    responseCode = 408
+                    responseMessage = "Timeout: " + e.getMessage()
+                    logger.error("Webhook Timeout to ${endpointUrl}", e)
+                } catch (Exception e) {
+                    responseCode = 500
+                    responseMessage = "Error: " + e.getMessage()
+                    logger.error("Webhook Error to ${endpointUrl}", e)
+                } finally {
+                    // FAILURE LOGGING: Always log the attempt, especially if it fails, for debugging
+                    def logMap = [
+                        subscriptionId: subscriptionId,
+                        topic: payload.get('topic') ?: 'Unknown',
+                        endpointUrl: endpointUrl,
+                        payload: jsonPayload,
+                        responseCode: responseCode,
+                        responseMessage: responseMessage,
+                        isSuccess: isSuccess,
+                        createdDate: ec.user.nowTimestamp
+                    ]
+                    ec.service.sync().name("create#zenith.erp.integrations.webhook.WebhookLog").parameters(logMap).call()
+                }
+            ]]></script>
+        </actions>
+    </service>
+
+</services>

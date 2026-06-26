@@ -1,0 +1,164 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
+        default-menu-title="Barcodes" default-menu-index="18">
+
+    <parameter name="searchTerm"/>
+    <parameter name="catId"/>
+    <parameter name="pageIndex"/>
+
+    <!-- Save one product's Item Code / Barcode (AJAX, returns JSON). Blocks a code already used elsewhere. -->
+    <transition name="saveBarcode" begin-transaction="true">
+        <actions>
+            <script><![CDATA[
+                def p = ec.web.parameters
+                try {
+                    if (!p.productId) { ec.web.sendJsonResponse([success:false, error:'Missing product']); return }
+                    def code = (p.code ?: '').toString().trim()
+                    def ev = ec.entity.find("mantle.product.Product").condition("productId", p.productId).one()
+                    if (!ev) { ec.web.sendJsonResponse([success:false, error:'Unknown product']); return }
+                    if (code != '') {
+                        // A barcode must be unique — two products sharing a code break scanning.
+                        def clash = ec.entity.find("mantle.product.Product").condition("pseudoId", code).list().find { it.productId != p.productId }
+                        if (clash) { ec.web.sendJsonResponse([success:false, error:'Code already used by ' + (clash.productName ?: clash.productId)]); return }
+                    }
+                    // Update via a fresh mutable value (the found value is read-only); null clears the code.
+                    ec.entity.makeValue("mantle.product.Product").set("productId", p.productId).set("pseudoId", (code != '' ? code : null)).update()
+                    ec.web.sendJsonResponse([success:true, code:code])
+                } catch (Exception e) { ec.web.sendJsonResponse([success:false, error:e.message]) }
+            ]]></script>
+        </actions>
+        <default-response type="none"/>
+    </transition>
+
+    <actions>
+        <script><![CDATA[
+            def posOrg = ec.user.getPreference('ACTIVE_ORGANIZATION')
+            def pageSize = 60
+            def pIdx = 0
+            try { if (pageIndex) pIdx = (pageIndex as Integer) } catch (Exception ig) { pIdx = 0 }
+            if (pIdx < 0) pIdx = 0
+
+            def catFinder = ec.entity.find("mantle.product.category.ProductCategory")
+            if (posOrg) catFinder.condition("ownerPartyId", posOrg)
+            categories = catFinder.orderBy("categoryName").list()
+
+            def catProdIds = null
+            if (catId) {
+                catProdIds = [] as Set
+                ec.entity.find("mantle.product.category.ProductCategoryMember").condition("productCategoryId", catId).list().each { catProdIds.add(it.productId) }
+            }
+
+            def pf = ec.entity.find("mantle.product.Product").condition("productTypeEnumId", "PtAsset")
+            if (posOrg) pf.condition("ownerPartyId", posOrg)
+            def candidates = pf.orderBy("productName").limit(5000).list()
+
+            // Duplicate-code detection across ALL of the tenant's products (codes shared by 2+ products).
+            def codeCounts = [:]
+            candidates.each { pr -> def c = (pr.pseudoId ?: '').trim(); if (c != '') codeCounts[c] = (codeCounts[c] ?: 0) + 1 }
+            def dupCodes = codeCounts.findAll { it.value > 1 }.keySet()
+            missingTotal = candidates.count { (it.pseudoId ?: '').trim() == '' }
+            dupTotal = candidates.count { def c = (it.pseudoId ?: '').trim(); c != '' && dupCodes.contains(c) }
+
+            def termLower = (searchTerm ?: '').toLowerCase().trim()
+            def filtered = candidates.findAll { pr ->
+                (termLower == '' || (pr.productName ?: '').toLowerCase().contains(termLower) || (pr.pseudoId ?: '').toLowerCase().contains(termLower)) &&
+                (catProdIds == null || catProdIds.contains(pr.productId))
+            }
+            totalCount = filtered.size()
+            pageCount = (int) Math.ceil(totalCount / (double) pageSize)
+            if (pageCount < 1) pageCount = 1
+            if (pIdx >= pageCount) pIdx = pageCount - 1
+            curPage = pIdx
+            def from = pIdx * pageSize
+            def to = Math.min(from + pageSize, totalCount)
+            def pageProds = (from < totalCount) ? filtered.subList(from, to) : []
+
+            rows = pageProds.collect { pr ->
+                def c = (pr.pseudoId ?: '').trim()
+                def status = (c == '') ? 'missing' : (dupCodes.contains(c) ? 'dup' : 'ok')
+                [productId: pr.productId, productName: (pr.productName ?: pr.productId), code: c, status: status]
+            }
+        ]]></script>
+    </actions>
+
+    <widgets>
+        <render-mode><text type="html,qvt" template="true"><![CDATA[
+        <div style="padding:14px 16px;max-width:1000px;margin:0 auto;font-family:'Segoe UI',Arial,sans-serif">
+            <!-- The /qapps SPA strips <script> tags from screen content, so bootstrap the external
+                 save logic via an <img onload> attribute (inline event attributes survive); a script
+                 element created with appendChild executes normally. -->
+            <img src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" alt="" style="display:none" onload="if(!window.__bcBoot){window.__bcBoot=1;var s=document.createElement('script');s.src='/zenithstatic/js/pos-barcodes.js?v=1';document.body.appendChild(s);}"/>
+            <div style="font-size:22px;font-weight:800;color:#1a237e;margin-bottom:2px">&#128290; Barcodes</div>
+            <div style="font-size:13px;color:#5f6368;margin-bottom:12px">Give every product a code so it can be <b>scanned</b> at billing.</div>
+
+            <details open style="background:#e8f0fe;border:1px solid #4285f4;border-left:6px solid #1a73e8;border-radius:10px;padding:10px 16px;margin-bottom:14px">
+                <summary style="cursor:pointer;font-weight:800;font-size:15px;color:#174ea6;outline:none">&#127991;&#65039; New here? Read this first <span style="font-weight:600;color:#5f6368;font-size:12px">(click to hide / show)</span></summary>
+                <div style="font-size:13.5px;color:#202124;line-height:1.85;margin-top:10px">
+                    <div style="margin-bottom:8px">A product's <b>Item Code / Barcode</b> is the number under the barcode on the packet (or any short code you make up). At billing, scanning or typing this code instantly adds the product to the cart.</div>
+                    <div style="background:#fff3cd;border:1px solid #ffe082;border-radius:7px;padding:8px 11px;margin-bottom:9px;color:#6d4c00">
+                        &#9888;&#65039; <b style="color:#b71c1c">No code</b> = the product <b>can't be scanned</b> (you'd have to tap it). &nbsp; <b style="color:#b71c1c">Duplicate code</b> = two products share a code, which <b>breaks scanning</b> &mdash; give each its own.
+                    </div>
+                    <div style="font-weight:700;color:#174ea6;margin-bottom:3px">How to set a code</div>
+                    <div style="margin-bottom:6px">1&nbsp; Find the product (search below) &nbsp;&rarr;&nbsp; 2&nbsp; Click the box and <b>scan the barcode</b> with a scanner gun, or type a code &nbsp;&rarr;&nbsp; 3&nbsp; Click the green <b>Save</b>.</div>
+                    <div style="font-size:12.5px;color:#5f6368">Tip: use the real barcode on the packet so any scanner reads it. Tap a column heading filter to find products that still need a code.</div>
+                </div>
+            </details>
+
+            <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px">
+                <div style="background:#fdecea;border:1px solid #f5c6cb;border-radius:8px;padding:7px 13px;font-size:13px;color:#b71c1c"><b>${missingTotal!0}</b> product(s) have <b>no code</b></div>
+                <div style="background:#fff3e0;border:1px solid #ffcc80;border-radius:8px;padding:7px 13px;font-size:13px;color:#e65100"><b>${dupTotal!0}</b> product(s) have a <b>duplicate code</b></div>
+            </div>
+
+            <form method="get" action="Barcodes" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px">
+                <input type="text" name="searchTerm" value="${(searchTerm!'')?html}" placeholder="Search name or code..." style="flex:1;min-width:200px;padding:9px 12px;border:1px solid #bbb;border-radius:7px;font-size:14px"/>
+                <select name="catId" style="padding:9px 10px;border:1px solid #bbb;border-radius:7px;font-size:14px">
+                    <option value="">All categories</option>
+                    <#list (categories![]) as c>
+                        <option value="${c.productCategoryId}" <#if (catId!'') == c.productCategoryId>selected</#if>>${(c.categoryName!c.productCategoryId)?html}</option>
+                    </#list>
+                </select>
+                <input type="hidden" name="pageIndex" value="0"/>
+                <button type="submit" style="padding:9px 20px;background:#1565c0;color:#fff;border:none;border-radius:7px;font-size:14px;font-weight:700;cursor:pointer">Search</button>
+            </form>
+
+            <div style="font-size:13px;color:#555;margin-bottom:6px">${totalCount!0} product(s) — page ${(curPage!0)+1} of ${pageCount!1}</div>
+
+            <table style="width:100%;border-collapse:collapse;font-size:14px">
+                <thead>
+                    <tr style="background:#1565c0;color:#fff">
+                        <th style="text-align:left;padding:9px 8px">Product</th>
+                        <th style="text-align:left;padding:9px 8px;width:230px">Item Code / Barcode</th>
+                        <th style="text-align:center;padding:9px 8px;width:120px">Status</th>
+                        <th style="text-align:center;padding:9px 8px;width:90px">Save</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <#list (rows![]) as r>
+                    <tr data-pid="${(r.productId)?html}" style="border-bottom:1px solid #e0e0e0">
+                        <td style="padding:7px 8px;color:#222">${(r.productName)?html}</td>
+                        <td style="padding:5px 8px"><input class="bc-code" type="text" value="${(r.code)?html}" placeholder="scan or type a code" autocomplete="off" style="width:100%;padding:7px;border:1px solid #ccc;border-radius:5px;font-size:14px;box-sizing:border-box"/></td>
+                        <td class="bc-status" style="padding:5px 8px;text-align:center;font-size:12px;font-weight:700">
+                            <#if r.status == 'missing'><span style="color:#b71c1c">&#9888; No code</span>
+                            <#elseif r.status == 'dup'><span style="color:#e65100">&#9888; Duplicate</span>
+                            <#else><span style="color:#2e7d32">&#10004; OK</span></#if>
+                        </td>
+                        <td style="padding:5px 8px;text-align:center"><button type="button" class="bc-save" style="padding:7px 14px;background:#2e7d32;color:#fff;border:none;border-radius:6px;font-size:13px;font-weight:700;cursor:pointer">Save</button></td>
+                    </tr>
+                    </#list>
+                    <#if !(rows?has_content)>
+                    <tr><td colspan="4" style="padding:24px;text-align:center;color:#888">No products match your search. Clear the search box and click Search to see all products.</td></tr>
+                    </#if>
+                </tbody>
+            </table>
+
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-top:14px">
+                <#assign baseQ = "Barcodes?searchTerm=" + (searchTerm!'')?url('UTF-8') + "&catId=" + (catId!'')?url('UTF-8')>
+                <#if (curPage!0) gt 0><a href="${baseQ}&pageIndex=${(curPage!0)-1}" style="padding:8px 16px;background:#eceff1;border-radius:7px;text-decoration:none;color:#1565c0;font-weight:700">&#8592; Prev</a><#else><span></span></#if>
+                <#if (curPage!0)+1 lt (pageCount!1)><a href="${baseQ}&pageIndex=${(curPage!0)+1}" style="padding:8px 16px;background:#eceff1;border-radius:7px;text-decoration:none;color:#1565c0;font-weight:700">Next &#8594;</a><#else><span></span></#if>
+            </div>
+        </div>
+
+        ]]></text></render-mode>
+    </widgets>
+</screen>

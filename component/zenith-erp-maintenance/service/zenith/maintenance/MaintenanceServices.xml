@@ -1,0 +1,216 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <service verb="create" noun="Equipment">
+        <in-parameters>
+            <parameter name="equipmentName" required="true"/>
+            <parameter name="equipmentType" required="true"/>
+            <parameter name="make"/><parameter name="model"/><parameter name="serialNumber"/>
+            <parameter name="facilityId"/><parameter name="locationDetail"/>
+            <parameter name="purchaseDate" type="Date"/><parameter name="purchaseAmount" type="BigDecimal"/>
+            <parameter name="warrantyExpiryDate" type="Date"/>
+            <parameter name="meterUnit"/><parameter name="criticality"/>
+            <parameter name="description"/>
+        </in-parameters>
+        <out-parameters><parameter name="equipmentId"/></out-parameters>
+        <actions><script><![CDATA[
+            import java.time.LocalDate
+            def now = LocalDate.now()
+            def fysSetting = ec.entity.find("zenith.erp.base.CompanySettings").condition("organizationPartyId", ec.user.getPreference("ACTIVE_ORGANIZATION")).condition("settingKey", "FY_START_MONTH").one()
+            int fyStartMonth = fysSetting ? (fysSetting.settingValue as int) : 4
+            int fyStart = now.monthValue >= fyStartMonth ? now.year : now.year - 1
+            String fySuffix = String.format("%02d-%02d", fyStart % 100, (fyStart + 1) % 100)
+
+            def last = ec.entity.find("zenith.erp.maintenance.Equipment")
+                .condition("equipmentNumber", "like", "EQ/${fySuffix}/%").orderBy("-equipmentNumber").limit(1).list()
+            int nextSeq = 1
+            if (last) {
+                def parts = last[0].equipmentNumber.split("/")
+                if (parts.length == 3) nextSeq = (parts[2] as int) + 1
+            }
+            String equipmentNumber = "EQ/${fySuffix}/" + String.format("%05d", nextSeq)
+
+            context.equipmentId = ec.entity.sequencedIdPrimary("zenith.erp.maintenance.Equipment", null, null)
+            ec.entity.makeValue("zenith.erp.maintenance.Equipment").setAll([
+                equipmentId: context.equipmentId, equipmentNumber: equipmentNumber,
+                equipmentName: equipmentName, equipmentType: equipmentType,
+                make: make, model: model, serialNumber: serialNumber,
+                facilityId: facilityId, locationDetail: locationDetail,
+                purchaseDate: purchaseDate, purchaseAmount: purchaseAmount,
+                warrantyExpiryDate: warrantyExpiryDate, statusId: "EqActive",
+                currentMeterReading: 0, meterUnit: meterUnit ?: "Hours",
+                criticality: criticality ?: "Medium", description: description
+            ]).create()
+        ]]></script></actions>
+    </service>
+
+    <service verb="create" noun="WorkOrder">
+        <in-parameters>
+            <parameter name="equipmentId" required="true"/>
+            <parameter name="planId"/>
+            <parameter name="workOrderType" required="true"/>
+            <parameter name="priority" default-value="Medium"/>
+            <parameter name="description"/><parameter name="scheduledDate" type="Timestamp"/>
+            <parameter name="assignedToPartyId"/><parameter name="estimatedHours" type="BigDecimal"/>
+        </in-parameters>
+        <out-parameters><parameter name="workOrderId"/></out-parameters>
+        <actions><script><![CDATA[
+            import java.time.LocalDate
+            def now = LocalDate.now()
+            def fysSetting = ec.entity.find("zenith.erp.base.CompanySettings").condition("organizationPartyId", ec.user.getPreference("ACTIVE_ORGANIZATION")).condition("settingKey", "FY_START_MONTH").one()
+            int fyStartMonth = fysSetting ? (fysSetting.settingValue as int) : 4
+            int fyStart = now.monthValue >= fyStartMonth ? now.year : now.year - 1
+            String fySuffix = String.format("%02d-%02d", fyStart % 100, (fyStart + 1) % 100)
+
+            def last = ec.entity.find("zenith.erp.maintenance.MaintWorkOrder")
+                .condition("workOrderNumber", "like", "WO/${fySuffix}/%").orderBy("-workOrderNumber").limit(1).list()
+            int nextSeq = 1
+            if (last) {
+                def parts = last[0].workOrderNumber.split("/")
+                if (parts.length == 3) nextSeq = (parts[2] as int) + 1
+            }
+            String workOrderNumber = "WO/${fySuffix}/" + String.format("%05d", nextSeq)
+
+            context.workOrderId = ec.entity.sequencedIdPrimary("zenith.erp.maintenance.MaintWorkOrder", null, null)
+            ec.entity.makeValue("zenith.erp.maintenance.MaintWorkOrder").setAll([
+                workOrderId: context.workOrderId, workOrderNumber: workOrderNumber,
+                equipmentId: equipmentId, planId: planId,
+                workOrderType: workOrderType, priority: priority,
+                description: description, requestedDate: ec.user.nowTimestamp,
+                scheduledDate: scheduledDate, assignedToPartyId: assignedToPartyId,
+                statusId: "WoDraft", estimatedHours: estimatedHours
+            ]).create()
+        ]]></script></actions>
+    </service>
+
+    <service verb="start" noun="WorkOrder">
+        <in-parameters><parameter name="workOrderId" required="true"/></in-parameters>
+        <actions><script><![CDATA[
+            def wo = ec.entity.find("zenith.erp.maintenance.MaintWorkOrder").condition("workOrderId", workOrderId).one()
+            if (!wo) { ec.message.addError("Work order not found"); return }
+            if (wo.statusId != "WoDraft" && wo.statusId != "WoScheduled") {
+                ec.message.addError("Work order must be Draft or Scheduled"); return
+            }
+            wo.set("statusId", "WoInProgress")
+            wo.set("startDate", ec.user.nowTimestamp)
+            wo.update()
+
+            def equip = ec.entity.find("zenith.erp.maintenance.Equipment").condition("equipmentId", wo.equipmentId).one()
+            if (equip && equip.statusId == "EqActive") {
+                equip.set("statusId", "EqInMaintenance")
+                equip.update()
+            }
+        ]]></script></actions>
+    </service>
+
+    <service verb="complete" noun="WorkOrder">
+        <in-parameters>
+            <parameter name="workOrderId" required="true"/>
+            <parameter name="actualHours" type="BigDecimal"/>
+            <parameter name="downTimeHours" type="BigDecimal"/>
+            <parameter name="remarks"/>
+        </in-parameters>
+        <actions><script><![CDATA[
+            def wo = ec.entity.find("zenith.erp.maintenance.MaintWorkOrder").condition("workOrderId", workOrderId).one()
+            if (!wo) { ec.message.addError("Work order not found"); return }
+            if (wo.statusId != "WoInProgress") { ec.message.addError("Work order must be In Progress"); return }
+
+            wo.set("statusId", "WoCompleted")
+            wo.set("completedDate", ec.user.nowTimestamp)
+            if (actualHours) wo.set("actualHours", actualHours)
+            if (downTimeHours) wo.set("downTimeHours", downTimeHours)
+            if (remarks) wo.set("remarks", remarks)
+
+            def parts = ec.entity.find("zenith.erp.maintenance.WorkOrderPart").condition("workOrderId", workOrderId).list()
+            BigDecimal totalParts = 0
+            for (def p : parts) totalParts += (p.totalCost ?: 0) as BigDecimal
+            wo.set("totalPartsCost", totalParts)
+            wo.update()
+
+            def equip = ec.entity.find("zenith.erp.maintenance.Equipment").condition("equipmentId", wo.equipmentId).one()
+            if (equip && equip.statusId == "EqInMaintenance") {
+                equip.set("statusId", "EqActive")
+                equip.update()
+            }
+
+            if (wo.planId) {
+                def plan = ec.entity.find("zenith.erp.maintenance.MaintenancePlan").condition("planId", wo.planId).one()
+                if (plan) {
+                    def today = java.time.LocalDate.now()
+                    plan.set("lastMaintenanceDate", java.sql.Date.valueOf(today))
+                    if (plan.frequencyDays) {
+                        plan.set("nextMaintenanceDate", java.sql.Date.valueOf(today.plusDays(plan.frequencyDays as int)))
+                    }
+                    if (equip.currentMeterReading && plan.frequencyMeterReading) {
+                        plan.set("lastMeterReading", equip.currentMeterReading)
+                        plan.set("nextMeterReading", (equip.currentMeterReading as BigDecimal) + (plan.frequencyMeterReading as BigDecimal))
+                    }
+                    plan.update()
+                }
+            }
+        ]]></script></actions>
+    </service>
+
+    <service verb="add" noun="WorkOrderPart">
+        <in-parameters>
+            <parameter name="workOrderId" required="true"/>
+            <parameter name="partName" required="true"/>
+            <parameter name="productId"/>
+            <parameter name="quantityRequired" type="BigDecimal" required="true"/>
+            <parameter name="quantityUsed" type="BigDecimal"/>
+            <parameter name="unitCost" type="BigDecimal"/>
+        </in-parameters>
+        <actions><script><![CDATA[
+            def existing = ec.entity.find("zenith.erp.maintenance.WorkOrderPart")
+                .condition("workOrderId", workOrderId).orderBy("-partSeqId").limit(1).list()
+            int nextSeq = 1
+            if (existing) nextSeq = (existing[0].partSeqId as int) + 1
+
+            def totalCost = ((quantityUsed ?: quantityRequired ?: 0) as BigDecimal) * ((unitCost ?: 0) as BigDecimal)
+            ec.entity.makeValue("zenith.erp.maintenance.WorkOrderPart").setAll([
+                workOrderId: workOrderId, partSeqId: String.format("%05d", nextSeq),
+                productId: productId, partName: partName,
+                quantityRequired: quantityRequired, quantityUsed: quantityUsed,
+                unitCost: unitCost, totalCost: totalCost
+            ]).create()
+        ]]></script></actions>
+    </service>
+
+    <service verb="log" noun="MeterReading">
+        <in-parameters>
+            <parameter name="equipmentId" required="true"/>
+            <parameter name="meterReading" type="BigDecimal" required="true"/>
+            <parameter name="readingType" default-value="Manual"/>
+        </in-parameters>
+        <out-parameters><parameter name="logId"/></out-parameters>
+        <actions><script><![CDATA[
+            context.logId = ec.entity.sequencedIdPrimary("zenith.erp.maintenance.EquipmentMeterLog", null, null)
+            ec.entity.makeValue("zenith.erp.maintenance.EquipmentMeterLog").setAll([
+                logId: context.logId, equipmentId: equipmentId,
+                readingDate: ec.user.nowTimestamp, meterReading: meterReading,
+                readingType: readingType, recordedByPartyId: ec.user.userId
+            ]).create()
+
+            def equip = ec.entity.find("zenith.erp.maintenance.Equipment").condition("equipmentId", equipmentId).one()
+            if (equip) {
+                equip.set("currentMeterReading", meterReading)
+                equip.update()
+            }
+        ]]></script></actions>
+    </service>
+
+    <service verb="check" noun="MaintenanceDue">
+        <in-parameters><parameter name="daysAhead" type="Integer" default-value="7"/></in-parameters>
+        <out-parameters><parameter name="dueCount" type="Integer"/></out-parameters>
+        <actions><script><![CDATA[
+            def cutoff = java.sql.Date.valueOf(java.time.LocalDate.now().plusDays(daysAhead ?: 7))
+            def plans = ec.entity.find("zenith.erp.maintenance.MaintenancePlan")
+                .condition("isActive", "Y")
+                .condition("nextMaintenanceDate", "<=", cutoff).list()
+            context.dueCount = plans.size()
+            ec.message.addMessage("Found ${context.dueCount} maintenance plans due within ${daysAhead} days")
+        ]]></script></actions>
+    </service>
+
+</services>

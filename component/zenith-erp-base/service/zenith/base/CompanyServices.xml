@@ -1,0 +1,255 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <service verb="create" noun="Company">
+        <in-parameters>
+            <parameter name="organizationName" required="true"/>
+            <parameter name="orgCode" required="true">
+                <description>Unique Organization ID for login (e.g., ACME, TATA001). Used as login credential.</description>
+            </parameter>
+            <parameter name="countryGeoId" required="true">
+                <description>Country code (IND, USA, GBR, ARE, etc.)</description>
+            </parameter>
+            <parameter name="taxRegistrationNumber">
+                <description>Primary tax registration: GSTIN (India), EIN (US), VAT reg (UK/UAE)</description>
+            </parameter>
+            <parameter name="regionGeoId"><description>State/province/emirate</description></parameter>
+            <parameter name="address1"/>
+            <parameter name="city"/>
+            <parameter name="postalCode"/>
+            <parameter name="emailAddress"/>
+            <parameter name="phoneNumber"/>
+            <parameter name="financialYearStartMonth" type="Integer"/>
+            <parameter name="currencyUomId"/>
+            <!-- India-specific params kept for backward compatibility — handled via country plugin EECA -->
+            <parameter name="gstin"><description>Deprecated: use taxRegistrationNumber</description></parameter>
+            <parameter name="panNumber"/>
+            <parameter name="tanNumber"/>
+            <parameter name="cinNumber"/>
+            <parameter name="stateCode"><description>Deprecated: use regionGeoId</description></parameter>
+            <parameter name="isCompositionScheme" default-value="N"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="partyId"/>
+        </out-parameters>
+        <actions>
+            <!-- Resolve country defaults -->
+            <entity-find-one entity-name="zenith.erp.base.CountryConfiguration" value-field="countryConfig">
+                <field-map field-name="countryGeoId"/>
+            </entity-find-one>
+
+            <if condition="!currencyUomId">
+                <set field="currencyUomId" from="countryConfig?.defaultCurrencyUomId ?: 'USD'"/>
+            </if>
+            <if condition="!financialYearStartMonth">
+                <set field="financialYearStartMonth" from="countryConfig?.fiscalYearStartMonth ?: 1"/>
+            </if>
+
+            <!-- Backward compat: gstin → taxRegistrationNumber -->
+            <if condition="gstin &amp;&amp; !taxRegistrationNumber">
+                <set field="taxRegistrationNumber" from="gstin"/>
+            </if>
+            <if condition="stateCode &amp;&amp; !regionGeoId">
+                <set field="regionGeoId" from="stateCode"/>
+            </if>
+
+            <!-- Create organization -->
+            <service-call name="mantle.party.PartyServices.create#Organization"
+                          in-map="[organizationName:organizationName, roleTypeId:'OrgInternal']"
+                          out-map="orgOut"/>
+            <set field="partyId" from="orgOut.partyId"/>
+            <script><![CDATA[
+                def _owner = ec.user.getPreference('ACTIVE_ORGANIZATION') ?: partyId
+                def _gd = ec.artifactExecution.disableAuthz()
+                try { def _pv = ec.entity.find("mantle.party.Party").condition("partyId", partyId).one(); if (_pv) { _pv.ownerPartyId = _owner; _pv.update() } } finally { if (!_gd) ec.artifactExecution.enableAuthz() }
+            ]]></script>
+
+            <!-- Verify org code is unique -->
+            <entity-find entity-name="mantle.party.PartyIdentification" list="existingOrgCode" limit="1">
+                <econdition field-name="partyIdTypeEnumId" value="PtidOrgCode"/>
+                <econdition field-name="idValue" from="orgCode"/>
+            </entity-find>
+            <if condition="existingOrgCode">
+                <return error="true" message="Organization ID '${orgCode}' is already in use"/>
+            </if>
+
+            <!-- Store org code as PartyIdentification -->
+            <service-call name="create#mantle.party.PartyIdentification"
+                          in-map="[partyId:partyId, partyIdTypeEnumId:'PtidOrgCode', idValue:orgCode]"/>
+
+            <!-- Contact info -->
+            <if condition="address1">
+                <service-call name="mantle.party.ContactServices.create#PostalAddress"
+                              in-map="[partyId:partyId, address1:address1, city:city,
+                                       postalCode:postalCode, stateProvinceGeoId:regionGeoId,
+                                       countryGeoId:countryGeoId,
+                                       contactMechPurposeId:'PostalPrimary']"/>
+            </if>
+            <if condition="emailAddress">
+                <service-call name="mantle.party.ContactServices.create#EmailAddress"
+                              in-map="[partyId:partyId, emailAddress:emailAddress,
+                                       contactMechPurposeId:'EmailPrimary']"/>
+            </if>
+            <if condition="phoneNumber">
+                <service-call name="mantle.party.ContactServices.create#TelecomNumber"
+                              in-map="[partyId:partyId, contactNumber:phoneNumber,
+                                       contactMechPurposeId:'PhonePrimary']"/>
+            </if>
+
+            <!-- Initialize accounting -->
+            <service-call name="mantle.ledger.LedgerServices.init#OrganizationAccounting"
+                          in-map="[organizationPartyId:partyId, currencyUomId:currencyUomId]"
+                          ignore-error="true"/>
+
+            <!-- Store company settings -->
+            <entity-make-value entity-name="zenith.erp.base.CompanySettings" value-field="fySetting"
+                               map="[organizationPartyId:partyId, settingKey:'FY_START_MONTH',
+                                     settingValue:financialYearStartMonth.toString(),
+                                     description:'Financial Year Start Month (1=Jan, 4=Apr)']"/>
+            <entity-create value-field="fySetting"/>
+
+            <entity-make-value entity-name="zenith.erp.base.CompanySettings" value-field="countrySetting"
+                               map="[organizationPartyId:partyId, settingKey:'COUNTRY_GEO_ID',
+                                     settingValue:countryGeoId, description:'Company Country']"/>
+            <entity-create value-field="countrySetting"/>
+
+            <entity-make-value entity-name="zenith.erp.base.CompanySettings" value-field="currSetting"
+                               map="[organizationPartyId:partyId, settingKey:'CURRENCY_UOM_ID',
+                                     settingValue:currencyUomId, description:'Default Currency']"/>
+            <entity-create value-field="currSetting"/>
+
+            <!-- Store PAN as generic party identification if provided -->
+            <if condition="panNumber">
+                <service-call name="create#mantle.party.PartyIdentification"
+                              in-map="[partyId:partyId, partyIdTypeEnumId:'PtidTaxId',
+                                       idValue:panNumber]"/>
+            </if>
+
+            <!-- Store TAN/CIN as company settings (India-specific but harmless to keep in base for backward compat) -->
+            <if condition="tanNumber">
+                <entity-make-value entity-name="zenith.erp.base.CompanySettings" value-field="tanSetting"
+                                   map="[organizationPartyId:partyId, settingKey:'TAN_NUMBER',
+                                         settingValue:tanNumber, description:'Tax Deduction Account Number']"/>
+                <entity-create value-field="tanSetting"/>
+            </if>
+            <if condition="cinNumber">
+                <entity-make-value entity-name="zenith.erp.base.CompanySettings" value-field="cinSetting"
+                                   map="[organizationPartyId:partyId, settingKey:'CIN_NUMBER',
+                                         settingValue:cinNumber, description:'Corporate Identity Number']"/>
+                <entity-create value-field="cinSetting"/>
+            </if>
+
+            <!-- Initialize sequences -->
+            <service-call name="zenith.base.SequenceServices.init#Sequences"
+                          in-map="[organizationPartyId:partyId]"/>
+
+            <!-- Tax registration via tax engine (if tax module loaded) -->
+            <if condition="taxRegistrationNumber">
+                <service-call name="zenith.tax.TaxServices.create#TaxRegistration" ignore-error="true"
+                              in-map="[partyId:partyId, taxAuthorityId:countryGeoId + '_NATIONAL',
+                                       registrationTypeEnumId:countryGeoId == 'IND' ? 'TrtGstin' :
+                                           (countryGeoId == 'USA' ? 'TrtEin' :
+                                           (countryGeoId == 'ARE' ? 'TrtTrn' : 'TrtVatReg')),
+                                       registrationNumber:taxRegistrationNumber,
+                                       regionGeoId:regionGeoId]"/>
+            </if>
+        </actions>
+    </service>
+
+    <service verb="update" noun="Company">
+        <in-parameters>
+            <parameter name="partyId" required="true"/>
+            <parameter name="organizationName"/>
+            <parameter name="taxRegistrationNumber"/>
+            <parameter name="gstin"><description>Deprecated: use taxRegistrationNumber</description></parameter>
+            <parameter name="panNumber"/>
+            <parameter name="tanNumber"/>
+            <parameter name="cinNumber"/>
+            <parameter name="stateCode"><description>Deprecated: use regionGeoId</description></parameter>
+            <parameter name="regionGeoId"/>
+        </in-parameters>
+        <actions>
+            <if condition="organizationName">
+                <service-call name="update#mantle.party.Organization"
+                              in-map="[partyId:partyId, organizationName:organizationName]"/>
+            </if>
+
+            <!-- PAN: store when given, clear when explicitly blanked. This is the only caller and the
+                 edit form always submits the field pre-filled, so an empty value means the admin cleared it. -->
+            <if condition="panNumber != null">
+                <if condition="panNumber.trim()">
+                    <service-call name="store#mantle.party.PartyIdentification"
+                                  in-map="[partyId:partyId, partyIdTypeEnumId:'PtidTaxId', idValue:panNumber.trim()]"/>
+                <else>
+                    <entity-find entity-name="mantle.party.PartyIdentification" list="panRows">
+                        <econdition field-name="partyId"/>
+                        <econdition field-name="partyIdTypeEnumId" value="PtidTaxId"/>
+                    </entity-find>
+                    <iterate list="panRows" entry="pr"><entity-delete value-field="pr"/></iterate>
+                </else>
+                </if>
+            </if>
+
+            <!-- TAN -->
+            <if condition="tanNumber != null">
+                <if condition="tanNumber.trim()">
+                    <service-call name="store#zenith.erp.base.CompanySettings"
+                                  in-map="[organizationPartyId:partyId, settingKey:'TAN_NUMBER',
+                                           settingValue:tanNumber.trim(), description:'Tax Deduction Account Number']"/>
+                <else>
+                    <entity-find entity-name="zenith.erp.base.CompanySettings" list="tanRows">
+                        <econdition field-name="organizationPartyId" from="partyId"/>
+                        <econdition field-name="settingKey" value="TAN_NUMBER"/>
+                    </entity-find>
+                    <iterate list="tanRows" entry="tr"><entity-delete value-field="tr"/></iterate>
+                </else>
+                </if>
+            </if>
+
+            <!-- CIN -->
+            <if condition="cinNumber != null">
+                <if condition="cinNumber.trim()">
+                    <service-call name="store#zenith.erp.base.CompanySettings"
+                                  in-map="[organizationPartyId:partyId, settingKey:'CIN_NUMBER',
+                                           settingValue:cinNumber.trim(), description:'Corporate Identity Number']"/>
+                <else>
+                    <entity-find entity-name="zenith.erp.base.CompanySettings" list="cinRows">
+                        <econdition field-name="organizationPartyId" from="partyId"/>
+                        <econdition field-name="settingKey" value="CIN_NUMBER"/>
+                    </entity-find>
+                    <iterate list="cinRows" entry="cr"><entity-delete value-field="cr"/></iterate>
+                </else>
+                </if>
+            </if>
+
+            <!-- Primary tax registration (GSTIN / EIN / VAT): update the org's default registration,
+                 or create one from the org's stored country if none exists yet. -->
+            <if condition="taxRegistrationNumber != null &amp;&amp; taxRegistrationNumber.trim()">
+                <entity-find entity-name="zenith.erp.tax.TaxRegistration" list="taxRegList" limit="1">
+                    <econdition field-name="partyId"/>
+                    <order-by field-name="-isDefault"/>
+                </entity-find>
+                <if condition="taxRegList">
+                    <service-call name="update#zenith.erp.tax.TaxRegistration"
+                                  in-map="[registrationId:taxRegList[0].registrationId, registrationNumber:taxRegistrationNumber.trim()]"/>
+                <else>
+                    <entity-find entity-name="zenith.erp.base.CompanySettings" list="ccList" limit="1">
+                        <econdition field-name="organizationPartyId" from="partyId"/>
+                        <econdition field-name="settingKey" value="COUNTRY_GEO_ID"/>
+                    </entity-find>
+                    <set field="cgeo" from="ccList ? ccList[0].settingValue : null"/>
+                    <if condition="cgeo">
+                        <service-call name="zenith.tax.TaxServices.create#TaxRegistration" ignore-error="true"
+                                      in-map="[partyId:partyId, taxAuthorityId:cgeo + '_NATIONAL',
+                                               registrationTypeEnumId:cgeo == 'IND' ? 'TrtGstin' : (cgeo == 'USA' ? 'TrtEin' : (cgeo == 'ARE' ? 'TrtTrn' : 'TrtVatReg')),
+                                               registrationNumber:taxRegistrationNumber.trim(), regionGeoId:regionGeoId]"/>
+                    </if>
+                </else>
+                </if>
+            </if>
+        </actions>
+    </service>
+
+
+</services>

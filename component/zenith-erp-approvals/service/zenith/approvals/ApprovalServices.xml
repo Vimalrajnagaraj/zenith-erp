@@ -1,0 +1,228 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <service verb="create" noun="ApprovalRequest">
+        <in-parameters>
+            <parameter name="workflowId" required="true"/>
+            <parameter name="requestTitle" required="true"/>
+            <parameter name="requestDescription"/>
+            <parameter name="entityName"/>
+            <parameter name="primaryKeyValue"/>
+            <parameter name="amount" type="BigDecimal"/>
+            <parameter name="moduleEnumId"/>
+            <parameter name="priority" default-value="ApPri_NORMAL"/>
+            <parameter name="dueDate" type="Timestamp"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="requestId"/>
+            <parameter name="requestNumber"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.approvals.ApprovalWorkflow" value-field="workflow"/>
+            <if condition="!workflow"><return error="true" message="Workflow not found"/></if>
+
+            <!-- Generate request number: APR/FY/SEQ -->
+            <set field="now" from="ec.user.nowTimestamp"/>
+            <set field="cal" from="java.util.Calendar.getInstance()"/>
+            <script>cal.setTime(now)</script>
+            <set field="year" from="cal.get(java.util.Calendar.YEAR)"/>
+            <set field="month" from="cal.get(java.util.Calendar.MONTH) + 1"/>
+            <set field="fyStart" from="month &gt;= 4 ? year : year - 1"/>
+            <set field="fyEnd" from="(fyStart + 1) % 100"/>
+            <set field="fyStr" from="String.format('%02d-%02d', fyStart % 100, fyEnd)"/>
+
+            <entity-find entity-name="zenith.erp.approvals.ApprovalRequest" list="existing">
+                <econdition field-name="requestNumber" operator="like" value="APR/${fyStr}/%"/>
+                <order-by field-name="-requestNumber"/>
+                <limit count="1"/>
+            </entity-find>
+            <set field="seq" from="1"/>
+            <if condition="existing">
+                <set field="lastNum" from="existing[0].requestNumber"/>
+                <set field="seq" from="(lastNum.substring(lastNum.lastIndexOf('/') + 1) as Integer) + 1"/>
+            </if>
+            <set field="requestNumber" from="'APR/' + fyStr + '/' + String.format('%05d', seq)"/>
+
+            <!-- Check auto-approve threshold -->
+            <if condition="workflow.autoApproveAmount &amp;&amp; amount &amp;&amp; amount &lt;= workflow.autoApproveAmount">
+                <set field="statusId" value="ArApproved"/>
+                <set field="completedDate" from="now"/>
+            <else>
+                <set field="statusId" value="ArPending"/>
+            </else></if>
+
+            <service-call name="create#zenith.erp.approvals.ApprovalRequest"
+                          in-map="[requestId:requestId, requestNumber:requestNumber, workflowId:workflowId,
+                                   entityName:entityName ?: workflow.entityName, primaryKeyValue:primaryKeyValue,
+                                   requestTitle:requestTitle, requestDescription:requestDescription,
+                                   amount:amount, currencyUomId:(workflow.currencyUomId ?: 'USD'), requestedByPartyId:ec.user.userAccount?.partyId,
+                                   requestDate:now, statusId:statusId, currentStepNumber:1,
+                                   completedDate:completedDate, moduleEnumId:moduleEnumId,
+                                   priority:priority, dueDate:dueDate]" out-map="createOut"/>
+            <set field="requestId" from="createOut.requestId"/>
+        </actions>
+    </service>
+
+    <service verb="approve" noun="Request">
+        <in-parameters>
+            <parameter name="requestId" required="true"/>
+            <parameter name="comments"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.approvals.ApprovalRequest" value-field="request"/>
+            <if condition="!request"><return error="true" message="Request not found"/></if>
+            <if condition="request.statusId != 'ArPending' &amp;&amp; request.statusId != 'ArInReview' &amp;&amp; request.statusId != 'ArEscalated'">
+                <return error="true" message="Request cannot be approved in current status"/>
+            </if>
+
+            <set field="now" from="ec.user.nowTimestamp"/>
+            <set field="approverPartyId" from="ec.user.userAccount?.partyId"/>
+
+            <!-- Record the decision -->
+            <service-call name="create#zenith.erp.approvals.ApprovalDecision"
+                          in-map="[requestId:requestId, stepNumber:request.currentStepNumber,
+                                   approverPartyId:approverPartyId, decision:'ApDec_APPROVE',
+                                   comments:comments, decisionDate:now]"/>
+
+            <!-- Check if more steps remain -->
+            <entity-find entity-name="zenith.erp.approvals.ApprovalStep" list="nextSteps">
+                <econdition field-name="workflowId" from="request.workflowId"/>
+                <econdition field-name="stepNumber" operator="greater" from="request.currentStepNumber"/>
+                <order-by field-name="stepNumber"/>
+                <limit count="1"/>
+            </entity-find>
+
+            <if condition="nextSteps">
+                <!-- Advance to next step -->
+                <set field="request.currentStepNumber" from="nextSteps[0].stepNumber"/>
+                <set field="request.statusId" value="ArInReview"/>
+                <entity-update value-field="request"/>
+            <else>
+                <!-- Final approval -->
+                <set field="request.statusId" value="ArApproved"/>
+                <set field="request.completedDate" from="now"/>
+                <entity-update value-field="request"/>
+            </else></if>
+        </actions>
+    </service>
+
+    <service verb="reject" noun="Request">
+        <in-parameters>
+            <parameter name="requestId" required="true"/>
+            <parameter name="comments" required="true"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.approvals.ApprovalRequest" value-field="request"/>
+            <if condition="!request"><return error="true" message="Request not found"/></if>
+            <if condition="request.statusId != 'ArPending' &amp;&amp; request.statusId != 'ArInReview' &amp;&amp; request.statusId != 'ArEscalated'">
+                <return error="true" message="Request cannot be rejected in current status"/>
+            </if>
+
+            <set field="now" from="ec.user.nowTimestamp"/>
+            <service-call name="create#zenith.erp.approvals.ApprovalDecision"
+                          in-map="[requestId:requestId, stepNumber:request.currentStepNumber,
+                                   approverPartyId:ec.user.userAccount?.partyId, decision:'ApDec_REJECT',
+                                   comments:comments, decisionDate:now]"/>
+
+            <set field="request.statusId" value="ArRejected"/>
+            <set field="request.completedDate" from="now"/>
+            <entity-update value-field="request"/>
+        </actions>
+    </service>
+
+    <service verb="return" noun="Request">
+        <in-parameters>
+            <parameter name="requestId" required="true"/>
+            <parameter name="comments" required="true"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.approvals.ApprovalRequest" value-field="request"/>
+            <if condition="!request"><return error="true" message="Request not found"/></if>
+
+            <set field="now" from="ec.user.nowTimestamp"/>
+            <service-call name="create#zenith.erp.approvals.ApprovalDecision"
+                          in-map="[requestId:requestId, stepNumber:request.currentStepNumber,
+                                   approverPartyId:ec.user.userAccount?.partyId, decision:'ApDec_RETURN',
+                                   comments:comments, decisionDate:now]"/>
+
+            <set field="request.statusId" value="ArReturned"/>
+            <set field="request.currentStepNumber" from="1"/>
+            <entity-update value-field="request"/>
+        </actions>
+    </service>
+
+    <service verb="escalate" noun="Request">
+        <in-parameters>
+            <parameter name="requestId" required="true"/>
+            <parameter name="comments"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.approvals.ApprovalRequest" value-field="request"/>
+            <if condition="!request"><return error="true" message="Request not found"/></if>
+
+            <set field="now" from="ec.user.nowTimestamp"/>
+            <service-call name="create#zenith.erp.approvals.ApprovalDecision"
+                          in-map="[requestId:requestId, stepNumber:request.currentStepNumber,
+                                   approverPartyId:ec.user.userAccount?.partyId, decision:'ApDec_ESCALATE',
+                                   comments:comments, decisionDate:now]"/>
+
+            <set field="request.statusId" value="ArEscalated"/>
+            <entity-update value-field="request"/>
+        </actions>
+    </service>
+
+    <service verb="cancel" noun="Request">
+        <in-parameters>
+            <parameter name="requestId" required="true"/>
+            <parameter name="comments"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.approvals.ApprovalRequest" value-field="request"/>
+            <if condition="!request"><return error="true" message="Request not found"/></if>
+            <if condition="request.statusId == 'ArApproved' || request.statusId == 'ArRejected' || request.statusId == 'ArCancelled'">
+                <return error="true" message="Cannot cancel a completed request"/>
+            </if>
+
+            <set field="now" from="ec.user.nowTimestamp"/>
+            <set field="request.statusId" value="ArCancelled"/>
+            <set field="request.completedDate" from="now"/>
+            <entity-update value-field="request"/>
+        </actions>
+    </service>
+
+    <service verb="delegate" noun="Approval">
+        <in-parameters>
+            <parameter name="fromPartyId" required="true"/>
+            <parameter name="toPartyId" required="true"/>
+            <parameter name="workflowId"/>
+            <parameter name="fromDate" type="Timestamp" required="true"/>
+            <parameter name="thruDate" type="Timestamp" required="true"/>
+            <parameter name="reason"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="delegationId"/>
+        </out-parameters>
+        <actions>
+            <service-call name="create#zenith.erp.approvals.ApprovalDelegation"
+                          in-map="context" out-map="context"/>
+        </actions>
+    </service>
+
+    <service verb="check" noun="OverdueApprovals">
+        <actions>
+            <set field="now" from="ec.user.nowTimestamp"/>
+            <entity-find entity-name="zenith.erp.approvals.ApprovalRequest" list="overdueList">
+                <econdition field-name="statusId" operator="in" value="ArPending,ArInReview"/>
+                <econdition field-name="dueDate" operator="less" from="now"/>
+            </entity-find>
+            <iterate list="overdueList" entry="req">
+                <service-call name="create#zenith.erp.approvals.ApprovalNotification"
+                              in-map="[requestId:req.requestId, recipientPartyId:req.requestedByPartyId,
+                                       notificationType:'ApNotif_REMINDER', sentDate:now]"/>
+            </iterate>
+            <set field="overdueCount" from="overdueList?.size() ?: 0"/>
+            <log level="info" message="Checked overdue approvals: ${overdueCount} found"/>
+        </actions>
+    </service>
+</services>

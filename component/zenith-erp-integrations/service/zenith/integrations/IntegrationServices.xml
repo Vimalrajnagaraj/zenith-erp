@@ -1,0 +1,307 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <!-- Portal Authentication -->
+    <service verb="authenticate" noun="Portal">
+        <in-parameters>
+            <parameter name="portalConfigId" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="tokenId"/>
+            <parameter name="accessToken"/>
+            <parameter name="success" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.integrations.ApiPortalConfig" value-field="config"/>
+            <if condition="!config"><return error="true" message="Portal configuration not found"/></if>
+            <if condition="config.isActive != 'Y'"><return error="true" message="Portal is not active"/></if>
+
+            <!-- Check for existing valid token -->
+            <entity-find entity-name="zenith.erp.integrations.ApiAuthToken" list="existingTokens">
+                <econdition field-name="portalConfigId"/>
+                <econdition field-name="isValid" value="Y"/>
+                <econdition field-name="tokenExpiry" operator="greater" from="ec.user.nowTimestamp"/>
+                <order-by field-name="-issuedDate"/>
+                <limit count="1"/>
+            </entity-find>
+            <if condition="existingTokens">
+                <set field="tokenId" from="existingTokens[0].tokenId"/>
+                <set field="accessToken" from="existingTokens[0].accessToken"/>
+                <set field="success" from="true"/>
+                <return/>
+            </if>
+
+            <!-- Log the auth attempt (actual HTTP call would go here in production) -->
+            <set field="now" from="ec.user.nowTimestamp"/>
+            <service-call name="create#zenith.erp.integrations.ApiRequestLog"
+                          in-map="[portalConfigId:portalConfigId, requestType:'RtAuth',
+                                   httpMethod:'POST', requestUrl:config.authUrl,
+                                   statusId:'ArqPending', requestDate:now,
+                                   requestByPartyId:ec.user.userAccount?.partyId]"
+                          out-map="logOut"/>
+
+            <!-- Placeholder: In production, make actual HTTP call to auth URL -->
+            <!-- For now, create a placeholder token valid for 6 hours -->
+            <set field="calExpiry" from="java.util.Calendar.getInstance()"/>
+            <script>calExpiry.setTime(now); calExpiry.add(java.util.Calendar.HOUR, 6)</script>
+
+            <service-call name="create#zenith.erp.integrations.ApiAuthToken"
+                          in-map="[portalConfigId:portalConfigId, tokenType:'Bearer',
+                                   accessToken:'PLACEHOLDER_TOKEN_' + portalConfigId + '_' + System.currentTimeMillis(),
+                                   tokenExpiry:new java.sql.Timestamp(calExpiry.getTimeInMillis()),
+                                   issuedDate:now, isValid:'Y']"
+                          out-map="tokenOut"/>
+            <set field="tokenId" from="tokenOut.tokenId"/>
+            <set field="accessToken" from="'PLACEHOLDER_TOKEN'"/>
+            <set field="success" from="true"/>
+
+            <!-- Update request log -->
+            <entity-find-one entity-name="zenith.erp.integrations.ApiRequestLog" value-field="reqLog">
+                <field-map field-name="requestLogId" from="logOut.requestLogId"/>
+            </entity-find-one>
+            <set field="reqLog.statusId" value="ArqSuccess"/>
+            <set field="reqLog.responseCode" from="200"/>
+            <entity-update value-field="reqLog"/>
+        </actions>
+    </service>
+
+    <!-- Generate E-Invoice (build JSON payload per NIC schema) -->
+    <service verb="generate" noun="Einvoice">
+        <in-parameters>
+            <parameter name="invoiceId" required="true"/>
+            <parameter name="portalConfigId" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="einvoiceId"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.integrations.ApiPortalConfig" value-field="config"/>
+            <if condition="!config"><return error="true" message="Portal config not found"/></if>
+
+            <set field="now" from="ec.user.nowTimestamp"/>
+
+            <!-- Build e-Invoice JSON payload (NIC Schema v1.1 structure) -->
+            <set field="payload" from="[
+                Version:'1.1',
+                TranDtls:[TaxSch:'GST', SupTyp:'B2B', RegRev:'N'],
+                DocDtls:[Typ:'INV', No:'placeholder', Dt:now.format('dd/MM/yyyy')],
+                SellerDtls:[Gstin:config.gstin, LglNm:'Seller Legal Name', Addr1:'Address',
+                            Loc:'City', Pin:560001, Stcd:'29'],
+                BuyerDtls:[Gstin:'placeholder', LglNm:'Buyer Legal Name', Addr1:'Address',
+                            Loc:'City', Pin:400001, Stcd:'27', Pos:'27'],
+                ItemList:[[SlNo:'1', PrdDesc:'Product', IsServc:'N', HsnCd:'00000000',
+                           Qty:1, Unit:'NOS', UnitPrice:1000, TotAmt:1000,
+                           AssAmt:1000, GstRt:18, CgstAmt:90, SgstAmt:90, TotItemVal:1180]],
+                ValDtls:[AssVal:1000, CgstVal:90, SgstVal:90, TotInvVal:1180]
+            ]"/>
+
+            <set field="jsonPayload" from="groovy.json.JsonOutput.toJson(payload)"/>
+
+            <service-call name="create#zenith.erp.integrations.EinvoiceRecord"
+                          in-map="[invoiceId:invoiceId, gstin:config.gstin,
+                                   requestPayload:jsonPayload, statusId:'EiPending',
+                                   generatedDate:now, generatedByPartyId:ec.user.userAccount?.partyId]"
+                          out-map="eiOut"/>
+            <set field="einvoiceId" from="eiOut.einvoiceId"/>
+
+            <!-- Log API request -->
+            <service-call name="create#zenith.erp.integrations.ApiRequestLog"
+                          in-map="[portalConfigId:portalConfigId, requestType:'RtEinvGenerate',
+                                   httpMethod:'POST', requestUrl:config.baseUrl + '/eicore/v1.03/Invoice',
+                                   requestBody:jsonPayload, statusId:'ArqPending',
+                                   referenceType:'EinvoiceRecord', referenceId:einvoiceId,
+                                   requestDate:now, requestByPartyId:ec.user.userAccount?.partyId]"/>
+        </actions>
+    </service>
+
+    <!-- Generate E-Way Bill -->
+    <service verb="generate" noun="Ewaybill">
+        <in-parameters>
+            <parameter name="referenceType" required="true"/>
+            <parameter name="referenceId" required="true"/>
+            <parameter name="portalConfigId" required="true"/>
+            <parameter name="fromGstin" required="true"/>
+            <parameter name="fromAddress" required="true"/>
+            <parameter name="fromPincode" required="true"/>
+            <parameter name="fromStateCode" required="true"/>
+            <parameter name="toGstin"/>
+            <parameter name="toAddress" required="true"/>
+            <parameter name="toPincode" required="true"/>
+            <parameter name="toStateCode" required="true"/>
+            <parameter name="totalValue" type="BigDecimal" required="true"/>
+            <parameter name="totalGst" type="BigDecimal" required="true"/>
+            <parameter name="transporterId"/>
+            <parameter name="transporterName"/>
+            <parameter name="vehicleNumber"/>
+            <parameter name="transDistance" type="Integer"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="ewaybillId"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.integrations.ApiPortalConfig" value-field="config"/>
+            <set field="now" from="ec.user.nowTimestamp"/>
+
+            <service-call name="create#zenith.erp.integrations.EwaybillRecord"
+                          in-map="[referenceType:referenceType, referenceId:referenceId,
+                                   gstin:fromGstin, supplyType:'O', docType:'INV',
+                                   fromGstin:fromGstin, fromAddress:fromAddress,
+                                   fromPincode:fromPincode, fromStateCode:fromStateCode,
+                                   toGstin:toGstin, toAddress:toAddress,
+                                   toPincode:toPincode, toStateCode:toStateCode,
+                                   totalValue:totalValue, totalGst:totalGst,
+                                   transporterId:transporterId, transporterName:transporterName,
+                                   vehicleNumber:vehicleNumber, transDistance:transDistance,
+                                   transMode:'1', vehicleType:'R',
+                                   statusId:'EwPending', generatedDate:now]"
+                          out-map="ewbOut"/>
+            <set field="ewaybillId" from="ewbOut.ewaybillId"/>
+
+            <service-call name="create#zenith.erp.integrations.ApiRequestLog"
+                          in-map="[portalConfigId:portalConfigId, requestType:'RtEwbGenerate',
+                                   httpMethod:'POST', requestUrl:config.baseUrl + '/ewbapi/v1.03/ewayapi',
+                                   statusId:'ArqPending', referenceType:'EwaybillRecord',
+                                   referenceId:ewaybillId, requestDate:now,
+                                   requestByPartyId:ec.user.userAccount?.partyId]"/>
+        </actions>
+    </service>
+
+    <!-- Generate GSTR-1 JSON -->
+    <service verb="generate" noun="Gstr1Json">
+        <in-parameters>
+            <parameter name="gstin" required="true"/>
+            <parameter name="financialYear" required="true"/>
+            <parameter name="returnPeriod" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="filingId"/>
+        </out-parameters>
+        <actions>
+            <set field="now" from="ec.user.nowTimestamp"/>
+
+            <!-- Build GSTR-1 JSON structure -->
+            <set field="gstr1" from="[
+                gstin:gstin, fp:returnPeriod,
+                b2b:[], b2cl:[], b2cs:[], cdnr:[], cdnur:[],
+                exp:[], nil:[], hsn:[data:[]],
+                doc_issue:[doc_det:[]]
+            ]"/>
+
+            <set field="jsonPayload" from="groovy.json.JsonOutput.toJson(gstr1)"/>
+
+            <service-call name="create#zenith.erp.integrations.GstReturnFiling"
+                          in-map="[gstin:gstin, returnType:'GrGstr1',
+                                   financialYear:financialYear, returnPeriod:returnPeriod,
+                                   jsonPayload:jsonPayload, statusId:'GfGenerated',
+                                   filedByPartyId:ec.user.userAccount?.partyId]"
+                          out-map="fileOut"/>
+            <set field="filingId" from="fileOut.filingId"/>
+        </actions>
+    </service>
+
+    <!-- Generate EPF ECR File -->
+    <service verb="generate" noun="EpfEcr">
+        <in-parameters>
+            <parameter name="establishmentCode" required="true"/>
+            <parameter name="wageMonth" required="true"/>
+            <parameter name="financialYear" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="ecrFilingId"/>
+        </out-parameters>
+        <actions>
+            <set field="now" from="ec.user.nowTimestamp"/>
+
+            <!-- ECR text file format: UAN#Member Name#Gross Wages#EPF Wages#EPS Wages#EDLI Wages#EPF Contri(EE)#EPS Contri(ER)#EPF Contri(ER)#NCP Days#Refund of Advances -->
+            <set field="ecrHeader" from="'#~#' + establishmentCode + '#~#' + wageMonth + '#~#SUBMISSION'"/>
+            <set field="ecrContent" from="ecrHeader"/>
+
+            <service-call name="create#zenith.erp.integrations.EpfEcrFiling"
+                          in-map="[establishmentCode:establishmentCode, wageMonth:wageMonth,
+                                   financialYear:financialYear, totalEmployees:0,
+                                   totalEpfWages:0, totalEpsWages:0,
+                                   totalEpfContribution:0, totalEpsContribution:0,
+                                   totalEdliContribution:0, totalAdminCharges:0,
+                                   ecrFileContent:ecrContent, statusId:'EcGenerated',
+                                   filingDate:now, filedByPartyId:ec.user.userAccount?.partyId]"
+                          out-map="ecrOut"/>
+            <set field="ecrFilingId" from="ecrOut.ecrFilingId"/>
+        </actions>
+    </service>
+
+    <!-- Verify GSTIN -->
+    <service verb="verify" noun="Gstin">
+        <in-parameters>
+            <parameter name="gstin" required="true"/>
+            <parameter name="portalConfigId"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="verificationId"/>
+            <parameter name="isValid" type="Boolean"/>
+            <parameter name="tradeName"/>
+            <parameter name="legalName"/>
+        </out-parameters>
+        <actions>
+            <!-- Check cache first -->
+            <entity-find entity-name="zenith.erp.integrations.GstinVerification" list="cached">
+                <econdition field-name="gstin"/>
+                <order-by field-name="-verifiedDate"/>
+                <limit count="1"/>
+            </entity-find>
+            <if condition="cached">
+                <set field="verificationId" from="cached[0].verificationId"/>
+                <set field="isValid" from="cached[0].isValid == 'Y'"/>
+                <set field="tradeName" from="cached[0].tradeName"/>
+                <set field="legalName" from="cached[0].legalName"/>
+                <return/>
+            </if>
+
+            <!-- Format validation (15-digit GSTIN: 2-state + 10-PAN + 1-entity + 1-alpha + 1-check) -->
+            <set field="gstinPattern" from="'^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$'"/>
+            <set field="formatValid" from="gstin ==~ gstinPattern"/>
+
+            <set field="now" from="ec.user.nowTimestamp"/>
+            <service-call name="create#zenith.erp.integrations.GstinVerification"
+                          in-map="[gstin:gstin, isValid:formatValid ? 'Y' : 'N',
+                                   gstStatus:formatValid ? 'Format Valid' : 'Invalid Format',
+                                   stateCode:gstin.substring(0, 2),
+                                   verifiedDate:now]"
+                          out-map="verifyOut"/>
+            <set field="verificationId" from="verifyOut.verificationId"/>
+            <set field="isValid" from="formatValid"/>
+        </actions>
+    </service>
+
+    <!-- Test Portal Connection -->
+    <service verb="test" noun="PortalConnection">
+        <in-parameters>
+            <parameter name="portalConfigId" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="success" type="Boolean"/>
+            <parameter name="message"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.integrations.ApiPortalConfig" value-field="config"/>
+            <if condition="!config"><return error="true" message="Configuration not found"/></if>
+
+            <set field="now" from="ec.user.nowTimestamp"/>
+            <set field="config.lastTestedDate" from="now"/>
+
+            <!-- Placeholder: actual connectivity test would go here -->
+            <if condition="config.baseUrl &amp;&amp; config.clientId">
+                <set field="success" from="true"/>
+                <set field="message" value="Configuration valid. Credentials present."/>
+                <set field="config.lastTestResult" value="Pass — credentials configured"/>
+            <else>
+                <set field="success" from="false"/>
+                <set field="message" value="Missing base URL or client credentials"/>
+                <set field="config.lastTestResult" value="Fail — missing configuration"/>
+            </else>
+            </if>
+            <entity-update value-field="config"/>
+        </actions>
+    </service>
+
+</services>

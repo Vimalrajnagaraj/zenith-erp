@@ -1,0 +1,154 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <!-- ========== Route Management ========== -->
+
+    <service verb="create" noun="Route">
+        <in-parameters>
+            <parameter name="routeName" required="true"/>
+            <parameter name="description"/>
+            <parameter name="originFacilityId" required="true"/>
+            <parameter name="vehicleId"/>
+            <parameter name="driverPartyId"/>
+            <parameter name="dayOfWeek"/>
+            <parameter name="estimatedDuration" type="Integer"/>
+            <parameter name="organizationPartyId"/>
+            <parameter name="stops" type="List"><description>List of maps: partyId, facilityId, address, estimatedArrival</description></parameter>
+        </in-parameters>
+        <out-parameters><parameter name="routeId"/></out-parameters>
+        <actions>
+            <service-call name="create#zenith.erp.distribution.DistributionRoute" out-map="context"
+                          in-map="[routeName:routeName, description:description, originFacilityId:originFacilityId,
+                                   vehicleId:vehicleId, driverPartyId:driverPartyId, dayOfWeek:dayOfWeek,
+                                   estimatedDuration:estimatedDuration, organizationPartyId:organizationPartyId]"/>
+
+            <if condition="stops">
+                <set field="seq" from="1" type="Integer"/>
+                <iterate list="stops" entry="stop">
+                    <service-call name="create#zenith.erp.distribution.RouteStop"
+                                  in-map="[routeId:routeId, stopSeqId:seq, partyId:stop.partyId,
+                                           facilityId:stop.facilityId, address:stop.address,
+                                           estimatedArrival:stop.estimatedArrival, notes:stop.notes]"/>
+                    <set field="seq" from="seq + 1"/>
+                </iterate>
+            </if>
+        </actions>
+    </service>
+
+    <service verb="add" noun="RouteStop">
+        <in-parameters>
+            <parameter name="routeId" required="true"/>
+            <parameter name="partyId"/>
+            <parameter name="facilityId"/>
+            <parameter name="address"/>
+            <parameter name="estimatedArrival"/>
+            <parameter name="notes"/>
+        </in-parameters>
+        <actions>
+            <entity-find entity-name="zenith.erp.distribution.RouteStop" list="existing">
+                <econdition field-name="routeId"/></entity-find>
+            <set field="nextSeq" from="(existing*.stopSeqId?.max() ?: 0) + 1" type="Integer"/>
+            <service-call name="create#zenith.erp.distribution.RouteStop"
+                          in-map="[routeId:routeId, stopSeqId:nextSeq, partyId:partyId,
+                                   facilityId:facilityId, address:address,
+                                   estimatedArrival:estimatedArrival, notes:notes]"/>
+        </actions>
+    </service>
+
+    <!-- ========== Delivery Run Management ========== -->
+
+    <service verb="create" noun="DeliveryRun">
+        <in-parameters>
+            <parameter name="routeId" required="true"/>
+            <parameter name="runDate" type="Date" required="true"/>
+            <parameter name="driverPartyId"/>
+            <parameter name="vehicleId"/>
+            <parameter name="orderIds" type="List"><description>List of orderId strings to assign to this run</description></parameter>
+        </in-parameters>
+        <out-parameters><parameter name="runId"/></out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.distribution.DistributionRoute" value-field="route"/>
+            <service-call name="create#zenith.erp.distribution.DeliveryRun" out-map="context"
+                          in-map="[routeId:routeId, runDate:runDate,
+                                   driverPartyId:driverPartyId ?: route.driverPartyId,
+                                   vehicleId:vehicleId ?: route.vehicleId,
+                                   totalOrders:0, deliveredOrders:0,
+                                   totalValue:0, totalCollected:0, statusId:'DrPlanned']"/>
+
+            <if condition="orderIds">
+                <iterate list="orderIds" entry="oid">
+                    <service-call name="zenith.distribution.DistributionServices.assign#OrderToRun"
+                                  in-map="[runId:runId, orderId:oid]"/>
+                </iterate>
+            </if>
+        </actions>
+    </service>
+
+    <service verb="assign" noun="OrderToRun">
+        <in-parameters>
+            <parameter name="runId" required="true"/>
+            <parameter name="orderId" required="true"/>
+            <parameter name="stopSeqId" type="Integer"/>
+        </in-parameters>
+        <actions>
+            <service-call name="store#zenith.erp.distribution.DeliveryRunOrder"
+                          in-map="[runId:runId, orderId:orderId, stopSeqId:stopSeqId,
+                                   deliveryStatusId:'DoAssigned']"/>
+
+            <!-- Update order count -->
+            <entity-find-count entity-name="zenith.erp.distribution.DeliveryRunOrder" count-field="cnt">
+                <econdition field-name="runId"/></entity-find-count>
+            <service-call name="update#zenith.erp.distribution.DeliveryRun"
+                          in-map="[runId:runId, totalOrders:cnt]"/>
+        </actions>
+    </service>
+
+    <service verb="start" noun="DeliveryRun">
+        <in-parameters><parameter name="runId" required="true"/></in-parameters>
+        <actions>
+            <service-call name="update#zenith.erp.distribution.DeliveryRun"
+                          in-map="[runId:runId, statusId:'DrInTransit', departureTime:ec.user.nowTimestamp]"/>
+        </actions>
+    </service>
+
+    <service verb="deliver" noun="Order">
+        <in-parameters>
+            <parameter name="runId" required="true"/>
+            <parameter name="orderId" required="true"/>
+            <parameter name="collectedAmount" type="BigDecimal"/>
+            <parameter name="paymentMethod"/>
+            <parameter name="notes"/>
+            <parameter name="deliveryStatusId" default-value="DoDelivered"/>
+        </in-parameters>
+        <actions>
+            <service-call name="update#zenith.erp.distribution.DeliveryRunOrder"
+                          in-map="[runId:runId, orderId:orderId, deliveryStatusId:deliveryStatusId,
+                                   deliveredTime:ec.user.nowTimestamp, collectedAmount:collectedAmount,
+                                   paymentMethod:paymentMethod, notes:notes]"/>
+
+            <!-- Update delivered count and collected totals -->
+            <entity-find entity-name="zenith.erp.distribution.DeliveryRunOrder" list="allOrders">
+                <econdition field-name="runId"/></entity-find>
+            <set field="delivered" from="0" type="Integer"/>
+            <set field="collected" from="BigDecimal.ZERO" type="BigDecimal"/>
+            <iterate list="allOrders" entry="dro">
+                <if condition="dro.deliveryStatusId == 'DoDelivered' || dro.deliveryStatusId == 'DoPartial'">
+                    <set field="delivered" from="delivered + 1"/>
+                </if>
+                <set field="collected" from="collected + ((dro.collectedAmount ?: 0) as BigDecimal)"/>
+            </iterate>
+            <service-call name="update#zenith.erp.distribution.DeliveryRun"
+                          in-map="[runId:runId, deliveredOrders:delivered, totalCollected:collected]"/>
+        </actions>
+    </service>
+
+    <service verb="complete" noun="DeliveryRun">
+        <in-parameters><parameter name="runId" required="true"/></in-parameters>
+        <actions>
+            <service-call name="update#zenith.erp.distribution.DeliveryRun"
+                          in-map="[runId:runId, statusId:'DrCompleted', completionTime:ec.user.nowTimestamp]"/>
+        </actions>
+    </service>
+
+</services>

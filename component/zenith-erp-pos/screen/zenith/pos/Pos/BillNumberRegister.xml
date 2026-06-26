@@ -1,0 +1,181 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
+        default-menu-title="Bill Register" default-menu-index="17">
+
+    <transition name="goTerminal"><default-response url="../Terminal"/></transition>
+    <transition name="goAudit"><default-response url="../BillAuditReport"/></transition>
+    <transition name="goReports"><default-response url="../Reports"/></transition>
+    <transition name="goDashboard"><default-response url="../Dashboard"/></transition>
+
+    <!-- Custom date range: redirect back to this screen with period=custom + the chosen dates -->
+    <transition name="applyFilter" read-only="true">
+        <default-response url="." parameter-map="[period:'custom', fromDate:fromDate, thruDate:thruDate, viewMode:viewMode]"/>
+    </transition>
+
+    <!-- Read-only print view: clean, self-contained HTML report that auto-opens the print dialog. -->
+    <transition name="printDoc" read-only="true">
+        <actions>
+            <script><![CDATA[
+                def vm = ec.web.parameters.viewMode ?: 'all'
+                def pd = ec.web.parameters.period ?: 'all'
+                def fd = ec.web.parameters.fromDate
+                def td = ec.web.parameters.thruDate
+                def opParty = ec.user.userAccount?.partyId
+                def rs = ec.entity.find("zenith.erp.pos.PosSession").condition("operatorPartyId", opParty).orderBy("-openDate").limit(1).list()
+                def myOrg = null
+                if (rs) { def tm = ec.entity.find("zenith.erp.pos.PosTerminal").condition("terminalId", rs[0].terminalId).one(); myOrg = tm?.organizationPartyId }
+                def res = ec.service.sync().name("zenith.pos.PosReportServices.get#BillNumberRegister")
+                    .parameters([organizationPartyId: myOrg, viewMode: vm, period: pd, fromDate: fd, thruDate: td]).call()
+                def seqList = res.seqList ?: []
+                def regList = res.registerList ?: []
+                def grand = (res.grandSalesValue ?: 0) as BigDecimal
+                def periodLabel = res.periodLabel ?: 'All dates'
+                def esc = { o -> (o == null ? '' : o.toString().replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')) }
+                def money = { v -> (v == null) ? '' : ec.l10n.format(v as BigDecimal, "#,##,##0.00") }
+                def now = ec.l10n.format(ec.user.nowTimestamp, "dd-MM-yyyy HH:mm")
+                def sb = new StringBuilder()
+                sb.append("<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Bill Number Register</title><style>")
+                sb.append("body{font-family:Arial,Helvetica,sans-serif;margin:24px;color:#222}h1{font-size:20px;margin:0 0 2px}")
+                sb.append(".sub{color:#666;font-size:12px;margin-bottom:14px}h2{font-size:14px;margin:14px 0 4px}")
+                sb.append("table{border-collapse:collapse;width:100%;font-size:12px;margin:8px 0 20px}")
+                sb.append("th,td{border:1px solid #ccc;padding:5px 8px;text-align:left}th{background:#f0f0f0}")
+                sb.append(".gap{background:#ffebee;color:#b71c1c;font-weight:bold}.r{text-align:right}")
+                sb.append(".tot{background:#e8f5e9;font-weight:bold}.btn{margin-bottom:10px;padding:8px 16px;font-size:13px;cursor:pointer}")
+                sb.append("@media print{.noprint{display:none}body{margin:6px}}</style></head><body>")
+                sb.append("<button class=\"noprint btn\" onclick=\"window.print()\">Print</button>")
+                sb.append("<h1>Bill Number Register").append(vm == 'gaps' ? " &ndash; Gaps Only" : "").append("</h1>")
+                sb.append("<div class=\"sub\">Period: <b>").append(esc(periodLabel)).append("</b> &middot; Generated ").append(esc(now))
+                sb.append(" &middot; Every number from the first to the last issued is accounted for. No issued bill has been altered or renumbered.</div>")
+                sb.append("<h2>Summary</h2><table><tr><th>Store</th><th>Sequence</th><th>Range</th><th>Total</th><th>Sales</th><th>Held</th><th>Incomplete</th><th>Voided</th><th>Unused (Gaps)</th><th>Sales Value</th></tr>")
+                for (s in seqList) {
+                    sb.append("<tr><td>").append(esc(s.orgName)).append("</td><td>").append(esc(s.prefix)).append("</td><td>").append(esc(s.rangeText))
+                      .append("</td><td class=\"r\">").append(s.total).append("</td><td class=\"r\">").append(s.sale).append("</td><td class=\"r\">").append(s.held)
+                      .append("</td><td class=\"r\">").append(s.inc).append("</td><td class=\"r\">").append(s.voided).append("</td><td class=\"r\">").append(s.gap)
+                      .append("</td><td class=\"r\">").append(money(s.salesValue)).append("</td></tr>")
+                }
+                sb.append("<tr class=\"tot\"><td colspan=\"9\">Total sales value (Sale issued)</td><td class=\"r\">&#8377; ").append(money(grand)).append("</td></tr>")
+                sb.append("</table>")
+                sb.append("<h2>").append(vm == 'gaps' ? "Unused (Gap) Numbers" : "Number-by-Number Register").append("</h2>")
+                sb.append("<table><tr><th>Store</th><th>Bill Number</th><th>Status</th><th>Date / Time</th><th>Amount</th></tr>")
+                for (r in regList) {
+                    def isGap = (r.statusLabel != null && r.statusLabel.toString().startsWith('UNUSED'))
+                    def dt = r.entryDate ? ec.l10n.format(r.entryDate, "dd-MM-yyyy HH:mm") : ''
+                    sb.append("<tr").append(isGap ? " class=\"gap\"" : "").append("><td>").append(esc(r.orgName)).append("</td><td>").append(esc(r.fullNumber))
+                      .append("</td><td>").append(esc(r.statusLabel)).append("</td><td>").append(esc(dt)).append("</td><td class=\"r\">").append(esc(money(r.amount))).append("</td></tr>")
+                }
+                sb.append("</table>")
+                sb.append("<script>window.onload=function(){setTimeout(function(){try{window.print()}catch(e){}},350)}</script></body></html>")
+                ec.web.sendTextResponse(sb.toString(), "text/html", null)
+            ]]></script>
+        </actions>
+        <default-response type="none"/>
+    </transition>
+
+    <actions>
+        <set field="viewMode" from="ec.web.parameters.viewMode ?: 'all'"/>
+        <set field="period" from="ec.web.parameters.period ?: 'all'"/>
+        <set field="fromDate" from="ec.web.parameters.fromDate"/>
+        <set field="thruDate" from="ec.web.parameters.thruDate"/>
+        <!-- Scope to the operator's organization (whole store) -->
+        <set field="opParty" from="ec.user.userAccount?.partyId"/>
+        <entity-find entity-name="zenith.erp.pos.PosSession" list="recentSess" limit="1">
+            <econdition field-name="operatorPartyId" from="opParty"/>
+            <order-by field-name="-openDate"/>
+        </entity-find>
+        <set field="myOrg" from="null"/>
+        <if condition="recentSess">
+            <entity-find-one entity-name="zenith.erp.pos.PosTerminal" value-field="myTerm">
+                <field-map field-name="terminalId" from="recentSess[0].terminalId"/>
+            </entity-find-one>
+            <set field="myOrg" from="myTerm?.organizationPartyId"/>
+        </if>
+        <service-call name="zenith.pos.PosReportServices.get#BillNumberRegister" out-map="regOut"
+            in-map="[organizationPartyId:myOrg, viewMode:viewMode, period:period, fromDate:fromDate, thruDate:thruDate]"/>
+        <set field="register" from="regOut.registerList"/>
+        <set field="seqInfo" from="regOut.seqList"/>
+        <set field="periodLabel" from="regOut.periodLabel"/>
+        <set field="grandSalesFmt" from="ec.l10n.format(regOut.grandSalesValue ?: 0, '#,##,##0.00')"/>
+    </actions>
+
+    <widgets>
+        <render-mode><text type="html,qvt" template="true"><![CDATA[<details id="posHelp_billregister" open style="background:#e8f0fe;border:1px solid #4285f4;border-left:6px solid #1a73e8;border-radius:10px;padding:10px 16px;margin:8px 12px 4px 12px;font-family:Segoe UI,Arial,sans-serif"><summary style="cursor:pointer;font-weight:800;font-size:15px;color:#174ea6;outline:none">&#128290; Bill Register &mdash; quick help <span style="font-weight:600;color:#5f6368;font-size:12px">(click to hide / show)</span></summary><div style="font-size:13px;color:#202124;line-height:1.9;margin-top:8px">Confirms <b>every bill number is accounted for</b>, with no gaps.<br><b>1</b>&nbsp;Pick a <b>period</b>.<br><b>2</b>&nbsp;Choose <b>all numbers</b> or <b>gaps only</b> to spot any missing or skipped bills.</div></details>]]></text></render-mode>
+        <container style="row items-center justify-end q-px-md q-pt-md q-gutter-sm">
+            <link url="goTerminal" text="Billing" icon="fa fa-calculator" btn-type="success" style="q-btn--dense"/>
+            <link url="goAudit" text="Edit Audit" icon="fa fa-history" btn-type="info" style="q-btn--dense"/>
+            <link url="goReports" text="Reports" icon="fa fa-bar-chart" btn-type="warning" style="q-btn--dense"/>
+            <link url="goDashboard" text="Dashboard" icon="fa fa-dashboard" style="q-btn--dense"/>
+        </container>
+
+        <container style="row items-center q-px-md q-pt-sm q-gutter-sm">
+            <label text="View:" type="span" style="text-weight-medium"/>
+            <link url="." text="All Numbers" parameter-map="[viewMode:'all', period:period, fromDate:fromDate, thruDate:thruDate]" btn-type="info" style="q-btn--dense"/>
+            <link url="." text="Gaps Only" parameter-map="[viewMode:'gaps', period:period, fromDate:fromDate, thruDate:thruDate]" btn-type="warning" style="q-btn--dense"/>
+            <label text="(showing: ${viewMode == 'gaps' ? 'gaps only' : 'all numbers'})" type="span" style="text-grey-7"/>
+            <render-mode>
+                <text type="qvt,html"><![CDATA[
+                    <a href="${sri.buildUrl('printDoc').url}?viewMode=${viewMode!'all'}&amp;period=${period!'all'}&amp;fromDate=${fromDate!''}&amp;thruDate=${thruDate!''}" target="_blank"
+                       style="margin-left:12px;display:inline-flex;align-items:center;gap:6px;padding:6px 16px;border-radius:6px;background:#1565c0;color:#fff;text-decoration:none;font-weight:600;font-size:13px">Print Report</a>
+                ]]></text>
+            </render-mode>
+        </container>
+
+        <container style="row items-center q-px-md q-pt-sm q-gutter-sm">
+            <label text="Period:" type="span" style="text-weight-medium"/>
+            <link url="." text="All Dates" parameter-map="[period:'all', viewMode:viewMode]" btn-type="info" style="q-btn--dense"/>
+            <link url="." text="This Month" parameter-map="[period:'thisMonth', viewMode:viewMode]" btn-type="info" style="q-btn--dense"/>
+            <link url="." text="Last Month" parameter-map="[period:'lastMonth', viewMode:viewMode]" btn-type="info" style="q-btn--dense"/>
+            <label text="Showing: ${periodLabel ?: 'All dates'}" type="span" style="text-weight-medium text-primary"/>
+        </container>
+
+        <container style="row items-center q-px-md q-pb-xs q-gutter-sm">
+            <label text="Total sales value (in view): &#8377; ${grandSalesFmt ?: '0.00'}" type="span" style="text-h6 text-positive text-weight-bold"/>
+        </container>
+
+        <container style="row items-center q-px-md q-pb-sm">
+            <form-single name="DateRange" transition="applyFilter">
+                <field name="viewMode"><default-field><hidden/></default-field></field>
+                <field name="fromDate"><default-field title="From"><date-time type="date"/></default-field></field>
+                <field name="thruDate"><default-field title="To"><date-time type="date"/></default-field></field>
+                <field name="applyBtn"><default-field title=""><submit text="Apply Custom Range"/></default-field></field>
+            </form-single>
+        </container>
+
+        <container-box>
+            <box-header title="Bill Number Register - every number accounted for"/>
+            <box-body>
+                <label type="p" text="This shows every bill number in each sequence, from the first to the last issued. An 'UNUSED' number was never printed on a customer bill - older system behaviour reserved a number when a cart was opened, so a cancelled or abandoned cart left a gap. That is now fixed: a number is assigned only when payment is taken. No issued bill has been changed or renumbered - this report only explains the gaps."/>
+                <form-list name="SeqSummary" list="seqInfo" skip-form="true">
+                    <field name="orgName"><default-field title="Store"><display/></default-field></field>
+                    <field name="prefix"><default-field title="Sequence"><display/></default-field></field>
+                    <field name="rangeText"><default-field title="Number Range"><display/></default-field></field>
+                    <field name="total"><default-field title="Total Numbers"><display/></default-field></field>
+                    <field name="sale"><default-field title="Sales Issued"><display/></default-field></field>
+                    <field name="held"><default-field title="Held"><display/></default-field></field>
+                    <field name="inc"><default-field title="Incomplete"><display/></default-field></field>
+                    <field name="voided"><default-field title="Voided"><display/></default-field></field>
+                    <field name="gap"><default-field title="Unused (Gaps)"><display/></default-field></field>
+                    <field name="salesValue"><default-field title="Sales Value"><display format="#,##,##0.00"/></default-field></field>
+                    <field name="note"><default-field title=" "><display/></default-field></field>
+                </form-list>
+            </box-body>
+        </container-box>
+
+        <container-box>
+            <box-header title="Number-by-Number Register"/>
+            <box-body>
+                <label type="caption" text="Legend: Sale issued = a real customer sale. Held = a parked sale. Incomplete cart = started but never paid. Voided = cancelled. UNUSED = the number was never issued as a bill."/>
+                <form-list name="Register" list="register" skip-form="true" select-columns="true" show-csv-button="true" show-all-button="true">
+                    <field name="orgName"><header-field title="Store"><text-find/></header-field>
+                        <default-field><display/></default-field></field>
+                    <field name="fullNumber"><header-field title="Bill Number"><text-find/></header-field>
+                        <default-field><display/></default-field></field>
+                    <field name="statusLabel"><header-field title="Status"><text-find/></header-field>
+                        <default-field><display/></default-field></field>
+                    <field name="entryDate"><default-field title="Date / Time"><display format="dd-MM-yyyy HH:mm"/></default-field></field>
+                    <field name="amount"><default-field title="Amount"><display format="#,##,##0.00"/></default-field></field>
+                </form-list>
+            </box-body>
+        </container-box>
+    </widgets>
+</screen>

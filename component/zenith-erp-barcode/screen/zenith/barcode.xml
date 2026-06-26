@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
+        default-menu-title="Barcodes" default-menu-index="19">
+
+    <subscreens default-item="BarcodeDashboard">
+        <subscreens-item name="BarcodeDashboard" location="component://zenith-erp-barcode/screen/zenith/barcode/BarcodeDashboard.xml"
+                         menu-title="Dashboard" menu-index="1"/>
+        <subscreens-item name="FindBarcode" location="component://zenith-erp-barcode/screen/zenith/barcode/FindBarcode.xml"
+                         menu-title="Product Barcodes" menu-index="2"/>
+        <subscreens-item name="LabelTemplates" location="component://zenith-erp-barcode/screen/zenith/barcode/LabelTemplates.xml"
+                         menu-title="Label Templates" menu-index="3"/>
+        <subscreens-item name="PrintJobs" location="component://zenith-erp-barcode/screen/zenith/barcode/PrintJobs.xml"
+                         menu-title="Print Jobs" menu-index="4"/>
+    </subscreens>
+
+    <transition name="renderLabels" read-only="true">
+        <parameter name="printJobId"/>
+        <parameter name="barcodeId"/>
+        <actions>
+            <script><![CDATA[
+                def RM = java.math.RoundingMode.HALF_UP
+                def fmtMap = [BctEan13:'EAN13', BctEan8:'EAN8', BctUpcA:'UPC', BctUpcE:'CODE128',
+                              BctCode128:'CODE128', BctCode39:'CODE39', BctInternal:'CODE128', BctQrCode:'QR']
+                def labels = []; def tpl = null
+                if (printJobId) {
+                    def job = ec.entity.find("zenith.erp.barcode.BarcodePrintJob").condition("printJobId", printJobId).one()
+                    if (job?.labelId) tpl = ec.entity.find("zenith.erp.barcode.BarcodeLabel").condition("labelId", job.labelId).one()
+                    ec.entity.find("zenith.erp.barcode.BarcodePrintJobItem").condition("printJobId", printJobId).list().each { it ->
+                        def prd = ec.entity.find("mantle.product.Product").condition("productId", it.productId).one()
+                        def pb = ec.entity.find("zenith.erp.barcode.ProductBarcode").condition("productId", it.productId).condition("isActive","Y").orderBy("-isPrimary").list()
+                        def bcType = pb ? pb[0].barcodeTypeEnumId : 'BctCode128'
+                        int qty = (it.quantity ?: 1) as int
+                        for (int i=0;i<qty;i++) labels.add([value:(it.barcodeValue ?: ''), fmt:(fmtMap[bcType] ?: 'CODE128'),
+                            name:(prd?.productName ?: it.productId), price:(prd?.mrpAmount), sku:(prd?.pseudoId ?: '')])
+                    }
+                } else if (barcodeId) {
+                    def bc = ec.entity.find("zenith.erp.barcode.ProductBarcode").condition("barcodeId", barcodeId).one()
+                    if (bc) {
+                        def prd = ec.entity.find("mantle.product.Product").condition("productId", bc.productId).one()
+                        labels.add([value:bc.barcodeValue, fmt:(fmtMap[bc.barcodeTypeEnumId] ?: 'CODE128'),
+                            name:(prd?.productName ?: bc.productId), price:(prd?.mrpAmount), sku:(prd?.pseudoId ?: '')])
+                    }
+                }
+                int cols = (tpl?.columnsPerRow ?: 3) as int
+                boolean showName = (tpl == null) || tpl.showProductName == 'Y'
+                boolean showPrice = (tpl == null) || tpl.showPrice == 'Y'
+                boolean showSku = (tpl?.showSku == 'Y')
+                def lw = tpl?.labelWidth ?: 50; def lh = tpl?.labelHeight ?: 30
+                def esc = { x -> (x ?: '').toString().replace('&','&amp;').replace('<','&lt;').replace('>','&gt;') }
+                def jsq = { x -> (x ?: '').toString().replace('\\','\\\\').replace("'","\\'") }
+                def sb = new StringBuilder()
+                sb.append("<!DOCTYPE html><html><head><meta charset='utf-8'><title>Barcode Labels</title>")
+                sb.append("<scr"+"ipt src='/zenithstatic/js/JsBarcode.all.min.js'></scr"+"ipt>")
+                sb.append("<scr"+"ipt src='/zenithstatic/js/qrcode.min.js'></scr"+"ipt>")
+                sb.append("<style>body{font-family:Arial,sans-serif;margin:10px;color:#000}")
+                sb.append(".grid{display:grid;grid-template-columns:repeat(" + cols + ",1fr);gap:6px}")
+                sb.append(".lbl{border:1px solid #ddd;border-radius:4px;padding:6px;text-align:center;break-inside:avoid;min-height:" + lh + "mm;display:flex;flex-direction:column;align-items:center;justify-content:center}")
+                sb.append(".nm{font-size:11px;font-weight:bold;margin:2px 0}.pr{font-size:13px;font-weight:bold;margin-top:2px}.sk{font-size:9px;color:#666}")
+                sb.append(".qr canvas,.qr img{margin:2px auto}@media print{.noprint{display:none}}</style></head><body>")
+                sb.append("<div class='noprint' style='margin-bottom:10px'><button onclick='window.print()' style='padding:6px 14px;font-size:14px;cursor:pointer'>&#128424; Print</button> &nbsp;<b>" + labels.size() + "</b> label(s)</div>")
+                if (!labels) sb.append("<p>No labels to print (no products/barcodes in this job).</p>")
+                sb.append("<div class='grid'>")
+                labels.eachWithIndex { lab, idx ->
+                    sb.append("<div class='lbl'>")
+                    if (showName) sb.append("<div class='nm'>" + esc(lab.name) + "</div>")
+                    if (lab.fmt == 'QR') sb.append("<div class='qr' id='q" + idx + "'></div>")
+                    else sb.append("<svg class='bc' id='b" + idx + "'></svg>")
+                    if (showSku && lab.sku) sb.append("<div class='sk'>" + esc(lab.sku) + "</div>")
+                    if (showPrice && lab.price != null) sb.append("<div class='pr'>₹" + (lab.price as BigDecimal).setScale(2, RM) + "</div>")
+                    sb.append("</div>")
+                }
+                sb.append("</div><scr"+"ipt>function zren(){")
+                labels.eachWithIndex { lab, idx ->
+                    def v = jsq(lab.value)
+                    if (lab.fmt == 'QR')
+                        sb.append("try{new QRCode(document.getElementById('q" + idx + "'),{text:'" + v + "',width:90,height:90});}catch(e){}")
+                    else
+                        sb.append("try{JsBarcode('#b" + idx + "','" + v + "',{format:'" + lab.fmt + "',height:38,fontSize:12,margin:2});}catch(e){try{JsBarcode('#b" + idx + "','" + v + "',{format:'CODE128',height:38,fontSize:12,margin:2});}catch(e2){}}")
+                }
+                sb.append("}if(document.readyState!='loading')zren();else window.addEventListener('DOMContentLoaded',zren);</scr"+"ipt></body></html>")
+                ec.web.sendTextResponse(sb.toString(), "text/html", null)
+            ]]></script>
+        </actions>
+        <default-response type="none"/>
+    </transition>
+
+    <widgets><subscreens-active/></widgets>
+</screen>

@@ -1,0 +1,255 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <!-- ========== Employee Services ========== -->
+
+    <service verb="create" noun="Employee">
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="firstName" required="true"/>
+            <parameter name="lastName"/>
+            <parameter name="employeeCode"/>
+            <parameter name="joiningDate" type="Date" required="true"/>
+            <parameter name="employmentType" default-value="Permanent"/>
+            <parameter name="probationMonths" type="Integer" default="6"/>
+            <parameter name="noticePeriodDays" type="Integer" default="30"/>
+            <parameter name="departmentId"/>
+            <parameter name="designationId"/>
+            <parameter name="reportingToEmployeeId"/>
+            <parameter name="panNumber"/>
+            <parameter name="aadhaarNumber"/>
+            <parameter name="uanNumber"/>
+            <parameter name="dateOfBirth" type="Date"/>
+            <parameter name="gender"/>
+            <parameter name="email"/>
+            <parameter name="phone"/>
+            <parameter name="bankName"/>
+            <parameter name="bankAccountNumber"/>
+            <parameter name="ifscCode"/>
+            <parameter name="stateCode"/>
+            <parameter name="isMetroCity" default-value="N"/>
+            <parameter name="ctcAnnual" type="BigDecimal"/>
+            <parameter name="incomeTaxRegime" default-value="New"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="employeeId"/>
+            <parameter name="partyId"/>
+        </out-parameters>
+        <actions>
+            <!-- Create Person party -->
+            <service-call name="mantle.party.PartyServices.create#Person" out-map="pOut"
+                          in-map="[firstName:firstName, lastName:lastName, roleTypeId:'Employee']"/>
+            <set field="partyId" from="pOut.partyId"/>
+
+            <!-- Add email if provided -->
+            <if condition="email">
+                <service-call name="mantle.party.ContactServices.create#PartyContactMech"
+                              in-map="[partyId:partyId, contactMechTypeEnumId:'CmtEmailAddress',
+                                       infoString:email, contactMechPurposeId:'EmailPrimary']" ignore-error="true"/>
+            </if>
+            <!-- Add phone if provided -->
+            <if condition="phone">
+                <service-call name="mantle.party.ContactServices.create#PartyContactMech"
+                              in-map="[partyId:partyId, contactMechTypeEnumId:'CmtTelecomNumber',
+                                       contactNumber:phone, countryCode:'91',
+                                       contactMechPurposeId:'PhonePrimary']" ignore-error="true"/>
+            </if>
+
+            <!-- Generate employee code if not provided -->
+            <if condition="!employeeCode">
+                <entity-find entity-name="zenith.erp.hr.Employee" list="existingList">
+                    <econdition field-name="organizationPartyId"/>
+                    <order-by field-name="-employeeCode"/>
+                    <select-field field-name="employeeCode"/>
+                </entity-find>
+                <set field="nextNum" from="1"/>
+                <if condition="existingList &amp;&amp; existingList[0].employeeCode">
+                    <set field="codeStr" from="existingList[0].employeeCode.replaceAll('[^0-9]', '')"/>
+                    <if condition="codeStr"><set field="nextNum" from="(codeStr as int) + 1"/></if>
+                </if>
+                <set field="employeeCode" value="EMP${String.format('%05d', nextNum)}"/>
+            </if>
+
+            <!-- Determine initial status -->
+            <set field="initialStatus" from="employmentType == 'Probation' ? 'EmpProbation' : 'EmpActive'"/>
+
+            <!-- Determine ESI applicability (gross <= 21000/month) -->
+            <set field="monthlyGross" from="ctcAnnual ? ctcAnnual / 12 : 0" type="BigDecimal"/>
+            <set field="esiApplicable" from="monthlyGross &gt; 0 &amp;&amp; monthlyGross &lt;= 21000 ? 'Y' : 'N'"/>
+
+            <!-- Set default leave balances (pro-rated later) -->
+            <set field="earnedLeave" from="15" type="BigDecimal"/>
+            <set field="casualLeave" from="12" type="BigDecimal"/>
+            <set field="sickLeave" from="12" type="BigDecimal"/>
+
+            <service-call name="create#zenith.erp.hr.Employee" out-map="empOut"
+                          in-map="[partyId:partyId, organizationPartyId:organizationPartyId,
+                                   employeeCode:employeeCode, joiningDate:joiningDate,
+                                   statusId:initialStatus, employmentType:employmentType,
+                                   probationMonths:probationMonths, noticePeriodDays:noticePeriodDays,
+                                   departmentId:departmentId, designationId:designationId,
+                                   reportingToEmployeeId:reportingToEmployeeId,
+                                   panNumber:panNumber, aadhaarNumber:aadhaarNumber,
+                                   uanNumber:uanNumber, dateOfBirth:dateOfBirth, gender:gender,
+                                   bankName:bankName, bankAccountNumber:bankAccountNumber,
+                                   ifscCode:ifscCode, stateCode:stateCode, isMetroCity:isMetroCity,
+                                   ctcAnnual:ctcAnnual, incomeTaxRegime:incomeTaxRegime,
+                                   pfApplicable:'Y', esiApplicable:esiApplicable, ptApplicable:'Y',
+                                   earnedLeaveBalance:earnedLeave, casualLeaveBalance:casualLeave,
+                                   sickLeaveBalance:sickLeave]"/>
+            <set field="employeeId" from="empOut.employeeId"/>
+        </actions>
+    </service>
+
+    <service verb="confirm" noun="Employee">
+        <in-parameters>
+            <parameter name="employeeId" required="true"/>
+            <parameter name="confirmationDate" type="Date" default="ec.user.nowTimestamp"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.hr.Employee" value-field="emp"/>
+            <if condition="emp.statusId != 'EmpProbation'">
+                <return error="true" message="Employee must be on probation to confirm"/></if>
+            <service-call name="update#zenith.erp.hr.Employee"
+                          in-map="[employeeId:employeeId, statusId:'EmpActive',
+                                   confirmationDate:confirmationDate, employmentType:'Permanent']"/>
+        </actions>
+    </service>
+
+    <service verb="resign" noun="Employee">
+        <in-parameters>
+            <parameter name="employeeId" required="true"/>
+            <parameter name="resignationDate" type="Date" default="ec.user.nowTimestamp"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.hr.Employee" value-field="emp"/>
+            <!-- Calculate last working date based on notice period -->
+            <set field="lwdCal" from="java.util.Calendar.getInstance()"/>
+            <script>lwdCal.setTime(resignationDate instanceof java.util.Date ? resignationDate : java.sql.Date.valueOf(resignationDate.toString()))</script>
+            <script>lwdCal.add(java.util.Calendar.DAY_OF_MONTH, emp.noticePeriodDays ?: 30)</script>
+            <set field="lastWorkingDate" from="new java.sql.Date(lwdCal.getTimeInMillis())"/>
+
+            <service-call name="update#zenith.erp.hr.Employee"
+                          in-map="[employeeId:employeeId, statusId:'EmpNoticeperiod',
+                                   resignationDate:resignationDate, lastWorkingDate:lastWorkingDate]"/>
+        </actions>
+    </service>
+
+    <!-- ========== Leave Services ========== -->
+
+    <service verb="apply" noun="Leave">
+        <in-parameters>
+            <parameter name="employeeId" required="true"/>
+            <parameter name="leaveType" required="true"/>
+            <parameter name="fromDate" type="Date" required="true"/>
+            <parameter name="toDate" type="Date" required="true"/>
+            <parameter name="reason"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="leaveApplicationId"/>
+        </out-parameters>
+        <actions>
+            <!-- Calculate total days (excluding Sundays) -->
+            <set field="startCal" from="java.util.Calendar.getInstance()"/>
+            <script>startCal.setTime(fromDate instanceof java.util.Date ? fromDate : java.sql.Date.valueOf(fromDate.toString()))</script>
+            <set field="endCal" from="java.util.Calendar.getInstance()"/>
+            <script>endCal.setTime(toDate instanceof java.util.Date ? toDate : java.sql.Date.valueOf(toDate.toString()))</script>
+            <set field="totalDays" from="0" type="BigDecimal"/>
+            <script><![CDATA[
+                def cal = startCal.clone()
+                while (!cal.after(endCal)) {
+                    if (cal.get(java.util.Calendar.DAY_OF_WEEK) != java.util.Calendar.SUNDAY) {
+                        totalDays++
+                    }
+                    cal.add(java.util.Calendar.DAY_OF_MONTH, 1)
+                }
+            ]]></script>
+
+            <!-- Check balance -->
+            <entity-find-one entity-name="zenith.erp.hr.Employee" value-field="emp"/>
+            <set field="balanceField" from="leaveType == 'EL' ? 'earnedLeaveBalance' : leaveType == 'CL' ? 'casualLeaveBalance' : leaveType == 'SL' ? 'sickLeaveBalance' : null"/>
+            <if condition="balanceField &amp;&amp; emp.get(balanceField) != null">
+                <if condition="totalDays &gt; emp.get(balanceField)">
+                    <return error="true" message="Insufficient ${leaveType} balance. Available: ${emp.get(balanceField)}, Requested: ${totalDays}"/>
+                </if>
+            </if>
+
+            <service-call name="create#zenith.erp.hr.LeaveApplication" out-map="lvOut"
+                          in-map="[employeeId:employeeId, leaveType:leaveType, fromDate:fromDate,
+                                   toDate:toDate, totalDays:totalDays, reason:reason, statusId:'LvPending']"/>
+            <set field="leaveApplicationId" from="lvOut.leaveApplicationId"/>
+        </actions>
+    </service>
+
+    <service verb="approve" noun="Leave">
+        <in-parameters>
+            <parameter name="leaveApplicationId" required="true"/>
+            <parameter name="approvedByEmployeeId"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.hr.LeaveApplication" value-field="lv"/>
+            <if condition="lv.statusId != 'LvPending'">
+                <return error="true" message="Leave must be in Pending status"/></if>
+
+            <!-- Deduct balance -->
+            <entity-find-one entity-name="zenith.erp.hr.Employee" value-field="emp">
+                <field-map field-name="employeeId" from="lv.employeeId"/></entity-find-one>
+            <set field="balanceField" from="lv.leaveType == 'EL' ? 'earnedLeaveBalance' : lv.leaveType == 'CL' ? 'casualLeaveBalance' : lv.leaveType == 'SL' ? 'sickLeaveBalance' : null"/>
+            <if condition="balanceField">
+                <set field="newBalance" from="(emp.get(balanceField) ?: 0) - lv.totalDays"/>
+                <service-call name="update#zenith.erp.hr.Employee"
+                              in-map="[employeeId:lv.employeeId, (balanceField):newBalance]"/>
+            </if>
+
+            <service-call name="update#zenith.erp.hr.LeaveApplication"
+                          in-map="[leaveApplicationId:leaveApplicationId, statusId:'LvApproved',
+                                   approvedByEmployeeId:approvedByEmployeeId, approvalDate:ec.user.nowTimestamp]"/>
+        </actions>
+    </service>
+
+    <!-- ========== Full & Final Settlement ========== -->
+
+    <service verb="calculate" noun="FullAndFinal">
+        <in-parameters>
+            <parameter name="employeeId" required="true"/>
+            <parameter name="lastWorkingDate" type="Date" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="fnfId"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.hr.Employee" value-field="emp"/>
+            <set field="monthlyCTC" from="(emp.ctcAnnual ?: 0) / 12" type="BigDecimal"/>
+
+            <!-- Leave encashment: EL balance * daily rate -->
+            <set field="dailyRate" from="monthlyCTC / 26" type="BigDecimal"/>
+            <set field="leaveEncashDays" from="emp.earnedLeaveBalance ?: 0" type="BigDecimal"/>
+            <set field="leaveEncashAmt" from="leaveEncashDays * dailyRate"/>
+
+            <!-- Gratuity: (Basic * 15) / 26 per year of service (if >= 5 years) -->
+            <set field="basicMonthly" from="monthlyCTC * 0.4" type="BigDecimal"/>
+            <set field="joiningCal" from="java.util.Calendar.getInstance()"/>
+            <script>joiningCal.setTime(emp.joiningDate instanceof java.util.Date ? emp.joiningDate : java.sql.Date.valueOf(emp.joiningDate.toString()))</script>
+            <set field="lwdCal" from="java.util.Calendar.getInstance()"/>
+            <script>lwdCal.setTime(lastWorkingDate instanceof java.util.Date ? lastWorkingDate : java.sql.Date.valueOf(lastWorkingDate.toString()))</script>
+            <set field="yearsOfService" from="(lwdCal.getTimeInMillis() - joiningCal.getTimeInMillis()) / (365.25 * 24 * 60 * 60 * 1000)" type="BigDecimal"/>
+            <set field="gratuityAmt" from="yearsOfService &gt;= 5 ? (basicMonthly * 15 / 26) * yearsOfService : 0" type="BigDecimal"/>
+
+            <!-- Pending salary (assume last month) -->
+            <set field="pendingSalary" from="monthlyCTC"/>
+
+            <set field="netPayable" from="pendingSalary + leaveEncashAmt + gratuityAmt"/>
+
+            <service-call name="create#zenith.erp.hr.FullAndFinal" out-map="fnfOut"
+                          in-map="[employeeId:employeeId, lastWorkingDate:lastWorkingDate,
+                                   pendingSalary:pendingSalary, leaveEncashmentDays:leaveEncashDays,
+                                   leaveEncashmentAmount:leaveEncashAmt, gratuityAmount:gratuityAmt,
+                                   noticePeriodRecovery:0, otherDeductions:0, otherEarnings:0,
+                                   tdsAmount:0, pfSettlementAmount:0, netPayable:netPayable,
+                                   statusId:'FnfPending']"/>
+            <set field="fnfId" from="fnfOut.fnfId"/>
+        </actions>
+    </service>
+
+</services>

@@ -1,0 +1,364 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <!-- ========== BOM Management ========== -->
+
+    <service verb="create" noun="BillOfMaterial">
+        <in-parameters>
+            <parameter name="productId" required="true"/>
+            <parameter name="bomName" required="true"/>
+            <parameter name="bomVersion" default-value="1.0"/>
+            <parameter name="description"/>
+            <parameter name="outputQuantity" type="BigDecimal" default-value="1"/>
+            <parameter name="isDefault" default-value="Y"/>
+        </in-parameters>
+        <out-parameters><parameter name="bomId"/></out-parameters>
+        <actions>
+            <service-call name="create#zenith.erp.manufacturing.BillOfMaterial" out-map="context"
+                in-map="[productId:productId, bomName:bomName, bomVersion:bomVersion,
+                         description:description, outputQuantity:outputQuantity,
+                         isDefault:isDefault, isActive:'Y']"/>
+        </actions>
+    </service>
+
+    <service verb="add" noun="BomItem">
+        <in-parameters>
+            <parameter name="bomId" required="true"/>
+            <parameter name="productId" required="true"/>
+            <parameter name="quantity" type="BigDecimal" required="true"/>
+            <parameter name="uomId"/>
+            <parameter name="wastePercent" type="BigDecimal" default-value="0"/>
+            <parameter name="isOptional" default-value="N"/>
+            <parameter name="notes"/>
+        </in-parameters>
+        <out-parameters><parameter name="bomItemSeqId"/></out-parameters>
+        <actions>
+            <entity-find entity-name="zenith.erp.manufacturing.BomItem" list="existing">
+                <econdition field-name="bomId"/>
+                <order-by field-name="-bomItemSeqId"/>
+            </entity-find>
+            <set field="lastSeq" from="existing ? (existing[0].bomItemSeqId as Integer) : 0"/>
+            <set field="bomItemSeqId" from="(lastSeq + 1).toString().padLeft(5, '0')"/>
+
+            <service-call name="create#zenith.erp.manufacturing.BomItem"
+                in-map="[bomId:bomId, bomItemSeqId:bomItemSeqId, productId:productId,
+                         quantity:quantity, uomId:uomId, wastePercent:wastePercent,
+                         isOptional:isOptional, notes:notes]"/>
+        </actions>
+    </service>
+
+    <!-- ========== Work Order Management ========== -->
+
+    <service verb="create" noun="WorkOrder">
+        <in-parameters>
+            <parameter name="productId" required="true"/>
+            <parameter name="bomId"/>
+            <parameter name="routingId"/>
+            <parameter name="quantity" type="BigDecimal" required="true"/>
+            <parameter name="plannedStartDate" type="Date"/>
+            <parameter name="plannedEndDate" type="Date"/>
+            <parameter name="facilityId"/>
+            <parameter name="priority" default-value="Medium"/>
+            <parameter name="notes"/>
+        </in-parameters>
+        <out-parameters><parameter name="workOrderId"/></out-parameters>
+        <actions>
+            <!-- Auto-number: WO/FY/SEQUENCE -->
+            <script><![CDATA[
+                def now = java.time.LocalDate.now()
+                def fysSetting = ec.entity.find("zenith.erp.base.CompanySettings").condition("organizationPartyId", ec.user.getPreference("ACTIVE_ORGANIZATION")).condition("settingKey", "FY_START_MONTH").one()
+                int fyStartMonth = fysSetting ? (fysSetting.settingValue as int) : 4
+                int fyStart = now.monthValue >= fyStartMonth ? now.year : now.year - 1
+                def fy = "${fyStart}-${((fyStart+1) % 100).toString().padLeft(2, '0')}"
+                context.fyStr = fy
+            ]]></script>
+            <entity-find entity-name="zenith.erp.manufacturing.WorkOrder" list="woList">
+                <econdition field-name="workOrderNumber" operator="like" value="WO/${fyStr}/%"/>
+                <order-by field-name="-workOrderNumber"/>
+            </entity-find>
+            <script><![CDATA[
+                def seq = 1
+                if (woList) {
+                    def lastNum = woList[0].workOrderNumber
+                    def parts = lastNum.split('/')
+                    if (parts.length >= 3) seq = (parts[2] as Integer) + 1
+                }
+                context.workOrderNumber = "WO/${fyStr}/${seq.toString().padLeft(5, '0')}"
+            ]]></script>
+
+            <!-- If no BOM specified, find default BOM for product -->
+            <if condition="!bomId">
+                <entity-find entity-name="zenith.erp.manufacturing.BillOfMaterial" list="bomList">
+                    <econdition field-name="productId"/>
+                    <econdition field-name="isDefault" value="Y"/>
+                    <econdition field-name="isActive" value="Y"/>
+                </entity-find>
+                <set field="bomId" from="bomList ? bomList[0].bomId : null"/>
+            </if>
+
+            <!-- If no routing specified, find default routing -->
+            <if condition="!routingId">
+                <entity-find entity-name="zenith.erp.manufacturing.Routing" list="rtList">
+                    <econdition field-name="productId"/>
+                    <econdition field-name="isDefault" value="Y"/>
+                    <econdition field-name="isActive" value="Y"/>
+                </entity-find>
+                <set field="routingId" from="rtList ? rtList[0].routingId : null"/>
+            </if>
+
+            <service-call name="create#zenith.erp.manufacturing.WorkOrder" out-map="context"
+                in-map="[workOrderNumber:workOrderNumber, productId:productId, bomId:bomId,
+                         routingId:routingId, quantity:quantity, completedQuantity:0, wastageQuantity:0,
+                         plannedStartDate:plannedStartDate, plannedEndDate:plannedEndDate,
+                         facilityId:facilityId, statusId:'WoDraft', priority:priority, notes:notes]"/>
+
+            <!-- Explode BOM into work order materials -->
+            <if condition="bomId">
+                <entity-find entity-name="zenith.erp.manufacturing.BomItem" list="bomItems">
+                    <econdition field-name="bomId"/>
+                    <order-by field-name="bomItemSeqId"/>
+                </entity-find>
+                <entity-find-one entity-name="zenith.erp.manufacturing.BillOfMaterial" value-field="bom"/>
+                <set field="outputQty" from="bom?.outputQuantity ?: 1" type="BigDecimal"/>
+                <set field="multiplier" from="(quantity as BigDecimal) / outputQty"/>
+
+                <set field="matSeq" from="1" type="Integer"/>
+                <iterate list="bomItems" entry="bi">
+                    <set field="reqQty" from="((bi.quantity as BigDecimal) * multiplier)"/>
+                    <set field="wasteQty" from="bi.wastePercent ? reqQty * (bi.wastePercent as BigDecimal) / 100 : 0"/>
+                    <set field="totalQty" from="(reqQty + wasteQty).setScale(4, java.math.RoundingMode.HALF_UP)"/>
+                    <service-call name="create#zenith.erp.manufacturing.WorkOrderMaterial"
+                        in-map="[workOrderId:workOrderId, materialSeqId:matSeq.toString().padLeft(5,'0'),
+                                 productId:bi.productId, plannedQuantity:totalQty,
+                                 actualQuantity:0, wastedQuantity:0, uomId:bi.uomId]"/>
+                    <set field="matSeq" from="matSeq + 1"/>
+                </iterate>
+            </if>
+
+            <!-- Copy routing operations into work order -->
+            <if condition="routingId">
+                <entity-find entity-name="zenith.erp.manufacturing.RoutingOperation" list="ops">
+                    <econdition field-name="routingId"/>
+                    <order-by field-name="operationSeqId"/>
+                </entity-find>
+                <set field="opSeq" from="1" type="Integer"/>
+                <iterate list="ops" entry="op">
+                    <set field="totalRunTime" from="((op.runTimeMinutes ?: 0) as Integer) * ((quantity ?: 1) as Integer)"/>
+                    <service-call name="create#zenith.erp.manufacturing.WorkOrderOperation"
+                        in-map="[workOrderId:workOrderId, operationSeqId:opSeq.toString().padLeft(5,'0'),
+                                 operationName:op.operationName, workCenterId:op.workCenterId,
+                                 plannedMinutes:(op.setupTimeMinutes ?: 0) + totalRunTime,
+                                 actualMinutes:0, statusId:'OpPending']"/>
+                    <set field="opSeq" from="opSeq + 1"/>
+                </iterate>
+            </if>
+        </actions>
+    </service>
+
+    <service verb="release" noun="WorkOrder">
+        <in-parameters><parameter name="workOrderId" required="true"/></in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.manufacturing.WorkOrder" value-field="wo"/>
+            <if condition="wo.statusId != 'WoDraft'">
+                <return error="true" message="Work order must be in Draft to release"/></if>
+            <service-call name="update#zenith.erp.manufacturing.WorkOrder"
+                in-map="[workOrderId:workOrderId, statusId:'WoReleased']"/>
+        </actions>
+    </service>
+
+    <service verb="start" noun="WorkOrder">
+        <in-parameters><parameter name="workOrderId" required="true"/></in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.manufacturing.WorkOrder" value-field="wo"/>
+            <if condition="wo.statusId != 'WoReleased'">
+                <return error="true" message="Work order must be Released to start"/></if>
+            <service-call name="update#zenith.erp.manufacturing.WorkOrder"
+                in-map="[workOrderId:workOrderId, statusId:'WoInProgress',
+                         actualStartDate:ec.user.nowTimestamp]"/>
+        </actions>
+    </service>
+
+    <service verb="complete" noun="WorkOrder">
+        <in-parameters>
+            <parameter name="workOrderId" required="true"/>
+            <parameter name="completedQuantity" type="BigDecimal" required="true"/>
+            <parameter name="wastageQuantity" type="BigDecimal" default-value="0"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.manufacturing.WorkOrder" value-field="wo"/>
+            <if condition="wo.statusId != 'WoInProgress'">
+                <return error="true" message="Work order must be In Progress to complete"/></if>
+
+            <service-call name="update#zenith.erp.manufacturing.WorkOrder"
+                in-map="[workOrderId:workOrderId, statusId:'WoCompleted',
+                         completedQuantity:completedQuantity, wastageQuantity:wastageQuantity,
+                         actualEndDate:ec.user.nowTimestamp]"/>
+
+            <!-- Mark all pending operations as completed -->
+            <entity-find entity-name="zenith.erp.manufacturing.WorkOrderOperation" list="ops">
+                <econdition field-name="workOrderId"/>
+                <econdition field-name="statusId" operator="not-equals" value="OpCompleted"/>
+            </entity-find>
+            <iterate list="ops" entry="op">
+                <service-call name="update#zenith.erp.manufacturing.WorkOrderOperation"
+                    in-map="[workOrderId:workOrderId, operationSeqId:op.operationSeqId, statusId:'OpCompleted']"/>
+            </iterate>
+
+            <!-- Create finished goods asset -->
+            <if condition="completedQuantity &gt; 0 &amp;&amp; wo.facilityId">
+                <service-call name="create#mantle.product.asset.Asset"
+                    in-map="[productId:wo.productId, facilityId:wo.facilityId,
+                             statusId:'AstAvailable', assetTypeEnumId:'AstTpInventory',
+                             quantityOnHandTotal:completedQuantity, availableToPromiseTotal:completedQuantity,
+                             receivedDate:ec.user.nowTimestamp]"/>
+            </if>
+        </actions>
+    </service>
+
+    <service verb="record" noun="MaterialConsumption">
+        <in-parameters>
+            <parameter name="workOrderId" required="true"/>
+            <parameter name="materialSeqId" required="true"/>
+            <parameter name="actualQuantity" type="BigDecimal" required="true"/>
+            <parameter name="wastedQuantity" type="BigDecimal" default-value="0"/>
+        </in-parameters>
+        <actions>
+            <service-call name="update#zenith.erp.manufacturing.WorkOrderMaterial"
+                in-map="[workOrderId:workOrderId, materialSeqId:materialSeqId,
+                         actualQuantity:actualQuantity, wastedQuantity:wastedQuantity]"/>
+        </actions>
+    </service>
+
+    <!-- ========== Job Work (GST Compliant) ========== -->
+
+    <service verb="create" noun="JobWorkOrder">
+        <in-parameters>
+            <parameter name="jobWorkerPartyId" required="true"/>
+            <parameter name="facilityId"/>
+            <parameter name="isCapitalGoods" default-value="N"/>
+            <parameter name="sacCode" default-value="9988"/>
+            <parameter name="gstRatePercent" type="BigDecimal" default-value="18"/>
+            <parameter name="notes"/>
+        </in-parameters>
+        <out-parameters><parameter name="jobWorkOrderId"/></out-parameters>
+        <actions>
+            <script><![CDATA[
+                def now = java.time.LocalDate.now()
+                def fysSetting = ec.entity.find("zenith.erp.base.CompanySettings").condition("organizationPartyId", ec.user.getPreference("ACTIVE_ORGANIZATION")).condition("settingKey", "FY_START_MONTH").one()
+                int fyStartMonth = fysSetting ? (fysSetting.settingValue as int) : 4
+                int fyStart = now.monthValue >= fyStartMonth ? now.year : now.year - 1
+                def fy = "${fyStart}-${((fyStart+1) % 100).toString().padLeft(2, '0')}"
+                context.fyStr = fy
+            ]]></script>
+            <entity-find entity-name="zenith.erp.manufacturing.JobWorkOrder" list="jwList">
+                <econdition field-name="jobWorkNumber" operator="like" value="JW/${fyStr}/%"/>
+                <order-by field-name="-jobWorkNumber"/>
+            </entity-find>
+            <script><![CDATA[
+                def seq = 1
+                if (jwList) {
+                    def parts = jwList[0].jobWorkNumber.split('/')
+                    if (parts.length >= 3) seq = (parts[2] as Integer) + 1
+                }
+                context.jobWorkNumber = "JW/${fyStr}/${seq.toString().padLeft(5, '0')}"
+                context.challanNumber = "DC/${fyStr}/${seq.toString().padLeft(5, '0')}"
+            ]]></script>
+
+            <service-call name="create#zenith.erp.manufacturing.JobWorkOrder" out-map="context"
+                in-map="[jobWorkNumber:jobWorkNumber, jobWorkerPartyId:jobWorkerPartyId,
+                         challanNumber:challanNumber, challanDate:ec.user.nowTimestamp,
+                         facilityId:facilityId, isCapitalGoods:isCapitalGoods,
+                         sacCode:sacCode, gstRatePercent:gstRatePercent,
+                         statusId:'JwDraft', notes:notes]"/>
+        </actions>
+    </service>
+
+    <service verb="add" noun="JobWorkItem">
+        <in-parameters>
+            <parameter name="jobWorkOrderId" required="true"/>
+            <parameter name="productId" required="true"/>
+            <parameter name="dispatchedQuantity" type="BigDecimal" required="true"/>
+            <parameter name="valueAmount" type="BigDecimal"/>
+            <parameter name="uomId"/>
+        </in-parameters>
+        <actions>
+            <entity-find entity-name="zenith.erp.manufacturing.JobWorkItem" list="existing">
+                <econdition field-name="jobWorkOrderId"/>
+                <order-by field-name="-itemSeqId"/>
+            </entity-find>
+            <set field="lastSeq" from="existing ? (existing[0].itemSeqId as Integer) : 0"/>
+            <set field="itemSeqId" from="(lastSeq + 1).toString().padLeft(5, '0')"/>
+
+            <service-call name="create#zenith.erp.manufacturing.JobWorkItem"
+                in-map="[jobWorkOrderId:jobWorkOrderId, itemSeqId:itemSeqId,
+                         productId:productId, dispatchedQuantity:dispatchedQuantity,
+                         returnedQuantity:0, damagedQuantity:0,
+                         uomId:uomId, valueAmount:valueAmount]"/>
+        </actions>
+    </service>
+
+    <service verb="dispatch" noun="JobWorkOrder">
+        <in-parameters><parameter name="jobWorkOrderId" required="true"/></in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.manufacturing.JobWorkOrder" value-field="jw"/>
+            <if condition="jw.statusId != 'JwDraft'">
+                <return error="true" message="Job work must be in Draft to dispatch"/></if>
+
+            <!-- Calculate expected return: 1 year for inputs, 3 years for capital goods -->
+            <script><![CDATA[
+                def now = java.time.LocalDate.now()
+                def years = jw.isCapitalGoods == 'Y' ? 3 : 1
+                context.expectedReturn = java.sql.Date.valueOf(now.plusYears(years))
+            ]]></script>
+
+            <!-- Check if e-Way Bill needed (total value > ₹50,000) -->
+            <entity-find entity-name="zenith.erp.manufacturing.JobWorkItem" list="items">
+                <econdition field-name="jobWorkOrderId"/></entity-find>
+            <set field="totalValue" from="0" type="BigDecimal"/>
+            <iterate list="items" entry="item">
+                <set field="totalValue" from="totalValue + (item.valueAmount ?: 0)"/>
+            </iterate>
+
+            <service-call name="update#zenith.erp.manufacturing.JobWorkOrder"
+                in-map="[jobWorkOrderId:jobWorkOrderId, statusId:'JwDispatched',
+                         dispatchDate:ec.user.nowTimestamp, expectedReturnDate:expectedReturn]"/>
+        </actions>
+    </service>
+
+    <service verb="receive" noun="JobWorkReturn">
+        <in-parameters>
+            <parameter name="jobWorkOrderId" required="true"/>
+            <parameter name="itemSeqId" required="true"/>
+            <parameter name="returnedQuantity" type="BigDecimal" required="true"/>
+            <parameter name="damagedQuantity" type="BigDecimal" default-value="0"/>
+            <parameter name="returnChallanNumber"/>
+        </in-parameters>
+        <actions>
+            <service-call name="update#zenith.erp.manufacturing.JobWorkItem"
+                in-map="[jobWorkOrderId:jobWorkOrderId, itemSeqId:itemSeqId,
+                         returnedQuantity:returnedQuantity, damagedQuantity:damagedQuantity]"/>
+
+            <if condition="returnChallanNumber">
+                <service-call name="update#zenith.erp.manufacturing.JobWorkOrder"
+                    in-map="[jobWorkOrderId:jobWorkOrderId, returnChallanNumber:returnChallanNumber]"/>
+            </if>
+
+            <!-- Check if all items fully returned -->
+            <entity-find entity-name="zenith.erp.manufacturing.JobWorkItem" list="allItems">
+                <econdition field-name="jobWorkOrderId"/></entity-find>
+            <set field="allReturned" from="true" type="Boolean"/>
+            <iterate list="allItems" entry="ai">
+                <if condition="(ai.returnedQuantity ?: 0) + (ai.damagedQuantity ?: 0) &lt; (ai.dispatchedQuantity ?: 0)">
+                    <set field="allReturned" from="false"/>
+                </if>
+            </iterate>
+
+            <set field="newStatus" from="allReturned ? 'JwReturned' : 'JwPartialReturn'"/>
+            <service-call name="update#zenith.erp.manufacturing.JobWorkOrder"
+                in-map="[jobWorkOrderId:jobWorkOrderId, statusId:newStatus,
+                         actualReturnDate:allReturned ? ec.user.nowTimestamp : null]"/>
+        </actions>
+    </service>
+
+</services>

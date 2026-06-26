@@ -1,0 +1,140 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <!-- ========== Job Requisition Lifecycle ========== -->
+
+    <service verb="create" noun="JobRequisition">
+        <description>Create a new job requisition in ReqDraft status.</description>
+        <in-parameters>
+            <parameter name="jobTitle" required="true"/>
+            <parameter name="departmentId"/>
+            <parameter name="locationId"/>
+            <parameter name="openings"/>
+            <parameter name="description"/>
+            <parameter name="requirements"/>
+            <parameter name="targetHireDate"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="requisitionId"/>
+        </out-parameters>
+        <actions>
+            <set field="statusId" value="ReqDraft"/>
+            <service-call name="create#zenith.erp.recruitment.JobRequisition" in-map="context" out-map="context"/>
+        </actions>
+    </service>
+
+    <service verb="open" noun="JobRequisition">
+        <description>Open a draft job requisition for applications. Validates current status is ReqDraft.</description>
+        <in-parameters>
+            <parameter name="requisitionId" required="true"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.recruitment.JobRequisition" value-field="requisition"/>
+            <if condition="!requisition"><return error="true" message="Job requisition [${requisitionId}] not found."/></if>
+            <if condition="requisition.statusId != 'ReqDraft'">
+                <return error="true" message="Requisition [${requisitionId}] must be in ReqDraft status to open. Current status: ${requisition.statusId}"/>
+            </if>
+
+            <service-call name="update#zenith.erp.recruitment.JobRequisition"
+                          in-map="[requisitionId: requisitionId, statusId: 'ReqOpen']"/>
+        </actions>
+    </service>
+
+    <service verb="close" noun="JobRequisition">
+        <description>Close an open job requisition. Validates current status is ReqOpen.</description>
+        <in-parameters>
+            <parameter name="requisitionId" required="true"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.recruitment.JobRequisition" value-field="requisition"/>
+            <if condition="!requisition"><return error="true" message="Job requisition [${requisitionId}] not found."/></if>
+            <if condition="requisition.statusId != 'ReqOpen'">
+                <return error="true" message="Requisition [${requisitionId}] must be in ReqOpen status to close. Current status: ${requisition.statusId}"/>
+            </if>
+
+            <service-call name="update#zenith.erp.recruitment.JobRequisition"
+                          in-map="[requisitionId: requisitionId, statusId: 'ReqClosed']"/>
+        </actions>
+    </service>
+
+    <!-- ========== Job Application Services ========== -->
+
+    <service verb="create" noun="JobApplication">
+        <description>Create a new job application. Defaults to AppApplied status with current timestamp.</description>
+        <in-parameters>
+            <parameter name="requisitionId" required="true"/>
+            <parameter name="candidateName" required="true"/>
+            <parameter name="emailAddress"/>
+            <parameter name="phoneNumber"/>
+            <parameter name="source"/>
+            <parameter name="resumeUrl"/>
+            <parameter name="notes"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="applicationId"/>
+        </out-parameters>
+        <actions>
+            <set field="statusId" value="AppApplied"/>
+            <set field="applicationDate" from="ec.user.nowTimestamp"/>
+
+            <service-call name="create#zenith.erp.recruitment.JobApplication" in-map="context" out-map="context"/>
+        </actions>
+    </service>
+
+    <service verb="advance" noun="JobApplication">
+        <description>Advance a job application to the next stage. Validates the status progression order:
+            AppApplied -> AppScreening -> AppInterview -> AppOffered -> AppHired.</description>
+        <in-parameters>
+            <parameter name="applicationId" required="true"/>
+            <parameter name="statusId" required="true"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.recruitment.JobApplication" value-field="application"/>
+            <if condition="!application"><return error="true" message="Job application [${applicationId}] not found."/></if>
+
+            <!-- Define valid progression order -->
+            <set field="progressionOrder" from="['AppApplied', 'AppScreening', 'AppInterview', 'AppOffered', 'AppHired']"/>
+            <set field="currentIndex" from="progressionOrder.indexOf(application.statusId)"/>
+            <set field="targetIndex" from="progressionOrder.indexOf(statusId)"/>
+
+            <!-- Validate current status is in the progression -->
+            <if condition="currentIndex == -1">
+                <return error="true" message="Application [${applicationId}] is in status [${application.statusId}] which cannot be advanced."/>
+            </if>
+            <!-- Validate target status is in the progression -->
+            <if condition="targetIndex == -1">
+                <return error="true" message="Target status [${statusId}] is not a valid progression status. Valid statuses: ${progressionOrder}"/>
+            </if>
+            <!-- Validate target is after current -->
+            <if condition="targetIndex &lt;= currentIndex">
+                <return error="true" message="Cannot advance application [${applicationId}] from [${application.statusId}] to [${statusId}]. Target status must be a later stage in the pipeline."/>
+            </if>
+
+            <service-call name="update#zenith.erp.recruitment.JobApplication"
+                          in-map="[applicationId: applicationId, statusId: statusId]"/>
+        </actions>
+    </service>
+
+    <service verb="reject" noun="JobApplication">
+        <description>Reject a job application. Cannot reject if already hired.</description>
+        <in-parameters>
+            <parameter name="applicationId" required="true"/>
+            <parameter name="notes"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.recruitment.JobApplication" value-field="application"/>
+            <if condition="!application"><return error="true" message="Job application [${applicationId}] not found."/></if>
+            <if condition="application.statusId == 'AppHired'">
+                <return error="true" message="Application [${applicationId}] is already hired and cannot be rejected."/>
+            </if>
+
+            <!-- Append rejection notes to existing notes if present -->
+            <set field="updatedNotes" from="application.notes ? (application.notes + '\n[Rejection] ' + (notes ?: '')) : ('[Rejection] ' + (notes ?: ''))"/>
+
+            <service-call name="update#zenith.erp.recruitment.JobApplication"
+                          in-map="[applicationId: applicationId, statusId: 'AppRejected', notes: updatedNotes]"/>
+        </actions>
+    </service>
+
+</services>

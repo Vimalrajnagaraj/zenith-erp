@@ -1,0 +1,224 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <!-- ========== CONVERT CURRENCY ========== -->
+    <service verb="convert" noun="Currency">
+        <description>Converts amount between currencies using the most recent exchange rate</description>
+        <in-parameters>
+            <parameter name="amount" type="BigDecimal" required="true"/>
+            <parameter name="fromCurrencyUomId" required="true"/>
+            <parameter name="toCurrencyUomId" required="true"/>
+            <parameter name="referenceDate" type="Date" default="ec.user.nowTimestamp"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="convertedAmount" type="BigDecimal"/>
+            <parameter name="exchangeRate" type="BigDecimal"/>
+            <parameter name="rateDate" type="Date"/>
+        </out-parameters>
+        <actions>
+            <if condition="fromCurrencyUomId == toCurrencyUomId">
+                <set field="convertedAmount" from="amount"/>
+                <set field="exchangeRate" from="BigDecimal.ONE"/>
+                <set field="rateDate" from="referenceDate"/>
+                <return/>
+            </if>
+
+            <entity-find entity-name="zenith.erp.base.CurrencyExchangeRate" list="rates" limit="1">
+                <econdition field-name="fromCurrencyUomId"/>
+                <econdition field-name="toCurrencyUomId"/>
+                <econdition field-name="effectiveDate" operator="less-equals" from="referenceDate"/>
+                <order-by field-name="-effectiveDate"/>
+            </entity-find>
+
+            <if condition="!rates">
+                <entity-find entity-name="zenith.erp.base.CurrencyExchangeRate" list="reverseRates" limit="1">
+                    <econdition field-name="fromCurrencyUomId" from="toCurrencyUomId"/>
+                    <econdition field-name="toCurrencyUomId" from="fromCurrencyUomId"/>
+                    <econdition field-name="effectiveDate" operator="less-equals" from="referenceDate"/>
+                    <order-by field-name="-effectiveDate"/>
+                </entity-find>
+                <if condition="reverseRates">
+                    <set field="exchangeRate" from="BigDecimal.ONE.divide(reverseRates[0].exchangeRate, 6, java.math.RoundingMode.HALF_UP)"/>
+                    <set field="rateDate" from="reverseRates[0].effectiveDate"/>
+                <else>
+                    <return error="true" message="No exchange rate found for ${fromCurrencyUomId} to ${toCurrencyUomId}"/>
+                </else>
+                </if>
+            <else>
+                <set field="exchangeRate" from="rates[0].exchangeRate"/>
+                <set field="rateDate" from="rates[0].effectiveDate"/>
+            </else>
+            </if>
+
+            <set field="convertedAmount" from="amount.multiply(exchangeRate).setScale(2, java.math.RoundingMode.HALF_UP)"/>
+        </actions>
+    </service>
+
+    <!-- ========== GET FINANCIAL YEAR DATES ========== -->
+    <service verb="get" noun="FinancialYearDates">
+        <description>Returns financial year start/end dates for a given organization or country.
+            Reads fiscal year start month from CountryConfiguration.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="countryGeoId"/>
+            <parameter name="referenceDate" type="Date" default="ec.user.nowTimestamp"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="fyStartDate" type="Date"/>
+            <parameter name="fyEndDate" type="Date"/>
+            <parameter name="fyLabel" type="String"/>
+            <parameter name="fiscalYearStartMonth" type="Integer"/>
+        </out-parameters>
+        <actions>
+            <if condition="!countryGeoId &amp;&amp; organizationPartyId">
+                <entity-find-one entity-name="zenith.erp.base.CompanySettings" value-field="countrySetting">
+                    <field-map field-name="organizationPartyId"/>
+                    <field-map field-name="settingKey" value="COUNTRY_GEO_ID"/>
+                </entity-find-one>
+                <set field="countryGeoId" from="countrySetting?.settingValue ?: 'IND'"/>
+            </if>
+
+            <entity-find-one entity-name="zenith.erp.base.CountryConfiguration" value-field="countryConfig">
+                <field-map field-name="countryGeoId" from="countryGeoId ?: 'IND'"/>
+            </entity-find-one>
+
+            <set field="fiscalYearStartMonth" from="(countryConfig?.fiscalYearStartMonth ?: 1) as Integer"/>
+
+            <script><![CDATA[
+                import java.time.LocalDate
+                import java.time.temporal.TemporalAdjusters
+
+                def refDate = referenceDate instanceof java.sql.Date ?
+                    ((java.sql.Date) referenceDate).toLocalDate() :
+                    (referenceDate instanceof java.util.Date ?
+                        new java.sql.Date(referenceDate.time).toLocalDate() :
+                        LocalDate.now())
+
+                def year = refDate.year
+                def startMonth = fiscalYearStartMonth as int
+
+                LocalDate fyStart
+                if (startMonth == 1) {
+                    fyStart = LocalDate.of(year, 1, 1)
+                } else if (refDate.monthValue >= startMonth) {
+                    fyStart = LocalDate.of(year, startMonth, 1)
+                } else {
+                    fyStart = LocalDate.of(year - 1, startMonth, 1)
+                }
+
+                def fyEnd = fyStart.plusYears(1).minusDays(1)
+
+                context.fyStartDate = java.sql.Date.valueOf(fyStart)
+                context.fyEndDate = java.sql.Date.valueOf(fyEnd)
+
+                if (startMonth == 1) {
+                    context.fyLabel = "FY ${fyStart.year}"
+                } else {
+                    context.fyLabel = "FY ${fyStart.year}-${(fyEnd.year % 100).toString().padLeft(2, '0')}"
+                }
+            ]]></script>
+        </actions>
+    </service>
+
+    <!-- ========== CONVERT AMOUNT TO WORDS ========== -->
+    <service verb="convert" noun="AmountToWords">
+        <description>Converts a numeric amount to words, dispatching to country-specific service.
+            Falls back to English if no country-specific service is configured.</description>
+        <in-parameters>
+            <parameter name="amount" type="BigDecimal" required="true"/>
+            <parameter name="currencyUomId"/>
+            <parameter name="organizationPartyId"/>
+            <parameter name="countryGeoId"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="amountInWords"/>
+        </out-parameters>
+        <actions>
+            <if condition="!currencyUomId &amp;&amp; organizationPartyId">
+                <entity-find-one entity-name="zenith.erp.base.CompanySettings" value-field="currSetting">
+                    <field-map field-name="organizationPartyId"/>
+                    <field-map field-name="settingKey" value="CURRENCY_UOM_ID"/>
+                </entity-find-one>
+                <set field="currencyUomId" from="currSetting?.settingValue ?: 'USD'"/>
+            </if>
+            <if condition="!currencyUomId"><set field="currencyUomId" value="USD"/></if>
+
+            <if condition="!countryGeoId &amp;&amp; organizationPartyId">
+                <entity-find-one entity-name="zenith.erp.base.CompanySettings" value-field="countrySetting">
+                    <field-map field-name="organizationPartyId"/>
+                    <field-map field-name="settingKey" value="COUNTRY_GEO_ID"/>
+                </entity-find-one>
+                <set field="countryGeoId" from="countrySetting?.settingValue"/>
+            </if>
+
+            <set field="countryConfig" from="null"/>
+            <if condition="countryGeoId">
+                <entity-find-one entity-name="zenith.erp.base.CountryConfiguration" value-field="countryConfig">
+                    <field-map field-name="countryGeoId"/>
+                </entity-find-one>
+            </if>
+
+            <if condition="countryConfig?.amountToWordsServiceName">
+                <service-call name="${countryConfig.amountToWordsServiceName}" out-map="wordsResult"
+                    in-map="[amount:amount, currencyUomId:currencyUomId]"/>
+                <set field="amountInWords" from="wordsResult.amountInWords"/>
+            <else>
+                <script><![CDATA[
+                    def currencyNames = [INR:'Rupees', USD:'Dollars', GBP:'Pounds', EUR:'Euros',
+                                         AED:'Dirhams', AUD:'Dollars', CAD:'Dollars', JPY:'Yen',
+                                         SGD:'Dollars', SAR:'Riyals']
+                    def subNames = [INR:'Paise', USD:'Cents', GBP:'Pence', EUR:'Cents',
+                                    AED:'Fils', AUD:'Cents', CAD:'Cents', JPY:'Sen',
+                                    SGD:'Cents', SAR:'Halalah']
+
+                    def currName = currencyNames[currencyUomId] ?: currencyUomId
+                    def subName = subNames[currencyUomId] ?: 'Cents'
+
+                    def ones = ['', 'One', 'Two', 'Three', 'Four', 'Five', 'Six', 'Seven',
+                                'Eight', 'Nine', 'Ten', 'Eleven', 'Twelve', 'Thirteen',
+                                'Fourteen', 'Fifteen', 'Sixteen', 'Seventeen', 'Eighteen', 'Nineteen']
+                    def tens = ['', '', 'Twenty', 'Thirty', 'Forty', 'Fifty',
+                                'Sixty', 'Seventy', 'Eighty', 'Ninety']
+
+                    def convertGroup = { int n ->
+                        if (n == 0) return ''
+                        def result = ''
+                        if (n >= 100) { result += ones[(int)(n / 100)] + ' Hundred '; n = n % 100 }
+                        if (n >= 20) { result += tens[(int)(n / 10)] + ' '; n = n % 10 }
+                        if (n > 0) { result += ones[n] + ' ' }
+                        return result.trim()
+                    }
+
+                    def wholeAmount = amount.toBigInteger().longValue()
+                    def fractional = amount.remainder(BigDecimal.ONE).multiply(new BigDecimal(100)).intValue()
+
+                    if (wholeAmount == 0) {
+                        context.amountInWords = "Zero ${currName}"
+                    } else {
+                        def parts = []
+                        def scales = [[1000000000000L, 'Trillion'], [1000000000L, 'Billion'],
+                                      [1000000L, 'Million'], [1000L, 'Thousand']]
+                        def remaining = wholeAmount
+                        for (s in scales) {
+                            if (remaining >= s[0]) {
+                                parts.add(convertGroup((int)(remaining / s[0])) + ' ' + s[1])
+                                remaining = remaining % s[0]
+                            }
+                        }
+                        if (remaining > 0) parts.add(convertGroup((int) remaining))
+                        context.amountInWords = parts.join(' ') + ' ' + currName
+                    }
+
+                    if (fractional > 0) {
+                        context.amountInWords += ' and ' + convertGroup(fractional) + ' ' + subName
+                    }
+
+                    context.amountInWords += ' Only'
+                ]]></script>
+            </else>
+            </if>
+        </actions>
+    </service>
+
+</services>

@@ -1,0 +1,212 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <service verb="authenticate" noun="EinvoiceApi">
+        <description>Authenticate with NIC IRP Sandbox/Production</description>
+        <in-parameters>
+            <parameter name="configId" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="authToken"/>
+            <parameter name="sek"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.india.IndiaApiConfig" value-field="apiConfig">
+                <field-map field-name="configId"/>
+            </entity-find-one>
+            <if condition="!apiConfig">
+                <return error="true" message="API Config not found"/>
+            </if>
+            
+            <!-- Sandbox/Mock logic -->
+            <set field="authToken" value="mock-auth-token-einvoice"/>
+            <set field="sek" value="mock-session-encryption-key"/>
+            
+            <set field="apiConfig.currentToken" from="authToken"/>
+            <set field="cal" from="new java.util.GregorianCalendar()"/>
+            <script>cal.add(java.util.Calendar.HOUR, 6)</script>
+            <set field="apiConfig.tokenExpiry" from="new java.sql.Timestamp(cal.getTimeInMillis())"/>
+            <entity-update value-field="apiConfig"/>
+        </actions>
+    </service>
+
+    <service verb="generate" noun="Einvoice">
+        <description>Generate JSON Payload and push to IRP for E-Invoice generation</description>
+        <in-parameters>
+            <parameter name="invoiceId" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="irn"/>
+            <parameter name="signedQrCode"/>
+            <parameter name="ackNo"/>
+            <parameter name="ackDate" type="Timestamp"/>
+            <parameter name="einvoiceId"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="invoice"/>
+            <if condition="!invoice"><return error="true" message="Invoice ${invoiceId} not found"/></if>
+
+            <entity-find entity-name="mantle.account.invoice.InvoiceItem" list="items">
+                <econdition field-name="invoiceId"/>
+            </entity-find>
+
+            <!-- Generate NIC JSON Payload structure using Groovy -->
+            <script><![CDATA[
+                def payload = [
+                    Version: "1.1",
+                    TranDtls: [
+                        TaxSch: "GST",
+                        SupTyp: invoice.b2bB2cType == 'B2B' ? 'B2B' : (invoice.isExport == 'Y' ? 'EXPWP' : 'B2B'),
+                        RegRev: invoice.isReverseCharge ?: "N",
+                        IgstOnIntra: "N"
+                    ],
+                    DocDtls: [
+                        Typ: invoice.documentType == 'TAX_INVOICE' ? 'INV' : (invoice.documentType == 'CREDIT_NOTE' ? 'CRN' : 'DBN'),
+                        No: invoice.gstInvoiceNumber ?: invoice.invoiceId,
+                        Dt: ec.l10n.format(invoice.invoiceDate, "dd/MM/yyyy")
+                    ],
+                    SellerDtls: [
+                        Gstin: invoice.supplierGstin,
+                        LglNm: "ZetaERP Seller",
+                        Loc: "City",
+                        Pin: 100000,
+                        Stcd: invoice.supplierStateCode
+                    ],
+                    BuyerDtls: [
+                        Gstin: invoice.buyerGstin ?: "URP",
+                        LglNm: "Buyer Name",
+                        Pos: invoice.placeOfSupplyStateCode,
+                        Loc: "City",
+                        Pin: 200000,
+                        Stcd: invoice.buyerStateCode ?: invoice.placeOfSupplyStateCode
+                    ],
+                    ItemList: [],
+                    ValDtls: [
+                        AssVal: invoice.totalTaxableAmount,
+                        CgstVal: invoice.totalCgst ?: 0.0,
+                        SgstVal: invoice.totalSgst ?: 0.0,
+                        IgstVal: invoice.totalIgst ?: 0.0,
+                        CesVal: invoice.totalCess ?: 0.0,
+                        TotInvVal: (invoice.totalTaxableAmount ?: 0.0) + (invoice.totalCgst ?: 0.0) + (invoice.totalSgst ?: 0.0) + (invoice.totalIgst ?: 0.0) + (invoice.totalCess ?: 0.0)
+                    ]
+                ]
+
+                int seq = 1
+                for (item in items) {
+                    payload.ItemList.add([
+                        SlNo: (seq++).toString(),
+                        PrdDesc: item.description ?: "Product",
+                        IsServc: "N",
+                        HsnCd: item.hsnSacCode ?: "123456",
+                        Qty: item.quantity ?: 1.0,
+                        Unit: "NOS",
+                        UnitPrice: item.amount ?: 0.0,
+                        TotAmt: item.taxableAmount ?: 0.0,
+                        Discount: item.discountAmount ?: 0.0,
+                        AssAmt: item.taxableAmount ?: 0.0,
+                        GstRt: (item.cgstRate ?: 0.0) + (item.sgstRate ?: 0.0) + (item.igstRate ?: 0.0),
+                        IgstAmt: item.igstAmount ?: 0.0,
+                        CgstAmt: item.cgstAmount ?: 0.0,
+                        SgstAmt: item.sgstAmount ?: 0.0,
+                        CesRt: item.cessRate ?: 0.0,
+                        CesAmt: item.cessAmount ?: 0.0,
+                        TotItemVal: (item.taxableAmount ?: 0.0) + (item.cgstAmount ?: 0.0) + (item.sgstAmount ?: 0.0) + (item.igstAmount ?: 0.0) + (item.cessAmount ?: 0.0)
+                    ])
+                }
+
+                jsonPayloadStr = groovy.json.JsonOutput.toJson(payload)
+                
+                // MOCK API CALL
+                irnMock = java.util.UUID.randomUUID().toString().replace("-", "").padRight(64, "0").substring(0, 64)
+                qrMock = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.MockSignedQRCodeForNIC." + irnMock
+                ackNoMock = Math.abs(new java.util.Random().nextLong()).toString().substring(0, 15)
+            ]]></script>
+
+            <set field="irn" from="irnMock"/>
+            <set field="signedQrCode" from="qrMock"/>
+            <set field="ackNo" from="ackNoMock"/>
+            <set field="ackDate" from="ec.user.nowTimestamp"/>
+
+            <entity-make-value entity-name="zenith.erp.india.IndiaEinvoice" value-field="einvoice"/>
+            <set field="einvoice.invoiceId" from="invoiceId"/>
+            <set field="einvoice.irn" from="irn"/>
+            <set field="einvoice.signedQrCode" from="signedQrCode"/>
+            <set field="einvoice.ackNumber" from="ackNo"/>
+            <set field="einvoice.ackDate" from="ackDate"/>
+            <set field="einvoice.statusId" value="GENERATED"/>
+            <set field="einvoice.jsonPayload" from="jsonPayloadStr"/>
+            <entity-create value-field="einvoice"/>
+            <set field="einvoiceId" from="einvoice.einvoiceId"/>
+        </actions>
+    </service>
+
+    <service verb="cancel" noun="Einvoice">
+        <description>Cancel an active E-invoice</description>
+        <in-parameters>
+            <parameter name="irn" required="true"/>
+            <parameter name="cancelReason" required="true"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.india.IndiaEinvoice" value-field="einvoice">
+                <field-map field-name="irn"/>
+            </entity-find-one>
+            <if condition="!einvoice"><return error="true" message="E-Invoice not found"/></if>
+            <set field="einvoice.statusId" value="CANCELLED"/>
+            <set field="einvoice.cancelReason" from="cancelReason"/>
+            <set field="einvoice.cancelDate" from="ec.user.nowTimestamp"/>
+            <entity-update value-field="einvoice"/>
+        </actions>
+    </service>
+
+    <service verb="get" noun="EinvoiceDetails">
+        <in-parameters>
+            <parameter name="irn" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="einvoiceDetails" type="Map"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.india.IndiaEinvoice" value-field="einvoice">
+                <field-map field-name="irn"/>
+            </entity-find-one>
+            <set field="einvoiceDetails" from="einvoice?.getMap()"/>
+        </actions>
+    </service>
+
+    <service verb="generate" noun="EinvoiceQrCode">
+        <in-parameters>
+            <parameter name="irn" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="qrCodeBase64"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.india.IndiaEinvoice" value-field="einvoice">
+                <field-map field-name="irn"/>
+            </entity-find-one>
+            <!-- Mock generation -->
+            <set field="qrCodeBase64" value="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="/>
+        </actions>
+    </service>
+
+    <service verb="generate" noun="DynamicUpiQr">
+        <in-parameters>
+            <parameter name="invoiceId" required="true"/>
+            <parameter name="upiId" required="true"/>
+            <parameter name="merchantName" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="upiQrBase64"/>
+            <parameter name="upiString"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="invoice"/>
+            <set field="total" from="(invoice.totalTaxableAmount ?: 0.0) + (invoice.totalCgst ?: 0.0) + (invoice.totalSgst ?: 0.0) + (invoice.totalIgst ?: 0.0) + (invoice.totalCess ?: 0.0) + (invoice.tcsAmount ?: 0.0)"/>
+            <set field="upiString" value="upi://pay?pa=${upiId}&amp;pn=${merchantName}&amp;tr=${invoice.gstInvoiceNumber ?: invoice.invoiceId}&amp;am=${total}&amp;cu=INR"/>
+            <!-- Mock image generation -->
+            <set field="upiQrBase64" value="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="/>
+        </actions>
+    </service>
+
+</services>

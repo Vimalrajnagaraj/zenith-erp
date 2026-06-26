@@ -1,0 +1,140 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <!-- Turn ONE completed POS transaction into a finalized Sales Invoice (mantle), mirroring the
+         exact amounts/tax the POS recorded. Idempotent: skips if already linked. Runs in its own
+         transaction so a single bad row never rolls back a batch. -->
+    <service verb="sync" noun="PosTransactionInvoice" authenticate="false" transaction="force-new" transaction-timeout="120">
+        <in-parameters><parameter name="transactionId" required="true"/></in-parameters>
+        <out-parameters><parameter name="invoiceId"/><parameter name="skipped"/></out-parameters>
+        <actions>
+            <script><![CDATA[
+                def txn = ec.entity.find("zenith.erp.pos.PosTransaction").condition("transactionId", transactionId).forUpdate(true).one()
+                if (txn == null) { skipped = "not_found"; return }
+                if (txn.linkedInvoiceId) { invoiceId = txn.linkedInvoiceId; skipped = "already_synced"; return }
+                if (txn.statusId != "PtCompleted") { skipped = "not_completed"; return }
+                if (txn.transactionType == "Return") { skipped = "return_skip"; return }
+                def org = txn.organizationPartyId
+
+                // Resolve customer: real customer, else a per-org Walk-in Customer party (B2C cash sale)
+                def toParty = txn.customerPartyId
+                if (!toParty) {
+                    def wid = "WALKIN_" + org
+                    if (ec.entity.find("mantle.party.Party").condition("partyId", wid).one() == null) {
+                        ec.service.sync().name("create#mantle.party.Party")
+                            .parameters([partyId:wid, partyTypeEnumId:"PtyOrganization", ownerPartyId:org]).call()
+                        ec.service.sync().name("create#mantle.party.Organization")
+                            .parameters([partyId:wid, organizationName:"Walk-in Customer"]).call()
+                        if (ec.entity.find("mantle.party.PartyRole").condition("partyId", wid).condition("roleTypeId","Customer").one() == null)
+                            ec.service.sync().name("create#mantle.party.PartyRole").parameters([partyId:wid, roleTypeId:"Customer"]).call()
+                    }
+                    toParty = wid
+                }
+
+                // Invoice header (start In-Process)
+                def inv = ec.service.sync().name("mantle.account.InvoiceServices.create#Invoice").parameters([
+                    invoiceTypeEnumId:"InvoiceSales", fromPartyId:org, toPartyId:toParty,
+                    invoiceDate:txn.entryDate, currencyUomId:"INR", statusId:"InvoiceInProcess"]).call()
+                def iid = inv.invoiceId
+
+                def items = ec.entity.find("zenith.erp.pos.PosTransactionItem")
+                    .condition("transactionId", transactionId).orderBy("itemSeqId").list()
+                for (li in items) {
+                    def ii = ec.service.sync().name("mantle.account.InvoiceServices.create#InvoiceItem").parameters([
+                        invoiceId:iid, itemTypeEnumId:"ItemProduct", productId:li.productId,
+                        description:li.productName, quantity:li.quantity, amount:li.unitPrice]).call()
+                    def seq = ii.invoiceItemSeqId
+                    ec.service.sync().name("update#mantle.account.invoice.InvoiceItem").parameters([
+                        invoiceId:iid, invoiceItemSeqId:seq, productTaxCode:li.productTaxCode,
+                        taxableAmount:li.taxableAmount, totalTaxAmount:li.totalTaxAmount,
+                        discountAmount:li.discountAmount]).call()
+                    // Carry the GST breakdown (CGST/SGST/IGST/CESS) that was computed and stored at sale time
+                    // onto the invoice item, instead of re-deriving from fields that do not exist on the POS line.
+                    def tlds = ec.entity.find("zenith.erp.tax.TaxLineDetail")
+                        .condition("referenceType", "PosTransactionItem").condition("referenceId", transactionId)
+                        .condition("referenceSeqId", li.itemSeqId).orderBy("sequenceNum").list()
+                    if (tlds) {
+                        def bds = tlds.collect { [taxAuthorityId:it.taxAuthorityId, taxRateId:it.taxRateId,
+                            taxCategoryId:it.taxCategoryId, taxName:it.taxName, taxRate:it.taxRate,
+                            taxableAmount:it.taxableAmount, taxAmount:it.taxAmount,
+                            isIncludedInPrice:it.isIncludedInPrice, countryGeoId:it.countryGeoId, regionGeoId:it.regionGeoId] }
+                        ec.service.sync().name("zenith.tax.TaxServices.store#TaxLineDetails").parameters([
+                            referenceType:"InvoiceItem", referenceId:iid, referenceSeqId:seq,
+                            parentReferenceType:"Invoice", parentReferenceId:iid,
+                            currencyUomId:"INR", taxBreakdowns:bds]).call()
+                    }
+                }
+
+                // Header totals + use the POS bill number as the tax-invoice number + finalize
+                def fy = ec.service.sync().name("zenith.base.LocalizationServices.get#FinancialYearDates")
+                    .parameters([organizationPartyId:org, referenceDate:txn.entryDate]).call()
+                def docType = (((txn.totalTaxAmount ?: 0) as BigDecimal) > 0) ? "Tax Invoice" : "Bill of Supply"
+                ec.service.sync().name("update#mantle.account.invoice.Invoice").parameters([
+                    invoiceId:iid, customInvoiceNumber:txn.transactionNumber, gstInvoiceNumber:txn.transactionNumber,
+                    financialYearPrefix:fy?.fyLabel, totalTaxableAmount:txn.subtotal, totalTaxAmount:txn.totalTaxAmount,
+                    roundOffAmount:txn.roundOff, documentType:docType, statusId:"InvoiceFinalized"]).call()
+
+                // Deplete per line, but ONLY for products marked inventoryTracked (an opening count was entered).
+                // Untracked products are skipped so stock never goes spuriously negative / spams reorder alerts.
+                for (li in items) {
+                    if (li.productId && li.quantity) {
+                        def prod = ec.entity.find("mantle.product.Product").condition("productId", li.productId).one()
+                        if (prod?.inventoryTracked == "Y") {
+                            try {
+                                ec.service.sync().name("zenith.inventory.InventoryStockServices.adjust#AssetOnHand")
+                                    .parameters([organizationPartyId:org, productId:li.productId,
+                                                 quantityDiff:(-((li.quantity ?: 0) as BigDecimal)),
+                                                 reason:("POS Sale " + txn.transactionNumber), effectiveDate:txn.entryDate]).call()
+                            } catch (Throwable e) { ec.logger.error("Stock depletion failed for " + li.productId + ": " + e.message) }
+                        }
+                    }
+                }
+
+                // Link back (this is also the idempotency guard)
+                ec.service.sync().name("update#zenith.erp.pos.PosTransaction")
+                    .parameters([transactionId:transactionId, linkedInvoiceId:iid]).call()
+                invoiceId = iid
+            ]]></script>
+        </actions>
+    </service>
+
+    <!-- Batch: sync all completed, not-yet-linked POS transactions into invoices. Idempotent; safe to re-run.
+         Processes up to maxCount per call (each invoice in its own tx). Returns counts + remaining. -->
+    <service verb="sync" noun="PosSalesBacklog" authenticate="false" transaction-timeout="3600">
+        <in-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="maxCount" type="Integer" default="1000"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="synced" type="Integer"/>
+            <parameter name="failed" type="Integer"/>
+            <parameter name="remaining" type="Integer"/>
+        </out-parameters>
+        <actions>
+            <script><![CDATA[
+                import org.moqui.entity.EntityCondition
+                def base = {
+                    def ef = ec.entity.find("zenith.erp.pos.PosTransaction")
+                        .condition("statusId", "PtCompleted")
+                        .condition(ec.entity.conditionFactory.makeCondition("linkedInvoiceId", EntityCondition.EQUALS, null))
+                        .condition(ec.entity.conditionFactory.makeCondition("transactionType", EntityCondition.NOT_EQUAL, "Return"))
+                    if (organizationPartyId) ef.condition("organizationPartyId", organizationPartyId)
+                    return ef
+                }
+                def total = base().count()
+                def list = base().orderBy("entryDate").limit(maxCount).list()
+                synced = 0; failed = 0
+                for (t in list) {
+                    try {
+                        ec.service.sync().name("zenith.pos.PosSyncServices.sync#PosTransactionInvoice")
+                            .parameter("transactionId", t.transactionId).call()
+                        if (ec.message.hasError()) { failed++; ec.message.clearErrors() } else { synced++ }
+                    } catch (Throwable e) { failed++; ec.logger.error("POS sync failed for " + t.transactionId + ": " + e.message); ec.message.clearErrors() }
+                }
+                remaining = (total - synced) as Integer
+            ]]></script>
+        </actions>
+    </service>
+
+</services>

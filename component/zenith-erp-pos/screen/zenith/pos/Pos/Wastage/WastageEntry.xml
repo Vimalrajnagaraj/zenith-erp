@@ -1,0 +1,244 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
+        default-menu-title="Record Wastage" default-menu-index="1">
+
+    <transition name="createWastage">
+        <actions>
+            <set field="totalLoss" from="((quantity ?: 0) as BigDecimal) * ((unitCost ?: 0) as BigDecimal)"/>
+            <service-call name="create#zenith.erp.pos.PosStockWastage" in-map="context + [totalLoss:totalLoss, organizationPartyId:ec.user.getPreference('ACTIVE_ORGANIZATION')]"/>
+        </actions>
+        <default-response url="."/>
+    </transition>
+    <transition name="deleteWastage"><service-call name="delete#zenith.erp.pos.PosStockWastage"/>
+        <default-response url="."/></transition>
+    <transition name="goStock"><default-response url="../../Stock"/></transition>
+    <transition name="goDashboard"><default-response url="../../Dashboard"/></transition>
+    <transition name="goTerminal"><default-response url="../../Terminal"/></transition>
+    <transition name="searchProducts">
+        <actions>
+            <entity-find entity-name="mantle.product.Product" list="prodList" limit="20">
+                <econdition field-name="productTypeEnumId" value="PtAsset"/>
+                <econditions combine="or">
+                    <econdition field-name="productName" operator="like" value="%${term}%" ignore-case="true"/>
+                    <econdition field-name="pseudoId" operator="like" value="%${term}%" ignore-case="true"/>
+                </econditions>
+                <order-by field-name="productName"/>
+            </entity-find>
+            <set field="options" from="prodList.collect { [value:it.productId, label:(it.productName ?: it.pseudoId) + ' (' + (it.pseudoId ?: '') + ')'] }"/>
+            <script>ec.web.sendJsonResponse(options)</script>
+        </actions>
+        <default-response type="none"/>
+    </transition>
+
+    <transition name="expiringProductsJson">
+        <actions><script><![CDATA[
+            def todayMs = java.sql.Date.valueOf(ec.l10n.format(ec.user.nowTimestamp, 'yyyy-MM-dd')).getTime()
+            def soonMs = todayMs + 7L*24*60*60*1000
+            def list = ec.entity.find("mantle.product.Product").condition("productTypeEnumId","PtAsset").condition("isPerishable","Y").orderBy("expiryDate").list()
+            def rows = []
+            list.each { p ->
+                if (!p.expiryDate) return
+                def expMs = p.expiryDate.getTime()
+                def st = expMs <= todayMs ? 'EXPIRED' : (expMs <= soonMs ? 'SOON' : 'OK')
+                rows.add([productId:p.productId, productName:(p.productName ?: p.pseudoId), sku:(p.pseudoId ?: ''),
+                    expiry: ec.l10n.format(p.expiryDate, 'dd-MM-yyyy'), cost:(p.mrpAmount ?: 0), status:st])
+            }
+            ec.web.sendJsonResponse([success:true, rows:rows])
+        ]]></script></actions>
+        <default-response type="none"/>
+    </transition>
+
+    <transition name="recordExpiredWastage">
+        <actions><script><![CDATA[
+            def qty = ec.web.parameters.quantity ? (ec.web.parameters.quantity as BigDecimal) : BigDecimal.ZERO
+            def cost = ec.web.parameters.unitCost ? (ec.web.parameters.unitCost as BigDecimal) : BigDecimal.ZERO
+            if (qty <= BigDecimal.ZERO) { ec.web.sendJsonResponse([success:false, error:'Enter a quantity greater than zero']); return }
+            ec.service.sync().name("create#zenith.erp.pos.PosStockWastage").parameters([
+                productId:ec.web.parameters.productId, productName:ec.web.parameters.productName,
+                quantity:qty, unitCost:cost, totalLoss:(qty * cost),
+                wastageReason:'WrExpiry', wastageDate:ec.user.nowTimestamp, organizationPartyId:ec.user.getPreference('ACTIVE_ORGANIZATION'),
+                enteredByPartyId:ec.user.userAccount?.partyId, description:'Expired stock written off']).call()
+            ec.web.sendJsonResponse([success:true])
+        ]]></script></actions>
+        <default-response type="none"/>
+    </transition>
+
+    <actions>
+        <set field="filterDate" from="filterDate ?: ec.l10n.format(ec.user.nowTimestamp, 'yyyy-MM-dd')"/>
+        <set field="filterThruDate" from="filterThruDate ?: filterDate"/>
+        <set field="dayStart" from="java.sql.Timestamp.valueOf(filterDate + ' 00:00:00')"/>
+        <set field="dayEnd" from="java.sql.Timestamp.valueOf(filterThruDate + ' 23:59:59')"/>
+
+        <entity-find entity-name="zenith.erp.pos.PosStockWastageView" list="wastageList">
+            <econdition field-name="wastageDate" operator="greater-equals" from="dayStart"/>
+            <econdition field-name="wastageDate" operator="less-equals" from="dayEnd"/>
+            <econdition field-name="wastageReason" from="filterReason" ignore-if-empty="true"/>
+            <order-by field-name="-wastageDate"/>
+        </entity-find>
+
+        <entity-find entity-name="moqui.basic.Enumeration" list="reasonList">
+            <econdition field-name="enumTypeId" value="PosWastageReason"/>
+            <order-by field-name="sequenceNum"/>
+        </entity-find>
+
+        <script><![CDATA[
+            totalLoss = wastageList.sum { (it.totalLoss ?: 0) as BigDecimal } ?: BigDecimal.ZERO
+            totalQty = wastageList.sum { (it.quantity ?: 0) as BigDecimal } ?: BigDecimal.ZERO
+            entryCount = wastageList.size()
+        ]]></script>
+
+        <!-- Perishable products (with import expiry dates): flag expired / expiring soon -->
+        <entity-find entity-name="mantle.product.Product" list="perishableList">
+            <econdition field-name="productTypeEnumId" value="PtAsset"/>
+            <econdition field-name="isPerishable" value="Y"/>
+            <order-by field-name="expiryDate"/>
+        </entity-find>
+        <script><![CDATA[
+            def todayMs = java.sql.Date.valueOf(ec.l10n.format(ec.user.nowTimestamp, 'yyyy-MM-dd')).getTime()
+            def soonMs = todayMs + 7L*24*60*60*1000
+            expiringRows = []
+            perishableList.each { p ->
+                if (!p.expiryDate) return
+                def expMs = p.expiryDate.getTime()
+                def st = expMs <= todayMs ? 'EXPIRED' : (expMs <= soonMs ? 'SOON' : 'OK')
+                expiringRows.add([productId:p.productId, productName:(p.productName ?: p.pseudoId), sku:(p.pseudoId ?: ''),
+                    expiryDate:p.expiryDate, mrpAmount:(p.mrpAmount ?: 0), status:st,
+                    statusLabel:(st == 'EXPIRED' ? 'EXPIRED' : (st == 'SOON' ? 'EXPIRING SOON' : 'OK'))])
+            }
+            expiredCount = expiringRows.count { it.status == 'EXPIRED' }
+            soonCount = expiringRows.count { it.status == 'SOON' }
+        ]]></script>
+
+    </actions>
+
+    <widgets>
+        <container style="q-pa-md">
+            <container style="row items-center justify-between q-mb-md">
+                <label text="Record Stock Wastage" type="h6" style="text-weight-bold"/>
+                <container style="row q-gutter-sm">
+                    <link url="goTerminal" text="Billing" icon="fa fa-calculator" btn-type="success" style="q-btn--dense"/>
+                    <link url="goStock" text="Stock" icon="fa fa-cubes" btn-type="primary" style="q-btn--dense"/>
+                    <link url="goDashboard" text="Dashboard" icon="fa fa-dashboard" style="q-btn--dense"/>
+                </container>
+            </container>
+            <container style="zenith-card bg-white shadow-2 q-pa-md q-mb-lg border-radius-lg">
+                <form-single name="AddWastage" transition="createWastage">
+                    <field name="wastageDate"><default-field title="Date">
+                        <date-time type="date-time" default-value="${ec.l10n.format(ec.user.nowTimestamp, 'yyyy-MM-dd HH:mm')}"/>
+                    </default-field></field>
+                    <field name="productId"><default-field title="Product">
+                        <drop-down>
+                            <dynamic-options transition="searchProducts" server-search="true" min-length="2"/>
+                        </drop-down>
+                    </default-field></field>
+                    <field name="productName"><default-field title="Product Name (if not in list)">
+                        <text-line size="30"/>
+                    </default-field></field>
+                    <field name="quantity"><default-field title="Quantity">
+                        <text-line size="10" input-type="number"/>
+                    </default-field></field>
+                    <field name="unitCost"><default-field title="Unit Cost">
+                        <text-line size="10" input-type="number"/>
+                    </default-field></field>
+                    <field name="wastageReason"><default-field title="Reason">
+                        <drop-down>
+                            <list-options list="reasonList" key="${enumId}" text="${description}"/>
+                        </drop-down>
+                    </default-field></field>
+                    <field name="batchNumber"><default-field title="Batch No.">
+                        <text-line size="15"/>
+                    </default-field></field>
+                    <field name="description"><default-field title="Notes">
+                        <text-line size="40"/>
+                    </default-field></field>
+                    <field name="enteredByPartyId"><default-field><hidden default-value="${ec.user.userAccount?.partyId}"/></default-field></field>
+                    <field name="submitBtn"><default-field title="">
+                        <submit text="Record Wastage" icon="fa fa-plus" type="danger"/>
+                    </default-field></field>
+                </form-single>
+            </container>
+
+            <container style="row items-center q-gutter-sm q-mb-sm">
+                <label text="&#9201; Expiring &amp; Expired Products" type="h6" style="text-weight-bold"/>
+            </container>
+            <container style="zenith-card bg-white shadow-2 q-pa-md q-mb-lg border-radius-lg">
+                <render-mode><text type="html,qvt"><![CDATA[<div id="wastage-expiring-root" style="min-height:60px">Loading…</div><script src="/zenithstatic/js/pos-terminal.js?v=80"></script>]]></text></render-mode>
+            </container>
+
+            <label text="Wastage List" type="h6" style="text-weight-bold q-mb-md"/>
+            <container style="q-mb-md">
+                <form-single name="WastageFilter" transition=".">
+                    <field name="filterDate"><default-field title="From">
+                        <date-time type="date" default-value="${filterDate}"/>
+                    </default-field></field>
+                    <field name="filterThruDate"><default-field title="To">
+                        <date-time type="date" default-value="${filterThruDate}"/>
+                    </default-field></field>
+                    <field name="filterReason"><default-field title="Reason">
+                        <drop-down allow-empty="true">
+                            <list-options list="reasonList" key="${enumId}" text="${description}"/>
+                        </drop-down>
+                    </default-field></field>
+                    <field name="searchBtn"><default-field title="">
+                        <submit text="Search" icon="fa fa-search"/>
+                    </default-field></field>
+                </form-single>
+            </container>
+
+            <container-row>
+                <row-col lg="4" md="4" sm="4">
+                    <container style="zenith-card bg-white shadow-2 q-pa-md q-mb-md text-center border-radius-lg">
+                        <label text="Total Loss" style="text-grey-7 text-caption"/>
+                        <label text="${ec.l10n.format(totalLoss, '#,##0.00')}" type="h5" style="text-weight-bold text-negative q-my-xs"/>
+                    </container>
+                </row-col>
+                <row-col lg="4" md="4" sm="4">
+                    <container style="zenith-card bg-white shadow-2 q-pa-md q-mb-md text-center border-radius-lg">
+                        <label text="Qty Wasted" style="text-grey-7 text-caption"/>
+                        <label text="${ec.l10n.format(totalQty, '#,##0')}" type="h5" style="text-weight-bold text-orange-7 q-my-xs"/>
+                    </container>
+                </row-col>
+                <row-col lg="4" md="4" sm="4">
+                    <container style="zenith-card bg-white shadow-2 q-pa-md q-mb-md text-center border-radius-lg">
+                        <label text="Entries" style="text-grey-7 text-caption"/>
+                        <label text="${entryCount}" type="h5" style="text-weight-bold text-primary q-my-xs"/>
+                    </container>
+                </row-col>
+            </container-row>
+
+            <form-list name="WastageListForm" list="wastageList" list-entry="w" skip-form="true"
+                       show-csv-button="true" show-xlsx-button="true">
+                <field name="wastageDate"><default-field title="Date">
+                    <display format="dd-MM-yyyy HH:mm"/>
+                </default-field></field>
+                <field name="productName"><default-field title="Product">
+                    <display/>
+                </default-field></field>
+                <field name="quantity"><default-field title="Qty">
+                    <display format="#,##0"/>
+                </default-field></field>
+                <field name="unitCost"><default-field title="Unit Cost">
+                    <display format="#,##0.00"/>
+                </default-field></field>
+                <field name="totalLoss"><default-field title="Loss Amount">
+                    <display format="#,##0.00"/>
+                </default-field></field>
+                <field name="wastageReason"><default-field title="Reason">
+                    <display-entity entity-name="moqui.basic.Enumeration" key-field-name="enumId" text="${description}"/>
+                </default-field></field>
+                <field name="batchNumber"><default-field title="Batch">
+                    <display default-text="-"/>
+                </default-field></field>
+                <field name="enteredBy"><default-field title="By">
+                    <display text="${w.firstName ?: ''} ${w.lastName ?: ''}"/>
+                </default-field></field>
+                <field name="deleteBtn"><default-field title="">
+                    <link url="deleteWastage" text="" icon="fa fa-trash" btn-type="danger"
+                          parameter-map="[wastageId:w.wastageId]"
+                          confirmation="Delete this wastage entry?"/>
+                </default-field></field>
+            </form-list>
+        </container>
+    </widgets>
+</screen>

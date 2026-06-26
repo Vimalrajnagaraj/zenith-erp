@@ -1,0 +1,166 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <!-- Export Journal Entries to Tally XML format -->
+    <service verb="export" noun="JournalsToTally">
+        <description>Export accounting journal entries in Tally-compatible XML format.
+            Generates Tally Day Book XML that can be imported via Tally Gateway.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="fromDate" type="Date" required="true"/>
+            <parameter name="toDate" type="Date" required="true"/>
+            <parameter name="companyName"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="tallyXml" type="String"/>
+            <parameter name="voucherCount" type="Integer"/>
+        </out-parameters>
+        <actions>
+            <entity-find entity-name="zenith.erp.accounting.JournalEntry" list="journals">
+                <econdition field-name="organizationPartyId"/>
+                <econdition field-name="transactionDate" operator="greater-equals" from="fromDate"/>
+                <econdition field-name="transactionDate" operator="less-equals" from="toDate"/>
+                <econdition field-name="statusId" value="JePosted"/>
+                <order-by field-name="transactionDate"/>
+            </entity-find>
+
+            <set field="voucherCount" from="journals?.size() ?: 0"/>
+            <script><![CDATA[
+                def sb = new StringBuilder()
+                sb.append('<?xml version="1.0" encoding="UTF-8"?>\n')
+                sb.append('<ENVELOPE>\n')
+                sb.append('  <HEADER>\n')
+                sb.append('    <TALLYREQUEST>Import Data</TALLYREQUEST>\n')
+                sb.append('  </HEADER>\n')
+                sb.append('  <BODY>\n')
+                sb.append('    <IMPORTDATA>\n')
+                sb.append('      <REQUESTDESC>\n')
+                sb.append('        <REPORTNAME>Vouchers</REPORTNAME>\n')
+                sb.append('        <STATICVARIABLES>\n')
+                sb.append('          <SVCURRENTCOMPANY>' + (companyName ?: 'Company') + '</SVCURRENTCOMPANY>\n')
+                sb.append('        </STATICVARIABLES>\n')
+                sb.append('      </REQUESTDESC>\n')
+                sb.append('      <REQUESTDATA>\n')
+
+                journals?.each { journal ->
+                    def txnDate = ec.l10n.format(journal.transactionDate, 'yyyyMMdd')
+                    def voucherType = 'Journal'
+                    if (journal.voucherType == 'Sales') voucherType = 'Sales'
+                    else if (journal.voucherType == 'Purchase') voucherType = 'Purchase'
+                    else if (journal.voucherType == 'Payment') voucherType = 'Payment'
+                    else if (journal.voucherType == 'Receipt') voucherType = 'Receipt'
+                    else if (journal.voucherType == 'Contra') voucherType = 'Contra'
+
+                    sb.append('        <TALLYMESSAGE xmlns:UDF="TallyUDF">\n')
+                    sb.append('          <VOUCHER VCHTYPE="' + voucherType + '" ACTION="Create">\n')
+                    sb.append('            <DATE>' + txnDate + '</DATE>\n')
+                    sb.append('            <VOUCHERTYPENAME>' + voucherType + '</VOUCHERTYPENAME>\n')
+                    sb.append('            <VOUCHERNUMBER>' + (journal.voucherNumber ?: journal.journalEntryId) + '</VOUCHERNUMBER>\n')
+                    sb.append('            <NARRATION>' + (journal.description ?: '') + '</NARRATION>\n')
+
+                    // Get line items
+                    def lines = ec.entity.find('zenith.erp.accounting.JournalEntryLine')
+                        .condition('journalEntryId', journal.journalEntryId).list()
+
+                    lines?.each { line ->
+                        def acctName = ''
+                        def acct = ec.entity.find('zenith.erp.accounting.GlAccount')
+                            .condition('glAccountId', line.glAccountId).one()
+                        if (acct) acctName = acct.accountName ?: acct.glAccountId
+
+                        if (line.debitAmount && line.debitAmount > 0) {
+                            sb.append('            <ALLLEDGERENTRIES.LIST>\n')
+                            sb.append('              <LEDGERNAME>' + acctName + '</LEDGERNAME>\n')
+                            sb.append('              <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>\n')
+                            sb.append('              <AMOUNT>-' + line.debitAmount + '</AMOUNT>\n')
+                            sb.append('            </ALLLEDGERENTRIES.LIST>\n')
+                        }
+                        if (line.creditAmount && line.creditAmount > 0) {
+                            sb.append('            <ALLLEDGERENTRIES.LIST>\n')
+                            sb.append('              <LEDGERNAME>' + acctName + '</LEDGERNAME>\n')
+                            sb.append('              <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>\n')
+                            sb.append('              <AMOUNT>' + line.creditAmount + '</AMOUNT>\n')
+                            sb.append('            </ALLLEDGERENTRIES.LIST>\n')
+                        }
+                    }
+
+                    sb.append('          </VOUCHER>\n')
+                    sb.append('        </TALLYMESSAGE>\n')
+                }
+
+                sb.append('      </REQUESTDATA>\n')
+                sb.append('    </IMPORTDATA>\n')
+                sb.append('  </BODY>\n')
+                sb.append('</ENVELOPE>')
+
+                tallyXml = sb.toString()
+            ]]></script>
+        </actions>
+    </service>
+
+    <!-- Export Chart of Accounts to Tally -->
+    <service verb="export" noun="LedgersToTally">
+        <description>Export GL accounts as Tally Ledger masters</description>
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="companyName"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="tallyXml" type="String"/>
+            <parameter name="ledgerCount" type="Integer"/>
+        </out-parameters>
+        <actions>
+            <entity-find entity-name="zenith.erp.accounting.GlAccount" list="accounts">
+                <econdition field-name="organizationPartyId"/>
+                <order-by field-name="accountCode"/>
+            </entity-find>
+            <set field="ledgerCount" from="accounts?.size() ?: 0"/>
+            <script><![CDATA[
+                def sb = new StringBuilder()
+                sb.append('<?xml version="1.0" encoding="UTF-8"?>\n')
+                sb.append('<ENVELOPE>\n')
+                sb.append('  <HEADER>\n')
+                sb.append('    <TALLYREQUEST>Import Data</TALLYREQUEST>\n')
+                sb.append('  </HEADER>\n')
+                sb.append('  <BODY>\n')
+                sb.append('    <IMPORTDATA>\n')
+                sb.append('      <REQUESTDESC>\n')
+                sb.append('        <REPORTNAME>All Masters</REPORTNAME>\n')
+                sb.append('        <STATICVARIABLES>\n')
+                sb.append('          <SVCURRENTCOMPANY>' + (companyName ?: 'Company') + '</SVCURRENTCOMPANY>\n')
+                sb.append('        </STATICVARIABLES>\n')
+                sb.append('      </REQUESTDESC>\n')
+                sb.append('      <REQUESTDATA>\n')
+
+                def tallyGroupMap = [
+                    'ASSET': 'Current Assets',
+                    'LIABILITY': 'Current Liabilities',
+                    'EQUITY': 'Capital Account',
+                    'REVENUE': 'Sales Accounts',
+                    'EXPENSE': 'Purchase Accounts',
+                    'INCOME': 'Direct Incomes',
+                    'COST_OF_GOODS': 'Direct Expenses'
+                ]
+
+                accounts?.each { acct ->
+                    def tallyGroup = tallyGroupMap[acct.accountClassification] ?: 'Sundry Debtors'
+                    sb.append('        <TALLYMESSAGE xmlns:UDF="TallyUDF">\n')
+                    sb.append('          <LEDGER NAME="' + (acct.accountName ?: acct.glAccountId) + '" ACTION="Create">\n')
+                    sb.append('            <PARENT>' + tallyGroup + '</PARENT>\n')
+                    sb.append('            <OPENINGBALANCE>0</OPENINGBALANCE>\n')
+                    sb.append('          </LEDGER>\n')
+                    sb.append('        </TALLYMESSAGE>\n')
+                }
+
+                sb.append('      </REQUESTDATA>\n')
+                sb.append('    </IMPORTDATA>\n')
+                sb.append('  </BODY>\n')
+                sb.append('</ENVELOPE>')
+
+                tallyXml = sb.toString()
+            ]]></script>
+        </actions>
+    </service>
+
+</services>

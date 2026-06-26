@@ -1,0 +1,225 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
+        default-menu-title="Offline Mode" default-menu-index="20">
+
+    <transition name="saveOfflineConfig">
+        <actions>
+            <entity-find-one entity-name="zenith.erp.pos.PosOfflineConfig" value-field="existing">
+                <field-map field-name="terminalId"/></entity-find-one>
+            <if condition="existing">
+                <service-call name="update#zenith.erp.pos.PosOfflineConfig"
+                    in-map="context"/>
+                <else>
+                    <service-call name="create#zenith.erp.pos.PosOfflineConfig"
+                        in-map="context"/>
+                </else>
+            </if>
+        </actions>
+        <default-response url="."/>
+    </transition>
+    <transition name="syncOfflineTransaction">
+        <actions>
+            <entity-find-one entity-name="zenith.erp.pos.PosOfflineTransaction" value-field="offlineTxn"/>
+            <if condition="offlineTxn">
+                <set field="offlineTxn.statusId" value="OtSynced"/>
+                <set field="offlineTxn.syncedTimestamp" from="ec.user.nowTimestamp"/>
+                <entity-update value-field="offlineTxn"/>
+                <message>Transaction synced successfully.</message>
+            </if>
+        </actions>
+        <default-response url="."/>
+    </transition>
+    <transition name="retrySync">
+        <actions>
+            <entity-find-one entity-name="zenith.erp.pos.PosOfflineTransaction" value-field="offlineTxn"/>
+            <if condition="offlineTxn">
+                <set field="offlineTxn.statusId" value="OtPending"/>
+                <set field="offlineTxn.syncAttempts" from="(offlineTxn.syncAttempts ?: 0) + 1"/>
+                <entity-update value-field="offlineTxn"/>
+                <message>Transaction queued for retry.</message>
+            </if>
+        </actions>
+        <default-response url="."/>
+    </transition>
+
+    <actions>
+        <!-- Get all terminals -->
+        <entity-find entity-name="zenith.erp.pos.PosTerminal" list="terminals">
+            <econdition field-name="isActive" value="Y"/>
+        </entity-find>
+
+        <!-- Get offline configs -->
+        <entity-find entity-name="zenith.erp.pos.PosOfflineConfig" list="offlineConfigs"/>
+
+        <!-- Get pending offline transactions -->
+        <entity-find entity-name="zenith.erp.pos.PosOfflineTransaction" list="pendingList">
+            <econdition field-name="statusId" operator="in" value="OtPending,OtFailed"/>
+            <order-by field-name="-offlineTimestamp"/>
+        </entity-find>
+
+        <!-- Get recently synced -->
+        <entity-find entity-name="zenith.erp.pos.PosOfflineTransaction" list="syncedList">
+            <econdition field-name="statusId" value="OtSynced"/>
+            <order-by field-name="-syncedTimestamp"/>
+            <limit count="20"/>
+        </entity-find>
+
+        <!-- Summary counts -->
+        <entity-find-count entity-name="zenith.erp.pos.PosOfflineTransaction" count-field="pendingCount">
+            <econdition field-name="statusId" value="OtPending"/>
+        </entity-find-count>
+        <entity-find-count entity-name="zenith.erp.pos.PosOfflineTransaction" count-field="failedCount">
+            <econdition field-name="statusId" value="OtFailed"/>
+        </entity-find-count>
+        <entity-find-count entity-name="zenith.erp.pos.PosOfflineTransaction" count-field="syncedCount">
+            <econdition field-name="statusId" value="OtSynced"/>
+        </entity-find-count>
+        <set field="enabledTerminals" from="offlineConfigs?.findAll { it.offlineEnabled == 'Y' }?.size() ?: 0"/>
+        
+        <script><![CDATA[
+            terminalConfigList = []
+            for (term in terminals) {
+                def conf = offlineConfigs.find { it.terminalId == term.terminalId }
+                terminalConfigList.add([
+                    terminalId: term.terminalId,
+                    terminalName: term.terminalName,
+                    offlineEnabled: conf?.offlineEnabled ?: 'N',
+                    maxOfflineTransactions: conf?.maxOfflineTransactions ?: 100,
+                    maxOfflineHours: conf?.maxOfflineHours ?: 24,
+                    autoSyncIntervalMinutes: conf?.autoSyncIntervalMinutes ?: 5,
+                    syncProductCatalog: conf?.syncProductCatalog ?: 'Y'
+                ])
+            }
+        ]]></script>
+    </actions>
+
+    <widgets>
+        <render-mode><text type="html,qvt" template="true"><![CDATA[<details id="posHelp_offline" open style="background:#e8f0fe;border:1px solid #4285f4;border-left:6px solid #1a73e8;border-radius:10px;padding:10px 16px;margin:8px 12px 4px 12px;font-family:Segoe UI,Arial,sans-serif"><summary style="cursor:pointer;font-weight:800;font-size:15px;color:#174ea6;outline:none">&#128244; Offline Mode &mdash; quick help <span style="font-weight:600;color:#5f6368;font-size:12px">(click to hide / show)</span></summary><div style="font-size:13px;color:#202124;line-height:1.9;margin-top:8px">Lets terminals keep billing when the internet drops &mdash; sales sync once it is back.<br><b>1</b>&nbsp;<b>Enable</b> it for the terminals that need it.<br><b>2</b>&nbsp;Watch the <b>Pending</b> / <b>Failed</b> counts here and re-sync if anything is stuck.</div></details>]]></text></render-mode>
+        <container style="row items-center justify-between q-mb-lg">
+            <container>
+                <label text="POS Offline Mode" type="h3" style="text-primary text-weight-bold q-my-none"/>
+                <label text="Configure offline capabilities and manage transaction sync queue" type="p" style="text-grey-7 q-mt-sm q-mb-none"/>
+            </container>
+        </container>
+
+        <!-- Status Cards -->
+        <container-row>
+            <row-col lg="3">
+                <container style="bg-white shadow-3 q-pa-lg text-center q-mb-md border-radius-lg">
+                    <label text="Enabled Terminals" type="p" style="text-grey-7 text-weight-bold q-mb-sm"/>
+                    <label text="${enabledTerminals}" type="h3" style="text-positive text-weight-bolder q-my-none"/>
+                </container>
+            </row-col>
+            <row-col lg="3">
+                <container style="bg-white shadow-3 q-pa-lg text-center q-mb-md border-radius-lg">
+                    <label text="Pending Sync" type="p" style="text-grey-7 text-weight-bold q-mb-sm"/>
+                    <label text="${pendingCount}" type="h3" style="text-warning text-weight-bolder q-my-none"/>
+                </container>
+            </row-col>
+            <row-col lg="3">
+                <container style="bg-white shadow-3 q-pa-lg text-center q-mb-md border-radius-lg">
+                    <label text="Failed" type="p" style="text-grey-7 text-weight-bold q-mb-sm"/>
+                    <label text="${failedCount}" type="h3" style="text-negative text-weight-bolder q-my-none"/>
+                </container>
+            </row-col>
+            <row-col lg="3">
+                <container style="bg-white shadow-3 q-pa-lg text-center q-mb-md border-radius-lg">
+                    <label text="Synced Today" type="p" style="text-grey-7 text-weight-bold q-mb-sm"/>
+                    <label text="${syncedCount}" type="h3" style="text-info text-weight-bolder q-my-none"/>
+                </container>
+            </row-col>
+        </container-row>
+
+        <!-- How It Works -->
+        <container style="bg-blue-1 shadow-2 border-radius-lg q-pa-lg q-mb-md">
+            <label text="How Offline Mode Works" type="h6" style="text-primary text-weight-bold q-mb-sm"/>
+            <label text="1. Enable offline mode for each terminal below." type="p" style="text-grey-8 q-mb-xs"/>
+            <label text="2. The POS terminal caches product catalog locally using browser IndexedDB storage." type="p" style="text-grey-8 q-mb-xs"/>
+            <label text="3. When internet connection is lost, transactions are saved locally in the browser." type="p" style="text-grey-8 q-mb-xs"/>
+            <label text="4. When connection is restored, offline transactions auto-sync to the server." type="p" style="text-grey-8 q-mb-xs"/>
+            <label text="5. Failed syncs are retried automatically. Manual retry is available below." type="p" style="text-grey-8 q-mb-none"/>
+        </container>
+
+        <!-- Terminal Offline Configuration -->
+        <container style="bg-white shadow-2 border-radius-lg q-pa-md q-mb-md">
+            <label text="Terminal Offline Configuration" type="h6" style="text-weight-bold q-mb-md"/>
+            <form-list name="OfflineConfigList" list="terminalConfigList" transition="saveOfflineConfig">
+                <field name="terminalId"><default-field><hidden/></default-field></field>
+                <field name="terminalName"><default-field title="Terminal"><display/></default-field></field>
+                <field name="offlineEnabled"><default-field title="Offline Enabled">
+                    <drop-down allow-empty="false">
+                        <option key="Y" text="Yes"/>
+                        <option key="N" text="No"/>
+                    </drop-down>
+                </default-field></field>
+                <field name="maxOfflineTransactions"><default-field title="Max Txns">
+                    <text-line size="5"/>
+                </default-field></field>
+                <field name="maxOfflineHours"><default-field title="Max Hours">
+                    <text-line size="5"/>
+                </default-field></field>
+                <field name="autoSyncIntervalMinutes"><default-field title="Sync Interval (min)">
+                    <text-line size="5"/>
+                </default-field></field>
+                <field name="syncProductCatalog"><default-field title="Cache Catalog">
+                    <drop-down allow-empty="false">
+                        <option key="Y" text="Yes"/>
+                        <option key="N" text="No"/>
+                    </drop-down>
+                </default-field></field>
+                <field name="submitButton"><default-field title="Save"><submit/></default-field></field>
+            </form-list>
+        </container>
+
+        <!-- Pending Sync Queue -->
+        <section name="PendingSection" condition="pendingList">
+            <widgets>
+                <container style="bg-orange-1 shadow-2 border-radius-lg q-pa-md q-mb-md">
+                    <label text="Pending / Failed Transactions" type="h6" style="text-warning text-weight-bold q-mb-md"/>
+                    <form-list name="PendingSyncList" list="pendingList" skip-form="true">
+                        <field name="offlineTransactionId"><default-field title="Offline ID"><display/></default-field></field>
+                        <field name="terminalId"><default-field title="Terminal">
+                            <display-entity entity-name="zenith.erp.pos.PosTerminal" text="${terminalName}"/>
+                        </default-field></field>
+                        <field name="offlineTimestamp"><default-field title="Offline Time"><display format="dd-MMM HH:mm"/></default-field></field>
+                        <field name="itemCount"><default-field title="Items"><display/></default-field></field>
+                        <field name="grandTotal"><default-field title="Amount"><display format="#,##0.00"/></default-field></field>
+                        <field name="paymentMethod"><default-field title="Payment"><display/></default-field></field>
+                        <field name="syncAttempts"><default-field title="Attempts"><display/></default-field></field>
+                        <field name="statusId"><default-field title="Status">
+                            <display-entity entity-name="moqui.basic.StatusItem" key-field-name="statusId" text="${description}"/>
+                        </default-field></field>
+                        <field name="actions"><default-field title="">
+                            <link url="syncOfflineTransaction" text="Sync Now" btn-type="success" style="q-btn--dense q-mr-xs"
+                                  parameter-map="[offlineTransactionId: offlineTransactionId]"
+                                  condition="statusId == 'OtPending'"/>
+                            <link url="retrySync" text="Retry" btn-type="warning" style="q-btn--dense"
+                                  parameter-map="[offlineTransactionId: offlineTransactionId]"
+                                  condition="statusId == 'OtFailed'"/>
+                        </default-field></field>
+                    </form-list>
+                </container>
+            </widgets>
+        </section>
+
+        <!-- Recently Synced -->
+        <section name="SyncedSection" condition="syncedList">
+            <widgets>
+                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md">
+                    <label text="Recently Synced Transactions" type="h6" style="text-weight-bold q-mb-md"/>
+                    <form-list name="SyncedList" list="syncedList" skip-form="true" show-csv-button="true">
+                        <field name="offlineTransactionId"><default-field title="ID"><display/></default-field></field>
+                        <field name="terminalId"><default-field title="Terminal">
+                            <display-entity entity-name="zenith.erp.pos.PosTerminal" text="${terminalName}"/>
+                        </default-field></field>
+                        <field name="offlineTimestamp"><default-field title="Offline At"><display format="dd-MMM HH:mm"/></default-field></field>
+                        <field name="syncedTimestamp"><default-field title="Synced At"><display format="dd-MMM HH:mm"/></default-field></field>
+                        <field name="grandTotal"><default-field title="Amount"><display format="#,##0.00"/></default-field></field>
+                        <field name="createdTransactionId"><default-field title="Transaction ID"><display/></default-field></field>
+                    </form-list>
+                </container>
+            </widgets>
+        </section>
+    </widgets>
+</screen>

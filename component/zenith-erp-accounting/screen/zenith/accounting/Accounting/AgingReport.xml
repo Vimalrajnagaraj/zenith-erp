@@ -1,0 +1,234 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
+        default-menu-title="AR/AP Aging" default-menu-index="13">
+
+    <parameter name="reportType" value="AR"/>
+
+    <transition name="exportCsv" read-only="true">
+        <actions><script><![CDATA[
+            def title = reportType == 'AP' ? 'Accounts Payable Aging Report' : 'Accounts Receivable Aging Report'
+            StringBuilder csv = new StringBuilder()
+            csv.append('﻿')
+            csv.append("${title}\n")
+            csv.append("As of: ${ec.l10n.format(new Date(), 'dd-MMM-yyyy')}\n\n")
+            csv.append("Party Name,Current,1-30 Days,31-60 Days,61-90 Days,91-120 Days,120+ Days,Total\n")
+
+            for (def row : agingRows) {
+                csv.append("\"${row.partyName}\",")
+                csv.append("${ec.l10n.format(row.current, '#,##0.00')},")
+                csv.append("${ec.l10n.format(row.days30, '#,##0.00')},")
+                csv.append("${ec.l10n.format(row.days60, '#,##0.00')},")
+                csv.append("${ec.l10n.format(row.days90, '#,##0.00')},")
+                csv.append("${ec.l10n.format(row.days120, '#,##0.00')},")
+                csv.append("${ec.l10n.format(row.days120plus, '#,##0.00')},")
+                csv.append("${ec.l10n.format(row.total, '#,##0.00')}\n")
+            }
+
+            csv.append("\n\"TOTAL\",")
+            csv.append("${ec.l10n.format(totals.current, '#,##0.00')},")
+            csv.append("${ec.l10n.format(totals.days30, '#,##0.00')},")
+            csv.append("${ec.l10n.format(totals.days60, '#,##0.00')},")
+            csv.append("${ec.l10n.format(totals.days90, '#,##0.00')},")
+            csv.append("${ec.l10n.format(totals.days120, '#,##0.00')},")
+            csv.append("${ec.l10n.format(totals.days120plus, '#,##0.00')},")
+            csv.append("${ec.l10n.format(totals.total, '#,##0.00')}\n")
+
+            ec.web.response.setContentType("text/csv; charset=utf-8")
+            ec.web.response.setHeader("Content-Disposition", "attachment; filename=\"${reportType}_Aging_Report.csv\"")
+            ec.web.response.writer.write(csv.toString())
+            ec.web.response.writer.flush()
+        ]]></script></actions>
+        <default-response type="none"/>
+    </transition>
+
+    <actions>
+        <set field="reportType" from="reportType ?: 'AR'"/>
+        <set field="isAR" from="reportType == 'AR'"/>
+        <set field="invoiceType" from="isAR ? 'InvoiceSales' : 'InvoicePurchase'"/>
+        <set field="reportTitle" from="isAR ? 'Accounts Receivable (AR) Aging Report' : 'Accounts Payable (AP) Aging Report'"/>
+
+        <!-- Fetch unpaid invoices -->
+        <entity-find entity-name="mantle.account.invoice.Invoice" list="openInvoices">
+            <econdition field-name="invoiceTypeEnumId" from="invoiceType"/>
+            <econdition field-name="statusId" operator="in" value="InvoiceFinalized,InvoiceSent,InvoiceApproved,InvoiceReceived"/>
+        </entity-find>
+
+        <script><![CDATA[
+            def today = new java.util.Date()
+            def partyMap = [:]
+
+            for (def inv : openInvoices) {
+                def partyId = isAR ? (inv.toPartyId ?: inv.fromPartyId) : (inv.fromPartyId ?: inv.toPartyId)
+                def unpaid = inv.unpaidTotal ?: inv.invoiceTotal ?: 0
+                if (unpaid == 0) continue
+
+                def invDate = inv.invoiceDate ?: inv.entryDate
+                if (!invDate) continue
+                def daysOverdue = ((today.time - invDate.time) / 86400000).intValue()
+
+                if (!partyMap[partyId]) {
+                    def partyDetail = ec.entity.find("mantle.party.PartyDetail").condition("partyId", partyId).one()
+                    def pName = partyDetail?.organizationName ?: "${partyDetail?.firstName ?: ''} ${partyDetail?.lastName ?: ''}".trim() ?: partyId
+                    partyMap[partyId] = [partyId: partyId, partyName: pName,
+                        current: 0.0, days30: 0.0, days60: 0.0, days90: 0.0, days120: 0.0, days120plus: 0.0, total: 0.0]
+                }
+
+                def bucket = partyMap[partyId]
+                bucket.total += unpaid
+                if (daysOverdue <= 0) bucket.current += unpaid
+                else if (daysOverdue <= 30) bucket.days30 += unpaid
+                else if (daysOverdue <= 60) bucket.days60 += unpaid
+                else if (daysOverdue <= 90) bucket.days90 += unpaid
+                else if (daysOverdue <= 120) bucket.days120 += unpaid
+                else bucket.days120plus += unpaid
+            }
+
+            agingRows = partyMap.values().toList().sort { a, b -> b.total <=> a.total }
+
+            if (agingRows.isEmpty()) {
+                showDemo = true
+                if (isAR) {
+                    agingRows = [
+                        [partyName:'Reliance Retail Ltd.', current:180000, days30:95000, days60:45000, days90:0, days120:0, days120plus:0, total:320000],
+                        [partyName:'Tata Consumer Products', current:120000, days30:80000, days60:0, days90:25000, days120:0, days120plus:0, total:225000],
+                        [partyName:'DMart Ready', current:95000, days30:45000, days60:30000, days90:15000, days120:10000, days120plus:0, total:195000],
+                        [partyName:'BigBasket (Supermarket)', current:75000, days30:50000, days60:25000, days90:0, days120:0, days120plus:12000, total:162000],
+                        [partyName:'Spencer Retail', current:60000, days30:35000, days60:0, days90:0, days120:0, days120plus:0, total:95000],
+                        [partyName:'Metro Cash & Carry', current:45000, days30:0, days60:20000, days90:10000, days120:5000, days120plus:8000, total:88000]
+                    ]
+                } else {
+                    agingRows = [
+                        [partyName:'ABC Wholesale Supplies', current:250000, days30:120000, days60:50000, days90:0, days120:0, days120plus:0, total:420000],
+                        [partyName:'PQR Packaging Ltd.', current:85000, days30:65000, days60:30000, days90:20000, days120:0, days120plus:0, total:200000],
+                        [partyName:'Fresh Farm Produce', current:120000, days30:45000, days60:0, days90:0, days120:0, days120plus:0, total:165000],
+                        [partyName:'National Distributors', current:60000, days30:40000, days60:25000, days90:15000, days120:10000, days120plus:5000, total:155000],
+                        [partyName:'City Logistics Corp.', current:45000, days30:30000, days60:0, days90:0, days120:0, days120plus:0, total:75000]
+                    ]
+                }
+            }
+
+            totals = [current:0, days30:0, days60:0, days90:0, days120:0, days120plus:0, total:0]
+            for (def r : agingRows) {
+                totals.current += r.current
+                totals.days30 += r.days30
+                totals.days60 += r.days60
+                totals.days90 += r.days90
+                totals.days120 += r.days120
+                totals.days120plus += r.days120plus
+                totals.total += r.total
+            }
+
+            overdueTotal = totals.days30 + totals.days60 + totals.days90 + totals.days120 + totals.days120plus
+            overduePercent = totals.total > 0 ? ((overdueTotal / totals.total) * 100).intValue() : 0
+        ]]></script>
+    </actions>
+
+    <widgets>
+        <container style="row items-center justify-between q-mb-lg">
+            <container>
+                <label text="${reportTitle}" type="h3" style="text-primary text-weight-bold q-my-none"/>
+                <label text="As of ${ec.l10n.format(new java.util.Date(), 'dd MMMM, yyyy')}" type="p" style="text-grey-7 q-mt-sm q-mb-none"/>
+            </container>
+            <container style="row q-gutter-sm">
+                <form-single name="TypeToggle" transition="." dynamic="true">
+                    <field name="reportType"><default-field title="">
+                        <drop-down allow-empty="false" submit-on-select="true">
+                            <option key="AR" text="Receivables (AR)"/>
+                            <option key="AP" text="Payables (AP)"/>
+                        </drop-down>
+                    </default-field></field>
+                </form-single>
+                <link url="exportCsv" text="Export CSV" icon="fa fa-file-csv" link-type="anchor" target-window="_blank"
+                      style="q-btn q-btn-item non-selectable no-outline q-btn--standard q-btn--rectangle bg-secondary text-white q-btn--actionable q-focusable q-hoverable text-weight-bold q-px-md"/>
+            </container>
+        </container>
+
+        <section name="DemoNotice" condition="showDemo"><widgets>
+            <container style="bg-amber-1 text-amber-10 q-pa-md q-mb-md" style-type="border-radius: 8px;">
+                <label text="Displaying demo data — create and finalize invoices to see actual aging." style="text-weight-medium"/>
+            </container>
+        </widgets></section>
+
+        <!-- Summary Cards -->
+        <container-row>
+            <row-col lg="3">
+                <container style="bg-white shadow-3 q-pa-lg text-center q-mb-md">
+                    <label text="Total Outstanding" type="p" style="text-grey-7 text-weight-bold q-mb-sm"/>
+                    <label text="${currSymbol}${ec.l10n.format(totals.total, '#,##,##0')}" type="h4" style="text-primary text-weight-bolder q-my-none"/>
+                </container>
+            </row-col>
+            <row-col lg="3">
+                <container style="bg-white shadow-3 q-pa-lg text-center q-mb-md">
+                    <label text="Current (Not Due)" type="p" style="text-grey-7 text-weight-bold q-mb-sm"/>
+                    <label text="${currSymbol}${ec.l10n.format(totals.current, '#,##,##0')}" type="h4" style="text-positive text-weight-bolder q-my-none"/>
+                </container>
+            </row-col>
+            <row-col lg="3">
+                <container style="bg-white shadow-3 q-pa-lg text-center q-mb-md">
+                    <label text="Total Overdue" type="p" style="text-grey-7 text-weight-bold q-mb-sm"/>
+                    <label text="${currSymbol}${ec.l10n.format(overdueTotal, '#,##,##0')}" type="h4" style="text-negative text-weight-bolder q-my-none"/>
+                </container>
+            </row-col>
+            <row-col lg="3">
+                <container style="bg-white shadow-3 q-pa-lg text-center q-mb-md">
+                    <label text="Overdue %" type="p" style="text-grey-7 text-weight-bold q-mb-sm"/>
+                    <label text="${overduePercent}%" type="h4" style="${overduePercent > 50 ? 'text-negative' : overduePercent > 25 ? 'text-warning' : 'text-positive'} text-weight-bolder q-my-none"/>
+                </container>
+            </row-col>
+        </container-row>
+
+        <!-- Aging Table -->
+        <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md">
+            <render-mode><text type="html,vuet,qvt"><![CDATA[
+                <div class="q-markup-table q-table__container q-table__card q-table--horizontal-separator q-table--flat">
+                <table class="q-table" style="width: 100%;">
+                    <thead>
+                        <tr class="bg-indigo-8 text-white">
+                            <th class="text-left text-weight-bold">${isAR ? 'Customer' : 'Vendor'}</th>
+                            <th class="text-right text-weight-bold">Current</th>
+                            <th class="text-right text-weight-bold">1-30 Days</th>
+                            <th class="text-right text-weight-bold">31-60 Days</th>
+                            <th class="text-right text-weight-bold">61-90 Days</th>
+                            <th class="text-right text-weight-bold">91-120 Days</th>
+                            <th class="text-right text-weight-bold">120+ Days</th>
+                            <th class="text-right text-weight-bold">Total</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <#list agingRows as row>
+                            <tr class="${row_index % 2 == 0 ? '' : 'bg-grey-1'}">
+                                <td class="text-weight-medium">${row.partyName}</td>
+                                <td class="text-right text-positive"><#if row.current != 0>${ec.l10n.format(row.current, '#,##0')}</#if></td>
+                                <td class="text-right <#if row.days30 != 0>text-amber-8</#if>"><#if row.days30 != 0>${ec.l10n.format(row.days30, '#,##0')}</#if></td>
+                                <td class="text-right <#if row.days60 != 0>text-orange-8</#if>"><#if row.days60 != 0>${ec.l10n.format(row.days60, '#,##0')}</#if></td>
+                                <td class="text-right <#if row.days90 != 0>text-deep-orange</#if>"><#if row.days90 != 0>${ec.l10n.format(row.days90, '#,##0')}</#if></td>
+                                <td class="text-right <#if row.days120 != 0>text-red-8</#if>"><#if row.days120 != 0>${ec.l10n.format(row.days120, '#,##0')}</#if></td>
+                                <td class="text-right <#if row.days120plus != 0>text-red-10 text-weight-bold</#if>"><#if row.days120plus != 0>${ec.l10n.format(row.days120plus, '#,##0')}</#if></td>
+                                <td class="text-right text-weight-bold">${ec.l10n.format(row.total, '#,##0')}</td>
+                            </tr>
+                        </#list>
+                    </tbody>
+                    <tfoot>
+                        <tr class="text-weight-bolder bg-grey-3" style="font-size: 1.05em;">
+                            <td class="text-weight-bold">TOTAL</td>
+                            <td class="text-right">${ec.l10n.format(totals.current, '#,##0')}</td>
+                            <td class="text-right">${ec.l10n.format(totals.days30, '#,##0')}</td>
+                            <td class="text-right">${ec.l10n.format(totals.days60, '#,##0')}</td>
+                            <td class="text-right">${ec.l10n.format(totals.days90, '#,##0')}</td>
+                            <td class="text-right">${ec.l10n.format(totals.days120, '#,##0')}</td>
+                            <td class="text-right">${ec.l10n.format(totals.days120plus, '#,##0')}</td>
+                            <td class="text-right">${ec.l10n.format(totals.total, '#,##0')}</td>
+                        </tr>
+                    </tfoot>
+                </table>
+                </div>
+            ]]></text></render-mode>
+        </container>
+
+        <container style="q-mt-md text-center">
+            <link url="javascript:window.print()" url-type="plain" link-type="anchor" text="Print / Download PDF" icon="picture_as_pdf"
+                  class="q-btn q-btn--standard bg-primary text-white q-mr-sm"/>
+        </container>
+    </widgets>
+</screen>

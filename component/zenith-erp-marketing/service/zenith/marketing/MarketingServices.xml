@@ -1,0 +1,222 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <!-- ========== Campaign Management ========== -->
+
+    <service verb="create" noun="Campaign">
+        <in-parameters>
+            <parameter name="campaignName" required="true"/>
+            <parameter name="campaignType" default-value="Email"/>
+            <parameter name="templateId"/>
+            <parameter name="contactListId"/>
+            <parameter name="subject"/>
+            <parameter name="senderName"/>
+            <parameter name="senderEmail"/>
+            <parameter name="smsGatewayId"/>
+            <parameter name="smsMessage"/>
+            <parameter name="smsDltTemplateId"/>
+            <parameter name="scheduledDate" type="Timestamp"/>
+        </in-parameters>
+        <out-parameters><parameter name="campaignId"/></out-parameters>
+        <actions>
+            <service-call name="create#zenith.erp.marketing.MarketingCampaign" out-map="context"
+                in-map="[campaignName:campaignName, campaignType:campaignType,
+                         templateId:templateId, contactListId:contactListId,
+                         subject:subject, senderName:senderName, senderEmail:senderEmail,
+                         smsGatewayId:smsGatewayId, smsMessage:smsMessage,
+                         smsDltTemplateId:smsDltTemplateId, scheduledDate:scheduledDate,
+                         statusId:'McpDraft', totalRecipients:0, totalSent:0, totalDelivered:0,
+                         totalOpened:0, totalClicked:0, totalBounced:0, totalUnsubscribed:0]"/>
+        </actions>
+    </service>
+
+    <service verb="schedule" noun="Campaign">
+        <in-parameters>
+            <parameter name="campaignId" required="true"/>
+            <parameter name="scheduledDate" type="Timestamp" required="true"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.marketing.MarketingCampaign" value-field="campaign"/>
+            <if condition="campaign.statusId != 'McpDraft'">
+                <return error="true" message="Campaign must be in Draft status to schedule"/></if>
+            <service-call name="update#zenith.erp.marketing.MarketingCampaign"
+                in-map="[campaignId:campaignId, scheduledDate:scheduledDate, statusId:'McpScheduled']"/>
+        </actions>
+    </service>
+
+    <service verb="send" noun="Campaign">
+        <description>Prepares campaign for sending by loading recipients from contact list</description>
+        <in-parameters><parameter name="campaignId" required="true"/></in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.marketing.MarketingCampaign" value-field="campaign"/>
+            <if condition="campaign.statusId != 'McpDraft' &amp;&amp; campaign.statusId != 'McpScheduled'">
+                <return error="true" message="Campaign must be in Draft or Scheduled status"/></if>
+
+            <!-- Load recipients from contact list -->
+            <entity-find entity-name="zenith.erp.marketing.ContactListMember" list="members">
+                <econdition field-name="listId" from="campaign.contactListId"/>
+                <econdition field-name="isSubscribed" value="Y"/>
+            </entity-find>
+
+            <set field="seqNum" from="0" type="Integer"/>
+            <iterate list="members" entry="member">
+                <set field="seqNum" from="seqNum + 1"/>
+                <set field="channel" from="campaign.campaignType == 'SMS' ? 'SMS' : 'Email'"/>
+                <service-call name="create#zenith.erp.marketing.CampaignRecipient"
+                    in-map="[campaignId:campaignId,
+                             recipientSeqId:String.format('%05d', seqNum),
+                             partyId:member.partyId, email:member.email, phone:member.phone,
+                             channel:channel, statusId:'Queued']"/>
+            </iterate>
+
+            <service-call name="update#zenith.erp.marketing.MarketingCampaign"
+                in-map="[campaignId:campaignId, statusId:'McpSending',
+                         sentDate:ec.user.nowTimestamp, totalRecipients:seqNum]"/>
+        </actions>
+    </service>
+
+    <service verb="cancel" noun="Campaign">
+        <in-parameters><parameter name="campaignId" required="true"/></in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.marketing.MarketingCampaign" value-field="campaign"/>
+            <if condition="campaign.statusId == 'McpSent'">
+                <return error="true" message="Cannot cancel a sent campaign"/></if>
+            <service-call name="update#zenith.erp.marketing.MarketingCampaign"
+                in-map="[campaignId:campaignId, statusId:'McpCancelled']"/>
+        </actions>
+    </service>
+
+    <service verb="complete" noun="Campaign">
+        <in-parameters><parameter name="campaignId" required="true"/></in-parameters>
+        <actions>
+            <!-- Aggregate stats from recipients -->
+            <entity-find entity-name="zenith.erp.marketing.CampaignRecipient" list="recipients">
+                <econdition field-name="campaignId"/></entity-find>
+            <script><![CDATA[
+                def sent = 0; def delivered = 0; def opened = 0
+                def clicked = 0; def bounced = 0
+                recipients.each { r ->
+                    if (r.statusId == 'Sent' || r.statusId == 'Delivered' || r.statusId == 'Opened' || r.statusId == 'Clicked') sent++
+                    if (r.statusId == 'Delivered' || r.statusId == 'Opened' || r.statusId == 'Clicked') delivered++
+                    if (r.statusId == 'Opened' || r.statusId == 'Clicked') opened++
+                    if (r.statusId == 'Clicked') clicked++
+                    if (r.statusId == 'Bounced') bounced++
+                }
+            ]]></script>
+            <service-call name="update#zenith.erp.marketing.MarketingCampaign"
+                in-map="[campaignId:campaignId, statusId:'McpSent',
+                         totalSent:sent, totalDelivered:delivered,
+                         totalOpened:opened, totalClicked:clicked, totalBounced:bounced]"/>
+        </actions>
+    </service>
+
+    <!-- ========== Contact List Management ========== -->
+
+    <service verb="addMember" noun="ContactList">
+        <in-parameters>
+            <parameter name="listId" required="true"/>
+            <parameter name="partyId" required="true"/>
+            <parameter name="email"/>
+            <parameter name="phone"/>
+            <parameter name="firstName"/>
+            <parameter name="lastName"/>
+        </in-parameters>
+        <actions>
+            <service-call name="store#zenith.erp.marketing.ContactListMember"
+                in-map="[listId:listId, partyId:partyId, email:email, phone:phone,
+                         firstName:firstName, lastName:lastName,
+                         isSubscribed:'Y', subscribedDate:ec.user.nowTimestamp]"/>
+            <!-- Update subscriber count -->
+            <entity-find entity-name="zenith.erp.marketing.ContactListMember" list="activeMembers">
+                <econdition field-name="listId"/>
+                <econdition field-name="isSubscribed" value="Y"/>
+            </entity-find>
+            <service-call name="update#zenith.erp.marketing.ContactList"
+                in-map="[listId:listId, totalSubscribers:activeMembers.size()]"/>
+        </actions>
+    </service>
+
+    <service verb="unsubscribe" noun="ContactListMember">
+        <in-parameters>
+            <parameter name="listId" required="true"/>
+            <parameter name="partyId" required="true"/>
+        </in-parameters>
+        <actions>
+            <service-call name="update#zenith.erp.marketing.ContactListMember"
+                in-map="[listId:listId, partyId:partyId, isSubscribed:'N',
+                         unsubscribedDate:ec.user.nowTimestamp]"/>
+            <entity-find entity-name="zenith.erp.marketing.ContactListMember" list="activeMembers">
+                <econdition field-name="listId"/>
+                <econdition field-name="isSubscribed" value="Y"/>
+            </entity-find>
+            <service-call name="update#zenith.erp.marketing.ContactList"
+                in-map="[listId:listId, totalSubscribers:activeMembers.size()]"/>
+        </actions>
+    </service>
+
+    <!-- ========== SMS (Indian Gateway - Phase 1: Payload) ========== -->
+
+    <service verb="build" noun="SmsPayload">
+        <description>Builds SMS API payload for Indian gateways (MSG91, Kaleyra, TextLocal). Phase 2 adds actual API calls.</description>
+        <in-parameters>
+            <parameter name="gatewayId" required="true"/>
+            <parameter name="phone" required="true"/>
+            <parameter name="message" required="true"/>
+            <parameter name="dltTemplateId"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="payload" type="Map"/>
+            <parameter name="apiUrl"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.marketing.SmsGateway" value-field="gateway"/>
+            <if condition="!gateway">
+                <return error="true" message="SMS gateway ${gatewayId} not found"/></if>
+
+            <script><![CDATA[
+                def baseUrl = gateway.apiBaseUrl ?: ""
+                def provider = gateway.providerCode
+
+                if (provider == "MSG91") {
+                    apiUrl = baseUrl + "/api/v5/flow/"
+                    payload = [
+                        sender: gateway.senderId,
+                        route: "4",
+                        DLT_TE_ID: dltTemplateId ?: gateway.dltEntityId,
+                        mobiles: phone.replaceAll("[^0-9]", ""),
+                        message: message,
+                        authkey: gateway.apiKey
+                    ]
+                } else if (provider == "KALEYRA") {
+                    apiUrl = baseUrl + "/v1/messages"
+                    payload = [
+                        to: phone.replaceAll("[^0-9]", ""),
+                        sender: gateway.senderId,
+                        body: message,
+                        template_id: dltTemplateId,
+                        type: "OTP"
+                    ]
+                } else if (provider == "TEXTLOCAL") {
+                    apiUrl = baseUrl + "/send/"
+                    payload = [
+                        apikey: gateway.apiKey,
+                        numbers: phone.replaceAll("[^0-9]", ""),
+                        message: message,
+                        sender: gateway.senderId
+                    ]
+                } else {
+                    payload = [phone: phone, message: message, sender: gateway.senderId]
+                    apiUrl = baseUrl
+                }
+            ]]></script>
+
+            <!-- Log the SMS attempt -->
+            <service-call name="create#zenith.erp.marketing.SmsLog"
+                in-map="[gatewayId:gatewayId, phone:phone, message:message,
+                         dltTemplateId:dltTemplateId, statusId:'Queued',
+                         sentDate:ec.user.nowTimestamp]"/>
+        </actions>
+    </service>
+
+</services>

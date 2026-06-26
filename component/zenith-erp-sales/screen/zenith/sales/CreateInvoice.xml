@@ -1,0 +1,162 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
+        default-menu-title="Create Invoice" default-menu-include="false">
+
+    <parameter name="partyId"/>
+
+    <transition name="createInvoice">
+        <!-- 1. Resolve Document Type based on parameters -->
+        <script>
+            def docType = "Tax Invoice"
+            def __it = ec.web.parameters.invoiceType
+            if (__it == 'BillOfSupply') docType = "Bill of Supply"
+            else if (__it == 'ExportInvoice') docType = "Export Invoice"
+            
+            // Generate basic invoice ID
+            inMap = [fromPartyId: ec.user.getPreference('ACTIVE_ORGANIZATION'), toPartyId: ec.web.parameters.toPartyId, invoiceDate: ec.web.parameters.invoiceDate, currencyUomId: 'INR'] + [
+                invoiceTypeEnumId: 'InvoiceSales',
+                statusId: 'InvoiceInProcess',
+                documentType: docType
+            ]
+        </script>
+        <service-call name="create#mantle.account.invoice.Invoice" out-map="createOut" in-map="[fromPartyId:ec.user.getPreference(&apos;ACTIVE_ORGANIZATION&apos;), toPartyId:ec.web.parameters.toPartyId, invoiceDate:ec.web.parameters.invoiceDate, currencyUomId:&apos;INR&apos;, invoiceTypeEnumId:&apos;InvoiceSales&apos;, statusId:&apos;InvoiceInProcess&apos;, documentType:(ec.web.parameters.invoiceType == &apos;BillOfSupply&apos; ? &apos;Bill of Supply&apos; : (ec.web.parameters.invoiceType == &apos;ExportInvoice&apos; ? &apos;Export Invoice&apos; : &apos;Tax Invoice&apos;))]"/>
+        
+        <!-- Generate generic GST Invoice Number if not provided -->
+        <if condition="!ec.web.parameters.gstInvoiceNumber">
+            <set field="__yy" from="Integer.parseInt(ec.l10n.format(ec.user.nowTimestamp, 'yy'))"/>
+            <set field="__fy" from="ec.l10n.format(ec.user.nowTimestamp, 'yy') + '-' + (__yy + 1)"/>
+            <service-call name="update#mantle.account.invoice.Invoice" in-map="[invoiceId:createOut.invoiceId, gstInvoiceNumber:('INV/' + __fy + '/' + createOut.invoiceId), financialYearPrefix:__fy]"/>
+        </if>
+        
+        <default-response url="../EditInvoice">
+            <parameter name="invoiceId" value="${createOut.invoiceId}"/>
+        </default-response>
+    </transition>
+
+    <transition name="getCustomers" read-only="true">
+        <parameter name="term"/>
+        <actions>
+            <entity-find entity-name="mantle.party.PartyDetailAndRole" list="partyList" limit="20" distinct="true">
+                <econdition field-name="roleTypeId" value="Customer"/>
+                <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+                <econditions combine="or">
+                    <econdition field-name="partyId" operator="like" value="%${term}%" ignore-case="true"/>
+                    <econdition field-name="organizationName" operator="like" value="%${term}%" ignore-case="true"/>
+                    <econdition field-name="firstName" operator="like" value="%${term}%" ignore-case="true"/>
+                    <econdition field-name="lastName" operator="like" value="%${term}%" ignore-case="true"/>
+                </econditions>
+                <select-field field-name="partyId,organizationName,firstName,lastName"/>
+                <order-by field-name="organizationName,firstName,lastName"/>
+            </entity-find>
+            <script>
+                def outList = []
+                for (party in partyList) outList.add([value:party.partyId, label:party.organizationName ?: ((party.firstName?:'') + ' ' + (party.lastName?:'')).trim() + ' [' + party.partyId + ']'])
+                if (partyId) {
+                    def existing = ec.entity.find("mantle.party.PartyDetailAndRole").condition("partyId", partyId).one()
+                    if (existing) outList.add(0, [value:existing.partyId, label:existing.organizationName ?: ((existing.firstName?:'') + ' ' + (existing.lastName?:'')).trim() + ' [' + existing.partyId + ']'])
+                }
+                ec.web.sendJsonResponse(outList)
+            </script>
+        </actions>
+        <default-response type="none"/>
+    </transition>
+
+    <actions>
+        <set field="activeOrgId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+        <entity-find-one entity-name="mantle.party.Organization" value-field="activeOrg">
+            <field-map field-name="partyId" from="activeOrgId"/>
+        </entity-find-one>
+        <set field="activeOrgName" from="activeOrg?.organizationName ?: activeOrgId"/>
+    </actions>
+
+    <widgets>
+        <container style="q-mb-md">
+            <link url="../FindInvoice" text="Back to Invoices" icon="arrow_back" style="q-btn--flat bg-grey-2 text-dark border-radius-md q-px-md"/>
+        </container>
+
+        <container-row>
+            <row-col lg="8" md="10" sm="12" style="q-mx-auto">
+                <container style="zenith-card bg-white shadow-4 border-radius-xl q-pa-xl q-mt-md">
+                    <container-row>
+                        <row-col>
+                            <container style="row items-center q-mb-lg">
+                                <container style="q-pa-md bg-indigo-1 border-radius-md q-mr-md text-indigo-8">
+                                    <render-mode><text type="html"><![CDATA[<q-icon name="receipt_long" class="text-h3"/>]]></text></render-mode>
+                                </container>
+                                <container>
+                                    <label text="Create Tax Invoice" type="h4" style="text-dark text-weight-bolder q-mt-none q-mb-xs"/>
+                                    <label text="Pick the customer and date to start a new invoice — GST is added for you." type="p" style="text-grey-7 text-subtitle1 q-mb-none"/>
+                                </container>
+                            </container>
+                            <label text="" type="hr" style="q-mb-xl bg-grey-3" size="1"/>
+                        </row-col>
+                    </container-row>
+
+                    <form-single name="CreateInvoiceForm" transition="createInvoice">
+                        <field name="fromPartyId"><default-field><hidden default-value="${activeOrgId}"/></default-field></field>
+                        <field name="supplierName"><default-field title="Supplier (Organization)"><display text="${activeOrgName}"/></default-field></field>
+                        
+                        <field name="toPartyId">
+                            <default-field title="Buyer (Customer)">
+                                <drop-down allow-empty="true">
+                                    <entity-options key="${partyId}" text="${(organizationName ?: ((firstName?:'') + ' ' + (lastName?:'')).trim()) ?: partyId} [${partyId}]">
+                                        <entity-find entity-name="mantle.party.PartyDetailAndRole" distinct="true">
+                                            <econdition field-name="roleTypeId" value="Customer"/>
+                                            <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+                                            <order-by field-name="organizationName,firstName,lastName"/>
+                                        </entity-find>
+                                    </entity-options>
+                                </drop-down>
+                            </default-field>
+                        </field>
+                        
+                        <field name="invoiceType">
+                            <default-field title="Document Type">
+                                <drop-down no-current-selected-key="TaxInvoice">
+                                    <option key="TaxInvoice" text="Tax Invoice (B2B/B2C with GST)"/>
+                                    <option key="BillOfSupply" text="Bill of Supply (Exempt Goods/Composition Scheme)"/>
+                                    <option key="ExportInvoice" text="Export Invoice (Zero Rated Supply)"/>
+                                </drop-down>
+                            </default-field>
+                        </field>
+
+                        <field name="invoiceDate">
+                            <default-field title="Invoice Date">
+                                <date-time type="date" default-value="${ec.l10n.format(ec.user.nowTimestamp, 'yyyy-MM-dd')}"/>
+                            </default-field>
+                        </field>
+                        
+                        <field name="gstInvoiceNumber">
+                            <default-field title="Invoice Number (Optional)"><text-line/></default-field>
+                        </field>
+
+                        <field name="submitButton">
+                            <default-field title="">
+                                <submit text="Create Invoice" icon="receipt_long" style="bg-indigo-8 text-white shadow-3 q-px-xl q-py-sm text-subtitle1 text-weight-bold q-mt-lg glossy"/>
+                            </default-field>
+                        </field>
+
+                        <field-layout>
+                            <field-row>
+                                <field-ref name="supplierName"/>
+                                <field-ref name="toPartyId"/>
+                            </field-row>
+                            <field-ref name="fromPartyId"/>
+                            <field-row>
+                                <field-ref name="invoiceType"/>
+                                <field-ref name="invoiceDate"/>
+                            </field-row>
+                            <field-row>
+                                <field-ref name="gstInvoiceNumber"/>
+                            </field-row>
+                            <field-row>
+                                <field-ref name="submitButton"/>
+                            </field-row>
+                        </field-layout>
+                    </form-single>
+                </container>
+            </row-col>
+        </container-row>
+    </widgets>
+</screen>

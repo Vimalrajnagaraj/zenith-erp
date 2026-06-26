@@ -1,0 +1,229 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <service verb="create" noun="Inspection">
+        <in-parameters>
+            <parameter name="inspectionType" required="true"/>
+            <parameter name="templateId"/>
+            <parameter name="referenceType"/><parameter name="referenceId"/>
+            <parameter name="productId"/><parameter name="batchNumber"/>
+            <parameter name="sampleSize" type="Integer"/>
+            <parameter name="inspectedQuantity" type="BigDecimal"/>
+            <parameter name="inspectorPartyId"/><parameter name="facilityId"/>
+            <parameter name="remarks"/>
+        </in-parameters>
+        <out-parameters><parameter name="inspectionId"/></out-parameters>
+        <actions><script><![CDATA[
+            import java.time.LocalDate
+
+            def now = LocalDate.now()
+            def fysSetting = ec.entity.find("zenith.erp.base.CompanySettings").condition("organizationPartyId", ec.user.getPreference("ACTIVE_ORGANIZATION")).condition("settingKey", "FY_START_MONTH").one()
+            int fyStartMonth = fysSetting ? (fysSetting.settingValue as int) : 4
+            int fyStart = now.monthValue >= fyStartMonth ? now.year : now.year - 1
+            String fySuffix = String.format("%02d-%02d", fyStart % 100, (fyStart + 1) % 100)
+
+            def lastInsp = ec.entity.find("zenith.erp.quality.QualityInspection")
+                .condition("inspectionNumber", "like", "QC/${fySuffix}/%").orderBy("-inspectionNumber").limit(1).list()
+            int nextSeq = 1
+            if (lastInsp) {
+                def parts = lastInsp[0].inspectionNumber.split("/")
+                if (parts.length == 3) nextSeq = (parts[2] as int) + 1
+            }
+            String inspectionNumber = "QC/${fySuffix}/" + String.format("%05d", nextSeq)
+
+            context.inspectionId = ec.entity.sequencedIdPrimary("zenith.erp.quality.QualityInspection", null, null)
+            ec.entity.makeValue("zenith.erp.quality.QualityInspection").setAll([
+                inspectionId: context.inspectionId, inspectionNumber: inspectionNumber,
+                inspectionType: inspectionType, templateId: templateId,
+                referenceType: referenceType, referenceId: referenceId,
+                productId: productId, batchNumber: batchNumber,
+                sampleSize: sampleSize, inspectedQuantity: inspectedQuantity,
+                inspectionDate: ec.user.nowTimestamp, inspectorPartyId: inspectorPartyId ?: ec.user.userId,
+                facilityId: facilityId, statusId: "QiDraft", remarks: remarks
+            ]).create()
+
+            if (templateId) {
+                def params = ec.entity.find("zenith.erp.quality.InspectionTemplateParam")
+                    .condition("templateId", templateId).orderBy("sequenceNum").list()
+                int seq = 1
+                for (def tp : params) {
+                    def param = ec.entity.find("zenith.erp.quality.QualityParameter")
+                        .condition("parameterId", tp.parameterId).one()
+                    if (!param) continue
+                    ec.entity.makeValue("zenith.erp.quality.InspectionReading").setAll([
+                        inspectionId: context.inspectionId,
+                        readingSeqId: String.format("%05d", seq),
+                        parameterId: param.parameterId, parameterName: param.parameterName,
+                        targetValue: param.targetValue, minValue: param.minValue,
+                        maxValue: param.maxValue, unit: param.unit
+                    ]).create()
+                    seq++
+                }
+            }
+        ]]></script></actions>
+    </service>
+
+    <service verb="record" noun="InspectionReading">
+        <in-parameters>
+            <parameter name="inspectionId" required="true"/>
+            <parameter name="readingSeqId" required="true"/>
+            <parameter name="actualValue" type="BigDecimal"/>
+            <parameter name="textValue"/>
+            <parameter name="remarks"/>
+        </in-parameters>
+        <actions><script><![CDATA[
+            def reading = ec.entity.find("zenith.erp.quality.InspectionReading")
+                .condition("inspectionId", inspectionId).condition("readingSeqId", readingSeqId).one()
+            if (!reading) { ec.message.addError("Reading not found"); return }
+
+            if (actualValue != null) reading.set("actualValue", actualValue)
+            if (textValue) reading.set("textValue", textValue)
+            if (remarks) reading.set("remarks", remarks)
+
+            String result = "Pass"
+            if (actualValue != null && reading.minValue != null && reading.maxValue != null) {
+                def av = actualValue as BigDecimal
+                def min = reading.minValue as BigDecimal
+                def max = reading.maxValue as BigDecimal
+                if (av < min || av > max) result = "Fail"
+            }
+            reading.set("result", result)
+            reading.update()
+
+            def inspection = ec.entity.find("zenith.erp.quality.QualityInspection")
+                .condition("inspectionId", inspectionId).one()
+            if (inspection && inspection.statusId == "QiDraft") {
+                inspection.set("statusId", "QiInProgress")
+                inspection.update()
+            }
+        ]]></script></actions>
+    </service>
+
+    <service verb="complete" noun="Inspection">
+        <in-parameters>
+            <parameter name="inspectionId" required="true"/>
+            <parameter name="acceptedQuantity" type="BigDecimal"/>
+            <parameter name="rejectedQuantity" type="BigDecimal"/>
+        </in-parameters>
+        <actions><script><![CDATA[
+            def inspection = ec.entity.find("zenith.erp.quality.QualityInspection")
+                .condition("inspectionId", inspectionId).one()
+            if (!inspection) { ec.message.addError("Inspection not found"); return }
+
+            def readings = ec.entity.find("zenith.erp.quality.InspectionReading")
+                .condition("inspectionId", inspectionId).list()
+
+            int totalReadings = readings.size()
+            int passed = readings.count { it.result == "Pass" }
+            int failed = readings.count { it.result == "Fail" }
+
+            String overallResult
+            String statusId
+            if (failed == 0 && totalReadings > 0) {
+                overallResult = "Pass"; statusId = "QiPassed"
+            } else if (passed == 0 && failed > 0) {
+                overallResult = "Fail"; statusId = "QiFailed"
+            } else if (failed > 0) {
+                overallResult = "Partial Pass"; statusId = "QiPartialPass"
+            } else {
+                overallResult = "Pass"; statusId = "QiPassed"
+            }
+
+            inspection.set("statusId", statusId)
+            inspection.set("overallResult", overallResult)
+            if (acceptedQuantity != null) inspection.set("acceptedQuantity", acceptedQuantity)
+            if (rejectedQuantity != null) inspection.set("rejectedQuantity", rejectedQuantity)
+            inspection.update()
+        ]]></script></actions>
+    </service>
+
+    <service verb="create" noun="NonConformance">
+        <in-parameters>
+            <parameter name="inspectionId"/>
+            <parameter name="productId"/><parameter name="batchNumber"/>
+            <parameter name="ncType" required="true"/>
+            <parameter name="severity" required="true"/>
+            <parameter name="description" required="true"/>
+            <parameter name="assignedToPartyId"/>
+            <parameter name="dueDate" type="Date"/>
+            <parameter name="dispositionAction"/>
+            <parameter name="affectedQuantity" type="BigDecimal"/>
+        </in-parameters>
+        <out-parameters><parameter name="ncId"/></out-parameters>
+        <actions><script><![CDATA[
+            import java.time.LocalDate
+
+            def now = LocalDate.now()
+            def fysSetting = ec.entity.find("zenith.erp.base.CompanySettings").condition("organizationPartyId", ec.user.getPreference("ACTIVE_ORGANIZATION")).condition("settingKey", "FY_START_MONTH").one()
+            int fyStartMonth = fysSetting ? (fysSetting.settingValue as int) : 4
+            int fyStart = now.monthValue >= fyStartMonth ? now.year : now.year - 1
+            String fySuffix = String.format("%02d-%02d", fyStart % 100, (fyStart + 1) % 100)
+
+            def lastNc = ec.entity.find("zenith.erp.quality.NonConformance")
+                .condition("ncNumber", "like", "NC/${fySuffix}/%").orderBy("-ncNumber").limit(1).list()
+            int nextSeq = 1
+            if (lastNc) {
+                def parts = lastNc[0].ncNumber.split("/")
+                if (parts.length == 3) nextSeq = (parts[2] as int) + 1
+            }
+            String ncNumber = "NC/${fySuffix}/" + String.format("%05d", nextSeq)
+
+            context.ncId = ec.entity.sequencedIdPrimary("zenith.erp.quality.NonConformance", null, null)
+            ec.entity.makeValue("zenith.erp.quality.NonConformance").setAll([
+                ncId: context.ncId, ncNumber: ncNumber,
+                inspectionId: inspectionId, productId: productId,
+                batchNumber: batchNumber, ncType: ncType, severity: severity,
+                description: description, statusId: "NcOpen",
+                reportedDate: ec.user.nowTimestamp,
+                reportedByPartyId: ec.user.userId,
+                assignedToPartyId: assignedToPartyId,
+                dueDate: dueDate, dispositionAction: dispositionAction,
+                affectedQuantity: affectedQuantity
+            ]).create()
+        ]]></script></actions>
+    </service>
+
+    <service verb="resolve" noun="NonConformance">
+        <in-parameters>
+            <parameter name="ncId" required="true"/>
+            <parameter name="rootCause"/>
+            <parameter name="correctiveAction"/>
+            <parameter name="preventiveAction"/>
+            <parameter name="statusId" required="true"/>
+        </in-parameters>
+        <actions><script><![CDATA[
+            def nc = ec.entity.find("zenith.erp.quality.NonConformance").condition("ncId", ncId).one()
+            if (!nc) { ec.message.addError("NCR not found"); return }
+
+            if (rootCause) nc.set("rootCause", rootCause)
+            if (correctiveAction) nc.set("correctiveAction", correctiveAction)
+            if (preventiveAction) nc.set("preventiveAction", preventiveAction)
+            nc.set("statusId", statusId)
+            if (statusId == "NcClosed") nc.set("closedDate", ec.user.nowTimestamp)
+            nc.update()
+        ]]></script></actions>
+    </service>
+
+    <service verb="add" noun="TemplateParameter">
+        <in-parameters>
+            <parameter name="templateId" required="true"/>
+            <parameter name="parameterId" required="true"/>
+            <parameter name="isMandatory" default-value="Y"/>
+        </in-parameters>
+        <actions><script><![CDATA[
+            def existing = ec.entity.find("zenith.erp.quality.InspectionTemplateParam")
+                .condition("templateId", templateId).orderBy("-parameterSeqId").limit(1).list()
+            int nextSeq = 1
+            if (existing) nextSeq = (existing[0].parameterSeqId as int) + 1
+
+            ec.entity.makeValue("zenith.erp.quality.InspectionTemplateParam").setAll([
+                templateId: templateId,
+                parameterSeqId: String.format("%05d", nextSeq),
+                parameterId: parameterId, sequenceNum: nextSeq,
+                isMandatory: isMandatory
+            ]).create()
+        ]]></script></actions>
+    </service>
+
+</services>

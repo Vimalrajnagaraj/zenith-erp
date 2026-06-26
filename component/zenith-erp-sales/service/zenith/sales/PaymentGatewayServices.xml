@@ -1,0 +1,111 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <service verb="create" noun="PaymentLink">
+        <description>Generates a mock payment link for an invoice via Razorpay/CCAvenue</description>
+        <in-parameters>
+            <parameter name="invoiceId" required="true"/>
+            <parameter name="gatewayType" default-value="RAZORPAY"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="paymentLinkId"/>
+            <parameter name="paymentUrl"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="invoice"/>
+            <if condition="!invoice">
+                <return error="true" message="Invoice ${invoiceId} not found."/>
+            </if>
+            <set field="amount" from="invoice.invoiceTotal"/>
+            
+            <!-- Generate a mock external link ID and URL -->
+            <set field="externalLinkId" value="plink_${ec.l10n.format(ec.user.nowTimestamp, 'yyyyMMddHHmmss')}"/>
+            <set field="paymentUrl" value="https://checkout.${gatewayType.toLowerCase()}.com/pay/${externalLinkId}"/>
+
+            <!-- Create PaymentLink record -->
+            <entity-make-value entity-name="zenith.erp.sales.PaymentLink" value-field="plink"/>
+            <set field="plink.invoiceId" from="invoiceId"/>
+            <set field="plink.externalLinkId" from="externalLinkId"/>
+            <set field="plink.paymentUrl" from="paymentUrl"/>
+            <set field="plink.amount" from="amount"/>
+            <set field="plink.statusId" value="CREATED"/>
+            <set field="plink.expiryDate" from="ec.user.nowTimestamp + 30"/> <!-- Expires in 30 days -->
+            <entity-create value-field="plink"/>
+            <set field="paymentLinkId" from="plink.paymentLinkId"/>
+
+            <!-- In a real scenario, an HTTP request to the gateway API would be placed here -->
+            <message>Mock Payment Link Generated: ${paymentUrl}</message>
+        </actions>
+    </service>
+
+    <service verb="check" noun="PaymentStatus">
+        <in-parameters>
+            <parameter name="paymentLinkId" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="statusId"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.sales.PaymentLink" value-field="plink"/>
+            <if condition="!plink">
+                <return error="true" message="Payment Link ${paymentLinkId} not found."/>
+            </if>
+
+            <!-- Mock API check -->
+            <!-- Typically we'd query Razorpay here to get the status. We just return the DB status. -->
+            <set field="statusId" from="plink.statusId"/>
+        </actions>
+    </service>
+
+    <service verb="process" noun="PaymentCallback">
+        <in-parameters>
+            <parameter name="externalLinkId" required="true"/>
+            <parameter name="status" required="true"/> <!-- e.g., 'paid', 'failed' -->
+            <parameter name="transactionId"/>
+        </in-parameters>
+        <actions>
+            <entity-find entity-name="zenith.erp.sales.PaymentLink" list="links">
+                <econdition field-name="externalLinkId"/>
+            </entity-find>
+            <set field="plink" from="links?.first()"/>
+            <if condition="!plink">
+                <return error="true" message="Payment link not found for ${externalLinkId}"/>
+            </if>
+
+            <if condition="status == 'paid'">
+                <set field="plink.statusId" value="PAID"/>
+                <entity-update value-field="plink"/>
+                
+                <!-- Automatically create Payment and apply to Invoice -->
+                <!-- Use mantle.account.PaymentServices.create#Payment -->
+            </if>
+            <if condition="status == 'failed'">
+                <set field="plink.statusId" value="CANCELLED"/>
+                <entity-update value-field="plink"/>
+            </if>
+        </actions>
+    </service>
+
+    <service verb="generate" noun="UpiPaymentQr">
+        <description>Generates a dynamic UPI QR code string for the invoice.
+            UPI is India-specific; for the full implementation see zenith.india.IndiaPosServices.generate#UpiQrString</description>
+        <in-parameters>
+            <parameter name="invoiceId" required="true"/>
+            <parameter name="upiId" required="true"/>
+            <parameter name="merchantName" required="true"/>
+            <parameter name="currencyCode" default-value="INR"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="upiString"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="invoice"/>
+            <set field="amount" from="ec.l10n.format(invoice.invoiceTotal, '0.00')"/>
+            <set field="orderId" from="invoice.customInvoiceNumber ?: invoice.invoiceId"/>
+
+            <set field="upiString" value="upi://pay?pa=${upiId}&amp;pn=${merchantName}&amp;tr=${orderId}&amp;am=${amount}&amp;cu=${currencyCode}"/>
+        </actions>
+    </service>
+
+</services>

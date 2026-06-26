@@ -1,0 +1,192 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <!-- US Tax Calculator: implements the pluggable tax engine interface -->
+    <service verb="calculate" noun="Tax">
+        <description>US multi-jurisdiction sales tax calculation. Registered as TAX_CALCULATION_SERVICE for US companies.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="customerPartyId"/>
+            <parameter name="items" type="List" required="true">
+                <parameter name="itemEntry" type="Map">
+                    <parameter name="productId"/>
+                    <parameter name="productTaxCode"/>
+                    <parameter name="taxCategoryId"/>
+                    <parameter name="quantity" type="BigDecimal" required="true"/>
+                    <parameter name="unitAmount" type="BigDecimal" required="true"/>
+                    <parameter name="discountAmount" type="BigDecimal"/>
+                    <parameter name="isTaxInclusive" default-value="N"/>
+                </parameter>
+            </parameter>
+            <parameter name="originRegionGeoId"/>
+            <parameter name="destinationRegionGeoId"/>
+            <parameter name="originCountryGeoId"/>
+            <parameter name="destinationCountryGeoId"/>
+            <parameter name="currencyUomId"/>
+            <parameter name="transactionDate" type="Timestamp" default="ec.user.nowTimestamp"/>
+            <parameter name="transactionType" default-value="SALE"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="taxedItems" type="List"/>
+            <parameter name="totalTaxableAmount" type="BigDecimal"/>
+            <parameter name="totalTaxAmount" type="BigDecimal"/>
+            <parameter name="totalAmount" type="BigDecimal"/>
+        </out-parameters>
+        <actions>
+            <set field="taxedItems" from="[]"/>
+            <set field="totalTaxableAmount" from="BigDecimal.ZERO" type="BigDecimal"/>
+            <set field="totalTaxAmount" from="BigDecimal.ZERO" type="BigDecimal"/>
+            <set field="totalAmount" from="BigDecimal.ZERO" type="BigDecimal"/>
+
+            <!-- Check if destination state has nexus -->
+            <entity-find entity-name="zenith.erp.us.NexusConfiguration" list="nexusList">
+                <econdition field-name="organizationPartyId"/>
+                <econdition field-name="stateGeoId" from="destinationRegionGeoId"/>
+                <econdition field-name="isActive" value="Y"/>
+            </entity-find>
+
+            <set field="itemIndex" from="0" type="Integer"/>
+
+            <if condition="!nexusList">
+                <iterate list="items" entry="item">
+                    <set field="lineAmount" from="((item.quantity ?: 0) as BigDecimal) * ((item.unitAmount ?: 0) as BigDecimal)" type="BigDecimal"/>
+                    <set field="lineDiscount" from="(item.discountAmount ?: 0) as BigDecimal"/>
+                    <set field="taxableAmt" from="lineAmount - lineDiscount" type="BigDecimal"/>
+                    <script>taxedItems.add([itemIndex:itemIndex, taxableAmount:taxableAmt,
+                        totalTaxAmount:BigDecimal.ZERO, taxBreakdowns:[]])</script>
+                    <set field="totalTaxableAmount" from="totalTaxableAmount + taxableAmt"/>
+                    <set field="totalAmount" from="totalAmount + taxableAmt"/>
+                    <set field="itemIndex" from="itemIndex + 1"/>
+                </iterate>
+                <return/>
+            </if>
+
+            <!-- Look up combined tax rate for destination -->
+            <entity-find entity-name="zenith.erp.us.UsTaxJurisdiction" list="jurisdictions">
+                <econdition field-name="stateGeoId" from="destinationRegionGeoId"/>
+                <econdition field-name="effectiveDate" operator="less-equals" from="ec.user.nowTimestamp"/>
+                <order-by field-name="-effectiveDate"/>
+            </entity-find>
+            <set field="jurisdiction" from="jurisdictions ? jurisdictions[0] : null"/>
+            <set field="combinedRate" from="jurisdiction?.combinedRate ?: 0" type="BigDecimal"/>
+
+            <!-- Check for tax holiday -->
+            <entity-find entity-name="zenith.erp.us.TaxHoliday" list="holidays">
+                <econdition field-name="stateGeoId" from="destinationRegionGeoId"/>
+                <econdition field-name="startDate" operator="less-equals" from="ec.user.nowTimestamp"/>
+                <econdition field-name="endDate" operator="greater-equals" from="ec.user.nowTimestamp"/>
+                <econdition field-name="isActive" value="Y"/>
+            </entity-find>
+
+            <iterate list="items" entry="item">
+                <set field="lineAmount" from="((item.quantity ?: 0) as BigDecimal) * ((item.unitAmount ?: 0) as BigDecimal)" type="BigDecimal"/>
+                <set field="lineDiscount" from="(item.discountAmount ?: 0) as BigDecimal"/>
+                <set field="taxableAmount" from="lineAmount - lineDiscount" type="BigDecimal"/>
+                <set field="itemRate" from="combinedRate" type="BigDecimal"/>
+
+                <!-- Check tax holiday applicability -->
+                <if condition="holidays &amp;&amp; item.unitAmount &lt;= (holidays[0].maxItemPrice ?: 999999)">
+                    <set field="itemRate" from="BigDecimal.ZERO" type="BigDecimal"/>
+                </if>
+
+                <!-- Check customer tax exemption -->
+                <if condition="customerPartyId">
+                    <service-call name="zenith.tax.TaxServices.check#TaxExemption" ignore-error="true"
+                                  in-map="[partyId:customerPartyId, productId:item.productId,
+                                           transactionDate:transactionDate]"
+                                  out-map="exemptResult"/>
+                    <if condition="exemptResult?.isExempt"><set field="itemRate" from="BigDecimal.ZERO" type="BigDecimal"/></if>
+                </if>
+
+                <set field="itemTax" from="(taxableAmount * itemRate / 100).setScale(2, java.math.RoundingMode.HALF_UP)" type="BigDecimal"/>
+                <set field="breakdowns" from="[]"/>
+
+                <if condition="jurisdiction &amp;&amp; itemRate &gt; 0">
+                    <if condition="(jurisdiction.stateRate ?: 0) &gt; 0">
+                        <script>breakdowns.add([taxName:'State Sales Tax', taxRate:jurisdiction.stateRate,
+                            taxableAmount:taxableAmount,
+                            taxAmount:(taxableAmount * jurisdiction.stateRate / 100).setScale(2, java.math.RoundingMode.HALF_UP),
+                            taxAuthorityId:'US_' + destinationRegionGeoId, countryGeoId:'USA',
+                            regionGeoId:destinationRegionGeoId, isIncludedInPrice:'N'])</script>
+                    </if>
+                    <if condition="(jurisdiction.countyRate ?: 0) &gt; 0">
+                        <script>breakdowns.add([taxName:'County Tax', taxRate:jurisdiction.countyRate,
+                            taxableAmount:taxableAmount,
+                            taxAmount:(taxableAmount * jurisdiction.countyRate / 100).setScale(2, java.math.RoundingMode.HALF_UP),
+                            taxAuthorityId:'US_' + destinationRegionGeoId + '_COUNTY', countryGeoId:'USA',
+                            regionGeoId:destinationRegionGeoId, isIncludedInPrice:'N'])</script>
+                    </if>
+                    <if condition="(jurisdiction.cityRate ?: 0) &gt; 0">
+                        <script>breakdowns.add([taxName:'City Tax', taxRate:jurisdiction.cityRate,
+                            taxableAmount:taxableAmount,
+                            taxAmount:(taxableAmount * jurisdiction.cityRate / 100).setScale(2, java.math.RoundingMode.HALF_UP),
+                            taxAuthorityId:'US_' + destinationRegionGeoId + '_CITY', countryGeoId:'USA',
+                            regionGeoId:destinationRegionGeoId, isIncludedInPrice:'N'])</script>
+                    </if>
+                    <if condition="(jurisdiction.specialRate ?: 0) &gt; 0">
+                        <script>breakdowns.add([taxName:'Special District Tax', taxRate:jurisdiction.specialRate,
+                            taxableAmount:taxableAmount,
+                            taxAmount:(taxableAmount * jurisdiction.specialRate / 100).setScale(2, java.math.RoundingMode.HALF_UP),
+                            taxAuthorityId:'US_' + destinationRegionGeoId + '_SPECIAL', countryGeoId:'USA',
+                            regionGeoId:destinationRegionGeoId, isIncludedInPrice:'N'])</script>
+                    </if>
+                </if>
+
+                <script>taxedItems.add([itemIndex:itemIndex, taxableAmount:taxableAmount,
+                    totalTaxAmount:itemTax, taxBreakdowns:breakdowns])</script>
+                <set field="totalTaxableAmount" from="totalTaxableAmount + taxableAmount"/>
+                <set field="totalTaxAmount" from="totalTaxAmount + itemTax"/>
+                <set field="totalAmount" from="totalAmount + taxableAmount + itemTax"/>
+                <set field="itemIndex" from="itemIndex + 1"/>
+            </iterate>
+        </actions>
+    </service>
+
+    <!-- Generate Sales Tax Return -->
+    <service verb="generate" noun="SalesTaxReturn">
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="stateGeoId" required="true"/>
+            <parameter name="periodStart" type="Date" required="true"/>
+            <parameter name="periodEnd" type="Date" required="true"/>
+        </in-parameters>
+        <out-parameters><parameter name="taxReturnId"/></out-parameters>
+        <actions>
+            <service-call name="create#zenith.erp.us.SalesTaxReturn"
+                          in-map="[organizationPartyId:organizationPartyId, stateGeoId:stateGeoId,
+                                   periodStart:periodStart, periodEnd:periodEnd,
+                                   grossSales:0, exemptSales:0, taxableSales:0,
+                                   taxCollected:0, taxDue:0, statusId:'StrDraft']"
+                          out-map="context"/>
+        </actions>
+    </service>
+
+    <!-- Track 1099 Payments -->
+    <service verb="track" noun="1099Payment">
+        <in-parameters>
+            <parameter name="vendorPartyId" required="true"/>
+            <parameter name="taxYear" type="Integer" required="true"/>
+            <parameter name="paymentAmount" type="BigDecimal" required="true"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.us.Form1099Tracking" value-field="tracking" for-update="true">
+                <field-map field-name="vendorPartyId"/>
+                <field-map field-name="taxYear"/>
+            </entity-find-one>
+            <if condition="tracking">
+                <set field="tracking.totalPayments" from="(tracking.totalPayments ?: 0) + paymentAmount"/>
+                <set field="tracking.requires1099" from="tracking.totalPayments >= tracking.threshold1099 ? 'Y' : 'N'"/>
+                <entity-update value-field="tracking"/>
+                <else>
+                    <set field="requires" from="paymentAmount >= 600 ? 'Y' : 'N'"/>
+                    <service-call name="create#zenith.erp.us.Form1099Tracking"
+                                  in-map="[vendorPartyId:vendorPartyId, taxYear:taxYear,
+                                           totalPayments:paymentAmount, threshold1099:600,
+                                           requires1099:requires, form1099Filed:'N']"/>
+                </else>
+            </if>
+        </actions>
+    </service>
+
+</services>

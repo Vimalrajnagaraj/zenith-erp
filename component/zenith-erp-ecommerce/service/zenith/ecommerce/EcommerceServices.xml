@@ -1,0 +1,243 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <!-- ========== Pincode Serviceability ========== -->
+
+    <service verb="check" noun="PincodeServiceability">
+        <in-parameters>
+            <parameter name="pincode" required="true"/>
+            <parameter name="isCod" default-value="N"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="isServiceable" type="Boolean"/>
+            <parameter name="codAvailable" type="Boolean"/>
+            <parameter name="estimatedDays" type="Integer"/>
+            <parameter name="city"/>
+            <parameter name="stateCode"/>
+            <parameter name="zone"/>
+            <parameter name="shippingProviderId"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.ecommerce.PincodeServiceability" value-field="ps">
+                <field-map field-name="pincode"/></entity-find-one>
+            <if condition="ps &amp;&amp; ps.isServiceable == 'Y'">
+                <set field="isServiceable" from="true"/>
+                <set field="codAvailable" from="ps.codAvailable == 'Y'"/>
+                <set field="estimatedDays" from="ps.estimatedDays"/>
+                <set field="city" from="ps.city"/>
+                <set field="stateCode" from="ps.stateCode"/>
+                <set field="zone" from="ps.zone"/>
+                <set field="shippingProviderId" from="ps.shippingProviderId"/>
+            <else>
+                <set field="isServiceable" from="false"/>
+                <set field="codAvailable" from="false"/>
+            </else></if>
+        </actions>
+    </service>
+
+    <!-- ========== Shipping Rate Calculation ========== -->
+
+    <service verb="calculate" noun="ShippingRate">
+        <in-parameters>
+            <parameter name="shippingProviderId" required="true"/>
+            <parameter name="fromZone" required="true"/>
+            <parameter name="toZone" required="true"/>
+            <parameter name="weightGrams" type="Integer" required="true"/>
+            <parameter name="isCod" default-value="N"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="shippingCharge" type="BigDecimal"/>
+            <parameter name="codCharge" type="BigDecimal"/>
+            <parameter name="totalCharge" type="BigDecimal"/>
+        </out-parameters>
+        <actions>
+            <entity-find entity-name="zenith.erp.ecommerce.ShippingRate" list="rates">
+                <econdition field-name="shippingProviderId"/>
+                <econdition field-name="fromZone"/>
+                <econdition field-name="toZone"/>
+                <econdition field-name="isActive" value="Y"/>
+                <econdition field-name="weightFromGrams" operator="less-equals" from="weightGrams"/>
+                <econdition field-name="weightToGrams" operator="greater-equals" from="weightGrams"/>
+            </entity-find>
+
+            <if condition="rates">
+                <set field="rate" from="rates[0]"/>
+                <set field="shippingCharge" from="(rate.baseRate ?: 0) as BigDecimal"/>
+                <script><![CDATA[
+                    if (weightGrams > 500 && rate.perKgRate) {
+                        def extraKg = Math.ceil((weightGrams - 500) / 1000.0)
+                        shippingCharge = shippingCharge + (extraKg * (rate.perKgRate as BigDecimal))
+                    }
+                ]]></script>
+                <set field="codCharge" from="isCod == 'Y' ? (rate.codCharge ?: 0) as BigDecimal : 0"/>
+                <set field="totalCharge" from="shippingCharge + codCharge"/>
+            <else>
+                <set field="shippingCharge" from="0"/>
+                <set field="codCharge" from="0"/>
+                <set field="totalCharge" from="0"/>
+            </else></if>
+        </actions>
+    </service>
+
+    <!-- ========== Razorpay Integration (Phase 1: Payload Generation) ========== -->
+
+    <service verb="create" noun="RazorpayOrder">
+        <description>Generates Razorpay order payload. Phase 2 will add actual API call.</description>
+        <in-parameters>
+            <parameter name="orderId" required="true"/>
+            <parameter name="amount" type="BigDecimal" required="true"/>
+            <parameter name="currency"/>
+            <parameter name="customerEmail"/>
+            <parameter name="customerPhone"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="razorpayPayload" type="Map"/>
+        </out-parameters>
+        <actions>
+            <set field="amountPaise" from="((amount as BigDecimal) * 100).intValue()"/>
+            <set field="razorpayPayload" from="[
+                amount: amountPaise,
+                currency: currency,
+                receipt: orderId,
+                notes: [order_id: orderId, source: 'zenith-erp'],
+                payment_capture: 1
+            ]"/>
+
+            <service-call name="update#mantle.order.OrderHeader"
+                in-map="[orderId:orderId, paymentMethod:'Razorpay']"/>
+        </actions>
+    </service>
+
+    <service verb="verify" noun="RazorpayPayment">
+        <description>Verifies Razorpay payment signature (HMAC-SHA256). Phase 2 will add server-side verification.</description>
+        <in-parameters>
+            <parameter name="orderId" required="true"/>
+            <parameter name="razorpayOrderId" required="true"/>
+            <parameter name="razorpayPaymentId" required="true"/>
+            <parameter name="razorpaySignature" required="true"/>
+        </in-parameters>
+        <out-parameters><parameter name="isValid" type="Boolean"/></out-parameters>
+        <actions>
+            <entity-find entity-name="zenith.erp.ecommerce.EcommerceSettings" list="settingsList">
+                <econdition field-name="isActive" value="Y"/>
+            </entity-find>
+            <set field="settings" from="settingsList ? settingsList[0] : null"/>
+
+            <script><![CDATA[
+                if (settings?.razorpayKeySecret) {
+                    def data = razorpayOrderId + '|' + razorpayPaymentId
+                    def secret = settings.razorpayKeySecret
+                    def mac = javax.crypto.Mac.getInstance('HmacSHA256')
+                    mac.init(new javax.crypto.spec.SecretKeySpec(secret.getBytes('UTF-8'), 'HmacSHA256'))
+                    def hash = mac.doFinal(data.getBytes('UTF-8'))
+                    def computed = hash.collect { String.format('%02x', it) }.join('')
+                    context.isValid = (computed == razorpaySignature)
+                } else {
+                    context.isValid = false
+                }
+            ]]></script>
+
+            <if condition="isValid">
+                <service-call name="update#mantle.order.OrderHeader"
+                    in-map="[orderId:orderId, razorpayOrderId:razorpayOrderId,
+                             razorpayPaymentId:razorpayPaymentId, razorpaySignature:razorpaySignature]"/>
+            </if>
+        </actions>
+    </service>
+
+    <!-- ========== COD Order ========== -->
+
+    <service verb="create" noun="CodOrder">
+        <in-parameters>
+            <parameter name="orderId" required="true"/>
+            <parameter name="deliveryPincode" required="true"/>
+        </in-parameters>
+        <out-parameters><parameter name="codAllowed" type="Boolean"/></out-parameters>
+        <actions>
+            <!-- Check COD settings -->
+            <entity-find entity-name="zenith.erp.ecommerce.EcommerceSettings" list="settingsList">
+                <econdition field-name="isActive" value="Y"/>
+            </entity-find>
+            <set field="settings" from="settingsList ? settingsList[0] : null"/>
+
+            <if condition="settings?.codEnabled != 'Y'">
+                <set field="codAllowed" from="false"/>
+                <return error="true" message="COD is not enabled"/>
+            </if>
+
+            <!-- Check pincode COD availability -->
+            <service-call name="zenith.ecommerce.EcommerceServices.check#PincodeServiceability" out-map="pinCheck"
+                in-map="[pincode:deliveryPincode, isCod:'Y']"/>
+            <if condition="!pinCheck.codAvailable">
+                <set field="codAllowed" from="false"/>
+                <return error="true" message="COD not available for pincode ${deliveryPincode}"/>
+            </if>
+
+            <!-- Check order amount limits -->
+            <entity-find-one entity-name="mantle.order.OrderHeader" value-field="order">
+                <field-map field-name="orderId"/></entity-find-one>
+            <if condition="settings.codMaxAmount &amp;&amp; (order.grandTotal ?: 0) > settings.codMaxAmount">
+                <set field="codAllowed" from="false"/>
+                <return error="true" message="Order amount exceeds COD limit of ₹${settings.codMaxAmount}"/>
+            </if>
+
+            <set field="codAllowed" from="true"/>
+            <service-call name="update#mantle.order.OrderHeader"
+                in-map="[orderId:orderId, isCodOrder:'Y', codAmount:order.grandTotal,
+                         paymentMethod:'COD', deliveryPincode:deliveryPincode]"/>
+        </actions>
+    </service>
+
+    <!-- ========== Shipment Tracking ========== -->
+
+    <service verb="assign" noun="ShipmentTracking">
+        <in-parameters>
+            <parameter name="orderId" required="true"/>
+            <parameter name="shippingProviderId" required="true"/>
+            <parameter name="awbNumber" required="true"/>
+            <parameter name="trackingNumber"/>
+        </in-parameters>
+        <actions>
+            <service-call name="update#mantle.order.OrderHeader"
+                in-map="[orderId:orderId, shippingProviderId:shippingProviderId,
+                         awbNumber:awbNumber, trackingNumber:trackingNumber ?: awbNumber,
+                         trackingStatus:'Shipped']"/>
+        </actions>
+    </service>
+
+    <service verb="update" noun="TrackingStatus">
+        <in-parameters>
+            <parameter name="orderId" required="true"/>
+            <parameter name="trackingStatus" required="true"/>
+            <parameter name="actualDeliveryDate" type="Date"/>
+        </in-parameters>
+        <actions>
+            <set field="updateMap" from="[orderId:orderId, trackingStatus:trackingStatus]"/>
+            <if condition="trackingStatus == 'Delivered' &amp;&amp; actualDeliveryDate">
+                <set field="updateMap.actualDeliveryDate" from="actualDeliveryDate"/>
+            </if>
+            <service-call name="update#mantle.order.OrderHeader" in-map="updateMap"/>
+        </actions>
+    </service>
+
+    <!-- ========== Product Reviews ========== -->
+
+    <service verb="submit" noun="ProductReview">
+        <in-parameters>
+            <parameter name="productId" required="true"/>
+            <parameter name="customerPartyId"/>
+            <parameter name="rating" type="Integer" required="true"/>
+            <parameter name="reviewTitle"/>
+            <parameter name="reviewText"/>
+        </in-parameters>
+        <out-parameters><parameter name="reviewId"/></out-parameters>
+        <actions>
+            <service-call name="create#zenith.erp.ecommerce.ProductReview" out-map="context"
+                in-map="[productId:productId, customerPartyId:customerPartyId ?: ec.user.userAccount?.partyId,
+                         rating:rating, reviewTitle:reviewTitle, reviewText:reviewText,
+                         isVerifiedPurchase:'N', isApproved:'N', reviewDate:ec.user.nowTimestamp]"/>
+        </actions>
+    </service>
+
+</services>

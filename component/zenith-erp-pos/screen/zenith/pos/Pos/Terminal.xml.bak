@@ -1,0 +1,1362 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
+        default-menu-title="Billing Terminal" default-menu-index="2">
+
+    <parameter name="sessionId"/>
+    <parameter name="transactionId"/>
+    <parameter name="searchTerm"/>
+    <parameter name="lastCompletedId"/>
+    <parameter name="catId"/>
+    <parameter name="addQty"/>
+    <parameter name="taxOn"/>
+    <parameter name="salesModeId"/>
+    <parameter name="splitPay"/>
+
+    <!-- ==================== TRANSITIONS ==================== -->
+    <transition name="openSession" begin-transaction="true">
+        <actions>
+            <service-call name="zenith.pos.PosServices.open#PosSession" out-map="sOut"
+                          in-map="[terminalId:terminalId, openingCash:openingCash ?: 0]"/>
+        </actions>
+        <default-response url="." parameter-map="[sessionId:sOut.sessionId]"/>
+    </transition>
+
+    <transition name="addItem" begin-transaction="true">
+        <actions>
+            <if condition="!transactionId">
+                <service-call name="zenith.pos.PosServices.create#PosTransaction" out-map="tOut"
+                              in-map="[sessionId:sessionId]"/>
+                <set field="transactionId" from="tOut.transactionId"/>
+            </if>
+            <service-call name="zenith.pos.PosServices.add#PosTransactionItem"
+                          in-map="[transactionId:transactionId, productId:productId,
+                                   quantity:addQty ?: 1, unitPrice:unitPrice,
+                                   discountPercent:discountPercent ?: 0]"/>
+            <if condition="taxOn == 'N'">
+                <entity-find entity-name="zenith.erp.pos.PosTransactionItem" list="txnItems">
+                    <econdition field-name="transactionId"/>
+                    <order-by field-name="-itemSeqId"/>
+                </entity-find>
+                <if condition="txnItems">
+                    <set field="lastAdded" from="txnItems[0]"/>
+                    <service-call name="update#zenith.erp.pos.PosTransactionItem"
+                        in-map="[transactionId:transactionId, itemSeqId:lastAdded.itemSeqId,
+                                 totalTaxAmount:0, lineTotal:lastAdded.taxableAmount]"/>
+                    <service-call name="zenith.pos.PosServices.recalculate#TransactionTotals"
+                        in-map="[transactionId:transactionId]"/>
+                </if>
+            </if>
+        </actions>
+        <default-response url="." parameter-map="[sessionId:sessionId, transactionId:transactionId, catId:catId, taxOn:taxOn, salesModeId:salesModeId]"/>
+    </transition>
+
+    <transition name="removeItem" begin-transaction="true">
+        <actions>
+            <service-call name="zenith.pos.PosServices.remove#PosTransactionItem"
+                          in-map="[transactionId:transactionId, itemSeqId:itemSeqId]"/>
+        </actions>
+        <default-response url="." parameter-map="[sessionId:sessionId, transactionId:transactionId, catId:catId, taxOn:taxOn, salesModeId:salesModeId]"/>
+    </transition>
+
+    <transition name="payAndComplete" begin-transaction="true">
+        <actions>
+            <if condition="customerPhone">
+                <service-call name="update#zenith.erp.pos.PosTransaction"
+                              in-map="[transactionId:transactionId, customerPhone:customerPhone]"/>
+            </if>
+            <service-call name="zenith.pos.PosServices.process#PosPayment"
+                          in-map="[transactionId:transactionId, paymentMethod:paymentMethod,
+                                   amount:amount, referenceNumber:referenceNumber]"/>
+            <service-call name="zenith.pos.PosServices.complete#PosTransaction"
+                          in-map="[transactionId:transactionId]"/>
+        </actions>
+        <default-response url="." parameter-map="[sessionId:sessionId, lastCompletedId:transactionId]"/>
+    </transition>
+
+    <transition name="downloadReceiptPdf">
+        <actions>
+            <script><![CDATA[
+                // Redirect to the ReceiptPdf screen with .pdf extension which triggers XSL-FO rendering
+                ec.web.response.sendRedirect(ec.web.getWebappRootUrl(true, null) + "/apps/zenith/pos/ReceiptPdf.pdf?transactionId=" + transactionId)
+            ]]></script>
+        </actions>
+        <default-response type="none"/>
+    </transition>
+
+    <transition name="holdSale" begin-transaction="true">
+        <actions>
+            <service-call name="zenith.pos.PosServices.hold#Transaction"
+                          in-map="[transactionId:transactionId, holdReason:holdReason]"/>
+        </actions>
+        <default-response url="." parameter-map="[sessionId:sessionId, taxOn:taxOn, salesModeId:salesModeId]"/>
+    </transition>
+
+    <transition name="voidSale" begin-transaction="true">
+        <actions>
+            <service-call name="zenith.pos.PosServices.void#PosTransaction"
+                          in-map="[transactionId:transactionId]"/>
+        </actions>
+        <default-response url="." parameter-map="[sessionId:sessionId, taxOn:taxOn, salesModeId:salesModeId]"/>
+    </transition>
+
+    <transition name="recallSale" begin-transaction="true">
+        <actions>
+            <service-call name="zenith.pos.PosServices.recall#Transaction" out-map="rOut"
+                          in-map="[heldId:heldId, sessionId:sessionId]"/>
+        </actions>
+        <default-response url="." parameter-map="[sessionId:sessionId, transactionId:rOut.transactionId, taxOn:taxOn, salesModeId:salesModeId]"/>
+    </transition>
+
+    <transition name="updateItemQty" begin-transaction="true">
+        <actions>
+            <entity-find-one entity-name="zenith.erp.pos.PosTransactionItem" value-field="item"/>
+            <if condition="!item"><return error="true" message="Item not found"/></if>
+            <set field="newQty" from="(newQty as BigDecimal)" type="BigDecimal"/>
+            <if condition="newQty &lt;= 0">
+                <service-call name="zenith.pos.PosServices.remove#PosTransactionItem"
+                              in-map="[transactionId:transactionId, itemSeqId:itemSeqId]"/>
+            <else>
+                <set field="lineSubtotal" from="newQty * (item.unitPrice as BigDecimal)" type="BigDecimal"/>
+                <set field="discAmt" from="lineSubtotal * ((item.discountPercent ?: 0) as BigDecimal) / 100" type="BigDecimal"/>
+                <set field="taxableAmount" from="lineSubtotal - discAmt" type="BigDecimal"/>
+                <set field="taxRate" from="(taxOn == 'N') ? BigDecimal.ZERO : ((item.totalTaxAmount != null &amp;&amp; item.taxableAmount != null &amp;&amp; (item.taxableAmount as BigDecimal) != 0) ? ((item.totalTaxAmount as BigDecimal) / (item.taxableAmount as BigDecimal)) : BigDecimal.ZERO)"/>
+                <set field="totalTaxAmount" from="taxableAmount * taxRate" type="BigDecimal"/>
+                <set field="lineTotal" from="taxableAmount + totalTaxAmount" type="BigDecimal"/>
+                <service-call name="update#zenith.erp.pos.PosTransactionItem"
+                              in-map="[transactionId:transactionId, itemSeqId:itemSeqId,
+                                       quantity:newQty, discountAmount:discAmt,
+                                       taxableAmount:taxableAmount, totalTaxAmount:totalTaxAmount,
+                                       lineTotal:lineTotal]"/>
+            </else>
+            </if>
+            <service-call name="zenith.pos.PosServices.recalculate#TransactionTotals"
+                          in-map="[transactionId:transactionId]"/>
+        </actions>
+        <default-response url="." parameter-map="[sessionId:sessionId, transactionId:transactionId, catId:catId, taxOn:taxOn, salesModeId:salesModeId]"/>
+    </transition>
+
+    <transition name="updateItemPrice" begin-transaction="true">
+        <actions>
+            <entity-find-one entity-name="zenith.erp.pos.PosTransactionItem" value-field="item"/>
+            <if condition="!item"><return error="true" message="Item not found"/></if>
+            <set field="newPrice" from="(newPrice as BigDecimal)" type="BigDecimal"/>
+            <if condition="newPrice &lt; 0"><return error="true" message="Price cannot be negative"/></if>
+
+            <entity-find-one entity-name="zenith.erp.pos.PosTransaction" value-field="priceTxn">
+                <field-map field-name="transactionId" from="item.transactionId"/>
+            </entity-find-one>
+
+            <service-call name="create#zenith.erp.pos.PosItemPriceOverride"
+                in-map="[transactionId:item.transactionId, itemSeqId:item.itemSeqId,
+                         transactionNumber:priceTxn?.transactionNumber,
+                         productId:item.productId, productName:item.productName,
+                         originalPrice:item.unitPrice, newPrice:newPrice,
+                         changedByPartyId:ec.user.userAccount?.partyId,
+                         changedByUserId:ec.user.userId,
+                         changeDate:ec.user.nowTimestamp,
+                         sessionId:sessionId]"/>
+
+            <set field="qty" from="(item.quantity ?: 1) as BigDecimal" type="BigDecimal"/>
+            <set field="lineSubtotal" from="qty * newPrice" type="BigDecimal"/>
+            <set field="discAmt" from="lineSubtotal * ((item.discountPercent ?: 0) as BigDecimal) / 100" type="BigDecimal"/>
+            <set field="taxableAmount" from="lineSubtotal - discAmt" type="BigDecimal"/>
+            <set field="taxRate" from="(taxOn == 'N') ? BigDecimal.ZERO : ((item.totalTaxAmount != null &amp;&amp; item.taxableAmount != null &amp;&amp; (item.taxableAmount as BigDecimal) != 0) ? ((item.totalTaxAmount as BigDecimal) / (item.taxableAmount as BigDecimal)) : BigDecimal.ZERO)"/>
+            <set field="totalTaxAmount" from="taxableAmount * taxRate" type="BigDecimal"/>
+            <set field="lineTotal" from="taxableAmount + totalTaxAmount" type="BigDecimal"/>
+            <service-call name="update#zenith.erp.pos.PosTransactionItem"
+                          in-map="[transactionId:transactionId, itemSeqId:item.itemSeqId,
+                                   unitPrice:newPrice, discountAmount:discAmt,
+                                   taxableAmount:taxableAmount, totalTaxAmount:totalTaxAmount,
+                                   lineTotal:lineTotal]"/>
+            <service-call name="zenith.pos.PosServices.recalculate#TransactionTotals"
+                          in-map="[transactionId:transactionId]"/>
+        </actions>
+        <default-response url="." parameter-map="[sessionId:sessionId, transactionId:transactionId, catId:catId, taxOn:taxOn, salesModeId:salesModeId]"/>
+    </transition>
+
+    <transition name="cartAddProduct" begin-transaction="true">
+        <actions>
+            <script><![CDATA[
+                def foundProduct = null
+                if (cartSearch) {
+                    foundProduct = ec.entity.find("mantle.product.Product")
+                        .condition("pseudoId", cartSearch).one()
+                    if (!foundProduct) {
+                        foundProduct = ec.entity.find("mantle.product.Product")
+                            .condition("productId", cartSearch).one()
+                    }
+                    if (!foundProduct) {
+                        def cond = ec.entity.conditionFactory.makeCondition("productName",
+                            org.moqui.entity.EntityCondition.ComparisonOperator.LIKE, "%" + cartSearch + "%")
+                        foundProduct = ec.entity.find("mantle.product.Product")
+                            .condition("productTypeEnumId", "PtAsset").condition(cond)
+                            .limit(1).one()
+                    }
+                }
+            ]]></script>
+            <if condition="foundProduct">
+                <if condition="!transactionId">
+                    <service-call name="zenith.pos.PosServices.create#PosTransaction" out-map="tOut"
+                                  in-map="[sessionId:sessionId]"/>
+                    <set field="transactionId" from="tOut.transactionId"/>
+                </if>
+                <service-call name="zenith.pos.PosServices.add#PosTransactionItem"
+                              in-map="[transactionId:transactionId, productId:foundProduct.productId,
+                                       quantity:1, discountPercent:0]"/>
+                <if condition="taxOn == 'N'">
+                    <entity-find entity-name="zenith.erp.pos.PosTransactionItem" list="txnItems2">
+                        <econdition field-name="transactionId"/>
+                        <order-by field-name="-itemSeqId"/>
+                    </entity-find>
+                    <if condition="txnItems2">
+                        <set field="lastAdded2" from="txnItems2[0]"/>
+                        <service-call name="update#zenith.erp.pos.PosTransactionItem"
+                            in-map="[transactionId:transactionId, itemSeqId:lastAdded2.itemSeqId,
+                                     totalTaxAmount:0, lineTotal:lastAdded2.taxableAmount]"/>
+                        <service-call name="zenith.pos.PosServices.recalculate#TransactionTotals"
+                            in-map="[transactionId:transactionId]"/>
+                    </if>
+                </if>
+            <else>
+                <message error="true">Product not found: ${cartSearch}</message>
+            </else>
+            </if>
+        </actions>
+        <default-response url="." parameter-map="[sessionId:sessionId, transactionId:transactionId, catId:catId, taxOn:taxOn, salesModeId:salesModeId]"/>
+    </transition>
+
+    <transition name="toggleTax" begin-transaction="true">
+        <actions>
+            <if condition="transactionId">
+                <entity-find entity-name="zenith.erp.pos.PosTransactionItem" list="taxItems">
+                    <econdition field-name="transactionId"/>
+                </entity-find>
+                <if condition="taxOn == 'N'">
+                    <iterate list="taxItems" entry="ti">
+                        <service-call name="update#zenith.erp.pos.PosTransactionItem"
+                            in-map="[transactionId:transactionId, itemSeqId:ti.itemSeqId,
+                                     totalTaxAmount:0, lineTotal:ti.taxableAmount]"/>
+                    </iterate>
+                <else>
+                    <entity-find-one entity-name="zenith.erp.pos.PosTransaction" value-field="txn2"/>
+                    <entity-find-one entity-name="zenith.erp.pos.PosSession" value-field="sess2">
+                        <field-map field-name="sessionId" from="txn2.sessionId"/>
+                    </entity-find-one>
+                    <entity-find-one entity-name="zenith.erp.pos.PosTerminal" value-field="term2">
+                        <field-map field-name="terminalId" from="sess2.terminalId"/>
+                    </entity-find-one>
+                    <iterate list="taxItems" entry="ti">
+                        <entity-find-one entity-name="mantle.product.Product" value-field="prod2">
+                            <field-map field-name="productId" from="ti.productId"/>
+                        </entity-find-one>
+                        <service-call name="zenith.tax.TaxServices.calculate#Tax"
+                            in-map="[organizationPartyId:term2.organizationPartyId,
+                                     items:[[productId:ti.productId, productTaxCode:ti.productTaxCode ?: prod2?.productTaxCode,
+                                             taxCategoryId:prod2?.taxCategoryId, quantity:ti.quantity,
+                                             unitAmount:ti.unitPrice, discountAmount:ti.discountAmount ?: 0,
+                                             isTaxInclusive:'N']],
+                                     originRegionGeoId:txn2.originRegionGeoId,
+                                     destinationRegionGeoId:txn2.destinationRegionGeoId,
+                                     transactionType:'SALE']"
+                            out-map="taxRes2" ignore-error="true"/>
+                        <set field="ti2" from="taxRes2?.taxedItems ? taxRes2.taxedItems[0] : null"/>
+                        <set field="newTax" from="ti2?.totalTaxAmount ?: BigDecimal.ZERO" type="BigDecimal"/>
+                        <set field="newLine" from="((ti.taxableAmount ?: 0) as BigDecimal) + newTax" type="BigDecimal"/>
+                        <service-call name="update#zenith.erp.pos.PosTransactionItem"
+                            in-map="[transactionId:transactionId, itemSeqId:ti.itemSeqId,
+                                     totalTaxAmount:newTax, lineTotal:newLine]"/>
+                    </iterate>
+                </else>
+                </if>
+                <service-call name="zenith.pos.PosServices.recalculate#TransactionTotals"
+                    in-map="[transactionId:transactionId]"/>
+            </if>
+        </actions>
+        <default-response url="." parameter-map="[sessionId:sessionId, transactionId:transactionId, catId:catId, taxOn:taxOn, salesModeId:salesModeId]"/>
+    </transition>
+
+    <transition name="changeSalesMode">
+        <default-response url="." parameter-map="[sessionId:sessionId, transactionId:transactionId, catId:catId, taxOn:taxOn, salesModeId:salesModeId]"/>
+    </transition>
+
+    <transition name="showSplitPay">
+        <default-response url="." parameter-map="[sessionId:sessionId, transactionId:transactionId, catId:catId, taxOn:taxOn, salesModeId:salesModeId, splitPay:'Y']"/>
+    </transition>
+
+    <transition name="cancelSplitPay">
+        <default-response url="." parameter-map="[sessionId:sessionId, transactionId:transactionId, catId:catId, taxOn:taxOn, salesModeId:salesModeId]"/>
+    </transition>
+
+    <transition name="splitPayAndComplete" begin-transaction="true">
+        <actions>
+            <if condition="customerPhone">
+                <service-call name="update#zenith.erp.pos.PosTransaction"
+                              in-map="[transactionId:transactionId, customerPhone:customerPhone]"/>
+            </if>
+            <entity-find-one entity-name="zenith.erp.pos.PosTransaction" value-field="splitTxn"/>
+            <set field="cAmt" from="(cashAmount ?: 0) as BigDecimal" type="BigDecimal"/>
+            <set field="dAmt" from="(cardAmount ?: 0) as BigDecimal" type="BigDecimal"/>
+            <set field="uAmt" from="(upiAmount ?: 0) as BigDecimal" type="BigDecimal"/>
+            <set field="splitTotal" from="cAmt + dAmt + uAmt" type="BigDecimal"/>
+            <if condition="splitTotal &lt; ((splitTxn.payableAmount ?: 0) as BigDecimal)">
+                <return error="true" message="Split total is less than the payable amount. Please adjust."/>
+            </if>
+            <if condition="cAmt &gt; 0">
+                <service-call name="zenith.pos.PosServices.process#PosPayment"
+                              in-map="[transactionId:transactionId, paymentMethod:'Cash', amount:cAmt]"/>
+            </if>
+            <if condition="dAmt &gt; 0">
+                <service-call name="zenith.pos.PosServices.process#PosPayment"
+                              in-map="[transactionId:transactionId, paymentMethod:'Card', amount:dAmt, referenceNumber:cardRef]"/>
+            </if>
+            <if condition="uAmt &gt; 0">
+                <service-call name="zenith.pos.PosServices.process#PosPayment"
+                              in-map="[transactionId:transactionId, paymentMethod:'UPI', amount:uAmt, referenceNumber:upiRef]"/>
+            </if>
+            <service-call name="zenith.pos.PosServices.complete#PosTransaction"
+                          in-map="[transactionId:transactionId]"/>
+        </actions>
+        <default-response url="." parameter-map="[sessionId:sessionId, lastCompletedId:transactionId]"/>
+        <error-response url="." parameter-map="[sessionId:sessionId, transactionId:transactionId, catId:catId, taxOn:taxOn, salesModeId:salesModeId, splitPay:'Y']"/>
+    </transition>
+
+    <transition name="selectCategory">
+        <default-response url="." parameter-map="[sessionId:sessionId, transactionId:transactionId, catId:catId, taxOn:taxOn, salesModeId:salesModeId]"/>
+    </transition>
+
+    <transition name="searchProducts">
+        <default-response url="." parameter-map="[sessionId:sessionId, transactionId:transactionId, searchTerm:searchTerm, catId:catId, taxOn:taxOn, salesModeId:salesModeId]"/>
+    </transition>
+
+    <transition name="lookupProducts" begin-transaction="true">
+        <actions>
+            <script><![CDATA[
+                def results = []
+                if (term) {
+                    def cond1 = ec.entity.conditionFactory.makeCondition("productName",
+                        org.moqui.entity.EntityCondition.ComparisonOperator.LIKE, "%" + term + "%")
+                    def cond2 = ec.entity.conditionFactory.makeCondition("pseudoId",
+                        org.moqui.entity.EntityCondition.ComparisonOperator.LIKE, "%" + term + "%")
+                    def orCond = ec.entity.conditionFactory.makeCondition(cond1,
+                        org.moqui.entity.EntityCondition.JoinOperator.OR, cond2)
+                    def products = ec.entity.find("mantle.product.Product")
+                        .condition("productTypeEnumId", "PtAsset")
+                        .condition(orCond)
+                        .limit(10).orderBy("productName").list()
+                    products.each { p ->
+                        results.add([productId: p.productId, pseudoId: p.pseudoId ?: '',
+                                     productName: p.productName ?: p.pseudoId ?: p.productId,
+                                     mrpAmount: p.mrpAmount ?: 0])
+                    }
+                }
+                ec.web.sendJsonResponse(results)
+            ]]></script>
+        </actions>
+        <default-response type="none"/>
+    </transition>
+
+    <transition name="closeSession" begin-transaction="true">
+        <actions>
+            <service-call name="zenith.pos.PosServices.close#PosSession"
+                          in-map="[sessionId:sessionId, closingCash:closingCash]"/>
+        </actions>
+        <default-response url="."/>
+    </transition>
+
+    <!-- ==================== ACTIONS ==================== -->
+    <actions>
+        <set field="taxOn" from="taxOn ?: 'Y'"/>
+        <if condition="!sessionId">
+            <entity-find entity-name="zenith.erp.pos.PosSession" list="openSessions" limit="1">
+                <econdition field-name="operatorPartyId" from="ec.user.userAccount?.partyId"/>
+                <econdition field-name="statusId" value="PsOpen"/>
+                <order-by field-name="-openDate"/>
+            </entity-find>
+            <if condition="openSessions"><set field="sessionId" from="openSessions[0].sessionId"/></if>
+        </if>
+
+        <if condition="sessionId">
+            <entity-find-one entity-name="zenith.erp.pos.PosSession" value-field="session"/>
+            <if condition="session">
+                <entity-find-one entity-name="zenith.erp.pos.PosTerminal" value-field="terminal">
+                    <field-map field-name="terminalId" from="session.terminalId"/></entity-find-one>
+            </if>
+        </if>
+
+        <if condition="sessionId &amp;&amp; !transactionId &amp;&amp; !lastCompletedId">
+            <entity-find entity-name="zenith.erp.pos.PosTransaction" list="activeTxns" limit="1">
+                <econdition field-name="sessionId"/>
+                <econdition field-name="statusId" value="PtCreated"/>
+                <order-by field-name="-entryDate"/>
+            </entity-find>
+            <if condition="activeTxns"><set field="transactionId" from="activeTxns[0].transactionId"/></if>
+        </if>
+
+        <if condition="transactionId">
+            <entity-find-one entity-name="zenith.erp.pos.PosTransaction" value-field="txn"/>
+            <if condition="txn?.statusId == 'PtCreated'">
+                <entity-find entity-name="zenith.erp.pos.PosTransactionItem" list="cartItems">
+                    <econdition field-name="transactionId"/>
+                    <order-by field-name="itemSeqId"/>
+                </entity-find>
+            <else>
+                <set field="transactionId" from="null"/>
+            </else>
+            </if>
+        </if>
+
+        <!-- Last completed transaction (entities outside if, script outside if) -->
+        <if condition="lastCompletedId">
+            <entity-find-one entity-name="zenith.erp.pos.PosTransaction" value-field="completedTxn">
+                <field-map field-name="transactionId" from="lastCompletedId"/>
+            </entity-find-one>
+            <entity-find entity-name="zenith.erp.pos.PosTransactionItem" list="receiptItems">
+                <econdition field-name="transactionId" from="lastCompletedId"/>
+                <order-by field-name="itemSeqId"/>
+            </entity-find>
+            <entity-find entity-name="zenith.erp.pos.PosPayment" list="receiptPayments">
+                <econdition field-name="transactionId" from="lastCompletedId"/>
+            </entity-find>
+        </if>
+
+        <!-- Build receipt JSON — must be top-level script to avoid Groovy import issues -->
+        <script><![CDATA[
+            receiptJson = null
+            if (lastCompletedId && completedTxn) {
+                // Load receipt template for store details
+                def rTpl = ec.entity.find("zenith.erp.pos.PosReceiptTemplate")
+                        .condition("isDefault", "Y").condition("isActive", "Y").limit(1).one()
+                if (!rTpl) rTpl = ec.entity.find("zenith.erp.pos.PosReceiptTemplate")
+                        .condition("isActive", "Y").limit(1).one()
+
+                // Operator/cashier name
+                def operatorName = ''
+                if (session?.operatorPartyId) {
+                    def opPerson = ec.entity.find("mantle.party.Person")
+                            .condition("partyId", session.operatorPartyId).one()
+                    if (opPerson) operatorName = [(opPerson.firstName ?: ''), (opPerson.lastName ?: '')].findAll{it}.join(' ')
+                }
+
+                // Build store info from template or terminal
+                def storeAddr = ''
+                def storePhone = ''
+                def headerTxt = ''
+                def footerTxt = ''
+                def termsTxt = ''
+                if (rTpl) {
+                    storeAddr = [rTpl.addressLine1, rTpl.addressLine2, rTpl.city, rTpl.state, rTpl.pincode].findAll{it}.join(', ')
+                    storePhone = rTpl.phone ?: ''
+                    headerTxt = rTpl.headerText ?: ''
+                    footerTxt = rTpl.footerText ?: ''
+                    termsTxt = rTpl.termsText ?: ''
+                }
+
+                // Build items with MRP and savings
+                def totalSaving = BigDecimal.ZERO
+                def rItems = receiptItems.collect {
+                    def mrp = (it.mrp ?: it.unitPrice ?: 0) as BigDecimal
+                    def rate = (it.unitPrice ?: 0) as BigDecimal
+                    def qty = (it.quantity ?: 0) as BigDecimal
+                    def saving = (mrp - rate) * qty
+                    if (saving < 0) saving = BigDecimal.ZERO
+                    totalSaving += saving
+                    [
+                        name: it.productName ?: it.productId,
+                        mrp: ec.l10n.format(mrp, '#,##0'),
+                        qty: ec.l10n.format(qty, '#,##0.##'),
+                        rate: ec.l10n.format(rate, '#,##0.00'),
+                        total: ec.l10n.format(it.lineTotal ?: 0, '#,##0.00'),
+                        saving: ec.l10n.format(saving, '#,##0.00'),
+                        hasSaving: saving > 0,
+                        disc: (it.discountAmount ?: 0) as BigDecimal,
+                        discPct: it.discountPercent ?: 0,
+                        discAmt: ec.l10n.format(it.discountAmount ?: 0, '#,##0.00')
+                    ]
+                }
+
+                def rPayments = receiptPayments.collect { [method: it.paymentMethod, amount: ec.l10n.format(it.amount ?: 0, '#,##0.00')] }
+                def totalQty = receiptItems.sum { (it.quantity ?: 0) as BigDecimal } ?: 0
+                def paidTotal = receiptPayments.sum { (it.amount ?: 0) as BigDecimal } ?: 0
+
+                def builder = new groovy.json.JsonBuilder([
+                    storeName: rTpl?.companyName ?: terminal?.terminalName ?: 'Store',
+                    storeAddr: storeAddr,
+                    storePhone: storePhone,
+                    storeEmail: rTpl?.email ?: '',
+                    taxReg: rTpl?.taxRegistrationNumber ?: terminal?.taxRegistrationNumber ?: '',
+                    headerText: headerTxt,
+                    footerText: footerTxt,
+                    termsText: termsTxt,
+                    billNo: completedTxn.transactionNumber,
+                    date: ec.l10n.format(completedTxn.entryDate, 'dd/MM/yyyy hh:mm a'),
+                    saleBy: operatorName,
+                    customer: completedTxn.customerName ?: 'Walk-In Customer',
+                    customerPhone: completedTxn.customerPhone ?: '',
+                    items: rItems,
+                    itemCount: receiptItems.size(),
+                    totalQty: ec.l10n.format(totalQty, '#,##0.##'),
+                    subtotal: ec.l10n.format(completedTxn.subtotal ?: 0, '#,##0.00'),
+                    discount: ec.l10n.format(completedTxn.discountTotal ?: 0, '#,##0.00'),
+                    hasDiscount: ((completedTxn.discountTotal ?: 0) as BigDecimal) > 0,
+                    tax: ec.l10n.format(completedTxn.totalTaxAmount ?: 0, '#,##0.00'),
+                    hasTax: ((completedTxn.totalTaxAmount ?: 0) as BigDecimal) > 0,
+                    roundOff: ec.l10n.format(completedTxn.roundOff ?: 0, '#,##0.00'),
+                    hasRoundOff: ((completedTxn.roundOff ?: 0) as BigDecimal) != 0,
+                    total: ec.l10n.format(completedTxn.payableAmount ?: 0, '#,##0.00'),
+                    payments: rPayments,
+                    totalPaid: ec.l10n.format(paidTotal, '#,##0.00'),
+                    change: ec.l10n.format(completedTxn.changeAmount ?: 0, '#,##0.00'),
+                    hasChange: ((completedTxn.changeAmount ?: 0) as BigDecimal) > 0,
+                    totalSaving: ec.l10n.format(totalSaving, '#,##0.00'),
+                    hasSaving: totalSaving > 0,
+                    cs: currSymbol ?: '₹'
+                ])
+                receiptJson = builder.toString()
+            }
+        ]]></script>
+
+        <!-- Product categories -->
+        <entity-find entity-name="mantle.product.category.ProductCategory" list="categoryList">
+            <order-by field-name="categoryName"/>
+        </entity-find>
+
+        <!-- Products by category or search -->
+        <script><![CDATA[
+            gridProducts = []
+            if (searchTerm) {
+                def cond1 = ec.entity.conditionFactory.makeCondition("productName",
+                    org.moqui.entity.EntityCondition.ComparisonOperator.LIKE, "%" + searchTerm + "%")
+                def cond2 = ec.entity.conditionFactory.makeCondition("pseudoId",
+                    org.moqui.entity.EntityCondition.ComparisonOperator.LIKE, "%" + searchTerm + "%")
+                def orCond = ec.entity.conditionFactory.makeCondition(cond1,
+                    org.moqui.entity.EntityCondition.JoinOperator.OR, cond2)
+                gridProducts = ec.entity.find("mantle.product.Product")
+                    .condition("productTypeEnumId", "PtAsset")
+                    .condition(orCond)
+                    .limit(30).orderBy("productName").list()
+            } else if (catId) {
+                def members = ec.entity.find("mantle.product.category.ProductCategoryMember")
+                    .condition("productCategoryId", catId)
+                    .conditionDate("fromDate", "thruDate", ec.user.nowTimestamp)
+                    .orderBy("sequenceNum,productId").list()
+                def pIds = members.collect { it.productId }
+                if (pIds) {
+                    gridProducts = ec.entity.find("mantle.product.Product")
+                        .condition("productId", org.moqui.entity.EntityCondition.ComparisonOperator.IN, pIds)
+                        .limit(50).orderBy("productName").list()
+                }
+            } else {
+                gridProducts = ec.entity.find("mantle.product.Product")
+                    .condition("productTypeEnumId", "PtAsset")
+                    .limit(30).orderBy("productName").list()
+            }
+
+            lastBillNo = '-'
+            lastBillAmt = '0'
+            if (sessionId) {
+                def lastBill = ec.entity.find("zenith.erp.pos.PosTransaction")
+                    .condition("sessionId", sessionId).condition("statusId", "PtCompleted")
+                    .orderBy("-entryDate").limit(1).one()
+                if (lastBill) {
+                    lastBillNo = lastBill.transactionNumber ?: lastBill.transactionId
+                    lastBillAmt = ec.l10n.format(lastBill.payableAmount ?: 0, '#,##0.00')
+                }
+            }
+
+            cartQty = BigDecimal.ZERO
+            if (cartItems) {
+                cartQty = cartItems.sum { (it.quantity ?: 0) as BigDecimal } ?: BigDecimal.ZERO
+            }
+            cartAmt = txn?.payableAmount ?: BigDecimal.ZERO
+            cartDisc = txn?.discountTotal ?: BigDecimal.ZERO
+
+            heldTxns = []
+            if (sessionId) {
+                heldTxns = ec.entity.find("zenith.erp.pos.PosHeldTransaction")
+                    .condition("sessionId", sessionId).condition("statusId", "PhHeld")
+                    .orderBy("-holdTime").list()
+            }
+
+            dispDate = ec.l10n.format(ec.user.nowTimestamp, 'dd-MM-yyyy')
+            dispTime = ec.l10n.format(ec.user.nowTimestamp, 'hh:mm:ss a')
+
+            salesMode = 'RETAIL'
+            salesModeColor = '#2e7d32'
+            salesModesList = []
+            try {
+                def allModes = ec.entity.find("zenith.erp.pos.PosSalesMode").condition("isActive", "Y").orderBy("isDefault,modeName").list()
+                salesModesList = allModes
+                def currentMode = null
+                if (salesModeId) {
+                    currentMode = allModes.find { it.salesModeId == salesModeId }
+                }
+                if (!currentMode) {
+                    currentMode = allModes.find { it.isDefault == 'Y' }
+                }
+                if (!currentMode && allModes) {
+                    currentMode = allModes[0]
+                }
+                if (currentMode) {
+                    salesMode = currentMode.modeName ?: 'RETAIL'
+                    salesModeId = currentMode.salesModeId
+                    salesModeColor = currentMode.colorCode ?: '#2e7d32'
+                }
+            } catch (Exception e) { /* PosSalesMode may not exist yet */ }
+        ]]></script>
+
+        <entity-find entity-name="zenith.erp.pos.PosTerminal" list="terminalList">
+            <econdition field-name="isActive" value="Y"/>
+        </entity-find>
+    </actions>
+
+    <!-- ==================== WIDGETS ==================== -->
+    <widgets>
+        <render-mode><text type="html" template="true"><![CDATA[
+            <link rel="manifest" href="${sri.buildUrl('manifest.json').url}">
+            <script src="${sri.buildUrl('pos-db.js').url}"></script>
+            <style>
+                .offline-banner { display: none; background: #e53935; color: white; padding: 10px; text-align: center; font-weight: bold; position: fixed; top: 0; left: 0; right: 0; z-index: 9999; }
+                .offline-banner.active { display: block; }
+            </style>
+            <div id="offlineBanner" class="offline-banner">
+                <i class="fa fa-plug"></i> OFFLINE MODE - Operating from Local Database
+                <button onclick="PosDB.pushQueueToServer('${session?.terminalId}')" class="btn btn-sm" style="margin-left: 20px; background: white; color: #e53935; border: none; padding: 4px 10px; border-radius: 4px;">Sync Now</button>
+            </div>
+            <script>
+                if ('serviceWorker' in navigator) {
+                    window.addEventListener('load', function() {
+                        navigator.serviceWorker.register('${sri.buildUrl('sw.js').url}').then(function(reg) {
+                            console.log('PWA ServiceWorker registered');
+                        });
+                    });
+                }
+                
+                PosDB.init().then(() => {
+                    console.log("IndexedDB Initialized");
+                    if (navigator.onLine && '${session?.terminalId}') {
+                        PosDB.syncCatalog('${session?.terminalId}');
+                    }
+                });
+
+                function updateOnlineStatus() {
+                    if (navigator.onLine) {
+                        $('#offlineBanner').removeClass('active');
+                        if ('${session?.terminalId}') {
+                            PosDB.pushQueueToServer('${session?.terminalId}').then(count => {
+                                if (count > 0) alert(count + " offline transactions synced successfully.");
+                            });
+                        }
+                    } else {
+                        $('#offlineBanner').addClass('active');
+                    }
+                }
+
+                window.addEventListener('online', updateOnlineStatus);
+                window.addEventListener('offline', updateOnlineStatus);
+                $(document).ready(updateOnlineStatus);
+            </script>
+        ]]></text></render-mode>
+
+
+        <!-- ===== No Session — Open Session ===== -->
+        <section name="NoSessionSection" condition="!session">
+            <widgets>
+                <container style="q-pa-xl">
+                    <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-xl" style-sm="max-width:500px; margin:80px auto;">
+                        <container style="text-center q-mb-lg">
+                            <render-mode><text type="html"><![CDATA[<q-icon name="point_of_sale" class="text-h1 text-primary q-mb-md"/>]]></text></render-mode>
+                            <label text="POS Billing Terminal" type="h4" style="text-weight-bold q-my-none"/>
+                            <label text="Open a session to start billing" type="p" style="text-grey-7 q-mt-sm"/>
+                        </container>
+                        <form-single name="OpenSessionForm" transition="openSession">
+                            <field name="terminalId"><default-field title="Select Terminal">
+                                <drop-down>
+                                    <list-options list="terminalList" key="${terminalId}" text="${terminalName ?: terminalId}"/>
+                                </drop-down>
+                            </default-field></field>
+                            <field name="openingCash"><default-field title="Opening Cash">
+                                <text-line size="15" default-value="0" input-type="number"/>
+                            </default-field></field>
+                            <field name="submitBtn"><default-field title="">
+                                <submit text="Open Session" type="success" icon="fa fa-play"/>
+                            </default-field></field>
+                        </form-single>
+                    </container>
+                </container>
+            </widgets>
+        </section>
+
+        <!-- ===== Session Active ===== -->
+        <section name="ActiveSessionSection" condition="session">
+            <widgets>
+
+                <!-- ===== Receipt View ===== -->
+                <section name="ReceiptSection" condition="lastCompletedId &amp;&amp; completedTxn">
+                    <widgets>
+                        <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-xl" style-sm="max-width:600px; margin:0 auto;">
+                            <container style="text-center q-mb-lg">
+                                <render-mode><text type="html"><![CDATA[<q-icon name="check_circle" class="text-h1 text-positive q-mb-sm"/>]]></text></render-mode>
+                                <label text="Sale Complete!" type="h4" style="text-weight-bold text-positive q-my-none"/>
+                                <label text="${completedTxn.transactionNumber}" type="p" style="text-grey-7 q-mt-xs text-subtitle1"/>
+                            </container>
+                            <form-list name="ReceiptItemsForm" list="receiptItems" skip-form="true">
+                                <field name="productName"><default-field title="Item"><display/></default-field></field>
+                                <field name="quantity"><default-field title="Qty"><display/></default-field></field>
+                                <field name="unitPrice"><default-field title="Price"><display format="#,##0.00"/></default-field></field>
+                                <field name="lineTotal"><default-field title="Total"><display format="#,##0.00"/></default-field></field>
+                            </form-list>
+                            <container style="q-mt-md q-pa-md bg-grey-1 border-radius-md">
+                                <container style="row justify-between q-pt-sm" style-sm="border-top: 2px solid #1976D2;">
+                                    <label text="TOTAL PAID" type="h5" style="text-weight-bold q-my-none"/>
+                                    <label text="${ec.l10n.format(completedTxn.payableAmount ?: 0, '#,##0.00')}" type="h5" style="text-weight-bold text-primary q-my-none"/>
+                                </container>
+                            </container>
+                            <container style="row justify-center q-gutter-md q-mt-lg">
+                                <render-mode><text type="html" template="true"><![CDATA[
+                                    <button type="button" onclick="printThermalReceipt()" class="btn btn-primary btn-sm q-px-xl">
+                                        <i class="fa fa-print"></i> Print Receipt
+                                    </button>
+                                    <a href="${sri.buildUrl('ReceiptPdf').url}?transactionId=${lastCompletedId}" target="_blank" class="btn btn-sm q-px-xl" style="background:#e53935;color:#fff;border:none;text-decoration:none;display:inline-flex;align-items:center;gap:6px">
+                                        <i class="fa fa-file-pdf-o" style="font-size:16px"></i> Download PDF
+                                    </a>
+                                    <button type="button" onclick="sendWhatsAppWithPdf()" class="btn btn-sm q-px-xl" style="background:#25D366;color:#fff;border:none">
+                                        <i class="fa fa-whatsapp" style="font-size:16px"></i> WhatsApp Receipt
+                                    </button>
+                                ]]></text></render-mode>
+                                <link url="." text="New Sale" parameter-map="[sessionId:sessionId]" btn-type="success" icon="fa fa-plus" style="q-px-xl"/>
+                            </container>
+                        </container>
+                        <render-mode><text type="html" template="true"><![CDATA[
+<script>
+var _rd = ${receiptJson!'null'};
+function printThermalReceipt() {
+    var d = _rd, cs = d.cs || '₹', h = '';
+    /* Header text */
+    if (d.headerText) h += '<div class="ct sm" style="margin-bottom:4px">' + d.headerText + '</div>';
+    /* Store name */
+    h += '<div class="ct bg" style="font-size:16px;margin:2px 0">' + d.storeName + '</div>';
+    /* Store address & phone */
+    if (d.storeAddr) h += '<div class="ct sm">' + d.storeAddr + '</div>';
+    if (d.storePhone) h += '<div class="ct sm">Ph: ' + d.storePhone + '</div>';
+    if (d.storeEmail) h += '<div class="ct sm">' + d.storeEmail + '</div>';
+    if (d.taxReg) h += '<div class="ct sm">Tax Reg: ' + d.taxReg + '</div>';
+    h += '<div class="ln"></div>';
+    /* Invoice info */
+    h += '<div class="ct b" style="margin:2px 0">Invoice</div>';
+    h += '<div class="rw"><span class="lb">Invoice No:</span><span class="vl">' + d.billNo + '</span></div>';
+    h += '<div class="rw"><span class="lb">Date:</span><span class="vl">' + d.date + '</span></div>';
+    if (d.saleBy) h += '<div class="rw"><span class="lb">Sale By:</span><span class="vl">' + d.saleBy + '</span></div>';
+    h += '<div class="rw"><span class="lb">Customer:</span><span class="vl">' + d.customer + '</span></div>';
+    if (d.customerPhone) h += '<div class="rw"><span class="lb">Mobile:</span><span class="vl">' + d.customerPhone + '</span></div>';
+    h += '<div class="ln"></div>';
+    /* Items table: Item | MRP | Qty | Rate | Total */
+    h += '<table><tr><th>Item</th><th>MRP</th><th>Qty</th><th>Rate</th><th>Total</th></tr>';
+    for (var i = 0; i < d.items.length; i++) { var it = d.items[i];
+        h += '<tr><td>' + it.name + '</td><td class="r">' + it.mrp + '</td><td class="c">' + it.qty + '</td><td class="r">' + it.rate + '</td><td class="r">' + it.total + '</td></tr>';
+        if (it.hasSaving) h += '<tr><td colspan="5" class="sv">You Save ' + cs + it.saving + '</td></tr>';
+    }
+    h += '</table><div class="ln"></div>';
+    /* Summary: Qty, Items, Subtotal */
+    h += '<div class="rw sm"><span>Total Qty: ' + d.totalQty + '</span><span>Total Items: ' + d.itemCount + '</span></div>';
+    h += '<div class="rw"><span class="lb">Subtotal</span><span class="vl">' + cs + d.subtotal + '</span></div>';
+    if (d.hasDiscount) h += '<div class="rw"><span class="lb">Discount</span><span class="vl">-' + cs + d.discount + '</span></div>';
+    if (d.hasTax) h += '<div class="rw"><span class="lb">Tax</span><span class="vl">' + cs + d.tax + '</span></div>';
+    if (d.hasRoundOff) h += '<div class="rw sm"><span class="lb">Round Off</span><span class="vl">' + d.roundOff + '</span></div>';
+    h += '<div class="dl"></div>';
+    /* Grand total */
+    h += '<div class="rw bg"><span class="lb">TOTAL</span><span class="vl">' + cs + d.total + '</span></div>';
+    h += '<div class="dl"></div>';
+    /* Payment breakdown */
+    for (var p = 0; p < d.payments.length; p++)
+        h += '<div class="rw"><span class="lb">' + d.payments[p].method + '</span><span class="vl">' + cs + d.payments[p].amount + '</span></div>';
+    if (d.hasChange) h += '<div class="rw b"><span class="lb">Balance</span><span class="vl">' + cs + d.change + '</span></div>';
+    /* Total savings */
+    if (d.hasSaving) {
+        h += '<div class="ln"></div>';
+        h += '<div class="ct b" style="margin:4px 0">Your Total Saving Amt: ' + cs + d.totalSaving + '</div>';
+    }
+    h += '<div class="ln"></div>';
+    /* Terms / exchange policy */
+    if (d.termsText) h += '<div class="ct sm" style="margin:4px 0;white-space:pre-line">' + d.termsText + '</div>';
+    /* Footer */
+    if (d.footerText) { h += '<div class="ln"></div>'; h += '<div class="ct sm" style="margin:4px 0;white-space:pre-line">' + d.footerText + '</div>'; }
+    h += '<div style="margin-top:6px" class="ct b">Thank You !!</div>';
+    /* CSS for 80mm thermal */
+    var css = '@page{size:80mm auto;margin:0}*{margin:0;padding:0;box-sizing:border-box}body{font-family:"Courier New",monospace;font-size:12px;width:72mm;max-width:72mm;margin:0 auto;padding:4mm 2mm;color:#000}.ct{text-align:center}.r{text-align:right}.c{text-align:center}.b{font-weight:bold}.bg{font-size:14px;font-weight:bold}.sm{font-size:10px}.ln{border-top:1px dashed #000;margin:4px 0}.dl{border-top:2px solid #000;margin:4px 0}.rw{display:flex;justify-content:space-between;margin-bottom:2px}.rw .lb{flex:1}.rw .vl{text-align:right;white-space:nowrap}.sv{font-size:9px;color:#333;padding-left:8px;font-style:italic}table{width:100%;border-collapse:collapse}th{text-align:left;font-size:10px;border-bottom:1px solid #000;padding:2px 0}td{padding:2px 0;font-size:11px;vertical-align:top}th:nth-child(2),td:nth-child(2){text-align:right;width:38px}th:nth-child(3),td:nth-child(3){text-align:center;width:28px}th:nth-child(4),td:nth-child(4){text-align:right;width:44px}th:nth-child(5),td:nth-child(5){text-align:right;width:50px}@media print{body{padding:2mm 1mm}}';
+    var old = document.getElementById('_pf');
+    if (old) old.parentNode.removeChild(old);
+    var f = document.createElement('iframe');
+    f.id = '_pf'; f.style.cssText = 'position:fixed;right:0;bottom:0;width:0;height:0;border:0;visibility:hidden';
+    document.body.appendChild(f);
+    var fd = f.contentWindow.document;
+    fd.open(); fd.write('<!DOCTYPE html><html><head><meta charset="UTF-8"/><style>' + css + '</style></head><body>' + h + '</body></html>'); fd.close();
+    setTimeout(function(){ try { f.contentWindow.focus(); f.contentWindow.print(); } catch(e){} setTimeout(function(){ try { f.parentNode.removeChild(f); } catch(e){} }, 1000); }, 300);
+}
+var _pdfUrl = '${sri.buildUrl("ReceiptPdf").url}?transactionId=${lastCompletedId!""}';
+if (_rd) {
+    setTimeout(function(){ try{printThermalReceipt();}catch(e){} }, 600);
+    // Auto-download PDF receipt
+    setTimeout(function(){ try{downloadPdfReceipt();}catch(e){} }, 900);
+    // Auto-send WhatsApp with PDF link if customer phone is available
+    if (_rd.customerPhone) { setTimeout(function(){ try{sendWhatsAppWithPdf();}catch(e){} }, 1500); }
+}
+function downloadPdfReceipt() {
+    if (!_pdfUrl) return;
+    var a = document.createElement('a');
+    a.href = _pdfUrl;
+    a.target = '_blank';
+    a.download = 'Receipt-' + (_rd ? _rd.billNo.replace(/\//g, '-') : 'bill') + '.pdf';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(function(){ document.body.removeChild(a); }, 500);
+}
+function sendWhatsAppWithPdf() {
+    var d = _rd;
+    if (!d) return;
+    var cs = d.cs || '₹';
+    var phone = d.customerPhone;
+    if (!phone) { phone = prompt('Enter customer WhatsApp number (with country code, e.g. 91XXXXXXXXXX):'); }
+    if (!phone) return;
+    phone = phone.replace(/[^0-9]/g, '');
+    if (phone.length === 10) phone = '91' + phone;
+    var nl = '%0a';
+    var msg = '';
+    if (d.headerText) msg += '_' + d.headerText + '_' + nl;
+    msg += '*' + d.storeName + '*' + nl;
+    if (d.storeAddr) msg += d.storeAddr + nl;
+    if (d.storePhone) msg += 'Ph: ' + d.storePhone + nl;
+    msg += '━━━━━━━━━━━━━━━' + nl;
+    msg += '*Invoice*' + nl;
+    msg += 'No: ' + d.billNo + nl;
+    msg += 'Date: ' + d.date + nl;
+    if (d.saleBy) msg += 'Sale By: ' + d.saleBy + nl;
+    msg += 'Customer: ' + d.customer + nl;
+    msg += '━━━━━━━━━━━━━━━' + nl;
+    for (var i = 0; i < d.items.length; i++) {
+        var it = d.items[i];
+        msg += (i+1) + '. ' + it.name + nl;
+        msg += '   Qty:' + it.qty + ' x ' + cs + it.rate + ' = ' + cs + it.total + nl;
+    }
+    msg += '━━━━━━━━━━━━━━━' + nl;
+    msg += '*TOTAL: ' + cs + d.total + '*' + nl;
+    msg += '━━━━━━━━━━━━━━━' + nl;
+    for (var p = 0; p < d.payments.length; p++)
+        msg += d.payments[p].method + ': ' + cs + d.payments[p].amount + nl;
+    if (d.hasChange) msg += 'Balance: ' + cs + d.change + nl;
+    // PDF download link
+    msg += nl + '📄 *Download PDF Receipt:*' + nl;
+    msg += window.location.origin + _pdfUrl + nl;
+    msg += nl + 'Thank You!! 🙏';
+    window.open('https://wa.me/' + phone + '?text=' + encodeURIComponent(decodeURIComponent(msg.replace(/%0a/g, '\n'))), '_blank');
+}
+</script>
+                        ]]></text></render-mode>
+                    </widgets>
+                </section>
+
+                <!-- ===== BILLING TERMINAL (3-Column Layout) ===== -->
+                <section name="BillingSection" condition="!lastCompletedId">
+                    <widgets>
+                        <render-mode><text type="html,qvt" template="true"><![CDATA[
+<div>
+<!-- Header -->
+<div style="display:flex;align-items:center;justify-content:space-between;background:#1a237e;color:#fff;padding:10px 16px;border-radius:8px;margin-bottom:6px">
+    <div style="display:flex;align-items:center;gap:14px;font-size:15px">
+        <span style="color:#ef5350;font-weight:bold;font-size:18px">${(terminal.terminalName)!'Terminal'}</span>
+        <span>${dispDate}</span>
+        <#if salesModesList?? && (salesModesList?size > 1)>
+        <span style="display:inline-flex;gap:5px">
+            <#list salesModesList as sm>
+                <a href="Terminal/changeSalesMode?sessionId=${sessionId!''}&transactionId=${transactionId!''}&catId=${catId!''}&taxOn=${taxOn!'Y'}&salesModeId=${sm.salesModeId}" style="padding:6px 14px;border-radius:6px;text-decoration:none;font-size:14px;font-weight:bold;cursor:pointer;background:${(salesModeId! == sm.salesModeId)?then(sm.colorCode!'#2e7d32','rgba(255,255,255,0.15)')};color:#fff;border:2px solid ${(salesModeId! == sm.salesModeId)?then('#fff','rgba(255,255,255,0.3)')}">${sm.modeName!sm.salesModeId}</a>
+            </#list>
+        </span>
+        <#else>
+        <span style="background:${salesModeColor};padding:6px 14px;border-radius:6px;font-weight:bold">${salesMode}</span>
+        </#if>
+        <span style="background:#e65100;padding:6px 14px;border-radius:6px;font-weight:bold">BILL- ${(txn.transactionNumber)!'0'}</span>
+    </div>
+    <div style="display:flex;align-items:center;gap:14px">
+        <form method="post" action="Terminal/toggleTax" style="display:inline;margin:0">
+            <input type="hidden" name="sessionId" value="${sessionId!''}"/>
+            <input type="hidden" name="transactionId" value="${transactionId!''}"/>
+            <input type="hidden" name="catId" value="${catId!''}"/>
+            <input type="hidden" name="taxOn" value="${((taxOn!'Y') == 'Y')?then('N','Y')}"/>
+            <input type="hidden" name="salesModeId" value="${salesModeId!''}"/>
+            <input type="hidden" name="moquiSessionToken" value="${ec.web.sessionToken}"/>
+            <button type="submit" style="border:none;padding:8px 18px;border-radius:6px;cursor:pointer;font-weight:bold;font-size:14px;color:#fff;background:${((taxOn!'Y') == 'Y')?then('#4caf50','#f44336')}">TAX: ${((taxOn!'Y') == 'Y')?then('ON','OFF')}</button>
+        </form>
+        <span style="font-size:14px">#${sessionId!''}</span>
+        <#if heldTxns?? && (heldTxns?size > 0)>
+            <span style="background:#ff9800;padding:6px 12px;border-radius:6px;font-weight:bold;font-size:14px">HELD: ${heldTxns?size}</span>
+        </#if>
+        <a href="/apps/zenith/pos/Terminal?sessionId=${sessionId!''}&transactionId=${transactionId!''}&taxOn=${taxOn!'Y'}&salesModeId=${salesModeId!''}" target="_blank" style="padding:6px 14px;border-radius:6px;text-decoration:none;font-size:13px;font-weight:bold;cursor:pointer;background:#00695c;color:#fff;border:1px solid #4db6ac">&#9654; Apps Mode</a>
+    </div>
+</div>
+
+<div style="display:flex;height:calc(100vh - 130px);gap:0;font-family:'Segoe UI',Arial,sans-serif;overflow:hidden">
+
+    <!-- ===== LEFT: Categories + Search + Product Grid ===== -->
+    <div style="flex:1;display:flex;flex-direction:column;min-width:0">
+
+        <!-- Category Strip (horizontal scroll) -->
+        <div style="display:flex;gap:6px;padding:8px 10px;background:#263238;overflow-x:auto;flex-shrink:0;-webkit-overflow-scrolling:touch">
+            <a href="Terminal/selectCategory?sessionId=${sessionId!''}&transactionId=${transactionId!''}&catId=&taxOn=${taxOn!'Y'}&salesModeId=${salesModeId!''}" style="flex-shrink:0;padding:10px 20px;border-radius:8px;text-decoration:none;font-size:14px;font-weight:600;cursor:pointer;background:${(!catId?? || catId == '')?then('#1565c0','#455a64')};color:#fff;white-space:nowrap">ALL ITEMS</a>
+            <#if categoryList??>
+            <#list categoryList as cat>
+                <a href="Terminal/selectCategory?sessionId=${sessionId!''}&transactionId=${transactionId!''}&catId=${cat.productCategoryId}&taxOn=${taxOn!'Y'}&salesModeId=${salesModeId!''}" style="flex-shrink:0;padding:10px 20px;border-radius:8px;text-decoration:none;font-size:14px;font-weight:600;cursor:pointer;background:${(catId! == cat.productCategoryId)?then('#1565c0','#455a64')};color:#fff;white-space:nowrap">${cat.categoryName!cat.productCategoryId}</a>
+            </#list>
+            </#if>
+        </div>
+
+        <!-- Search Bar -->
+        <div style="padding:8px 10px;background:#eceff1;flex-shrink:0">
+            <form method="get" action="Terminal/searchProducts" style="display:flex;gap:6px;margin:0">
+                <input type="hidden" name="sessionId" value="${sessionId!''}"/>
+                <input type="hidden" name="transactionId" value="${transactionId!''}"/>
+                <input type="hidden" name="catId" value="${catId!''}"/>
+                <input type="hidden" name="taxOn" value="${taxOn!'Y'}"/>
+                <input type="hidden" name="salesModeId" value="${salesModeId!''}"/>
+                <input type="text" name="searchTerm" placeholder="Search products..." value="${searchTerm!''}" style="flex:1;padding:12px 16px;border:2px solid #bbb;border-radius:8px;font-size:16px;box-sizing:border-box;outline:none"/>
+            </form>
+        </div>
+
+        <!-- Product Grid -->
+        <div style="flex:1;background:#e8eaf6;padding:10px;overflow-y:auto;display:grid;grid-template-columns:repeat(2,1fr);gap:10px;align-content:start;-webkit-overflow-scrolling:touch">
+            <#if searchTerm?has_content>
+                <div style="grid-column:1/-1;font-size:14px;color:#555;padding:4px;">Results for "<b>${searchTerm}</b>"</div>
+            </#if>
+            <#if gridProducts?? && (gridProducts?size > 0)>
+                <#list gridProducts as p>
+                    <form method="post" action="Terminal/addItem" style="margin:0;display:contents">
+                        <input type="hidden" name="sessionId" value="${sessionId!''}"/>
+                        <input type="hidden" name="transactionId" value="${transactionId!''}"/>
+                        <input type="hidden" name="productId" value="${p.productId}"/>
+                        <input type="hidden" name="unitPrice" value="${(p.mrpAmount)!0}"/>
+                        <input type="hidden" name="addQty" value="1"/>
+                        <input type="hidden" name="catId" value="${catId!''}"/>
+                        <input type="hidden" name="taxOn" value="${taxOn!'Y'}"/>
+                        <input type="hidden" name="salesModeId" value="${salesModeId!''}"/>
+                        <input type="hidden" name="moquiSessionToken" value="${ec.web.sessionToken}"/>
+                        <button type="submit" style="background:#fff;border:1px solid #ddd;border-radius:10px;padding:14px 8px;cursor:pointer;text-align:center;font-family:inherit;min-height:80px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;-webkit-tap-highlight-color:rgba(0,0,0,0.1)">
+                            <div style="font-size:13px;font-weight:600;color:#333;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%" title="${(p.productName)!''}">${(p.productName)!(p.pseudoId)!''}</div>
+                            <div style="font-size:17px;font-weight:bold;color:#e53935">${ec.l10n.format((p.mrpAmount)!0, '#,##0')}</div>
+                            <div style="font-size:11px;color:#999">${p.pseudoId!''}</div>
+                        </button>
+                    </form>
+                </#list>
+            <#else>
+                <div style="grid-column:1/-1;text-align:center;padding:60px 20px;color:#999;">
+                    <div style="font-size:40px;margin-bottom:10px;">&#128722;</div>
+                    <div style="font-size:16px">No products found</div>
+                </div>
+            </#if>
+        </div>
+    </div>
+
+    <!-- ===== RIGHT: Cart + Totals + Payment ===== -->
+    <div style="width:70%;max-width:900px;min-width:500px;display:flex;flex-direction:column;background:#fff;border-left:2px solid #ddd">
+
+        <!-- Cart Table -->
+        <div style="flex:1;overflow-y:auto;padding:0;-webkit-overflow-scrolling:touch">
+            <table style="width:100%;border-collapse:collapse">
+                <thead>
+                    <tr>
+                        <th style="background:#1565c0;color:#fff;padding:10px 8px;font-size:13px;text-transform:uppercase;position:sticky;top:0;z-index:1;text-align:left">ITEM</th>
+                        <th style="width:100px;background:#1565c0;color:#fff;padding:10px 8px;font-size:13px;text-transform:uppercase;position:sticky;top:0;z-index:1;text-align:right">RATE</th>
+                        <th style="width:130px;background:#1565c0;color:#fff;padding:10px 8px;font-size:13px;text-transform:uppercase;position:sticky;top:0;z-index:1;text-align:center">QTY</th>
+                        <th style="width:90px;background:#1565c0;color:#fff;padding:10px 8px;font-size:13px;text-transform:uppercase;position:sticky;top:0;z-index:1;text-align:right">TOTAL</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <#if cartItems?? && (cartItems?size > 0)>
+                        <#list cartItems as item>
+                        <tr style="border-bottom:1px solid #e0e0e0">
+                            <td style="padding:8px 10px">
+                                <div style="font-size:14px;font-weight:600;color:#333">${item.productName!''}</div>
+                                <div style="font-size:11px;color:#999">${item.productId!''}</div>
+                            </td>
+                            <td style="padding:4px 4px;text-align:right;vertical-align:middle">
+                                <form method="post" action="Terminal/updateItemPrice" style="display:flex;align-items:center;gap:3px;margin:0;justify-content:flex-end">
+                                    <input type="hidden" name="transactionId" value="${transactionId!''}"/>
+                                    <input type="hidden" name="itemSeqId" value="${item.itemSeqId}"/>
+                                    <input type="hidden" name="sessionId" value="${sessionId!''}"/>
+                                    <input type="hidden" name="catId" value="${catId!''}"/>
+                                    <input type="hidden" name="taxOn" value="${taxOn!'Y'}"/>
+                                    <input type="hidden" name="salesModeId" value="${salesModeId!''}"/>
+                                    <input type="hidden" name="moquiSessionToken" value="${ec.web.sessionToken}"/>
+                                    <input type="text" name="newPrice" value="${(item.unitPrice!0)?c}" style="width:65px;padding:8px 6px;border:1px solid #ccc;border-radius:6px;font-size:14px;text-align:right;background:#fff;box-sizing:border-box"/>
+                                    <button type="submit" style="width:32px;height:32px;border:none;background:#1565c0;color:#fff;border-radius:6px;cursor:pointer;font-size:14px;display:flex;align-items:center;justify-content:center;padding:0;flex-shrink:0" title="Update Price">&#10003;</button>
+                                </form>
+                            </td>
+                            <td style="padding:4px;text-align:center;vertical-align:middle">
+                                <div style="display:flex;align-items:center;justify-content:center;gap:0">
+                                    <form method="post" action="Terminal/updateItemQty" style="display:inline;margin:0">
+                                        <input type="hidden" name="transactionId" value="${transactionId!''}"/>
+                                        <input type="hidden" name="itemSeqId" value="${item.itemSeqId}"/>
+                                        <input type="hidden" name="sessionId" value="${sessionId!''}"/>
+                                        <input type="hidden" name="catId" value="${catId!''}"/>
+                                        <input type="hidden" name="taxOn" value="${taxOn!'Y'}"/>
+                                        <input type="hidden" name="salesModeId" value="${salesModeId!''}"/>
+                                        <input type="hidden" name="newQty" value="${(item.quantity!1)?c?replace('.0','')?number - 1}"/>
+                                        <input type="hidden" name="moquiSessionToken" value="${ec.web.sessionToken}"/>
+                                        <button type="submit" style="width:40px;height:40px;border:2px solid #e53935;background:#fff;font-size:22px;font-weight:bold;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0;border-radius:8px 0 0 8px;color:#e53935;-webkit-tap-highlight-color:rgba(0,0,0,0.1)">-</button>
+                                    </form>
+                                    <span style="min-width:40px;text-align:center;font-weight:bold;font-size:18px;border-top:2px solid #ccc;border-bottom:2px solid #ccc;height:40px;line-height:40px;background:#f5f5f5">${ec.l10n.format(item.quantity!0, '#,##0')}</span>
+                                    <form method="post" action="Terminal/updateItemQty" style="display:inline;margin:0">
+                                        <input type="hidden" name="transactionId" value="${transactionId!''}"/>
+                                        <input type="hidden" name="itemSeqId" value="${item.itemSeqId}"/>
+                                        <input type="hidden" name="sessionId" value="${sessionId!''}"/>
+                                        <input type="hidden" name="catId" value="${catId!''}"/>
+                                        <input type="hidden" name="taxOn" value="${taxOn!'Y'}"/>
+                                        <input type="hidden" name="salesModeId" value="${salesModeId!''}"/>
+                                        <input type="hidden" name="newQty" value="${(item.quantity!1)?c?replace('.0','')?number + 1}"/>
+                                        <input type="hidden" name="moquiSessionToken" value="${ec.web.sessionToken}"/>
+                                        <button type="submit" style="width:40px;height:40px;border:2px solid #2e7d32;background:#fff;font-size:22px;font-weight:bold;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0;border-radius:0 8px 8px 0;color:#2e7d32;-webkit-tap-highlight-color:rgba(0,0,0,0.1)">+</button>
+                                    </form>
+                                </div>
+                            </td>
+                            <td style="padding:8px 10px;text-align:right;font-size:15px;font-weight:700;color:#333;vertical-align:middle">${ec.l10n.format(item.lineTotal!0, '#,##0.00')}</td>
+                        </tr>
+                        </#list>
+                    </#if>
+                </tbody>
+            </table>
+        </div>
+
+        <!-- Cart Search (outside scroll container so dropdown isn't clipped) -->
+        <div style="padding:6px 8px;background:#f0faf0;border-top:1px solid #e0e0e0;position:relative;flex-shrink:0">
+            <input type="text" id="cartInlineSearch" placeholder="&#128274; Scan barcode / Type product name..." autocomplete="off" style="width:100%;padding:12px 14px;border:2px solid #43a047;border-radius:8px;font-size:16px;background:#fff;box-sizing:border-box;outline:none"/>
+            <div id="cartSearchDropdown" style="display:none;position:absolute;bottom:100%;left:8px;right:8px;background:#fff;border:1px solid #ccc;max-height:240px;overflow-y:auto;z-index:100;box-shadow:0 -6px 20px rgba(0,0,0,.2);border-radius:8px 8px 0 0"></div>
+        </div>
+        <form id="cartInlineAddForm" method="post" action="Terminal/addItem" style="display:none">
+            <input type="hidden" name="sessionId" value="${sessionId!''}"/>
+            <input type="hidden" name="transactionId" value="${transactionId!''}"/>
+            <input type="hidden" name="productId" value=""/>
+            <input type="hidden" name="unitPrice" value=""/>
+            <input type="hidden" name="addQty" value="1"/>
+            <input type="hidden" name="catId" value="${catId!''}"/>
+            <input type="hidden" name="taxOn" value="${taxOn!'Y'}"/>
+            <input type="hidden" name="salesModeId" value="${salesModeId!''}"/>
+            <input type="hidden" name="moquiSessionToken" value="${ec.web.sessionToken}"/>
+        </form>
+        <form id="barcodeScanForm" method="post" action="Terminal/cartAddProduct" style="display:none">
+            <input type="hidden" name="sessionId" value="${sessionId!''}"/>
+            <input type="hidden" name="transactionId" value="${transactionId!''}"/>
+            <input type="hidden" name="catId" value="${catId!''}"/>
+            <input type="hidden" name="cartSearch" value=""/>
+            <input type="hidden" name="taxOn" value="${taxOn!'Y'}"/>
+            <input type="hidden" name="salesModeId" value="${salesModeId!''}"/>
+            <input type="hidden" name="moquiSessionToken" value="${ec.web.sessionToken}"/>
+        </form>
+
+        <!-- Summary + Total -->
+        <div style="background:#f8f9fa;border-top:2px solid #e0e0e0;padding:10px 14px;flex-shrink:0">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+                <div style="font-size:13px;color:#777">Last: ${lastBillNo} / ${lastBillAmt}</div>
+                <div style="display:flex;gap:16px;font-size:14px">
+                    <span style="color:#555">Qty: <b>${ec.l10n.format(cartQty, '#,##0')}</b></span>
+                    <span style="color:#555">Tax: <b>${ec.l10n.format((txn.totalTaxAmount)!0, '#,##0')}</b></span>
+                    <span style="color:#555">Disc: <b>${ec.l10n.format(cartDisc, '#,##0')}</b></span>
+                </div>
+            </div>
+            <div style="background:${salesModeColor};color:#fff;padding:14px 20px;border-radius:10px;display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+                <span style="font-size:16px;font-weight:600">${salesMode} TOTAL</span>
+                <span style="font-size:28px;font-weight:800;letter-spacing:1px">${currSymbol}${ec.l10n.format(cartAmt, '#,##0')}</span>
+            </div>
+
+            <!-- Payment Buttons -->
+            <#if transactionId?has_content && cartItems?? && (cartItems?size > 0)>
+              <#if (splitPay!'') == 'Y'>
+                <div style="border:2px solid #1565c0;border-radius:10px;padding:14px;background:#e3f2fd">
+                    <div style="text-align:center;font-size:17px;font-weight:700;color:#1565c0;margin-bottom:6px">SPLIT PAYMENT</div>
+                    <div style="text-align:center;font-size:24px;font-weight:800;color:#333;margin-bottom:14px">Total: ${currSymbol}${ec.l10n.format(cartAmt, '#,##0')}</div>
+                    <form method="post" action="Terminal/splitPayAndComplete" class="pos-pay-form" style="margin:0">
+                        <input type="hidden" name="transactionId" value="${transactionId}"/>
+                        <input type="hidden" name="sessionId" value="${sessionId}"/>
+                        <input type="hidden" name="catId" value="${catId!''}"/>
+                        <input type="hidden" name="taxOn" value="${taxOn!'Y'}"/>
+                        <input type="hidden" name="salesModeId" value="${salesModeId!''}"/>
+                        <input type="hidden" name="customerPhone" value=""/>
+                        <input type="hidden" name="moquiSessionToken" value="${ec.web.sessionToken}"/>
+                        <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">
+                            <span style="min-width:55px;font-size:14px;font-weight:700;color:#2e7d32;text-align:right">&#128176; Cash</span>
+                            <input type="number" name="cashAmount" value="0" step="any" min="0" style="flex:1;padding:12px 10px;border:2px solid #4caf50;border-radius:8px;font-size:18px;text-align:right;box-sizing:border-box;outline:none"/>
+                        </div>
+                        <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
+                            <span style="min-width:55px;font-size:14px;font-weight:700;color:#1565c0;text-align:right">&#128179; Card</span>
+                            <input type="number" name="cardAmount" value="0" step="any" min="0" style="flex:1;padding:12px 10px;border:2px solid #2196f3;border-radius:8px;font-size:18px;text-align:right;box-sizing:border-box;outline:none"/>
+                        </div>
+                        <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;padding-left:65px">
+                            <input type="text" name="cardRef" placeholder="Card reference #" style="flex:1;padding:8px 10px;border:1px solid #ccc;border-radius:6px;font-size:13px;box-sizing:border-box;outline:none"/>
+                        </div>
+                        <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
+                            <span style="min-width:55px;font-size:14px;font-weight:700;color:#7b1fa2;text-align:right">&#128241; UPI</span>
+                            <input type="number" name="upiAmount" value="0" step="any" min="0" style="flex:1;padding:12px 10px;border:2px solid #9c27b0;border-radius:8px;font-size:18px;text-align:right;box-sizing:border-box;outline:none"/>
+                        </div>
+                        <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;padding-left:65px">
+                            <input type="text" name="upiRef" placeholder="UPI reference #" style="flex:1;padding:8px 10px;border:1px solid #ccc;border-radius:6px;font-size:13px;box-sizing:border-box;outline:none"/>
+                        </div>
+                        <button type="submit" style="width:100%;padding:16px;background:#1565c0;color:#fff;border:none;border-radius:10px;font-size:17px;font-weight:700;cursor:pointer;margin-bottom:8px;-webkit-tap-highlight-color:rgba(0,0,0,0.1)">&#10003; CONFIRM SPLIT</button>
+                    </form>
+                    <a href="Terminal/cancelSplitPay?sessionId=${sessionId!''}&transactionId=${transactionId!''}&catId=${catId!''}&taxOn=${taxOn!'Y'}&salesModeId=${salesModeId!''}" style="display:block;text-align:center;padding:12px;background:#f5f5f5;border-radius:8px;color:#666;font-size:14px;font-weight:600;text-decoration:none">&#10006; CANCEL</a>
+                </div>
+              <#else>
+                <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:8px">
+                    <form method="post" action="Terminal/payAndComplete" class="pos-pay-form" style="margin:0">
+                        <input type="hidden" name="transactionId" value="${transactionId}"/>
+                        <input type="hidden" name="sessionId" value="${sessionId}"/>
+                        <input type="hidden" name="paymentMethod" value="Cash"/>
+                        <input type="hidden" name="amount" value="${cartAmt!0}"/>
+                        <input type="hidden" name="salesModeId" value="${salesModeId!''}"/>
+                        <input type="hidden" name="customerPhone" value=""/>
+                        <input type="hidden" name="moquiSessionToken" value="${ec.web.sessionToken}"/>
+                        <button type="submit" style="width:100%;padding:16px 8px;border:none;border-radius:10px;font-size:16px;font-weight:700;cursor:pointer;background:#4caf50;color:#fff;-webkit-tap-highlight-color:rgba(0,0,0,0.1)">&#128176; CASH</button>
+                    </form>
+                    <form method="post" action="Terminal/payAndComplete" class="pos-pay-form" style="margin:0">
+                        <input type="hidden" name="transactionId" value="${transactionId}"/>
+                        <input type="hidden" name="sessionId" value="${sessionId}"/>
+                        <input type="hidden" name="paymentMethod" value="Card"/>
+                        <input type="hidden" name="amount" value="${cartAmt!0}"/>
+                        <input type="hidden" name="salesModeId" value="${salesModeId!''}"/>
+                        <input type="hidden" name="customerPhone" value=""/>
+                        <input type="hidden" name="moquiSessionToken" value="${ec.web.sessionToken}"/>
+                        <button type="submit" style="width:100%;padding:16px 8px;border:none;border-radius:10px;font-size:16px;font-weight:700;cursor:pointer;background:#2196f3;color:#fff;-webkit-tap-highlight-color:rgba(0,0,0,0.1)">&#128179; CARD</button>
+                    </form>
+                    <form method="post" action="Terminal/payAndComplete" class="pos-pay-form" style="margin:0">
+                        <input type="hidden" name="transactionId" value="${transactionId}"/>
+                        <input type="hidden" name="sessionId" value="${sessionId}"/>
+                        <input type="hidden" name="paymentMethod" value="UPI"/>
+                        <input type="hidden" name="amount" value="${cartAmt!0}"/>
+                        <input type="hidden" name="salesModeId" value="${salesModeId!''}"/>
+                        <input type="hidden" name="customerPhone" value=""/>
+                        <input type="hidden" name="moquiSessionToken" value="${ec.web.sessionToken}"/>
+                        <button type="submit" style="width:100%;padding:16px 8px;border:none;border-radius:10px;font-size:16px;font-weight:700;cursor:pointer;background:#9c27b0;color:#fff;-webkit-tap-highlight-color:rgba(0,0,0,0.1)">&#128241; UPI</button>
+                    </form>
+                </div>
+                <a href="Terminal/showSplitPay?sessionId=${sessionId!''}&transactionId=${transactionId!''}&catId=${catId!''}&taxOn=${taxOn!'Y'}&salesModeId=${salesModeId!''}" style="display:block;width:100%;padding:14px 8px;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;background:#1565c0;color:#fff;text-decoration:none;text-align:center;margin-bottom:8px;box-sizing:border-box;-webkit-tap-highlight-color:rgba(0,0,0,0.1)">&#8596; SPLIT PAYMENT</a>
+                <div style="display:grid;grid-template-columns:1fr 1fr<#if heldTxns?? && (heldTxns?size > 0)> 1fr</#if>;gap:8px">
+                    <form method="post" action="Terminal/holdSale" style="margin:0">
+                        <input type="hidden" name="transactionId" value="${transactionId}"/>
+                        <input type="hidden" name="sessionId" value="${sessionId}"/>
+                        <input type="hidden" name="taxOn" value="${taxOn!'Y'}"/>
+                        <input type="hidden" name="salesModeId" value="${salesModeId!''}"/>
+                        <input type="hidden" name="moquiSessionToken" value="${ec.web.sessionToken}"/>
+                        <button type="submit" style="width:100%;padding:14px 8px;border:none;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;background:#ff9800;color:#fff;-webkit-tap-highlight-color:rgba(0,0,0,0.1)" onclick="return confirm('Hold this sale?')">HOLD</button>
+                    </form>
+                    <form method="post" action="Terminal/voidSale" style="margin:0">
+                        <input type="hidden" name="transactionId" value="${transactionId}"/>
+                        <input type="hidden" name="sessionId" value="${sessionId}"/>
+                        <input type="hidden" name="taxOn" value="${taxOn!'Y'}"/>
+                        <input type="hidden" name="salesModeId" value="${salesModeId!''}"/>
+                        <input type="hidden" name="moquiSessionToken" value="${ec.web.sessionToken}"/>
+                        <button type="submit" style="width:100%;padding:14px 8px;border:none;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;background:#f44336;color:#fff;-webkit-tap-highlight-color:rgba(0,0,0,0.1)" onclick="return confirm('Void this sale?')">VOID</button>
+                    </form>
+                    <#if heldTxns?? && (heldTxns?size > 0)>
+                        <form method="post" action="Terminal/recallSale" style="margin:0">
+                            <input type="hidden" name="heldId" value="${heldTxns[0].heldId}"/>
+                            <input type="hidden" name="sessionId" value="${sessionId}"/>
+                            <input type="hidden" name="taxOn" value="${taxOn!'Y'}"/>
+                            <input type="hidden" name="salesModeId" value="${salesModeId!''}"/>
+                            <input type="hidden" name="moquiSessionToken" value="${ec.web.sessionToken}"/>
+                            <button type="submit" style="width:100%;padding:14px 8px;border:none;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;background:#e65100;color:#fff;-webkit-tap-highlight-color:rgba(0,0,0,0.1)">RECALL<#if (heldTxns?size > 1)> (${heldTxns?size})</#if></button>
+                        </form>
+                    </#if>
+                </div>
+              </#if>
+            <#else>
+                <div style="text-align:center;padding:16px;color:#aaa;font-size:16px">Tap products to add items</div>
+            </#if>
+        </div>
+    </div>
+</div>
+</div>
+                        ]]></text></render-mode>
+                        <render-mode><text type="html" template="true"><![CDATA[
+<style>
+.cart-dd-item{padding:7px 10px;cursor:pointer;border-bottom:1px solid #f0f0f0;font-size:12px}
+.cart-dd-item:hover,.cart-dd-item.active{background:#e8f5e9}
+.cart-dd-item .dd-price{float:right;color:#e53935;font-weight:bold}
+.cart-dd-item .dd-name{font-weight:600;color:#333}
+.cart-dd-item .dd-code{font-size:10px;color:#999}
+</style>
+<script>
+var numVal = '';
+function numpadPress(v) { numVal += v; document.getElementById('numDisp') && (document.getElementById('numDisp').textContent = numVal); }
+function numpadClear() { numVal = ''; document.getElementById('numDisp') && (document.getElementById('numDisp').textContent = '0'); }
+function numpadBack() { numVal = numVal.slice(0,-1); document.getElementById('numDisp') && (document.getElementById('numDisp').textContent = numVal || '0'); }
+function numpadEnter() { var s = document.querySelector('.pos-search input[name=searchTerm]'); if(s){s.value=numVal;s.form.submit();} }
+function numpadQty() { /* qty override for next add */ }
+
+(function(){
+    var si = document.getElementById('cartInlineSearch');
+    var dd = document.getElementById('cartSearchDropdown');
+    if (!si) return;
+    var dt, activeIdx = -1, keyTimes = [];
+    function esc(s){var d=document.createElement('div');d.textContent=s;return d.innerHTML;}
+
+    function isScan(){
+        if(keyTimes.length<3) return false;
+        var avg=(keyTimes[keyTimes.length-1]-keyTimes[0])/(keyTimes.length-1);
+        return avg<50;
+    }
+    si.addEventListener('keypress', function(){ keyTimes.push(Date.now()); if(keyTimes.length>30) keyTimes.shift(); });
+
+    si.addEventListener('input', function(){
+        var t = this.value.trim();
+        clearTimeout(dt);
+        activeIdx = -1;
+        if (t.length < 1) { dd.style.display='none'; return; }
+        dt = setTimeout(function(){
+            var tk = document.querySelector('#cartInlineAddForm [name=moquiSessionToken]').value;
+            fetch('Terminal/lookupProducts', {
+                method:'POST',
+                headers:{'Content-Type':'application/x-www-form-urlencoded'},
+                body:'term='+encodeURIComponent(t)+'&moquiSessionToken='+encodeURIComponent(tk)
+            })
+            .then(function(r){ return r.json(); })
+            .then(function(data){
+                if (!data || data.length===0) {
+                    dd.innerHTML='<div style="padding:8px;color:#999;font-size:12px">No products found</div>';
+                    dd.style.display='block'; return;
+                }
+                var h='';
+                for(var i=0;i<data.length;i++){
+                    var p=data[i];
+                    h+='<div class="cart-dd-item" data-pid="'+esc(p.productId)+'" data-price="'+p.mrpAmount+'">';
+                    h+='<span class="dd-price">'+esc(''+p.mrpAmount)+'</span>';
+                    h+='<span class="dd-name">'+esc(p.productName||'')+'</span>';
+                    h+='<div class="dd-code">'+esc(p.pseudoId||'')+'</div>';
+                    h+='</div>';
+                }
+                dd.innerHTML=h;
+                dd.style.display='block';
+                activeIdx = -1;
+            });
+        }, 250);
+    });
+    si.addEventListener('keydown', function(e){
+        var items = dd.querySelectorAll('.cart-dd-item');
+        if(e.key==='ArrowDown'){e.preventDefault();activeIdx=Math.min(activeIdx+1,items.length-1);hlItem(items);}
+        else if(e.key==='ArrowUp'){e.preventDefault();activeIdx=Math.max(activeIdx-1,0);hlItem(items);}
+        else if(e.key==='Enter'){
+            e.preventDefault();
+            var val=si.value.trim();
+            if(!val) return;
+            if(isScan() || items.length===0){
+                scanAdd(val);
+            } else if(activeIdx>=0&&items[activeIdx]) selItem(items[activeIdx]);
+            else selItem(items[0]);
+            keyTimes=[];
+        }
+        else if(e.key==='Escape'){dd.style.display='none';}
+    });
+    function hlItem(items){
+        for(var i=0;i<items.length;i++)items[i].classList.toggle('active',i===activeIdx);
+        if(activeIdx>=0&&items[activeIdx])items[activeIdx].scrollIntoView({block:'nearest'});
+    }
+    function selItem(el){
+        var f=document.getElementById('cartInlineAddForm');
+        f.querySelector('[name=productId]').value=el.dataset.pid;
+        f.querySelector('[name=unitPrice]').value=el.dataset.price;
+        f.submit();
+    }
+    function scanAdd(code){
+        var f=document.getElementById('barcodeScanForm');
+        f.querySelector('[name=cartSearch]').value=code;
+        f.submit();
+    }
+    dd.addEventListener('click',function(e){
+        var item=e.target.closest('.cart-dd-item');
+        if(item)selItem(item);
+    });
+    document.addEventListener('click',function(e){
+        if(!si.contains(e.target)&&!dd.contains(e.target))dd.style.display='none';
+    });
+
+    var gBuf='',gLast=0,gTimer;
+    document.addEventListener('keydown',function(e){
+        if(e.target.tagName==='INPUT'||e.target.tagName==='TEXTAREA'||e.target.tagName==='SELECT') return;
+        var now=Date.now();
+        if(now-gLast>100) gBuf='';
+        gLast=now;
+        if(e.key==='Enter'&&gBuf.length>2){
+            e.preventDefault();
+            scanAdd(gBuf);
+            gBuf='';
+            return;
+        }
+        if(e.key.length===1) gBuf+=e.key;
+        clearTimeout(gTimer);
+        gTimer=setTimeout(function(){gBuf='';},500);
+    });
+
+})();
+
+// ===== Customer Phone Modal for WhatsApp Receipt =====
+(function(){
+    // Create modal overlay
+    var overlay = document.createElement('div');
+    overlay.id = 'phoneModal';
+    overlay.style.cssText = 'display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);z-index:9999;align-items:center;justify-content:center';
+    overlay.innerHTML = '<div style="background:#fff;border-radius:16px;padding:30px;width:400px;max-width:90%;box-shadow:0 8px 32px rgba(0,0,0,0.3)">'
+        + '<div style="text-align:center;margin-bottom:20px">'
+        + '<div style="font-size:40px;margin-bottom:8px">&#128241;</div>'
+        + '<div style="font-size:18px;font-weight:700;color:#333">Customer Phone Number</div>'
+        + '<div style="font-size:13px;color:#888;margin-top:4px">For WhatsApp receipt (optional)</div>'
+        + '</div>'
+        + '<input type="tel" id="phoneModalInput" placeholder="e.g. 9876543210" maxlength="15" '
+        + 'style="width:100%;padding:16px;border:2px solid #25D366;border-radius:10px;font-size:22px;text-align:center;box-sizing:border-box;outline:none;letter-spacing:2px;font-weight:600" />'
+        + '<div style="display:flex;gap:10px;margin-top:20px">'
+        + '<button id="phoneSkipBtn" style="flex:1;padding:14px;border:2px solid #ccc;background:#f5f5f5;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;color:#666">SKIP</button>'
+        + '<button id="phoneConfirmBtn" style="flex:2;padding:14px;border:none;background:#25D366;color:#fff;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer">&#10003; CONFIRM &amp; PAY</button>'
+        + '</div></div>';
+    document.body.appendChild(overlay);
+
+    var pendingForm = null;
+    var phoneInput = document.getElementById('phoneModalInput');
+
+    document.getElementById('phoneSkipBtn').addEventListener('click', function(){
+        overlay.style.display = 'none';
+        if (pendingForm) { pendingForm.submit(); pendingForm = null; }
+    });
+
+    document.getElementById('phoneConfirmBtn').addEventListener('click', function(){
+        var phone = phoneInput.value.replace(/[^0-9]/g, '');
+        overlay.style.display = 'none';
+        if (pendingForm) {
+            var phoneField = pendingForm.querySelector('[name=customerPhone]');
+            if (phoneField) phoneField.value = phone;
+            pendingForm.submit();
+            pendingForm = null;
+        }
+    });
+
+    phoneInput.addEventListener('keydown', function(e){
+        if (e.key === 'Enter') { e.preventDefault(); document.getElementById('phoneConfirmBtn').click(); }
+        if (e.key === 'Escape') { document.getElementById('phoneSkipBtn').click(); }
+    });
+
+    overlay.addEventListener('click', function(e){ if (e.target === overlay) document.getElementById('phoneSkipBtn').click(); });
+
+    // Intercept all payment form submissions
+    var payForms = document.querySelectorAll('.pos-pay-form');
+    for (var i = 0; i < payForms.length; i++) {
+        payForms[i].addEventListener('submit', function(e){
+            e.preventDefault();
+            pendingForm = this;
+            phoneInput.value = '';
+            overlay.style.display = 'flex';
+            setTimeout(function(){ phoneInput.focus(); }, 100);
+        });
+    }
+})();
+</script>
+                        ]]></text></render-mode>
+                    </widgets>
+                </section>
+
+            </widgets>
+        </section>
+    </widgets>
+</screen>

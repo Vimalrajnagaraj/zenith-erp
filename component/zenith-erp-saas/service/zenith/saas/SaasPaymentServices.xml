@@ -1,0 +1,278 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <!-- ==================== CREATE RAZORPAY ORDER ==================== -->
+    <service verb="create" noun="RazorpayOrder">
+        <description>Creates a Razorpay order for a SaaS invoice payment</description>
+        <in-parameters>
+            <parameter name="saasInvoiceId" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="razorpayOrderId"/>
+            <parameter name="razorpayKeyId"/>
+            <parameter name="amount"/>
+            <parameter name="currency"/>
+            <parameter name="tenantName"/>
+            <parameter name="adminEmail"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.saas.SaasInvoice" value-field="invoice"/>
+            <if condition="!invoice">
+                <return error="true" message="Invoice not found"/>
+            </if>
+            <if condition="invoice.statusId == 'SiPaid'">
+                <return error="true" message="Invoice is already paid"/>
+            </if>
+
+            <entity-find-one entity-name="zenith.erp.saas.SaasTenant" value-field="tenant">
+                <field-map field-name="tenantId" from="invoice.tenantId"/>
+            </entity-find-one>
+
+            <script><![CDATA[
+                import javax.crypto.Mac
+                import javax.crypto.spec.SecretKeySpec
+
+                // Read Razorpay config from system settings
+                def keyId = ec.entity.find("zenith.erp.base.CompanySettings")
+                    .condition("organizationPartyId", "ZETAERP")
+                    .condition("settingKey", "RAZORPAY_KEY_ID").disableAuthz().one()?.settingValue
+                def keySecret = ec.entity.find("zenith.erp.base.CompanySettings")
+                    .condition("organizationPartyId", "ZETAERP")
+                    .condition("settingKey", "RAZORPAY_KEY_SECRET").disableAuthz().one()?.settingValue
+
+                if (!keyId || !keySecret) {
+                    ec.message.addError("Razorpay is not configured. Set RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET in ZETAERP company settings.")
+                    return
+                }
+
+                context.razorpayKeyId = keyId
+                context.tenantName = tenant?.tenantName
+                context.adminEmail = tenant?.adminEmail
+
+                // Amount in paise (Razorpay requires smallest currency unit)
+                def amountPaise = ((invoice.totalAmount ?: 0) * 100) as long
+                context.amount = amountPaise
+                context.currency = invoice.currencyUomId ?: "INR"
+
+                // Create Razorpay order via API
+                def auth = "${keyId}:${keySecret}".bytes.encodeBase64().toString()
+                def restClient = ec.service.rest()
+                    .method("POST")
+                    .uri("https://api.razorpay.com/v1/orders")
+                    .addHeader("Authorization", "Basic ${auth}")
+                    .addHeader("Content-Type", "application/json")
+                    .jsonObject([
+                        amount: amountPaise,
+                        currency: context.currency,
+                        receipt: "SAAS_INV_${invoice.saasInvoiceId}",
+                        notes: [
+                            tenantId: invoice.tenantId,
+                            invoiceId: invoice.saasInvoiceId,
+                            tenantName: tenant?.tenantName ?: ''
+                        ]
+                    ])
+
+                def response = restClient.call()
+                if (response.statusCode == 200 || response.statusCode == 201) {
+                    def body = response.jsonObject()
+                    context.razorpayOrderId = body.id
+
+                    // Store order ID on the invoice
+                    ec.service.sync().name("update#zenith.erp.saas.SaasInvoice")
+                        .parameter("saasInvoiceId", invoice.saasInvoiceId)
+                        .parameter("notes", "razorpay_order:${body.id}")
+                        .disableAuthz().call()
+                } else {
+                    def errBody = response.text()
+                    ec.logger.error("Razorpay order creation failed: ${response.statusCode} - ${errBody}")
+                    ec.message.addError("Payment gateway error. Please try again later.")
+                }
+            ]]></script>
+        </actions>
+    </service>
+
+    <!-- ==================== VERIFY RAZORPAY PAYMENT ==================== -->
+    <service verb="verify" noun="RazorpayPayment" authenticate="anonymous-all">
+        <description>Verifies Razorpay payment signature and records the payment</description>
+        <in-parameters>
+            <parameter name="razorpay_order_id" required="true"/>
+            <parameter name="razorpay_payment_id" required="true"/>
+            <parameter name="razorpay_signature" required="true"/>
+            <parameter name="saasInvoiceId" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="success" type="Boolean"/>
+            <parameter name="saasPaymentId"/>
+        </out-parameters>
+        <actions>
+            <script><![CDATA[
+                import javax.crypto.Mac
+                import javax.crypto.spec.SecretKeySpec
+
+                context.success = false
+
+                def keySecret = ec.entity.find("zenith.erp.base.CompanySettings")
+                    .condition("organizationPartyId", "ZETAERP")
+                    .condition("settingKey", "RAZORPAY_KEY_SECRET").disableAuthz().one()?.settingValue
+
+                if (!keySecret) {
+                    ec.message.addError("Razorpay not configured")
+                    return
+                }
+
+                // Verify signature: HMAC-SHA256(razorpay_order_id + "|" + razorpay_payment_id, secret)
+                def payload = "${razorpay_order_id}|${razorpay_payment_id}"
+                def mac = Mac.getInstance("HmacSHA256")
+                mac.init(new SecretKeySpec(keySecret.getBytes("UTF-8"), "HmacSHA256"))
+                def computed = mac.doFinal(payload.getBytes("UTF-8"))
+                def expectedSig = computed.collect { String.format('%02x', it) }.join('')
+
+                if (expectedSig != razorpay_signature) {
+                    ec.logger.warn("Razorpay signature mismatch for order ${razorpay_order_id}")
+                    ec.message.addError("Payment verification failed. Please contact support.")
+                    return
+                }
+
+                // Signature valid — record payment
+                boolean d = ec.artifactExecution.disableAuthz()
+                try {
+                    def invoice = ec.entity.find("zenith.erp.saas.SaasInvoice")
+                        .condition("saasInvoiceId", saasInvoiceId).one()
+                    if (!invoice) {
+                        ec.message.addError("Invoice not found")
+                        return
+                    }
+
+                    // Create payment record
+                    def payResult = ec.service.sync().name("create#zenith.erp.saas.SaasPayment")
+                        .parameter("saasInvoiceId", saasInvoiceId)
+                        .parameter("tenantId", invoice.tenantId)
+                        .parameter("paymentDate", ec.user.nowTimestamp)
+                        .parameter("amount", invoice.totalAmount)
+                        .parameter("currencyUomId", invoice.currencyUomId ?: "INR")
+                        .parameter("paymentGateway", "Razorpay")
+                        .parameter("gatewayPaymentId", razorpay_payment_id)
+                        .parameter("gatewayOrderId", razorpay_order_id)
+                        .parameter("statusId", "SpSuccess")
+                        .call()
+                    context.saasPaymentId = payResult.saasPaymentId
+
+                    // Mark invoice as paid
+                    ec.service.sync().name("update#zenith.erp.saas.SaasInvoice")
+                        .parameter("saasInvoiceId", saasInvoiceId)
+                        .parameter("statusId", "SiPaid")
+                        .parameter("paidDate", ec.user.nowTimestamp)
+                        .call()
+
+                    // Reactivate tenant if suspended
+                    def tenant = ec.entity.find("zenith.erp.saas.SaasTenant")
+                        .condition("tenantId", invoice.tenantId).one()
+                    if (tenant?.statusId == 'SaasTenantSuspended') {
+                        ec.service.sync().name("zenith.saas.SaasLifecycleServices.reactivate#AfterPayment")
+                            .parameter("tenantId", invoice.tenantId)
+                            .parameter("paymentId", razorpay_payment_id)
+                            .call()
+                    }
+
+                    // Audit log
+                    ec.service.sync().name("create#zenith.erp.saas.SaasAuditLog")
+                        .parameter("tenantId", invoice.tenantId)
+                        .parameter("eventType", "PAYMENT_SUCCESS")
+                        .parameter("eventDate", ec.user.nowTimestamp)
+                        .parameter("description", "Payment of ${invoice.totalAmount} ${invoice.currencyUomId ?: 'INR'} via Razorpay (${razorpay_payment_id})")
+                        .call()
+
+                    context.success = true
+                } finally { if (!d) ec.artifactExecution.enableAuthz() }
+            ]]></script>
+        </actions>
+    </service>
+
+    <!-- ==================== PAYMENT WEBHOOK (Razorpay) ==================== -->
+    <service verb="handle" noun="RazorpayWebhook" authenticate="anonymous-all">
+        <description>Handles Razorpay webhook events (payment.captured, payment.failed)</description>
+        <in-parameters>
+            <parameter name="webhookBody" type="Map"/>
+            <parameter name="webhookSignature"/>
+        </in-parameters>
+        <actions>
+            <script><![CDATA[
+                import javax.crypto.Mac
+                import javax.crypto.spec.SecretKeySpec
+
+                def webhookSecret = ec.entity.find("zenith.erp.base.CompanySettings")
+                    .condition("organizationPartyId", "ZETAERP")
+                    .condition("settingKey", "RAZORPAY_WEBHOOK_SECRET").disableAuthz().one()?.settingValue
+
+                if (!webhookSecret || !webhookSignature) {
+                    ec.logger.warn("Razorpay webhook: missing secret or signature")
+                    return
+                }
+
+                // Verify webhook signature
+                def rawBody = ec.web?.getRequest()?.getReader()?.text ?: ''
+                def mac = Mac.getInstance("HmacSHA256")
+                mac.init(new SecretKeySpec(webhookSecret.getBytes("UTF-8"), "HmacSHA256"))
+                def computed = mac.doFinal(rawBody.getBytes("UTF-8"))
+                def expectedSig = computed.collect { String.format('%02x', it) }.join('')
+
+                if (expectedSig != webhookSignature) {
+                    ec.logger.warn("Razorpay webhook: signature mismatch")
+                    return
+                }
+
+                def event = webhookBody?.event
+                def payload = webhookBody?.payload?.payment?.entity
+
+                if (!payload) return
+
+                ec.logger.info("Razorpay webhook: ${event} for payment ${payload.id}")
+
+                boolean d = ec.artifactExecution.disableAuthz()
+                try {
+                    if (event == 'payment.captured') {
+                        def orderId = payload.order_id
+                        // Find invoice by razorpay order ID (stored in notes)
+                        def invoices = ec.entity.find("zenith.erp.saas.SaasInvoice")
+                            .condition("notes", "like", "%${orderId}%").list()
+                        if (invoices) {
+                            def inv = invoices[0]
+                            if (inv.statusId != 'SiPaid') {
+                                ec.service.sync().name("update#zenith.erp.saas.SaasInvoice")
+                                    .parameter("saasInvoiceId", inv.saasInvoiceId)
+                                    .parameter("statusId", "SiPaid")
+                                    .parameter("paidDate", ec.user.nowTimestamp).call()
+                            }
+                        }
+                    } else if (event == 'payment.failed') {
+                        ec.service.sync().name("create#zenith.erp.saas.SaasAuditLog")
+                            .parameter("eventType", "PAYMENT_FAILED")
+                            .parameter("eventDate", ec.user.nowTimestamp)
+                            .parameter("description", "Payment failed: ${payload.error_description ?: payload.id}").call()
+                    }
+                } finally { if (!d) ec.artifactExecution.enableAuthz() }
+            ]]></script>
+        </actions>
+    </service>
+
+    <!-- ==================== GET PENDING INVOICES ==================== -->
+    <service verb="get" noun="PendingInvoices">
+        <description>Get unpaid invoices for a tenant</description>
+        <in-parameters>
+            <parameter name="tenantId" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="invoices" type="List"/>
+        </out-parameters>
+        <actions>
+            <entity-find entity-name="zenith.erp.saas.SaasInvoice" list="invoiceList">
+                <econdition field-name="tenantId"/>
+                <econdition field-name="statusId" operator="in" value="SiSent,SiOverdue"/>
+                <order-by field-name="-invoiceDate"/>
+            </entity-find>
+            <set field="invoices" from="invoiceList"/>
+        </actions>
+    </service>
+
+</services>

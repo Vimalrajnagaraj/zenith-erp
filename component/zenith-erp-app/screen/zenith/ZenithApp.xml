@@ -1,0 +1,297 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
+        require-authentication="true" default-menu-title="ZetaERP">
+
+    <always-actions><set field="html_title" value="ZetaERP"/></always-actions>
+
+    <transition name="askCopilot" read-only="true" begin-transaction="false">
+        <actions>
+            <script><![CDATA[
+                def q = ec.web.getRequest().getParameter("query")
+                def out = [response: null]
+                boolean _d = ec.artifactExecution.disableAuthz()
+                try {
+                    def r = ec.service.sync().name("zenith.base.AiServices.ask#Copilot").parameter("query", q).call()
+                    out.response = r?.response ?: "Sorry, I couldn't generate a response."
+                } catch (Exception e) {
+                    out.response = "Sorry, the assistant is unavailable right now."
+                } finally { if (!_d) ec.artifactExecution.enableAuthz() }
+                ec.web.sendJsonResponse(out)
+            ]]></script>
+        </actions>
+        <default-response type="none"/>
+    </transition>
+
+    <transition name="saasConfig" read-only="true">
+        <actions>
+            <script><![CDATA[
+                def orgId = ec.user.getPreference("ACTIVE_ORGANIZATION")
+                def result = [isSaasTenant:false, hasAllAccess:false, modules:[]]
+                if (orgId) {
+                    boolean d = ec.artifactExecution.disableAuthz()
+                    try {
+                        def tl = ec.entity.find("zenith.erp.saas.SaasTenant")
+                            .condition("organizationPartyId", orgId)
+                            .condition("statusId", "SaasTenantActive").list()
+                        if (tl) {
+                            result.isSaasTenant = true
+                            def pm = ec.entity.find("zenith.erp.saas.SaasPlanModule")
+                                .condition("planId", tl[0].planId).list()
+                            def mods = pm.collect { it.moduleId.toLowerCase() }
+                            result.modules = mods
+                            result.hasAllAccess = mods.contains("all")
+                        }
+                    } catch (Exception e) {}
+                    finally { if (!d) ec.artifactExecution.enableAuthz() }
+                }
+                ec.web.sendJsonResponse(result)
+            ]]></script>
+        </actions>
+        <default-response type="none"/>
+    </transition>
+
+    <pre-actions>
+        <service-call name="mantle.party.PartyServices.setup#UserOrganizationInfo" out-map="context"/>
+        <script><![CDATA[
+            if (html_stylesheets == null) html_stylesheets = []
+            html_stylesheets.add('/zenithstatic/css/zenith-theme-v4.css?v=6')
+            html_stylesheets.add('https://fonts.googleapis.com/icon?family=Material+Icons')
+            if (footer_scripts == null) footer_scripts = []
+            footer_scripts.add('/zenithstatic/js/saas-menu-filter.js?v=4')
+            footer_scripts.add('/zenithstatic/js/zenith-copilot.js')
+
+            // SaaS tenant resolution: auto-set org from subdomain if not already set
+            def orgId = ec.user.getPreference("ACTIVE_ORGANIZATION")
+            if (!orgId && ec.web) {
+                try {
+                    def hostname = ec.web.getRequest()?.getServerName()
+                    if (hostname && hostname.contains('.') && !hostname.startsWith('localhost') && !hostname.startsWith('127.')) {
+                        boolean wasDisabled = ec.artifactExecution.disableAuthz()
+                        try {
+                            def tenantRec = ec.entity.find("zenith.erp.saas.SaasTenant")
+                                .condition("subdomain", hostname.split('\\.')[0]).one()
+                            if (tenantRec && tenantRec.organizationPartyId) {
+                                orgId = tenantRec.organizationPartyId
+                                ec.user.setPreference("ACTIVE_ORGANIZATION", orgId)
+                            }
+                        } catch (Exception e) { /* SaasTenant entity may not exist yet */ }
+                        finally { if (!wasDisabled) ec.artifactExecution.enableAuthz() }
+                    }
+                } catch (Exception e) { /* ignore in non-web context */ }
+            }
+
+            // Load active company settings into screen context for all child screens
+            if (orgId) {
+                boolean alreadyDisabled = ec.artifactExecution.disableAuthz()
+                try {
+                    def settingsList = ec.entity.find("zenith.erp.base.CompanySettings")
+                            .condition("organizationPartyId", orgId).list()
+                    def getSetting = { String key -> settingsList?.find { it.settingKey == key }?.settingValue }
+
+                    context.activeOrgId = orgId
+                    context.companyCurrency = getSetting("CURRENCY_UOM_ID") ?: "INR"
+                    context.companyCountry = getSetting("COUNTRY_GEO_ID") ?: "IND"
+                    context.companyFyStartMonth = (getSetting("FY_START_MONTH") ?: "4") as int
+
+                    def currSymbols = [INR:"₹", USD:"\$", GBP:"£", AED:"AED ", EUR:"€", JPY:"¥"]
+                    context.currSymbol = currSymbols[context.companyCurrency] ?: (context.companyCurrency + " ")
+
+                    def cc = ec.entity.find("zenith.erp.base.CountryConfiguration")
+                            .condition("countryGeoId", context.companyCountry).one()
+                    context.companyNumberFormat = cc?.numberFormatPattern ?: "###,###.##"
+                    context.companyDateFormat = cc?.dateFormatPattern ?: "yyyy-MM-dd"
+
+                    // FY label for current date
+                    def now = java.time.LocalDate.now()
+                    int fyYear = now.monthValue >= context.companyFyStartMonth ? now.year : now.year - 1
+                    context.companyFyStart = fyYear
+                    context.companyFyLabel = (fyYear % 100).toString().padLeft(2, '0') + '-' + ((fyYear + 1) % 100).toString().padLeft(2, '0')
+                } finally {
+                    if (!alreadyDisabled) ec.artifactExecution.enableAuthz()
+                }
+            } else {
+                context.activeOrgId = null
+                context.companyCurrency = "INR"
+                context.companyCountry = "IND"
+                context.companyFyStartMonth = 4
+                context.currSymbol = "₹"
+                context.companyNumberFormat = "##,##,###.##"
+                context.companyDateFormat = "dd/MM/yyyy"
+                def now = java.time.LocalDate.now()
+                context.companyFyStart = now.monthValue >= 4 ? now.year : now.year - 1
+                context.companyFyLabel = (context.companyFyStart % 100).toString().padLeft(2, '0') + '-' + ((context.companyFyStart + 1) % 100).toString().padLeft(2, '0')
+            }
+
+            // SaaS module access gating: load allowed modules for tenant
+            context.isSuperAdmin = ec.user.isInGroup("ADMIN")
+            context.isSaasTenant = false
+            context.isSaasSuspended = false
+            context.saasAllowedModules = null
+            context.saasPlanName = null
+            context.saasAllowedModulesJson = '[]'
+            if (orgId) {
+                boolean gateDisabled = ec.artifactExecution.disableAuthz()
+                try {
+                    // Check for active tenant
+                    def tenantList = ec.entity.find("zenith.erp.saas.SaasTenant")
+                        .condition("organizationPartyId", orgId)
+                        .condition("statusId", "SaasTenantActive").list()
+                    if (tenantList) {
+                        context.isSaasTenant = true
+                        def tenant = tenantList[0]
+                        def plan = ec.entity.find("zenith.erp.saas.SaasPlan")
+                            .condition("planId", tenant.planId).one()
+                        context.saasPlanName = plan?.planName ?: tenant.planId
+
+                        def planModules = ec.entity.find("zenith.erp.saas.SaasPlanModule")
+                            .condition("planId", tenant.planId).list()
+                        def moduleSet = new HashSet()
+                        planModules.each { moduleSet.add(it.moduleId.toLowerCase()) }
+                        context.saasAllowedModules = moduleSet
+                        context.saasHasAllAccess = moduleSet.contains("all")
+                        context.saasAllowedModulesJson = '[' + moduleSet.collect{ '"' + it + '"' }.join(',') + ']'
+                    } else {
+                        // Check if tenant exists but is suspended
+                        def suspendedList = ec.entity.find("zenith.erp.saas.SaasTenant")
+                            .condition("organizationPartyId", orgId)
+                            .condition("statusId", "SaasTenantSuspended").list()
+                        if (suspendedList) {
+                            context.isSaasTenant = true
+                            context.isSaasSuspended = true
+                            context.saasPlanName = suspendedList[0].planId
+                        }
+                    }
+                } catch (Exception e) { /* SaaS entities may not exist */ }
+                finally { if (!gateDisabled) ec.artifactExecution.enableAuthz() }
+            }
+        ]]></script>
+    </pre-actions>
+
+    <subscreens default-item="Dashboard">
+        <subscreens-item name="Dashboard" location="component://zenith-erp-app/screen/zenith/Dashboard.xml"
+                         menu-title="Dashboard" menu-index="1"/>
+        <subscreens-item name="Settings" location="component://zenith-erp-settings/screen/zenith/settings/Settings.xml"
+                         menu-title="Settings" menu-index="90"/>
+    </subscreens>
+
+    <widgets>
+        <section name="SaasSuspendedCheck" condition="isSaasSuspended">
+            <widgets>
+                <container style="text-center q-pa-xl" style-sm="max-width:650px;margin:60px auto">
+                    <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-xl">
+                        <render-mode><text type="html"><![CDATA[<q-icon name="block" class="text-h1 text-negative"/>]]></text></render-mode>
+                        <label text="Account Suspended" type="h4" style="text-weight-bold q-mt-md text-negative"/>
+                        <label text="Your subscription has been suspended due to an expired trial or overdue payment." type="p" style="text-grey-7 q-mt-sm text-body1"/>
+                        <label text="Please contact support or make a payment to reactivate your account." type="p" style="text-grey-7"/>
+                        <container style="q-pa-md bg-amber-1 border-radius-md q-mt-lg">
+                            <render-mode><text type="html"><![CDATA[<q-icon name="email" class="text-warning q-mr-sm"/>]]></text></render-mode>
+                            <label text="Contact: support@zetaclantech.com" style="text-weight-bold"/>
+                        </container>
+                    </container>
+                </container>
+            </widgets>
+        </section>
+        <section name="SaasModuleGateCheck" condition="!isSaasSuspended">
+            <actions>
+                <script><![CDATA[
+                    context.saasModuleBlocked = false
+                    if (isSaasTenant && !saasHasAllAccess && saasAllowedModules != null) {
+                        def reqUri = ec.web?.getRequest()?.getRequestURI() ?: ''
+                        def parts = reqUri.split('/')
+                        def currentModule = (parts.length > 3) ? parts[3]?.toLowerCase() : null
+                        def alwaysAllowed = ['dashboard', 'settings', 'saas-admin', 'my-subscription'] as Set
+                        if (currentModule && !alwaysAllowed.contains(currentModule) && !saasAllowedModules.contains(currentModule)) {
+                            context.saasModuleBlocked = true
+                            context.saasBlockedModule = currentModule
+                        }
+                    }
+                ]]></script>
+            </actions>
+            <widgets>
+                <section name="SaasBlockedSection" condition="saasModuleBlocked">
+                    <widgets>
+                        <container style="text-center q-pa-xl" style-sm="max-width:600px;margin:80px auto">
+                            <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-xl">
+                                <render-mode><text type="html"><![CDATA[<q-icon name="lock" class="text-h1 text-warning"/>]]></text></render-mode>
+                                <label text="Module Not Available" type="h4" style="text-weight-bold q-mt-md"/>
+                                <label text="The '${saasBlockedModule}' module is not included in your current ${saasPlanName} plan." type="p" style="text-grey-7 q-mt-sm text-body1"/>
+                                <label text="Please upgrade your subscription to access this feature." type="p" style="text-grey-7"/>
+                                <container style="q-mt-lg">
+                                    <link url="/vapps/zenith/my-subscription" text="View Subscription" btn-type="primary" icon="fa fa-arrow-up"/>
+                                </container>
+                            </container>
+                        </container>
+                    </widgets>
+                </section>
+                <section name="SaasAllowedSection" condition="!saasModuleBlocked">
+                    <widgets><subscreens-active/></widgets>
+                </section>
+            </widgets>
+        </section>
+
+        <render-mode><text type="html"><![CDATA[
+            <!-- Inject Global Styles and Icons for Quasar SPA -->
+            <link rel="preconnect" href="https://fonts.googleapis.com"/>
+            <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="anonymous"/>
+            <div id="zenith-saas-cfg" style="display:none" data-tenant="${(isSaasTenant!false)?c}" data-all="${(saasHasAllAccess!false)?c}" data-modules='${saasAllowedModulesJson!"[]"}'></div>
+            <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet"/>
+            <link rel="stylesheet" href="/zenithstatic/css/zenith-theme-v4.css?v=6"/>
+
+
+            <!-- Floating Copilot UI -->
+            <div id="ai-copilot-container">
+                <button id="ai-copilot-toggle" class="btn btn-primary shadow">
+                    <i class="glyphicon glyphicon-comment"></i> AI Copilot
+                </button>
+                <div id="ai-copilot-window" class="panel" style="display:none;">
+                    <div class="chat-header">ZetaERP Copilot</div>
+                    <div class="chat-history" id="copilot-history">
+                        <div class="msg ai"><b>Copilot:</b> Hi! I'm your ERP assistant.</div>
+                    </div>
+                    <div class="chat-input-area">
+                        <input type="text" id="copilot-input" class="form-control" placeholder="Ask anything..."/>
+                        <button id="copilot-send" class="btn btn-primary">Ask</button>
+                    </div>
+                </div>
+            </div>
+
+            <script>
+                $(function() {
+                    $('#ai-copilot-toggle').click(function() {
+                        $('#ai-copilot-window').fadeToggle(200);
+                    });
+
+                    $('#copilot-input').keypress(function(e) {
+                        if (e.which == 13) {
+                            $('#copilot-send').click();
+                            return false;
+                        }
+                    });
+
+                    $('#copilot-send').click(function() {
+                        var q = $('#copilot-input').val();
+                        if(!q) return;
+                        var userDiv=document.createElement('div');userDiv.className='msg user';userDiv.innerHTML='<b>You:</b> ';userDiv.appendChild(document.createTextNode(q));$('#copilot-history').append(userDiv);
+                        $('#copilot-input').val('');
+                        $('#copilot-history').scrollTop($('#copilot-history')[0].scrollHeight);
+
+                        $.ajax({
+                            url: '/rest/s1/zenith/base/AiServices/askCopilot',
+                            type: 'POST',
+                            data: JSON.stringify({query: q}),
+                            contentType: 'application/json',
+                            success: function(res) {
+                                var aiDiv=document.createElement('div');aiDiv.className='msg ai';aiDiv.innerHTML='<b>Copilot:</b> ';aiDiv.appendChild(document.createTextNode(res.response));$('#copilot-history').append(aiDiv);
+                                $('#copilot-history').scrollTop($('#copilot-history')[0].scrollHeight);
+                            },
+                            error: function(err) {
+                                $('#copilot-history').append('<div class="msg error" style="color:red;"><b>Error:</b> Could not reach AI service.</div>');
+                            }
+                        });
+                    });
+                });
+            </script>
+        ]]></text></render-mode>
+    </widgets>
+</screen>

@@ -1,0 +1,210 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
+        default-menu-title="Demand Forecast" default-menu-index="8">
+
+    <transition name="runCycle">
+        <actions>
+            <set field="orgId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <service-call name="zenith.inventory.AdvancedForecastServices.cycle#DemandForecast"
+                          in-map="[organizationPartyId: orgId, periodDays: 7]" async="true"/>
+            <script>ec.message.addMessage("Updating your forecast in the background — it predicts every product, checks how the last predictions did, and flags anything to restock. Give it a minute, then reload this page.", "info")</script>
+        </actions>
+        <default-response url="."/>
+    </transition>
+    <transition name="acknowledgeAlert">
+        <actions>
+            <!-- These alert statuses are ad-hoc strings, not managed StatusItems, so the auto update# service's
+                 status-flow check wrongly blocks AlertNew->AlertAck. Update the row directly to skip that check. -->
+            <entity-find-one entity-name="zenith.erp.inventory.DemandAlert" value-field="alertRec"><field-map field-name="alertId"/></entity-find-one>
+            <if condition="alertRec">
+                <set field="alertRec.statusId" value="AlertAck"/>
+                <entity-update value-field="alertRec"/>
+            </if>
+        </actions>
+        <default-response url="."/>
+    </transition>
+    <transition name="exportCsv">
+        <default-response url="."/>
+        <actions>
+            <set field="orgId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <entity-find entity-name="mantle.product.Product" list="myProducts"><econdition field-name="ownerPartyId" from="orgId"/><select-field field-name="productId"/></entity-find>
+            <set field="myProductIds" from="(myProducts*.productId) ?: ['__none__']"/>
+            <entity-find entity-name="zenith.erp.inventory.DemandForecast" list="exportList">
+                <order-by field-name="productId,-periodStart"/>
+                <econdition field-name="productId" operator="in" from="myProductIds"/>
+            </entity-find>
+            <script><![CDATA[
+                def sb = new StringBuilder()
+                sb.append("Product ID,Period Start,Period End,Method,Forecast Qty,Actual Qty,Accuracy %\n")
+                for (def f : exportList) {
+                    sb.append("${f.productId},${f.periodStart},${f.periodEnd},${f.forecastMethodEnumId},")
+                    sb.append("${f.forecastQuantity ?: 0},${f.actualQuantity ?: '-'},${f.accuracyPercent ?: '-'}\n")
+                }
+                ec.web.response.setContentType("text/csv")
+                ec.web.response.setHeader("Content-Disposition", "attachment; filename=demand_forecast.csv")
+                ec.web.response.writer.write(sb.toString())
+                ec.web.response.writer.flush()
+            ]]></script>
+        </actions>
+    </transition>
+
+    <actions>
+        <set field="orgId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+        <set field="today" from="new java.sql.Date(System.currentTimeMillis())"/>
+        <entity-find entity-name="mantle.product.Product" list="myProducts"><econdition field-name="ownerPartyId" from="orgId"/><select-field field-name="productId"/></entity-find>
+        <set field="myProductIds" from="(myProducts*.productId) ?: ['__none__']"/>
+
+        <entity-find entity-name="zenith.erp.inventory.DemandForecast" list="forecastList">
+            <search-form-inputs default-order-by="-periodStart"/>
+            <econdition field-name="productId" operator="in" from="myProductIds"/>
+        </entity-find>
+
+        <entity-find entity-name="zenith.erp.inventory.DemandAlert" list="alertList">
+            <econdition field-name="organizationPartyId" from="orgId"/>
+            <econdition field-name="statusId" value="AlertNew"/>
+            <order-by field-name="alertType,-alertDate"/>
+        </entity-find>
+
+        <entity-find-count entity-name="zenith.erp.inventory.DemandForecast" count-field="activeForecasts">
+            <econdition field-name="periodEnd" operator="greater-equals" from="today"/>
+            <econdition field-name="productId" operator="in" from="myProductIds"/>
+        </entity-find-count>
+        <entity-find-count entity-name="zenith.erp.inventory.DemandAlert" count-field="alertCount">
+            <econdition field-name="organizationPartyId" from="orgId"/><econdition field-name="statusId" value="AlertNew"/>
+        </entity-find-count>
+        <entity-find entity-name="zenith.erp.inventory.DemandForecast" list="pastWithAccuracy">
+            <econdition field-name="accuracyPercent" operator="is-not-null"/>
+            <econdition field-name="productId" operator="in" from="myProductIds"/>
+            <select-field field-name="accuracyPercent"/>
+        </entity-find>
+        <entity-find entity-name="zenith.erp.inventory.DemandForecast" list="allForecastPids"><econdition field-name="productId" operator="in" from="myProductIds"/><select-field field-name="productId"/></entity-find>
+        <set field="avgAccuracy" from="0" type="BigDecimal"/>
+        <script><![CDATA[
+            context.hasAcc = (pastWithAccuracy != null && pastWithAccuracy.size() > 0)
+            if (hasAcc) {
+                def total = 0.0
+                for (def f : pastWithAccuracy) total += (f.accuracyPercent ?: 0)
+                avgAccuracy = (total / pastWithAccuracy.size()).setScale(0, java.math.RoundingMode.HALF_UP)
+            }
+            def fpset = new HashSet(); for (def f : allForecastPids) fpset.add(f.productId)
+            context.forecastProductCount = fpset.size()
+
+            def confWord = { p -> p == null ? "Still learning" : (p >= 75 ? "Strong" : (p >= 60 ? "Good" : (p >= 45 ? "Fair" : "Still learning"))) }
+            context.accWord = hasAcc ? confWord(avgAccuracy) : "Building up"
+            context.accColor = !hasAcc ? "grey" : (avgAccuracy >= 60 ? "success" : (avgAccuracy >= 45 ? "warning" : "grey"))
+            context.alertColor = (alertCount > 0) ? "danger" : "success"
+            context.plain = "We're predicting how much of each product you'll sell, so you can restock at the right time. " +
+                "We're keeping an eye on " + forecastProductCount + " products. " +
+                (alertCount > 0 ? (alertCount + (alertCount == 1 ? " item needs" : " items need") + " your attention right now — see the list just below.") :
+                                  "Nothing needs attention right now — everything is selling normally and stock looks healthy.") +
+                (hasAcc ? (" When we check our past predictions against what really sold, we've been about " + avgAccuracy + "% accurate (" + accWord.toLowerCase() + ").") :
+                          " Once a few predictions have been checked against real sales, you'll see how accurate we are here.")
+        ]]></script>
+    </actions>
+
+    <widgets>
+        <container style="row items-center justify-between q-mb-sm">
+            <container style="column">
+                <label text="Demand Forecast" type="h4" style="text-primary text-weight-bold q-my-none"/>
+                <label text="A simple prediction of how much of each product you'll sell — so you know what to restock and when. It updates by itself every night." type="p" style="text-grey-7 q-mb-none"/>
+            </container>
+            <container style="row q-gutter-sm items-center">
+                <link url="exportCsv" text="Download" icon="download" btn-type="info" style="q-btn--dense"/>
+                <link url="runCycle" text="Update Now" icon="refresh" btn-type="primary" style="q-btn--dense text-weight-bold"
+                      confirmation="Update the forecast now? It checks your latest sales, predicts every product, and flags anything to restock. Takes up to a minute."/>
+            </container>
+        </container>
+
+        <container style="zenith-card q-pa-md bg-indigo-1 border-radius-md q-mb-md">
+            <label text="In plain words" type="p" style="text-indigo-9 text-uppercase text-weight-bold text-caption q-mb-xs"/>
+            <label text="${plain}" type="p" style="text-grey-9 text-subtitle1 q-mb-none"/>
+        </container>
+
+        <container-row>
+            <row-col lg="3" md="6">
+                <container style="zenith-card q-pa-md bg-white shadow-1 border-radius-md q-mb-md">
+                    <label text="Needs your attention" type="p" style="text-grey-7 text-weight-bold text-caption q-mb-xs"/>
+                    <label text="${alertCount}" type="h4" style="text-weight-bolder q-my-none ${alertCount > 0 ? 'text-danger' : 'text-success'}"/>
+                    <label text="${alertCount > 0 ? 'items to restock or look at' : 'all good right now'}" type="p" style="text-grey-6 text-caption q-mb-none"/>
+                </container>
+            </row-col>
+            <row-col lg="3" md="6">
+                <container style="zenith-card q-pa-md bg-white shadow-1 border-radius-md q-mb-md">
+                    <label text="Products we're tracking" type="p" style="text-grey-7 text-weight-bold text-caption q-mb-xs"/>
+                    <label text="${forecastProductCount}" type="h4" style="text-primary text-weight-bolder q-my-none"/>
+                    <label text="predictions are running for these" type="p" style="text-grey-6 text-caption q-mb-none"/>
+                </container>
+            </row-col>
+            <row-col lg="3" md="6">
+                <container style="zenith-card q-pa-md bg-white shadow-1 border-radius-md q-mb-md">
+                    <label text="How accurate we've been" type="p" style="text-grey-7 text-weight-bold text-caption q-mb-xs"/>
+                    <label text="${hasAcc ? avgAccuracy + '%' : accWord}" type="h4" style="text-weight-bolder q-my-none text-${accColor}"/>
+                    <label text="${hasAcc ? accWord + ' — checked against real sales' : 'shows up after the first check'}" type="p" style="text-grey-6 text-caption q-mb-none"/>
+                </container>
+            </row-col>
+            <row-col lg="3" md="6">
+                <container style="zenith-card q-pa-md bg-white shadow-1 border-radius-md q-mb-md">
+                    <label text="Live predictions" type="p" style="text-grey-7 text-weight-bold text-caption q-mb-xs"/>
+                    <label text="${activeForecasts}" type="h4" style="text-info text-weight-bolder q-my-none"/>
+                    <label text="forecasts covering the days ahead" type="p" style="text-grey-6 text-caption q-mb-none"/>
+                </container>
+            </row-col>
+        </container-row>
+
+        <container style="zenith-card bg-white shadow-2 border-radius-md q-pa-md q-mb-md">
+            <label text="What needs your attention" type="h6" style="text-primary text-weight-bold q-my-none"/>
+            <label text="Items selling unusually fast or slow, or running low on stock. Tap “Done” once you've handled one." type="p" style="text-grey-6 text-caption q-mb-sm"/>
+            <section name="HasAlerts">
+                <condition><expression>alertList</expression></condition>
+                <widgets>
+                    <form-list name="AlertList" list="alertList" transition="acknowledgeAlert" skip-form="false">
+                        <field name="alertId"><default-field><hidden/></default-field></field>
+                        <field name="alertType"><default-field title="What's up">
+                            <display text="${alertType == 'Reorder' ? 'Running low on stock' : (alertType == 'CategoryShift' ? 'A product group is shifting' : 'Selling unusually')}"/>
+                        </default-field></field>
+                        <field name="productName"><default-field title="Product / Group"><display/></default-field></field>
+                        <field name="direction"><default-field title="Which way">
+                            <display text="${direction == 'Increase' ? 'Selling more ↑' : (direction == 'Decrease' ? 'Selling less ↓' : (direction ?: '—'))}"/>
+                        </default-field></field>
+                        <field name="message"><default-field title="What's happening"><display/></default-field></field>
+                        <field name="alertDate"><default-field title="Spotted"><display format="dd-MMM"/></default-field></field>
+                        <field name="ackBtn"><default-field title=""><submit text="Done" icon="check"/></default-field></field>
+                    </form-list>
+                </widgets>
+                <fail-widgets>
+                    <container style="q-pa-lg text-center">
+                        <label text="✓ All good!" type="h6" style="text-success text-weight-bold q-mb-xs"/>
+                        <label text="Every product is selling normally and nothing is running low on stock." type="p" style="text-grey-6 q-mb-none"/>
+                    </container>
+                </fail-widgets>
+            </section>
+        </container>
+
+        <container style="zenith-card bg-white shadow-2 border-radius-md q-pa-md">
+            <label text="How our past predictions did" type="h6" style="text-primary text-weight-bold q-my-none"/>
+            <label text="For each product and time period: what we predicted, what actually sold, and how close we were." type="p" style="text-grey-6 text-caption q-mb-sm"/>
+            <form-list name="ForecastListForm" list="forecastList" skip-form="true"
+                       header-dialog="true" select-columns="true" show-csv-button="true">
+                <field name="productId"><header-field title="Product" show-order-by="true"/>
+                    <default-field title="Product">
+                        <display-entity entity-name="mantle.product.Product" text="${pseudoId} - ${productName}"/>
+                    </default-field></field>
+                <field name="periodStart"><header-field title="From" show-order-by="true"/>
+                    <default-field title="From"><display format="dd-MMM-yyyy"/></default-field></field>
+                <field name="periodEnd"><default-field title="To"><display format="dd-MMM-yyyy"/></default-field></field>
+                <field name="forecastQuantity"><default-field title="We expected"><display format="#,##0" text="${forecastQuantity != null ? ec.l10n.format(forecastQuantity,'#,##0') + ' units' : '—'}"/></default-field></field>
+                <field name="actualQuantity"><default-field title="Actually sold"><display text="${actualQuantity != null ? ec.l10n.format(actualQuantity,'#,##0') + ' units' : 'not yet'}"/></default-field></field>
+                <field name="accuracyPercent"><default-field title="How close">
+                    <display text="${accuracyPercent != null ? accuracyPercent + '% on target' : 'not checked yet'}"/>
+                </default-field></field>
+                <field name="searchButton"><header-field title="Find"><submit/></header-field></field>
+            </form-list>
+        </container>
+
+        <container style="bg-blue-1 q-pa-md border-radius-md q-mt-md">
+            <label text="How to read this" type="p" style="text-blue-9 text-weight-bold q-mb-xs"/>
+            <label text="• &quot;Needs your attention&quot; lists products running low (restock them) or selling unusually fast/slow. • &quot;How accurate we've been&quot; grows as the system learns from your real sales each night. • Everything here comes from your actual sales — you don't have to enter anything. • Want a quick answer? Ask the AI Copilot, e.g. “how many Pen Cartridges should I order?”" type="p" style="text-grey-8 text-caption q-mb-none"/>
+        </container>
+    </widgets>
+</screen>

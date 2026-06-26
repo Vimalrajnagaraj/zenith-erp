@@ -1,0 +1,131 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <!-- Create KOT (Kitchen Order Ticket) -->
+    <service verb="create" noun="KitchenOrderTicket">
+        <in-parameters>
+            <parameter name="posTransactionId" required="true"/>
+            <parameter name="tableNumber"/>
+            <parameter name="waiterName"/>
+            <parameter name="items" type="List" required="true">
+                <parameter name="entry" type="Map">
+                    <parameter name="productId" required="true"/>
+                    <parameter name="quantity" type="BigDecimal" required="true"/>
+                    <parameter name="specialInstructions"/>
+                </parameter>
+            </parameter>
+        </in-parameters>
+        <out-parameters><parameter name="kotId"/></out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.pos.PosTransaction" value-field="kotTxn">
+                <field-map field-name="transactionId" from="posTransactionId"/></entity-find-one>
+            <service-call name="create#zenith.erp.pos.KitchenOrderTicket"
+                          in-map="[transactionId:posTransactionId, tableNumber:tableNumber,
+                                   waiterName:waiterName, statusId:'KotNew',
+                                   organizationPartyId:kotTxn?.organizationPartyId,
+                                   printCount:0, kotDate:ec.user.nowTimestamp]"
+                          out-map="context"/>
+            <set field="seqNum" from="0" type="Integer"/>
+            <iterate list="items" entry="item">
+                <set field="seqNum" from="seqNum + 1"/>
+                <service-call name="create#zenith.erp.pos.KotItem"
+                              in-map="[kotId:kotId, kotItemSeqId:String.format('%05d', seqNum),
+                                       productId:item.productId, quantity:item.quantity,
+                                       specialInstructions:item.specialInstructions]"/>
+            </iterate>
+        </actions>
+    </service>
+
+    <!-- Update KOT Status -->
+    <service verb="update" noun="KotStatus">
+        <in-parameters>
+            <parameter name="kotId" required="true"/>
+            <parameter name="statusId" required="true"/>
+        </in-parameters>
+        <actions>
+            <service-call name="update#zenith.erp.pos.KitchenOrderTicket"
+                          in-map="[kotId:kotId, statusId:statusId]"/>
+        </actions>
+    </service>
+
+    <!-- Reprint KOT -->
+    <service verb="reprint" noun="KitchenOrderTicket">
+        <in-parameters><parameter name="kotId" required="true"/></in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.pos.KitchenOrderTicket" value-field="kot" for-update="true"/>
+            <set field="kot.printCount" from="(kot.printCount ?: 0) + 1"/>
+            <entity-update value-field="kot"/>
+        </actions>
+    </service>
+
+    <!-- Generate QR Payment -->
+    <service verb="generate" noun="QrPayment">
+        <in-parameters>
+            <parameter name="posTransactionId" required="true"/>
+            <parameter name="amount" type="BigDecimal" required="true"/>
+            <parameter name="qrTypeEnumId" required="true"/>
+            <parameter name="merchantName"/>
+            <parameter name="merchantId"/>
+        </in-parameters>
+        <out-parameters><parameter name="qrPaymentId"/><parameter name="qrCodeData"/></out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.pos.PosTransaction" value-field="qrTxn">
+                <field-map field-name="transactionId" from="posTransactionId"/></entity-find-one>
+            <set field="cleanAmount" from="(amount as BigDecimal).setScale(2, java.math.RoundingMode.HALF_UP)"/>
+            <if condition="qrTypeEnumId == 'QrUpi'">
+                <set field="qrCodeData" from="'upi://pay?pa=' + (merchantId ?: '') + '&amp;pn=' + java.net.URLEncoder.encode((merchantName ?: 'Merchant'), 'UTF-8') + '&amp;am=' + cleanAmount + '&amp;cu=INR'"/>
+                <else>
+                    <set field="qrCodeData" from="'pay://' + (merchantId ?: 'merchant') + '/' + cleanAmount"/>
+                </else>
+            </if>
+            <service-call name="create#zenith.erp.pos.PosQrPayment"
+                          in-map="[transactionId:posTransactionId, amount:cleanAmount, qrTypeEnumId:qrTypeEnumId,
+                                   merchantName:merchantName, merchantId:merchantId, currencyUomId:'INR',
+                                   qrCodeData:qrCodeData, organizationPartyId:qrTxn?.organizationPartyId,
+                                   statusId:'QpGenerated', generatedDate:ec.user.nowTimestamp]"
+                          out-map="context"/>
+        </actions>
+    </service>
+
+    <!-- Confirm QR Payment -->
+    <service verb="confirm" noun="QrPayment">
+        <in-parameters>
+            <parameter name="qrPaymentId" required="true"/>
+            <parameter name="paymentReference"/>
+        </in-parameters>
+        <actions>
+            <service-call name="update#zenith.erp.pos.PosQrPayment"
+                          in-map="[qrPaymentId:qrPaymentId, statusId:'QpConfirmed',
+                                   paymentReference:paymentReference]"/>
+        </actions>
+    </service>
+
+    <!-- Update Table Status -->
+    <service verb="update" noun="TableStatus">
+        <in-parameters>
+            <parameter name="tableId" required="true"/>
+            <parameter name="statusId" required="true"/>
+            <parameter name="currentTransactionId"/>
+        </in-parameters>
+        <actions>
+            <service-call name="update#zenith.erp.pos.RestaurantTable"
+                          in-map="[tableId:tableId, statusId:statusId,
+                                   currentTransactionId:currentTransactionId]"/>
+        </actions>
+    </service>
+
+    <!-- Get Available Tables -->
+    <service verb="get" noun="AvailableTables">
+        <in-parameters><parameter name="facilityId"/></in-parameters>
+        <out-parameters><parameter name="tables" type="List"/></out-parameters>
+        <actions>
+            <entity-find entity-name="zenith.erp.pos.RestaurantTable" list="tables">
+                <econdition field-name="statusId" value="TblAvailable"/>
+                <econdition field-name="facilityId" from="facilityId" ignore-if-empty="true"/>
+                <order-by field-name="tableNumber"/>
+            </entity-find>
+        </actions>
+    </service>
+
+</services>

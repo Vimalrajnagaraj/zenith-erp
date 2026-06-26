@@ -1,0 +1,173 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <!-- Create Return Request -->
+    <service verb="create" noun="ReturnRequest">
+        <in-parameters>
+            <parameter name="originalOrderId"/>
+            <parameter name="originalInvoiceId"/>
+            <parameter name="customerPartyId" required="true"/>
+            <parameter name="storeId"/>
+            <parameter name="channelTypeEnumId"/>
+            <parameter name="returnTypeEnumId" required="true"/>
+            <parameter name="returnReasonEnumId" required="true"/>
+            <parameter name="refundMethodEnumId"/>
+            <parameter name="currencyUomId"/>
+            <parameter name="notes"/>
+            <parameter name="items" type="List"/>
+        </in-parameters>
+        <out-parameters><parameter name="returnId"/></out-parameters>
+        <actions>
+            <service-call name="create#zenith.erp.returns.ReturnRequest"
+                          in-map="[originalOrderId:originalOrderId, originalInvoiceId:originalInvoiceId,
+                                   customerPartyId:customerPartyId, storeId:storeId,
+                                   channelTypeEnumId:channelTypeEnumId, returnTypeEnumId:returnTypeEnumId,
+                                   returnReasonEnumId:returnReasonEnumId, refundMethodEnumId:refundMethodEnumId,
+                                   statusId:'RrRequested', requestDate:ec.user.nowTimestamp,
+                                   currencyUomId:currencyUomId, notes:notes]"
+                          out-map="context"/>
+
+            <set field="totalAmount" from="0" type="BigDecimal"/>
+            <if condition="items">
+                <set field="seqNum" from="1" type="Integer"/>
+                <iterate list="items" entry="item">
+                    <set field="lineAmount" from="(item.unitPrice ?: 0) * (item.quantity ?: 1)" type="BigDecimal"/>
+                    <service-call name="create#zenith.erp.returns.ReturnItem"
+                                  in-map="[returnId:returnId, returnItemSeqId:String.format('%05d', seqNum),
+                                           productId:item.productId, quantity:item.quantity ?: 1,
+                                           unitPrice:item.unitPrice, returnAmount:lineAmount,
+                                           returnConditionEnumId:item.returnConditionEnumId ?: 'RcGood',
+                                           returnActionEnumId:item.returnActionEnumId ?: 'RaRefund',
+                                           restockable:item.restockable ?: 'Y']"/>
+                    <set field="totalAmount" from="totalAmount + lineAmount"/>
+                    <set field="seqNum" from="seqNum + 1"/>
+                </iterate>
+            </if>
+
+            <service-call name="update#zenith.erp.returns.ReturnRequest"
+                          in-map="[returnId:returnId, totalReturnAmount:totalAmount]"/>
+        </actions>
+    </service>
+
+    <!-- Approve Return -->
+    <service verb="approve" noun="Return">
+        <in-parameters>
+            <parameter name="returnId" required="true"/>
+        </in-parameters>
+        <actions>
+            <service-call name="update#zenith.erp.returns.ReturnRequest"
+                          in-map="[returnId:returnId, statusId:'RrApproved',
+                                   approvedDate:ec.user.nowTimestamp, approvedByPartyId:ec.user.userAccount.partyId]"/>
+        </actions>
+    </service>
+
+    <!-- Receive Return Items -->
+    <service verb="receive" noun="Return">
+        <in-parameters>
+            <parameter name="returnId" required="true"/>
+        </in-parameters>
+        <actions>
+            <service-call name="update#zenith.erp.returns.ReturnRequest"
+                          in-map="[returnId:returnId, statusId:'RrReceived', receivedDate:ec.user.nowTimestamp]"/>
+        </actions>
+    </service>
+
+    <!-- Complete Return (process refund) -->
+    <service verb="complete" noun="Return">
+        <in-parameters>
+            <parameter name="returnId" required="true"/>
+        </in-parameters>
+        <out-parameters><parameter name="refundPaymentId"/></out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.returns.ReturnRequest" value-field="rr"/>
+
+            <if condition="rr.refundMethodEnumId == 'RmStoreCredit' &amp;&amp; rr.customerPartyId">
+                <service-call name="create#zenith.erp.giftcard.StoreCredit"
+                              in-map="[partyId:rr.customerPartyId, balance:rr.totalReturnAmount,
+                                       currencyUomId:rr.currencyUomId, reasonEnumId:'ScReturn',
+                                       issuedDate:ec.user.nowTimestamp, statusId:'ScActive']"
+                              out-map="creditOut"/>
+                <service-call name="create#zenith.erp.returns.RefundPayment"
+                              in-map="[returnId:returnId, refundMethodEnumId:'RmStoreCredit',
+                                       amount:rr.totalReturnAmount, storeCreditId:creditOut.storeCreditId,
+                                       refundDate:ec.user.nowTimestamp, statusId:'RpProcessed']"
+                              out-map="refundOut"/>
+                <set field="refundPaymentId" from="refundOut.refundPaymentId"/>
+                <else>
+                    <service-call name="create#zenith.erp.returns.RefundPayment"
+                                  in-map="[returnId:returnId, refundMethodEnumId:rr.refundMethodEnumId ?: 'RmOriginalPayment',
+                                           amount:rr.totalReturnAmount, refundDate:ec.user.nowTimestamp,
+                                           statusId:'RpPending']"
+                                  out-map="refundOut"/>
+                    <set field="refundPaymentId" from="refundOut.refundPaymentId"/>
+                </else>
+            </if>
+
+            <service-call name="update#zenith.erp.returns.ReturnRequest"
+                          in-map="[returnId:returnId, statusId:'RrCompleted', completedDate:ec.user.nowTimestamp]"/>
+        </actions>
+    </service>
+
+    <!-- Create Exchange Order -->
+    <service verb="create" noun="ExchangeOrder">
+        <in-parameters>
+            <parameter name="returnId" required="true"/>
+            <parameter name="newOrderId" required="true"/>
+            <parameter name="priceDifference" type="BigDecimal" default-value="0"/>
+            <parameter name="differenceHandling"/>
+        </in-parameters>
+        <out-parameters><parameter name="exchangeOrderId"/></out-parameters>
+        <actions>
+            <service-call name="create#zenith.erp.returns.ExchangeOrder"
+                          in-map="[returnId:returnId, newOrderId:newOrderId, priceDifference:priceDifference,
+                                   differenceHandling:differenceHandling, createdDate:ec.user.nowTimestamp]"
+                          out-map="context"/>
+        </actions>
+    </service>
+
+    <!-- Reject Return -->
+    <service verb="reject" noun="Return">
+        <in-parameters>
+            <parameter name="returnId" required="true"/>
+            <parameter name="notes"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.returns.ReturnRequest" value-field="rr" for-update="true"/>
+            <set field="rr.statusId" value="RrRejected"/>
+            <if condition="notes"><set field="rr.notes" from="(rr.notes ? rr.notes + '\n' : '') + 'Rejection: ' + notes"/></if>
+            <entity-update value-field="rr"/>
+        </actions>
+    </service>
+
+    <!-- Get Return Dashboard Stats -->
+    <service verb="get" noun="ReturnDashboard">
+        <out-parameters>
+            <parameter name="pendingReturns" type="Integer"/>
+            <parameter name="approvedReturns" type="Integer"/>
+            <parameter name="completedToday" type="Integer"/>
+            <parameter name="totalRefundedToday" type="BigDecimal"/>
+        </out-parameters>
+        <actions>
+            <entity-find-count entity-name="zenith.erp.returns.ReturnRequest" count-field="pendingReturns">
+                <econdition field-name="statusId" value="RrRequested"/>
+            </entity-find-count>
+            <entity-find-count entity-name="zenith.erp.returns.ReturnRequest" count-field="approvedReturns">
+                <econdition field-name="statusId" operator="in" value="RrApproved,RrReceived,RrInspecting"/>
+            </entity-find-count>
+            <entity-find-count entity-name="zenith.erp.returns.ReturnRequest" count-field="completedToday">
+                <econdition field-name="statusId" value="RrCompleted"/>
+                <econdition field-name="completedDate" operator="greater-equals" from="ec.user.nowTimestamp.clearTime()"/>
+            </entity-find-count>
+            <entity-find entity-name="zenith.erp.returns.ReturnRequest" list="todayCompleted">
+                <econdition field-name="statusId" value="RrCompleted"/>
+                <econdition field-name="completedDate" operator="greater-equals" from="ec.user.nowTimestamp.clearTime()"/>
+            </entity-find>
+            <set field="totalRefundedToday" from="0" type="BigDecimal"/>
+            <iterate list="todayCompleted" entry="r">
+                <set field="totalRefundedToday" from="totalRefundedToday + (r.totalReturnAmount ?: 0)"/>
+            </iterate>
+        </actions>
+    </service>
+
+</services>

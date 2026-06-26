@@ -1,0 +1,145 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
+        default-menu-title="Sales Forecast" default-menu-index="9">
+
+    <transition name="runForecast">
+        <actions>
+            <set field="org" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <script>ec.service.async().name("zenith.sales.SalesForecastServices.cycle#SalesForecast").parameter("organizationPartyId", org).call()</script>
+        </actions>
+        <default-response url="."><message>Updating your forecast — give it a few seconds, then reload the page.</message></default-response>
+    </transition>
+
+    <actions>
+        <set field="org" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+        <service-call name="zenith.sales.SalesForecastServices.forecast#Sales" out-map="fc" in-map="[organizationPartyId:org, horizonDays:14]"/>
+        <service-call name="zenith.sales.SalesForecastServices.forecast#CategorySales" out-map="catFc" in-map="[organizationPartyId:org, topN:6, horizonDays:14]"/>
+        <entity-find entity-name="zenith.erp.sales.SalesRevenueForecast" list="histList">
+            <econdition field-name="organizationPartyId" from="org"/>
+            <econdition field-name="dimension" value="Overall"/>
+            <order-by field-name="periodDate"/>
+        </entity-find>
+        <set field="weeklyList" from="fc.weeklyPoints ?: []"/>
+        <set field="catList" from="catFc.categories ?: []"/>
+        <set field="sym" value="₹"/>
+        <script><![CDATA[
+            def fmt = { v -> ec.l10n.format((v ?: 0) as BigDecimal, "#,##,##0") }
+            def confWord = { p -> p == null ? "Building up" : (p >= 75 ? "Strong" : (p >= 60 ? "Good" : (p >= 45 ? "Fair" : "Early estimate"))) }
+            def trendWord = { t -> t == "growing" ? "Going up" : (t == "softening" ? "Slowing down" : "Holding steady") }
+            def driverWord = { d ->
+                if (!d) return "—"
+                def up = d.toString().contains("rising")
+                if (d.toString().contains("footfall")) return up ? "More customers coming in" : "Fewer customers coming in"
+                return up ? "Customers spending more each visit" : "Customers spending a little less"
+            }
+            trendNice = trendWord(fc.trendLabel)
+            driverNice = driverWord(fc.primaryDriver)
+            confNice = confWord(fc.confidencePct)
+            hasData = (fc.confidencePct != null)
+            confColor = (fc.confidencePct != null && fc.confidencePct >= 60) ? "success" : (fc.confidencePct != null && fc.confidencePct >= 45 ? "warning" : "grey")
+            perDay = (fc.projectedNext7 != null) ? (fc.projectedNext7 / 7.0) : 0
+            // plain-words summary built from the numbers
+            if (hasData) {
+                plain = "Over the next 7 days you're likely to sell about " + sym + fmt(fc.projectedNext7) +
+                    " — roughly " + sym + fmt(perDay) + " a day. Sales are " + trendNice.toLowerCase() +
+                    ", and " + (fc.peakDay ?: "the weekend") + " is usually your busiest day. " +
+                    "Expect around " + fmt(fc.next7Traffic) + " customers spending about " + sym + fmt(fc.next7Aov) + " each. " +
+                    "The main change right now: " + driverNice.toLowerCase() + ". " +
+                    "How sure are we? " + confNice + " — and this gets sharper every day as more sales come in."
+            } else {
+                plain = "We need a couple of weeks of sales before we can predict reliably. Keep billing through the POS and check back soon."
+            }
+            catList.each { it.dirNice = trendWord(it.trend); it.relWord = confWord(it.confidencePct) }
+        ]]></script>
+    </actions>
+
+    <widgets>
+        <container style="row items-center justify-between q-mb-sm">
+            <container style="column">
+                <label text="Sales Forecast" type="h4" style="text-primary text-weight-bold q-my-none"/>
+                <label text="A simple prediction of how much you'll sell in the coming days, based on your past sales. It updates by itself every night." type="p" style="text-grey-7 q-mb-none"/>
+            </container>
+            <container style="row q-gutter-sm items-center">
+                <label text="How sure: ${confNice}${hasData ? ' (' + fc.confidencePct + '%)' : ''}" type="span" style="zenith-badge ${confColor}"/>
+                <form-single name="RunForm" transition="runForecast"><field name="go"><default-field title="">
+                    <submit text="Update Now" icon="refresh" style="bg-indigo-7 text-white text-weight-bold border-radius-sm"/></default-field></field></form-single>
+            </container>
+        </container>
+
+        <container style="zenith-card q-pa-md bg-indigo-1 border-radius-md q-mb-md">
+            <label text="In plain words" type="p" style="text-indigo-9 text-uppercase text-weight-bold text-caption q-mb-xs"/>
+            <label text="${plain}" type="p" style="text-grey-9 text-subtitle1 q-mb-none"/>
+        </container>
+
+        <container-row>
+            <row-col lg="3" md="6">
+                <container style="zenith-card q-pa-md bg-white shadow-1 border-radius-md q-mb-md">
+                    <label text="Expected sales — next 7 days" type="p" style="text-grey-7 text-weight-bold text-caption q-mb-xs"/>
+                    <label text="${sym}${ec.l10n.format(fc.projectedNext7 ?: 0,'#,##,##0')}" type="h5" style="text-primary text-weight-bold q-my-none"/>
+                    <label text="about ${sym}${ec.l10n.format(perDay,'#,##,##0')} on a normal day" type="p" style="text-grey-6 text-caption q-mb-none"/>
+                </container>
+            </row-col>
+            <row-col lg="3" md="6">
+                <container style="zenith-card q-pa-md bg-white shadow-1 border-radius-md q-mb-md">
+                    <label text="Which way sales are going" type="p" style="text-grey-7 text-weight-bold text-caption q-mb-xs"/>
+                    <label text="${trendNice}" type="h5" style="text-weight-bold q-my-none ${fc.trendLabel == 'growing' ? 'text-success' : (fc.trendLabel == 'softening' ? 'text-danger' : 'text-grey-8')}"/>
+                    <label text="Busiest day is usually ${fc.peakDay ?: '—'}" type="p" style="text-grey-6 text-caption q-mb-none"/>
+                </container>
+            </row-col>
+            <row-col lg="3" md="6">
+                <container style="zenith-card q-pa-md bg-white shadow-1 border-radius-md q-mb-md">
+                    <label text="Customers expected — next 7 days" type="p" style="text-grey-7 text-weight-bold text-caption q-mb-xs"/>
+                    <label text="${ec.l10n.format(fc.next7Traffic ?: 0,'#,##0')}" type="h5" style="text-primary text-weight-bold q-my-none"/>
+                    <label text="spending about ${sym}${ec.l10n.format(fc.next7Aov ?: 0,'#,##0')} each" type="p" style="text-grey-6 text-caption q-mb-none"/>
+                </container>
+            </row-col>
+            <row-col lg="3" md="6">
+                <container style="zenith-card q-pa-md bg-white shadow-1 border-radius-md q-mb-md">
+                    <label text="What's changing" type="p" style="text-grey-7 text-weight-bold text-caption q-mb-xs"/>
+                    <label text="${driverNice}" type="h6" style="text-weight-bold text-indigo-8 q-my-none"/>
+                    <label text="the main reason sales are moving" type="p" style="text-grey-6 text-caption q-mb-none"/>
+                </container>
+            </row-col>
+        </container-row>
+
+        <container-row>
+            <row-col lg="5" md="12">
+                <label text="Week by week" type="h6" style="text-primary text-weight-bold q-mt-md q-mb-xs"/>
+                <label text="How much you can expect to sell each week." type="p" style="text-grey-6 text-caption q-mb-sm"/>
+                <form-list name="WeeklyList" list="weeklyList" skip-form="true">
+                    <field name="weekStart"><default-field title="Week starting"><display/></default-field></field>
+                    <field name="predicted"><default-field title="Expected sales"><display text="${sym}${ec.l10n.format(predicted ?: 0,'#,##,##0')}"/></default-field></field>
+                    <field name="range"><default-field title="Likely between"><display text="${sym}${ec.l10n.format(lower ?: 0,'#,##,##0')} and ${sym}${ec.l10n.format(upper ?: 0,'#,##,##0')}"/></default-field></field>
+                </form-list>
+            </row-col>
+            <row-col lg="7" md="12">
+                <label text="By product group" type="h6" style="text-primary text-weight-bold q-mt-md q-mb-xs"/>
+                <label text="Your biggest groups and what each is expected to sell over the next 7 days." type="p" style="text-grey-6 text-caption q-mb-sm"/>
+                <form-list name="CatList" list="catList" skip-form="true">
+                    <field name="category"><default-field title="Group"><display/></default-field></field>
+                    <field name="projectedNext7"><default-field title="Next 7 days"><display text="${sym}${ec.l10n.format(projectedNext7 ?: 0,'#,##,##0')}"/></default-field></field>
+                    <field name="perDay"><default-field title="Per day"><display text="${sym}${ec.l10n.format(perDay ?: 0,'#,##0')}"/></default-field></field>
+                    <field name="dirNice"><default-field title="Direction"><display/></default-field></field>
+                    <field name="relWord"><default-field title="How sure"><display/></default-field></field>
+                    <field name="trackedAccuracy"><default-field title="Past accuracy"><display/></default-field></field>
+                </form-list>
+            </row-col>
+        </container-row>
+
+        <label text="Day by day — forecast vs what really happened" type="h6" style="text-primary text-weight-bold q-mt-md q-mb-xs"/>
+        <label text="Each upcoming day's expected sales, and once the day is over, what you actually sold and how close we were." type="p" style="text-grey-6 text-caption q-mb-sm"/>
+        <form-list name="ForecastList" list="histList" skip-form="true">
+            <field name="periodDate"><default-field title="Date"><display/></default-field></field>
+            <field name="predictedAmount"><default-field title="We expect"><display text="${sym}${ec.l10n.format(predictedAmount ?: 0,'#,##,##0')}"/></default-field></field>
+            <field name="band"><default-field title="Likely between"><display text="${sym}${ec.l10n.format(lowerBound ?: 0,'#,##,##0')} and ${sym}${ec.l10n.format(upperBound ?: 0,'#,##,##0')}"/></default-field></field>
+            <field name="actualAmount"><default-field title="Actually sold"><display text="${actualAmount != null ? (sym + ec.l10n.format(actualAmount,'#,##,##0')) : 'not yet'}"/></default-field></field>
+            <field name="accuracyPct"><default-field title="How close"><display text="${accuracyPct != null ? (accuracyPct + '% on target') : '—'}"/></default-field></field>
+        </form-list>
+
+        <container style="bg-blue-1 q-pa-md border-radius-md q-mt-md">
+            <label text="How to read this" type="p" style="text-blue-9 text-weight-bold q-mb-xs"/>
+            <label text="• &quot;Expected sales&quot; is our best single guess. &quot;Likely between&quot; is the realistic range it should fall in. • &quot;How sure&quot; tells you how much to trust it — it grows as the system learns from more days of your sales. • Numbers come straight from your POS bills and refresh automatically every night." type="p" style="text-grey-8 text-caption q-mb-none"/>
+        </container>
+    </widgets>
+</screen>

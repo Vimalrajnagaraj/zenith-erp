@@ -1,0 +1,197 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
+        default-menu-title="GSTR-2B Recon" default-menu-index="9">
+
+    <transition name="runReconciliation">
+        <service-call name="zenith.india.Gstr2Services.importAndReconcile#Gstr2b"/>
+        <default-response url="."/>
+    </transition>
+    
+    <transition name="exportCsv" read-only="true">
+        <actions>
+            <script><![CDATA[
+                import org.moqui.context.ExecutionContext
+                ExecutionContext ec = context.ec
+                // Use searchFormInputs to apply the same filters the user applied on the UI
+                def ef = ec.entity.find("zenith.erp.india.Gstr2bReconView")
+                ef.searchFormInputs("", "-invoiceDate", false)
+                def reconList = ef.list()
+                
+                def escapeCsv = { val ->
+                    if (val == null) return ""
+                    String str = val.toString().trim()
+                    if (str.contains(",") || str.contains("\"") || str.contains("\n")) {
+                        return "\"" + str.replace("\"", "\"\"") + "\""
+                    }
+                    return str
+                }
+                
+                StringBuilder csv = new StringBuilder()
+                csv.append("ZetaERP - GSTR-2B Reconciliation Report\n")
+                csv.append("Generated on: ${ec.l10n.format(ec.user.nowTimestamp, 'dd MMM yyyy HH:mm')}\n\n")
+                
+                csv.append("Supplier GSTIN,Supplier,Portal Inv#,Portal Date,Portal Taxable,IGST,CGST,SGST,Book Inv#,Book Taxable,Status,ITC,Mismatch\n")
+                
+                for (def row in reconList) {
+                    def dateStr = row.invoiceDate ? ec.l10n.format(row.invoiceDate, "dd/MM/yyyy") : ""
+                    
+                    csv.append(escapeCsv(row.supplierGstin)).append(",")
+                    csv.append(escapeCsv(row.supplierName)).append(",")
+                    csv.append(escapeCsv(row.invoiceNumber)).append(",")
+                    csv.append(escapeCsv(dateStr)).append(",")
+                    csv.append(escapeCsv(String.format("%.2f", row.taxableAmount ?: 0.0))).append(",")
+                    csv.append(escapeCsv(String.format("%.2f", row.igstAmount ?: 0.0))).append(",")
+                    csv.append(escapeCsv(String.format("%.2f", row.cgstAmount ?: 0.0))).append(",")
+                    csv.append(escapeCsv(String.format("%.2f", row.sgstAmount ?: 0.0))).append(",")
+                    csv.append(escapeCsv(row.bookInvoiceNumber)).append(",")
+                    csv.append(escapeCsv(String.format("%.2f", row.bookTaxableAmount ?: 0.0))).append(",")
+                    csv.append(escapeCsv(row.matchStatus)).append(",")
+                    csv.append(escapeCsv(row.itcAvailable)).append(",")
+                    csv.append(escapeCsv(row.mismatchReasons)).append("\n")
+                }
+                
+                String fileName = "GSTR2B_Recon_${ec.l10n.format(ec.user.nowTimestamp, 'yyyyMMdd_HHmm')}.csv"
+                ec.web.sendTextResponse(csv.toString(), "text/csv", fileName)
+            ]]></script>
+        </actions>
+        <default-response type="none"/>
+    </transition>
+
+    <actions>
+        <set field="cal" from="new java.util.GregorianCalendar()"/>
+        <set field="yr" from="cal.get(java.util.Calendar.YEAR)"/>
+        <set field="mn" from="cal.get(java.util.Calendar.MONTH) + 1"/>
+        <set field="fyStart" from="mn &gt;= 4 ? yr : yr - 1"/>
+        <set field="currentFy" value="${fyStart}-${fyStart + 1}"/>
+
+        <entity-find entity-name="zenith.erp.india.Gstr2bReconView" list="reconList">
+            <search-form-inputs default-order-by="-invoiceDate"/>
+        </entity-find>
+        <entity-find entity-name="mantle.party.PartyDetailAndRole" list="orgList">
+            <econdition field-name="roleTypeId" value="OrgInternal"/>
+            <econdition field-name="disabled" value="N" or-null="true"/>
+        </entity-find>
+        
+        <entity-find-count entity-name="zenith.erp.india.Gstr2bReconView" count-field="matchedCount">
+            <econdition field-name="matchStatus" value="Matched"/>
+        </entity-find-count>
+        <entity-find-count entity-name="zenith.erp.india.Gstr2bReconView" count-field="unmatchedCount">
+            <econdition field-name="matchStatus" value="Unmatched"/>
+        </entity-find-count>
+        <entity-find-count entity-name="zenith.erp.india.Gstr2bReconView" count-field="missingInBooksCount">
+            <econdition field-name="matchStatus" value="MissingInBooks"/>
+        </entity-find-count>
+        <entity-find-count entity-name="zenith.erp.india.Gstr2bReconView" count-field="missingInPortalCount">
+            <econdition field-name="matchStatus" value="MissingInPortal"/>
+        </entity-find-count>
+    </actions>
+
+    <widgets>
+        <label text="GSTR-2B Reconciliation" type="h4"/>
+        <label text="Financial Year: ${currentFy}" type="div" style="text-muted"/>
+
+        <!-- Reconciliation Summary Cards -->
+        <container-row>
+            <row-col lg="3">
+                <container-box><box-header title="Matched"/><box-body>
+                    <label text="${matchedCount ?: 0}" type="h2" style="text-success mb-2"/>
+                    <label text="Invoices where portal data matches your books within ₹1 tolerance." type="p" style="text-muted"/>
+                </box-body></container-box>
+            </row-col>
+            <row-col lg="3">
+                <container-box><box-header title="Unmatched"/><box-body>
+                    <label text="${unmatchedCount ?: 0}" type="h2" style="text-warning mb-2"/>
+                    <label text="Found in both portal and books but amounts differ." type="p" style="text-muted"/>
+                </box-body></container-box>
+            </row-col>
+            <row-col lg="3">
+                <container-box><box-header title="Missing in Books"/><box-body>
+                    <label text="${missingInBooksCount ?: 0}" type="h2" style="text-danger mb-2"/>
+                    <label text="Present in GSTR-2B but no matching invoice in your books." type="p" style="text-muted"/>
+                </box-body></container-box>
+            </row-col>
+            <row-col lg="3">
+                <container-box><box-header title="Missing in Portal"/><box-body>
+                    <label text="${missingInPortalCount ?: 0}" type="h2" style="text-info mb-2"/>
+                    <label text="In your books but supplier hasn't filed in GSTR-1." type="p" style="text-muted"/>
+                </box-body></container-box>
+            </row-col>
+        </container-row>
+
+        <!-- Run Reconciliation -->
+        <container-box><box-header title="Run Reconciliation"/><box-toolbar>
+            <container-dialog id="RunReconDialog" button-text="Reconcile Now" button-class="btn btn-primary" width="500">
+                <form-single name="RunReconForm" transition="runReconciliation">
+                    <field name="organizationPartyId"><default-field title="Organization">
+                        <drop-down allow-empty="false">
+                            <list-options list="orgList" key="${partyId}" text="${organizationName}"/>
+                        </drop-down>
+                    </default-field></field>
+                    <field name="returnPeriod">
+                        <default-field title="Return Period (MMYYYY)" tooltip="Enter exactly 6 digits, e.g., 052026">
+                            <text-line size="6" maxlength="6" default-value="${(mn &lt; 10 ? '0' : '') + mn}${yr}"/>
+                        </default-field>
+                    </field>
+                    <field name="gstr2bJsonFile"><default-field title="GSTR-2B JSON File"><file/></default-field></field>
+                    <field name="submitButton"><default-field title=""><submit text="Start Reconciliation" icon="fa fa-play" type="success"/></default-field></field>
+                </form-single>
+            </container-dialog>
+        </box-toolbar><box-body>
+            <label text="Upload GSTR-2B JSON from the GST portal, then run reconciliation to match against purchase invoices." type="p"/>
+        </box-body></container-box>
+
+        <!-- Reconciliation Results -->
+        <container-box><box-header title="Reconciliation Records"/><box-toolbar>
+            <link url="exportCsv" text="Export CSV" icon="fa fa-download" class="btn btn-success"/>
+        </box-toolbar><box-body>
+            <form-list name="ReconListForm" list="reconList" skip-form="true" header-dialog="true"
+                       show-csv-button="false" show-xlsx-button="false" show-page-size="true">
+                <field name="supplierGstin">
+                    <header-field title="Supplier GSTIN"><text-line/></header-field>
+                    <default-field><display/></default-field>
+                </field>
+                <field name="supplierName">
+                    <default-field title="Supplier"><display/></default-field>
+                </field>
+                <field name="invoiceNumber">
+                    <header-field title="Portal Inv#"><text-line/></header-field>
+                    <default-field><display/></default-field>
+                </field>
+                <field name="invoiceDate">
+                    <header-field title="Portal Date" show-order-by="true"><date-find/></header-field>
+                    <default-field><display format="dd/MM/yyyy"/></default-field>
+                </field>
+                <field name="taxableAmount">
+                    <default-field title="Portal Taxable"><display format="#,##,##0.00"/></default-field>
+                </field>
+                <field name="igstAmount"><default-field title="IGST"><display format="#,##,##0.00"/></default-field></field>
+                <field name="cgstAmount"><default-field title="CGST"><display format="#,##,##0.00"/></default-field></field>
+                <field name="sgstAmount"><default-field title="SGST"><display format="#,##,##0.00"/></default-field></field>
+                <field name="bookInvoiceNumber">
+                    <default-field title="Book Inv#"><display/></default-field>
+                </field>
+                <field name="bookTaxableAmount">
+                    <default-field title="Book Taxable"><display format="#,##,##0.00"/></default-field>
+                </field>
+                <field name="matchStatus">
+                    <header-field title="Status">
+                        <drop-down allow-empty="true">
+                            <option key="Matched"/><option key="Unmatched"/>
+                            <option key="MissingInBooks" text="Missing in Books"/>
+                            <option key="MissingInPortal" text="Missing in Portal"/>
+                        </drop-down>
+                    </header-field>
+                    <default-field><display/></default-field>
+                </field>
+                <field name="itcAvailable">
+                    <default-field title="ITC"><display/></default-field>
+                </field>
+                <field name="mismatchReasons">
+                    <default-field title="Mismatch"><display/></default-field>
+                </field>
+                <field name="submitButton"><header-field title="Find"><submit/></header-field></field>
+            </form-list>
+        </box-body></container-box>
+    </widgets>
+</screen>

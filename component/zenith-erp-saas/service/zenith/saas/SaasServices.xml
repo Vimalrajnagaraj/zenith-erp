@@ -1,0 +1,497 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <!-- ==================== TENANT PROVISIONING ==================== -->
+    <service verb="provision" noun="Tenant" authenticate="anonymous-all">
+        <description>Creates a new SaaS tenant: Organization, admin user, company settings, subscription</description>
+        <in-parameters>
+            <parameter name="tenantName" required="true"><description>Business/company name</description></parameter>
+            <parameter name="subdomain" required="true"><description>Subdomain slug (lowercase, no spaces)</description></parameter>
+            <parameter name="adminEmail" required="true"/>
+            <parameter name="adminPhone"/>
+            <parameter name="adminFirstName" required="true"/>
+            <parameter name="adminLastName" required="true"/>
+            <parameter name="adminPassword" required="true"/>
+            <parameter name="countryGeoId" default-value="IND"/>
+            <parameter name="currencyUomId"/>
+            <parameter name="gstin"><description>Optional GSTIN. If provided (India), configures GST: state code from first 2 digits.</description></parameter>
+            <parameter name="industryEnumId" default-value="TiRetailGeneral"/>
+            <parameter name="planId" default-value="STARTER"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="tenantId"/>
+            <parameter name="organizationPartyId"/>
+            <parameter name="userId"/>
+        </out-parameters>
+        <actions>
+            <!-- Validate subdomain uniqueness -->
+            <entity-find-count entity-name="zenith.erp.saas.SaasTenant" count-field="subdomainCount">
+                <econdition field-name="subdomain"/>
+            </entity-find-count>
+            <if condition="subdomainCount > 0">
+                <return error="true" message="Subdomain '${subdomain}' is already taken. Please choose another."/>
+            </if>
+
+            <!-- Validate email uniqueness -->
+            <entity-find-count entity-name="zenith.erp.saas.SaasTenant" count-field="emailCount">
+                <econdition field-name="adminEmail"/>
+            </entity-find-count>
+            <if condition="emailCount > 0">
+                <return error="true" message="An account with email '${adminEmail}' already exists."/>
+            </if>
+
+            <!-- Resolve currency from country if not provided -->
+            <if condition="!currencyUomId">
+                <entity-find-one entity-name="zenith.erp.base.CountryConfiguration" value-field="countryConf">
+                    <field-map field-name="countryGeoId"/>
+                </entity-find-one>
+                <set field="currencyUomId" from="countryConf?.defaultCurrencyUomId ?: 'INR'"/>
+            </if>
+
+            <!-- 1. Create Organization Party -->
+            <service-call name="mantle.party.PartyServices.create#Organization" out-map="orgOut"
+                in-map="[organizationName:tenantName, roleTypeId:'OrgInternal']"/>
+            <set field="organizationPartyId" from="orgOut.partyId"/>
+
+            <!-- Create Organization ID (used for login) -->
+            <set field="orgCode" from="subdomain.toUpperCase()"/>
+            <service-call name="update#mantle.party.Party"
+                in-map="[partyId:organizationPartyId, pseudoId:orgCode]"/>
+            <service-call name="create#mantle.party.PartyIdentification"
+                in-map="[partyId:organizationPartyId, partyIdTypeEnumId:'PtidOrgCode', idValue:orgCode]"/>
+
+            <!-- 2. Create admin user account -->
+            <service-call name="org.moqui.impl.UserServices.create#UserAccount" out-map="userOut"
+                in-map="[username:adminEmail, emailAddress:adminEmail,
+                         newPassword:adminPassword, newPasswordVerify:adminPassword,
+                         userFullName:(adminFirstName + ' ' + adminLastName)]"/>
+            <set field="userId" from="userOut.userId"/>
+
+            <!-- Create Person record for admin -->
+            <service-call name="mantle.party.PartyServices.create#Person" out-map="personOut"
+                in-map="[firstName:adminFirstName, lastName:adminLastName,
+                         roleTypeId:'Manager']"/>
+
+            <!-- Link user to person party -->
+            <service-call name="update#moqui.security.UserAccount"
+                in-map="[userId:userId, partyId:personOut.partyId]"/>
+
+            <!-- Link person to org via PartyRelationship -->
+            <service-call name="create#mantle.party.PartyRelationship"
+                in-map="[fromPartyId:personOut.partyId, fromRoleTypeId:'Manager',
+                         toPartyId:organizationPartyId, toRoleTypeId:'OrgInternal',
+                         relationshipTypeEnumId:'PrtEmployee', fromDate:ec.user.nowTimestamp]"/>
+
+            <!-- Set ACTIVE_ORGANIZATION user preference (direct entity create since no user session) -->
+            <service-call name="create#moqui.security.UserPreference"
+                in-map="[userId:userId, preferenceKey:'ACTIVE_ORGANIZATION', preferenceValue:organizationPartyId]"/>
+
+            <!-- 3. Create user group for this tenant -->
+            <set field="tenantGroupId" from="'TENANT_' + subdomain.toUpperCase()"/>
+            <service-call name="create#moqui.security.UserGroup"
+                in-map="[userGroupId:tenantGroupId, description:(tenantName + ' Users')]"/>
+
+            <!-- Add admin to tenant group and ZenithAll group -->
+            <service-call name="create#moqui.security.UserGroupMember"
+                in-map="[userGroupId:tenantGroupId, userId:userId, fromDate:ec.user.nowTimestamp]"/>
+            <service-call name="create#moqui.security.UserGroupMember"
+                in-map="[userGroupId:'ZENITH_ALL', userId:userId, fromDate:ec.user.nowTimestamp]"/>
+
+            <!-- 4. Company Settings -->
+            <service-call name="create#zenith.erp.base.CompanySettings"
+                in-map="[organizationPartyId:organizationPartyId, settingKey:'COUNTRY_GEO_ID', settingValue:countryGeoId]"/>
+            <service-call name="create#zenith.erp.base.CompanySettings"
+                in-map="[organizationPartyId:organizationPartyId, settingKey:'CURRENCY_UOM_ID', settingValue:currencyUomId]"/>
+            <if condition="countryGeoId == 'IND'">
+                <service-call name="create#zenith.erp.base.CompanySettings"
+                    in-map="[organizationPartyId:organizationPartyId, settingKey:'TAX_CALCULATION_SERVICE', settingValue:'zenith.india.IndiaTaxServices.calculate#Tax']"/>
+                <!-- GST registration: state code drives intra (CGST+SGST) vs inter (IGST) supply -->
+                <if condition="gstin &amp;&amp; gstin.length() &gt;= 15">
+                    <set field="gstStateCode" from="gstin.substring(0,2)"/>
+                    <service-call name="create#zenith.erp.india.IndiaGstConfig"
+                        in-map="[organizationPartyId:organizationPartyId, gstin:gstin, legalName:tenantName,
+                                 stateCode:gstStateCode, registrationType:'Regular', isCompositionScheme:'N',
+                                 einvoiceEnabled:'N', ewayBillThreshold:50000]"/>
+                    <service-call name="create#zenith.erp.india.IndiaGstin"
+                        in-map="[gstinId:('GSTIN_' + organizationPartyId), partyId:organizationPartyId, gstin:gstin,
+                                 gstRegistrationType:'Regular', stateCode:gstStateCode, isCompositionScheme:'N', isActive:'Y']"/>
+                </if>
+            </if>
+
+            <!-- Set FY start from country config -->
+            <set field="fyStart" from="countryConf?.fiscalYearStartMonth ?: 1"/>
+            <service-call name="create#zenith.erp.base.CompanySettings"
+                in-map="[organizationPartyId:organizationPartyId, settingKey:'FY_START_MONTH', settingValue:fyStart.toString()]"/>
+            <!-- document-number sequences (INVOICE, SALES_ORDER, QUOTATION, CHALLAN, CREDIT_NOTE, ...) -->
+            <service-call name="zenith.base.SequenceServices.init#Sequences" in-map="[organizationPartyId:organizationPartyId]"/>
+            <!-- default store so inventory workflows (stock levels, adjustments, receipts) work out of the box -->
+            <service-call name="create#mantle.facility.Facility"
+                in-map="[facilityName:(tenantName + ' - Main Store'), facilityTypeEnumId:'FcTpRetailStore', ownerPartyId:organizationPartyId]"/>
+            <service-call name="create#zenith.erp.pos.PosReceiptTemplate"
+                in-map="[templateId:('TPL_' + subdomain.toUpperCase()), organizationPartyId:organizationPartyId,
+                         templateName:'Default', companyName:tenantName, isDefault:'Y', isActive:'Y',
+                         receiptWidth:'80mm', showDiscount:'Y', showCustomerInfo:'Y', showPaymentDetails:'Y', showTaxBreakdown:'Y',
+                         footerText:'Thank you! Visit again']"/>
+
+            <!-- 5. Create SaasTenant record -->
+            <set field="tenantStatus" from="(plan?.trialDays &amp;&amp; (plan.trialDays as int) &gt; 0) ? 'SaasTenantTrial' : 'SaasTenantActive'"/>
+            <service-call name="create#zenith.erp.saas.SaasTenant" out-map="tenantOut"
+                in-map="[organizationPartyId:organizationPartyId, tenantName:tenantName,
+                         subdomain:subdomain, adminUserId:userId, adminEmail:adminEmail,
+                         adminPhone:adminPhone, countryGeoId:countryGeoId,
+                         currencyUomId:currencyUomId, industryEnumId:industryEnumId,
+                         planId:planId, statusId:tenantStatus,
+                         registeredDate:ec.user.nowTimestamp]"/>
+            <set field="tenantId" from="tenantOut.tenantId"/>
+
+            <!-- 6. Create subscription -->
+            <entity-find-one entity-name="zenith.erp.saas.SaasPlan" value-field="plan">
+                <field-map field-name="planId"/>
+            </entity-find-one>
+            <set field="startDate" from="ec.user.nowTimestamp"/>
+            <script><![CDATA[
+                import java.time.LocalDate
+                def today = LocalDate.now()
+                def trialEnd = plan?.trialDays ? today.plusDays(plan.trialDays as int) : null
+                def renewalDt = today.plusMonths(1)
+                context.trialEndDate = trialEnd ? java.sql.Date.valueOf(trialEnd) : null
+                context.renewalDate = java.sql.Date.valueOf(renewalDt)
+                context.subStatus = (plan?.trialDays && (plan.trialDays as int) > 0) ? 'SubTrial' : 'SubActive'
+            ]]></script>
+            <service-call name="create#zenith.erp.saas.SaasSubscription"
+                in-map="[tenantId:tenantId, planId:planId, statusId:subStatus,
+                         billingCycle:'Monthly', startDate:startDate,
+                         renewalDate:renewalDate, trialEndDate:trialEndDate,
+                         amount:plan?.monthlyPrice ?: 0, currencyUomId:currencyUomId]"/>
+
+            <!-- 7. Audit log -->
+            <service-call name="create#zenith.erp.saas.SaasAuditLog"
+                in-map="[tenantId:tenantId, eventType:'SIGNUP', eventDate:ec.user.nowTimestamp,
+                         userId:userId, description:('Tenant provisioned: ' + tenantName + ' (plan: ' + planId + ')')]"/>
+
+            <message type="success">Tenant '${tenantName}' created successfully! Subdomain: ${subdomain}.zetaclantech.com</message>
+        </actions>
+    </service>
+
+    <!-- ==================== TENANT STATUS MANAGEMENT ==================== -->
+    <service verb="suspend" noun="Tenant">
+        <in-parameters>
+            <parameter name="tenantId" required="true"/>
+            <parameter name="reason"/>
+        </in-parameters>
+        <actions>
+            <service-call name="update#zenith.erp.saas.SaasTenant"
+                in-map="[tenantId:tenantId, statusId:'SaasTenantSuspended']"/>
+            <service-call name="create#zenith.erp.saas.SaasAuditLog"
+                in-map="[tenantId:tenantId, eventType:'SUSPEND', eventDate:ec.user.nowTimestamp,
+                         userId:ec.user.userId, description:('Suspended: ' + (reason ?: 'No reason given'))]"/>
+            <message>Tenant suspended.</message>
+        </actions>
+    </service>
+
+    <service verb="reactivate" noun="Tenant">
+        <in-parameters>
+            <parameter name="tenantId" required="true"/>
+        </in-parameters>
+        <actions>
+            <service-call name="update#zenith.erp.saas.SaasTenant"
+                in-map="[tenantId:tenantId, statusId:'SaasTenantActive']"/>
+            <service-call name="create#zenith.erp.saas.SaasAuditLog"
+                in-map="[tenantId:tenantId, eventType:'REACTIVATE', eventDate:ec.user.nowTimestamp,
+                         userId:ec.user.userId, description:'Tenant reactivated']"/>
+            <message>Tenant reactivated.</message>
+        </actions>
+    </service>
+
+    <!-- ==================== PLAN CHANGE ==================== -->
+    <service verb="change" noun="Plan">
+        <in-parameters>
+            <parameter name="tenantId" required="true"/>
+            <parameter name="newPlanId" required="true"/>
+            <parameter name="billingCycle" default-value="Monthly"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.saas.SaasTenant" value-field="tenant"/>
+            <set field="oldPlanId" from="tenant.planId"/>
+            <entity-find-one entity-name="zenith.erp.saas.SaasPlan" value-field="newPlan">
+                <field-map field-name="planId" from="newPlanId"/>
+            </entity-find-one>
+
+            <!-- Update tenant plan -->
+            <service-call name="update#zenith.erp.saas.SaasTenant"
+                in-map="[tenantId:tenantId, planId:newPlanId]"/>
+
+            <!-- Create new subscription, expire old -->
+            <entity-find entity-name="zenith.erp.saas.SaasSubscription" list="activeSubs">
+                <econdition field-name="tenantId"/>
+                <econdition field-name="statusId" value="SubActive"/>
+            </entity-find>
+            <iterate list="activeSubs" entry="oldSub">
+                <service-call name="update#zenith.erp.saas.SaasSubscription"
+                    in-map="[subscriptionId:oldSub.subscriptionId, statusId:'SubExpired']"/>
+            </iterate>
+
+            <set field="subAmount" from="billingCycle == 'Yearly' ? newPlan.yearlyPrice : newPlan.monthlyPrice"/>
+            <script><![CDATA[
+                import java.time.LocalDate
+                def today = LocalDate.now()
+                def renewal = billingCycle == 'Yearly' ? today.plusYears(1) : today.plusMonths(1)
+                context.renewalDate = java.sql.Date.valueOf(renewal)
+            ]]></script>
+            <service-call name="create#zenith.erp.saas.SaasSubscription"
+                in-map="[tenantId:tenantId, planId:newPlanId, statusId:'SubActive',
+                         billingCycle:billingCycle, startDate:ec.user.nowTimestamp,
+                         renewalDate:renewalDate, amount:subAmount,
+                         currencyUomId:tenant.currencyUomId]"/>
+
+            <service-call name="create#zenith.erp.saas.SaasAuditLog"
+                in-map="[tenantId:tenantId, eventType:'PLAN_CHANGE', eventDate:ec.user.nowTimestamp,
+                         userId:ec.user.userId, description:('Plan changed from ' + oldPlanId + ' to ' + newPlanId)]"/>
+
+            <message>Plan changed to ${newPlan.planName}.</message>
+        </actions>
+    </service>
+
+    <!-- ==================== USAGE TRACKING ==================== -->
+    <service verb="update" noun="TenantUsage">
+        <in-parameters>
+            <parameter name="tenantId" required="true"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.saas.SaasTenant" value-field="tenant"/>
+            <set field="orgId" from="tenant.organizationPartyId"/>
+            <script><![CDATA[
+                import java.time.LocalDate
+                import java.time.YearMonth
+                def now = LocalDate.now()
+                context.periodMonth = (now.year * 100) + now.monthValue
+
+                // Count active users linked to this org
+                def userCount = ec.entity.find("moqui.security.UserAccount")
+                    .condition("partyId", orgId).count()
+                context.activeUsers = userCount as int
+
+                // Count products
+                def prodCount = ec.entity.find("mantle.product.Product")
+                    .condition("ownerPartyId", orgId).count()
+                context.totalProducts = prodCount as int
+
+                // Count POS transactions this month
+                def monthStart = YearMonth.of(now.year, now.monthValue).atDay(1).atStartOfDay()
+                def txnCount = ec.entity.find("zenith.erp.pos.PosTransaction")
+                    .condition("organizationPartyId", orgId)
+                    .condition("entryDate", ">=", java.sql.Timestamp.valueOf(monthStart))
+                    .count()
+                context.totalTransactions = txnCount as int
+
+                // POS terminals
+                def termCount = ec.entity.find("zenith.erp.pos.PosTerminal")
+                    .condition("organizationPartyId", orgId)
+                    .condition("isActive", "Y").count()
+                context.posTerminals = termCount as int
+
+                // Stores
+                try {
+                    def storeCount = ec.entity.find("zenith.erp.stores.Store")
+                        .condition("organizationPartyId", orgId)
+                        .condition("isActive", "Y").count()
+                    context.totalStores = storeCount as int
+                } catch (Exception e) { context.totalStores = 0 }
+
+                // Loyalty members
+                try {
+                    def loyaltyCount = ec.entity.find("zenith.erp.loyalty.LoyaltyMember")
+                        .condition("organizationPartyId", orgId)
+                        .condition("isActive", "Y").count()
+                    context.loyaltyMembers = loyaltyCount as int
+                } catch (Exception e) { context.loyaltyMembers = 0 }
+
+                // Active promotions
+                try {
+                    def promoCount = ec.entity.find("zenith.erp.promotions.Promotion")
+                        .condition("organizationPartyId", orgId)
+                        .condition("isActive", "Y").count()
+                    context.activePromotions = promoCount as int
+                } catch (Exception e) { context.activePromotions = 0 }
+            ]]></script>
+
+            <!-- Upsert usage record -->
+            <entity-find-one entity-name="zenith.erp.saas.SaasUsage" value-field="existing">
+                <field-map field-name="tenantId"/>
+                <field-map field-name="periodMonth"/>
+            </entity-find-one>
+            <if condition="existing">
+                <service-call name="update#zenith.erp.saas.SaasUsage"
+                    in-map="[tenantId:tenantId, periodMonth:periodMonth,
+                             activeUsers:activeUsers, posTerminals:posTerminals,
+                             totalProducts:totalProducts, totalTransactions:totalTransactions,
+                             totalStores:totalStores, loyaltyMembers:loyaltyMembers,
+                             activePromotions:activePromotions,
+                             lastUpdated:ec.user.nowTimestamp]"/>
+                <else>
+                    <service-call name="create#zenith.erp.saas.SaasUsage"
+                        in-map="[tenantId:tenantId, periodMonth:periodMonth,
+                                 activeUsers:activeUsers, posTerminals:posTerminals,
+                                 totalProducts:totalProducts, totalTransactions:totalTransactions,
+                                 totalStores:totalStores, loyaltyMembers:loyaltyMembers,
+                                 activePromotions:activePromotions,
+                                 lastUpdated:ec.user.nowTimestamp]"/>
+                </else>
+            </if>
+        </actions>
+    </service>
+
+    <!-- ==================== USAGE LIMIT CHECK ==================== -->
+    <service verb="check" noun="UsageLimits">
+        <description>Check if tenant is within plan limits. Returns violations list.</description>
+        <in-parameters>
+            <parameter name="tenantId" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="withinLimits" type="Boolean"/>
+            <parameter name="violations" type="List"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.saas.SaasTenant" value-field="tenant"/>
+            <entity-find-one entity-name="zenith.erp.saas.SaasPlan" value-field="plan">
+                <field-map field-name="planId" from="tenant.planId"/>
+            </entity-find-one>
+
+            <set field="violations" from="[]"/>
+
+            <!-- Enterprise plan (0 = unlimited) -->
+            <if condition="plan.planCode == 'ENTERPRISE'">
+                <set field="withinLimits" from="true"/>
+                <return/>
+            </if>
+
+            <!-- Get current usage -->
+            <service-call name="zenith.saas.SaasServices.update#TenantUsage" in-map="[tenantId:tenantId]"/>
+            <script><![CDATA[
+                import java.time.LocalDate
+                def now = LocalDate.now()
+                def pm = (now.year * 100) + now.monthValue
+            ]]></script>
+            <entity-find-one entity-name="zenith.erp.saas.SaasUsage" value-field="usage">
+                <field-map field-name="tenantId"/>
+                <field-map field-name="periodMonth" from="pm"/>
+            </entity-find-one>
+
+            <if condition="usage">
+                <if condition="plan.maxUsers > 0 &amp;&amp; usage.activeUsers > plan.maxUsers">
+                    <script>violations.add("Users: ${usage.activeUsers}/${plan.maxUsers}")</script>
+                </if>
+                <if condition="plan.maxPosTerminals > 0 &amp;&amp; usage.posTerminals > plan.maxPosTerminals">
+                    <script>violations.add("POS Terminals: ${usage.posTerminals}/${plan.maxPosTerminals}")</script>
+                </if>
+                <if condition="plan.maxProductsSku > 0 &amp;&amp; usage.totalProducts > plan.maxProductsSku">
+                    <script>violations.add("Products: ${usage.totalProducts}/${plan.maxProductsSku}")</script>
+                </if>
+                <if condition="plan.maxMonthlyTransactions > 0 &amp;&amp; usage.totalTransactions > plan.maxMonthlyTransactions">
+                    <script>violations.add("Monthly Transactions: ${usage.totalTransactions}/${plan.maxMonthlyTransactions}")</script>
+                </if>
+                <if condition="plan.maxStores > 0 &amp;&amp; (usage.totalStores ?: 0) > plan.maxStores">
+                    <script>violations.add("Stores: ${usage.totalStores}/${plan.maxStores}")</script>
+                </if>
+                <if condition="plan.maxLoyaltyMembers > 0 &amp;&amp; (usage.loyaltyMembers ?: 0) > plan.maxLoyaltyMembers">
+                    <script>violations.add("Loyalty Members: ${usage.loyaltyMembers}/${plan.maxLoyaltyMembers}")</script>
+                </if>
+                <if condition="plan.maxPromotions > 0 &amp;&amp; (usage.activePromotions ?: 0) > plan.maxPromotions">
+                    <script>violations.add("Active Promotions: ${usage.activePromotions}/${plan.maxPromotions}")</script>
+                </if>
+            </if>
+
+            <set field="withinLimits" from="violations.isEmpty()"/>
+        </actions>
+    </service>
+
+    <!-- ==================== CANCEL SUBSCRIPTION ==================== -->
+    <service verb="cancel" noun="Subscription">
+        <description>Cancel a tenant's subscription. Tenant stays active until end of billing period.</description>
+        <in-parameters>
+            <parameter name="tenantId" required="true"/>
+            <parameter name="reason"/>
+            <parameter name="immediate" type="Boolean" default-value="false"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.saas.SaasTenant" value-field="tenant"/>
+            <if condition="!tenant">
+                <return error="true" message="Tenant not found"/>
+            </if>
+
+            <!-- Cancel active subscriptions -->
+            <entity-find entity-name="zenith.erp.saas.SaasSubscription" list="activeSubs">
+                <econdition field-name="tenantId"/>
+                <econdition field-name="statusId" operator="in" value="SubActive,SubTrial"/>
+            </entity-find>
+            <iterate list="activeSubs" entry="sub">
+                <service-call name="update#zenith.erp.saas.SaasSubscription"
+                    in-map="[subscriptionId:sub.subscriptionId, statusId:'SubCancelled',
+                             cancelledDate:ec.user.nowTimestamp, cancelReason:reason,
+                             autoRenew:'N']"/>
+            </iterate>
+
+            <if condition="immediate">
+                <service-call name="update#zenith.erp.saas.SaasTenant"
+                    in-map="[tenantId:tenantId, statusId:'SaasTenantCancelled']"/>
+            </if>
+
+            <service-call name="create#zenith.erp.saas.SaasAuditLog"
+                in-map="[tenantId:tenantId, eventType:'CANCEL', eventDate:ec.user.nowTimestamp,
+                         userId:ec.user.userId,
+                         description:('Subscription cancelled' + (immediate ? ' (immediate)' : ' (end of period)') + (reason ? ': ' + reason : ''))]"/>
+
+            <message>Subscription cancelled${immediate ? '' : '. Access continues until end of billing period'}.</message>
+        </actions>
+    </service>
+
+    <!-- ==================== TENANT LOOKUP (by subdomain) ==================== -->
+    <service verb="resolve" noun="Tenant">
+        <description>Resolve tenant by subdomain or custom domain</description>
+        <in-parameters>
+            <parameter name="hostname" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="tenantId"/>
+            <parameter name="organizationPartyId"/>
+            <parameter name="tenantName"/>
+            <parameter name="planId"/>
+            <parameter name="statusId"/>
+            <parameter name="found" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <set field="found" from="false"/>
+            <!-- Try subdomain match: extract from hostname like "store1.zetaclantech.com" → "store1" -->
+            <script><![CDATA[
+                def parts = hostname?.split('\\.')
+                def sub = (parts?.length >= 3) ? parts[0] : null
+            ]]></script>
+
+            <!-- Check subdomain -->
+            <if condition="sub">
+                <entity-find entity-name="zenith.erp.saas.SaasTenant" list="tenants" limit="1">
+                    <econdition field-name="subdomain" from="sub"/>
+                </entity-find>
+            </if>
+
+            <!-- Fallback: check custom domain -->
+            <if condition="!tenants">
+                <entity-find entity-name="zenith.erp.saas.SaasTenant" list="tenants" limit="1">
+                    <econdition field-name="customDomain" from="hostname"/>
+                </entity-find>
+            </if>
+
+            <if condition="tenants">
+                <set field="t" from="tenants[0]"/>
+                <set field="tenantId" from="t.tenantId"/>
+                <set field="organizationPartyId" from="t.organizationPartyId"/>
+                <set field="tenantName" from="t.tenantName"/>
+                <set field="planId" from="t.planId"/>
+                <set field="statusId" from="t.statusId"/>
+                <set field="found" from="true"/>
+            </if>
+        </actions>
+    </service>
+
+</services>

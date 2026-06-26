@@ -1,0 +1,219 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <!-- ========== Create Fixed Asset ========== -->
+    <service verb="create" noun="FixedAsset">
+        <in-parameters>
+            <parameter name="assetName" required="true"/>
+            <parameter name="assetCode"/>
+            <parameter name="categoryId" required="true"/>
+            <parameter name="organizationPartyId"/>
+            <parameter name="facilityId"/>
+            <parameter name="purchaseDate" type="Date" required="true"/>
+            <parameter name="purchaseAmount" type="BigDecimal" required="true"/>
+            <parameter name="currencyUomId"/>
+            <parameter name="vendorPartyId"/>
+            <parameter name="invoiceId"/>
+            <parameter name="serialNumber"/>
+            <parameter name="modelNumber"/>
+            <parameter name="manufacturer"/>
+            <parameter name="warrantyExpiryDate" type="Date"/>
+            <parameter name="depreciationMethodEnumId"/>
+            <parameter name="usefulLifeMonths" type="Integer"/>
+            <parameter name="salvageValue" type="BigDecimal"/>
+            <parameter name="depreciationStartDate" type="Date"/>
+            <parameter name="location"/>
+            <parameter name="assignedToPartyId"/>
+            <parameter name="description"/>
+        </in-parameters>
+        <out-parameters><parameter name="fixedAssetId"/></out-parameters>
+        <actions>
+            <set field="organizationPartyId" from="organizationPartyId ?: ec.user.context.activeOrgId"/>
+
+            <!-- Auto-populate from category if not provided -->
+            <entity-find-one entity-name="zenith.erp.assets.FixedAssetCategory" value-field="cat">
+                <field-map field-name="categoryId"/></entity-find-one>
+            <if condition="!depreciationMethodEnumId &amp;&amp; cat?.depreciationMethodEnumId">
+                <set field="depreciationMethodEnumId" from="cat.depreciationMethodEnumId"/></if>
+            <if condition="!usefulLifeMonths &amp;&amp; cat?.defaultUsefulLifeMonths">
+                <set field="usefulLifeMonths" from="cat.defaultUsefulLifeMonths"/></if>
+            <if condition="salvageValue == null &amp;&amp; cat?.defaultSalvagePercent != null">
+                <set field="salvageValue" from="purchaseAmount * (cat.defaultSalvagePercent / 100)"/></if>
+
+            <set field="depreciationStartDate" from="depreciationStartDate ?: purchaseDate"/>
+            <set field="currentBookValue" from="purchaseAmount"/>
+            <set field="accumulatedDepreciation" from="0"/>
+
+            <!-- Generate asset code if not provided -->
+            <if condition="!assetCode">
+                <set field="prefix" from="cat?.categoryName?.take(3)?.toUpperCase() ?: 'AST'"/>
+                <service-call name="zenith.base.SequenceServices.get#NextSequence"
+                              in-map="[sequenceType:'FixedAsset', prefix:prefix + '-']" out-map="seqOut"/>
+                <set field="assetCode" from="seqOut?.sequenceValue ?: (prefix + '-' + System.currentTimeMillis())"/>
+            </if>
+
+            <service-call name="create#zenith.erp.assets.FixedAsset"
+                          in-map="context + [statusId:'FaActive']" out-map="context"/>
+        </actions>
+    </service>
+
+    <!-- ========== Update Fixed Asset ========== -->
+    <service verb="update" noun="FixedAsset">
+        <in-parameters>
+            <parameter name="fixedAssetId" required="true"/>
+            <parameter name="assetName"/>
+            <parameter name="categoryId"/>
+            <parameter name="facilityId"/>
+            <parameter name="serialNumber"/>
+            <parameter name="modelNumber"/>
+            <parameter name="manufacturer"/>
+            <parameter name="warrantyExpiryDate" type="Date"/>
+            <parameter name="location"/>
+            <parameter name="assignedToPartyId"/>
+            <parameter name="description"/>
+            <parameter name="statusId"/>
+        </in-parameters>
+        <actions>
+            <service-call name="update#zenith.erp.assets.FixedAsset" in-map="context"/>
+        </actions>
+    </service>
+
+    <!-- ========== Calculate Depreciation for a Single Asset ========== -->
+    <service verb="calculate" noun="Depreciation">
+        <in-parameters>
+            <parameter name="fixedAssetId" required="true"/>
+            <parameter name="periodEnd" type="Date" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="depreciationAmount" type="BigDecimal"/>
+            <parameter name="depreciationEntryId"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.assets.FixedAsset" value-field="fa" for-update="true"/>
+            <if condition="!fa"><return error="true" message="Fixed asset not found"/></if>
+            <if condition="fa.statusId == 'FaDisposed' || fa.statusId == 'FaScrapped'">
+                <return error="true" message="Cannot depreciate a disposed/scrapped asset"/></if>
+
+            <set field="purchaseAmt" from="fa.purchaseAmount ?: 0" type="BigDecimal"/>
+            <set field="salvageVal" from="fa.salvageValue ?: 0" type="BigDecimal"/>
+            <set field="usefulMonths" from="fa.usefulLifeMonths ?: 60" type="BigDecimal"/>
+            <set field="accDep" from="fa.accumulatedDepreciation ?: 0" type="BigDecimal"/>
+            <set field="bookValue" from="fa.currentBookValue ?: (purchaseAmt - accDep)" type="BigDecimal"/>
+            <set field="method" from="fa.depreciationMethodEnumId ?: 'DmStraightLine'"/>
+
+            <set field="depreciableAmount" from="purchaseAmt - salvageVal" type="BigDecimal"/>
+            <if condition="depreciableAmount &lt;= 0 || bookValue &lt;= salvageVal">
+                <set field="depreciationAmount" from="0" type="BigDecimal"/>
+                <return/>
+            </if>
+
+            <!-- Period start = last depreciation date + 1 day, or depreciation start date -->
+            <set field="periodStart" from="fa.lastDepreciationDate ? new java.sql.Date(fa.lastDepreciationDate.time + 86400000L) : fa.depreciationStartDate"/>
+
+            <script><![CDATA[
+                def monthlyDep = 0.0
+                if (method == 'DmStraightLine') {
+                    monthlyDep = depreciableAmount / usefulMonths
+                } else if (method == 'DmWrittenDown') {
+                    def annualRate = (2.0 / (usefulMonths / 12.0)) * 100
+                    monthlyDep = bookValue * (annualRate / 100.0) / 12.0
+                } else if (method == 'DmDoubleDeclining') {
+                    def annualRate = (2.0 / (usefulMonths / 12.0))
+                    monthlyDep = bookValue * annualRate / 12.0
+                } else {
+                    monthlyDep = depreciableAmount / usefulMonths
+                }
+
+                // Don't depreciate below salvage
+                if (bookValue - monthlyDep < salvageVal) {
+                    monthlyDep = bookValue - salvageVal
+                }
+                if (monthlyDep < 0) monthlyDep = 0
+
+                depreciationAmount = monthlyDep.setScale(2, java.math.RoundingMode.HALF_UP)
+            ]]></script>
+
+            <if condition="depreciationAmount > 0">
+                <set field="newAccDep" from="(accDep + depreciationAmount).setScale(2, java.math.RoundingMode.HALF_UP)"/>
+                <set field="newBookValue" from="(purchaseAmt - newAccDep).setScale(2, java.math.RoundingMode.HALF_UP)"/>
+
+                <service-call name="create#zenith.erp.assets.DepreciationEntry" out-map="depOut"
+                              in-map="[fixedAssetId:fixedAssetId, periodStart:periodStart, periodEnd:periodEnd,
+                                       openingBookValue:bookValue, depreciationAmount:depreciationAmount,
+                                       accumulatedDepreciation:newAccDep, closingBookValue:newBookValue,
+                                       depreciationRate:(depreciationAmount/bookValue*100).setScale(2, java.math.RoundingMode.HALF_UP),
+                                       calculatedDate:ec.user.nowTimestamp]"/>
+                <set field="depreciationEntryId" from="depOut.depreciationEntryId"/>
+
+                <!-- Update asset -->
+                <set field="fa.accumulatedDepreciation" from="newAccDep"/>
+                <set field="fa.currentBookValue" from="newBookValue"/>
+                <set field="fa.lastDepreciationDate" from="periodEnd"/>
+                <if condition="newBookValue &lt;= salvageVal">
+                    <set field="fa.statusId" value="FaFullyDepreciated"/></if>
+                <entity-update value-field="fa"/>
+            </if>
+        </actions>
+    </service>
+
+    <!-- ========== Run Depreciation for All Active Assets ========== -->
+    <service verb="run" noun="MonthlyDepreciation">
+        <in-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="periodEnd" type="Date"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="assetsProcessed" type="Integer"/>
+            <parameter name="totalDepreciation" type="BigDecimal"/>
+        </out-parameters>
+        <actions>
+            <set field="organizationPartyId" from="organizationPartyId ?: ec.user.context.activeOrgId"/>
+            <if condition="!periodEnd">
+                <set field="cal" from="java.util.Calendar.getInstance()"/>
+                <script>cal.set(java.util.Calendar.DAY_OF_MONTH, cal.getActualMaximum(java.util.Calendar.DAY_OF_MONTH))</script>
+                <set field="periodEnd" from="new java.sql.Date(cal.timeInMillis)"/>
+            </if>
+
+            <entity-find entity-name="zenith.erp.assets.FixedAsset" list="activeAssets">
+                <econdition field-name="statusId" operator="in" value="FaActive,FaUnderMaintenance"/>
+                <econdition field-name="organizationPartyId" from="organizationPartyId" ignore-if-empty="true"/>
+            </entity-find>
+
+            <set field="assetsProcessed" from="0" type="Integer"/>
+            <set field="totalDepreciation" from="0" type="BigDecimal"/>
+
+            <iterate list="activeAssets" entry="asset">
+                <service-call name="zenith.assets.FixedAssetServices.calculate#Depreciation"
+                              in-map="[fixedAssetId:asset.fixedAssetId, periodEnd:periodEnd]"
+                              out-map="depResult" ignore-error="true"/>
+                <if condition="depResult?.depreciationAmount &amp;&amp; depResult.depreciationAmount > 0">
+                    <set field="assetsProcessed" from="assetsProcessed + 1"/>
+                    <set field="totalDepreciation" from="totalDepreciation + depResult.depreciationAmount"/>
+                </if>
+            </iterate>
+        </actions>
+    </service>
+
+    <!-- ========== Dispose Fixed Asset ========== -->
+    <service verb="dispose" noun="FixedAsset">
+        <in-parameters>
+            <parameter name="fixedAssetId" required="true"/>
+            <parameter name="disposalDate" type="Date" required="true"/>
+            <parameter name="disposalAmount" type="BigDecimal" required="true"/>
+            <parameter name="disposalMethod" required="true"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.assets.FixedAsset" value-field="fa" for-update="true"/>
+            <if condition="!fa"><return error="true" message="Fixed asset not found"/></if>
+
+            <set field="fa.statusId" value="FaDisposed"/>
+            <set field="fa.disposalDate" from="disposalDate"/>
+            <set field="fa.disposalAmount" from="disposalAmount"/>
+            <set field="fa.disposalMethod" from="disposalMethod"/>
+            <set field="fa.disposalGainLoss" from="(disposalAmount - (fa.currentBookValue ?: 0)).setScale(2, java.math.RoundingMode.HALF_UP)"/>
+            <entity-update value-field="fa"/>
+        </actions>
+    </service>
+
+</services>

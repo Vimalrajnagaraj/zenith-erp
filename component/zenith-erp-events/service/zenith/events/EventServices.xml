@@ -1,0 +1,200 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <service verb="create" noun="Event">
+        <in-parameters>
+            <parameter name="eventName" required="true"/>
+            <parameter name="eventType" required="true"/>
+            <parameter name="categoryId"/>
+            <parameter name="description"/>
+            <parameter name="venueId"/>
+            <parameter name="startDate" type="Timestamp" required="true"/>
+            <parameter name="endDate" type="Timestamp" required="true"/>
+            <parameter name="registrationOpenDate" type="Timestamp"/>
+            <parameter name="registrationCloseDate" type="Timestamp"/>
+            <parameter name="maxAttendees" type="Integer"/>
+            <parameter name="contactEmail"/>
+            <parameter name="contactPhone"/>
+            <parameter name="websiteUrl"/>
+            <parameter name="isFreeEvent" default-value="N"/>
+            <parameter name="notes"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="eventId"/>
+            <parameter name="eventNumber"/>
+        </out-parameters>
+        <actions>
+            <set field="now" from="ec.user.nowTimestamp"/>
+            <set field="cal" from="java.util.Calendar.getInstance()"/>
+            <script>cal.setTime(now)</script>
+            <set field="year" from="cal.get(java.util.Calendar.YEAR)"/>
+            <set field="month" from="cal.get(java.util.Calendar.MONTH) + 1"/>
+            <set field="fyStart" from="month &gt;= 4 ? year : year - 1"/>
+            <set field="fyStr" from="String.format('%02d-%02d', fyStart % 100, (fyStart + 1) % 100)"/>
+
+            <entity-find entity-name="zenith.erp.events.Event" list="existing">
+                <econdition field-name="eventNumber" operator="like" value="EVT/${fyStr}/%"/>
+                <order-by field-name="-eventNumber"/>
+                <limit count="1"/>
+            </entity-find>
+            <set field="seq" from="1"/>
+            <if condition="existing">
+                <set field="lastNum" from="existing[0].eventNumber"/>
+                <set field="seq" from="(lastNum.substring(lastNum.lastIndexOf('/') + 1) as Integer) + 1"/>
+            </if>
+            <set field="eventNumber" from="'EVT/' + fyStr + '/' + String.format('%05d', seq)"/>
+
+            <service-call name="create#zenith.erp.events.Event"
+                          in-map="[eventId:eventId, eventNumber:eventNumber, eventName:eventName,
+                                   eventType:eventType, categoryId:categoryId, description:description,
+                                   venueId:venueId, startDate:startDate, endDate:endDate,
+                                   registrationOpenDate:registrationOpenDate, registrationCloseDate:registrationCloseDate,
+                                   maxAttendees:maxAttendees, organizerPartyId:ec.user.userAccount?.partyId,
+                                   contactEmail:contactEmail, contactPhone:contactPhone, websiteUrl:websiteUrl,
+                                   isFreeEvent:isFreeEvent, statusId:'EvDraft', notes:notes]"
+                          out-map="createOut"/>
+            <set field="eventId" from="createOut.eventId"/>
+        </actions>
+    </service>
+
+    <service verb="register" noun="Attendee">
+        <in-parameters>
+            <parameter name="eventId" required="true"/>
+            <parameter name="ticketTypeId" required="true"/>
+            <parameter name="attendeeName" required="true"/>
+            <parameter name="attendeeEmail" required="true"/>
+            <parameter name="attendeePhone"/>
+            <parameter name="attendeeOrganization"/>
+            <parameter name="attendeePartyId"/>
+            <parameter name="ticketQuantity" type="Integer" default-value="1"/>
+            <parameter name="paymentMethod"/>
+            <parameter name="paymentReference"/>
+            <parameter name="notes"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="registrationId"/>
+            <parameter name="registrationNumber"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.events.Event" value-field="event"/>
+            <if condition="!event"><return error="true" message="Event not found"/></if>
+
+            <entity-find-one entity-name="zenith.erp.events.TicketType" value-field="ticket"/>
+            <if condition="!ticket"><return error="true" message="Ticket type not found"/></if>
+
+            <!-- Check capacity -->
+            <if condition="event.maxAttendees &amp;&amp; (event.currentRegistrations ?: 0) + ticketQuantity &gt; event.maxAttendees">
+                <return error="true" message="Event is at full capacity"/>
+            </if>
+            <if condition="ticket.maxQuantity &amp;&amp; (ticket.soldCount ?: 0) + ticketQuantity &gt; ticket.maxQuantity">
+                <return error="true" message="Ticket type sold out"/>
+            </if>
+
+            <set field="now" from="ec.user.nowTimestamp"/>
+
+            <!-- Generate REG/FY/SEQ -->
+            <set field="cal" from="java.util.Calendar.getInstance()"/>
+            <script>cal.setTime(now)</script>
+            <set field="year" from="cal.get(java.util.Calendar.YEAR)"/>
+            <set field="month" from="cal.get(java.util.Calendar.MONTH) + 1"/>
+            <set field="fyStart" from="month &gt;= 4 ? year : year - 1"/>
+            <set field="fyStr" from="String.format('%02d-%02d', fyStart % 100, (fyStart + 1) % 100)"/>
+
+            <entity-find entity-name="zenith.erp.events.EventRegistration" list="existingReg">
+                <econdition field-name="registrationNumber" operator="like" value="REG/${fyStr}/%"/>
+                <order-by field-name="-registrationNumber"/>
+                <limit count="1"/>
+            </entity-find>
+            <set field="seq" from="1"/>
+            <if condition="existingReg">
+                <set field="lastNum" from="existingReg[0].registrationNumber"/>
+                <set field="seq" from="(lastNum.substring(lastNum.lastIndexOf('/') + 1) as Integer) + 1"/>
+            </if>
+            <set field="registrationNumber" from="'REG/' + fyStr + '/' + String.format('%05d', seq)"/>
+
+            <!-- Calculate pricing -->
+            <set field="unitPrice" from="ticket.price ?: 0"/>
+            <if condition="ticket.earlyBirdPrice &amp;&amp; ticket.earlyBirdEndDate &amp;&amp; now.before(ticket.earlyBirdEndDate)">
+                <set field="unitPrice" from="ticket.earlyBirdPrice"/>
+            </if>
+            <set field="baseTotal" from="unitPrice * ticketQuantity"/>
+            <set field="gstRate" from="ticket.gstRate ?: 18"/>
+            <set field="gstAmount" from="event.isFreeEvent == 'Y' ? 0 : (baseTotal * gstRate / 100).setScale(2, java.math.RoundingMode.HALF_UP)"/>
+            <set field="totalAmount" from="baseTotal + gstAmount"/>
+
+            <set field="statusId" from="event.isFreeEvent == 'Y' ? 'ErConfirmed' : 'ErPending'"/>
+
+            <service-call name="create#zenith.erp.events.EventRegistration"
+                          in-map="[registrationId:registrationId, registrationNumber:registrationNumber,
+                                   eventId:eventId, ticketTypeId:ticketTypeId, attendeePartyId:attendeePartyId,
+                                   attendeeName:attendeeName, attendeeEmail:attendeeEmail,
+                                   attendeePhone:attendeePhone, attendeeOrganization:attendeeOrganization,
+                                   ticketQuantity:ticketQuantity, unitPrice:unitPrice, gstAmount:gstAmount,
+                                   totalAmount:totalAmount, paymentMethod:paymentMethod,
+                                   paymentReference:paymentReference, statusId:statusId,
+                                   registrationDate:now, notes:notes]"
+                          out-map="regOut"/>
+            <set field="registrationId" from="regOut.registrationId"/>
+
+            <!-- Update counts -->
+            <set field="event.currentRegistrations" from="(event.currentRegistrations ?: 0) + ticketQuantity"/>
+            <entity-update value-field="event"/>
+            <set field="ticket.soldCount" from="(ticket.soldCount ?: 0) + ticketQuantity"/>
+            <entity-update value-field="ticket"/>
+        </actions>
+    </service>
+
+    <service verb="checkIn" noun="Attendee">
+        <in-parameters>
+            <parameter name="registrationId" required="true"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.events.EventRegistration" value-field="reg"/>
+            <if condition="!reg"><return error="true" message="Registration not found"/></if>
+            <if condition="reg.statusId != 'ErConfirmed'">
+                <return error="true" message="Only confirmed registrations can check in"/>
+            </if>
+
+            <set field="reg.statusId" value="ErCheckedIn"/>
+            <set field="reg.checkedIn" value="Y"/>
+            <set field="reg.checkInTime" from="ec.user.nowTimestamp"/>
+            <entity-update value-field="reg"/>
+        </actions>
+    </service>
+
+    <service verb="cancel" noun="Registration">
+        <in-parameters>
+            <parameter name="registrationId" required="true"/>
+            <parameter name="cancelReason" required="true"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.events.EventRegistration" value-field="reg"/>
+            <if condition="!reg"><return error="true" message="Registration not found"/></if>
+            <if condition="reg.statusId == 'ErCancelled' || reg.statusId == 'ErRefunded'">
+                <return error="true" message="Registration is already cancelled"/>
+            </if>
+
+            <set field="reg.statusId" value="ErCancelled"/>
+            <set field="reg.cancelReason" from="cancelReason"/>
+            <entity-update value-field="reg"/>
+
+            <!-- Restore capacity -->
+            <entity-find-one entity-name="zenith.erp.events.Event" value-field="event">
+                <field-map field-name="eventId" from="reg.eventId"/>
+            </entity-find-one>
+            <if condition="event">
+                <set field="event.currentRegistrations" from="Math.max(0, (event.currentRegistrations ?: 0) - (reg.ticketQuantity ?: 1))"/>
+                <entity-update value-field="event"/>
+            </if>
+            <entity-find-one entity-name="zenith.erp.events.TicketType" value-field="ticket">
+                <field-map field-name="ticketTypeId" from="reg.ticketTypeId"/>
+            </entity-find-one>
+            <if condition="ticket">
+                <set field="ticket.soldCount" from="Math.max(0, (ticket.soldCount ?: 0) - (reg.ticketQuantity ?: 1))"/>
+                <entity-update value-field="ticket"/>
+            </if>
+        </actions>
+    </service>
+
+</services>

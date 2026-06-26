@@ -1,0 +1,202 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
+        default-menu-title="Users &amp; Role Assignment">
+
+    <transition name="createUser">
+        <actions>
+            <if condition="!(ec.user.isInGroup('ZENITH_ADMIN') || ec.user.isInGroup('ADMIN'))"><return error="true" message="Only an administrator can change settings"/></if>
+            <service-call name="org.moqui.impl.UserServices.create#UserAccount"
+                          in-map="[username:username, userFullName:userFullName, newPassword:newPassword, newPasswordVerify:newPasswordVerify]"
+                          out-map="userOut"/>
+            <service-call name="create#moqui.security.UserGroupMember"
+                          in-map="[userGroupId:'ZENITH_ALL', userId:userOut.userId, fromDate:ec.user.nowTimestamp]"/>
+            <script><![CDATA[
+                def orgId = ec.user.getPreference('ACTIVE_ORGANIZATION')
+                // add the new user to the same TENANT_ group(s) as the creating admin (scopes them to this tenant)
+                def myT = ec.entity.find("moqui.security.UserGroupMember").condition("userId", ec.user.userId).list()*.userGroupId.findAll{ it?.startsWith('TENANT_') }
+                myT.each { tg -> ec.entity.makeValue("moqui.security.UserGroupMember").setAll([userGroupId:tg, userId:userOut.userId, fromDate:ec.user.nowTimestamp]).create() }
+                // give the new user the tenant's active organization so row-level filters work on login
+                if (orgId) ec.entity.makeValue("moqui.security.UserPreference").setAll([userId:userOut.userId, preferenceKey:'ACTIVE_ORGANIZATION', preferenceValue:orgId]).createOrUpdate()
+            ]]></script>
+        </actions>
+        <default-response url="."/>
+    </transition>
+
+    <transition name="assignRole">
+        <actions>
+            <service-call name="zenith.settings.SettingsServices.check#UserInActiveOrg" in-map="[userId:userId]"/>
+            <script>if (!(userGroupId?.startsWith('ZENITH_'))) ec.message.addError('Only Zenith roles can be assigned')</script>
+            <if condition="!ec.message.hasError()">
+                <service-call name="create#moqui.security.UserGroupMember"
+                              in-map="[userId:userId, userGroupId:userGroupId, fromDate:ec.user.nowTimestamp]"/>
+            </if>
+        </actions>
+        <default-response url="."/>
+    </transition>
+
+    <transition name="removeRole">
+        <actions>
+            <service-call name="zenith.settings.SettingsServices.check#UserInActiveOrg" in-map="[userId:userId]"/>
+            <if condition="!ec.message.hasError()">
+                <service-call name="zenith.settings.SettingsServices.remove#UserRole" in-map="[userId:userId, userGroupId:userGroupId]"/>
+            </if>
+        </actions>
+        <default-response url="."/>
+    </transition>
+
+    <transition name="resetPassword">
+        <actions>
+            <service-call name="zenith.settings.SettingsServices.check#UserInActiveOrg" in-map="[userId:userId]"/>
+            <if condition="!ec.message.hasError()">
+                <service-call name="org.moqui.impl.UserServices.update#Password"
+                              in-map="[userId:userId, newPassword:newPassword, newPasswordVerify:newPasswordVerify]"/>
+            </if>
+        </actions>
+        <default-response url="."/>
+    </transition>
+
+    <transition name="disableUser">
+        <actions>
+            <service-call name="zenith.settings.SettingsServices.check#UserInActiveOrg" in-map="[userId:userId]"/>
+            <if condition="!ec.message.hasError()">
+                <service-call name="update#moqui.security.UserAccount" in-map="[userId:userId, disabled:'Y']"/>
+            </if>
+        </actions>
+        <default-response url="."/>
+    </transition>
+
+    <transition name="enableUser">
+        <actions>
+            <service-call name="zenith.settings.SettingsServices.check#UserInActiveOrg" in-map="[userId:userId]"/>
+            <if condition="!ec.message.hasError()">
+                <service-call name="update#moqui.security.UserAccount" in-map="[userId:userId, disabled:'N']"/>
+            </if>
+        </actions>
+        <default-response url="."/>
+    </transition>
+
+    <actions>
+        <script><![CDATA[
+            if (ec.user.isInGroup('ADMIN')) {
+                userList = ec.entity.find("moqui.security.UserAccount").orderBy("username").list()
+            } else {
+                def myT = ec.entity.find("moqui.security.UserGroupMember").condition("userId", ec.user.userId).list()*.userGroupId.findAll{ it?.startsWith('TENANT_') }
+                def ids = [ec.user.userId]
+                if (myT) ids = (ec.entity.find("moqui.security.UserGroupMember").condition("userGroupId","in",myT).list()*.userId + [ec.user.userId]).unique()
+                userList = ec.entity.find("moqui.security.UserAccount").condition("userId","in",ids).orderBy("username").list()
+            }
+        ]]></script>
+        <entity-find entity-name="moqui.security.UserGroup" list="allRolesList">
+            <econdition field-name="userGroupId" operator="like" value="ZENITH_%"/>
+            <order-by field-name="description"/>
+        </entity-find>
+        <set field="canSettingsAdmin" from="ec.user.isInGroup('ZENITH_ADMIN') || ec.user.isInGroup('ADMIN')"/>
+    </actions>
+
+    <widgets>
+        <section name="SettingsViewGate" condition="canSettingsAdmin"><widgets>
+        <render-mode><text type="html"><![CDATA[
+        <details open style="background:#e8f0fe;border:1px solid #4285f4;border-left:6px solid #1a73e8;border-radius:10px;padding:10px 16px;margin:0 0 16px 0;font-family:'Segoe UI',Arial,sans-serif">
+            <summary style="cursor:pointer;font-weight:800;font-size:15px;color:#174ea6;outline:none">&#128100; Users &amp; Roles &mdash; what this page is for <span style="font-weight:600;color:#5f6368;font-size:12px">(click to hide / show)</span></summary>
+            <div style="font-size:13.5px;color:#202124;line-height:1.85;margin-top:10px">
+                Everyone who logs in needs their own <b>user account</b>. This page is where you add people and decide what they can do.<br>
+                <b>1</b>&nbsp;Click <b>Create New User</b> &mdash; enter their name, a username and a password.<br>
+                <b>2</b>&nbsp;Click <b>+ Role</b> next to their name to give them a job role (e.g. Cashier). The <b>role</b> decides what they can see and do.<br>
+                <b>3</b>&nbsp;<b>Reset Pwd</b> sets a new password if someone forgets it. <b>Disable</b> blocks login when someone leaves &mdash; their past sales stay intact.<br>
+                You only see and manage users in <b>your own organization</b>.
+            </div>
+        </details>
+        ]]></text></render-mode>
+        <container style="zenith-grid-container glass-panel">
+            <container layout="horizontal" style="items-center q-mb-md">
+                <label text="Users &amp; Role Assignment" type="h3"/>
+                <container-dialog id="CreateUserDialog" button-text="Create New User">
+                    <form-single name="CreateUserForm" transition="createUser">
+                        <field name="username"><default-field title="Username"><text-line size="20"/></default-field></field>
+                        <field name="userFullName"><default-field title="Full Name"><text-line size="40"/></default-field></field>
+                        <field name="newPassword"><default-field title="Password"><password size="20"/></default-field></field>
+                        <field name="newPasswordVerify"><default-field title="Verify Password"><password size="20"/></default-field></field>
+                        <field name="submitButton"><default-field title="Create User"><submit/></default-field></field>
+                    </form-single>
+                </container-dialog>
+            </container>
+
+            <form-list name="UserList" list="userList" skip-form="true">
+                <field name="username">
+                    <header-field title="Username" show-order-by="true"/>
+                    <default-field><display/></default-field>
+                </field>
+                <field name="userFullName">
+                    <header-field title="Full Name" show-order-by="true"/>
+                    <default-field><display/></default-field>
+                </field>
+                <field name="status">
+                    <header-field title="Status"/>
+                    <default-field>
+                        <label text="${disabled == 'Y' ? 'Disabled' : 'Active'}"/>
+                    </default-field>
+                </field>
+                <field name="currentRoles">
+                    <header-field title="Assigned Roles"/>
+                    <default-field>
+                        <section-iterate name="UserRolesSection"
+                                         list="ec.entity.find('moqui.security.UserGroupMember').condition('userId', userId).conditionDate('fromDate', 'thruDate', ec.user.nowTimestamp).list()"
+                                         entry="roleMap">
+                            <widgets>
+                                <container layout="horizontal" style="items-center q-gutter-xs q-mb-xs">
+                                    <label text="${roleMap.userGroupId}" style="text-caption"/>
+                                    <link url="removeRole" text="x" btn-type="danger" style="q-btn--dense q-btn--flat"
+                                          confirmation="Remove role ${roleMap.userGroupId} from this user?">
+                                        <parameter name="userId"/>
+                                        <parameter name="userGroupId" from="roleMap.userGroupId"/>
+                                    </link>
+                                </container>
+                            </widgets>
+                        </section-iterate>
+                    </default-field>
+                </field>
+                <field name="actions">
+                    <header-field title="Actions"/>
+                    <default-field>
+                        <container-dialog id="AssignRoleDialog" button-text="+ Role">
+                            <form-single name="AssignRoleForm" transition="assignRole">
+                                <field name="userId"><default-field><hidden/></default-field></field>
+                                <field name="userGroupId">
+                                    <default-field title="Select Role">
+                                        <drop-down>
+                                            <list-options list="allRolesList" key="${userGroupId}" text="${description} [${userGroupId}]"/>
+                                        </drop-down>
+                                    </default-field>
+                                </field>
+                                <field name="submitButton"><default-field title="Assign"><submit/></default-field></field>
+                            </form-single>
+                        </container-dialog>
+                        <container-dialog id="ResetPasswordDialog" button-text="Reset Pwd">
+                            <form-single name="ResetPasswordForm" transition="resetPassword">
+                                <field name="userId"><default-field><hidden/></default-field></field>
+                                <field name="newPassword"><default-field title="New Password"><password size="20"/></default-field></field>
+                                <field name="newPasswordVerify"><default-field title="Verify"><password size="20"/></default-field></field>
+                                <field name="submitButton"><default-field title="Reset"><submit/></default-field></field>
+                            </form-single>
+                        </container-dialog>
+                        <section name="DisableEnableSection">
+                            <condition><expression>disabled != 'Y'</expression></condition>
+                            <widgets>
+                                <link url="disableUser" text="Disable" btn-type="danger" style="q-btn--dense"
+                                      confirmation="Disable this user account?">
+                                    <parameter name="userId"/>
+                                </link>
+                            </widgets>
+                            <fail-widgets>
+                                <link url="enableUser" text="Enable" btn-type="success" style="q-btn--dense">
+                                    <parameter name="userId"/>
+                                </link>
+                            </fail-widgets>
+                        </section>
+                    </default-field>
+                </field>
+            </form-list>
+        </container>
+        </widgets><fail-widgets><container style="text-center q-pa-xl"><label text="Access Restricted" type="h4" style="text-negative text-weight-bold q-mt-lg"/><label text="This section is available to administrators only." type="p" style="text-grey-7 q-mt-sm"/></container></fail-widgets></section>
+    </widgets>
+</screen>
