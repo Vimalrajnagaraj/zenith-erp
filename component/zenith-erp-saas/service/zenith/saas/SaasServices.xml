@@ -506,4 +506,81 @@
         </actions>
     </service>
 
+    <!-- ==================== GOOGLE IDENTITY ==================== -->
+    <service verb="verify" noun="GoogleIdToken" authenticate="anonymous-all">
+        <description>Verifies a Google Identity Services id_token server-side via Google's tokeninfo endpoint.</description>
+        <in-parameters><parameter name="idToken" required="true"/></in-parameters>
+        <out-parameters>
+            <parameter name="verified" type="Boolean"/>
+            <parameter name="email"/><parameter name="firstName"/><parameter name="lastName"/><parameter name="googleSub"/>
+        </out-parameters>
+        <actions>
+            <script><![CDATA[
+                import groovy.json.JsonSlurper
+                context.verified = false
+                // Our expected audience = configured Google Web Client ID
+                def cfg = ec.entity.find("zenith.erp.base.CompanySettings")
+                    .condition("organizationPartyId","ZETAERP").condition("settingKey","GOOGLE_CLIENT_ID").one()
+                def expectedAud = cfg?.settingValue
+                if (!expectedAud) { ec.message.addError("Google sign-in is not configured."); return }
+
+                def url = new URL("https://oauth2.googleapis.com/tokeninfo?id_token=" + java.net.URLEncoder.encode(idToken, "UTF-8"))
+                def conn = (java.net.HttpURLConnection) url.openConnection()
+                conn.setRequestMethod("GET"); conn.setConnectTimeout(5000); conn.setReadTimeout(5000)
+                def code = conn.responseCode
+                if (code != 200) { ec.message.addError("Could not verify Google sign-in. Please try again."); return }
+                def body = conn.inputStream.getText("UTF-8")
+                def claims = new JsonSlurper().parseText(body)
+
+                def iss = claims.iss
+                if (iss != "accounts.google.com" && iss != "https://accounts.google.com") { ec.message.addError("Invalid Google token issuer."); return }
+                if (claims.aud != expectedAud) { ec.message.addError("Google token was issued for a different application."); return }
+                def expSec = (claims.exp ?: "0") as long
+                if (expSec * 1000L < System.currentTimeMillis()) { ec.message.addError("Google sign-in expired. Please try again."); return }
+                if (!("true".equals(String.valueOf(claims.email_verified)))) { ec.message.addError("Your Google email is not verified."); return }
+
+                context.email = claims.email
+                context.firstName = claims.given_name ?: ""
+                context.lastName = claims.family_name ?: ""
+                context.googleSub = claims.sub
+                context.verified = true
+            ]]></script>
+        </actions>
+    </service>
+
+    <service verb="authenticate" noun="GoogleUser" authenticate="anonymous-all">
+        <description>Verifies a Google id_token, then logs in an existing user or routes a new one to onboarding.</description>
+        <in-parameters><parameter name="idToken" required="true"/></in-parameters>
+        <out-parameters>
+            <parameter name="action"/><parameter name="redirectUrl"/>
+            <parameter name="email"/><parameter name="firstName"/><parameter name="lastName"/><parameter name="googleSub"/>
+        </out-parameters>
+        <actions>
+            <service-call name="zenith.saas.SaasServices.verify#GoogleIdToken" out-map="vf"
+                in-map="[idToken:idToken]"/>
+            <if condition="ec.message.hasError() || !vf.verified"><return/></if>
+            <set field="email" from="vf.email"/><set field="firstName" from="vf.firstName"/>
+            <set field="lastName" from="vf.lastName"/><set field="googleSub" from="vf.googleSub"/>
+
+            <entity-find-one entity-name="moqui.security.UserAccount" value-field="ua">
+                <field-map field-name="username" from="email"/>
+            </entity-find-one>
+            <if condition="ua">
+                <!-- Returning user: passwordless SSO login -->
+                <script>ec.user.internalLoginUser(email)</script>
+                <set field="action" value="login"/>
+                <set field="redirectUrl" value="/apps/zenith"/>
+                <else>
+                    <!-- New user: stash verified identity for the onboarding wizard -->
+                    <script>
+                        ec.web.session.setAttribute("googleIdentity",
+                            [email:email, firstName:firstName, lastName:lastName, googleSub:googleSub])
+                    </script>
+                    <set field="action" value="signup"/>
+                    <set field="redirectUrl" value="/get-started"/>
+                </else>
+            </if>
+        </actions>
+    </service>
+
 </services>
