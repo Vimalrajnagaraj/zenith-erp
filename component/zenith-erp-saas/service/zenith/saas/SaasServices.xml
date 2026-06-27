@@ -12,7 +12,8 @@
             <parameter name="adminPhone"/>
             <parameter name="adminFirstName" required="true"/>
             <parameter name="adminLastName" required="true"/>
-            <parameter name="adminPassword" required="true"/>
+            <parameter name="adminPassword"><description>Optional. If blank (Google sign-up), a random password is generated.</description></parameter>
+            <parameter name="googleSub"><description>Optional. Google account subject id; binds this account to a Google identity for passwordless login.</description></parameter>
             <parameter name="countryGeoId" default-value="IND"/>
             <parameter name="currencyUomId"/>
             <parameter name="gstin"><description>Optional GSTIN. If provided (India), configures GST: state code from first 2 digits.</description></parameter>
@@ -61,6 +62,14 @@
             <service-call name="create#mantle.party.PartyIdentification"
                 in-map="[partyId:organizationPartyId, partyIdTypeEnumId:'PtidOrgCode', idValue:orgCode]"/>
 
+            <!-- Passwordless (Google) sign-up: synthesize a strong random password the user never sees. -->
+            <if condition="!adminPassword">
+                <!-- Passwordless (Google) sign-up: the user never sees or uses this. Must satisfy Moqui's
+                     password policy (upper + lower + digit + a non-alphanumeric char), which a bare UUID
+                     hex string does NOT - the missing "other" char rolled back the whole provisioning. -->
+                <script>adminPassword = 'Aa1!' + (java.util.UUID.randomUUID().toString() + java.util.UUID.randomUUID().toString()).replace('-','')</script>
+            </if>
+
             <!-- 2. Create admin user account -->
             <service-call name="org.moqui.impl.UserServices.create#UserAccount" out-map="userOut"
                 in-map="[username:adminEmail, emailAddress:adminEmail,
@@ -86,6 +95,12 @@
             <!-- Set ACTIVE_ORGANIZATION user preference (direct entity create since no user session) -->
             <service-call name="create#moqui.security.UserPreference"
                 in-map="[userId:userId, preferenceKey:'ACTIVE_ORGANIZATION', preferenceValue:organizationPartyId]"/>
+
+            <!-- Bind this account to its Google identity (used for passwordless sign-in). -->
+            <if condition="googleSub">
+                <service-call name="create#moqui.security.UserPreference"
+                    in-map="[userId:userId, preferenceKey:'GOOGLE_SUB', preferenceValue:googleSub]"/>
+            </if>
 
             <!-- 3. Create user group for this tenant -->
             <set field="tenantGroupId" from="'TENANT_' + subdomain.toUpperCase()"/>
@@ -490,6 +505,98 @@
                 <set field="planId" from="t.planId"/>
                 <set field="statusId" from="t.statusId"/>
                 <set field="found" from="true"/>
+            </if>
+        </actions>
+    </service>
+
+    <!-- ==================== GOOGLE IDENTITY ==================== -->
+    <service verb="verify" noun="GoogleIdToken" authenticate="anonymous-all">
+        <description>Verifies a Google Identity Services id_token server-side via Google's tokeninfo endpoint.</description>
+        <in-parameters><parameter name="idToken" required="true"/></in-parameters>
+        <out-parameters>
+            <parameter name="verified" type="Boolean"/>
+            <parameter name="email"/><parameter name="firstName"/><parameter name="lastName"/><parameter name="googleSub"/>
+        </out-parameters>
+        <actions>
+            <script><![CDATA[
+                import groovy.json.JsonSlurper
+                context.verified = false
+                // Our expected audience = configured Google Web Client ID
+                def cfg = ec.entity.find("zenith.erp.base.CompanySettings")
+                    .condition("organizationPartyId","ZETAERP").condition("settingKey","GOOGLE_CLIENT_ID").one()
+                def expectedAud = cfg?.settingValue
+                if (!expectedAud) { ec.message.addError("Google sign-in is not configured."); return }
+
+                def body
+                try {
+                    def url = new URL("https://oauth2.googleapis.com/tokeninfo?id_token=" + java.net.URLEncoder.encode(idToken, "UTF-8"))
+                    def conn = (java.net.HttpURLConnection) url.openConnection()
+                    conn.setRequestMethod("GET"); conn.setConnectTimeout(5000); conn.setReadTimeout(5000)
+                    def code = conn.responseCode
+                    if (code != 200) { ec.message.addError("Could not verify Google sign-in. Please try again."); return }
+                    body = conn.inputStream.getText("UTF-8")
+                } catch (Exception e) { ec.message.addError("Could not verify Google sign-in. Please try again."); return }
+                def claims = new JsonSlurper().parseText(body)
+
+                def iss = claims.iss
+                if (iss != "accounts.google.com" && iss != "https://accounts.google.com") { ec.message.addError("Invalid Google token issuer."); return }
+                if (claims.aud != expectedAud) { ec.message.addError("Google token was issued for a different application."); return }
+                def expSec = (claims.exp ?: "0") as long
+                if (expSec * 1000L < System.currentTimeMillis()) { ec.message.addError("Google sign-in expired. Please try again."); return }
+                if (!("true".equals(String.valueOf(claims.email_verified)))) { ec.message.addError("Your Google email is not verified."); return }
+
+                context.email = claims.email
+                context.firstName = claims.given_name ?: ""
+                context.lastName = claims.family_name ?: ""
+                context.googleSub = claims.sub
+                context.verified = true
+            ]]></script>
+        </actions>
+    </service>
+
+    <service verb="authenticate" noun="GoogleUser" authenticate="anonymous-all">
+        <description>Verifies a Google id_token, then logs in an existing user or routes a new one to onboarding.</description>
+        <in-parameters><parameter name="idToken" required="true"/></in-parameters>
+        <out-parameters>
+            <parameter name="action"/><parameter name="redirectUrl"/>
+            <parameter name="email"/><parameter name="firstName"/><parameter name="lastName"/><parameter name="googleSub"/>
+        </out-parameters>
+        <actions>
+            <service-call name="zenith.saas.SaasServices.verify#GoogleIdToken" out-map="vf"
+                in-map="[idToken:idToken]"/>
+            <if condition="ec.message.hasError() || !vf.verified"><return/></if>
+            <set field="email" from="vf.email"/><set field="firstName" from="vf.firstName"/>
+            <set field="lastName" from="vf.lastName"/><set field="googleSub" from="vf.googleSub"/>
+
+            <!-- Policy: only accounts that signed up/linked with Google (have a GOOGLE_SUB binding) may log in via Google. -->
+            <entity-find entity-name="moqui.security.UserPreference" list="subPrefs">
+                <econdition field-name="preferenceKey" value="GOOGLE_SUB"/>
+                <econdition field-name="preferenceValue" from="googleSub"/>
+            </entity-find>
+            <if condition="subPrefs">
+                <!-- Returning Google user: passwordless SSO login -->
+                <entity-find-one entity-name="moqui.security.UserAccount" value-field="boundUa">
+                    <field-map field-name="userId" from="subPrefs[0].userId"/>
+                </entity-find-one>
+                <script>ec.user.internalLoginUser(boundUa.username)</script>
+                <set field="action" value="login"/>
+                <set field="redirectUrl" value="/apps/zenith"/>
+                <else>
+                    <!-- No Google binding for this sub. Does an account already exist for this email? -->
+                    <entity-find-one entity-name="moqui.security.UserAccount" value-field="ua">
+                        <field-map field-name="username" from="email"/>
+                    </entity-find-one>
+                    <if condition="ua">
+                        <!-- Existing password account that has not linked Google: do NOT auto-enable Google login. -->
+                        <return error="true" message="An account already exists for ${email}. Please sign in with your password, then link Google from your account settings."/>
+                        <else>
+                            <!-- Brand-new user: route to onboarding -->
+                            <script>ec.web.session.setAttribute("googleIdentity", [email:email, firstName:firstName, lastName:lastName, googleSub:googleSub])</script>
+                            <set field="action" value="signup"/>
+                            <set field="redirectUrl" value="/get-started"/>
+                        </else>
+                    </if>
+                </else>
             </if>
         </actions>
     </service>
