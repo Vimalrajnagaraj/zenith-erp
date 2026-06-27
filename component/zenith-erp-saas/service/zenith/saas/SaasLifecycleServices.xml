@@ -67,6 +67,14 @@
                         .condition("planId", sub.planId).one()
                     if (!tenant || !plan) return
 
+                    // IDEMPOTENCY: skip if an invoice already exists for this subscription + renewal period,
+                    // so a re-run / overlapping cron can't double-bill the tenant for one cycle.
+                    def alreadyBilled = ec.entity.find("zenith.erp.saas.SaasInvoice")
+                        .condition("subscriptionId", sub.subscriptionId)
+                        .condition("periodFrom", sub.renewalDate)
+                        .disableAuthz().count()
+                    if (alreadyBilled > 0) return
+
                     // Create invoice for the renewal period
                     def periodFrom = sub.renewalDate
                     def periodToDate = sub.billingCycle == 'Yearly' ?
@@ -75,9 +83,16 @@
                     def periodTo = java.sql.Date.valueOf(periodToDate)
                     def amount = sub.billingCycle == 'Yearly' ? plan.yearlyPrice : plan.monthlyPrice
 
-                    // Generate invoice number
-                    def invoiceCount = ec.entity.find("zenith.erp.saas.SaasInvoice").disableAuthz().count()
-                    def invoiceNumber = 'SAAS-' + java.time.LocalDate.now().format(java.time.format.DateTimeFormatter.ofPattern('yyyyMM')) + '-' + String.format('%04d', invoiceCount + 1)
+                    // Generate invoice number: max existing suffix +1 within this month's SAAS-yyyyMM- series.
+                    // (count()+1 REUSED a number whenever any invoice was deleted, and raced on concurrent runs.)
+                    def _yyyyMM = java.time.LocalDate.now().format(java.time.format.DateTimeFormatter.ofPattern('yyyyMM'))
+                    def _prefix = 'SAAS-' + _yyyyMM + '-'
+                    def _lastInv = ec.entity.find("zenith.erp.saas.SaasInvoice")
+                        .condition("invoiceNumber", "like", _prefix + '%')
+                        .orderBy("-invoiceNumber").disableAuthz().list()
+                    int _nextSeq = 1
+                    if (_lastInv) { try { _nextSeq = (_lastInv[0].invoiceNumber.toString().substring(_prefix.length()) as Integer) + 1 } catch (Exception _ne) { _nextSeq = _lastInv.size() + 1 } }
+                    def invoiceNumber = _prefix + String.format('%04d', _nextSeq)
 
                     def invResult = ec.service.sync().name("create#zenith.erp.saas.SaasInvoice")
                         .parameter("tenantId", sub.tenantId)
@@ -354,15 +369,24 @@ ${fromName}"""
                     in-map="[subscriptionId:sub.subscriptionId, statusId:'SubActive']"/>
             </iterate>
 
-            <!-- Mark overdue invoices as paid -->
-            <entity-find entity-name="zenith.erp.saas.SaasInvoice" list="overdueInvs">
-                <econdition field-name="tenantId"/>
-                <econdition field-name="statusId" value="SiOverdue"/>
-            </entity-find>
-            <iterate list="overdueInvs" entry="inv">
-                <service-call name="update#zenith.erp.saas.SaasInvoice"
-                    in-map="[saasInvoiceId:inv.saasInvoiceId, statusId:'SiPaid', paidDate:ec.user.nowTimestamp]"/>
-            </iterate>
+            <!-- Settle ONLY the invoice tied to THIS payment (scoped to the tenant, idempotent). Bulk-marking
+                 EVERY SiOverdue invoice paid off a single payment was a revenue-loss / ledger-corruption bug:
+                 a tenant with several unpaid invoices who paid one got them all cleared. The payment handler
+                 (verify#RazorpayPayment / webhook) normally already settled the specific invoice; this is a guard. -->
+            <if condition="paymentId">
+                <entity-find entity-name="zenith.erp.saas.SaasPayment" list="_pmts" limit="1">
+                    <econdition field-name="gatewayPaymentId" from="paymentId"/>
+                    <econdition field-name="tenantId"/>
+                </entity-find>
+                <if condition="_pmts &amp;&amp; _pmts[0].saasInvoiceId">
+                    <entity-find-one entity-name="zenith.erp.saas.SaasInvoice" value-field="_inv">
+                        <field-map field-name="saasInvoiceId" from="_pmts[0].saasInvoiceId"/></entity-find-one>
+                    <if condition="_inv &amp;&amp; _inv.tenantId == tenantId &amp;&amp; _inv.statusId != 'SiPaid'">
+                        <service-call name="update#zenith.erp.saas.SaasInvoice"
+                            in-map="[saasInvoiceId:_inv.saasInvoiceId, statusId:'SiPaid', paidDate:ec.user.nowTimestamp]"/>
+                    </if>
+                </if>
+            </if>
 
             <!-- Audit log -->
             <service-call name="create#zenith.erp.saas.SaasAuditLog"
