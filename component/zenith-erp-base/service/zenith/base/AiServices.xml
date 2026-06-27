@@ -121,11 +121,67 @@
                             ]]
                         ]
 
+                        // ---- Indic translation layer (Sarvam) : FAIL-OPEN, total no-op when SARVAM_API_KEY is unset ----
+                        // Native-script Dravidian/other Indic queries get translated to English for the LLM and the
+                        // answer translated back, so the model always reasons + tool-calls in English (its strongest
+                        // mode) while the user reads their own language. English / Hinglish / Devanagari (Hindi,Marathi)
+                        // are NOT translated - llama-3.3 already handles them - so those proven paths are unchanged.
+                        def sarvamKey = ec.entity.find("zenith.erp.base.CompanySettings")
+                            .condition("organizationPartyId", "ZETAERP").condition("settingKey", "SARVAM_API_KEY").one()?.settingValue
+                        def sarvamModel = ec.entity.find("zenith.erp.base.CompanySettings")
+                            .condition("organizationPartyId", "ZETAERP").condition("settingKey", "SARVAM_TRANSLATE_MODEL").one()?.settingValue ?: "sarvam-translate:v1"
+                        // Detect dominant non-ASCII script -> Sarvam lang code. Deliberately EXCLUDES Devanagari
+                        // (Hindi/Marathi, U+0900-097F) and Latin (Hinglish) so those keep current llama behaviour.
+                        def detectIndicLang = { String s ->
+                            if (!s) return null
+                            def counts = ["ta-IN":0,"te-IN":0,"kn-IN":0,"ml-IN":0,"bn-IN":0,"gu-IN":0,"pa-IN":0,"od-IN":0,"ur-IN":0]
+                            int tot = 0
+                            for (int i = 0; i < s.length(); i++) {
+                                int c = (int) s.charAt(i)
+                                if (c < 0x80 || Character.isWhitespace(c)) continue
+                                tot++
+                                if (c >= 0x0B80 && c <= 0x0BFF) counts["ta-IN"]++
+                                else if (c >= 0x0C00 && c <= 0x0C7F) counts["te-IN"]++
+                                else if (c >= 0x0C80 && c <= 0x0CFF) counts["kn-IN"]++
+                                else if (c >= 0x0D00 && c <= 0x0D7F) counts["ml-IN"]++
+                                else if (c >= 0x0980 && c <= 0x09FF) counts["bn-IN"]++
+                                else if (c >= 0x0A80 && c <= 0x0AFF) counts["gu-IN"]++
+                                else if (c >= 0x0A00 && c <= 0x0A7F) counts["pa-IN"]++
+                                else if (c >= 0x0B00 && c <= 0x0B7F) counts["od-IN"]++
+                                else if (c >= 0x0600 && c <= 0x06FF) counts["ur-IN"]++
+                            }
+                            if (tot == 0) return null
+                            def best = counts.max { it.value }
+                            return (best.value > 0 && best.value * 2 >= tot) ? best.key : null
+                        }
+                        def sarvamTranslate = { String text, String src, String tgt ->
+                            if (!sarvamKey || !text || text.trim().isEmpty()) return null
+                            try {
+                                def reqMap = [input: text, source_language_code: src, target_language_code: tgt, model: sarvamModel]
+                                def body = JsonOutput.toJson(reqMap)
+                                def conn = new java.net.URL("https://api.sarvam.ai/translate").openConnection()
+                                conn.setRequestMethod("POST")
+                                conn.setRequestProperty("Content-Type", "application/json")
+                                conn.setRequestProperty("api-subscription-key", sarvamKey)
+                                conn.setConnectTimeout(8000); conn.setReadTimeout(20000); conn.setDoOutput(true)
+                                conn.getOutputStream().withWriter("UTF-8") { it.write(body) }
+                                int code = conn.responseCode
+                                def stream = (code >= 200 && code < 300) ? conn.getInputStream() : conn.getErrorStream()
+                                def txt = stream != null ? stream.getText("UTF-8") : ""
+                                if (code >= 200 && code < 300) {
+                                    def j = new JsonSlurper().parseText(txt)
+                                    return j?.translated_text
+                                } else {
+                                    ec.logger.warn("Sarvam translate HTTP " + code + ": " + (txt != null ? txt.take(200) : ""))
+                                }
+                            } catch (Exception se) { ec.logger.warn("Sarvam translate failed: " + se.message) }
+                            return null
+                        }
+
                         def callGroq = { List msgs ->
-                            // Primary llama-3.3-70b: stable + proven tool-calling for the forecasting features, strong
-                            // in English and Hindi/Hinglish (covers most users). NOTE: reliable Tamil/Telugu/other
-                            // Dravidian-script replies need a dedicated Indic translation layer (Bhashini/Sarvam) -
-                            // every tested Groq model drifts to Hindi or degrades under this full prompt. Planned follow-up.
+                            // llama-3.3-70b: stable + proven tool-calling for forecasting, strong in English and
+                            // Hindi/Hinglish. Native-script Dravidian/other Indic queries are translated to/from
+                            // English by the Sarvam layer above, so the model always reasons in English.
                             def models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
                             for (m in models) {
                                 int attempt = 0
@@ -158,7 +214,16 @@
                             return null
                         }
 
-                        def msgs = [[role: "system", content: system], [role: "user", content: query]]
+                        // Forward-translate native-script Indic queries to English for the LLM (fail-open: on any
+                        // miss, userLang is cleared and the raw query is sent to llama exactly as before).
+                        String userLang = detectIndicLang(query)
+                        String llmQuery = query
+                        if (userLang && sarvamKey) {
+                            def _en = sarvamTranslate(query, userLang, "en-IN")
+                            if (_en && _en.trim()) { llmQuery = _en } else { userLang = null }
+                        }
+
+                        def msgs = [[role: "system", content: system], [role: "user", content: llmQuery]]
                         def msg1 = callGroq(msgs)
                         def toolCalls = msg1?.tool_calls
                         if (toolCalls) {
@@ -203,7 +268,7 @@
                                 fnText = svcOut?.summary ?: fnText
                                 def msgs2 = [
                                     [role: "system", content: system],
-                                    [role: "user", content: query],
+                                    [role: "user", content: llmQuery],
                                     [role: "assistant", content: (msg1.content ?: ""), tool_calls: toolCalls],
                                     [role: "tool", tool_call_id: tc.id, name: fname, content: JsonOutput.toJson(svcOut?.result ?: [:])]
                                 ]
@@ -215,6 +280,12 @@
                             }
                         } else {
                             resp = msg1?.content?.trim()
+                        }
+
+                        // Back-translate the English answer into the user's language (fail-open: keep English on miss).
+                        if (userLang && resp) {
+                            def _back = sarvamTranslate(resp, "en-IN", userLang)
+                            if (_back && _back.trim()) resp = _back
                         }
                     }
                 } catch (Exception e) {
