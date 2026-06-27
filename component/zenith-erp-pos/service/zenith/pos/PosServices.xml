@@ -587,6 +587,9 @@
             <parameter name="created" type="Boolean"/>
         </out-parameters>
         <actions>
+            <!-- SECURITY (org isolation): scope SKU matching + ownership to the caller's active org so an
+                 import can never match/overwrite another tenant's product or create an unowned (orphan) one. -->
+            <set field="_org" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
             <!-- mrpAmount is the price the POS charges; prefer the selling (list) price -->
             <set field="priceVal" from="listPrice ?: mrp"/>
             <set field="expVal" from="null"/>
@@ -602,6 +605,7 @@
             <if condition="sku">
                 <entity-find entity-name="mantle.product.Product" list="exList" limit="1">
                     <econdition field-name="pseudoId" from="sku"/>
+                    <econdition field-name="ownerPartyId" from="_org" ignore-if-empty="true"/>
                 </entity-find>
                 <if condition="exList"><set field="existing" from="exList[0]"/></if>
             </if>
@@ -620,7 +624,7 @@
                 <set field="created" from="false"/>
             <else>
                 <service-call name="create#mantle.product.Product" out-map="crOut"
-                    in-map="[productTypeEnumId:'PtAsset', productName:productName, pseudoId:sku,
+                    in-map="[productTypeEnumId:'PtAsset', ownerPartyId:_org, productName:productName, pseudoId:sku,
                              description:description, mrpAmount:priceVal, productTaxCode:productTaxCode,
                              reorderPoint:reorderPoint, reorderQuantity:reorderQuantity,
                              expiryDate:expVal, isPerishable:perishVal, amountUomId:(uomId ?: 'OTH_ea')]"/>
@@ -1116,10 +1120,17 @@
             <parameter name="customers" type="List"/>
         </out-parameters>
         <actions>
-            <entity-find entity-name="mantle.product.Product" list="productList">
-                <econdition field-name="ownerPartyId" from="organizationPartyId" ignore-if-empty="true"/>
-            </entity-find>
+            <!-- SECURITY (org isolation): the catalog org MUST be the caller's own active org, never a
+                 client param - omitting it previously dumped EVERY tenant's products + customer PII.
+                 Only a platform super-admin may pass an explicit org. No org -> empty catalog. -->
+            <set field="_activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <set field="organizationPartyId" from="ec.user.isInGroup('ADMIN') ? (organizationPartyId ?: _activeOrg) : _activeOrg"/>
             <set field="products" from="[]"/>
+            <set field="customers" from="[]"/>
+            <if condition="!organizationPartyId"><return/></if>
+            <entity-find entity-name="mantle.product.Product" list="productList">
+                <econdition field-name="ownerPartyId" from="organizationPartyId"/>
+            </entity-find>
             <iterate list="productList" entry="prod">
                 <script>
                     def _uom = (['OTH_ea':'Nos','WT_kg':'kg','WT_g':'g','VLIQ_L':'L','VLIQ_ml':'ml','LEN_m':'m','LEN_cm':'cm'].get(prod.amountUomId) ?: '')
@@ -1137,9 +1148,8 @@
             <entity-find entity-name="mantle.party.PartyRole" list="customerRoles">
                 <econdition field-name="roleTypeId" value="Customer"/>
             </entity-find>
-            <if condition="organizationPartyId">
-                <set field="customerRoles" from="customerRoles.findAll { cr -&gt; (ec.entity.find('mantle.party.Party').condition('partyId', cr.partyId).one()?.ownerPartyId) == organizationPartyId }"/>
-            </if>
+            <!-- SECURITY: always scope customers to this org (org is guaranteed set above). -->
+            <set field="customerRoles" from="customerRoles.findAll { cr -&gt; (ec.entity.find('mantle.party.Party').condition('partyId', cr.partyId).one()?.ownerPartyId) == organizationPartyId }"/>
             <set field="customers" from="[]"/>
             <iterate list="customerRoles" entry="cust">
                 <entity-find-one entity-name="mantle.party.Person" value-field="person">
@@ -1245,13 +1255,18 @@
                         if (dup > 0) { synced += 1; return }
                     }
 
-                    // Resolve an open session: prefer the captured one, else any open session for the terminal
+                    // SECURITY (org isolation): resolve the session ONLY within the caller's active org, so a
+                    // client-supplied terminalId/sessionId from another tenant can never attach a sale to that
+                    // tenant's books. No active org -> no session -> the sale is recorded OtPending, not injected.
+                    // (Also fixes the -openedDate orderBy: the field is openDate, so it was silently dropped.)
+                    def _activeOrg = ec.user.getPreference("ACTIVE_ORGANIZATION")
                     def sessionId = sale.sessionId
-                    def sess = sessionId ? ec.entity.find("zenith.erp.pos.PosSession").condition("sessionId", sessionId).one() : null
+                    def sess = sessionId ? ec.entity.find("zenith.erp.pos.PosSession").condition("sessionId", sessionId).condition("organizationPartyId", _activeOrg).one() : null
                     if (sess == null || sess.statusId != 'PsOpen') {
                         def openList = ec.entity.find("zenith.erp.pos.PosSession")
                             .condition("terminalId", sale.terminalId ?: terminalId)
-                            .condition("statusId", "PsOpen").orderBy("-openedDate").list()
+                            .condition("organizationPartyId", _activeOrg)
+                            .condition("statusId", "PsOpen").orderBy("-openDate").list()
                         sess = openList ? openList[0] : null
                     }
 
