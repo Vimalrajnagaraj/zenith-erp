@@ -94,6 +94,20 @@
                     if (_lastInv) { try { _nextSeq = (_lastInv[0].invoiceNumber.toString().substring(_prefix.length()) as Integer) + 1 } catch (Exception _ne) { _nextSeq = _lastInv.size() + 1 } }
                     def invoiceNumber = _prefix + String.format('%04d', _nextSeq)
 
+                    // GST: plan prices are tax-EXCLUSIVE -> add GST on top (18% default for SaaS/SAC 998314).
+                    // Route through the India GST engine for CGST/SGST vs IGST split by place-of-supply.
+                    // Falls back to a flat 18% exclusive calc when ZETAERP's GST config / the tenant's
+                    // state isn't configured, so the TOTAL is always correct even before a GSTIN is set;
+                    // the head split auto-activates once ZETAERP's GSTIN/state and the tenant's are present.
+                    def taxOut = ec.service.sync().name("zenith.subscriptions.SubscriptionServices.calculate#SubscriptionTax")
+                        .parameter("organizationPartyId", "ZETAERP")
+                        .parameter("customerPartyId", tenant.organizationPartyId)
+                        .parameter("taxableAmount", amount)
+                        .parameter("gstRate", 18)
+                        .disableAuthz().call()
+                    def _taxAmount = taxOut?.taxAmount ?: 0
+                    def _totalAmount = taxOut?.totalAmount ?: amount
+
                     def invResult = ec.service.sync().name("create#zenith.erp.saas.SaasInvoice")
                         .parameter("tenantId", sub.tenantId)
                         .parameter("subscriptionId", sub.subscriptionId)
@@ -103,8 +117,12 @@
                         .parameter("periodFrom", periodFrom)
                         .parameter("periodTo", periodTo)
                         .parameter("subtotal", amount)
-                        .parameter("taxAmount", 0)
-                        .parameter("totalAmount", amount)
+                        .parameter("taxAmount", _taxAmount)
+                        .parameter("cgstAmount", taxOut?.cgstAmount)
+                        .parameter("sgstAmount", taxOut?.sgstAmount)
+                        .parameter("igstAmount", taxOut?.igstAmount)
+                        .parameter("placeOfSupply", taxOut?.placeOfSupply)
+                        .parameter("totalAmount", _totalAmount)
                         .parameter("currencyUomId", sub.currencyUomId ?: tenant.currencyUomId)
                         .parameter("statusId", "SiSent")
                         .disableAuthz().call()
@@ -120,7 +138,7 @@
                         .parameter("tenantId", sub.tenantId)
                         .parameter("eventType", "RENEWAL_INVOICE")
                         .parameter("eventDate", ec.user.nowTimestamp)
-                        .parameter("description", "Renewal invoice created: ${amount} ${sub.currencyUomId ?: 'INR'} for ${periodFrom} to ${periodTo}")
+                        .parameter("description", "Renewal invoice created: ${_totalAmount} ${sub.currencyUomId ?: 'INR'} (subtotal ${amount} + GST ${_taxAmount}) for ${periodFrom} to ${periodTo}")
                         .disableAuthz().call()
 
                     renewedCount++
