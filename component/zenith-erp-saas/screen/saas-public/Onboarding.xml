@@ -1,0 +1,112 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
+        require-authentication="false" default-menu-include="false">
+
+    <transition name="checkSubdomain" read-only="true" require-session-token="false">
+        <actions>
+            <script>ec.artifactExecution.disableAuthz()</script>
+            <entity-find-count entity-name="zenith.erp.saas.SaasTenant" count-field="cnt">
+                <econdition field-name="subdomain" from="sub"/>
+            </entity-find-count>
+            <script>ec.web.sendJsonResponse([available: cnt == 0])</script>
+        </actions>
+        <default-response type="none"/>
+    </transition>
+
+    <transition name="register" require-session-token="true">
+        <actions>
+            <script><![CDATA[
+                def gid = ec.web.session.getAttribute("googleIdentity")
+                def gstinClean = gstin?.trim()?.toUpperCase()
+                if (gstinClean && gstinClean.length() != 15) { ec.message.addError("GSTIN must be exactly 15 characters, or leave it blank."); return }
+                // Identity: from Google if present, else from the form
+                def fName = gid?.firstName ?: adminFirstName
+                def lName = gid?.lastName ?: adminLastName
+                def email = gid?.email ?: adminEmail
+                def gsub = gid?.googleSub
+                def pwd = gid ? null : adminPassword   // Google = passwordless; email signup keeps its password
+                boolean alreadyDisabled = ec.artifactExecution.disableAuthz()
+                try {
+                    def result = ec.service.sync().name("zenith.saas.SaasServices.provision#Tenant")
+                        .parameters([tenantName:tenantName, subdomain:subdomain, countryGeoId:countryGeoId,
+                            industryEnumId:industryEnumId, adminFirstName:fName, adminLastName:lName,
+                            adminEmail:email, adminPhone:adminPhone, adminPassword:pwd, planId:planId,
+                            gstin:gstinClean, googleSub:gsub])
+                        .disableAuthz().requireNewTransaction(true).call()
+                    if (ec.message.hasError()) return
+                    context.putAll(result)
+                    ec.web.session.removeAttribute("googleIdentity")
+                    // Log the new user straight in (passwordless for Google; for email signup we have the password)
+                    if (gid) { ec.user.internalLoginUser(email) } else { ec.user.loginUser(email, adminPassword) }
+                } finally { if (!alreadyDisabled) ec.artifactExecution.enableAuthz() }
+            ]]></script>
+        </actions>
+        <default-response url="/apps/zenith"/>
+        <error-response url="."/>
+    </transition>
+
+    <actions>
+        <script><![CDATA[
+            boolean alreadyDisabled = ec.artifactExecution.disableAuthz()
+            try {
+                planList = ec.entity.find("zenith.erp.saas.SaasPlan").condition("isActive","Y").orderBy("sortOrder").list()
+                countryList = ec.entity.find("zenith.erp.base.CountryConfiguration").orderBy("countryName").list()
+                industryList = ec.entity.find("moqui.basic.Enumeration").condition("enumTypeId","TenantIndustry").orderBy("sequenceNum").list()
+            } finally { if (!alreadyDisabled) ec.artifactExecution.enableAuthz() }
+            context.googleIdentity = ec.web.session.getAttribute("googleIdentity")
+        ]]></script>
+    </actions>
+
+    <widgets>
+        <container style="row justify-center q-pa-lg">
+            <container style="col-7 bg-white shadow-2 border-radius-lg q-pa-xl">
+                <label text="Set up your workspace" type="h4" style="text-weight-bold q-mb-xs"/>
+                <label text="${googleIdentity ? ('Signed in as ' + googleIdentity.email + ' — just a few business details.') : 'Create your ZetaERP account.'}" type="p" style="text-grey-7 q-mb-lg"/>
+
+                <form-single name="OnboardForm" transition="register">
+                    <!-- STEP 1: Company basics -->
+                    <field name="step1hdr"><default-field title=""><label text="1. Company" type="h6" style="text-weight-bold text-primary"/></default-field></field>
+                    <field name="tenantName"><default-field title="Business Name"><text-line size="40"/></default-field></field>
+                    <field name="subdomain"><default-field title="Workspace URL (.zetaclantech.com)">
+                        <text-line size="25"/>
+                        <label text="Also your Organization ID for login (uppercase)." style="text-grey-6 text-caption" type="p"/>
+                    </default-field></field>
+                    <field name="countryGeoId"><default-field title="Country">
+                        <drop-down no-current-selected-key="IND"><list-options list="countryList" key="${countryGeoId}" text="${countryName}"/></drop-down>
+                    </default-field></field>
+                    <field name="industryEnumId"><default-field title="Industry">
+                        <drop-down no-current-selected-key="TiRetailGeneral"><list-options list="industryList" key="${enumId}" text="${description}"/></drop-down>
+                    </default-field></field>
+
+                    <!-- Admin account: only when NOT coming from Google -->
+                    <field name="adminFirstName"><conditional-field condition="!googleIdentity" title="First Name"><text-line size="20"/></conditional-field></field>
+                    <field name="adminLastName"><conditional-field condition="!googleIdentity" title="Last Name"><text-line size="20"/></conditional-field></field>
+                    <field name="adminEmail"><conditional-field condition="!googleIdentity" title="Email (your login)"><text-line size="30"/></conditional-field></field>
+                    <field name="adminPassword"><conditional-field condition="!googleIdentity" title="Password (min 8 characters)"><password size="20"/></conditional-field></field>
+                    <field name="adminPhone"><default-field title="Phone"><text-line size="15"/></default-field></field>
+
+                    <!-- STEP 2: Tax -->
+                    <field name="step2hdr"><default-field title=""><label text="2. Tax (optional)" type="h6" style="text-weight-bold text-primary q-mt-md"/></default-field></field>
+                    <field name="gstin"><default-field title="GSTIN (optional)">
+                        <text-line size="20"/>
+                        <label text="15-character GST number (India). Sets your state for CGST/SGST vs IGST. Leave blank if not registered." style="text-grey-6 text-caption" type="p"/>
+                    </default-field></field>
+
+                    <!-- STEP 3: Plan -->
+                    <field name="step3hdr"><default-field title=""><label text="3. Plan" type="h6" style="text-weight-bold text-primary q-mt-md"/></default-field></field>
+                    <field name="planId"><default-field title="Plan">
+                        <drop-down no-current-selected-key="STARTER"><list-options list="planList" key="${planId}" text="${planName} (${maxUsers} users, ${maxPosTerminals} POS)"/></drop-down>
+                    </default-field></field>
+
+                    <field name="submitBtn"><default-field title=""><submit text="Create workspace &amp; start free trial" type="success" icon="fa fa-rocket"/></default-field></field>
+                </form-single>
+
+                <container style="text-center q-mt-md">
+                    <label text="Already have an account? " style="text-grey-7"/>
+                    <link url="/signin" text="Sign in" link-type="anchor"/>
+                </container>
+            </container>
+        </container>
+    </widgets>
+</screen>
