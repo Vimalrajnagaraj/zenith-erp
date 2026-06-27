@@ -2,6 +2,126 @@
 <services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
           xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
 
+    <!-- ============================================================================
+         Shared India-GST calculator for subscription billing.
+         Resolves the supplier (tenant org) state vs the buyer (customer) state and routes the
+         tax through the canonical engine zenith.india.GstServices.calculate#Gst, returning the
+         CGST/SGST (intra-state) or IGST (inter-state) split plus place-of-supply.
+
+         TAX MODEL: prices are treated as tax-EXCLUSIVE (tax is ADDED on top of taxableAmount),
+         exactly as the original flat calc did. We only SPLIT that tax into heads + add a
+         place-of-supply; totalAmount stays = taxableAmount + tax. The returned taxAmount equals
+         the sum of the heads, so totals are preserved.
+         >>> If subscription prices are ever meant to be GST-INCLUSIVE, this must be revisited
+             (e.g. back the base out first via zenith.india.GstServices.calculate#TaxInclusive). <<<
+
+         STATE RESOLUTION (flagged assumptions, see report):
+           supplier state = IndiaGstConfig[org].stateCode, else the org's active IndiaGstin.
+           buyer state    = the customer's active IndiaGstin.stateCode (or GSTIN's first 2 digits).
+           If the buyer has no GSTIN on file we ASSUME an intra-state supply in the supplier's own
+           state (the common B2C / same-state case) -> CGST+SGST.
+         FALLBACK: if supplier state, buyer state, or a matching GST slab is not configured, we fall
+         back to the original flat exclusive calc (single tax, no head split) so this latent module
+         never errors. -->
+    <service verb="calculate" noun="SubscriptionTax">
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/> <!-- supplier (tenant) org -->
+            <parameter name="customerPartyId"/>                      <!-- buyer -->
+            <parameter name="taxableAmount" type="BigDecimal" required="true"/>
+            <parameter name="gstRate" type="BigDecimal"/>
+            <parameter name="productTaxCode"/>                       <!-- optional HSN/SAC for slab lookup -->
+        </in-parameters>
+        <out-parameters>
+            <parameter name="taxAmount" type="BigDecimal"/>
+            <parameter name="cgstAmount" type="BigDecimal"/>
+            <parameter name="sgstAmount" type="BigDecimal"/>
+            <parameter name="igstAmount" type="BigDecimal"/>
+            <parameter name="totalAmount" type="BigDecimal"/>
+            <parameter name="placeOfSupply"/>
+            <parameter name="supplyType"/>
+        </out-parameters>
+        <actions>
+            <set field="gstRate" from="gstRate ?: 18" type="BigDecimal"/>
+
+            <!-- Supplier (tenant org) state: GST config first, else its active GSTIN -->
+            <set field="supplierStateCode" from="null"/>
+            <entity-find-one entity-name="zenith.erp.india.IndiaGstConfig" value-field="supCfg">
+                <field-map field-name="organizationPartyId"/>
+            </entity-find-one>
+            <if condition="supCfg?.stateCode"><set field="supplierStateCode" from="supCfg.stateCode"/></if>
+            <if condition="!supplierStateCode">
+                <entity-find entity-name="zenith.erp.india.IndiaGstin" list="supGstins">
+                    <econdition field-name="partyId" from="organizationPartyId"/>
+                    <econdition field-name="isActive" value="Y"/>
+                    <order-by field-name="-lastUpdatedStamp"/>
+                    <limit count="1"/>
+                </entity-find>
+                <if condition="supGstins">
+                    <set field="supplierStateCode" from="supGstins[0].stateCode ?: (supGstins[0].gstin ? supGstins[0].gstin.substring(0,2) : null)"/>
+                </if>
+            </if>
+
+            <!-- Buyer (customer) state: its active GSTIN -->
+            <set field="buyerStateCode" from="null"/>
+            <if condition="customerPartyId">
+                <entity-find entity-name="zenith.erp.india.IndiaGstin" list="buyGstins">
+                    <econdition field-name="partyId" from="customerPartyId"/>
+                    <econdition field-name="isActive" value="Y"/>
+                    <order-by field-name="-lastUpdatedStamp"/>
+                    <limit count="1"/>
+                </entity-find>
+                <if condition="buyGstins">
+                    <set field="buyerStateCode" from="buyGstins[0].stateCode ?: (buyGstins[0].gstin ? buyGstins[0].gstin.substring(0,2) : null)"/>
+                </if>
+            </if>
+
+            <!-- Resolve GST slab: HSN/SAC default first, else exact rate match
+                 (exclude cess and composition slabs so the base GST_x slab wins). -->
+            <set field="gstSlabId" from="null"/>
+            <if condition="productTaxCode">
+                <entity-find-one entity-name="zenith.erp.india.IndiaHsnCode" value-field="hsn">
+                    <field-map field-name="hsnCode" from="productTaxCode"/>
+                </entity-find-one>
+                <if condition="hsn?.defaultGstSlabId"><set field="gstSlabId" from="hsn.defaultGstSlabId"/></if>
+            </if>
+            <if condition="!gstSlabId">
+                <entity-find entity-name="zenith.erp.india.IndiaGstSlab" list="slabs">
+                    <econdition field-name="gstRate" from="gstRate"/>
+                    <econdition field-name="cessRate" value="0"/>
+                    <econdition field-name="isActive" value="Y"/>
+                    <econdition field-name="gstSlabId" operator="not-like" value="COMP%"/>
+                    <order-by field-name="gstSlabId"/>
+                    <limit count="1"/>
+                </entity-find>
+                <if condition="slabs"><set field="gstSlabId" from="slabs[0].gstSlabId"/></if>
+            </if>
+
+            <!-- Buyer state unknown -> assume intra-state supply in the supplier's state (FLAGGED). -->
+            <if condition="supplierStateCode &amp;&amp; !buyerStateCode"><set field="buyerStateCode" from="supplierStateCode"/></if>
+
+            <if condition="supplierStateCode &amp;&amp; buyerStateCode &amp;&amp; gstSlabId">
+                <then>
+                    <service-call name="zenith.india.GstServices.calculate#Gst"
+                                  in-map="[supplierStateCode:supplierStateCode, buyerStateCode:buyerStateCode,
+                                           gstSlabId:gstSlabId, taxableAmount:taxableAmount]"
+                                  out-map="gstOut"/>
+                    <set field="cgstAmount" from="gstOut.cgstAmount"/>
+                    <set field="sgstAmount" from="gstOut.sgstAmount"/>
+                    <set field="igstAmount" from="gstOut.igstAmount"/>
+                    <set field="taxAmount" from="gstOut.totalTaxAmount"/>
+                    <set field="totalAmount" from="gstOut.totalAmount"/>
+                    <set field="placeOfSupply" from="buyerStateCode"/>
+                    <set field="supplyType" from="gstOut.supplyType"/>
+                </then>
+                <else>
+                    <!-- Fallback: original flat, tax-EXCLUSIVE calc, no head split. -->
+                    <set field="taxAmount" from="(taxableAmount * gstRate / 100).setScale(2, java.math.RoundingMode.HALF_UP)"/>
+                    <set field="totalAmount" from="taxableAmount + taxAmount"/>
+                </else>
+            </if>
+        </actions>
+    </service>
+
     <service verb="create" noun="Subscription">
         <in-parameters>
             <parameter name="customerPartyId" required="true"/>
@@ -33,7 +153,10 @@
             <set field="fyStart" from="month &gt;= 4 ? year : year - 1"/>
             <set field="fyStr" from="String.format('%02d-%02d', fyStart % 100, (fyStart + 1) % 100)"/>
 
+            <!-- Per-tenant consecutive series: scope the max-suffix lookup to THIS supplier org so each
+                 tenant gets its own SUB/FY/NNNNN sequence (GST consecutiveness; no cross-tenant leakage). -->
             <entity-find entity-name="zenith.erp.subscriptions.Subscription" list="existing">
+                <econdition field-name="organizationPartyId" from="organizationPartyId"/>
                 <econdition field-name="subscriptionNumber" operator="like" value="SUB/${fyStr}/%"/>
                 <order-by field-name="-subscriptionNumber"/>
                 <limit count="1"/>
@@ -75,11 +198,19 @@
             <set field="nextBillingDate" from="hasTrial ? trialEndDate : new java.sql.Timestamp(calBill.getTimeInMillis())"/>
             <set field="endDate" from="new java.sql.Timestamp(calBill.getTimeInMillis())"/>
 
-            <!-- Calculate GST -->
+            <!-- Calculate GST (split into CGST/SGST/IGST via the India engine; tax-EXCLUSIVE total preserved) -->
             <set field="billingAmount" from="plan.billingAmount"/>
             <set field="gstRate" from="plan.taxRate ?: 18"/>
-            <set field="gstAmount" from="(billingAmount * gstRate / 100).setScale(2, java.math.RoundingMode.HALF_UP)"/>
-            <set field="totalAmount" from="billingAmount + gstAmount"/>
+            <service-call name="zenith.erp.subscriptions.SubscriptionServices.calculate#SubscriptionTax"
+                          in-map="[organizationPartyId:organizationPartyId, customerPartyId:customerPartyId,
+                                   taxableAmount:billingAmount, gstRate:gstRate, productTaxCode:plan.productTaxCode]"
+                          out-map="taxOut"/>
+            <set field="gstAmount" from="taxOut.taxAmount"/>
+            <set field="cgstAmount" from="taxOut.cgstAmount"/>
+            <set field="sgstAmount" from="taxOut.sgstAmount"/>
+            <set field="igstAmount" from="taxOut.igstAmount"/>
+            <set field="placeOfSupply" from="taxOut.placeOfSupply"/>
+            <set field="totalAmount" from="taxOut.totalAmount"/>
 
             <!-- Apply discount if any (only within validity window and use limit, scoped to this tenant) -->
             <if condition="discountCode">
@@ -105,8 +236,17 @@
                             <set field="billingAmount" from="billingAmount - disc.discountValue"/>
                         </else-if>
                     </if>
-                    <set field="gstAmount" from="(billingAmount * gstRate / 100).setScale(2, java.math.RoundingMode.HALF_UP)"/>
-                    <set field="totalAmount" from="billingAmount + gstAmount"/>
+                    <!-- Recompute the GST split on the discounted base (still tax-EXCLUSIVE) -->
+                    <service-call name="zenith.erp.subscriptions.SubscriptionServices.calculate#SubscriptionTax"
+                                  in-map="[organizationPartyId:organizationPartyId, customerPartyId:customerPartyId,
+                                           taxableAmount:billingAmount, gstRate:gstRate, productTaxCode:plan.productTaxCode]"
+                                  out-map="taxOut"/>
+                    <set field="gstAmount" from="taxOut.taxAmount"/>
+                    <set field="cgstAmount" from="taxOut.cgstAmount"/>
+                    <set field="sgstAmount" from="taxOut.sgstAmount"/>
+                    <set field="igstAmount" from="taxOut.igstAmount"/>
+                    <set field="placeOfSupply" from="taxOut.placeOfSupply"/>
+                    <set field="totalAmount" from="taxOut.totalAmount"/>
                     <set field="disc.usedCount" from="(disc.usedCount ?: 0) + 1"/>
                     <entity-update value-field="disc"/>
                 </if>
@@ -120,7 +260,9 @@
                                    organizationPartyId:organizationPartyId,
                                    startDate:startDate, endDate:endDate, trialEndDate:trialEndDate,
                                    nextBillingDate:nextBillingDate, billingAmount:billingAmount,
-                                   currencyUomId:(plan.currencyUomId ?: 'USD'), gstAmount:gstAmount, totalAmount:totalAmount,
+                                   currencyUomId:(plan.currencyUomId ?: 'USD'), gstAmount:gstAmount,
+                                   cgstAmount:cgstAmount, sgstAmount:sgstAmount, igstAmount:igstAmount, placeOfSupply:placeOfSupply,
+                                   totalAmount:totalAmount,
                                    paymentMethodId:paymentMethodId, autoRenew:plan.autoRenew, notes:notes]"
                           out-map="createOut"/>
             <set field="subscriptionId" from="createOut.subscriptionId"/>
@@ -139,7 +281,12 @@
         </in-parameters>
         <actions>
             <entity-find-one entity-name="zenith.erp.subscriptions.Subscription" value-field="sub"/>
-            <if condition="!sub"><return error="true" message="Subscription not found"/></if>
+            <!-- Ownership guard: a tenant user may only mutate subscriptions owned by their active org (ADMIN exempt).
+                 Same generic message whether missing or cross-tenant, to avoid leaking existence across tenants. -->
+            <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <if condition="sub == null || (activeOrg &amp;&amp; sub.organizationPartyId != activeOrg &amp;&amp; !ec.user.isInGroup('ADMIN'))">
+                <return error="true" message="Subscription not found"/>
+            </if>
             <if condition="sub.statusId != 'SubTrial'">
                 <return error="true" message="Only trial subscriptions can be activated"/>
             </if>
@@ -163,7 +310,10 @@
         </in-parameters>
         <actions>
             <entity-find-one entity-name="zenith.erp.subscriptions.Subscription" value-field="sub"/>
-            <if condition="!sub"><return error="true" message="Subscription not found"/></if>
+            <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <if condition="sub == null || (activeOrg &amp;&amp; sub.organizationPartyId != activeOrg &amp;&amp; !ec.user.isInGroup('ADMIN'))">
+                <return error="true" message="Subscription not found"/>
+            </if>
             <if condition="sub.statusId != 'SubActive'">
                 <return error="true" message="Only active subscriptions can be paused"/>
             </if>
@@ -186,7 +336,10 @@
         </in-parameters>
         <actions>
             <entity-find-one entity-name="zenith.erp.subscriptions.Subscription" value-field="sub"/>
-            <if condition="!sub"><return error="true" message="Subscription not found"/></if>
+            <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <if condition="sub == null || (activeOrg &amp;&amp; sub.organizationPartyId != activeOrg &amp;&amp; !ec.user.isInGroup('ADMIN'))">
+                <return error="true" message="Subscription not found"/>
+            </if>
             <if condition="sub.statusId != 'SubPaused'">
                 <return error="true" message="Only paused subscriptions can be resumed"/>
             </if>
@@ -210,7 +363,10 @@
         </in-parameters>
         <actions>
             <entity-find-one entity-name="zenith.erp.subscriptions.Subscription" value-field="sub"/>
-            <if condition="!sub"><return error="true" message="Subscription not found"/></if>
+            <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <if condition="sub == null || (activeOrg &amp;&amp; sub.organizationPartyId != activeOrg &amp;&amp; !ec.user.isInGroup('ADMIN'))">
+                <return error="true" message="Subscription not found"/>
+            </if>
             <if condition="sub.statusId == 'SubCancelled' || sub.statusId == 'SubExpired'">
                 <return error="true" message="Subscription is already cancelled or expired"/>
             </if>
