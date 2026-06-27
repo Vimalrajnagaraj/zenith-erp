@@ -121,67 +121,123 @@
                             ]]
                         ]
 
-                        // ---- Indic translation layer (Sarvam) : FAIL-OPEN, total no-op when SARVAM_API_KEY is unset ----
-                        // Native-script Dravidian/other Indic queries get translated to English for the LLM and the
-                        // answer translated back, so the model always reasons + tool-calls in English (its strongest
-                        // mode) while the user reads their own language. English / Hinglish / Devanagari (Hindi,Marathi)
+                        // ---- Indic translation layer : FAIL-OPEN. Uses Bhashini (free, govt-backed) when its creds
+                        // are set, else Sarvam when its key is set, else a TOTAL no-op (also on any error). Native-
+                        // script Dravidian/other Indic queries are translated to English for the LLM and the answer
+                        // translated back, so the model always reasons + tool-calls in English (its strongest mode)
+                        // while the user reads their own language. English / Hinglish / Devanagari (Hindi, Marathi)
                         // are NOT translated - llama-3.3 already handles them - so those proven paths are unchanged.
-                        def sarvamKey = ec.entity.find("zenith.erp.base.CompanySettings")
-                            .condition("organizationPartyId", "ZETAERP").condition("settingKey", "SARVAM_API_KEY").one()?.settingValue
-                        def sarvamModel = ec.entity.find("zenith.erp.base.CompanySettings")
-                            .condition("organizationPartyId", "ZETAERP").condition("settingKey", "SARVAM_TRANSLATE_MODEL").one()?.settingValue ?: "sarvam-translate:v1"
-                        // Detect dominant non-ASCII script -> Sarvam lang code. Deliberately EXCLUDES Devanagari
-                        // (Hindi/Marathi, U+0900-097F) and Latin (Hinglish) so those keep current llama behaviour.
+                        def getSetting = { String k -> ec.entity.find("zenith.erp.base.CompanySettings")
+                            .condition("organizationPartyId", "ZETAERP").condition("settingKey", k).one()?.settingValue }
+                        def sarvamKey = getSetting("SARVAM_API_KEY")
+                        def sarvamModel = getSetting("SARVAM_TRANSLATE_MODEL") ?: "sarvam-translate:v1"
+                        def bhashiniUser = getSetting("BHASHINI_USER_ID")
+                        def bhashiniApiKey = getSetting("BHASHINI_ULCA_API_KEY")
+                        def bhashiniPipelineId = getSetting("BHASHINI_PIPELINE_ID") ?: "64392f96daac500b55c543cd"
+                        boolean bhashiniReady = (bhashiniUser && bhashiniApiKey)
+                        boolean translationOn = (bhashiniReady || sarvamKey)
+                        // Detect dominant non-ASCII script -> bare ISO lang code (Odia=or). Deliberately EXCLUDES
+                        // Devanagari (Hindi/Marathi, U+0900-097F) and Latin (Hinglish) so those keep llama behaviour.
                         def detectIndicLang = { String s ->
                             if (!s) return null
-                            def counts = ["ta-IN":0,"te-IN":0,"kn-IN":0,"ml-IN":0,"bn-IN":0,"gu-IN":0,"pa-IN":0,"od-IN":0,"ur-IN":0]
+                            def counts = ["ta":0,"te":0,"kn":0,"ml":0,"bn":0,"gu":0,"pa":0,"or":0,"ur":0]
                             int tot = 0
                             for (int i = 0; i < s.length(); i++) {
                                 int c = (int) s.charAt(i)
                                 if (c < 0x80 || Character.isWhitespace(c)) continue
                                 tot++
-                                if (c >= 0x0B80 && c <= 0x0BFF) counts["ta-IN"]++
-                                else if (c >= 0x0C00 && c <= 0x0C7F) counts["te-IN"]++
-                                else if (c >= 0x0C80 && c <= 0x0CFF) counts["kn-IN"]++
-                                else if (c >= 0x0D00 && c <= 0x0D7F) counts["ml-IN"]++
-                                else if (c >= 0x0980 && c <= 0x09FF) counts["bn-IN"]++
-                                else if (c >= 0x0A80 && c <= 0x0AFF) counts["gu-IN"]++
-                                else if (c >= 0x0A00 && c <= 0x0A7F) counts["pa-IN"]++
-                                else if (c >= 0x0B00 && c <= 0x0B7F) counts["od-IN"]++
-                                else if (c >= 0x0600 && c <= 0x06FF) counts["ur-IN"]++
+                                if (c >= 0x0B80 && c <= 0x0BFF) counts["ta"]++
+                                else if (c >= 0x0C00 && c <= 0x0C7F) counts["te"]++
+                                else if (c >= 0x0C80 && c <= 0x0CFF) counts["kn"]++
+                                else if (c >= 0x0D00 && c <= 0x0D7F) counts["ml"]++
+                                else if (c >= 0x0980 && c <= 0x09FF) counts["bn"]++
+                                else if (c >= 0x0A80 && c <= 0x0AFF) counts["gu"]++
+                                else if (c >= 0x0A00 && c <= 0x0A7F) counts["pa"]++
+                                else if (c >= 0x0B00 && c <= 0x0B7F) counts["or"]++
+                                else if (c >= 0x0600 && c <= 0x06FF) counts["ur"]++
                             }
                             if (tot == 0) return null
                             def best = counts.max { it.value }
                             return (best.value > 0 && best.value * 2 >= tot) ? best.key : null
                         }
-                        def sarvamTranslate = { String text, String src, String tgt ->
-                            if (!sarvamKey || !text || text.trim().isEmpty()) return null
+                        def httpPostJson = { String urlStr, Map headers, String reqBody, int readMs ->
                             try {
-                                def reqMap = [input: text, source_language_code: src, target_language_code: tgt, model: sarvamModel]
-                                def body = JsonOutput.toJson(reqMap)
-                                def conn = new java.net.URL("https://api.sarvam.ai/translate").openConnection()
+                                def conn = new java.net.URL(urlStr).openConnection()
                                 conn.setRequestMethod("POST")
                                 conn.setRequestProperty("Content-Type", "application/json")
-                                conn.setRequestProperty("api-subscription-key", sarvamKey)
-                                conn.setConnectTimeout(8000); conn.setReadTimeout(20000); conn.setDoOutput(true)
-                                conn.getOutputStream().withWriter("UTF-8") { it.write(body) }
+                                headers.each { hk, hv -> conn.setRequestProperty(hk as String, hv as String) }
+                                conn.setConnectTimeout(8000); conn.setReadTimeout(readMs); conn.setDoOutput(true)
+                                conn.getOutputStream().withWriter("UTF-8") { it.write(reqBody) }
                                 int code = conn.responseCode
                                 def stream = (code >= 200 && code < 300) ? conn.getInputStream() : conn.getErrorStream()
                                 def txt = stream != null ? stream.getText("UTF-8") : ""
-                                if (code >= 200 && code < 300) {
-                                    def j = new JsonSlurper().parseText(txt)
-                                    return j?.translated_text
-                                } else {
-                                    ec.logger.warn("Sarvam translate HTTP " + code + ": " + (txt != null ? txt.take(200) : ""))
-                                }
-                            } catch (Exception se) { ec.logger.warn("Sarvam translate failed: " + se.message) }
+                                return [code: code, text: txt]
+                            } catch (Exception he) { ec.logger.warn("Indic translate HTTP error (" + urlStr + "): " + he.message); return [code: -1, text: ""] }
+                        }
+                        // Bhashini = 2 steps: (1) getModelsPipeline -> serviceId + inference endpoint/key (cached per
+                        // src>tgt pair; it rarely changes); (2) compute on that callback URL. Codes are bare ISO.
+                        def bhashiniConfig = { String src, String tgt ->
+                            def cache = ec.cache.getCache("zenith.bhashini.pipelineConfig")
+                            String ck = src + ">" + tgt
+                            def cached = cache.get(ck)
+                            if (cached != null) return cached
+                            def reqBody = JsonOutput.toJson([
+                                pipelineTasks: [[taskType: "translation", config: [language: [sourceLanguage: src, targetLanguage: tgt]]]],
+                                pipelineRequestConfig: [pipelineId: bhashiniPipelineId]
+                            ])
+                            def r = httpPostJson("https://meity-auth.ulcacontrib.org/ulca/apis/v0/model/getModelsPipeline",
+                                [userID: bhashiniUser, ulcaApiKey: bhashiniApiKey], reqBody, 20000)
+                            if (r.code < 200 || r.code >= 300) { ec.logger.warn("Bhashini config HTTP " + r.code + ": " + (r.text ?: "").take(200)); return null }
+                            try {
+                                def j = new JsonSlurper().parseText(r.text)
+                                def ep = j?.pipelineInferenceAPIEndPoint
+                                def cfg = [serviceId: j?.pipelineResponseConfig?.getAt(0)?.config?.getAt(0)?.serviceId,
+                                           callbackUrl: ep?.callbackUrl, keyName: ep?.inferenceApiKey?.name, keyVal: ep?.inferenceApiKey?.value]
+                                if (cfg.serviceId && cfg.callbackUrl && cfg.keyName && cfg.keyVal) { cache.put(ck, cfg); return cfg }
+                                ec.logger.warn("Bhashini config incomplete for " + ck)
+                            } catch (Exception ce) { ec.logger.warn("Bhashini config parse failed: " + ce.message) }
+                            return null
+                        }
+                        def bhashiniTranslate = { String text, String src, String tgt ->
+                            def cfg = bhashiniConfig(src, tgt)
+                            if (!cfg) return null
+                            def reqBody = JsonOutput.toJson([
+                                pipelineTasks: [[taskType: "translation", config: [language: [sourceLanguage: src, targetLanguage: tgt], serviceId: cfg.serviceId]]],
+                                inputData: [input: [[source: text]]]
+                            ])
+                            def r = httpPostJson(cfg.callbackUrl as String, [(cfg.keyName as String): (cfg.keyVal as String)], reqBody, 25000)
+                            if (r.code < 200 || r.code >= 300) { ec.logger.warn("Bhashini compute HTTP " + r.code + ": " + (r.text ?: "").take(200)); return null }
+                            try {
+                                return new JsonSlurper().parseText(r.text)?.pipelineResponse?.getAt(0)?.output?.getAt(0)?.target
+                            } catch (Exception ce) { ec.logger.warn("Bhashini compute parse failed: " + ce.message) }
+                            return null
+                        }
+                        def sarvamTranslate = { String text, String src, String tgt ->
+                            if (!sarvamKey || !text || text.trim().isEmpty()) return null
+                            def r = httpPostJson("https://api.sarvam.ai/translate", ["api-subscription-key": sarvamKey as String],
+                                JsonOutput.toJson([input: text, source_language_code: src, target_language_code: tgt, model: sarvamModel]), 20000)
+                            if (r.code < 200 || r.code >= 300) { ec.logger.warn("Sarvam translate HTTP " + r.code + ": " + (r.text ?: "").take(200)); return null }
+                            try { return new JsonSlurper().parseText(r.text)?.translated_text } catch (Exception se) { ec.logger.warn("Sarvam translate parse failed: " + se.message) }
+                            return null
+                        }
+                        // Unified entry: bare-ISO src/tgt ("ta","en"...). Bhashini first when configured, else Sarvam.
+                        def translateIndic = { String text, String srcIso, String tgtIso ->
+                            if (!text || text.trim().isEmpty()) return null
+                            if (bhashiniReady) {
+                                def b = bhashiniTranslate(text, srcIso, tgtIso)
+                                if (b && b.toString().trim()) return b
+                            }
+                            if (sarvamKey) {
+                                def toS = { String c -> c == "en" ? "en-IN" : (c == "or" ? "od-IN" : c + "-IN") }
+                                return sarvamTranslate(text, toS(srcIso), toS(tgtIso))
+                            }
                             return null
                         }
 
                         def callGroq = { List msgs ->
                             // llama-3.3-70b: stable + proven tool-calling for forecasting, strong in English and
                             // Hindi/Hinglish. Native-script Dravidian/other Indic queries are translated to/from
-                            // English by the Sarvam layer above, so the model always reasons in English.
+                            // English by the Bhashini/Sarvam layer above, so the model always reasons in English.
                             def models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
                             for (m in models) {
                                 int attempt = 0
@@ -218,9 +274,9 @@
                         // miss, userLang is cleared and the raw query is sent to llama exactly as before).
                         String userLang = detectIndicLang(query)
                         String llmQuery = query
-                        if (userLang && sarvamKey) {
-                            def _en = sarvamTranslate(query, userLang, "en-IN")
-                            if (_en && _en.trim()) { llmQuery = _en } else { userLang = null }
+                        if (userLang && translationOn) {
+                            def _en = translateIndic(query, userLang, "en")
+                            if (_en && _en.toString().trim()) { llmQuery = _en.toString() } else { userLang = null }
                         }
 
                         def msgs = [[role: "system", content: system], [role: "user", content: llmQuery]]
@@ -284,8 +340,8 @@
 
                         // Back-translate the English answer into the user's language (fail-open: keep English on miss).
                         if (userLang && resp) {
-                            def _back = sarvamTranslate(resp, "en-IN", userLang)
-                            if (_back && _back.trim()) resp = _back
+                            def _back = translateIndic(resp, "en", userLang)
+                            if (_back && _back.toString().trim()) resp = _back.toString()
                         }
                     }
                 } catch (Exception e) {
