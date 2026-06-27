@@ -21,6 +21,11 @@
             <parameter name="pin"/>
         </out-parameters>
         <actions>
+            <!-- Org isolation: stamp the active organization if caller did not pass one -->
+            <if condition="!organizationPartyId">
+                <set field="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            </if>
+
             <!-- Generate unique card number and PIN -->
             <script><![CDATA[
                 def rng = new java.security.SecureRandom()
@@ -43,7 +48,8 @@
                                    notes:notes]"/>
 
             <service-call name="create#zenith.erp.giftcard.GiftCardTransaction"
-                          in-map="[giftCardId:giftCardId, transactionTypeEnumId:'GctLoad',
+                          in-map="[giftCardId:giftCardId, organizationPartyId:organizationPartyId,
+                                   transactionTypeEnumId:'GctLoad',
                                    amount:initialBalance, balanceAfter:initialBalance,
                                    referenceType:'INITIAL', transactionDate:ec.user.nowTimestamp,
                                    performedByUserId:ec.user.userId, notes:'Initial load']"/>
@@ -64,8 +70,13 @@
             <parameter name="newBalance" type="BigDecimal"/>
         </out-parameters>
         <actions>
+            <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
             <entity-find-one entity-name="zenith.erp.giftcard.GiftCard" value-field="card" for-update="true"/>
             <if condition="!card || card.statusId != 'GcActive'">
+                <return error="true" message="Gift card not found or not active"/>
+            </if>
+            <!-- Org ownership re-check: refuse a card belonging to another org -->
+            <if condition="activeOrg &amp;&amp; card.organizationPartyId != activeOrg">
                 <return error="true" message="Gift card not found or not active"/>
             </if>
             <if condition="amount &lt;= 0">
@@ -77,7 +88,8 @@
             <entity-update value-field="card"/>
 
             <service-call name="create#zenith.erp.giftcard.GiftCardTransaction"
-                          in-map="[giftCardId:giftCardId, transactionTypeEnumId:'GctLoad',
+                          in-map="[giftCardId:giftCardId, organizationPartyId:card.organizationPartyId,
+                                   transactionTypeEnumId:'GctLoad',
                                    amount:amount, balanceAfter:newBalance,
                                    referenceType:referenceType, referenceId:referenceId,
                                    transactionDate:ec.user.nowTimestamp,
@@ -102,10 +114,12 @@
             <parameter name="giftCardId"/>
         </out-parameters>
         <actions>
-            <!-- Lookup by card number if giftCardId not provided -->
+            <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <!-- Lookup by card number if giftCardId not provided (org-scoped) -->
             <if condition="!giftCardId &amp;&amp; cardNumber">
                 <entity-find entity-name="zenith.erp.giftcard.GiftCard" list="cards" limit="1">
                     <econdition field-name="cardNumber"/>
+                    <econdition field-name="organizationPartyId" from="activeOrg" ignore-if-empty="true"/>
                 </entity-find>
                 <if condition="!cards">
                     <return error="true" message="Gift card not found"/>
@@ -117,6 +131,10 @@
             </else></if>
 
             <if condition="!card">
+                <return error="true" message="Gift card not found"/>
+            </if>
+            <!-- Org ownership re-check: a card belonging to another org must NOT resolve/redeem -->
+            <if condition="activeOrg &amp;&amp; card.organizationPartyId != activeOrg">
                 <return error="true" message="Gift card not found"/>
             </if>
             <if condition="pin &amp;&amp; card.pin != pin">
@@ -144,7 +162,8 @@
             <entity-update value-field="cardForUpdate"/>
 
             <service-call name="create#zenith.erp.giftcard.GiftCardTransaction"
-                          in-map="[giftCardId:giftCardId, transactionTypeEnumId:'GctRedeem',
+                          in-map="[giftCardId:giftCardId, organizationPartyId:card.organizationPartyId,
+                                   transactionTypeEnumId:'GctRedeem',
                                    amount:redeemedAmount, balanceAfter:remainingBalance,
                                    referenceType:referenceType, referenceId:referenceId,
                                    transactionDate:ec.user.nowTimestamp,
@@ -167,13 +186,20 @@
             <parameter name="expiryDate" type="Timestamp"/>
         </out-parameters>
         <actions>
+            <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <!-- Org-scoped lookup: a card from another org must NOT resolve -->
             <entity-find entity-name="zenith.erp.giftcard.GiftCard" list="cards" limit="1">
                 <econdition field-name="cardNumber"/>
+                <econdition field-name="organizationPartyId" from="activeOrg" ignore-if-empty="true"/>
             </entity-find>
             <if condition="!cards">
                 <return error="true" message="Gift card not found"/>
             </if>
             <set field="card" from="cards[0]"/>
+            <!-- Org ownership re-check before exposing balance -->
+            <if condition="activeOrg &amp;&amp; card.organizationPartyId != activeOrg">
+                <return error="true" message="Gift card not found"/>
+            </if>
             <if condition="pin &amp;&amp; card.pin != pin">
                 <return error="true" message="Invalid PIN"/>
             </if>
@@ -200,6 +226,11 @@
             <parameter name="creditId"/>
         </out-parameters>
         <actions>
+            <!-- Org isolation: stamp the active organization if caller did not pass one -->
+            <if condition="!organizationPartyId">
+                <set field="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            </if>
+
             <set field="expiryDate" from="null"/>
             <if condition="expiryDays">
                 <script>expiryDate = new java.sql.Timestamp(ec.user.nowTimestamp.time + (expiryDays * 86400000L))</script>
@@ -211,7 +242,8 @@
                                    createdDate:ec.user.nowTimestamp, expiryDate:expiryDate]"/>
 
             <service-call name="create#zenith.erp.giftcard.StoreCreditTransaction"
-                          in-map="[creditId:creditId, transactionTypeEnumId:'SctCredit',
+                          in-map="[creditId:creditId, organizationPartyId:organizationPartyId,
+                                   transactionTypeEnumId:'SctCredit',
                                    amount:amount, balanceAfter:amount,
                                    transactionDate:ec.user.nowTimestamp,
                                    performedByUserId:ec.user.userId]"/>
@@ -232,8 +264,13 @@
             <parameter name="remainingBalance" type="BigDecimal"/>
         </out-parameters>
         <actions>
+            <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
             <entity-find-one entity-name="zenith.erp.giftcard.StoreCredit" value-field="credit" for-update="true"/>
             <if condition="!credit">
+                <return error="true" message="Store credit not found"/>
+            </if>
+            <!-- Org ownership re-check: refuse store credit belonging to another org -->
+            <if condition="activeOrg &amp;&amp; credit.organizationPartyId != activeOrg">
                 <return error="true" message="Store credit not found"/>
             </if>
             <if condition="credit.expiryDate &amp;&amp; ec.user.nowTimestamp &gt; credit.expiryDate">
@@ -248,7 +285,8 @@
             <entity-update value-field="credit"/>
 
             <service-call name="create#zenith.erp.giftcard.StoreCreditTransaction"
-                          in-map="[creditId:creditId, transactionTypeEnumId:'SctDebit',
+                          in-map="[creditId:creditId, organizationPartyId:credit.organizationPartyId,
+                                   transactionTypeEnumId:'SctDebit',
                                    amount:usedAmount, balanceAfter:remainingBalance,
                                    referenceType:referenceType, referenceId:referenceId,
                                    transactionDate:ec.user.nowTimestamp,
@@ -269,6 +307,7 @@
         <actions>
             <entity-find entity-name="zenith.erp.giftcard.StoreCredit" list="credits">
                 <econdition field-name="partyId"/>
+                <econdition field-name="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
                 <econdition field-name="balance" operator="greater" from="0"/>
                 <order-by field-name="-createdDate"/>
             </entity-find>
