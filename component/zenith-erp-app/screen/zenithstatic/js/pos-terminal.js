@@ -1,4 +1,9 @@
-console.log('[posterm] script loaded v110 — posOpenHistory defined:', (typeof window.posOpenHistory));
+// Signals to Terminal.xml's legacy inline cart engine (the 7171 IIFE) that the
+// optimistic engine in THIS file is present, so it stands down — otherwise on /apps
+// both bind a grid-submit handler and every product tap fires TWO addItem POSTs,
+// making the cart flicker through optimistic + two server settles ("three states").
+window.__posTermJsActive = true;
+console.log('[posterm] script loaded v113 — posOpenHistory defined:', (typeof window.posOpenHistory));
 /* POS Terminal - external JS for SPA (qapps) - Full AJAX */
 
 /* === Close the SPA left nav drawer when on the POS terminal ===
@@ -1493,6 +1498,16 @@ window.posToggleFullscreen = function() {
     function init() {
         var af = document.getElementById('cartInlineAddForm');
         if (!af) { setTimeout(init, 300); return; }
+        // The /apps SPA re-executes this screen script on soft-navigation, and the
+        // no-session load's init() retry-loop stays alive across the open-session swap.
+        // Without this guard TWO optimistic engines bind to the same cart+grid: one
+        // product tap fires both grid-submit listeners -> two addItem POSTs -> the cart
+        // re-renders optimistic + settleA + settleB (the "three states" flicker, and the
+        // item could even post twice). The flag lives on the cart FORM element, so it is
+        // per-live-DOM: a real DOM swap brings a fresh form (no flag) and re-binds cleanly,
+        // while a bare re-exec against the same form is skipped.
+        if (af.dataset.posEngineBound) return;   // a cart engine is already wired to this form (guards SPA soft-nav re-exec)
+        af.dataset.posEngineBound = '1';
 
         var TK = (af.querySelector('[name=moquiSessionToken]') || {}).value || '';
         var SI = (af.querySelector('[name=sessionId]') || {}).value || '';
