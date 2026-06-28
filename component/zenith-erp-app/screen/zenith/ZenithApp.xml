@@ -27,7 +27,13 @@
         <actions>
             <script><![CDATA[
                 def orgId = ec.user.getPreference("ACTIVE_ORGANIZATION")
-                def result = [isSaasTenant:false, hasAllAccess:false, modules:[]]
+                def result = [isSaasTenant:false, hasAllAccess:false, posOnly:false, modules:[]]
+                try {
+                    if (!ec.user.isInGroup("ADMIN")) {
+                        def _zr = (ec.user.userGroupIdSet ?: []).findAll { it?.startsWith("ZENITH_") && it != "ZENITH_ALL" }
+                        result.posOnly = (_zr.size() == 1 && _zr.contains("ZENITH_CASHIER"))
+                    }
+                } catch (Exception e) {}
                 if (orgId) {
                     boolean d = ec.artifactExecution.disableAuthz()
                     try {
@@ -58,7 +64,7 @@
             html_stylesheets.add('/zenithstatic/css/zenith-theme-v4.css?v=6')
             html_stylesheets.add('https://fonts.googleapis.com/icon?family=Material+Icons')
             if (footer_scripts == null) footer_scripts = []
-            footer_scripts.add('/zenithstatic/js/saas-menu-filter.js?v=4')
+            footer_scripts.add('/zenithstatic/js/saas-menu-filter.js?v=5')
             footer_scripts.add('/zenithstatic/js/zenith-copilot.js')
 
             // SaaS tenant resolution: auto-set org from subdomain if not already set
@@ -166,30 +172,53 @@
                 finally { if (!gateDisabled) ec.artifactExecution.enableAuthz() }
             }
 
-            // ===== Server-side module enforcement (single reusable gate for ALL modules) =====
-            // A plan-gated tenant must not reach a module screen its plan excludes, by ANY route
-            // (direct URL, stale cached menu, etc.) - the client menu/tile filters are advisory only.
-            // Fail-OPEN: only redirect when the request path POSITIVELY names a known module the plan
-            // does not grant. Platform super-admin (ADMIN group) and 'all'-access plans pass through.
-            if (context.isSaasTenant && !context.saasHasAllAccess && context.saasAllowedModules != null
-                    && !ec.user.isInGroup("ADMIN") && ec.web != null) {
+            // ===== Role-based access: POS-only cashiers =====
+            // A user whose ONLY Zenith role is ZENITH_CASHIER (POS Cashier — POS Terminal Only) gets a
+            // POS-only experience: the nav menu is trimmed to POS (client) and every other module screen
+            // bounces to the terminal (server, below). Anyone with a broader role (admin/manager/etc.)
+            // or the platform super-admin is unaffected.
+            context.posOnlyUser = false
+            try {
+                if (!ec.user.isInGroup("ADMIN")) {
+                    def _zr = (ec.user.userGroupIdSet ?: []).findAll { it?.startsWith("ZENITH_") && it != "ZENITH_ALL" }
+                    context.posOnlyUser = (_zr.size() == 1 && _zr.contains("ZENITH_CASHIER"))
+                }
+            } catch (Exception e) { context.posOnlyUser = false }
+
+            // ===== Server-side module enforcement (plan gate + role gate; single reusable place) =====
+            // Modules must not be reachable by ANY route (direct URL, stale cached menu, etc.) - the
+            // client menu/tile filters are advisory only. Fail-OPEN: only redirect when the request path
+            // POSITIVELY names a known module the user may not reach. Platform super-admin (ADMIN) passes.
+            if (ec.web != null && !ec.user.isInGroup("ADMIN")) {
                 def gateableModules = ['pos','sales','purchase','inventory','accounting','contacts','crm','hr',
                     'payroll','attendance','timeoff','recruitment','expenses','manufacturing','quality','maintenance',
                     'fleet','helpdesk','marketing','ecommerce','events','subscriptions','documents','approvals',
                     'integrations','website','studio','plm','fieldservice','discuss','sign','project','timesheets',
                     'tax','pricing','barcode'] as Set
                 def reqMod = null
+                def isAppRoot = false
                 try {
                     def uri = ec.web.getRequest()?.getRequestURI()   // e.g. /apps/zenith/Accounting/AcctgDashboard
                     if (uri) {
                         def segs = uri.split('/').findAll { it }
                         int zi = segs.findIndexOf { it.toLowerCase() == 'zenith' }
-                        if (zi >= 0 && zi + 1 < segs.size()) reqMod = segs[zi + 1].toLowerCase()
+                        if (zi >= 0) {
+                            if (zi + 1 < segs.size()) reqMod = segs[zi + 1].toLowerCase()
+                            else isAppRoot = true   // bare /apps/zenith (renders the default Dashboard)
+                        }
                     }
                 } catch (Exception e) { reqMod = null }
-                if (reqMod && gateableModules.contains(reqMod) && !context.saasAllowedModules.contains(reqMod)) {
+                // PLAN gate: a plan-gated tenant must not reach a module screen its plan excludes.
+                if (context.isSaasTenant && !context.saasHasAllAccess && context.saasAllowedModules != null
+                        && reqMod && gateableModules.contains(reqMod) && !context.saasAllowedModules.contains(reqMod)) {
                     ec.message.addMessage("That module isn't included in your current plan.")
                     sri.sendRedirectAndStopRender("/apps/zenith/Dashboard")
+                }
+                // ROLE gate: a POS-only cashier lives entirely in the POS. Bounce every non-POS module,
+                // the Dashboard (its tiles link to other modules), and the app root to the terminal.
+                if (context.posOnlyUser && (isAppRoot || reqMod == 'dashboard'
+                        || (reqMod && gateableModules.contains(reqMod) && reqMod != 'pos'))) {
+                    sri.sendRedirectAndStopRender("/qapps/zenith/pos/Terminal")
                 }
             }
         ]]></script>
@@ -261,7 +290,7 @@
             <!-- Inject Global Styles and Icons for Quasar SPA -->
             <link rel="preconnect" href="https://fonts.googleapis.com"/>
             <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="anonymous"/>
-            <div id="zenith-saas-cfg" style="display:none" data-tenant="${(isSaasTenant!false)?c}" data-all="${(saasHasAllAccess!false)?c}" data-modules='${saasAllowedModulesJson!"[]"}'></div>
+            <div id="zenith-saas-cfg" style="display:none" data-tenant="${(isSaasTenant!false)?c}" data-all="${(saasHasAllAccess!false)?c}" data-pos-only="${(posOnlyUser!false)?c}" data-modules='${saasAllowedModulesJson!"[]"}'></div>
             <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet"/>
             <link rel="stylesheet" href="/zenithstatic/css/zenith-theme-v4.css?v=6"/>
 

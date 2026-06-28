@@ -8,6 +8,7 @@
         var vm = app.__vue__;
         var isTenant = !!cfg.isSaasTenant;
         var hasAll = !!cfg.hasAllAccess;
+        var posOnly = !!cfg.posOnly;
         var allowedSet = {};
         (cfg.modules || []).forEach(function(m) { allowedSet[String(m).toLowerCase()] = true; });
         var alwaysAllowed = { "dashboard":true, "settings":true, "saas-admin":true, "my-subscription":true };
@@ -26,6 +27,8 @@
                 if (!item.subscreens || !item.subscreens.length) continue;
                 var filtered = item.subscreens.filter(function(ss) {
                     var name = ss.name ? ss.name.toLowerCase() : "";
+                    // POS-only cashier: show only the POS module, hide everything else.
+                    if (posOnly) return name === "pos";
                     if (name === "saas-admin" && isTenant) return false;
                     if (name === "my-subscription" && !isTenant) return false;
                     if (!isTenant || hasAll) return true;
@@ -52,6 +55,7 @@
             return {
                 isSaasTenant: el.getAttribute("data-tenant") === "true",
                 hasAllAccess: el.getAttribute("data-all") === "true",
+                posOnly: el.getAttribute("data-pos-only") === "true",
                 modules: JSON.parse(el.getAttribute("data-modules") || "[]")
             };
         } catch (e) { return null; }
