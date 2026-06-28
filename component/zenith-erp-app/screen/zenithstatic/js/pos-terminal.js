@@ -1,4 +1,4 @@
-console.log('[posterm] script loaded v86 — posOpenHistory defined:', (typeof window.posOpenHistory));
+console.log('[posterm] script loaded v108 — posOpenHistory defined:', (typeof window.posOpenHistory));
 /* POS Terminal - external JS for SPA (qapps) - Full AJAX */
 
 /* === Close the SPA left nav drawer when on the POS terminal ===
@@ -394,7 +394,7 @@ window._posOffline = (function() {
                     row.addEventListener('click', function() {
                         var txId = row.dataset.txId;
                         var bill = d.bills.find(function(b) { return b.txId === txId; });
-                        if (bill) openBillDetail(bill);
+                        if (bill) openCartEditor(bill);
                     });
                 });
             });
@@ -560,6 +560,223 @@ window._posOffline = (function() {
                 }, 300);
             });
         }
+
+        /* === Edit an issued bill IN the cart view ===
+           Loads a completed bill's items into a cart-styled editor mounted over the .pos-cart
+           panel. Editing is entirely client-side (the live open cart is never touched); SAVE diffs
+           against the original and replays the proven server `amendBill` ops (same bill number,
+           tracked amendments, tax recompute, refund/collect, revised receipt). No-op for normal
+           billing — nothing here runs unless a cashier opens a bill from History to edit. */
+        var cartEditorEl = null, cartEditorPrevPos = '';
+        function closeCartEditor() {
+            var cartEl = document.querySelector('.pos-cart');
+            if (cartEditorEl && cartEditorEl.parentNode) cartEditorEl.parentNode.removeChild(cartEditorEl);
+            cartEditorEl = null;
+            if (cartEl) cartEl.style.position = cartEditorPrevPos || '';
+        }
+        function openCartEditor(bill) {
+            closeHistory();
+            closeCartEditor();
+            var cartEl = document.querySelector('.pos-cart');
+            if (!cartEl) { histToast('Cart view not available', '#e53935'); return; }
+            function f2(n) { return Number(n||0).toFixed(2); }
+            // Working model — one row per line. Existing lines carry their seq; new lines have seq=null.
+            var work = (bill.items || []).map(function(it) {
+                var price = Number(it.price)||0, qty = Number(it.qty)||0;
+                var taxable = price * qty;
+                return { seq: it.seq, pid: it.pid, name: it.name, uom: it.uom || '',
+                         price: price, qty: qty,
+                         origPrice: price, origQty: qty,
+                         taxRate: (taxable > 0 ? (Number(it.tax)||0) / taxable : 0),
+                         isNew: false, removed: false };
+            });
+            cartEditorPrevPos = cartEl.style.position || '';
+            cartEl.style.position = 'relative';
+            var ed = document.createElement('div');
+            cartEditorEl = ed;
+            ed.id = 'pos-cart-editor';
+            ed.style.cssText = 'position:absolute;top:0;left:0;right:0;bottom:0;z-index:900;background:#fff;display:flex;flex-direction:column;box-shadow:-2px 0 0 #1565c0 inset';
+            // Block the global terminal keyboard shortcuts while typing in the editor.
+            ed.addEventListener('keydown', function(e) { e.stopPropagation(); });
+            ed.innerHTML =
+                '<div style="background:#1565c0;color:#fff;padding:10px 14px;display:flex;justify-content:space-between;align-items:center;flex-shrink:0">'
+              + '<div><span style="font-size:16px;font-weight:800">&#9998; Editing Bill #'+bill.billNo+'</span>'
+              + '<div style="font-size:11px;opacity:0.9;margin-top:2px">Change qty / price, remove or add items, then Save. This updates the same bill &mdash; not a new sale.</div></div>'
+              + '<button id="ced-cancel-x" title="Cancel" style="background:rgba(255,255,255,0.18);border:none;color:#fff;font-size:22px;line-height:1;cursor:pointer;border-radius:6px;width:34px;height:34px">&times;</button></div>'
+              + '<div id="ced-rows" style="flex:1;overflow-y:auto;padding:6px 10px"></div>'
+              + '<div style="flex-shrink:0;border-top:1px solid #e0e0e0;background:#f0faf0;padding:8px 12px;position:relative">'
+              +   '<div style="display:flex;gap:6px;align-items:center;position:relative">'
+              +     '<input id="ced-add" type="text" placeholder="&#43; Add item — search name or code…" autocomplete="off" style="flex:1;padding:9px 12px;border:1px solid #90caf9;border-radius:6px;font-size:13px;box-sizing:border-box;outline:none"/>'
+              +     '<input id="ced-add-qty" type="number" value="1" min="1" style="width:56px;padding:9px;border:1px solid #90caf9;border-radius:6px;font-size:13px;text-align:center;box-sizing:border-box"/>'
+              +     '<div id="ced-add-res" style="display:none;position:absolute;bottom:100%;left:0;right:0;z-index:20;background:#fff;border:1px solid #ccc;border-radius:8px;box-shadow:0 -4px 16px rgba(0,0,0,0.15);max-height:200px;overflow-y:auto;margin-bottom:4px"></div>'
+              +   '</div>'
+              + '</div>'
+              + '<div style="flex-shrink:0;border-top:1px solid #e0e0e0;padding:10px 12px;background:#fafafa">'
+              +   '<div id="ced-totals" style="font-size:13px;color:#333;margin-bottom:8px"></div>'
+              +   '<input id="ced-reason" type="text" placeholder="Reason for edit (required)…" style="width:100%;padding:10px;border:1px solid #c8e6c9;border-radius:6px;font-size:13px;box-sizing:border-box;margin-bottom:8px;outline:none"/>'
+              +   '<div style="display:flex;gap:8px">'
+              +     '<button id="ced-cancel" style="flex:1;padding:13px;border:2px solid #ccc;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;background:#fff;color:#555">Cancel</button>'
+              +     '<button id="ced-save" style="flex:2;padding:13px;border:none;border-radius:10px;font-size:15px;font-weight:800;cursor:pointer;background:#2e7d32;color:#fff">&#10003; Save changes</button>'
+              +   '</div>'
+              + '</div>';
+            cartEl.appendChild(ed);
+
+            var rowsEl = ed.querySelector('#ced-rows');
+            var totalsEl = ed.querySelector('#ced-totals');
+            function dirty() {
+                for (var i=0;i<work.length;i++){ var w=work[i];
+                    if (w.isNew && !w.removed) return true;
+                    if (!w.isNew && w.removed) return true;
+                    if (!w.isNew && !w.removed && (w.qty!==w.origQty || f2(w.price)!==f2(w.origPrice))) return true;
+                }
+                return false;
+            }
+            function renderRows() {
+                var h = '<table style="width:100%;border-collapse:collapse;font-size:13px">'
+                  + '<thead><tr style="border-bottom:2px solid #ddd;color:#777">'
+                  + '<th style="text-align:left;padding:6px 4px;width:22px">#</th>'
+                  + '<th style="text-align:left;padding:6px 4px">Item</th>'
+                  + '<th style="text-align:right;padding:6px 4px;width:78px">Rate</th>'
+                  + '<th style="text-align:center;padding:6px 4px;width:104px">Qty</th>'
+                  + '<th style="text-align:right;padding:6px 4px;width:74px">Total</th>'
+                  + '<th style="width:30px"></th></tr></thead><tbody>';
+                var shown = 0;
+                work.forEach(function(w, idx) {
+                    var lineTot = w.price * w.qty;
+                    if (w.removed) {
+                        h += '<tr data-idx="'+idx+'" style="border-bottom:1px solid #f0f0f0;background:#fff5f5;color:#bbb">'
+                          + '<td style="padding:6px 4px">&mdash;</td>'
+                          + '<td style="padding:6px 4px;text-decoration:line-through">'+w.name+'</td>'
+                          + '<td colspan="3" style="padding:6px 4px;text-align:right;font-style:italic;color:#c62828">removed</td>'
+                          + '<td style="padding:6px 4px;text-align:center"><button class="ced-undo" data-idx="'+idx+'" title="Undo" style="background:#eee;border:none;border-radius:4px;width:26px;height:26px;cursor:pointer;font-size:14px">&#8634;</button></td></tr>';
+                        return;
+                    }
+                    shown++;
+                    var newTag = w.isNew ? ' <span style="background:#2e7d32;color:#fff;font-size:9px;padding:1px 5px;border-radius:4px;vertical-align:middle">NEW</span>' : '';
+                    h += '<tr data-idx="'+idx+'" style="border-bottom:1px solid #eee">'
+                      + '<td style="padding:6px 4px;color:#999">'+shown+'</td>'
+                      + '<td style="padding:6px 4px;font-weight:600">'+w.name+newTag+(w.uom?'<div style="font-size:10px;color:#999;font-weight:400">'+w.uom+'</div>':'')+'</td>'
+                      + '<td style="padding:6px 4px;text-align:right"><input class="ced-price" data-idx="'+idx+'" type="number" step="0.01" min="0" value="'+f2(w.price)+'" style="width:70px;padding:5px;border:1px solid #ccc;border-radius:4px;text-align:right;font-size:13px"/></td>'
+                      + '<td style="padding:6px 4px;text-align:center;white-space:nowrap">'
+                      +   '<button class="ced-dec" data-idx="'+idx+'" style="width:26px;height:28px;border:1px solid #bbb;background:#f5f5f5;border-radius:5px;font-size:16px;cursor:pointer;vertical-align:middle">&minus;</button>'
+                      +   '<input class="ced-qty" data-idx="'+idx+'" type="number" step="0.001" min="0" value="'+w.qty+'" style="width:46px;padding:5px 2px;border:1px solid #ccc;border-radius:4px;text-align:center;font-size:13px;margin:0 3px;vertical-align:middle"/>'
+                      +   '<button class="ced-inc" data-idx="'+idx+'" style="width:26px;height:28px;border:1px solid #bbb;background:#f5f5f5;border-radius:5px;font-size:16px;cursor:pointer;vertical-align:middle">&#43;</button>'
+                      + '</td>'
+                      + '<td style="padding:6px 4px;text-align:right;font-weight:600">&#8377;'+f2(lineTot)+'</td>'
+                      + '<td style="padding:6px 4px;text-align:center"><button class="ced-rm" data-idx="'+idx+'" title="Remove" style="background:#e53935;color:#fff;border:none;border-radius:4px;width:26px;height:26px;cursor:pointer;font-size:15px;line-height:1">&times;</button></td></tr>';
+                });
+                h += '</tbody></table>';
+                if (shown === 0) h += '<div style="text-align:center;color:#c62828;padding:18px;font-size:13px">All items removed — saving will empty this bill.</div>';
+                rowsEl.innerHTML = h;
+                bindRows();
+                renderTotals();
+            }
+            function renderTotals() {
+                var sub = 0, tax = 0, hasNew = false;
+                work.forEach(function(w) {
+                    if (w.removed) return;
+                    var base = w.price * w.qty;
+                    sub += base;
+                    tax += base * (w.taxRate || 0);
+                    if (w.isNew) hasNew = true;
+                });
+                var est = sub + tax;
+                var orig = Number(bill.grand)||0;
+                var diff = est - orig;
+                var diffStr = diff > 0.005 ? ('<span style="color:#c62828;font-weight:700"> &nbsp;collect ~&#8377;'+f2(diff)+' more</span>')
+                            : diff < -0.005 ? ('<span style="color:#1565c0;font-weight:700"> &nbsp;refund ~&#8377;'+f2(-diff)+'</span>')
+                            : '';
+                totalsEl.innerHTML = 'Est. subtotal &#8377;'+f2(sub)+' &middot; GST ~&#8377;'+f2(tax)
+                  + ' &middot; <b>Est. total ~&#8377;'+f2(est)+'</b>'+diffStr
+                  + '<div style="font-size:11px;color:#999;margin-top:2px">Was &#8377;'+f2(orig)+'. '
+                  + (hasNew ? 'New items priced at default; ' : '') + 'final GST &amp; total are recomputed when you save.</div>';
+            }
+            function bindRows() {
+                rowsEl.querySelectorAll('.ced-price').forEach(function(inp){ inp.addEventListener('change', function(){ var w=work[+inp.dataset.idx]; var v=Number(inp.value); if(!(v>=0)){ inp.value=f2(w.price); return; } w.price=v; renderTotals(); var tot=inp.closest('tr').querySelector('td:nth-child(5)'); if(tot) tot.innerHTML='&#8377;'+f2(w.price*w.qty); }); });
+                rowsEl.querySelectorAll('.ced-qty').forEach(function(inp){ inp.addEventListener('change', function(){ var w=work[+inp.dataset.idx]; var v=Number(inp.value); if(!(v>0)){ inp.value=w.qty; return; } w.qty=v; renderTotals(); var tot=inp.closest('tr').querySelector('td:nth-child(5)'); if(tot) tot.innerHTML='&#8377;'+f2(w.price*w.qty); }); });
+                rowsEl.querySelectorAll('.ced-inc').forEach(function(b){ b.addEventListener('click', function(){ var w=work[+b.dataset.idx]; w.qty=Math.round((w.qty+1)*1000)/1000; renderRows(); }); });
+                rowsEl.querySelectorAll('.ced-dec').forEach(function(b){ b.addEventListener('click', function(){ var w=work[+b.dataset.idx]; var nv=Math.round((w.qty-1)*1000)/1000; if(nv>0){ w.qty=nv; renderRows(); } }); });
+                rowsEl.querySelectorAll('.ced-rm').forEach(function(b){ b.addEventListener('click', function(){ var w=work[+b.dataset.idx]; if(w.isNew){ work.splice(+b.dataset.idx,1); } else { w.removed=true; } renderRows(); }); });
+                rowsEl.querySelectorAll('.ced-undo').forEach(function(b){ b.addEventListener('click', function(){ work[+b.dataset.idx].removed=false; renderRows(); }); });
+            }
+            // Add-item search
+            var addInp = ed.querySelector('#ced-add'), addRes = ed.querySelector('#ced-add-res'), addTimer=null;
+            addInp.addEventListener('input', function(){
+                clearTimeout(addTimer);
+                var q = addInp.value.trim();
+                if (q.length < 1) { addRes.style.display='none'; return; }
+                addTimer = setTimeout(function(){
+                    historyPost({action:'searchProductsJson', q:q}).then(function(d){
+                        if (!d || !d.success || !d.products || !d.products.length) { addRes.innerHTML='<div style="padding:10px;color:#999;font-size:13px">No products found</div>'; addRes.style.display='block'; return; }
+                        var rh='';
+                        d.products.forEach(function(pr){ rh += '<div class="ced-pi" data-pid="'+pr.pid+'" data-name="'+(pr.name||'').replace(/"/g,'&quot;')+'" data-price="'+pr.price+'" style="padding:9px 12px;cursor:pointer;border-bottom:1px solid #f0f0f0;display:flex;justify-content:space-between;align-items:center" onmouseover="this.style.background=\'#e3f2fd\'" onmouseout="this.style.background=\'#fff\'"><div><div style="font-weight:600;font-size:13px">'+pr.name+'</div><div style="font-size:11px;color:#999">'+pr.pid+'</div></div><span style="font-weight:700;color:#2e7d32">&#8377;'+f2(pr.price)+'</span></div>'; });
+                        addRes.innerHTML=rh; addRes.style.display='block';
+                        addRes.querySelectorAll('.ced-pi').forEach(function(row){ row.addEventListener('click', function(){
+                            var qy = Number(ed.querySelector('#ced-add-qty').value)||1; if(qy<=0) qy=1;
+                            work.push({ seq:null, pid:row.dataset.pid, name:row.dataset.name, uom:'', price:Number(row.dataset.price)||0, qty:qy, origPrice:Number(row.dataset.price)||0, origQty:0, taxRate:0, isNew:true, removed:false });
+                            addInp.value=''; addRes.style.display='none'; renderRows();
+                        }); });
+                    });
+                }, 300);
+            });
+            document.addEventListener('click', function ofc(e){ if(!cartEditorEl){ document.removeEventListener('click', ofc); return; } if(addRes && !addRes.contains(e.target) && e.target!==addInp) addRes.style.display='none'; });
+
+            function doCancel() { if (dirty() && !window.confirm('Discard your unsaved changes to Bill #'+bill.billNo+'?')) return; closeCartEditor(); }
+            ed.querySelector('#ced-cancel').addEventListener('click', doCancel);
+            ed.querySelector('#ced-cancel-x').addEventListener('click', doCancel);
+
+            ed.querySelector('#ced-save').addEventListener('click', function(){
+                var reason = ed.querySelector('#ced-reason').value.trim();
+                if (!reason) { histToast('Enter a reason for the edit', '#e53935'); ed.querySelector('#ced-reason').focus(); return; }
+                // Build the ordered op list: existing-line changes/removes, then new-item adds.
+                var ops = [];
+                work.forEach(function(w){
+                    if (w.isNew || w.removed) return;
+                    if (w.qty !== w.origQty) ops.push({type:'QTY_CHANGE', seq:w.seq, newQty:w.qty});
+                    if (f2(w.price) !== f2(w.origPrice)) ops.push({type:'PRICE_CHANGE', seq:w.seq, newPrice:w.price});
+                });
+                work.forEach(function(w){ if (!w.isNew && w.removed) ops.push({type:'ITEM_REMOVED', seq:w.seq}); });
+                work.forEach(function(w){ if (w.isNew && !w.removed) ops.push({type:'ITEM_ADDED', pid:w.pid, addQty:w.qty, customPrice:w.price, defPrice:w.origPrice}); });
+                if (!ops.length) { histToast('No changes to save', '#ff9800'); return; }
+                var saveBtn = ed.querySelector('#ced-save'); saveBtn.disabled=true; saveBtn.textContent='Saving…';
+                var lastBill = null;
+                var chain = Promise.resolve(null);
+                ops.forEach(function(op){
+                    chain = chain.then(function(){
+                        var params = {action:'amendBill', editTxId:bill.txId, editReason:reason, editType:op.type};
+                        if (op.type==='QTY_CHANGE') { params.editItemSeqId=op.seq; params.newQty=op.newQty; }
+                        else if (op.type==='PRICE_CHANGE') { params.editItemSeqId=op.seq; params.newPrice=op.newPrice; }
+                        else if (op.type==='ITEM_REMOVED') { params.editItemSeqId=op.seq; }
+                        else if (op.type==='ITEM_ADDED') { params.addProductId=op.pid; params.addQty=op.addQty; }
+                        return historyPost(params).then(function(r){
+                            if (!r || !r.success) throw new Error(r && r.error ? r.error : 'Edit failed');
+                            lastBill = r.bill;
+                            // Honor a custom price on a just-added line: the server returns its new seq directly.
+                            if (op.type==='ITEM_ADDED' && r.bill && r.bill.newSeq && Math.abs(Number(op.customPrice)-Number(op.defPrice))>0.005) {
+                                return historyPost({action:'amendBill', editTxId:bill.txId, editReason:reason, editType:'PRICE_CHANGE', editItemSeqId:r.bill.newSeq, newPrice:op.customPrice}).then(function(r2){ if(r2&&r2.success) lastBill=r2.bill; });
+                            }
+                        });
+                    });
+                });
+                chain.then(function(){
+                    histToast('✔ Bill #'+(lastBill?lastBill.billNo:bill.billNo)+' updated — printing revised bill', '#2e7d32');
+                    if (lastBill) {
+                        var rd=Number(lastBill.refundDue)||0, bd=Number(lastBill.balanceDue)||0;
+                        if (rd>0.005) setTimeout(function(){ histToast('↩ REFUND ₹'+f2(rd)+' to the customer', '#1565c0'); }, 1200);
+                        else if (bd>0.005) setTimeout(function(){ histToast('➕ COLLECT ₹'+f2(bd)+' more from the customer', '#e65100'); }, 1200);
+                        printEditedReceipt(lastBill.txId, lastBill.billNo, (Number(lastBill.tax)>0?'Y':'N'));
+                    }
+                    closeCartEditor();
+                }).catch(function(err){
+                    histToast(String(err && err.message ? err.message : err), '#e53935');
+                    saveBtn.disabled=false; saveBtn.innerHTML='&#10003; Save changes';
+                });
+            });
+
+            renderRows();
+            setTimeout(function(){ var r=ed.querySelector('#ced-reason'); if(r) r.focus(); }, 50);
+        }
+        window.posOpenCartEditor = openCartEditor;
 
     window.posOpenHistory = function() {
         console.log('[posterm] posOpenHistory FIRED');
