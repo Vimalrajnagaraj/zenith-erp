@@ -222,6 +222,7 @@
             <parameter name="unitPrice" type="BigDecimal"/>
             <parameter name="discountPercent" type="BigDecimal" default-value="0"/>
             <parameter name="salesModeId"/>
+            <parameter name="taxOn" default-value="Y"/>
         </in-parameters>
         <out-parameters><parameter name="itemSeqId"/></out-parameters>
         <actions>
@@ -272,7 +273,24 @@
             <set field="mrp" from="product?.mrpAmount ?: unitPrice"/>
             <set field="productTaxCode" from="product?.productTaxCode ?: ''"/>
 
-            <!-- Repeat add of same product (same unit price) => increase qty on the existing line -->
+            <!-- Quantity-break products accumulate onto their existing same-product line even after the
+                 line has auto-switched to a wholesale price (so its stored unitPrice no longer matches the
+                 retail add). Detect: a RETAIL-context, non-manual add of a product that has a WHOLESALE row
+                 with a positive thresholdQty + price. No-op for tenants with no thresholds (e.g. MARUTHI). -->
+            <set field="_qbRelax" from="false"/>
+            <if condition="isDefaultPrice &amp;&amp; (!salesModeId || salesModeId == 'RETAIL')">
+                <entity-find entity-name="zenith.erp.pos.PosProductModePrice" list="_qbList" limit="1">
+                    <econdition field-name="productId"/>
+                    <econdition field-name="salesModeId" value="WHOLESALE"/>
+                    <econdition field-name="thresholdQty" operator="greater-than" from="0"/>
+                </entity-find>
+                <if condition="_qbList &amp;&amp; _qbList[0].price != null &amp;&amp; (_qbList[0].price as BigDecimal).compareTo(BigDecimal.ZERO) &gt; 0">
+                    <set field="_qbRelax" from="true"/></if>
+            </if>
+
+            <!-- Repeat add of same product (same unit price) => increase qty on the existing line.
+                 For a quantity-break product, merge onto the existing non-manual line regardless of its
+                 current (possibly already-wholesale) unit price. -->
             <set field="mergeQty" from="quantity as BigDecimal" type="BigDecimal"/>
             <set field="existingLine" from="null"/>
             <entity-find entity-name="zenith.erp.pos.PosTransactionItem" list="sameProdItems">
@@ -281,7 +299,9 @@
                 <order-by field-name="itemSeqId"/>
             </entity-find>
             <iterate list="sameProdItems" entry="spi">
-                <if condition="existingLine == null &amp;&amp; ((spi.unitPrice ?: 0) as BigDecimal).compareTo(unitPrice as BigDecimal) == 0">
+                <if condition="existingLine == null &amp;&amp; (
+                        (_qbRelax &amp;&amp; spi.manualPrice != 'Y')
+                        || ((spi.unitPrice ?: 0) as BigDecimal).compareTo(unitPrice as BigDecimal) == 0)">
                     <set field="existingLine" from="spi"/></if>
             </iterate>
             <if condition="existingLine != null">
@@ -317,6 +337,8 @@
             <set field="totalTaxAmount" from="taxedItem?.totalTaxAmount ?: BigDecimal.ZERO" type="BigDecimal"/>
             <set field="lineTotal" from="taxableAmount + totalTaxAmount" type="BigDecimal"/>
 
+            <!-- A cashier-typed price (isDefaultPrice false) locks the line against quantity-break auto-pricing. -->
+            <set field="_manualPrice" from="isDefaultPrice ? 'N' : 'Y'"/>
             <!-- Merge into the existing line if found, otherwise create a new line -->
             <if condition="existingLine != null">
                 <set field="itemSeqId" from="existingLine.itemSeqId"/>
@@ -324,7 +346,8 @@
                     in-map="[transactionId:transactionId, itemSeqId:itemSeqId, quantity:mergeQty,
                              unitPrice:unitPrice, mrp:mrp, discountPercent:discountPercent,
                              discountAmount:discAmt, taxableAmount:taxableAmount,
-                             totalTaxAmount:totalTaxAmount, lineTotal:lineTotal, uomId:(product?.amountUomId ?: 'OTH_ea'), salesModeId:salesModeId]"/>
+                             totalTaxAmount:totalTaxAmount, lineTotal:lineTotal, uomId:(product?.amountUomId ?: 'OTH_ea'), salesModeId:salesModeId,
+                             manualPrice:(existingLine.manualPrice ?: _manualPrice)]"/>
             <else>
                 <entity-find entity-name="zenith.erp.pos.PosTransactionItem" list="existingItems">
                     <econdition field-name="transactionId"/></entity-find>
@@ -334,7 +357,8 @@
                              productName:productName, productTaxCode:productTaxCode, quantity:mergeQty,
                              unitPrice:unitPrice, mrp:mrp, discountPercent:discountPercent,
                              discountAmount:discAmt, taxableAmount:taxableAmount,
-                             totalTaxAmount:totalTaxAmount, lineTotal:lineTotal, uomId:(product?.amountUomId ?: 'OTH_ea'), salesModeId:salesModeId]"/>
+                             totalTaxAmount:totalTaxAmount, lineTotal:lineTotal, uomId:(product?.amountUomId ?: 'OTH_ea'), salesModeId:salesModeId,
+                             manualPrice:_manualPrice]"/>
             </else></if>
 
             <!-- Store per-line tax breakdown -->
@@ -347,6 +371,12 @@
             <!-- Recalculate transaction totals -->
             <service-call name="zenith.pos.PosServices.recalculate#TransactionTotals"
                 in-map="[transactionId:transactionId]"/>
+
+            <!-- Quantity-break: if the merged line quantity crossed the product's wholesale threshold,
+                 auto-switch this single line to the wholesale price (or revert it to retail below it).
+                 No-op for products without a configured threshold and for manually-priced lines. -->
+            <service-call name="zenith.pos.PosServices.applyQuantityBreak#Line"
+                in-map="[transactionId:transactionId, itemSeqId:itemSeqId, taxOn:taxOn, cartModeId:salesModeId]"/>
         </actions>
     </service>
 
@@ -1552,6 +1582,7 @@
             <parameter name="productId" required="true"/>
             <parameter name="salesModeId" required="true"/>
             <parameter name="price" type="BigDecimal"/>
+            <parameter name="thresholdQty" type="BigDecimal"><description>Quantity-break threshold for a fixed mode (e.g. Wholesale): a RETAIL cart line auto-switches to this mode's price once its quantity reaches this value. Null/0 = off.</description></parameter>
         </in-parameters>
         <actions>
             <entity-find-one entity-name="mantle.product.Product" value-field="product">
@@ -1561,6 +1592,7 @@
                 <field-map field-name="salesModeId"/></entity-find-one>
             <set field="ps" from="mode?.priceSource ?: 'PpsMrp'"/>
             <set field="hasPrice" from="price != null &amp;&amp; (price as BigDecimal).compareTo(BigDecimal.ZERO) &gt; 0"/>
+            <set field="_thr" from="(thresholdQty != null &amp;&amp; (thresholdQty as BigDecimal).compareTo(BigDecimal.ZERO) &gt; 0) ? (thresholdQty as BigDecimal) : null"/>
             <if condition="ps != 'PpsFixedProduct'">
                 <if condition="hasPrice">
                     <service-call name="update#mantle.product.Product"
@@ -1570,13 +1602,69 @@
                 <if condition="hasPrice">
                     <service-call name="store#zenith.erp.pos.PosProductModePrice"
                                   in-map="[productId:productId, salesModeId:salesModeId,
-                                           price:(price as BigDecimal), organizationPartyId:product.ownerPartyId]"/>
+                                           price:(price as BigDecimal), thresholdQty:_thr, organizationPartyId:product.ownerPartyId]"/>
                 <else>
                     <entity-find-one entity-name="zenith.erp.pos.PosProductModePrice" value-field="exPmp">
                         <field-map field-name="productId"/><field-map field-name="salesModeId"/></entity-find-one>
                     <if condition="exPmp"><entity-delete value-field="exPmp"/></if>
                 </else></if>
             </else></if>
+        </actions>
+    </service>
+
+    <service verb="applyQuantityBreak" noun="Line">
+        <description>Quantity-break auto-pricing. When a cart line is sold at RETAIL and its quantity
+            reaches the product's per-product wholesale threshold (PosProductModePrice.thresholdQty on the
+            WHOLESALE/WSL row), auto-switch that single line to the WHOLESALE price; once the quantity drops
+            back below the threshold, revert it to RETAIL. The actual reprice + tax recompute is delegated to
+            set#PosTransactionItemMode so tax-inclusive handling and the tax toggle are honored.
+            Pure no-op when the product has no wholesale threshold configured, when the cashier has taken
+            manual control of the line (manualPrice='Y'), or when the line is in some other mode (e.g. EMPLOYEE).
+            Safe for tenants that configure no thresholds (e.g. MARUTHI) — it returns without touching anything.</description>
+        <in-parameters>
+            <parameter name="transactionId" required="true"/>
+            <parameter name="itemSeqId" required="true"/>
+            <parameter name="taxOn"/>
+            <parameter name="cartModeId"><description>The cart's current sales mode. Quantity-break only runs while the cart is in RETAIL (or default/blank); if the cashier deliberately put the cart in WHOLESALE/EMPLOYEE, lines are left under that explicit mode.</description></parameter>
+        </in-parameters>
+        <out-parameters><parameter name="switched" type="Boolean"/></out-parameters>
+        <actions>
+            <set field="switched" from="false"/>
+            <entity-find-one entity-name="zenith.erp.pos.PosTransactionItem" value-field="it">
+                <field-map field-name="transactionId"/><field-map field-name="itemSeqId"/></entity-find-one>
+            <if condition="!it"><return/></if>
+            <!-- Cashier hand-typed price / explicit per-line mode wins; never auto-override it. -->
+            <if condition="it.manualPrice == 'Y'"><return/></if>
+            <!-- Resolve the global WHOLESALE + RETAIL modes (codes WSL / RTL). -->
+            <entity-find entity-name="zenith.erp.pos.PosSalesMode" list="_wsList" limit="1">
+                <econdition field-name="modeCode" value="WSL"/></entity-find>
+            <set field="_ws" from="_wsList ? _wsList[0] : null"/>
+            <if condition="!_ws"><return/></if>
+            <entity-find entity-name="zenith.erp.pos.PosSalesMode" list="_rtList" limit="1">
+                <econdition field-name="modeCode" value="RTL"/></entity-find>
+            <set field="_retailModeId" from="(_rtList ? _rtList[0].salesModeId : 'RETAIL')"/>
+            <!-- Quantity-break is a RETAIL-mode convenience. If the cart is deliberately in any other mode,
+                 leave its lines under that explicit choice. -->
+            <if condition="cartModeId &amp;&amp; cartModeId != _retailModeId"><return/></if>
+            <!-- Only auto-manage a line that is RETAIL (or default/blank, treated as retail) or one we
+                 previously auto-switched to WHOLESALE. A line explicitly placed in EMPLOYEE (or any other
+                 mode) is left alone. -->
+            <if condition="it.salesModeId &amp;&amp; it.salesModeId != _retailModeId &amp;&amp; it.salesModeId != _ws.salesModeId"><return/></if>
+            <!-- The product's WHOLESALE row carries the threshold + the wholesale price. -->
+            <entity-find-one entity-name="zenith.erp.pos.PosProductModePrice" value-field="_wsp">
+                <field-map field-name="productId" from="it.productId"/>
+                <field-map field-name="salesModeId" from="_ws.salesModeId"/></entity-find-one>
+            <set field="_thr" from="(_wsp?.thresholdQty ?: 0) as BigDecimal" type="BigDecimal"/>
+            <set field="_wprice" from="(_wsp?.price ?: 0) as BigDecimal" type="BigDecimal"/>
+            <!-- No threshold (or no wholesale price) configured => not a quantity-break product => no-op. -->
+            <if condition="_thr.compareTo(BigDecimal.ZERO) &lt;= 0 || _wprice.compareTo(BigDecimal.ZERO) &lt;= 0"><return/></if>
+            <set field="_qty" from="(it.quantity ?: 0) as BigDecimal" type="BigDecimal"/>
+            <set field="_targetMode" from="(_qty.compareTo(_thr) &gt;= 0) ? _ws.salesModeId : _retailModeId"/>
+            <if condition="_targetMode != it.salesModeId">
+                <service-call name="zenith.pos.PosServices.set#PosTransactionItemMode"
+                    in-map="[transactionId:transactionId, itemSeqId:itemSeqId, salesModeId:_targetMode, taxOn:taxOn]"/>
+                <set field="switched" from="true"/>
+            </if>
         </actions>
     </service>
 
