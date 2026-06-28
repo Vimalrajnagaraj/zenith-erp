@@ -3,7 +3,7 @@
 // both bind a grid-submit handler and every product tap fires TWO addItem POSTs,
 // making the cart flicker through optimistic + two server settles ("three states").
 window.__posTermJsActive = true;
-console.log('[posterm] script loaded v113 — posOpenHistory defined:', (typeof window.posOpenHistory));
+console.log('[posterm] script loaded v115 — posOpenHistory defined:', (typeof window.posOpenHistory));
 /* POS Terminal - external JS for SPA (qapps) - Full AJAX */
 
 /* === Close the SPA left nav drawer when on the POS terminal ===
@@ -1541,27 +1541,11 @@ window.posToggleFullscreen = function() {
             if (hc === 0) heldId = '';
         }
         function updateHeldBadge() {
-            var found = document.getElementById('pos-held-badge');
-            if (heldCount > 0) {
-                if (!found) {
-                    var sessionSpan = null;
-                    document.querySelectorAll('.pos-header span').forEach(function(s) { if (/^#\d/.test(s.textContent)) sessionSpan = s; });
-                    if (sessionSpan) {
-                        var wrap = document.createElement('span');
-                        wrap.id = 'pos-held-badge';
-                        wrap.style.cssText = 'position:relative;display:inline-block;margin-left:8px;cursor:pointer';
-                        wrap.innerHTML = '<span style="background:#ff9800;padding:6px 12px;border-radius:6px;font-weight:bold;font-size:14px;display:inline-block">HELD: 0</span>';
-                        sessionSpan.parentNode.insertBefore(wrap, sessionSpan.nextSibling);
-                        wrap.addEventListener('click', function(ev) { ev.stopPropagation(); toggleHeldDropdown(); });
-                        found = wrap;
-                    }
-                }
-                if (found) found.querySelector('span').textContent = 'HELD: ' + heldCount;
-            } else {
-                if (found) found.remove();
-                var dd = document.getElementById('pos-held-dropdown');
-                if (dd) dd.remove();
-            }
+            // The held UI is the server-rendered #pos-held-wrap <details> picker, kept fresh via
+            // syncHeldWrap() from each hold/recall/void response. The old JS #pos-held-badge is
+            // retired so it can't duplicate the native one on /apps. No-op kept for old callers.
+            var stale = document.getElementById('pos-held-badge'); if (stale) stale.remove();
+            var dd = document.getElementById('pos-held-dropdown'); if (dd) dd.remove();
         }
         function toggleHeldDropdown() {
             var dd = document.getElementById('pos-held-dropdown');
@@ -2803,9 +2787,26 @@ window.posToggleFullscreen = function() {
         /* --- Init: extract held info from server-rendered page --- */
         extractHeldInfo(document);
 
-        /* --- Hold/Void/Recall + Payment: event delegation on .pos-summary --- */
-        if (smRoot) smRoot.addEventListener('submit', function(e) {
-            var form = e.target.closest('form');
+        // Refresh the server-rendered held-bills picker (#pos-held-wrap <details>) from a full
+        // terminal render, so HOLD/RECALL/VOID keep the badge correct with no page reload.
+        function syncHeldWrap(doc) {
+            try { var s = doc.querySelector('#pos-held-wrap'); var d = document.getElementById('pos-held-wrap'); if (s && d) d.innerHTML = s.innerHTML; } catch (e) {}
+        }
+        function reconcileTerminal(doc) {
+            var ntk = doc.querySelector('input[name="moquiSessionToken"]'); if (ntk && ntk.value) TK = ntk.value;
+            swapGrid(doc);
+            var nb = doc.querySelector('.pos-cart tbody'); var ct = document.querySelector('.pos-cart tbody'); if (nb && ct) ct.innerHTML = nb.innerHTML;
+            var ns = doc.querySelector('.pos-summary'); var sd = document.querySelector('.pos-summary'); if (ns && sd) sd.innerHTML = ns.innerHTML;
+            syncHeldWrap(doc);
+        }
+
+        /* --- Hold / Void / Recall: delegated on DOCUMENT so the header held-picker forms are
+               caught too (they live outside .pos-summary). HOLD/VOID clear the cart optimistically
+               (instant), then the single holdSale/voidSale response — itself a full terminal
+               render (url=".") with the updated HELD badge — reconciles the authoritative state.
+               No second round-trip, and the badge can't go stale. --- */
+        document.addEventListener('submit', function(e) {
+            var form = e.target.closest ? e.target.closest('form') : null;
             if (!form) return;
             var act = form.getAttribute('action') || '';
             if (act.indexOf('holdSale') !== -1 || act.indexOf('voidSale') !== -1 || act.indexOf('recallSale') !== -1) {
@@ -2815,55 +2816,39 @@ window.posToggleFullscreen = function() {
                 var fd = new FormData(form);
                 fd.set('transactionId', TX); fd.set('sessionId', SI); fd.set('taxOn', TO);
                 fd.set('salesModeId', SM); fd.set('moquiSessionToken', TK);
-                fetch(form.action, {method: 'POST', body: new URLSearchParams(fd), credentials: 'same-origin'})
-                    .then(function(r) {
-                        var rUrl = r.url || '';
-                        return r.text().then(function(html) { return {html: html, url: rUrl}; });
-                    })
+                if (isRecall) {
+                    showToast('Recalling held sale…', '#e65100');
+                } else {
+                    // OPTIMISTIC: empty the cart instantly so HOLD/VOID feel snappy.
+                    renderCart({ success: true, transactionId: '', items: [], sub: 0, tax: 0, disc: 0, tQty: 0, grand: 0, pay: 0 });
+                    TX = ''; lastCartData = null; lastPay = 0;
+                    showToast(isHold ? 'Sale held — tap RECALL to restore' : 'Sale voided', isHold ? '#ff9800' : '#e53935');
+                }
+                fetch(form.action, { method: 'POST', body: new URLSearchParams(fd), credentials: 'same-origin' })
+                    .then(function(r) { var u = r.url || ''; return r.text().then(function(html) { return { html: html, url: u }; }); })
                     .then(function(resp) {
-                        var html = resp.html;
-                        var rUrl = resp.url;
-                        var respDoc = new DOMParser().parseFromString(html, 'text/html');
-                        var ntx = respDoc.querySelector('input[name="transactionId"]');
+                        var doc = new DOMParser().parseFromString(resp.html, 'text/html');
+                        var ntx = doc.querySelector('input[name="transactionId"]');
                         var newTx = ntx ? (ntx.value || '') : '';
-                        if (!newTx && rUrl) {
-                            var m = rUrl.match(/transactionId=(\d+)/);
-                            if (m) newTx = m[1];
-                        }
-                        if (isRecall && newTx) {
-                            TX = newTx;
-                            document.querySelectorAll('input[name="transactionId"]').forEach(function(el) { el.value = TX; });
-                            var ntk = respDoc.querySelector('input[name="moquiSessionToken"]');
-                            if (ntk && ntk.value) TK = ntk.value;
-                            extractHeldInfo(respDoc);
-                            updateHeldBadge();
-                            post({action:'refresh', transactionId: TX}).then(function(d) {
-                                renderCart(d);
-                                showToast('✔ Held sale recalled');
-                            });
+                        if (!newTx && resp.url) { var m = resp.url.match(/transactionId=(\d+)/); if (m) newTx = m[1]; }
+                        TX = newTx;
+                        document.querySelectorAll('input[name="transactionId"]').forEach(function(el) { el.value = TX; });
+                        if (isRecall) {
+                            // Show the recalled cart immediately (server HTML), then load the JSON
+                            // model so optimistic edits work on the recalled lines.
+                            reconcileTerminal(doc);
+                            post({ action: 'refresh', transactionId: TX }).then(function(d) { renderCart(d); showToast('✔ Held sale recalled', '#e65100'); });
                         } else {
-                            TX = '';
-                            lastCartData = null; lastPay = 0;
-                            fetchScreen({}).then(function(doc) {
-                                extractHeldInfo(doc);
-                                updateHeldBadge();
-                                var ntx2 = doc.querySelector('input[name="transactionId"]');
-                                TX = ntx2 ? (ntx2.value || '') : '';
-                                document.querySelectorAll('input[name="transactionId"]').forEach(function(el) { el.value = TX; });
-                                var ntk2 = doc.querySelector('input[name="moquiSessionToken"]');
-                                if (ntk2 && ntk2.value) TK = ntk2.value;
-                                swapGrid(doc);
-                                var nb = doc.querySelector('.pos-cart tbody');
-                                if (nb) document.querySelector('.pos-cart tbody').innerHTML = nb.innerHTML;
-                                var ns = doc.querySelector('.pos-summary');
-                                if (ns) document.querySelector('.pos-summary').innerHTML = ns.innerHTML;
-                                appendRecallIfNeeded();
-                                var bn = document.querySelector('.pos-header [style*="background:#e65100"]') || document.querySelector('.pos-header [style*="background: rgb(230, 81, 0)"]');
-                                if (bn) bn.textContent = 'BILL- ' + (TX ? '' : '0');
-                                if (isHold) showToast('Sale held — tap RECALL to restore', '#ff9800');
-                            });
+                            // HOLD/VOID: keep the optimistic empty cart (total ₹0). The response's
+                            // cart/summary reflect the just-held bill, not the fresh empty cart, so only
+                            // adopt the new token + refresh the held badge — never swap cart/summary.
+                            var ntk = doc.querySelector('input[name="moquiSessionToken"]'); if (ntk && ntk.value) TK = ntk.value;
+                            syncHeldWrap(doc);
+                            var bn = document.querySelector('.pos-header [style*="background:#e65100"]') || document.querySelector('.pos-header [style*="background: rgb(230, 81, 0)"]');
+                            if (bn) bn.textContent = 'BILL- 0';
                         }
-                    });
+                    })
+                    .catch(function() { try { location.reload(); } catch (e) {} });
             }
             if (act.indexOf('payAndComplete') !== -1 && act.indexOf('splitPayAndComplete') === -1) {
                 e.preventDefault();
