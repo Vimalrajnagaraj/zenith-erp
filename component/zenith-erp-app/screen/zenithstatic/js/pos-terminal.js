@@ -1,4 +1,4 @@
-console.log('[posterm] script loaded v108 — posOpenHistory defined:', (typeof window.posOpenHistory));
+console.log('[posterm] script loaded v109 — posOpenHistory defined:', (typeof window.posOpenHistory));
 /* POS Terminal - external JS for SPA (qapps) - Full AJAX */
 
 /* === Close the SPA left nav drawer when on the POS terminal ===
@@ -579,6 +579,20 @@ window._posOffline = (function() {
             closeCartEditor();
             var cartEl = document.querySelector('.pos-cart');
             if (!cartEl) { histToast('Cart view not available', '#e53935'); return; }
+            // The editor is a light card; force readable colors so the dark-theme rules
+            // (body.body--dark .pos-cart table tbody td/input { …!important }) don't bleed in.
+            // An #id selector outranks the theme's class selectors.
+            if (!document.getElementById('ced-style')) {
+                var st = document.createElement('style'); st.id = 'ced-style';
+                st.textContent =
+                    '#pos-cart-editor table tbody td{color:#222 !important}'
+                  + '#pos-cart-editor table tbody td>div{color:#999 !important}'
+                  + '#pos-cart-editor table thead th{color:#777 !important;background:transparent !important}'
+                  + '#pos-cart-editor input{background:#fff !important;color:#222 !important}'
+                  + '#pos-cart-editor input::placeholder{color:#9aa0a6 !important}'
+                  + '#pos-cart-editor .ced-inc,#pos-cart-editor .ced-dec{background:#f5f5f5 !important;color:#222 !important}';
+                document.head.appendChild(st);
+            }
             function f2(n) { return Number(n||0).toFixed(2); }
             // Working model — one row per line. Existing lines carry their seq; new lines have seq=null.
             var work = (bill.items || []).map(function(it) {
