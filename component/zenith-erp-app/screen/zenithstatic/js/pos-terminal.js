@@ -1,4 +1,4 @@
-console.log('[posterm] script loaded v109 — posOpenHistory defined:', (typeof window.posOpenHistory));
+console.log('[posterm] script loaded v110 — posOpenHistory defined:', (typeof window.posOpenHistory));
 /* POS Terminal - external JS for SPA (qapps) - Full AJAX */
 
 /* === Close the SPA left nav drawer when on the POS terminal ===
@@ -590,7 +590,9 @@ window._posOffline = (function() {
                   + '#pos-cart-editor table thead th{color:#777 !important;background:transparent !important}'
                   + '#pos-cart-editor input{background:#fff !important;color:#222 !important}'
                   + '#pos-cart-editor input::placeholder{color:#9aa0a6 !important}'
-                  + '#pos-cart-editor .ced-inc,#pos-cart-editor .ced-dec{background:#f5f5f5 !important;color:#222 !important}';
+                  + '#pos-cart-editor .ced-inc,#pos-cart-editor .ced-dec{background:#f5f5f5 !important;color:#222 !important}'
+                  + '#pos-cart-editor #ced-add-res{background:#fff !important}'
+                  + '#pos-cart-editor .ced-pi div{color:#222 !important}';
                 document.head.appendChild(st);
             }
             function f2(n) { return Number(n||0).toFixed(2); }
