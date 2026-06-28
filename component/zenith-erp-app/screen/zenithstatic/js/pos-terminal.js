@@ -3,7 +3,7 @@
 // both bind a grid-submit handler and every product tap fires TWO addItem POSTs,
 // making the cart flicker through optimistic + two server settles ("three states").
 window.__posTermJsActive = true;
-console.log('[posterm] script loaded v115 — posOpenHistory defined:', (typeof window.posOpenHistory));
+console.log('[posterm] script loaded v116 — posOpenHistory defined:', (typeof window.posOpenHistory));
 /* POS Terminal - external JS for SPA (qapps) - Full AJAX */
 
 /* === Close the SPA left nav drawer when on the POS terminal ===
@@ -1354,8 +1354,8 @@ window.posPayDigital = function(form) {
             if (k === 'Escape') { if (qtyBuf !== '') { e.preventDefault(); qtyBuf = ''; showHint('cartrow'); } return; }
             if (k === '+' || k === '=') { e.preventDefault(); qtyBuf = ''; if (qb[1]) qb[1].click(); setTimeout(rehighlightCart, 280); return; }
             if (k === '-' || k === '_') { e.preventDefault(); qtyBuf = ''; if (qb[0]) qb[0].click(); setTimeout(rehighlightCart, 280); return; }
-            if (k === 'Backspace') { e.preventDefault(); if (qtyBuf !== '') { qtyBuf = qtyBuf.slice(0, -1); showQtyHint(); } else { setQty(c.el, 0); setTimeout(rehighlightCart, 280); } return; }
-            if (k === 'Delete') { e.preventDefault(); qtyBuf = ''; setQty(c.el, 0); setTimeout(rehighlightCart, 280); return; }
+            if (k === 'Backspace') { e.preventDefault(); if (qtyBuf !== '') { qtyBuf = qtyBuf.slice(0, -1); showQtyHint(); } else { var _rmb = c.el.querySelector('.aj-rm'); if (_rmb) _rmb.click(); setTimeout(rehighlightCart, 280); } return; }
+            if (k === 'Delete') { e.preventDefault(); qtyBuf = ''; var _rmd = c.el.querySelector('.aj-rm'); if (_rmd) _rmd.click(); setTimeout(rehighlightCart, 280); return; }
             return;
         }
 
@@ -2385,7 +2385,10 @@ window.posToggleFullscreen = function() {
             function doQty(seq, newQty) {
                 newQty = Number(newQty);
                 var ln = bySeq(seq); if (!ln) return;
-                if (!(newQty > 0)) { doRemove(seq); return; }
+                // A quantity edit must NEVER delete the line — a decimal/cleared/0 value that
+                // resolved while typing would silently drop the item. Revert to the authoritative
+                // cart instead; removal is only via the explicit × (remove) button.
+                if (!(newQty > 0)) { renderCart(lc()); return; }
                 var f = newQty / n(ln.qty); ln.qty = newQty; ln.total = n(ln.total) * f; ln.tax = n(ln.tax) * f;
                 recompute(); renderCart(lc());
                 enqueue({ action: 'updateQty', seq: ln.seq, newQty: newQty, needSeq: true, lineKey: ln.pid + '|' + (ln.mode || '') });
@@ -2467,7 +2470,7 @@ window.posToggleFullscreen = function() {
                 if (t.classList.contains('aj-q')) {
                     e.preventDefault(); e.stopPropagation();
                     var nq = Number(t.dataset.q);
-                    if (nq < 0) return;
+                    if (!(nq > 0)) return;   // − stops at the floor; it never deletes (× removes)
                     t.style.opacity = '0.5';
                     OPT.qty(t.dataset.seq, nq);
                 }
@@ -2492,7 +2495,10 @@ window.posToggleFullscreen = function() {
             cart.addEventListener('change', function(e) {
                 if (e.target.classList.contains('aj-qi')) {
                     var nq = Number(e.target.value);
-                    if (isNaN(nq)) { renderCart(lastCartData); return; }
+                    // Empty/0/NaN (e.g. the box was cleared to retype a decimal) must not delete
+                    // the line — revert to the last good qty. Any value > 0 (incl. decimals like
+                    // 0.5) keeps the line and recomputes its amount (qty × rate).
+                    if (!(nq > 0)) { renderCart(lastCartData); return; }
                     OPT.qty(e.target.dataset.seq, nq);
                 }
                 if (e.target.classList.contains('aj-mode')) {
