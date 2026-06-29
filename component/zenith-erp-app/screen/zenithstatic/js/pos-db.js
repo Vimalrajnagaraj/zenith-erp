@@ -2,9 +2,15 @@ const PosDB = (function() {
     const DB_NAME = 'ZenithOfflinePosDB';
     const DB_VERSION = 1;
     let db = null;
+    let initPromise = null;
 
     function init() {
-        return new Promise((resolve, reject) => {
+        // Idempotent: share ONE open() across the page-load catalog sync, the online/offline event
+        // handler and every method below, so a caller that runs before the first open completes
+        // (e.g. $(document).ready -> updateOnlineStatus -> pushQueueToServer) never hits a null db
+        // ("TypeError: null is not an object (evaluating 'db.transaction')").
+        if (initPromise) return initPromise;
+        initPromise = new Promise((resolve, reject) => {
             const request = indexedDB.open(DB_NAME, DB_VERSION);
             
             request.onerror = (event) => reject('IndexedDB error: ' + event.target.error);
@@ -31,11 +37,13 @@ const PosDB = (function() {
                 }
             };
         });
+        return initPromise;
     }
 
     // Sync Catalog from Server
     async function syncCatalog(terminalId) {
         try {
+            if (!db) await init();
             const response = await fetch('Terminal/exportPosCatalog', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -68,7 +76,8 @@ const PosDB = (function() {
     }
 
     // Search Product Local
-    function searchProduct(barcodeOrName) {
+    async function searchProduct(barcodeOrName) {
+        if (!db) await init();
         return new Promise((resolve, reject) => {
             const transaction = db.transaction(['products'], 'readonly');
             const store = transaction.objectStore('products');
@@ -94,7 +103,8 @@ const PosDB = (function() {
     }
 
     // Add Offline Transaction
-    function queueOfflineTransaction(txnObj) {
+    async function queueOfflineTransaction(txnObj) {
+        if (!db) await init();
         return new Promise((resolve, reject) => {
             const transaction = db.transaction(['syncQueue'], 'readwrite');
             const store = transaction.objectStore('syncQueue');
@@ -106,6 +116,7 @@ const PosDB = (function() {
 
     // Push Offline Queue to Server
     async function pushQueueToServer(terminalId) {
+        if (!db) await init();
         return new Promise((resolve, reject) => {
             const transaction = db.transaction(['syncQueue'], 'readwrite');
             const store = transaction.objectStore('syncQueue');
