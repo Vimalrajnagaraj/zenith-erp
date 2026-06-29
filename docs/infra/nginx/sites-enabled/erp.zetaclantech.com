@@ -4,6 +4,14 @@ server {
 
     rewrite ^/qapp$ /qapps permanent;
 
+    # POS terminal is /apps-only (optimistic pos-terminal.js); the /qapps Quasar SPA strips that
+    # JS and round-trips every product tap. Bounce any /qapps POS-terminal URL to the identical
+    # /apps URL at the proxy, so a kiosk bookmarked to /qapps never even loads the slow SPA shell
+    # (no client-side hop). Path + query string are preserved; /apps is unaffected.
+    location ^~ /qapps/zenith/pos/Terminal {
+        rewrite ^/qapps(/.*)$ https://$host/apps$1 permanent;
+    }
+
     # Security headers (defined once, included in all locations via snippets)
     add_header X-Content-Type-Options "nosniff" always;
     add_header X-Frame-Options "SAMEORIGIN" always;

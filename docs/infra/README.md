@@ -24,6 +24,16 @@ Moqui sets `Set-Cookie: JSESSIONID`/`moqui.visitor` on every response incl. stat
 Cloudflare cache them (`MISS`→`HIT`, served from the India edge). **Never** add this to the `/Login`,
 `/signup`, or `location /` blocks — those must set the session cookie. See [[project_site-performance]].
 
+### POS terminal /qapps→/apps redirect baked into `erp.zetaclantech.com` (2026-06-29)
+A `location ^~ /qapps/zenith/pos/Terminal { rewrite ^/qapps(/.*)$ https://$host/apps$1 permanent; }`
+block (just after the `^/qapp$` rewrite) **301-redirects any /qapps POS-terminal URL to the identical
+/apps URL** (path + query preserved). The terminal's optimistic cart engine (`pos-terminal.js`) is
+/apps-only — the /qapps Quasar SPA strips it, so every product tap round-trips a ~2MB screen reload.
+This bounces a kiosk bookmarked to /qapps **before** the slow SPA shell even loads (no client-side hop).
+Only the terminal path is matched; other /qapps screens are untouched. There is ALSO a client-side
+`<img onload>` fallback inside `Terminal.xml` (covers any path that bypasses nginx). See
+[[project_pos-qapps-terminal-redirect]].
+
 ## systemd (`/etc/systemd/system/`)
 `systemd/moqui-port-guard.service` — defense-in-depth firewall: re-adds a `DOCKER-USER` iptables (v4+v6)
 DROP for external `eth0:8080` on boot, so Moqui's Docker-published `:8080` can't be reached from the
