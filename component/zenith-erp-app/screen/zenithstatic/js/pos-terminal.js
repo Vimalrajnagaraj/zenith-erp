@@ -3,7 +3,7 @@
 // both bind a grid-submit handler and every product tap fires TWO addItem POSTs,
 // making the cart flicker through optimistic + two server settles ("three states").
 window.__posTermJsActive = true;
-console.log('[posterm] script loaded v119 — posOpenHistory defined:', (typeof window.posOpenHistory));
+console.log('[posterm] script loaded v120 — posOpenHistory defined:', (typeof window.posOpenHistory));
 /* POS Terminal - external JS for SPA (qapps) - Full AJAX */
 
 /* === Close the SPA left nav drawer when on the POS terminal ===
@@ -833,6 +833,95 @@ window._posOffline = (function() {
         document.addEventListener('click', function(e) {
             var b = (e.target && e.target.closest) ? e.target.closest('#pos-history-btn, #pos-history-btn-ns') : null;
             if (b) { console.log('[posterm] delegation caught history click'); e.preventDefault(); if (typeof window.posOpenHistory === 'function') window.posOpenHistory(); }
+        });
+    }
+
+    /* === Customer picker: attach a contact (Customer role) to the OPEN bill === */
+    function getOpenTxId() {
+        var af = document.getElementById('cartInlineAddForm');
+        var t = af ? af.querySelector('[name=transactionId]') : document.querySelector('input[name="transactionId"]');
+        return t ? (t.value || '') : '';
+    }
+    function setCustChip(name) {
+        var el = document.getElementById('pos-cust-name');
+        if (el) el.textContent = (name && name.length) ? name : 'Walk-In';
+    }
+    function custPost(transition, params) {
+        params = params || {};
+        if (CTX.sessionId) params.sessionId = CTX.sessionId;
+        params.moquiSessionToken = histToken();
+        return fetch('Terminal/' + transition, {
+            method: 'POST', headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+            body: new URLSearchParams(params), credentials: 'same-origin'
+        }).then(function(r) { return r.json(); });
+    }
+    var customerOverlay = null;
+    function closeCustomer() { if (customerOverlay) { customerOverlay.remove(); customerOverlay = null; } }
+    function openCustomerPicker() {
+        var af = document.getElementById('cartInlineAddForm');
+        CTX.sessionId = af ? ((af.querySelector('[name=sessionId]') || {}).value || '') : CTX.sessionId;
+        closeCustomer();
+        var ov = document.createElement('div'); customerOverlay = ov;
+        ov.style.cssText = 'position:fixed;inset:0;z-index:2147483647;background:rgba(0,0,0,0.5);display:flex;align-items:flex-start;justify-content:center;padding-top:6vh';
+        var panel = document.createElement('div');
+        panel.style.cssText = 'background:#fff;border-radius:16px;width:90vw;max-width:560px;max-height:84vh;display:flex;flex-direction:column;box-shadow:0 12px 48px rgba(0,0,0,0.3);overflow:hidden';
+        panel.innerHTML =
+            '<div style="padding:14px 18px;background:#283593;color:#fff;display:flex;justify-content:space-between;align-items:center">'
+          + '<span style="font-size:17px;font-weight:700">&#128100; Customer for this bill</span>'
+          + '<button id="cust-close" style="background:none;border:none;color:#fff;font-size:24px;cursor:pointer;padding:0 4px">&times;</button></div>'
+          + '<div style="padding:12px 18px;border-bottom:1px solid #e0e0e0;display:flex;gap:8px;align-items:center">'
+          + '<input id="cust-search" type="text" placeholder="Search name or phone…" autocomplete="off" style="flex:1;padding:11px 14px;border:1px solid #ccc;border-radius:8px;font-size:15px;box-sizing:border-box;outline:none"/>'
+          + '<a href="/apps/zenith/Contacts/Customers" target="_blank" rel="noopener" style="white-space:nowrap;padding:11px 14px;border-radius:8px;background:#e8eaf6;color:#283593;border:1px solid #c5cae9;font-weight:700;font-size:13px;text-decoration:none" title="Add a new customer in Contacts (opens a new tab)">&#43; New</a></div>'
+          + '<div style="padding:8px 18px 0"><button id="cust-walkin" type="button" style="width:100%;padding:11px;border:1px dashed #bbb;background:#fafafa;border-radius:8px;font-size:14px;font-weight:700;color:#555;cursor:pointer">&#128694; Walk-In (no customer)</button></div>'
+          + '<div id="cust-list" style="flex:1;overflow-y:auto;padding:10px 14px 16px"><div style="text-align:center;padding:30px;color:#999">Type a name or phone number to search your customers…</div></div>';
+        ov.appendChild(panel); document.body.appendChild(ov);
+        ov.addEventListener('click', function(ev) { if (ev.target === ov) closeCustomer(); });
+        panel.querySelector('#cust-close').addEventListener('click', closeCustomer);
+        panel.querySelector('#cust-walkin').addEventListener('click', function() {
+            var tx = getOpenTxId();
+            if (!tx) { setCustChip('Walk-In'); closeCustomer(); return; }
+            custPost('clearCustomer', {transactionId: tx}).then(function() {
+                setCustChip('Walk-In'); histToast('Customer cleared — Walk-In', '#607d8b'); closeCustomer();
+            });
+        });
+        var si = panel.querySelector('#cust-search'); var t = null;
+        si.addEventListener('input', function() { clearTimeout(t); t = setTimeout(function() { loadCustList(si.value); }, 350); });
+        si.focus();
+        loadCustList('');
+    }
+    function loadCustList(term) {
+        var listEl = document.getElementById('cust-list'); if (!listEl) return;
+        listEl.innerHTML = '<div style="text-align:center;padding:24px;color:#999">Searching…</div>';
+        custPost('searchCustomers', {term: term || ''}).then(function(d) {
+            if (!d || !d.success) { listEl.innerHTML = '<div style="text-align:center;padding:24px;color:#c62828">Error loading customers</div>'; return; }
+            if (!d.customers || !d.customers.length) { listEl.innerHTML = '<div style="text-align:center;padding:24px;color:#999">No customers found. Use “+ New” to add one in Contacts.</div>'; return; }
+            var h = '';
+            d.customers.forEach(function(c) {
+                h += '<div class="cust-row" data-pid="' + c.partyId + '" data-name="' + (c.name || '').replace(/"/g, '&quot;') + '" style="padding:12px 14px;border:1px solid #e8e8e8;border-radius:10px;margin-bottom:8px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;gap:10px" onmouseover="this.style.background=\'#e8eaf6\'" onmouseout="this.style.background=\'#fff\'">'
+                  + '<span style="font-weight:700;color:#283593">' + (c.name || c.partyId) + '</span>'
+                  + (c.phone ? '<span style="font-size:13px;color:#777;white-space:nowrap">' + c.phone + '</span>' : '')
+                  + '</div>';
+            });
+            listEl.innerHTML = h;
+            listEl.querySelectorAll('.cust-row').forEach(function(row) {
+                row.addEventListener('click', function() {
+                    var tx = getOpenTxId();
+                    var pid = row.dataset.pid, nm = row.dataset.name;
+                    if (!tx) { histToast('Add an item to the bill first, then set the customer', '#e65100'); return; }
+                    custPost('setCustomer', {transactionId: tx, customerPartyId: pid}).then(function(d) {
+                        if (d && d.success) { setCustChip(d.customer || nm); histToast('Customer: ' + (d.customer || nm), '#283593'); closeCustomer(); }
+                        else { histToast((d && d.error) || 'Could not set customer', '#c62828'); }
+                    });
+                });
+            });
+        });
+    }
+    window.posOpenCustomer = function() { openCustomerPicker(); };
+    if (!window.__posCustDelegated) {
+        window.__posCustDelegated = true;
+        document.addEventListener('click', function(e) {
+            var b = (e.target && e.target.closest) ? e.target.closest('#pos-customer-btn') : null;
+            if (b) { e.preventDefault(); if (typeof window.posOpenCustomer === 'function') window.posOpenCustomer(); }
         });
     }
 
@@ -2257,6 +2346,9 @@ window.posToggleFullscreen = function() {
             lastTxnNum = d.txnNum || '';
             lastPay = d.pay || 0;
             lastCartData = d;
+            // Keep the header customer chip in sync with the authoritative cart
+            var _cn = document.getElementById('pos-cust-name');
+            if (_cn) _cn.textContent = (d.customer && d.customer.length) ? d.customer : 'Walk-In';
         }
 
         /* ============================================================

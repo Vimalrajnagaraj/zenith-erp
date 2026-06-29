@@ -1506,6 +1506,106 @@
 
 
 
+    <!-- ===== Customer (from Contacts) attach to the open bill ===== -->
+    <transition name="searchCustomers" begin-transaction="true">
+        <actions><script><![CDATA[
+            def term = (ec.web.parameters.term ?: '').toString().trim()
+            def termL = term.toLowerCase()
+            // Scope to the terminal's organization (like the product grid), falling back to the
+            // user's active org — so it also works for an admin driving a tenant's session.
+            def sessId = ec.web.parameters.sessionId
+            def orgId = null
+            if (sessId) { def s = ec.entity.find("zenith.erp.pos.PosSession").condition("sessionId", sessId).one()
+                if (s?.terminalId) orgId = ec.entity.find("zenith.erp.pos.PosTerminal").condition("terminalId", s.terminalId).one()?.organizationPartyId }
+            if (!orgId || orgId == '_NA_') { def ao = ec.user.getPreference('ACTIVE_ORGANIZATION'); orgId = (ao && ao != '_NA_') ? ao : null }
+            def out = []
+            try {
+                def rows = ec.entity.find("mantle.party.PartyDetailAndRole")
+                    .condition("roleTypeId", "in", ['Customer','CustomerBillTo'])
+                    .condition("ownerPartyId", orgId)
+                    .orderBy("organizationName,firstName,lastName").limit(1000).list()
+                def nameOf = { r -> (r.organizationName ?: (((r.firstName ?: '') + ' ' + (r.lastName ?: '')).trim())) ?: r.partyId }
+                def custIdList = rows.collect { it.partyId }.unique()
+                // Build partyId -> phone for the org's customers in a few bounded queries (no N+1).
+                // Phones live in TelecomNumber (countryCode/areaCode/contactNumber), reached via PartyContactMech.
+                def pid2phone = [:]
+                if (custIdList) {
+                    def pcms = ec.entity.find("mantle.party.contact.PartyContactMech").condition("partyId", "in", custIdList)
+                        .conditionDate("fromDate", "thruDate", ec.user.nowTimestamp).list()
+                    def cmIds = pcms.collect { it.contactMechId }.unique()
+                    def cm2num = [:]
+                    if (cmIds) {
+                        ec.entity.find("mantle.party.contact.TelecomNumber").condition("contactMechId", "in", cmIds).list().each { tn ->
+                            cm2num[tn.contactMechId] = ((tn.countryCode ? ('+' + tn.countryCode + ' ') : '') + (tn.areaCode ?: '') + ' ' + (tn.contactNumber ?: '')).replaceAll("\\s+", " ").trim()
+                        }
+                    }
+                    pcms.each { pcm -> def n = cm2num[pcm.contactMechId]; if (n && !pid2phone[pcm.partyId]) pid2phone[pcm.partyId] = n }
+                }
+                def digits = term.replaceAll("[^0-9]", "")
+                def seen = [:] as Map
+                for (r in rows) {
+                    if (seen[r.partyId]) continue
+                    def nm = nameOf(r)
+                    def phone = pid2phone[r.partyId] ?: ''
+                    def phoneDigits = phone.replaceAll("[^0-9]", "")
+                    def match = !term || nm.toLowerCase().contains(termL) || (r.partyId ?: '').toLowerCase().contains(termL) || (digits.length() >= 3 && phoneDigits.contains(digits))
+                    if (!match) continue
+                    seen[r.partyId] = true
+                    out.add([partyId:r.partyId, name:nm, phone:phone])
+                    if (out.size() >= 30) break
+                }
+                ec.web.sendJsonResponse([success:true, customers:out])
+            } catch (Exception e) { ec.web.sendJsonResponse([success:false, error:e.message, customers:[]]) }
+        ]]></script></actions>
+        <default-response type="none"/>
+    </transition>
+
+    <transition name="setCustomer" begin-transaction="true">
+        <actions><script><![CDATA[
+            def txId = ec.web.parameters.transactionId
+            def cpid = ec.web.parameters.customerPartyId
+            if (!txId || !cpid) { ec.web.sendJsonResponse([success:false, error:'Missing customer or bill']); return }
+            def txn = ec.entity.find("zenith.erp.pos.PosTransaction").condition("transactionId", txId).one()
+            if (!txn) { ec.web.sendJsonResponse([success:false, error:'No open bill — add an item first']); return }
+            if (txn.statusId != 'PtCreated') { ec.web.sendJsonResponse([success:false, error:'This bill is already finalized']); return }
+            // Org isolation: a customer may only be attached to a bill of the same organization.
+            def custParty = ec.entity.find("mantle.party.Party").condition("partyId", cpid).one()
+            if (txn.organizationPartyId && custParty?.ownerPartyId && custParty.ownerPartyId != txn.organizationPartyId) {
+                ec.web.sendJsonResponse([success:false, error:'That customer belongs to a different organization']); return }
+            def pdr = ec.entity.find("mantle.party.PartyDetailAndRole").condition("partyId", cpid).limit(1).list()
+            def nm = null
+            if (pdr) { def r = pdr[0]; nm = (r.organizationName ?: (((r.firstName ?: '') + ' ' + (r.lastName ?: '')).trim())) }
+            if (!nm) { def per = ec.entity.find("mantle.party.Person").condition("partyId", cpid).one()
+                if (per) nm = (((per.firstName ?: '') + ' ' + (per.lastName ?: '')).trim())
+                else nm = ec.entity.find("mantle.party.Organization").condition("partyId", cpid).one()?.organizationName }
+            nm = nm ?: cpid
+            def phone = null
+            def pcms = ec.entity.find("mantle.party.contact.PartyContactMech").condition("partyId", cpid).conditionDate("fromDate","thruDate", ec.user.nowTimestamp).list()
+            for (pcm in pcms) {
+                def tn = ec.entity.find("mantle.party.contact.TelecomNumber").condition("contactMechId", pcm.contactMechId).one()
+                if (tn) { phone = ((tn.countryCode ? ('+' + tn.countryCode + ' ') : '') + (tn.areaCode ?: '') + ' ' + (tn.contactNumber ?: '')).replaceAll("\\s+", " ").trim(); if (phone) break }
+            }
+            def gstin = ec.entity.find("zenith.erp.india.IndiaGstin").condition("partyId", cpid).one()?.gstin
+            ec.service.sync().name("update#zenith.erp.pos.PosTransaction")
+                .parameters([transactionId:txId, customerPartyId:cpid, customerName:nm, customerPhone:phone, customerGstin:gstin, customerTaxRegNumber:gstin]).call()
+            ec.web.sendJsonResponse([success:true, customer:nm, customerPhone:(phone ?: ''), customerPartyId:cpid, customerGstin:(gstin ?: '')])
+        ]]></script></actions>
+        <default-response type="none"/>
+    </transition>
+
+    <transition name="clearCustomer" begin-transaction="true">
+        <actions><script><![CDATA[
+            def txId = ec.web.parameters.transactionId
+            def v = txId ? ec.entity.find("zenith.erp.pos.PosTransaction").condition("transactionId", txId).one() : null
+            if (v && v.statusId == 'PtCreated') {
+                v.customerPartyId = null; v.customerName = null; v.customerPhone = null
+                v.customerGstin = null; v.customerTaxRegNumber = null; v.update()
+            }
+            ec.web.sendJsonResponse([success:true, customer:'', customerPhone:'', customerPartyId:''])
+        ]]></script></actions>
+        <default-response type="none"/>
+    </transition>
+
     <transition name="closeSession" begin-transaction="true">
 
 
@@ -2645,6 +2745,7 @@
 
 
                         grand:txn?.grandTotal ?: 0, pay:txn?.payableAmount ?: 0, round:txn?.roundOff ?: 0,
+                        customer:txn?.customerName ?: '', customerPhone:txn?.customerPhone ?: '', customerPartyId:txn?.customerPartyId ?: '',
 
 
 
@@ -4179,7 +4280,7 @@
 
 
                         </form-single>
-                        <render-mode><text type="html,qvt" template="true"><![CDATA[<div style="text-align:center;margin-top:18px"><button id="pos-history-btn-ns" type="button" onclick="window.posOpenHistory&amp;&amp;window.posOpenHistory()" style="padding:10px 24px;border-radius:8px;font-size:14px;font-weight:bold;cursor:pointer;background:#1565c0;color:#fff;border:1px solid #42a5f5">&#128196; View Bill History<span style="margin-left:7px;padding:1px 6px;border:1px solid rgba(255,255,255,0.7);border-radius:4px;font-size:11px;font-weight:700;opacity:0.9">F9</span></button></div><script src="/zenithstatic/js/pos-terminal.js?v=119"></script>]]></text></render-mode>
+                        <render-mode><text type="html,qvt" template="true"><![CDATA[<div style="text-align:center;margin-top:18px"><button id="pos-history-btn-ns" type="button" onclick="window.posOpenHistory&amp;&amp;window.posOpenHistory()" style="padding:10px 24px;border-radius:8px;font-size:14px;font-weight:bold;cursor:pointer;background:#1565c0;color:#fff;border:1px solid #42a5f5">&#128196; View Bill History<span style="margin-left:7px;padding:1px 6px;border:1px solid rgba(255,255,255,0.7);border-radius:4px;font-size:11px;font-weight:700;opacity:0.9">F9</span></button></div><script src="/zenithstatic/js/pos-terminal.js?v=120"></script>]]></text></render-mode>
 
 
 
@@ -5157,6 +5258,8 @@ body.body--dark .pos-cat-strip a{background:#37474f!important;color:#e0e0e0!impo
 
 
 
+
+        <button id="pos-customer-btn" type="button" onclick="window.posOpenCustomer&amp;&amp;window.posOpenCustomer()" style="padding:6px 12px;border-radius:6px;font-size:13px;font-weight:bold;cursor:pointer;background:#283593;color:#fff;border:1px solid #5c6bc0;margin-right:6px;max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;-webkit-tap-highlight-color:rgba(0,0,0,0.1)" title="Attach a customer from your Contacts to this bill">&#128100; <span id="pos-cust-name">${(txn.customerName)!'Walk-In'}</span></button>
 
         <button id="pos-history-btn" type="button" onclick="window.posOpenHistory&amp;&amp;window.posOpenHistory()" style="padding:6px 12px;border-radius:6px;font-size:13px;font-weight:bold;cursor:pointer;background:#1565c0;color:#fff;border:1px solid #42a5f5;-webkit-tap-highlight-color:rgba(0,0,0,0.1)">&#128196; HISTORY<span style="margin-left:7px;padding:1px 6px;border:1px solid rgba(255,255,255,0.7);border-radius:4px;font-size:11px;font-weight:700;opacity:0.9">F9</span></button><a href="CreditBills" style="padding:6px 12px;border-radius:6px;font-size:13px;font-weight:bold;cursor:pointer;background:#e65100;color:#fff;border:1px solid #ff9800;text-decoration:none;margin-left:6px;-webkit-tap-highlight-color:rgba(0,0,0,0.1)" title="Credit / Outstanding Bills">&#128181; CREDIT BILLS</a><a href="/apps/zenith/Inventory/FindProduct" target="_blank" rel="noopener" style="padding:6px 12px;border-radius:6px;font-size:13px;font-weight:bold;cursor:pointer;background:#00838f;color:#fff;border:1px solid #4dd0e1;text-decoration:none;margin-left:6px;-webkit-tap-highlight-color:rgba(0,0,0,0.1)" title="Add or manage products (opens in a new tab)">&#10133; ITEM</a><a href="/apps/zenith/Inventory/CreateCatalogue" target="_blank" rel="noopener" style="padding:6px 12px;border-radius:6px;font-size:13px;font-weight:bold;cursor:pointer;background:#6a1b9a;color:#fff;border:1px solid #ba68c8;text-decoration:none;margin-left:6px;-webkit-tap-highlight-color:rgba(0,0,0,0.1)" title="Create or manage catalogues / categories (opens in a new tab)">&#128193; CATALOGUE</a>
 
@@ -6402,7 +6505,7 @@ body.body--dark .pos-cat-strip a{background:#37474f!important;color:#e0e0e0!impo
 <script src="https://cdn.jsdelivr.net/npm/qz-tray@2.2.4/qz-tray.js"></script>
 
 
-<script src="/zenithstatic/js/pos-terminal.js?v=119"></script>
+<script src="/zenithstatic/js/pos-terminal.js?v=120"></script>
 
 
 
