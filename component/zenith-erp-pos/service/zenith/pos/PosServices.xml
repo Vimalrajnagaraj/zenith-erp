@@ -25,6 +25,33 @@
                 <service-call name="update#zenith.erp.pos.PosSession" in-map="[sessionId: existingOpen[0].sessionId, statusId:'PsClosed', closeDate: ec.user.nowTimestamp, closingCash: existingOpen[0].openingCash]"/>
                 <script>ec.logger.info("Auto-closed empty orphaned POS session " + existingOpen[0].sessionId + " on terminal " + terminalId)</script>
             </if>
+
+            <!-- Start-fresh on open: retire THIS operator's other abandoned open sessions (no completed
+                 sales) on any terminal and discard their unpaid carts, so the terminal's resume-most-recent-
+                 open-session path can never resurface a stale cart from a different session. Sessions that
+                 already recorded a sale are left untouched (they must be closed/reconciled deliberately).
+                 Only PtCreated (never-paid, no bill number) carts are removed — issued bills are never touched. -->
+            <script><![CDATA[
+                def _opId = ec.user.userAccount?.partyId
+                if (_opId) {
+                    ec.entity.find("zenith.erp.pos.PosSession")
+                        .condition("operatorPartyId", _opId).condition("statusId", "PsOpen").list().each { os ->
+                        def soldCount = ec.entity.find("zenith.erp.pos.PosTransaction")
+                            .condition("sessionId", os.sessionId).condition("statusId", "PtCompleted").count()
+                        if (soldCount == 0) {
+                            ec.entity.find("zenith.erp.pos.PosTransaction").condition("sessionId", os.sessionId).condition("statusId", "PtCreated").list().each { st ->
+                                ec.entity.find("zenith.erp.pos.PosTransactionItem").condition("transactionId", st.transactionId).deleteAll()
+                                ec.entity.find("zenith.erp.pos.PosPayment").condition("transactionId", st.transactionId).deleteAll()
+                                ec.entity.find("zenith.erp.pos.PosItemPriceOverride").condition("transactionId", st.transactionId).deleteAll()
+                                try { st.delete() } catch (Exception e) { st.statusId = 'PtVoided'; st.update() }
+                            }
+                            ec.service.sync().name("update#zenith.erp.pos.PosSession")
+                                .parameters([sessionId: os.sessionId, statusId:'PsClosed', closeDate: ec.user.nowTimestamp, closingCash: (os.openingCash ?: 0)]).call()
+                            ec.logger.info("Start-fresh: retired abandoned POS session " + os.sessionId + " (operator " + _opId + ")")
+                        }
+                    }
+                }
+            ]]></script>
             <entity-find-one entity-name="zenith.erp.pos.PosTerminal" value-field="_term"><field-map field-name="terminalId" from="terminalId"/></entity-find-one>
             <service-call name="create#zenith.erp.pos.PosSession" out-map="context"
                 in-map="[terminalId:terminalId, organizationPartyId:_term?.organizationPartyId, operatorPartyId:ec.user.userAccount?.partyId,
@@ -92,6 +119,17 @@
                 in-map="[sessionId:sessionId, closeDate:ec.user.nowTimestamp,
                          closingCash:closingCash, expectedCash:expectedCash,
                          cashDifference:cashDiff, statusId:'PsClosed']"/>
+
+            <!-- Discard any unpaid in-progress cart left on this session so a later open/resume starts clean.
+                 Only PtCreated (never-paid, no bill number) carts are removed; completed/issued bills are untouched. -->
+            <script><![CDATA[
+                ec.entity.find("zenith.erp.pos.PosTransaction").condition("sessionId", sessionId).condition("statusId", "PtCreated").list().each { st ->
+                    ec.entity.find("zenith.erp.pos.PosTransactionItem").condition("transactionId", st.transactionId).deleteAll()
+                    ec.entity.find("zenith.erp.pos.PosPayment").condition("transactionId", st.transactionId).deleteAll()
+                    ec.entity.find("zenith.erp.pos.PosItemPriceOverride").condition("transactionId", st.transactionId).deleteAll()
+                    try { st.delete() } catch (Exception e) { st.statusId = 'PtVoided'; st.update() }
+                }
+            ]]></script>
         </actions>
     </service>
 
