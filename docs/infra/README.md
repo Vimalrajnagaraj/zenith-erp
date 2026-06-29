@@ -1,9 +1,22 @@
-# Server infrastructure (reference copies — NOT auto-deployed)
+# Server infrastructure (repo = source of truth; sync both ways with the scripts)
 
-These are **captured copies** of live host config on `root@167.233.117.229`. Moqui/Postgres run in
-Docker (`deploy-moqui-1`, `deploy-db-1`, `deploy-opensearch-1`); **nginx runs on the host** (not a
-container) and terminates TLS, with Cloudflare in front. Editing a file here changes nothing until you
-copy it back to the server and reload. Keep these in sync when you change server config.
+These mirror the live host config on `root@167.233.117.229`. Moqui/Postgres run in Docker
+(`deploy-moqui-1`, `deploy-db-1`, `deploy-opensearch-1`); **nginx runs on the host** (not a
+container) and terminates TLS, with Cloudflare in front — so host config is NOT carried by the
+`moqui-deploy` image pipeline.
+
+## One-command sync (no more manual scp)
+- **Push repo → server** (rebuild recovery, or to ship a repo-side change):
+  `bash docs/infra/apply-host-config.sh [user@host]`
+  Idempotent; runs `nginx -t` and only reloads if valid (a bad config can't take the site down).
+  On a **fresh box, issue TLS certs first** (`certbot --nginx -d erp.zetaclantech.com`) — the vhost
+  references `/etc/letsencrypt/live/.../*.pem`, so without them `nginx -t` fails and apply aborts.
+- **Pull server → repo** (after a certbot renewal or a hand-edit on the box):
+  `bash docs/infra/capture-host-config.sh [user@host]` → review `git diff docs/infra` → commit.
+
+⚠️ **Never leave a `.bak`/copy inside `/etc/nginx/sites-enabled/`** — nginx includes that dir by glob
+(`include /etc/nginx/sites-enabled/*;`), so a stray full-vhost copy loads a duplicate `server` block
+("conflicting server name … ignored"). Put backups in `/etc/nginx/backups/` (outside the glob).
 
 ## nginx (`/etc/nginx/`)
 | Repo path | Server path |
