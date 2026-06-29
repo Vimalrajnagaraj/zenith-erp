@@ -1585,9 +1585,12 @@ window.posToggleFullscreen = function() {
             el = el.parentNode;
         }
         document.body.style.overflow = 'hidden';
-        root.style.cssText = 'position:fixed;top:0;left:0;width:100vw;height:100vh;z-index:999999;background:#fff';
+        // height:100dvh (dynamic viewport height) overrides 100vh where supported (Safari 15.4+)
+        // so the fullscreen terminal isn't clipped by the iOS Safari URL bar; falls back to 100vh
+        // on older browsers (the invalid dvh declaration is simply dropped).
+        root.style.cssText = 'position:fixed;top:0;left:0;width:100vw;height:100vh;height:100dvh;z-index:999999;background:#fff';
         var ml = root.querySelector('.pos-main-layout');
-        if (ml) ml.style.height = 'calc(100vh - 52px)';
+        if (ml) { ml.style.height = 'calc(100vh - 52px)'; ml.style.height = 'calc(100dvh - 52px)'; }
         window.scrollTo(0, 0);
         try { sessionStorage.setItem('posFS', '1'); } catch(e) {}
         var ic = document.getElementById('fsBtnIcon');
