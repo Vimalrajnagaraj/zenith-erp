@@ -1,9 +1,11 @@
-const CACHE_NAME = 'zenith-pos-cache-v3';
+const CACHE_NAME = 'zenith-pos-cache-v4';
 
 // Minimal precache — only what's needed for an offline shell.
+// NOTE: the Terminal screen is mounted at /apps/zenith/pos/Terminal (NOT .../pos/Pos/...);
+// the /Pos/ paths used previously 404'd, so the offline shell never cached anything.
 const PRECACHE_ASSETS = [
-    '/apps/zenith/pos/Pos/Terminal',
-    '/apps/zenith/pos/Pos/manifest.json'
+    '/apps/zenith/pos/Terminal',
+    '/apps/zenith/pos/manifest.json'
 ];
 
 self.addEventListener('install', event => {
@@ -68,7 +70,7 @@ self.addEventListener('fetch', event => {
                 }
                 return response;
             }).catch(() =>
-                caches.match(event.request).then(c => c || caches.match('/apps/zenith/pos/Pos/Terminal'))
+                caches.match(event.request).then(c => c || caches.match('/apps/zenith/pos/Terminal'))
             )
         );
         return;

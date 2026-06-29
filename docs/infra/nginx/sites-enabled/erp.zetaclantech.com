@@ -136,8 +136,13 @@ server {
         add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
     }
 
-    # Service worker - never cache
-    location = /static/sw.js {
+    # Service worker - never cache. The POS SW is served by Moqui at /apps/zenith/pos/sw.js;
+    # WITHOUT this exact-match block it falls into the `~* \.(js|...)$` regex above and gets
+    # `Cache-Control: immutable, max-age=1y` -> Cloudflare + browsers pin a stale sw.js for a
+    # YEAR and SW updates can never ship. An exact (`=`) match outranks the regex. A SW script
+    # MUST revalidate every load; no-store also keeps Cloudflare from edge-caching it.
+    # (Old speculative path was /static/sw.js, which Moqui never served.)
+    location = /apps/zenith/pos/sw.js {
         proxy_pass http://moqui_backend;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
@@ -149,6 +154,7 @@ server {
         expires -1;
         add_header Cache-Control "no-cache, no-store, must-revalidate";
         add_header Service-Worker-Allowed "/";
+        add_header X-Content-Type-Options "nosniff" always;
         add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
     }
 
