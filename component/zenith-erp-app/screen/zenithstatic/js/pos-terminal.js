@@ -3,7 +3,7 @@
 // both bind a grid-submit handler and every product tap fires TWO addItem POSTs,
 // making the cart flicker through optimistic + two server settles ("three states").
 window.__posTermJsActive = true;
-console.log('[posterm] script loaded v116 — posOpenHistory defined:', (typeof window.posOpenHistory));
+console.log('[posterm] script loaded v117 — posOpenHistory defined:', (typeof window.posOpenHistory));
 /* POS Terminal - external JS for SPA (qapps) - Full AJAX */
 
 /* === Close the SPA left nav drawer when on the POS terminal ===
@@ -577,6 +577,8 @@ window._posOffline = (function() {
             var cartEl = document.querySelector('.pos-cart');
             if (cartEditorEl && cartEditorEl.parentNode) cartEditorEl.parentNode.removeChild(cartEditorEl);
             cartEditorEl = null;
+            // Stop routing product-grid taps into the (now closed) editor — taps go back to the live cart.
+            window.__posCartEditorAddProduct = null;
             if (cartEl) cartEl.style.position = cartEditorPrevPos || '';
         }
         function openCartEditor(bill) {
@@ -622,7 +624,7 @@ window._posOffline = (function() {
             ed.innerHTML =
                 '<div style="background:#1565c0;color:#fff;padding:10px 14px;display:flex;justify-content:space-between;align-items:center;flex-shrink:0">'
               + '<div><span style="font-size:16px;font-weight:800">&#9998; Editing Bill #'+bill.billNo+'</span>'
-              + '<div style="font-size:11px;opacity:0.9;margin-top:2px">Change qty / price, remove or add items, then Save. This updates the same bill &mdash; not a new sale.</div></div>'
+              + '<div style="font-size:11px;opacity:0.9;margin-top:2px">Change qty / price, remove items, or <b>tap a product on the left</b> to add it, then Save. This updates the same bill &mdash; not a new sale.</div></div>'
               + '<button id="ced-cancel-x" title="Cancel" style="background:rgba(255,255,255,0.18);border:none;color:#fff;font-size:22px;line-height:1;cursor:pointer;border-radius:6px;width:34px;height:34px">&times;</button></div>'
               + '<div id="ced-rows" style="flex:1;overflow-y:auto;padding:6px 10px"></div>'
               + '<div style="flex-shrink:0;border-top:1px solid #e0e0e0;background:#f0faf0;padding:8px 12px;position:relative">'
@@ -795,6 +797,20 @@ window._posOffline = (function() {
             });
 
             renderRows();
+            // While this editor is open, a product tap on the left grid adds the product to THIS
+            // bill (the working model) instead of the live cart hidden behind the editor. The grid
+            // submit-interceptor (in the cart engine) calls this hook when it is set. Tapping a
+            // product already on the bill bumps that line's qty by 1 (a tracked amendment on save).
+            window.__posCartEditorAddProduct = function(pid, price, name) {
+                if (!pid) return;
+                var ex = null;
+                for (var i = 0; i < work.length; i++) { if (!work[i].removed && work[i].pid === pid) { ex = work[i]; break; } }
+                if (ex) { ex.qty = Math.round((ex.qty + 1) * 1000) / 1000; }
+                else { work.push({ seq: null, pid: pid, name: name || pid, uom: '', price: Number(price) || 0,
+                                   qty: 1, origPrice: Number(price) || 0, origQty: 0, taxRate: 0, isNew: true, removed: false }); }
+                renderRows();
+                histToast('Added ' + (name || pid) + ' to bill', '#2e7d32');
+            };
             setTimeout(function(){ var r=ed.querySelector('#ced-reason'); if(r) r.focus(); }, 50);
         }
         window.posOpenCartEditor = openCartEditor;
@@ -2534,6 +2550,16 @@ window.posToggleFullscreen = function() {
             if (!form || form.action.indexOf('addItem') === -1) return;
             e.preventDefault();
             var fd = new FormData(form);
+            // When a bill is being edited from History, the editor is mounted over the cart and a
+            // product tap should land in THAT bill, not the live cart behind it. Route to the editor.
+            if (window.__posCartEditorAddProduct) {
+                window.__posCartEditorAddProduct(fd.get('productId'), fd.get('unitPrice'),
+                    (function(){ var b = form.querySelector('button div'); return b ? b.textContent : ''; })());
+                var ebtn = form.querySelector('button');
+                if (ebtn) { ebtn.style.transform = 'scale(0.92)'; ebtn.style.boxShadow = '0 0 0 3px #1565c0';
+                    setTimeout(function() { ebtn.style.transform = ''; ebtn.style.boxShadow = ''; }, 250); }
+                return;
+            }
             if (!navigator.onLine && window._posOffline) {
                 window._posOffline.add(fd.get('productId'), fd.get('unitPrice'));
                 var obtn = form.querySelector('button');
