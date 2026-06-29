@@ -93,10 +93,82 @@
         });
     }
 
+    /* Make the Copilot FAB draggable by its toggle button, remembering the spot.
+       Click still opens the panel (a real drag is suppressed so it doesn't toggle).
+       Works for mouse + touch, in both /apps and /qapps. */
+    function makeDraggable(container, handle) {
+        if (!container || !handle || container._copilotDrag) return;
+        container._copilotDrag = true;
+        var KEY = "zenithCopilotPos";
+        var dragging = false, moved = false, startX = 0, startY = 0, origLeft = 0, origTop = 0;
+        function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
+        function positionWindow(top) {
+            var win = document.getElementById("ai-copilot-window");
+            if (!win) return;
+            // Open the panel downward when the FAB is in the top half, upward otherwise.
+            if (top < window.innerHeight / 2) { win.style.top = "56px"; win.style.bottom = "auto"; }
+            else { win.style.bottom = "56px"; win.style.top = "auto"; }
+        }
+        function applyPos(left, top) {
+            var w = container.offsetWidth || 140, h = container.offsetHeight || 44;
+            left = clamp(left, 4, window.innerWidth - w - 4);
+            top = clamp(top, 4, window.innerHeight - h - 4);
+            container.style.left = left + "px"; container.style.top = top + "px";
+            container.style.right = "auto"; container.style.bottom = "auto";
+            positionWindow(top);
+        }
+        function restore() {
+            try { var s = JSON.parse(localStorage.getItem(KEY) || "null");
+                if (s && typeof s.left === "number" && typeof s.top === "number") applyPos(s.left, s.top); } catch (e) {}
+        }
+        // Pointer Events + setPointerCapture: once captured, every move/up goes to the handle
+        // regardless of what's under the cursor — robust across mouse + touch, /apps + /qapps.
+        function endDrag(e) {
+            if (!dragging) return;
+            dragging = false;
+            try { if (e && e.pointerId != null) handle.releasePointerCapture(e.pointerId); } catch (err) {}
+            if (moved) {
+                var r = container.getBoundingClientRect();
+                try { localStorage.setItem(KEY, JSON.stringify({ left: r.left, top: r.top })); } catch (err) {}
+                // Swallow the click that follows a real drag so the panel doesn't toggle open.
+                var suppress = function(ev) { ev.stopPropagation(); ev.preventDefault(); handle.removeEventListener("click", suppress, true); };
+                handle.addEventListener("click", suppress, true);
+                setTimeout(function() { handle.removeEventListener("click", suppress, true); }, 60);
+            }
+        }
+        handle.addEventListener("pointerdown", function(e) {
+            if (e.button != null && e.button !== 0) return;   // left button / touch / pen only
+            dragging = true; moved = false;
+            startX = e.clientX; startY = e.clientY;
+            var r = container.getBoundingClientRect();
+            origLeft = r.left; origTop = r.top;
+            try { handle.setPointerCapture(e.pointerId); } catch (err) {}
+        });
+        // Listen on document (events bubble here) so the drag tracks even when the FAB
+        // slides out from under the cursor — more robust than handle-only + capture.
+        document.addEventListener("pointermove", function(e) {
+            if (!dragging) return;
+            var dx = e.clientX - startX, dy = e.clientY - startY;
+            if (!moved && (Math.abs(dx) > 4 || Math.abs(dy) > 4)) moved = true;
+            if (moved) applyPos(origLeft + dx, origTop + dy);
+        });
+        document.addEventListener("pointerup", endDrag);
+        document.addEventListener("pointercancel", endDrag);
+        handle.style.touchAction = "none";
+        if (!handle.title) handle.title = "Click to open · drag to move";
+        restore();
+        window.addEventListener("resize", function() {
+            // keep it on-screen after a viewport change (only if it was moved)
+            if (container.style.left) { var r = container.getBoundingClientRect(); applyPos(r.left, r.top); }
+        });
+    }
+
     function inject() {
         if (!document.body) return false;
         if (document.getElementById("ai-copilot-container")) {  // classic /apps already rendered it
             window._zenithCopilotLoaded = true;
+            injectStyle();  // ensure the fixed bottom-right positioning CSS is present in /apps too
+            makeDraggable(document.getElementById("ai-copilot-container"), document.getElementById("ai-copilot-toggle"));
             return true;
         }
         injectStyle();
@@ -112,6 +184,7 @@
             '</div>';
         document.body.appendChild(c);
         wire();
+        makeDraggable(c, document.getElementById("ai-copilot-toggle"));
         window._zenithCopilotLoaded = true;
         return true;
     }
