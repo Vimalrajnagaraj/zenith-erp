@@ -3,7 +3,7 @@
 // both bind a grid-submit handler and every product tap fires TWO addItem POSTs,
 // making the cart flicker through optimistic + two server settles ("three states").
 window.__posTermJsActive = true;
-console.log('[posterm] script loaded v118 — posOpenHistory defined:', (typeof window.posOpenHistory));
+console.log('[posterm] script loaded v119 — posOpenHistory defined:', (typeof window.posOpenHistory));
 /* POS Terminal - external JS for SPA (qapps) - Full AJAX */
 
 /* === Close the SPA left nav drawer when on the POS terminal ===
@@ -594,16 +594,16 @@ window._posOffline = (function() {
                 st.textContent =
                     '#pos-cart-editor table tbody td{color:#222 !important}'
                   + '#pos-cart-editor table tbody td>div{color:#999 !important}'
-                  + '#pos-cart-editor table thead th{color:#777 !important;background:#f4f7fa !important}'
+                  + '#pos-cart-editor table thead th{color:#1565c0 !important;background:#eaf2fb !important}'
                   + '#pos-cart-editor input{background:#fff !important;color:#222 !important}'
                   + '#pos-cart-editor input::placeholder{color:#9aa0a6 !important}'
                   + '#pos-cart-editor .ced-inc,#pos-cart-editor .ced-dec{background:#f5f5f5 !important;color:#222 !important}'
                   + '#pos-cart-editor #ced-add-res{background:#fff !important}'
                   + '#pos-cart-editor .ced-pi div{color:#222 !important}'
-                  // Outlined table: outer border + gridlines on every cell so rows/columns read as a table.
-                  + '#pos-cart-editor table{border:1px solid #c7d0d8 !important}'
-                  + '#pos-cart-editor table th,#pos-cart-editor table td{border:1px solid #e3e8ec !important}'
-                  + '#pos-cart-editor table thead th{border-bottom:2px solid #c7d0d8 !important}';
+                  // Outlined table: blue outer border (matches the editor header) + soft-blue gridlines.
+                  + '#pos-cart-editor table{border:1px solid #1565c0 !important}'
+                  + '#pos-cart-editor table th,#pos-cart-editor table td{border:1px solid #bcd3ea !important}'
+                  + '#pos-cart-editor table thead th{border-bottom:2px solid #1565c0 !important}';
                 document.head.appendChild(st);
             }
             function f2(n) { return Number(n||0).toFixed(2); }
