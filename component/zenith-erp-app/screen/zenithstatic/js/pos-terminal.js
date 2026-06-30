@@ -53,6 +53,29 @@ console.log('[posterm] script loaded v120 — posOpenHistory defined:', (typeof 
     (document.head || document.documentElement).appendChild(st);
 })();
 
+/* === Numeric-only rate (price) inputs ===
+   The cart rate field is type="text" (so it can hold decimals like 12.50 and
+   not fire the browser's number-spinner), which also lets a user type letters.
+   Strip anything that isn't a digit or a single decimal point, in the capture
+   phase so it runs before the optimistic price handler. Delegated on document
+   so it covers BOTH render paths — the optimistic JS row (.aj-p) and the server
+   FreeMarker row (input[name=newPrice]) — and survives every cart re-render. */
+(function posNumericRate() {
+    function sanitize(v) {
+        v = v.replace(/[^0-9.]/g, '');           // drop letters & symbols
+        var i = v.indexOf('.');
+        if (i !== -1) v = v.slice(0, i + 1) + v.slice(i + 1).replace(/\./g, ''); // keep only the first dot
+        return v;
+    }
+    document.addEventListener('input', function (e) {
+        var t = e.target;
+        if (!t || t.tagName !== 'INPUT') return;
+        if (!((t.classList && t.classList.contains('aj-p')) || t.name === 'newPrice')) return;
+        var clean = sanitize(t.value);
+        if (clean !== t.value) t.value = clean; // only reassign on a real change → preserves caret while typing valid input
+    }, true);
+})();
+
 /* === Offline Mode: IndexedDB catalog cache + offline cart + sale capture + sync ===
    Self-contained: takes over the cart UI only while navigator is offline; the online
    flow is untouched. _posAjax/_posScan delegate here when offline. === */
@@ -2310,7 +2333,7 @@ window.posToggleFullscreen = function() {
                 }
                 h += '<td style="padding:3px 10px"><div style="display:flex;align-items:center;gap:8px"><div style="font-size:14px;font-weight:600;color:#000;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+it.name+'</div>'+modeSel+'</div><div style="font-size:11px;color:#555">'+it.pid+'</div></td>';
                 h += '<td style="padding:4px 4px;text-align:right;vertical-align:middle"><div style="display:flex;align-items:center;gap:3px;justify-content:flex-end">';
-                h += '<input type="text" value="'+Number(it.price)+'" data-seq="'+it.seq+'" class="aj-p" style="width:65px;padding:8px 6px;border:1px solid #ccc;border-radius:6px;font-size:14px;text-align:right;background:#fff;color:#000;box-sizing:border-box"/>';
+                h += '<input type="text" inputmode="decimal" value="'+Number(it.price)+'" data-seq="'+it.seq+'" class="aj-p" style="width:65px;padding:8px 6px;border:1px solid #ccc;border-radius:6px;font-size:14px;text-align:right;background:#fff;color:#000;box-sizing:border-box"/>';
                 h += '<button data-seq="'+it.seq+'" class="aj-pb" style="width:32px;height:32px;border:none;background:#1565c0;color:#fff;border-radius:6px;cursor:pointer;font-size:14px;display:flex;align-items:center;justify-content:center;padding:0;flex-shrink:0">&#10003;</button>';
                 h += '</div></td>';
                 h += '<td style="padding:4px;text-align:center;vertical-align:middle"><div style="display:flex;align-items:center;justify-content:center;gap:0">';
