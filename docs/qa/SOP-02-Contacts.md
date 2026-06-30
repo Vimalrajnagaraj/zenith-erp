@@ -145,15 +145,15 @@ Contacts can be created from the Dashboard, Customers, Vendors, or All-Contacts 
 
 | ID | Type | Title | Steps / data | Expected result | Sev |
 |---|---|---|---|---|---|
-| CT-020 | EDGE | Create with **no name** | Add Person, leave first & last blank, Save | **Record actual.** Today there is no required-name check — the contact saves and shows as "Unknown". Decide with dev whether a name should be required (likely **S3** defect) | S3 |
+| CT-020 | EDGE | Create with **no name** | Add Person, leave first & last blank, Save | **FIXED:** rejected with "Please enter a first or last name." (companies: "Please enter a business name.") — no more blank "Unknown" contacts | S3 |
 | CT-021 | EDGE | Duplicate contact allowed | Create `QA Asha Test` twice with the same phone | **Record actual.** No duplicate detection exists — both are created. The fix path is **Merge** (§12). Flag if you expect a "possible duplicate" warning | S3 |
-| CT-022 | EDGE | GSTIN wrong format/length | Enter `12ABC` or a 15-char string that isn't a real GSTIN pattern | **Record actual.** The field caps length at 15 but there is **no server-side GSTIN format/checksum validation** — a malformed GSTIN can be saved. Likely **S3** (invoices later rely on this) | S3 |
+| CT-022 | EDGE | GSTIN wrong format/length | Enter `12ABC` or a 15-char string that isn't a real GSTIN pattern | **PARTIALLY FIXED:** the tax-registration service now validates the Indian GSTIN format (rejects non-`NNAAAAANNNNANZN` values). **Note for dev:** the *input wiring* of the GSTIN field has a pre-existing parameter mismatch (the create dialog's `gstin` and the profile's "Add GST Number" form don't map to the service's `registrationNumber`/`taxAuthorityId`), so GSTIN isn't reliably saved end-to-end yet — that needs the tax-authority mapping wired before validation is reachable from the UI | S3 |
 | CT-023 | EDGE | PAN wrong format | Enter `1234567890` (digits) instead of `ABCDE1234F` | Field caps at 10 chars; **no format validation** — record whether a bad PAN saves | S3 |
 | CT-024 | EDGE | Email invalid | `not-an-email` | Record whether it's rejected or saved as-is (the create dialog may not validate email format) | S3 |
 | CT-025 | EDGE | Phone with letters / very long | `abcd`, or a 30-digit number | Record behaviour — should reject or trim, never 500 | S3 |
 | CT-026 | EDGE | Credit limit / opening balance non-numeric | Enter `abc` in Credit Limit on the profile | Should be rejected with a clear message, not a server error | S3 |
 | CT-027 | EDGE | Very long name | 200-char business name | Saved/handled gracefully; list/profile don't break layout | S4 |
-| CT-028 | SEC | **Script in the name** | Create a contact named `<img src=x onerror=alert(1)>` then open **All Contacts** | ⚠️ **High-value security check.** The All-Contacts directory renders the name as raw HTML — if the script executes (alert pops) or the tag renders as markup, that is **stored XSS (S1)**. The name must display as literal text. **Test this carefully and capture the result.** | S1 |
+| CT-028 | SEC | **Script in the name** | Create a contact named `<img src=x onerror=alert(1)>` then open **All Contacts** | **HARDENED (two layers):** (1) the framework input filter **rejects** `<`/`>` on submit, so the payload won't even save via the form; (2) the directory now **HTML-escapes** every value before rendering, so any value that arrives via import/DB shows as literal text, not markup. Expected: the name is refused or shown as plain text — never executes | S1 |
 
 ---
 
@@ -172,7 +172,7 @@ Contacts can be created from the Dashboard, Customers, Vendors, or All-Contacts 
 | CT-046 | EDGE | No-match search | Search a string that matches nothing | Empty list with no error (not a crash) | S3 |
 | CT-047 | FUNC | Vendors list | Open Vendors, repeat the search cases | Shows only suppliers; heading reads "Suppliers" | S2 |
 | CT-048 | EDGE | A contact that is both Customer & Vendor | Create one, set both roles | Appears correctly in both lists; no duplicate row weirdness within a list | S3 |
-| CT-049 | EDGE | Disabled customer visibility | Disable a customer (profile → Disabled = Yes), return to Customers | **Record actual.** All-Contacts hides disabled, but the Customers list may **not** filter disabled — if a disabled customer still shows here, flag the inconsistency (**S3**) | S3 |
+| CT-049 | EDGE | Disabled customer visibility | Disable a customer (profile → Disabled = Yes), return to Customers | **FIXED:** the Customers and Vendors lists now hide disabled contacts, consistent with the All-Contacts directory | S3 |
 | CT-050 | FUNC | Actions links | Click "Orders" / "Invoices" on a row | Opens the Sales orders / Accounting invoices filtered to that customer (or shows the module-locked behaviour if the plan excludes it) | S3 |
 
 ---
@@ -284,7 +284,7 @@ Every list filters on `ownerPartyId = your active organization`. These are the *
 | ISO-002 | ISO | Vendors scoped | Same, Vendors | Only Tenant A's suppliers | S1 |
 | ISO-003 | ISO | Directory scoped | Same, All Contacts | Only Tenant A's contacts | S1 |
 | ISO-004 | ISO | Dashboard counts scoped | Compare counts across two tenants | Each tenant's counts reflect only its own contacts | S1 |
-| ISO-005 | ISO | Direct-URL profile of another tenant | As Tenant A, open `EditContact?partyId=<a Tenant-B contact id>` | Should not reveal Tenant B's data (no access, or empty) — **capture the actual result** | S1 |
+| ISO-005 | ISO | Direct-URL profile of another tenant | As Tenant A, open `EditContact?partyId=<a Tenant-B contact id>` | **FIXED (was a real IDOR):** the profile now enforces ownership — a non-owner is redirected to the directory and sees nothing; the underlying edit/add services reject it too. Platform super-admins remain able to view any contact by design | S1 |
 | ISO-006 | ISO | New contact is tagged to your org | Create a contact as Tenant A, then log in as Tenant B | Tenant B does not see it | S1 |
 | ISO-007 | ISO | Customer Groups scoped | Each tenant sees only its own groups | Confirmed | S1 |
 | ISO-008 | ISO | Search can't cross tenants | As Tenant A, search a GSTIN/phone you know belongs to Tenant B | No Tenant-B result returned | S1 |
@@ -323,12 +323,12 @@ Every list filters on `ownerPartyId = your active organization`. These are the *
 
 ## 16. Areas to probe hardest (tester's attention map)
 
-1. **Multi-tenant isolation (§13)** — the single most important thing. Any cross-tenant visibility is Critical.
-2. **Stored XSS in the directory (CT-028, CT-066)** — contact name / tax fields are rendered as raw HTML in All Contacts; a name with a `<script>`/tag is the test. Treat a positive as Critical.
-3. **No server-side GSTIN/PAN validation (CT-022/023)** — bad tax IDs can be saved and will flow into invoices later.
+1. **Multi-tenant isolation (§13)** — still the single most important thing. The direct-URL profile IDOR (ISO-005) is now **fixed**; regression-test that a tenant cannot reach another tenant's contact by id, and that a tenant **can** still open its own.
+2. **Stored XSS in the directory (CT-028, CT-066)** — now defended at two layers (input filter + output escaping); confirm a payload shows as plain text.
+3. **GSTIN input wiring (CT-022)** — format validation exists at the service, but the field-to-service mapping is broken upstream; verify whether a GSTIN entered at create/profile actually persists.
 4. **Merge is irreversible (§12.2)** — only ever on QA contacts; verify nothing is lost and references re-point.
-5. **Disabled-contact consistency (CT-049 vs CT-064)** — directory hides disabled; confirm the Customers/Vendors lists and sales pickers behave the same.
-6. **No required name / no duplicate detection (CT-020/021)** — decide the intended behaviour with the dev.
+5. **Duplicate detection (CT-021)** — still none; decide with the dev whether a "possible duplicate" warning is wanted (merge is the cleanup path).
+6. **Required name (CT-020)** and **disabled-list consistency (CT-049)** are now **fixed** — quick regression checks.
 
 ---
 
