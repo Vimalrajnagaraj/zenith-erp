@@ -6,7 +6,7 @@
 | **Document** | QA-SOP-03 — Settings |
 | **Product** | ZetaERP / Zenith (multi-tenant POS / ERP) |
 | **Environment under test** | Production — https://erp.zetaclantech.com |
-| **Scope of this part** | The admin **Settings** area only: Companies & Company Setup, GST Configuration, Document Sequences, Notifications, Company Groups, Backups, Access Control, Digital Signatures, **Users**, and **Roles / module access**. |
+| **Scope of this part** | The admin **Settings** area: the four reachable screens — **Company Setup**, **Users**, **Roles**, **Edit Role / module access** — behind the admin gate. (GST/Sequences/Companies-list/Notifications/etc. were orphaned dead code and have been removed.) |
 | **Audience** | Manual QA tester (admin access required) |
 | **Document owner** | Platform / Solo-dev |
 | **Status** | Active |
@@ -26,7 +26,7 @@ Settings is **administrative** — its changes affect everyone in the organizati
 
 > ⚠️ **This is a LIVE commercial system. Settings changes are high-impact.**
 
-1. **NEVER change Document Sequences on a real tenant** (especially MARUTHI / org `100000`). Changing a prefix, "Next Number", or pad length can **duplicate, skip, or renumber issued invoices/bills** — a legal and accounting break. Only ever touch sequences on a **throwaway tenant** you control.
+1. **Never edit a real company's legal/tax data** on MARUTHI (org `100000`) or any live tenant. (The Document-Sequences screen — which could have renumbered live bills — has been removed; if it ever returns, the same rule applies: throwaway tenants only.)
 2. **Never disable or lock out the only/last admin** of an organization — you can make the account unmanageable. Only disable **test** users you created.
 3. **Never edit a real company's legal/tax data** (GSTIN, PAN, TAN, CIN, legal name, financial-year) on MARUTHI or any live tenant. Use a throwaway tenant, and **never fabricate** a tax number.
 4. **Module-access / role changes can be platform-wide.** Roles (`ZENITH_*`) and their module access are shared security objects — editing one can affect **every tenant** using that role. Only the platform administrator should change these; as a tester, **observe**, don't re-wire live roles.
@@ -41,18 +41,12 @@ The Settings area opens from the app menu → **Settings & Roles** and is **admi
 
 | Screen | URL (`/apps/zenith/Settings/…`) |
 |---|---|
-| Companies (list) — default | `…/Settings/CompanyList` |
-| Company Setup | `…/Settings/CompanySetup?partyId=<orgId>` |
-| GST Configuration | `…/Settings/GstConfiguration` |
-| Document Sequences | `…/Settings/Sequences` |
-| Notifications | `…/Settings/NotificationTemplates` |
-| Company Groups | `…/Settings/CompanyGroups` |
-| Backups | `…/Settings/BackupManagement` |
-| Access Control | `…/Settings/AccessControl` |
-| Digital Signatures | `…/Settings/DigitalSignatures` |
+| Company Setup — default | `…/Settings/CompanySetup` |
 | Users & Role Assignment | `…/Settings/Users` |
 | Roles & Access | `…/Settings/Roles` |
 | Edit Role Access | `…/Settings/EditRole?userGroupId=<role>` |
+
+> **Note (2026-07-01):** the reachable Settings module is exactly these four screens behind the admin gate. Earlier drafts of this SOP listed GST Configuration, Document Sequences, a Companies list, Notifications, Company Groups, Backups, Access Control and Digital Signatures — those were **orphaned, unreachable screens** (mounted nowhere) and have been **removed as dead code**. The cases for them below are retained only as "removed / not applicable". If any of those features is wanted later, it should be built into this gated module deliberately.
 
 **Two admin tiers matter for testing:**
 - **Platform admin** (`ADMIN` group, e.g. john.doe) — sees all tenants; can create roles and edit module access.
@@ -92,13 +86,12 @@ The Settings area opens from the app menu → **Settings & Roles** and is **admi
 ## 6. Flow map
 
 ```
-   Settings (admin-gated: ZENITH_ADMIN or ADMIN)
-   ├─ Companies ───── Company Setup (name, country, currency, PAN/TAN/CIN, GSTIN, FY start, settings)
-   ├─ GST Configuration ── registered GSTINs · GST slabs · composition/e-invoice · test calc
-   ├─ Document Sequences ── invoice/order numbering (prefix/suffix/next/pad/FY)   ⚠ bill-number integrity
-   ├─ Users ──────── create user · assign/remove role · reset password · disable/enable   (org-scoped)
-   ├─ Roles ──────── create ZENITH_ role (platform admin) ──► Edit Role ── module access NONE/VIEW/FULL
-   └─ Notifications · Company Groups · Backups · Access Control · Digital Signatures
+   Settings (admin-gated: ZENITH_ADMIN or ADMIN) — four reachable screens
+   ├─ Company Setup ─ own org only (name, country, currency, PAN/TAN/CIN, GSTIN, FY start, settings)
+   ├─ Users ───────── create user · assign/remove role · reset password · disable/enable   (org-scoped)
+   └─ Roles ───────── create ZENITH_ role (platform admin) ──► Edit Role ── module access NONE/VIEW/FULL
+   (GST Config, Document Sequences, Companies list, Notifications, Company Groups, Backups,
+    Access Control, Digital Signatures were orphaned dead code — removed.)
 ```
 
 ---
@@ -114,14 +107,13 @@ The Settings area opens from the app menu → **Settings & Roles** and is **admi
 
 ---
 
-# 8. COMPANIES & COMPANY SETUP
+# 8. COMPANY SETUP
 
-**Screens:** `…/Settings/CompanyList`, `…/Settings/CompanySetup?partyId=`.
+**Screen:** `…/Settings/CompanySetup` (the default Settings screen; renders the admin's **own** organization). The separate "Companies list" screen was removed (orphaned). 
 
 | ID | Type | Title | Steps | Expected result | Sev |
 |---|---|---|---|---|---|
-| ST-010 | FUNC | Companies list | Open Companies | Lists internal organizations (active) | S2 |
-| ST-011 | FUNC | Open company setup | Click a company | Opens its setup: Org Code, Name, Country, Currency, PAN, TAN, CIN, GSTIN records, FY start, settings | S2 |
+| ST-011 | FUNC | Open company setup | Open Settings → Company Setup | Shows **your own** org: Org Code, Name, Country, Currency, PAN, TAN, CIN, GSTIN records, FY start, settings | S2 |
 | ST-012 | FUNC | Edit company profile | On a **throwaway tenant**, change Name / PAN / TAN / CIN → Update | Persists after reload | S2 |
 | ST-013 | FUNC | Financial-year start | Set FY Start month → Save | Persists; document numbering FY reflects it (e.g. `INV/26-27/…`) | S2 |
 | ST-014 | FUNC | Company settings key/values | View the settings list; edit a value | Persists | S3 |
@@ -131,9 +123,11 @@ The Settings area opens from the app menu → **Settings & Roles** and is **admi
 
 ---
 
-# 9. GST CONFIGURATION
+# 9. GST CONFIGURATION  — *(REMOVED — dead code, not testable)*
 
-**Screen:** `…/Settings/GstConfiguration`. Registered GSTINs, GST slabs, composition/e-invoice flags, a test calculator.
+> **This screen was an orphaned, unreachable duplicate and has been deleted.** GST is configured per-tenant at signup/onboarding and on the contact/company records. The cases below are retained for historical reference only.
+
+**Screen (removed):** `…/Settings/GstConfiguration`. Registered GSTINs, GST slabs, composition/e-invoice flags, a test calculator.
 
 | ID | Type | Title | Steps | Expected result | Sev |
 |---|---|---|---|---|---|
@@ -144,11 +138,11 @@ The Settings area opens from the app menu → **Settings & Roles** and is **admi
 
 ---
 
-# 10. DOCUMENT SEQUENCES (highest operational risk)
+# 10. DOCUMENT SEQUENCES  — *(REMOVED — dead code, not testable)*
 
-**Screen:** `…/Settings/Sequences`. Controls the numbering of invoices, orders, bills, etc. (prefix, suffix, next number, pad length, include-FY).
+> **This screen was orphaned and unreachable and has been deleted.** Document numbering is currently handled by the system, not an editable admin screen — which is the safer state (no UI exists to renumber issued bills). The cases below are retained for reference, and as the **acceptance criteria** if a numbering screen is ever (re)built: it must be admin-gated, org-scoped, and must prevent setting "Next Number" below the highest issued value.
 
-> ⚠️ **Do these ONLY on a throwaway tenant.** Changing a live tenant's sequence can duplicate or renumber issued bills.
+**Screen (removed):** `…/Settings/Sequences`. Prefix, suffix, next number, pad length, include-FY.
 
 | ID | Type | Title | Steps | Expected result | Sev |
 |---|---|---|---|---|---|
@@ -230,16 +224,13 @@ The Settings area opens from the app menu → **Settings & Roles** and is **admi
 
 ---
 
-# 14. OTHER SETTINGS + UI / SECURITY
+# 14. UI / SECURITY
+
+> **Notifications, Company Groups, Backups, Access Control and Digital Signatures were orphaned/unreachable screens and have been removed.** (If wanted, build them into the gated module.) The remaining cases apply to the live screens (Company Setup, Users, Roles, Edit Role).
 
 | ID | Type | Title | Check | Expected result | Sev |
 |---|---|---|---|---|---|
-| ST-080 | FUNC | Notifications templates | Open Notifications | Templates list/edit works | S3 |
-| ST-081 | FUNC | Company Groups | Open Company Groups | Group create/list works | S3 |
-| ST-082 | FUNC | Backups | Open Backups | Backup list/trigger works; **don't restore** on live | S3 |
-| ST-083 | FUNC | Access Control | Open Access Control | Renders without error | S3 |
-| ST-084 | FUNC | Digital Signatures | Open Digital Signatures | Cert list/upload works; reject malformed cert gracefully | S3 |
-| ST-085 | UI | Desktop layout | All screens at 1920/1366 | Tables aligned, no overflow | S4 |
+| ST-085 | UI | Desktop layout | Live screens at 1920/1366 | Tables aligned, no overflow | S4 |
 | ST-086 | UI | Mobile layout | Settings at 360–390px | No horizontal scroll; dialogs fit | S3 |
 | ST-087 | A11Y | Keyboard | Tab through create-user / role dialogs | Logical order, visible focus, Enter submits | S3 |
 | ST-088 | SEC | XSS in free-text | Put `<img src=x onerror=alert(1)>` in a role description / company name | Stored/escaped as text, never executes | S1 |
