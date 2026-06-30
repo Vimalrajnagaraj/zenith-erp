@@ -2,6 +2,51 @@
 <services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
           xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
 
+    <!-- ==================== SUBDOMAIN VALIDATION (single source of truth) ==================== -->
+    <service verb="validate" noun="Subdomain" authenticate="anonymous-all">
+        <description>Canonicalises and validates a requested subdomain: format, reserved words, and uniqueness
+            (across SaaS tenants AND any existing organization code). Used by the live availability check and
+            by provision#Tenant so the rules can never drift apart.</description>
+        <in-parameters><parameter name="subdomain"/></in-parameters>
+        <out-parameters>
+            <parameter name="canonical"/>
+            <parameter name="valid" type="Boolean"/>
+            <parameter name="available" type="Boolean"/>
+            <parameter name="reason"/>
+        </out-parameters>
+        <actions>
+            <script><![CDATA[
+                def raw = subdomain?.trim()?.toLowerCase()
+                canonical = raw
+                valid = false
+                available = false
+                if (!raw) { reason = 'Please enter a workspace URL.'; return }
+                // 3-30 chars, lowercase letters/digits/hyphens, cannot start or end with a hyphen
+                if (!(raw ==~ /[a-z0-9][a-z0-9-]{1,28}[a-z0-9]/)) {
+                    reason = 'Use 3-30 characters: lowercase letters, numbers and hyphens only (cannot start or end with a hyphen).'
+                    return
+                }
+                if (raw.contains('--')) { reason = 'A workspace URL cannot contain two hyphens in a row.'; return }
+                def reserved = ['www','admin','api','app','apps','qapps','vapps','rest','login','logout',
+                    'signup','signin','get-started','dashboard','mail','smtp','imap','pop','ftp','root',
+                    'system','sys','support','help','billing','pay','payment','static','cdn','assets',
+                    'zenithstatic','ns1','ns2','status','blog','test','demo','moqui','zeta','zetaerp','zenith'] as Set
+                if (reserved.contains(raw)) { reason = "'" + raw + "' is reserved. Please choose another."; return }
+                valid = true
+                def tenantCnt = ec.entity.find('zenith.erp.saas.SaasTenant')
+                    .condition('subdomain', raw).disableAuthz().count()
+                def codeCnt = ec.entity.find('mantle.party.PartyIdentification')
+                    .condition('partyIdTypeEnumId','PtidOrgCode').condition('idValue', raw.toUpperCase())
+                    .disableAuthz().count()
+                if (tenantCnt > 0 || codeCnt > 0) {
+                    reason = "'" + raw + "' is already taken. Please choose another."; return
+                }
+                available = true
+                reason = 'Available'
+            ]]></script>
+        </actions>
+    </service>
+
     <!-- ==================== TENANT PROVISIONING ==================== -->
     <service verb="provision" noun="Tenant" authenticate="anonymous-all">
         <description>Creates a new SaaS tenant: Organization, admin user, company settings, subscription</description>
@@ -26,19 +71,26 @@
             <parameter name="userId"/>
         </out-parameters>
         <actions>
-            <!-- Validate subdomain uniqueness -->
-            <entity-find-count entity-name="zenith.erp.saas.SaasTenant" count-field="subdomainCount">
-                <econdition field-name="subdomain"/>
-            </entity-find-count>
-            <if condition="subdomainCount > 0">
-                <return error="true" message="Subdomain '${subdomain}' is already taken. Please choose another."/>
+            <!-- Canonicalise + validate the subdomain (format, reserved words, uniqueness) in ONE place,
+                 shared with the live availability check so the rules can never drift. -->
+            <service-call name="zenith.saas.SaasServices.validate#Subdomain" out-map="sdChk"
+                in-map="[subdomain:subdomain]"/>
+            <if condition="!sdChk.valid || !sdChk.available">
+                <return error="true" message="${sdChk.reason}"/>
             </if>
+            <set field="subdomain" from="sdChk.canonical"/>
 
-            <!-- Validate email uniqueness -->
+            <!-- Canonicalise the email (login username) so case never creates a duplicate or a login mismatch -->
+            <set field="adminEmail" from="adminEmail?.trim()?.toLowerCase()"/>
+
+            <!-- Email uniqueness: across SaaS tenants AND any existing user account (not just tenants) -->
             <entity-find-count entity-name="zenith.erp.saas.SaasTenant" count-field="emailCount">
                 <econdition field-name="adminEmail"/>
             </entity-find-count>
-            <if condition="emailCount > 0">
+            <entity-find-count entity-name="moqui.security.UserAccount" count-field="userCount">
+                <econdition field-name="username" from="adminEmail"/>
+            </entity-find-count>
+            <if condition="emailCount > 0 || userCount > 0">
                 <return error="true" message="An account with email '${adminEmail}' already exists."/>
             </if>
 
