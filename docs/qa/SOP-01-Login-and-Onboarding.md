@@ -419,7 +419,8 @@ After the run:
 - Invalid Org ID → **blocked**, "Invalid Organization ID" ✓
 - Super-admin (john.doe, `ADMIN`) → allowed, **not** pinned to any org ✓
 - Real member (john.sales into a throwaway-coded `ORG_ZIZI_RETAIL`, typed lowercase) → **allowed**, active org set ✓
-- **All three real MARUTHI users** (`admin@maruthi.com`, `cashier1@maruthi.com`, `cashier2@maruthi.com`) → the gate's exact verdict, run against their real records, is **ALLOW(member)** for Org ID `MARUTHI` and lowercase `maruthi` alike. Confirmed without their passwords via a read-only, admin-only diagnostic that replays the gate's logic (org-code resolution + `isInGroup` + dated `PrtEmployee` check); the only thing a full login adds is the unchanged stock password step. The belt-and-suspenders caveat is therefore closed.
+- **All three real MARUTHI users** (`admin@maruthi.com`, `cashier1@maruthi.com`, `cashier2@maruthi.com`) → the gate's exact verdict, run against their real records, is **ALLOW(member)** for Org ID `MARUTHI` and lowercase `maruthi` alike (read-only admin diagnostic replaying the gate logic; no passwords needed).
+- **Full end-to-end login on org 100000** — a throwaway QA user wired as a genuine `PrtEmployee` member of MARUTHI was driven through the **actual `/Login` form** (real password + gate): Org `MARUTHI` → **dashboard**, lowercase `maruthi` → **dashboard**, wrong org (correct password) → **blocked**, and the member branch correctly set `ACTIVE_ORGANIZATION=100000`. The throwaway account was then deleted (verified zero residue; MARUTHI's three real users untouched). The belt-and-suspenders caveat is therefore **fully closed end-to-end**, including the real password path on the live tenant.
 
 Containment note retained for history: even before the fix, cross-tenant **data** was protected (active-org wasn't re-set on the bad path); the defect was "authenticates when it shouldn't".
 
