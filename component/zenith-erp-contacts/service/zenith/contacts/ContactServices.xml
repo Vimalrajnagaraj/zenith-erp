@@ -2,6 +2,30 @@
 <services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
           xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
 
+    <!-- Org-isolation guard: a tenant user may only touch contacts owned by their active organization.
+         Platform super-admins (ADMIN) are exempt (they manage cross-tenant). Returns allowed=false and
+         adds an error when access is denied. Used by EditContact and the mutating contact services so a
+         crafted request can't read/edit another tenant's contact (the lists were already isolated). -->
+    <service verb="assert" noun="ContactAccess">
+        <in-parameters><parameter name="partyId" required="true"/></in-parameters>
+        <out-parameters><parameter name="allowed" type="Boolean"/></out-parameters>
+        <actions>
+            <script><![CDATA[
+                allowed = true
+                if (!ec.user.isInGroup('ADMIN')) {
+                    def activeOrg = ec.user.getPreference('ACTIVE_ORGANIZATION')
+                    if (!activeOrg || activeOrg == '_NA_') {
+                        allowed = false
+                    } else {
+                        def p = ec.entity.find('mantle.party.Party').condition('partyId', partyId).disableAuthz().one()
+                        if (p == null || p.ownerPartyId != activeOrg) allowed = false
+                    }
+                    if (!allowed) ec.message.addError("You do not have access to this contact.")
+                }
+            ]]></script>
+        </actions>
+    </service>
+
     <service verb="create" noun="Contact">
         <in-parameters>
             <parameter name="partyTypeEnumId" required="true"/>
@@ -28,6 +52,18 @@
             <parameter name="partyId"/>
         </out-parameters>
         <actions>
+            <!-- Require a name so contacts don't get created blank (shown as "Unknown" everywhere). -->
+            <if condition="partyTypeEnumId == 'PtyOrganization'">
+                <if condition="!organizationName?.trim()">
+                    <return error="true" message="Please enter a business name."/>
+                </if>
+                <else>
+                    <if condition="!firstName?.trim() &amp;&amp; !lastName?.trim()">
+                        <return error="true" message="Please enter a first or last name."/>
+                    </if>
+                </else>
+            </if>
+
             <if condition="partyTypeEnumId == 'PtyOrganization'">
                 <service-call name="mantle.party.PartyServices.create#Organization"
                               in-map="[organizationName:organizationName, roleTypeId:roleTypeId]" out-map="context"/>
@@ -88,6 +124,8 @@
             <parameter name="priceListId"/>
         </in-parameters>
         <actions>
+            <service-call name="zenith.contacts.ContactServices.assert#ContactAccess" in-map="[partyId:partyId]" out-map="_acc"/>
+            <if condition="!_acc.allowed"><return/></if>
             <entity-find-one entity-name="mantle.party.Party" value-field="party"/>
             <if condition="party.partyTypeEnumId == 'PtyOrganization' &amp;&amp; organizationName">
                 <service-call name="update#mantle.party.Organization"
@@ -114,6 +152,8 @@
             <parameter name="tagName" required="true"/>
         </in-parameters>
         <actions>
+            <service-call name="zenith.contacts.ContactServices.assert#ContactAccess" in-map="[partyId:partyId]" out-map="_acc"/>
+            <if condition="!_acc.allowed"><return/></if>
             <service-call name="store#zenith.erp.contacts.PartyTag"
                           in-map="[partyId:partyId, tagName:tagName]"/>
         </actions>
@@ -125,6 +165,8 @@
             <parameter name="tagName" required="true"/>
         </in-parameters>
         <actions>
+            <service-call name="zenith.contacts.ContactServices.assert#ContactAccess" in-map="[partyId:partyId]" out-map="_acc"/>
+            <if condition="!_acc.allowed"><return/></if>
             <service-call name="delete#zenith.erp.contacts.PartyTag"
                           in-map="[partyId:partyId, tagName:tagName]"/>
         </actions>
@@ -141,6 +183,21 @@
             <parameter name="isDefault" default-value="Y"/>
         </in-parameters>
         <actions>
+            <service-call name="zenith.contacts.ContactServices.assert#ContactAccess" in-map="[partyId:partyId]" out-map="_acc"/>
+            <if condition="!_acc.allowed"><return/></if>
+            <!-- Validate Indian GSTIN format when this is a GST registration (15 chars: 2-digit state code,
+                 5 letters, 4 digits, 1 letter, 1 alnum, 'Z', 1 alnum). Other tax types are not pattern-checked. -->
+            <script><![CDATA[
+                def rn = registrationNumber?.trim()?.toUpperCase()
+                def isGst = (registrationTypeEnumId == 'TrtGstin' || (taxAuthorityId?.toString()?.contains('GST')))
+                if (rn &amp;&amp; (isGst || rn.length() == 15)) {
+                    if (!(rn ==~ /[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][0-9A-Z]Z[0-9A-Z]/)) {
+                        ec.message.addError("That GSTIN doesn't look valid. A GSTIN is 15 characters, e.g. 29ABCDE1234F1Z5.")
+                    }
+                }
+                if (!ec.message.hasError()) registrationNumber = rn
+            ]]></script>
+            <if condition="ec.message.hasError()"><return/></if>
             <service-call name="zenith.tax.TaxServices.create#TaxRegistration"
                           in-map="[partyId:partyId, taxAuthorityId:taxAuthorityId,
                                    registrationTypeEnumId:registrationTypeEnumId,
