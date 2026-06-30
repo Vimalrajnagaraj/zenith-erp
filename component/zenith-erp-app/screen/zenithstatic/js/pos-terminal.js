@@ -1896,7 +1896,10 @@ window.posToggleFullscreen = function() {
                 + '<div style="padding:20px 24px">'
                 + '<div style="font-size:13px;color:#666;margin-bottom:14px">The current bill will be completed as <b>CREDIT (unpaid)</b>. Record who owes — settle the payment later from the Credit Bills screen.</div>'
                 + '<label style="font-size:13px;font-weight:600;color:#555;display:block;margin-bottom:4px">Customer Name *</label>'
-                + '<input id="credit-name" type="text" autocomplete="off" style="width:100%;padding:11px 14px;border:2px solid #ffb74d;border-radius:8px;font-size:15px;box-sizing:border-box;outline:none;margin-bottom:12px"/>'
+                + '<div style="position:relative;margin-bottom:12px">'
+                + '<input id="credit-name" type="text" autocomplete="off" placeholder="Type to search your saved customers&hellip;" style="width:100%;padding:11px 14px;border:2px solid #ffb74d;border-radius:8px;font-size:15px;box-sizing:border-box;outline:none"/>'
+                + '<div id="credit-cust-results" style="display:none;position:absolute;top:100%;left:0;right:0;z-index:20;background:#fff;border:1px solid #ccc;border-radius:8px;box-shadow:0 6px 20px rgba(0,0,0,0.18);max-height:160px;overflow-y:auto;margin-top:4px"></div>'
+                + '</div>'
                 + '<label style="font-size:13px;font-weight:600;color:#555;display:block;margin-bottom:4px">Customer Phone *</label>'
                 + '<input id="credit-phone" type="tel" inputmode="numeric" autocomplete="off" style="width:100%;padding:11px 14px;border:2px solid #ffb74d;border-radius:8px;font-size:15px;box-sizing:border-box;outline:none"/>'
                 + '<div style="display:flex;gap:12px;margin-top:20px">'
@@ -1907,6 +1910,39 @@ window.posToggleFullscreen = function() {
             ov.addEventListener('click', function(e) { if (e.target === ov) ov.remove(); });
             var nameInp = document.getElementById('credit-name');
             nameInp.focus();
+            // Saved-customer search: typing a name (or phone) lists matching saved customers
+            // (same org-scoped searchCustomers used by the CUSTOMER button); picking one fills
+            // both name and phone so credit is recorded against the existing contact.
+            var resBox = document.getElementById('credit-cust-results');
+            var phoneInp = document.getElementById('credit-phone');
+            var cTimer = null;
+            function creditCustSearch(term) {
+                var pr = new URLSearchParams({ term: term || '', sessionId: SI, moquiSessionToken: TK });
+                return fetch('Terminal/searchCustomers', { method: 'post', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: pr, credentials: 'same-origin' }).then(function(r) { return r.json(); });
+            }
+            function renderCreditCust(list) {
+                if (!list || !list.length) { resBox.style.display = 'none'; resBox.innerHTML = ''; return; }
+                var h = '';
+                list.forEach(function(c) {
+                    h += '<div class="cc-row" data-name="' + (c.name || '').replace(/"/g, '&quot;') + '" data-phone="' + (c.phone || '').replace(/"/g, '&quot;') + '" style="padding:10px 12px;cursor:pointer;border-bottom:1px solid #f0f0f0;display:flex;justify-content:space-between;align-items:center;gap:10px" onmouseover="this.style.background=\'#fff3e0\'" onmouseout="this.style.background=\'#fff\'"><span style="font-weight:700;color:#e65100">' + (c.name || '') + '</span>' + (c.phone ? '<span style="font-size:13px;color:#777;white-space:nowrap">' + c.phone + '</span>' : '') + '</div>';
+                });
+                resBox.innerHTML = h; resBox.style.display = 'block';
+                resBox.querySelectorAll('.cc-row').forEach(function(row) {
+                    row.addEventListener('click', function() {
+                        nameInp.value = row.dataset.name || '';
+                        if (row.dataset.phone) phoneInp.value = row.dataset.phone;
+                        resBox.style.display = 'none';
+                        if (!phoneInp.value) phoneInp.focus();
+                    });
+                });
+            }
+            nameInp.addEventListener('input', function() {
+                clearTimeout(cTimer);
+                var q = nameInp.value.trim();
+                if (q.length < 1) { resBox.style.display = 'none'; return; }
+                cTimer = setTimeout(function() { creditCustSearch(q).then(function(d) { renderCreditCust((d && d.success) ? (d.customers || []) : []); }); }, 300);
+            });
+            ov.addEventListener('click', function(e) { if (resBox && !resBox.contains(e.target) && e.target !== nameInp) resBox.style.display = 'none'; });
             document.getElementById('credit-cancel').addEventListener('click', function() { ov.remove(); });
             document.getElementById('credit-confirm').addEventListener('click', function() {
                 var nm = (document.getElementById('credit-name').value || '').trim();
