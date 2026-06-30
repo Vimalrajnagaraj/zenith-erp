@@ -204,7 +204,7 @@ Contacts can be created from the Dashboard, Customers, Vendors, or All-Contacts 
 |---|---|---|---|---|---|
 | CT-080 | FUNC | Banner | Open any profile | Avatar (first letter), name, "ID • Person/Organization", tag badges, "Disabled" badge if disabled | S3 |
 | CT-081 | FUNC | Edit basic details | Change name / business structure → Save Contact Profile | Persists after reload; banner updates | S2 |
-| CT-082 | FUNC | Tax block | Set PAN, GST registration type, CIN, TAN, TDS Applicable, Default TDS Section → Save | All persist | S2 |
+| CT-082 | FUNC | Tax block | Set PAN, GST registration type, CIN, TAN, TDS Applicable, Default TDS Section → Save | **FIXED:** all persist after reload (these profile fields — tax, MSME, bank IFSC/UPI, licences, business structure — were previously dropped on save and now save). PAN is validated (10-char `ABCDE1234F`, blank allowed) and upper-cased; a malformed PAN is rejected without losing the rest | S2 |
 | CT-083 | FUNC | MSME & payment terms | Set MSME status, Udyam no., Mandatory Payment Days → Save | Persist | S3 |
 | CT-084 | FUNC | Bank details | Set account name/number, IFSC, UPI, beneficiary status → Save | Persist | S2 |
 | CT-085 | FUNC | Licences | Set FSSAI / Drug / Trade licence → Save | Persist | S3 |
