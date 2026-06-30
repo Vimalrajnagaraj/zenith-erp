@@ -92,11 +92,11 @@ window._posOffline = (function() {
         var sm=document.querySelector('.pos-summary');
         if(sm){ var total=cart.reduce(function(a,it){return a+it.qty*it.price;},0); var qty=cart.reduce(function(a,it){return a+Number(it.qty);},0);
             var s='<div style="display:flex;justify-content:space-between;font-size:13px;color:#777;margin-bottom:6px"><span style="color:#c62828;font-weight:700">OFFLINE</span><span>Qty: <b>'+qty+'</b></span></div>'
-                +'<div style="background:#c62828;color:#fff;padding:14px 20px;border-radius:10px;display:flex;justify-content:space-between;align-items:center;margin-bottom:10px"><span style="font-size:16px;font-weight:600">OFFLINE TOTAL</span><span style="font-size:28px;font-weight:800">&#8377;'+f2(total)+'</span></div>';
+                +'<div style="background:#c62828;color:#fff;padding:clamp(5px,1vh,12px) 20px;border-radius:10px;display:flex;justify-content:space-between;align-items:center;margin-bottom:10px"><span style="font-size:16px;font-weight:600">OFFLINE TOTAL</span><span style="font-size:28px;font-weight:800">&#8377;'+f2(total)+'</span></div>';
             if(cart.length){ s+='<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px">'
-                +'<button type="button" class="ofl-pay" data-m="Cash" style="padding:16px 8px;border:none;border-radius:10px;font-size:16px;font-weight:700;cursor:pointer;background:#4caf50;color:#fff">&#128176; CASH</button>'
-                +'<button type="button" class="ofl-pay" data-m="Card" style="padding:16px 8px;border:none;border-radius:10px;font-size:16px;font-weight:700;cursor:pointer;background:#2196f3;color:#fff">&#128179; CARD</button>'
-                +'<button type="button" class="ofl-pay" data-m="UPI" style="padding:16px 8px;border:none;border-radius:10px;font-size:16px;font-weight:700;cursor:pointer;background:#9c27b0;color:#fff">&#128241; UPI</button></div>';
+                +'<button type="button" class="ofl-pay" data-m="Cash" style="padding:clamp(8px,1.4vh,15px) 8px;border:none;border-radius:10px;font-size:16px;font-weight:700;cursor:pointer;background:#4caf50;color:#fff">&#128176; CASH</button>'
+                +'<button type="button" class="ofl-pay" data-m="Card" style="padding:clamp(8px,1.4vh,15px) 8px;border:none;border-radius:10px;font-size:16px;font-weight:700;cursor:pointer;background:#2196f3;color:#fff">&#128179; CARD</button>'
+                +'<button type="button" class="ofl-pay" data-m="UPI" style="padding:clamp(8px,1.4vh,15px) 8px;border:none;border-radius:10px;font-size:16px;font-weight:700;cursor:pointer;background:#9c27b0;color:#fff">&#128241; UPI</button></div>';
             } else { s+='<div style="text-align:center;padding:16px;color:#aaa">Offline &mdash; tap products to add items</div>'; }
             sm.innerHTML=s; }
     }
@@ -1734,7 +1734,7 @@ window.posToggleFullscreen = function() {
                 + '<input type="hidden" name="taxOn" value="'+TO+'"/>'
                 + '<input type="hidden" name="salesModeId" value="'+SM+'"/>'
                 + '<input type="hidden" name="moquiSessionToken" value="'+TK+'"/>'
-                + '<button type="submit" style="width:100%;padding:14px 8px;border:none;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;background:#e65100;color:#fff">&#128260; RECALL'+(heldCount > 1 ? ' ('+heldCount+')' : '')+'</button></form>';
+                + '<button type="submit" style="width:100%;padding:clamp(7px,1.2vh,13px) 8px;border:none;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;background:#e65100;color:#fff">&#128260; RECALL'+(heldCount > 1 ? ' ('+heldCount+')' : '')+'</button></form>';
         }
         function appendRecallIfNeeded() {
             if (heldCount <= 0 || !heldId) return;
@@ -2156,7 +2156,7 @@ window.posToggleFullscreen = function() {
                 + '<input type="hidden" name="salesModeId" value="'+SM+'"/>'
                 + '<input type="hidden" name="customerPhone" value=""/>'
                 + '<input type="hidden" name="moquiSessionToken" value="'+TK+'"/>'
-                + '<button type="submit" style="width:100%;padding:16px 8px;border:none;border-radius:10px;font-size:16px;font-weight:700;cursor:pointer;background:'+bg+';color:#fff">'+label+'</button></form>';
+                + '<button type="submit" style="width:100%;padding:clamp(8px,1.4vh,15px) 8px;border:none;border-radius:10px;font-size:16px;font-weight:700;cursor:pointer;background:'+bg+';color:#fff">'+label+'</button></form>';
         }
         function actionBtn(action, label, bg, conf) {
             return '<form method="post" action="Terminal/'+action+'" style="margin:0">'
@@ -2165,7 +2165,7 @@ window.posToggleFullscreen = function() {
                 + '<input type="hidden" name="taxOn" value="'+TO+'"/>'
                 + '<input type="hidden" name="salesModeId" value="'+SM+'"/>'
                 + '<input type="hidden" name="moquiSessionToken" value="'+TK+'"/>'
-                + '<button type="submit" style="width:100%;padding:14px 8px;border:none;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;background:'+bg+';color:#fff"'
+                + '<button type="submit" style="width:100%;padding:clamp(7px,1.2vh,13px) 8px;border:none;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;background:'+bg+';color:#fff"'
                 + (conf ? ' onclick="return confirm(\''+conf+'\')"' : '') + '>'+label+'</button></form>';
         }
         function buildSummary(d) {
@@ -2178,17 +2178,17 @@ window.posToggleFullscreen = function() {
                 + '<span style="color:#555">Tax: <b id="posSumTax">'+fmt(d.tax)+'</b></span>'
                 + '<span style="color:#555">Disc: <b id="posSumDisc">'+fmt(d.disc)+'</b></span>'
                 + '</div></div>'
-                + '<div style="background:#1976d2;color:#fff;padding:14px 20px;border-radius:10px;display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">'
+                + '<div style="background:#1976d2;color:#fff;padding:clamp(5px,1vh,12px) 20px;border-radius:10px;display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">'
                 + '<span style="font-size:16px;font-weight:600">'+modeLabel+' TOTAL</span>'
                 + '<span id="posSumTotal" style="font-size:28px;font-weight:800;letter-spacing:1px">'+CS+fmt(d.pay)+'</span></div>';
             if (d.items.length > 0) {
                 sh += '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:8px">'
-                    + '<button type="button" class="pos-cash-btn" style="width:100%;padding:16px 8px;border:none;border-radius:10px;font-size:16px;font-weight:700;cursor:pointer;background:#4caf50;color:#fff">&#128176; CASH</button>'
+                    + '<button type="button" class="pos-cash-btn" style="width:100%;padding:clamp(8px,1.4vh,15px) 8px;border:none;border-radius:10px;font-size:16px;font-weight:700;cursor:pointer;background:#4caf50;color:#fff">&#128176; CASH</button>'
                     + payBtn('Card','&#128179; CARD','#2196f3')
                     + payBtn('UPI','&#128241; UPI','#9c27b0') + '</div>'
-                    + '<button type="button" class="pos-split-btn" style="display:block;width:100%;padding:14px 8px;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;background:#1565c0;color:#fff;border:none;text-align:center;margin-bottom:8px;box-sizing:border-box">&#8596; SPLIT PAYMENT</button>'
-                    + '<button type="button" onclick="posCreditSale()" style="display:block;width:100%;padding:14px 8px;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;background:#e65100;color:#fff;border:none;text-align:center;margin-bottom:8px;box-sizing:border-box">&#128196; CREDIT / PAY LATER</button>'
-                    + '<div style="display:grid;grid-template-columns:'+(heldCount > 0 ? '1fr 1fr 1fr' : '1fr 1fr')+';gap:8px">'
+                    + '<button type="button" class="pos-split-btn" style="display:block;width:100%;padding:clamp(7px,1.2vh,13px) 8px;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;background:#1565c0;color:#fff;border:none;text-align:center;margin-bottom:8px;box-sizing:border-box">&#8596; SPLIT PAYMENT</button>'
+                    + '<div style="display:grid;grid-template-columns:1fr 1fr 1fr'+(heldCount > 0 ? ' 1fr' : '')+';gap:8px">'
+                    + '<button type="button" onclick="posCreditSale()" style="width:100%;padding:clamp(7px,1.2vh,13px) 4px;border-radius:10px;font-size:14px;font-weight:700;cursor:pointer;background:#e65100;color:#fff;border:none;text-align:center;box-sizing:border-box">&#128196; CREDIT</button>'
                     + actionBtn('holdSale','HOLD','#ff9800')
                     + actionBtn('voidSale','VOID / CANCEL','#f44336','Void this sale?')
                     + (heldCount > 0 && heldId ? recallBtn() : '')
@@ -2209,7 +2209,7 @@ window.posToggleFullscreen = function() {
                 + '<span style="color:#555">Tax: <b>'+(lastCartData ? fmt(lastCartData.tax) : '0')+'</b></span>'
                 + '<span style="color:#555">Disc: <b>'+(lastCartData ? fmt(lastCartData.disc) : '0')+'</b></span>'
                 + '</div></div>'
-                + '<div style="background:#1976d2;color:#fff;padding:14px 20px;border-radius:10px;display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">'
+                + '<div style="background:#1976d2;color:#fff;padding:clamp(5px,1vh,12px) 20px;border-radius:10px;display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">'
                 + '<span style="font-size:16px;font-weight:600">'+modeLabel+' TOTAL</span>'
                 + '<span style="font-size:28px;font-weight:800;letter-spacing:1px">'+CS+fmt(lastPay)+'</span></div>'
                 + '<div class="pos-split-panel" style="border:2px solid #1565c0;border-radius:10px;padding:14px;background:#e3f2fd">'
@@ -2271,7 +2271,7 @@ window.posToggleFullscreen = function() {
                 + '<span style="color:#555">Tax: <b>'+(lastCartData ? fmt(lastCartData.tax) : '0')+'</b></span>'
                 + '<span style="color:#555">Disc: <b>'+(lastCartData ? fmt(lastCartData.disc) : '0')+'</b></span>'
                 + '</div></div>'
-                + '<div style="background:#1976d2;color:#fff;padding:14px 20px;border-radius:10px;display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">'
+                + '<div style="background:#1976d2;color:#fff;padding:clamp(5px,1vh,12px) 20px;border-radius:10px;display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">'
                 + '<span style="font-size:16px;font-weight:600">'+modeLabel+' TOTAL</span>'
                 + '<span style="font-size:28px;font-weight:800;letter-spacing:1px">'+CS+fmt(lastPay)+'</span></div>'
                 + '<div class="pos-cash-panel" style="border:2px solid #4caf50;border-radius:10px;padding:14px;background:#e8f5e9">'
