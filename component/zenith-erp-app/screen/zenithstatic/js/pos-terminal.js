@@ -1887,11 +1887,13 @@ window.posToggleFullscreen = function() {
                             card.innerHTML = '<div style="padding:60px 40px;text-align:center">'
                                 + '<div style="font-size:56px;margin-bottom:16px">&#9989;</div>'
                                 + '<div style="font-size:22px;font-weight:700;color:#2e7d32">Session Closed Successfully</div>'
-                                + '<div style="font-size:14px;color:#777;margin-top:8px">Returning to start screen...</div></div>';
-                            // Reload the Terminal at its clean URL (no sessionId). Server now renders the
-                            // "Open a session" screen for a closed session, ready for the next shift.
+                                + '<div style="font-size:14px;color:#777;margin-top:8px">Returning to the app&hellip;</div></div>';
+                            // Exit the POS to the Quasar app dashboard (the main app home), NOT the
+                            // /apps no-session terminal screen — its standard back-office chrome exposes
+                            // the app-chooser logo (AppList) + Welcome dashboard the cashier doesn't want.
+                            // Matches the logo / "← APP" / Back targets (all /qapps/zenith).
                             setTimeout(function() {
-                                window.location.href = window.location.pathname.replace(/\/+$/, '');
+                                window.location.href = '/qapps/zenith';
                             }, 1200);
                         }).catch(function(err) {
                             btn.disabled = false; btn.textContent = 'Close Session';
