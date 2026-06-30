@@ -131,7 +131,8 @@ Create these as you go; record the exact values you used in the *Actual* column 
 |---|---|---|---|---|---|
 | LOGIN-010 | FUNC | Missing Org ID | Correct username+password, **leave Org ID blank** | Login is rejected; user is logged back out; message **"Organization ID is required"** | S1 |
 | LOGIN-011 | FUNC | Invalid Org ID | Correct username+password, Org ID = `NOSUCHORG` | Rejected + logged out; message **"Invalid Organization ID"** | S2 |
-| LOGIN-012 | SEC | Valid Org ID but user not a member | User from Tenant A, but enter Tenant B's Org ID (both correct passwords) | **Should** reject + log out: **"User does not belong to this organization"**. ⚠️ **KNOWN DEFECT (see §14, D-1):** the membership gate currently does NOT block — the user reaches the dashboard. Active-org isolation still prevents seeing Tenant B's data, but the login should be refused. **Expect FAIL until D-1 is fixed.** | S1 |
+| LOGIN-012 | SEC | Valid Org ID but user not a member | User from Tenant A, but enter Tenant B's Org ID (both correct passwords) | **FIXED (D-1):** rejected + logged out with **"User does not belong to this organization"**; bounced back to the login page (does not reach the dashboard). Platform super-admins are exempt by design (LOGIN-012b) | S1 |
+| LOGIN-012b | SEC | Super-admin exemption | Log in as a platform super-admin (`ADMIN` group, e.g. john.doe) with any Org ID | Allowed (admins operate cross-tenant); the admin is **not** pinned to that org's active-organization | S2 |
 | LOGIN-013 | EDGE | Org ID case-insensitivity | Enter the Org ID in lowercase (`maruthi` / `qaalpha01`) | **FIXED:** accepted — login normalises the Org ID to uppercase (tries as-typed, then uppercased). Lower/mixed case no longer fails the lookup | S2 |
 | LOGIN-014 | EDGE | Org ID with spaces / trailing space | `  QAALPHA01 ` | Trimmed and accepted, or a clear error — never a silent 500 | S3 |
 | LOGIN-015 | SEC | Org isolation after login | Log in to Tenant A, then via URL try to view Tenant B data | No cross-tenant data is visible; `ACTIVE_ORGANIZATION` is bound to Tenant A only | S1 |
@@ -331,7 +332,7 @@ Create these as you go; record the exact values you used in the *Actual* column 
 
 These are the spots most likely to hide defects in *this* part of the product — spend extra time here:
 
-1. **Org-membership gate (LOGIN-012):** ⚠️ currently **bypassed** — see §14 D-1. The single most important thing to re-test once it's fixed, and to confirm the fix did **not** lock out existing tenants.
+1. **Org-membership gate (LOGIN-012/012b):** *fixed* (§14 D-1). Re-test the full matrix — non-member blocked, invalid blocked, super-admin allowed, real tenant member allowed — and especially confirm a **real MARUTHI cashier still logs in**.
 2. **Case-sensitivity of subdomain ↔ Org ID (ONB-012, LOGIN-013, XF-003):** *fixed* in this pass — regression-test that lower/mixed case Org IDs log in and that signup canonicalises to lowercase.
 3. **Password policy (ONB-022/023):** *fixed* — confirm the field states the full rule and that letter-only passwords are rejected.
 4. **Google email-collision policy (LOGIN-073):** must block, not silently link (verified correct in code).
@@ -404,20 +405,22 @@ After the run:
 | R-4 | Password rule under-stated (ONB-023) | Field now states "≥8 chars, 1 number, 1 special char" |
 | R-5 | Duplicate email only checked against tenants | Provisioning now also rejects an email already used by any user account, and lowercases the email |
 | R-6 | "Reserved subdomains / length / lockout" were open questions | Answered: reserved+length now enforced (R-3); lockout is the framework default **3 failures → 5-min disable** |
+| R-7 | **D-1: org-membership gate bypassed** (any valid user reached the dashboard with any Org ID) | **FIXED & verified** — see below |
 
-### ⚠️ D-1 — OPEN, HIGH PRIORITY: org-membership gate is bypassed
-**Symptom:** a valid user who supplies *any* existing Org ID (even one they don't belong to) is authenticated and reaches the dashboard, instead of being rejected with "User does not belong to this organization" (LOGIN-012).
+### ✅ D-1 — RESOLVED: org-membership gate now enforces (without locking out tenants)
+**Was:** the gate set `orgValidationFailed = true` then `return`ed early inside an inline `<script>`; Moqui does **not** sync context variables across an early `return`, so the flag never reached the outer `<if>` and login proceeded for anyone.
 
-**Root cause:** the Login org-validation runs in an inline `<script>` that sets `orgValidationFailed = true` and then `return`s early. Moqui does **not** sync context variables back across an early `return` in an inline script, so the outer `<if condition="orgValidationFailed">` never fires and login proceeds.
+**Fix:** rewrote the validation as structured `if/else` (no early `return`, so the flag propagates) and exempted platform super-admins (`isInGroup("ADMIN")`, who operate cross-tenant).
 
-**Why it wasn't fixed in this pass (constraint #3):** existing tenants — including the live flagship **MARUTHI (org 100000)** — do **not** have the `PrtEmployee` relationship the gate checks for, and their login currently relies on the gate being lax plus a persisted `ACTIVE_ORGANIZATION` preference. Simply making the gate enforce membership would **lock the live tenant out**. This must not be deployed blind.
+**Why it's safe for the live tenant:** investigation corrected an earlier wrong assumption — every existing active-org user **does** have the `PrtEmployee` membership, just from their *person* party (MARUTHI 100000/100410/100411 → person parties 100002/100765/100766 → `PrtEmployee` of 100000; the zenith_admin family → `PrtEmployee` of ORG_ZETA). So the gate passes for all of them via membership; no backfill was needed.
 
-**Containment today:** cross-tenant **data** is still protected — `ACTIVE_ORGANIZATION` is not re-set on this path, so the wrongly-admitted user sees no other tenant's data. The defect is "authenticates when it shouldn't", not "sees another tenant's data".
+**Verified on production:**
+- Non-member (john.sales + `maruthi`) → **blocked**, "does not belong", bounced to login ✓
+- Invalid Org ID → **blocked**, "Invalid Organization ID" ✓
+- Super-admin (john.doe, `ADMIN`) → allowed, **not** pinned to any org ✓
+- Real member (john.sales into a throwaway-coded `ORG_ZIZI_RETAIL`, typed lowercase) → **allowed**, active org set ✓
 
-**Safe remediation plan (needs a maintenance window + a real tenant login to verify):**
-1. Backfill the missing `PrtEmployee → OrgInternal` relationship for every existing tenant user that has an `ACTIVE_ORGANIZATION` preference (so the gate will pass for them).
-2. Rewrite the validation without the early `return` (structured if/else) **or** gate on `isMember OR persistedActiveOrg == requestedOrg`.
-3. Verify on a throwaway tenant: member logs in ✓, non-member blocked ✓; then verify a **real MARUTHI cashier** can still log in **before** considering it done.
+Containment note retained for history: even before the fix, cross-tenant **data** was protected (active-org wasn't re-set on the bad path); the defect was "authenticates when it shouldn't".
 
 ---
 
