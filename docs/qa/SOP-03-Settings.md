@@ -126,8 +126,8 @@ The Settings area opens from the app menu → **Settings & Roles** and is **admi
 | ST-013 | FUNC | Financial-year start | Set FY Start month → Save | Persists; document numbering FY reflects it (e.g. `INV/26-27/…`) | S2 |
 | ST-014 | FUNC | Company settings key/values | View the settings list; edit a value | Persists | S3 |
 | ST-015 | EDGE | Bad PAN/TAN/CIN | Enter malformed values | **Record actual** — is format validated? (likely not server-side) | S3 |
-| ST-016 | ISO | ⚠ Cross-tenant company list | As a **tenant admin** (ZENITH_ADMIN, not platform ADMIN), open Companies | **Record actual.** The list is **not** org-filtered in code — a tenant admin may see **all tenants' companies**. If so, that's a **Critical isolation** defect (S1) | S1 |
-| ST-017 | ISO | ⚠ Cross-tenant company setup (IDOR) | As tenant A's admin, open `CompanySetup?partyId=<Tenant-B org id>` | **Record actual.** If Tenant B's company profile renders/edits, that's an **IDOR (S1)** | S1 |
+| ST-016 | ISO | Cross-tenant company list | (The "Companies" list screen is an **orphaned/unreachable** screen — see §13 note) | n/a — not reachable via `/apps`, `/qapps`, or `/vapps`; defensively org-scoped anyway | S3 |
+| ST-017 | ISO | Cross-tenant company setup | As tenant A's admin, open `CompanySetup?partyId=<Tenant-B org id>` | **SAFE (verified):** the reachable Company Setup renders **your own** organization regardless of the `partyId` in the URL, and write actions are blocked ("Cannot modify another organization") unless you're the platform admin | S1 |
 
 ---
 
@@ -156,7 +156,7 @@ The Settings area opens from the app menu → **Settings & Roles** and is **admi
 | ST-031 | FUNC | Change prefix (throwaway) | On a throwaway tenant, set a new prefix → Update; create a document | New document uses the new prefix + FY format | S2 |
 | ST-032 | EDGE | Next-number guards | Set "Next Number" **below** the highest already-issued number | **Record actual.** It should be **prevented or warned** — otherwise the next document **duplicates an existing number** (S1 integrity). Test on throwaway only | S1 |
 | ST-033 | EDGE | Pad length / non-numeric | Set pad length to a letter, or next-number to text | Rejected cleanly, no 500 | S3 |
-| ST-034 | ISO | ⚠ Cross-tenant sequences | As a **tenant admin**, view the sequence list | **Record actual.** The list is **not** org-filtered in code — a tenant admin may **see and edit other tenants' numbering**. Editing another tenant's "Next Number" could corrupt **their** bills → **Critical (S1)** | S1 |
+| ST-034 | ISO | Cross-tenant sequences | (The Document Sequences screen is **orphaned/unreachable** — see §13 note) | n/a — not reachable via `/apps`, `/qapps`, or `/vapps` (the Vue app returns "Screen not found"); defensively org-scoped + write-guarded anyway. **The reachable Settings surface does not expose document sequences.** | S2 |
 | ST-035 | FUNC | FY rollover | With include-FY on, check the FY portion | Correct FY (e.g. 26-27) per the company's FY-start month | S3 |
 
 ---
@@ -220,14 +220,13 @@ The Settings area opens from the app menu → **Settings & Roles** and is **admi
 | ID | Type | Title | Steps | Expected result | Sev |
 |---|---|---|---|---|---|
 | ISO-001 | ISO | Users org-scoped | Tenant A admin sees only Tenant A users | Confirmed (the list filters by tenant group) | S1 |
-| ISO-002 | ISO | ⚠ Companies list | Tenant A admin opens Companies | **Should** show only Tenant A — **code does not filter**, so verify whether other tenants leak (likely defect) | S1 |
-| ISO-003 | ISO | ⚠ Company Setup IDOR | Tenant A admin opens `CompanySetup?partyId=<B>` | Should be denied; **verify** | S1 |
-| ISO-004 | ISO | ⚠ Document Sequences | Tenant A admin opens Sequences | **Should** show only Tenant A — **code does not filter**; if other tenants' sequences show/edit, **Critical** | S1 |
-| ISO-005 | ISO | ⚠ GST/GSTINs | Tenant A admin opens GST Configuration | Should show only Tenant A's GSTINs; **verify** | S1 |
-| ISO-006 | ISO | User actions cross-tenant | Tenant A admin tries to reset/disable a Tenant B user | Blocked (`check#UserInActiveOrg`) | S1 |
-| ISO-007 | ISO | Role creation/access global | Tenant admin cannot create roles or change module access | Blocked (platform-admin only) | S1 |
+| ISO-002 | ISO | Company Setup is own-org only | Tenant A admin opens Company Setup (any partyId) | **SAFE (verified):** always renders Tenant A's own org; cross-org writes blocked | S1 |
+| ISO-003 | ISO | Users org-scoped | Tenant A admin opens Users | Only Tenant A's users (platform admin sees all) | S1 |
+| ISO-004 | ISO | User actions cross-tenant | Tenant A admin tries to reset/disable a Tenant B user | Blocked (`check#UserInActiveOrg`) | S1 |
+| ISO-005 | ISO | Role creation/access global | Tenant admin cannot create roles or change module access | Blocked (platform-admin only) | S1 |
+| ISO-006 | ISO | Orphaned config screens | Try to reach Companies / Document Sequences / GST Configuration as any user | **Not reachable** (the Vue app returns "Screen not found"); they're dead code, defensively hardened. Confirm they remain unreachable | S3 |
 
-> **Tester note:** Users and user-actions are isolation-guarded in code; **Companies, Company Setup, Document Sequences and GST are not obviously org-filtered** — these are the ones to hammer and record exactly what a tenant admin can see/do.
+> **Tester note (resolved):** an investigation confirmed the *reachable* Settings surface — **Company Setup, Users, Roles, Edit Role** — is correctly isolated (Company Setup renders own-org only and blocks cross-org writes; Users is org-scoped with `check#UserInActiveOrg` on every action; Roles/Edit-Role are platform-admin-only). The previously-suspected leaks (Companies list, Document Sequences, GST Configuration) live in **orphaned, unreachable screens** and were additionally org-scoped + gated defensively in case they are ever re-mounted.
 
 ---
 
@@ -271,8 +270,8 @@ Notes:            user/role/org ids touched — NEVER paste passwords
 
 ## 16. Areas to probe hardest (attention map)
 
-1. **Document Sequences (§10, ISO-004)** — both a **bill-number integrity** risk (never edit live) and a likely **cross-tenant** hole (not org-filtered). The single most dangerous screen here.
-2. **Cross-tenant Companies / Company Setup / GST (§13)** — tenant admins reach Settings (`ZENITH_ADMIN`) but these screens don't obviously filter by org; verify exactly what leaks.
+1. **Reachable isolation is verified** (§13) — Company Setup own-org-only, Users org-scoped, Roles/Edit-Role platform-admin-only. Re-confirm these after any change; they're the live isolation surface.
+2. **Document Sequences** — when a numbering screen *is* exposed (it currently isn't reachable), editing "Next Number" on a live tenant is a **bill-number integrity** risk; keep it admin-gated, org-scoped, and never touch live data.
 3. **Permission gates (§7, ST-071/075)** — non-admins fully blocked; tenant admins can't create roles or change module access.
 4. **Password policy (ST-051)** — user create/reset must enforce ≥8/1-digit/1-special.
 5. **Admin lockout** — never disable the last admin; confirm there's a safeguard or at least document the risk.
