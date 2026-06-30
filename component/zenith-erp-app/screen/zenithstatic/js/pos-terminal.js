@@ -1919,6 +1919,69 @@ window.posToggleFullscreen = function() {
             }, true);
         })();
 
+        /* === Discount & Round-off === */
+        if (!window.__posDiscDelegated) {
+            window.__posDiscDelegated = true;
+            document.addEventListener('click', function(e) {
+                var b = e.target && e.target.closest ? e.target.closest('.pos-discount-btn') : null;
+                if (b) { e.preventDefault(); if (typeof window.posDiscount === 'function') window.posDiscount(); }
+            });
+        }
+        window.posDiscount = function() {
+            if (!TX || !lastCartData || !lastCartData.items || !lastCartData.items.length) { showToast('Add items to the cart first', '#e53935'); return; }
+            var ov = document.createElement('div');
+            ov.style.cssText = 'position:fixed;inset:0;z-index:999999;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;padding:16px';
+            var rows = lastCartData.items.map(function(it) {
+                return '<div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid #f0f0f0">'
+                    + '<div style="flex:1;min-width:0;font-size:13px;font-weight:600;color:#333;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + (it.name || it.seq)
+                    + '<span style="color:#999;font-weight:400"> &nbsp;' + (Number(it.qty) || 0) + ' &times; &#8377;' + Number(it.price || 0).toFixed(2) + '</span></div>'
+                    + '<input class="pd-line" data-seq="' + it.seq + '" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0" style="width:66px;padding:6px;border:1px solid #ccc;border-radius:6px;text-align:right;font-size:13px"/>'
+                    + '<button type="button" class="pd-tg" data-t="pct" style="width:36px;padding:6px 0;border:1px solid #bbb;border-radius:6px;background:#f5f5f5;cursor:pointer;font-weight:700">%</button></div>';
+            }).join('');
+            ov.innerHTML = '<div style="background:#fff;border-radius:16px;width:480px;max-width:96vw;max-height:90vh;display:flex;flex-direction:column;box-shadow:0 12px 48px rgba(0,0,0,0.3);overflow:hidden">'
+                + '<div style="padding:16px 20px;background:#6a1b9a;color:#fff;font-size:17px;font-weight:700">&#127991;&#65039; Discount &amp; Round-off</div>'
+                + '<div style="padding:14px 18px;overflow-y:auto">'
+                + '<div style="font-size:12px;font-weight:700;color:#6a1b9a;margin-bottom:2px">PER-ITEM DISCOUNT</div>'
+                + '<div style="font-size:11px;color:#999;margin-bottom:6px">Tap % to switch a box to &#8377; (fixed amount).</div>' + rows
+                + '<div style="font-size:12px;font-weight:700;color:#6a1b9a;margin:16px 0 4px">WHOLE-BILL DISCOUNT</div>'
+                + '<div style="display:flex;align-items:center;gap:8px"><div style="flex:1;font-size:13px;color:#555">Spread across all items (GST-correct)</div>'
+                + '<input id="pd-bill" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0" style="width:66px;padding:6px;border:1px solid #ccc;border-radius:6px;text-align:right;font-size:13px"/>'
+                + '<button type="button" id="pd-bill-tg" class="pd-tg" data-t="pct" style="width:36px;padding:6px 0;border:1px solid #bbb;border-radius:6px;background:#f5f5f5;cursor:pointer;font-weight:700">%</button></div>'
+                + '<label style="display:flex;align-items:center;gap:8px;margin-top:16px;font-size:13px;color:#333;cursor:pointer"><input type="checkbox" id="pd-round" style="width:18px;height:18px"/> Round the payable <b>down</b> to a round figure</label>'
+                + '<div id="pd-pin-wrap" style="display:none;margin-top:12px;background:#fff3e0;border:1px solid #ffcc80;border-radius:8px;padding:10px"><label style="font-size:13px;font-weight:600;color:#e65100;display:block;margin-bottom:4px">Manager PIN</label><input id="pd-pin" type="password" inputmode="numeric" autocomplete="off" style="width:100%;padding:9px;border:2px solid #ffb74d;border-radius:8px;font-size:15px;box-sizing:border-box;outline:none"/></div>'
+                + '<div id="pd-msg" style="margin-top:10px;font-size:13px;color:#c62828;min-height:16px"></div></div>'
+                + '<div style="display:flex;gap:10px;padding:14px 18px;border-top:1px solid #eee">'
+                + '<button id="pd-cancel" style="flex:1;padding:13px;border:2px solid #ccc;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;background:#fff;color:#555">Cancel</button>'
+                + '<button id="pd-apply" style="flex:2;padding:13px;border:none;border-radius:10px;font-size:15px;font-weight:800;cursor:pointer;background:#6a1b9a;color:#fff">Apply</button></div></div>';
+            document.body.appendChild(ov);
+            ov.addEventListener('click', function(e) { if (e.target === ov) ov.remove(); });
+            ov.querySelectorAll('.pd-tg').forEach(function(tg) { tg.addEventListener('click', function() { var t = tg.dataset.t === 'pct' ? 'amt' : 'pct'; tg.dataset.t = t; tg.textContent = t === 'pct' ? '%' : '₹'; }); });
+            ov.querySelector('#pd-cancel').addEventListener('click', function() { ov.remove(); });
+            ov.querySelector('#pd-apply').addEventListener('click', function() {
+                var lineDisc = {};
+                ov.querySelectorAll('.pd-line').forEach(function(inp) { var v = Number(inp.value); if (v > 0) { var tg = inp.parentNode.querySelector('.pd-tg'); lineDisc[inp.dataset.seq] = { t: tg.dataset.t, v: v }; } });
+                var billV = Number(ov.querySelector('#pd-bill').value) || 0;
+                var btn = ov.querySelector('#pd-apply'); btn.disabled = true; btn.textContent = 'Applying…';
+                var params = new URLSearchParams({ action: 'applyDiscount', transactionId: TX, sessionId: SI, taxOn: TO,
+                    lineDiscounts: JSON.stringify(lineDisc), billDiscType: ov.querySelector('#pd-bill-tg').dataset.t, billDiscValue: String(billV),
+                    roundOff: ov.querySelector('#pd-round').checked ? 'Y' : 'N', managerPin: (ov.querySelector('#pd-pin').value || ''), moquiSessionToken: TK });
+                fetch('Terminal/ajaxCart', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: params, credentials: 'same-origin' })
+                    .then(function(r) { return r.json(); }).then(function(d) {
+                        btn.disabled = false; btn.textContent = 'Apply';
+                        if (d && d.success) {
+                            showToast('Discount applied', '#2e7d32'); ov.remove();
+                            // Re-sync the cart from the server (NOT a full reload — a reload reprices the
+                            // cart to the sales-mode default, which would wipe the manual discount).
+                            try { post({ action: 'refresh', transactionId: TX }).then(function(rd) { if (rd) renderCart(rd); }); }
+                            catch (_e) { window.location.reload(); }
+                            return;
+                        }
+                        if (d && d.needPin) { ov.querySelector('#pd-pin-wrap').style.display = 'block'; ov.querySelector('#pd-msg').textContent = d.error || 'Manager PIN required'; ov.querySelector('#pd-pin').focus(); return; }
+                        ov.querySelector('#pd-msg').textContent = (d && d.error) || 'Could not apply the discount';
+                    }).catch(function() { btn.disabled = false; btn.textContent = 'Apply'; ov.querySelector('#pd-msg').textContent = 'Network error — try again'; });
+            });
+        };
+
         /* === Credit / Pay-Later sale === */
         window.posCreditSale = function() {
             if (!TX) { showToast('Add items to the cart first', '#e53935'); return; }
@@ -2303,6 +2366,7 @@ window.posToggleFullscreen = function() {
                 + '<span style="font-size:16px;font-weight:600">'+modeLabel+' TOTAL</span>'
                 + '<span id="posSumTotal" style="font-size:28px;font-weight:800;letter-spacing:1px">'+CS+fmt(d.pay)+'</span></div>';
             if (d.items.length > 0) {
+                sh += '<button type="button" class="pos-discount-btn" style="display:block;width:100%;padding:clamp(7px,1.1vh,12px) 8px;border-radius:10px;font-size:14px;font-weight:700;cursor:pointer;background:#6a1b9a;color:#fff;border:none;text-align:center;margin-bottom:8px;box-sizing:border-box">&#127991;&#65039; DISCOUNT / ROUND-OFF</button>';
                 sh += '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:8px">'
                     + '<button type="button" class="pos-cash-btn" style="width:100%;padding:clamp(8px,1.4vh,15px) 8px;border:none;border-radius:10px;font-size:16px;font-weight:700;cursor:pointer;background:#4caf50;color:#fff">&#128176; CASH</button>'
                     + payBtn('Card','&#128179; CARD','#2196f3')
