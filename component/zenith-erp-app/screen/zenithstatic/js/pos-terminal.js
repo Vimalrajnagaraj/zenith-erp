@@ -375,6 +375,13 @@ window._posOffline = (function() {
         function historyPost(params) {
             if (CTX.sessionId) params.sessionId = CTX.sessionId;
             if (CTX.terminalId) params.terminalId = CTX.terminalId;
+            // Start-session screen: no active session, so scope bill history by the terminal chosen
+            // in the Open-Session dropdown. Without this an owner/manager who never opened a session
+            // sees an empty history (the server can only fall back via the operator's own sessions).
+            if (!params.sessionId && !params.terminalId) {
+                var _tsel = document.querySelector('.pos-no-session [name=terminalId]') || document.querySelector('[name=terminalId]');
+                if (_tsel && _tsel.value) params.terminalId = _tsel.value;
+            }
             params.moquiSessionToken = histToken();
             return fetch('Terminal/ajaxCart', {
                 method: 'POST', headers: {'Content-Type': 'application/x-www-form-urlencoded'},
