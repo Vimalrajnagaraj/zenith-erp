@@ -76,6 +76,35 @@ console.log('[posterm] script loaded v120 — posOpenHistory defined:', (typeof 
     }, true);
 })();
 
+/* === Held-bills dropdown escapes the one-row header's horizontal scroll ===
+   The header is a single non-wrapping row with overflow-x:auto so it scrolls on
+   narrow screens. Per CSS spec, overflow-x:auto forces overflow-y to auto too, so
+   the header CLIPS the held-bills <details> panel that opens below it (the picker
+   appeared empty/cut off). A plain overflow ancestor does NOT clip a position:fixed
+   descendant — so when the held <details> opens, pin its panel as fixed at the
+   summary's location; restore on close. /apps-only (scripts are stripped on /qapps,
+   but the terminal always runs on /apps). */
+(function heldDropdownFix() {
+    document.addEventListener('toggle', function (e) {
+        var d = e.target;
+        if (!d || !d.tagName || d.tagName.toLowerCase() !== 'details') return;
+        if (!(d.closest && d.closest('#pos-held-wrap'))) return;
+        var panel = null, k = d.children;
+        for (var i = 0; i < k.length; i++) { if (k[i].tagName && k[i].tagName.toLowerCase() === 'div') { panel = k[i]; break; } }
+        if (!panel) return;
+        if (d.open) {
+            var sm = d.querySelector('summary');
+            var r = sm.getBoundingClientRect();
+            panel.style.position = 'fixed';
+            panel.style.top = (r.bottom + 4) + 'px';
+            panel.style.left = r.left + 'px';
+            panel.style.zIndex = '3000';
+        } else {
+            panel.style.position = ''; panel.style.top = ''; panel.style.left = ''; panel.style.zIndex = '';
+        }
+    }, true);
+})();
+
 /* === Offline Mode: IndexedDB catalog cache + offline cart + sale capture + sync ===
    Self-contained: takes over the cart UI only while navigator is offline; the online
    flow is untouched. _posAjax/_posScan delegate here when offline. === */
