@@ -147,7 +147,7 @@ Contacts can be created from the Dashboard, Customers, Vendors, or All-Contacts 
 |---|---|---|---|---|---|
 | CT-020 | EDGE | Create with **no name** | Add Person, leave first & last blank, Save | **FIXED:** rejected with "Please enter a first or last name." (companies: "Please enter a business name.") — no more blank "Unknown" contacts | S3 |
 | CT-021 | EDGE | Duplicate contact allowed | Create `QA Asha Test` twice with the same phone | **Record actual.** No duplicate detection exists — both are created. The fix path is **Merge** (§12). Flag if you expect a "possible duplicate" warning | S3 |
-| CT-022 | EDGE | GSTIN wrong format/length | Enter `12ABC` or a 15-char string that isn't a real GSTIN pattern | **PARTIALLY FIXED:** the tax-registration service now validates the Indian GSTIN format (rejects non-`NNAAAAANNNNANZN` values). **Note for dev:** the *input wiring* of the GSTIN field has a pre-existing parameter mismatch (the create dialog's `gstin` and the profile's "Add GST Number" form don't map to the service's `registrationNumber`/`taxAuthorityId`), so GSTIN isn't reliably saved end-to-end yet — that needs the tax-authority mapping wired before validation is reachable from the UI | S3 |
+| CT-022 | EDGE | GSTIN wrong format/length | Enter `12ABC` or a 15-char string that isn't a real GSTIN pattern | **FIXED end-to-end:** GSTIN now saves (both the create dialog's field and the profile's "Add GST Number" form), is **validated** to the 15-char Indian format (e.g. `29ABCDE1234F1Z5`), the **state code is derived** from the first two digits, and **duplicates are rejected**. A bad GSTIN at create rolls the whole create back (no orphan contact) | S3 |
 | CT-023 | EDGE | PAN wrong format | Enter `1234567890` (digits) instead of `ABCDE1234F` | Field caps at 10 chars; **no format validation** — record whether a bad PAN saves | S3 |
 | CT-024 | EDGE | Email invalid | `not-an-email` | Record whether it's rejected or saved as-is (the create dialog may not validate email format) | S3 |
 | CT-025 | EDGE | Phone with letters / very long | `abcd`, or a 30-digit number | Record behaviour — should reject or trim, never 500 | S3 |
@@ -325,7 +325,7 @@ Every list filters on `ownerPartyId = your active organization`. These are the *
 
 1. **Multi-tenant isolation (§13)** — still the single most important thing. The direct-URL profile IDOR (ISO-005) is now **fixed**; regression-test that a tenant cannot reach another tenant's contact by id, and that a tenant **can** still open its own.
 2. **Stored XSS in the directory (CT-028, CT-066)** — now defended at two layers (input filter + output escaping); confirm a payload shows as plain text.
-3. **GSTIN input wiring (CT-022)** — format validation exists at the service, but the field-to-service mapping is broken upstream; verify whether a GSTIN entered at create/profile actually persists.
+3. **GSTIN (CT-022)** — now saved end-to-end with format validation, state-code derivation, and dedup; regression-test create-with-GSTIN and the profile "Add GST Number" form, plus a duplicate and a malformed value.
 4. **Merge is irreversible (§12.2)** — only ever on QA contacts; verify nothing is lost and references re-point.
 5. **Duplicate detection (CT-021)** — still none; decide with the dev whether a "possible duplicate" warning is wanted (merge is the cleanup path).
 6. **Required name (CT-020)** and **disabled-list consistency (CT-049)** are now **fixed** — quick regression checks.
