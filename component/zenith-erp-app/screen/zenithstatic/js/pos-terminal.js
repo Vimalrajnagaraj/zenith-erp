@@ -328,7 +328,12 @@ window._posOffline = (function() {
     function histToken() {
         try { if (window.moqui && window.moqui.webrootVue && window.moqui.webrootVue.moquiSessionToken) return window.moqui.webrootVue.moquiSessionToken; } catch(e){}
         var af = document.getElementById('cartInlineAddForm');
-        if (af) { var t = af.querySelector('[name=moquiSessionToken]'); if (t) return t.value; }
+        if (af) { var t = af.querySelector('[name=moquiSessionToken]'); if (t && t.value) return t.value; }
+        // Start-session screen: no cart form and window.moqui.webrootVue may not be initialised yet,
+        // so the token came back EMPTY and the history POST was rejected (non-JSON -> "Couldn't load").
+        // Any server-rendered token on the page (e.g. the OpenSessionForm) is valid for this session.
+        var any = document.querySelector('[name=moquiSessionToken]');
+        if (any && any.value) return any.value;
         return '';
     }
     function histToast(msg, bg) {
