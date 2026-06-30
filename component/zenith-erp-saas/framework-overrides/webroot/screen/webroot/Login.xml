@@ -72,44 +72,55 @@ along with this software (see the LICENSE.md file). If not, see
                 <script><![CDATA[
                     boolean alreadyDisabled = ec.artifactExecution.disableAuthz()
                     try {
-                        // Organization IDs are stored uppercase (= subdomain.toUpperCase()). Try the value
-                        // as typed first (zero regression), then fall back to the uppercased form so a user
-                        // who types their Org ID in lower/mixed case is not wrongly locked out. idValue is an
-                        // encrypted field, so matching is exact-ciphertext — case must be normalised here.
-                        def orgIdInput = organizationId?.trim()
-                        def orgIdList = ec.entity.find("mantle.party.PartyIdentification")
-                                .condition("partyIdTypeEnumId", "PtidOrgCode")
-                                .condition("idValue", orgIdInput).list()
-                        if (!orgIdList && orgIdInput) {
-                            orgIdList = ec.entity.find("mantle.party.PartyIdentification")
-                                .condition("partyIdTypeEnumId", "PtidOrgCode")
-                                .condition("idValue", orgIdInput.toUpperCase()).list()
+                        // IMPORTANT: no early `return` in this block. Moqui does NOT sync context
+                        // variables back across an early return in an inline <script>, so a `return`
+                        // here would silently drop orgValidationFailed and let the login through
+                        // (the D-1 gate-bypass bug). Use structured if/else so the script completes
+                        // normally and the flag reliably reaches the <if> below.
+                        if (ec.user.isInGroup("ADMIN")) {
+                            // Platform super-admins operate across tenants and are exempt from the
+                            // per-tenant org gate (matches the central module gate in ZenithApp).
+                            // Do NOT pin an active organization for a cross-tenant admin.
+                        } else {
+                            // Organization IDs are stored uppercase (= subdomain.toUpperCase()); idValue
+                            // is encrypted so matching is exact-ciphertext — try as typed, then uppercased,
+                            // so a user typing lower/mixed case is not wrongly rejected.
+                            def orgIdInput = organizationId?.trim()
+                            def orgIdList = ec.entity.find("mantle.party.PartyIdentification")
+                                    .condition("partyIdTypeEnumId", "PtidOrgCode")
+                                    .condition("idValue", orgIdInput).list()
+                            if (!orgIdList && orgIdInput) {
+                                orgIdList = ec.entity.find("mantle.party.PartyIdentification")
+                                    .condition("partyIdTypeEnumId", "PtidOrgCode")
+                                    .condition("idValue", orgIdInput.toUpperCase()).list()
+                            }
+                            if (!orgIdList) {
+                                orgValidationError = "Invalid Organization ID"
+                                orgValidationFailed = true
+                            } else {
+                                def orgPartyId = orgIdList[0].partyId
+                                def userAcct = ec.entity.find("moqui.security.UserAccount")
+                                        .condition("userId", ec.user.userId).one()
+                                if (!userAcct?.partyId) {
+                                    orgValidationError = "User account is not linked to any organization"
+                                    orgValidationFailed = true
+                                } else {
+                                    def relList = ec.entity.find("mantle.party.PartyRelationship")
+                                            .condition("fromPartyId", userAcct.partyId)
+                                            .condition("toPartyId", orgPartyId)
+                                            .condition("relationshipTypeEnumId", "PrtEmployee")
+                                            .conditionDate("fromDate", "thruDate", ec.user.nowTimestamp).list()
+                                    if (!relList) {
+                                        orgValidationError = "User does not belong to this organization"
+                                        orgValidationFailed = true
+                                    } else {
+                                        // Member of this org: bind the active organization.
+                                        ec.web.sessionAttributes.put("organizationPartyId", orgPartyId)
+                                        ec.user.setPreference("ACTIVE_ORGANIZATION", orgPartyId)
+                                    }
+                                }
+                            }
                         }
-                        if (!orgIdList) {
-                            orgValidationError = "Invalid Organization ID"
-                            orgValidationFailed = true
-                            return
-                        }
-                        def orgPartyId = orgIdList[0].partyId
-                        def userAcct = ec.entity.find("moqui.security.UserAccount")
-                                .condition("userId", ec.user.userId).one()
-                        if (!userAcct?.partyId) {
-                            orgValidationError = "User account is not linked to any organization"
-                            orgValidationFailed = true
-                            return
-                        }
-                        def relList = ec.entity.find("mantle.party.PartyRelationship")
-                                .condition("fromPartyId", userAcct.partyId)
-                                .condition("toPartyId", orgPartyId)
-                                .condition("relationshipTypeEnumId", "PrtEmployee")
-                                .conditionDate("fromDate", "thruDate", ec.user.nowTimestamp).list()
-                        if (!relList) {
-                            orgValidationError = "User does not belong to this organization"
-                            orgValidationFailed = true
-                            return
-                        }
-                        ec.web.sessionAttributes.put("organizationPartyId", orgPartyId)
-                        ec.user.setPreference("ACTIVE_ORGANIZATION", orgPartyId)
                     } finally {
                         if (!alreadyDisabled) ec.artifactExecution.enableAuthz()
                     }
