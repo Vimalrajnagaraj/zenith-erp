@@ -158,6 +158,44 @@ server {
         add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
     }
 
+    # Back-office screens — drop `no-store` ONLY here so Chrome can prerender them
+    # (Speculation-Rules instant nav). Scoped to /apps/zenith/ so /rest, /apps/tools,
+    # /qapps, /Login and everything else keep `no-store`. Still `private` + revalidated
+    # (no shared/CF cache, never serves stale); the only delta is the browser MAY
+    # disk-cache these authed pages, which prerender requires. `^~` so it wins over the
+    # static-asset regex; the exact `= /apps/zenith/pos/sw.js` block still wins over this.
+    # Mirrors `location /` exactly except the Cache-Control override.
+    location ^~ /apps/zenith/ {
+        limit_req zone=general burst=50 nodelay;
+
+        proxy_pass http://moqui_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+
+        proxy_read_timeout 300s;
+        proxy_connect_timeout 75s;
+
+        proxy_buffering on;
+        proxy_buffer_size 16k;
+        proxy_buffers 8 16k;
+        proxy_busy_buffers_size 32k;
+
+        # Strip Moqui's `no-store` and re-set without it (still private + revalidate).
+        proxy_hide_header Cache-Control;
+        add_header Cache-Control "no-cache, must-revalidate, private" always;
+
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+        add_header Permissions-Policy "camera=(), microphone=(), geolocation=(self)" always;
+        add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    }
+
     # Main application
     location / {
         limit_req zone=general burst=50 nodelay;
