@@ -2020,6 +2020,83 @@
 
 
 
+                    } else if (action == 'applyDiscount') {
+                        def dTxId = transactionId ?: p.transactionId
+                        def dTxn = ec.entity.find("zenith.erp.pos.PosTransaction").condition("transactionId", dTxId).one()
+                        if (!dTxn || dTxn.statusId != 'PtCreated') { ec.web.sendJsonResponse([success:false, error:'No open bill to discount']); return }
+                        def dItems = ec.entity.find("zenith.erp.pos.PosTransactionItem").condition("transactionId", dTxId).orderBy("itemSeqId").list()
+                        if (!dItems) { ec.web.sendJsonResponse([success:false, error:'Add items before applying a discount']); return }
+                        def dTermId = null
+                        def dSess = sessionId ? ec.entity.find("zenith.erp.pos.PosSession").condition("sessionId", sessionId).one() : null
+                        if (dSess) dTermId = dSess.terminalId
+                        def dTerm = dTermId ? ec.entity.find("zenith.erp.pos.PosTerminal").condition("terminalId", dTermId).one() : null
+                        // Discount config is stored per-organization as UserPreference key/values
+                        // (POS_DISC_LIMIT / POS_DISC_PIN / POS_DISC_ROUNDSTEP), set from the POS settings.
+                        def dOrg = dTerm?.organizationPartyId
+                        def dCfg = { k -> dOrg ? ec.entity.find("moqui.security.UserPreference").condition("userId", dOrg).condition("preferenceKey", k).one()?.preferenceValue : null }
+                        def _lim = dCfg('POS_DISC_LIMIT'); def dLimit = (_lim != null && _lim.toString().trim() != '') ? new BigDecimal(_lim.toString().trim()) : null
+                        def dPin = dCfg('POS_DISC_PIN')
+                        def _step = dCfg('POS_DISC_ROUNDSTEP'); def dStep = (_step != null && _step.toString().trim() != '') ? new BigDecimal(_step.toString().trim()) : BigDecimal.ZERO
+                        def lineMap = [:]
+                        if (p.lineDiscounts) { try { lineMap = new groovy.json.JsonSlurper().parseText(p.lineDiscounts) } catch (Exception _e) { lineMap = [:] } }
+                        // intended per-line discount amounts
+                        def grossTotal = BigDecimal.ZERO
+                        def lineCalc = [:]
+                        dItems.each { itm ->
+                            def sub = ((itm.quantity ?: 0) as BigDecimal) * ((itm.unitPrice ?: 0) as BigDecimal)
+                            grossTotal += sub
+                            def dAmt = BigDecimal.ZERO
+                            def ld = lineMap[itm.itemSeqId]
+                            if (ld) { def v = ((ld.v ?: 0) as BigDecimal); dAmt = (ld.t == 'amt') ? v : (sub * v / 100) }
+                            if (dAmt < 0) dAmt = BigDecimal.ZERO
+                            if (dAmt > sub) dAmt = sub
+                            lineCalc[itm.itemSeqId] = [sub:sub, disc:dAmt]
+                        }
+                        // whole-bill discount, apportioned across lines on their after-line-discount base
+                        def afterLine = grossTotal - (lineCalc.values().sum { it.disc } ?: BigDecimal.ZERO)
+                        def billVal = (p.billDiscValue ?: 0) as BigDecimal
+                        if (billVal > 0 && afterLine > 0) {
+                            def billDisc = (p.billDiscType == 'amt') ? billVal : (afterLine * billVal / 100)
+                            if (billDisc > afterLine) billDisc = afterLine
+                            dItems.each { itm -> def lc = lineCalc[itm.itemSeqId]; def base = lc.sub - lc.disc
+                                lc.disc = lc.disc + (afterLine != 0 ? (billDisc * base / afterLine) : BigDecimal.ZERO)
+                                if (lc.disc > lc.sub) lc.disc = lc.sub }
+                        }
+                        // manager-PIN gate on the effective overall discount %
+                        def totalDisc = lineCalc.values().sum { it.disc } ?: BigDecimal.ZERO
+                        def effPct = grossTotal > 0 ? (totalDisc * 100 / grossTotal) : BigDecimal.ZERO
+                        if (dLimit != null && effPct > dLimit) {
+                            if (!dPin || (p.managerPin ?: '') != dPin) {
+                                ec.web.sendJsonResponse([success:false, needPin:true, error:'Manager PIN required for a discount above ' + dLimit + '%'])
+                                return
+                            }
+                        }
+                        // apply: rewrite each line's discount + recompute tax (GST rate preserved)
+                        dItems.each { itm ->
+                            def lc = lineCalc[itm.itemSeqId]; def sub = lc.sub; def dAmt = lc.disc
+                            def ta = sub - dAmt
+                            def taxR = BigDecimal.ZERO
+                            if (taxOn != 'N' && itm.totalTaxAmount != null && itm.taxableAmount != null && (itm.taxableAmount as BigDecimal) != 0) {
+                                taxR = (itm.totalTaxAmount as BigDecimal) / (itm.taxableAmount as BigDecimal) }
+                            def tt = ta * taxR
+                            def dPct = sub > 0 ? (dAmt * 100 / sub) : BigDecimal.ZERO
+                            ec.service.sync().name("update#zenith.erp.pos.PosTransactionItem")
+                                .parameters([transactionId:dTxId, itemSeqId:itm.itemSeqId,
+                                    discountPercent:dPct, discountAmount:dAmt, taxableAmount:ta,
+                                    totalTaxAmount:tt, lineTotal:(ta + tt)]).call()
+                        }
+                        ec.service.sync().name("zenith.pos.PosServices.recalculate#TransactionTotals").parameters([transactionId:dTxId]).call()
+                        // reduction: round the payable DOWN to the nearest configured step
+                        if ((p.roundOff ?: '') == 'Y' && dStep > 0) {
+                            def dT2 = ec.entity.find("zenith.erp.pos.PosTransaction").condition("transactionId", dTxId).one()
+                            def grand = (dT2.grandTotal ?: 0) as BigDecimal
+                            def payable = (grand / dStep).setScale(0, java.math.RoundingMode.FLOOR) * dStep
+                            ec.service.sync().name("update#zenith.erp.pos.PosTransaction")
+                                .parameters([transactionId:dTxId, payableAmount:payable, roundOff:(payable - grand)]).call()
+                        }
+                        def dF = ec.entity.find("zenith.erp.pos.PosTransaction").condition("transactionId", dTxId).one()
+                        ec.web.sendJsonResponse([success:true, subtotal:dF.subtotal, tax:dF.totalTaxAmount, discount:dF.discountTotal, grand:dF.grandTotal, roundOff:dF.roundOff, payable:dF.payableAmount])
+                        return
                     } else if (action == 'removeItem') {
 
 
