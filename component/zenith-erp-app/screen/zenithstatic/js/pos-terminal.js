@@ -76,6 +76,22 @@ console.log('[posterm] script loaded v120 — posOpenHistory defined:', (typeof 
     }, true);
 })();
 
+/* === Browser Back exits the POS to the Quasar app dashboard ===
+   The terminal runs on /apps (after a /qapps->/apps redirect), so the native Back
+   button retraces the /apps app-chooser ("Choose an Application") + back-office
+   dashboard the cashier passed through — confusing. Trap Back: push a sentinel
+   history entry on load, and on popstate send the browser to /qapps/zenith (the
+   Quasar dashboard) instead. One Back press cleanly exits the POS. /apps-only
+   (this script only loads on the terminal). */
+(function posBackToQapps() {
+    try {
+        if (window.__posBackTrap) return;
+        window.__posBackTrap = true;
+        history.pushState({ posTrap: 1 }, '', location.href);
+        window.addEventListener('popstate', function () { location.replace('/qapps/zenith'); });
+    } catch (e) { }
+})();
+
 /* === Held-bills dropdown escapes the one-row header's horizontal scroll ===
    The header is a single non-wrapping row with overflow-x:auto so it scrolls on
    narrow screens. Per CSS spec, overflow-x:auto forces overflow-y to auto too, so
