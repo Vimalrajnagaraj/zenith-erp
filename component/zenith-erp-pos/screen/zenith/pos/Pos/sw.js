@@ -1,4 +1,4 @@
-const CACHE_NAME = 'zenith-pos-cache-v4';
+const CACHE_NAME = 'zenith-pos-cache-v5';
 
 // Minimal precache — only what's needed for an offline shell.
 // NOTE: the Terminal screen is mounted at /apps/zenith/pos/Terminal (NOT .../pos/Pos/...);

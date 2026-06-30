@@ -477,6 +477,9 @@ window._posOffline = (function() {
                         if (bill) openCartEditor(bill);
                     });
                 });
+            }).catch(function() {
+                // Never leave the panel stuck on "Loading…" — surface a retryable error.
+                if (listEl) listEl.innerHTML = '<div style="text-align:center;padding:40px;color:#c62828">Couldn&#39;t load bill history &mdash; check your connection and try again.</div>';
             });
         }
         function openBillDetail(bill) {
