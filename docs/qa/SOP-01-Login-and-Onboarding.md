@@ -131,8 +131,8 @@ Create these as you go; record the exact values you used in the *Actual* column 
 |---|---|---|---|---|---|
 | LOGIN-010 | FUNC | Missing Org ID | Correct username+password, **leave Org ID blank** | Login is rejected; user is logged back out; message **"Organization ID is required"** | S1 |
 | LOGIN-011 | FUNC | Invalid Org ID | Correct username+password, Org ID = `NOSUCHORG` | Rejected + logged out; message **"Invalid Organization ID"** | S2 |
-| LOGIN-012 | FUNC | Valid Org ID but user not a member | User from Tenant A, but enter Tenant B's Org ID (both correct passwords) | Rejected + logged out; message **"User does not belong to this organization"** | S1 |
-| LOGIN-013 | EDGE | Org ID case-insensitivity | Enter the Org ID in lowercase (`qaalpha01`) | Define expected with dev: either accepted (normalised to uppercase) **or** rejected consistently. **Record actual.** A mismatch between signup (stores uppercase) and login is a real defect | S2 |
+| LOGIN-012 | SEC | Valid Org ID but user not a member | User from Tenant A, but enter Tenant B's Org ID (both correct passwords) | **Should** reject + log out: **"User does not belong to this organization"**. ⚠️ **KNOWN DEFECT (see §14, D-1):** the membership gate currently does NOT block — the user reaches the dashboard. Active-org isolation still prevents seeing Tenant B's data, but the login should be refused. **Expect FAIL until D-1 is fixed.** | S1 |
+| LOGIN-013 | EDGE | Org ID case-insensitivity | Enter the Org ID in lowercase (`maruthi` / `qaalpha01`) | **FIXED:** accepted — login normalises the Org ID to uppercase (tries as-typed, then uppercased). Lower/mixed case no longer fails the lookup | S2 |
 | LOGIN-014 | EDGE | Org ID with spaces / trailing space | `  QAALPHA01 ` | Trimmed and accepted, or a clear error — never a silent 500 | S3 |
 | LOGIN-015 | SEC | Org isolation after login | Log in to Tenant A, then via URL try to view Tenant B data | No cross-tenant data is visible; `ACTIVE_ORGANIZATION` is bound to Tenant A only | S1 |
 
@@ -147,7 +147,7 @@ Create these as you go; record the exact values you used in the *Actual* column 
 | LOGIN-024 | EDGE | Very long inputs | 1,000-char username/password | Handled gracefully (rejected/trimmed), no crash | S4 |
 | LOGIN-025 | EDGE | Leading/trailing spaces in username | ` user@qa.com ` | Define & record: trimmed or rejected consistently | S3 |
 | LOGIN-026 | EDGE | Unicode / emoji in fields | `tÉst😀@qa.com` | No crash; graceful failure | S4 |
-| LOGIN-027 | SEC | Rapid repeated failures (lockout / throttle) | 10 fast wrong-password attempts | Confirm with dev whether throttling/lockout exists; **record actual behaviour** (this is a known gap to verify) | S2 |
+| LOGIN-027 | SEC | Rapid repeated failures (lockout / throttle) | Enter a **wrong password 3 times** for a test user | Account is **locked for 5 minutes** after 3 successive failures (framework policy `max-failures=3`, `disable-minutes=5`); the 4th attempt fails even with the correct password until the window passes. Note for product: 3/5 may be tight for fat-fingering cashiers — tune in config if needed | S2 |
 
 ### 7.4 Two-factor authentication (2FA / OTP)
 
@@ -242,10 +242,10 @@ Create these as you go; record the exact values you used in the *Actual* column 
 |---|---|---|---|---|---|
 | ONB-010 | FUNC | Live availability check | Type a free subdomain, then a taken one (`qaalpha01` after creating Tenant A) | Real-time check shows available vs taken (the field calls a `checkSubdomain` lookup) | S2 |
 | ONB-011 | FUNC | Duplicate subdomain blocked on submit | Submit with an already-used subdomain | Rejected: **"Subdomain '…' is already taken. Please choose another."**; no tenant created | S1 |
-| ONB-012 | EDGE | Uppercase / mixed-case subdomain | Enter `QaAlpha02` | Define & record: should normalise to lowercase storage + uppercase Org ID; confirm the resulting Org ID on the success page matches what login expects | S2 |
-| ONB-013 | EDGE | Subdomain with spaces/symbols | `qa alpha!` / `qa_alpha` / `qa-alpha` | Invalid characters rejected or sanitised with a clear rule; never produces a broken Org ID or a 500 | S2 |
-| ONB-014 | EDGE | Very short / very long subdomain | `a` and a 60-char string | Sensible min/max enforced (confirm rule with dev); graceful message | S3 |
-| ONB-015 | EDGE | Reserved words | `www`, `admin`, `api`, `login` | Confirm with dev whether these are reserved/blocked; **record actual** | S3 |
+| ONB-012 | EDGE | Uppercase / mixed-case subdomain | Enter `QaAlpha02` | **FIXED:** canonicalised to lowercase (`qaalpha02`) for storage; Org ID becomes the uppercase form. Success page + login now agree | S2 |
+| ONB-013 | EDGE | Subdomain with spaces/symbols | `qa alpha!` / `qa_alpha` / `qa-alpha` / `-qa` / `qa-` / `qa--b` | **FIXED:** rejected with *"Use 3-30 characters: lowercase letters, numbers and hyphens only (cannot start or end with a hyphen)"*; double hyphen → *"cannot contain two hyphens in a row"*. `qa-alpha` (single internal hyphen) is allowed | S2 |
+| ONB-014 | EDGE | Very short / very long subdomain | `ab` (2) and a 31-char string | **FIXED:** min 3 / max 30 enforced with the format message above | S3 |
+| ONB-015 | EDGE | Reserved words | `www`, `admin`, `api`, `app`, `login`, `zeta`, `dashboard` | **FIXED:** blocked with *"'…' is reserved. Please choose another."* | S3 |
 
 ### 8.3 Email & password (admin account)
 
@@ -253,8 +253,8 @@ Create these as you go; record the exact values you used in the *Actual* column 
 |---|---|---|---|---|---|
 | ONB-020 | FUNC | Duplicate email blocked | Sign up with an email already used by another account | Rejected: **"An account with email '…' already exists."**; no tenant created | S1 |
 | ONB-021 | EDGE | Invalid email format | `notanemail`, `a@b`, `a@@b.com` | Rejected with a clear "valid email" message (client and/or server) | S2 |
-| ONB-022 | FUNC | Password too short | `abc` (under 8) | Rejected: states min 8 characters | S2 |
-| ONB-023 | EDGE | Password 8 letters only | `abcdefgh` | **Verify carefully:** the form says "min 8 characters" but the account-creation policy also requires ≥1 digit and ≥1 symbol. If 8 plain letters is rejected *after* submit with a confusing message, that's a **UX/validation-gap defect** (S3) — the rule should be stated up-front | S3 |
+| ONB-022 | FUNC | Password too short | `abc` (under 8) | Rejected; policy now stated under the field: **≥8 chars, ≥1 number, ≥1 special char** | S2 |
+| ONB-023 | EDGE | Password 8 letters only | `abcdefgh` (no digit/symbol) | Rejected. **FIXED:** the field now advertises the full rule up-front (*"At least 8 characters, including at least 1 number and 1 special character"*), so the rejection is no longer surprising. Confirm `Qa-test1!` passes and `abcdefgh` / `12345678` fail | S3 |
 | ONB-024 | FUNC | Strong password accepted | `Qa-test1!` | Accepted | S2 |
 | ONB-025 | UI | Password masking | Type into Password | Masked; optional show/hide toggle works if present | S4 |
 | ONB-026 | SEC | Password not echoed back on error | Cause a validation error after typing a password | On reload, the password field is **not** pre-filled with the real value in the page source | S2 |
@@ -322,7 +322,7 @@ Create these as you go; record the exact values you used in the *Actual* column 
 |---|---|---|---|---|
 | XF-001 | FUNC | Signup → Login round-trip | After ONB-002, log in at `/Login` with the new Org ID + email + password → reaches Dashboard | S1 |
 | XF-002 | FUNC | New tenant starts clean & isolated | The new tenant's dashboard shows **its own** (empty) data — never MARUTHI's or another tenant's | S1 |
-| XF-003 | FUNC | Org ID on success = Org ID at login | The exact Org ID shown on `/signup-success` is accepted verbatim at `/Login` (case included) | S2 |
+| XF-003 | FUNC | Org ID on success = Org ID at login | The Org ID shown on `/signup-success` is accepted at `/Login` **in any case** (login uppercases it; signup canonicalises the subdomain) | S2 |
 | XF-004 | UI | Branding consistency | Login, signup, onboarding, success all carry consistent ZetaERP branding/styling | S4 |
 
 ---
@@ -331,10 +331,10 @@ Create these as you go; record the exact values you used in the *Actual* column 
 
 These are the spots most likely to hide defects in *this* part of the product — spend extra time here:
 
-1. **Org-ID gate (LOGIN-010–015):** the custom org-membership check is the most ZetaERP-specific logic and the biggest correctness/security surface.
-2. **Case-sensitivity of subdomain ↔ Org ID (ONB-012, LOGIN-013, XF-003):** signup stores uppercase; any drift between what's displayed and what login accepts will lock users out.
-3. **Password policy mismatch (ONB-023):** the form advertises "min 8 characters" but creation also needs a digit and a symbol — a classic confusing-rejection bug.
-4. **Google email-collision policy (LOGIN-073):** must block, not silently link.
+1. **Org-membership gate (LOGIN-012):** ⚠️ currently **bypassed** — see §14 D-1. The single most important thing to re-test once it's fixed, and to confirm the fix did **not** lock out existing tenants.
+2. **Case-sensitivity of subdomain ↔ Org ID (ONB-012, LOGIN-013, XF-003):** *fixed* in this pass — regression-test that lower/mixed case Org IDs log in and that signup canonicalises to lowercase.
+3. **Password policy (ONB-022/023):** *fixed* — confirm the field states the full rule and that letter-only passwords are rejected.
+4. **Google email-collision policy (LOGIN-073):** must block, not silently link (verified correct in code).
 5. **Tenant cleanup (every ONB case):** each successful signup is a real org — track them all.
 
 ---
@@ -390,6 +390,34 @@ After the run:
 3. **Log out** of all sessions and clear the `moquiLoginKey` cookie on test machines.
 4. Confirm **MARUTHI (Org `100000`) was never touched** during the run.
 5. Attach the completed run sheet(s) and any defect IDs to this part's test report.
+
+---
+
+## 14. Known defects & resolutions (from the hardening pass on 2026-06-30)
+
+### Resolved (deployed)
+| Ref | Issue | Resolution |
+|---|---|---|
+| R-1 | Org ID typed in lower/mixed case failed the lookup (LOGIN-013) | Login now tries the value as typed, then the uppercased form |
+| R-2 | Blank / invalid Org-ID errors didn't display (silent bounce) | Switched to `ec.message.addError` so the message renders (a CDATA `&&` typo introduced during this fix briefly 500'd login and was corrected) |
+| R-3 | Subdomain case-collision, no format/length rules, no reserved words (ONB-012/013/014/015) | New `validate#Subdomain` service: lowercase canonicalisation, 3–30 char format, no edge/double hyphen, reserved-word block, uniqueness across tenants **and** org codes — shared by the live check and provisioning |
+| R-4 | Password rule under-stated (ONB-023) | Field now states "≥8 chars, 1 number, 1 special char" |
+| R-5 | Duplicate email only checked against tenants | Provisioning now also rejects an email already used by any user account, and lowercases the email |
+| R-6 | "Reserved subdomains / length / lockout" were open questions | Answered: reserved+length now enforced (R-3); lockout is the framework default **3 failures → 5-min disable** |
+
+### ⚠️ D-1 — OPEN, HIGH PRIORITY: org-membership gate is bypassed
+**Symptom:** a valid user who supplies *any* existing Org ID (even one they don't belong to) is authenticated and reaches the dashboard, instead of being rejected with "User does not belong to this organization" (LOGIN-012).
+
+**Root cause:** the Login org-validation runs in an inline `<script>` that sets `orgValidationFailed = true` and then `return`s early. Moqui does **not** sync context variables back across an early `return` in an inline script, so the outer `<if condition="orgValidationFailed">` never fires and login proceeds.
+
+**Why it wasn't fixed in this pass (constraint #3):** existing tenants — including the live flagship **MARUTHI (org 100000)** — do **not** have the `PrtEmployee` relationship the gate checks for, and their login currently relies on the gate being lax plus a persisted `ACTIVE_ORGANIZATION` preference. Simply making the gate enforce membership would **lock the live tenant out**. This must not be deployed blind.
+
+**Containment today:** cross-tenant **data** is still protected — `ACTIVE_ORGANIZATION` is not re-set on this path, so the wrongly-admitted user sees no other tenant's data. The defect is "authenticates when it shouldn't", not "sees another tenant's data".
+
+**Safe remediation plan (needs a maintenance window + a real tenant login to verify):**
+1. Backfill the missing `PrtEmployee → OrgInternal` relationship for every existing tenant user that has an `ACTIVE_ORGANIZATION` preference (so the gate will pass for them).
+2. Rewrite the validation without the early `return` (structured if/else) **or** gate on `isMember OR persistedActiveOrg == requestedOrg`.
+3. Verify on a throwaway tenant: member logs in ✓, non-member blocked ✓; then verify a **real MARUTHI cashier** can still log in **before** considering it done.
 
 ---
 
