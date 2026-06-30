@@ -2280,32 +2280,28 @@
                             if (recentSess) histTermId = recentSess[0].terminalId
                         }
                         def curTerm = histTermId ? ec.entity.find("zenith.erp.pos.PosTerminal").condition("terminalId", histTermId).one() : null
-                        def orgTerminalIds = curTerm?.organizationPartyId ?
-                            (ec.entity.find("zenith.erp.pos.PosTerminal").condition("organizationPartyId", curTerm.organizationPartyId).list()*.terminalId) :
-                            (histTermId ? [histTermId] : null)
-                        def histSessionIds = orgTerminalIds ?
-                            (ec.entity.find("zenith.erp.pos.PosSession").condition("terminalId", "in", orgTerminalIds).list()*.sessionId) :
-                            null
-                        if (!histSessionIds) { ec.web.sendJsonResponse([success:true, action:'billHistory', bills:[], total:0, offset:0]); return }
-                        def txnFind = ec.entity.find("zenith.erp.pos.PosTransaction")
-                            .condition("sessionId", "in", histSessionIds).condition("statusId", "PtCompleted")
-                            .orderBy("-entryDate")
-                        def allTxns = txnFind.list()
-                        def filteredTxns = allTxns
+                        def effOrgId = curTerm?.organizationPartyId
+                        if (!effOrgId) { def _ao = ec.user.getPreference('ACTIVE_ORGANIZATION'); if (_ao && _ao != '_NA_') effOrgId = _ao }
+                        if (!effOrgId) { ec.web.sendJsonResponse([success:true, action:'billHistory', bills:[], total:0, offset:0]); return }
+                        // Scope every completed bill to the store by organizationPartyId (fully populated, and
+                        // avoids a huge sessionId IN-list) and PAGINATE IN THE DB. A large tenant (MARUTHI has
+                        // ~5,700 bills) must never load the whole history into memory + build every bill - that
+                        // hung the history panel on "Loading...". count() gives the total; offset/limit fetch
+                        // only the page actually shown.
+                        def txnBase = ec.entity.find("zenith.erp.pos.PosTransaction")
+                            .condition("organizationPartyId", effOrgId).condition("statusId", "PtCompleted")
+                        BigDecimal searchAmt = null
                         if (search) {
-                            def sl = search.toLowerCase()
-                            BigDecimal searchAmt = null
                             try { searchAmt = new BigDecimal(search) } catch (Exception ignored) {}
-                            filteredTxns = allTxns.findAll { tx ->
-                                (tx.transactionNumber ?: '').toLowerCase().contains(sl) ||
-                                (tx.customerName ?: '').toLowerCase().contains(sl) ||
-                                (tx.grandTotal != null && (tx.grandTotal as BigDecimal).toPlainString().contains(sl)) ||
-                                (searchAmt != null && tx.grandTotal != null && (tx.grandTotal as BigDecimal).compareTo(searchAmt) == 0)
-                            }
+                            def _ecf = ec.entity.conditionFactory
+                            def _or = []
+                            _or.add(_ecf.makeCondition("transactionNumber", org.moqui.entity.EntityCondition.LIKE, "%" + search + "%"))
+                            _or.add(_ecf.makeCondition("customerName", org.moqui.entity.EntityCondition.LIKE, "%" + search + "%"))
+                            if (searchAmt != null) _or.add(_ecf.makeCondition("grandTotal", org.moqui.entity.EntityCondition.EQUALS, searchAmt))
+                            txnBase.condition(_ecf.makeCondition(_or, org.moqui.entity.EntityCondition.OR))
                         }
-                        def totalCount = filteredTxns.size()
-                        def endIdx = Math.min(offset + limit, totalCount)
-                        def txns = offset < totalCount ? filteredTxns.subList(offset, endIdx) : []
+                        def totalCount = txnBase.count()
+                        def txns = txnBase.orderBy("-entryDate").offset(offset).limit(limit).list()
                         def bills = []
                         txns.each { tx ->
                             def items = ec.entity.find("zenith.erp.pos.PosTransactionItem")
