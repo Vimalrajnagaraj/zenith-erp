@@ -306,11 +306,12 @@ These are the most likely defects in this module — spend extra time here:
 
 1. **GST correctness (§9.2, XF-002)** — the single most important thing. Intra vs inter-state, discounts, mixed rates, and the **"missing state → defaults to IGST"** behaviour (SL-045). Do the math by hand.
 2. **Issued-invoice immutability (SL-051)** — *fixed*: line items are locked once the invoice leaves draft.
-3. **GST intra/inter-state (SL-045)** — *fixed*: now uses the tax-registration state (`regionGeoId`), removing the crash and the always-IGST fallback. **Separate open bug found here:** the manual EditInvoice "Add Item" doesn't persist a line at all (`create#InvoiceItem` no-ops silently) — the Order→Invoice path works, but manual add on an invoice needs a fix.
-3. **⚠ Invoice-number uniqueness (SL-052)** — manual `gstInvoiceNumber` has no duplicate check.
-4. **⚠ Payment doesn't close the invoice (SL-082)** — payment link → PAID, but the invoice stays unpaid; no Payment recorded.
-5. **Validation gaps** — negative qty (SL-046), zero amount (SL-047), no GSTIN/HSN format check, no credit-limit enforcement, RCM/Export flags stored but **not applied** to GST.
-6. **Multi-tenant isolation (§14)** — lists and document actions are guarded (`fromPartyId`/`vendorPartyId`); confirm the *edit/add/delete/print* paths are **all** guarded, not just the lists.
+3. **GST intra/inter-state (SL-045)** — *fixed*: now uses the tax-registration state (`regionGeoId`), removing the crash and the always-IGST fallback.
+4. **Manual "Add Item" persistence (SL-032/033/035)** — *fixed*: manual `EditInvoice` **Add Item** / **Delete Item** now persist and recompute totals. Two causes were corrected — a call to a non-existent service (`calculate#InvoiceTotal` → replaced with `update#InvoiceTotals`) that rolled the item back, and a transition built from bare `<script>` blocks whose writes never committed (moved into an `<actions>` block). Verified: add persists; intra→CGST+SGST, inter→IGST; header totals recompute; issued invoice still blocked; delete recomputes.
+5. **Invoice-number uniqueness (SL-052)** — *fixed*: on `CreateInvoice` a manually-entered number is now honored (previously dropped) and checked for duplicates within the organization (org-scoped by `fromPartyId`); a clash is blocked before create, blank still auto-generates. No renumber path exists on `EditInvoice` (issued invoices stay immutable).
+6. **Payment closes the invoice (SL-082)** — *fixed*: the paid-callback (`process#PaymentCallback`) now records a Payment linked to the invoice and marks it **InvoicePmtRecvd** (unpaid → 0), idempotently; the `create#PaymentLink` null-PK bug was fixed too. NOTE: this instance settles by invoice **status**, not Mantle double-entry GL (the revenue control account is a non-postable summary account), so no ledger posting is expected.
+7. **Validation gaps** — negative qty (SL-046), zero amount (SL-047), no GSTIN/HSN format check, no credit-limit enforcement, RCM/Export flags stored but **not applied** to GST.
+8. **Multi-tenant isolation (§14)** — lists and document actions are guarded (`fromPartyId`/`vendorPartyId`); confirm the *edit/add/delete/print* paths are **all** guarded, not just the lists.
 
 ---
 
