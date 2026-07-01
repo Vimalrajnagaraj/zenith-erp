@@ -409,4 +409,4 @@ These are the most likely defects in this module — spend extra time here:
 
 ---
 
-*End of Part 5 — Inventory. Related: Part 3 — POS (counter billing depletes stock); Part 4 — Sales; Purchase (receipts add stock) and Accounting (valuation) are separate parts. Remaining known gaps to triage with the dev: QC quarantine/approval and the WMS pick-list are mock stubs (not wired), and there is no per-line batch/serial **picker** in the transfer UI yet (ship auto-selects the earliest-expiry lot).*
+*End of Part 5 — Inventory. Related: Part 3 — POS (counter billing depletes stock); Part 4 — Sales; Purchase (receipts add stock) and Accounting (valuation) are separate parts. Remaining known gaps to triage with the dev: QC quarantine/approval and the WMS pick-list are mock stubs (not wired). A per-line **lot picker** is now on the transfer form (choose the batch to move; blank = earliest-expiry); a dedicated **serial-number** multi-select (choose exactly which units) is a further enhancement — serials currently auto-relocate on receive.*
