@@ -146,7 +146,7 @@ The POS is at **`/apps/zenith/pos/<screen>`** (lowercase `pos`; the checkout is 
 | PS-021 | FUNC | Per-line mode | Change one line's mode via its dropdown; use "↻ Auto" to reset | That line reprices; a manually-set mode shows 🔒 (locked); Auto reverts to Retail + re-enables quantity-break | S2 |
 | PS-022 | EDGE | **Unpriced product in a fixed mode** | Add `PROD_NOWS` in Wholesale (no wholesale price) | **Blocked** at add and at mode switch (a clear "no price for this mode" message) | S2 |
 | PS-023 | FUNC | **Quantity-break** | Add `PROD_WS` at Retail; increase qty past its threshold | Line auto-switches to the Wholesale price at the threshold; reverts below; **no-op for products with no break configured** (MARUTHI-safe); a manual-price line is exempt | S2 |
-| PS-024 | GST | **TAX toggle OFF/ON** | Toggle GST OFF then ON | OFF → all line tax zeroed + totals drop; ON → GST recomputed per line (exclusive). ⚠ Note the **default tax state on first load may differ from link-navigation** (actions default vs UI default) — record which state a fresh Terminal opens in | S3 |
+| PS-024 | GST | **TAX toggle OFF/ON** | Toggle GST OFF then ON | OFF → all line tax zeroed + totals drop; ON → GST recomputed per line (exclusive). **[Fixed 80dd4b0 — a fresh session now shows "TAX: OFF" consistently (the UI default matched to the billing logic's OFF default); the button no longer falsely shows "ON". Toggle still works both ways.]** | S3 |
 | PS-025 | FUNC | Attach a customer | Customer button → search (name/phone) → select | Customer attached to the open bill (name/phone/GSTIN); org-scoped search | S2 |
 | PS-026 | SEC | Customer cross-org | Try to attach a customer from another tenant | Rejected (same-org owner check) | S1 |
 
@@ -314,7 +314,7 @@ Session/bill ids:
 6. **Hold/Recall/Void carry-forward (PS-060..064)** — after hold/void the next add must start a **fresh** cart (not target the held/voided one); recall auto-holds the current cart.
 7. **Amend an issued bill (PS-070)** — same number, stock delta, reconciled refund/balance, audit row — never a silent renumber or a stock double-count.
 8. **Receipt never undoes a completed sale (PS-052)** — a print failure must leave the sale completed.
-9. **Tax default state on load (PS-024)** — the actions default (`taxOn` off) vs the UI/redirect default can disagree, so a fresh Terminal may open GST-off; verify the state a real cashier sees.
+9. **Tax default state on load (PS-024) — fixed (80dd4b0).** The UI now defaults to the same OFF state as the billing logic, so a fresh session shows "TAX: OFF" honestly; re-verify the button matches the computed tax and that the toggle works both ways.
 10. **Multi-tenant isolation (§11)** — especially the child entities (payments/items/held/mode-price) that rely on their parent's org scope; and that offline export/sync (token-free) stay org-scoped.
 
 ---
@@ -332,7 +332,7 @@ Session/bill ids:
 
 ## 16. Known dead / fragile spots (for the tester's awareness)
 
-- **`EditTransaction.xml`** (the `/apps/zenith/pos/PosTransactions → EditTransaction` back-office bill screen) is **partly dead**: it references fields that aren't on `PosTransaction` (`customerGstin`, `isB2b`, `igstTotal` → render blank) and calls a service that doesn't exist (`generate#UpiQrString`). **The live bill-edit path is the Terminal's amend flow (PS-070), not this screen.** Don't test bill editing here.
+- **`EditTransaction.xml`** (the `/apps/zenith/pos/PosTransactions → EditTransaction` back-office bill screen) **works** — a re-check corrected the earlier recon: the GST fields (`customerGstin`, `isB2b`, `cgstTotal/sgstTotal/igstTotal`) are declared on `PosTransaction` via the **`zenith-erp-india`** extension (`IndiaExtendEntities.xml`), and `generate#UpiQrString` exists in that same component (`IndiaPosServices.xml`); the screen renders HTTP 200 and derives the GST split for display. It is a legacy back-office **bill viewer / draft-cart editor** (hidden from the menu); the primary live bill-edit path is still the Terminal's amend flow (PS-070), but this screen is not broken.
 - **`.bak` files** (`Terminal.xml.bak`, `ReceiptPdf.xml.bak`, `PosServices.xml.bak`) are stale copies, not deployed — ignore.
 - **/qapps** strips `<script>`/`<style>` — the rich terminal only works on **/apps** (verify the /qapps→/apps bounce, PS-121).
 
