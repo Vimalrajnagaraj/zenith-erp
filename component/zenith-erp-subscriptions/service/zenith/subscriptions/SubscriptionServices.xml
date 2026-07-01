@@ -392,7 +392,12 @@
         </in-parameters>
         <actions>
             <entity-find-one entity-name="zenith.erp.subscriptions.Subscription" value-field="sub"/>
-            <if condition="!sub"><return error="true" message="Subscription not found"/></if>
+            <!-- Org-isolation: only the owning tenant (or an ADMIN, or an un-scoped billing job) may act on
+                 this subscription — block cross-tenant view/mutate/bill via a guessed id. -->
+            <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <if condition="sub == null || (activeOrg &amp;&amp; sub.organizationPartyId != activeOrg &amp;&amp; !ec.user.isInGroup('ADMIN'))">
+                <return error="true" message="Subscription not found for your account."/>
+            </if>
             <entity-find-one entity-name="zenith.erp.subscriptions.SubscriptionPlan" value-field="plan">
                 <field-map field-name="planId" from="sub.planId"/>
             </entity-find-one>
@@ -436,7 +441,12 @@
         </out-parameters>
         <actions>
             <entity-find-one entity-name="zenith.erp.subscriptions.Subscription" value-field="sub"/>
-            <if condition="!sub"><return error="true" message="Subscription not found"/></if>
+            <!-- Org-isolation: only the owning tenant (or an ADMIN, or an un-scoped billing job) may act on
+                 this subscription — block cross-tenant view/mutate/bill via a guessed id. -->
+            <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <if condition="sub == null || (activeOrg &amp;&amp; sub.organizationPartyId != activeOrg &amp;&amp; !ec.user.isInGroup('ADMIN'))">
+                <return error="true" message="Subscription not found for your account."/>
+            </if>
             <entity-find-one entity-name="zenith.erp.subscriptions.SubscriptionPlan" value-field="plan">
                 <field-map field-name="planId" from="sub.planId"/>
             </entity-find-one>
@@ -451,7 +461,10 @@
             <set field="fyStart" from="month &gt;= 4 ? year : year - 1"/>
             <set field="fyStr" from="String.format('%02d-%02d', fyStart % 100, (fyStart + 1) % 100)"/>
 
+            <!-- Per-tenant consecutive series: scope to THIS supplier org so each tenant gets its own
+                 SINV/FY/NNNNN sequence (GST consecutiveness; no cross-tenant number leakage), like SUB. -->
             <entity-find entity-name="zenith.erp.subscriptions.SubscriptionInvoice" list="existingInv">
+                <econdition field-name="organizationPartyId" from="sub.organizationPartyId"/>
                 <econdition field-name="invoiceNumber" operator="like" value="SINV/${fyStr}/%"/>
                 <order-by field-name="-invoiceNumber"/>
                 <limit count="1"/>
@@ -471,9 +484,14 @@
             <set field="setupFee" from="!priorInv ? (plan.setupFee ?: 0) : 0"/>
             <set field="baseAmount" from="(sub.billingAmount ?: 0) + setupFee"/>
             <set field="taxableAmount" from="baseAmount"/>
-            <set field="gstRate" from="plan.taxRate ?: 18"/>
-            <set field="taxAmount" from="(taxableAmount * gstRate / 100).setScale(2, java.math.RoundingMode.HALF_UP)"/>
-            <set field="totalAmount" from="taxableAmount + taxAmount"/>
+            <!-- Proper GST head split (CGST+SGST intra vs IGST inter) via the same India engine used at
+                 create time, so the ISSUED invoice carries cgst/sgst/igst + place of supply, not a flat lump. -->
+            <service-call name="zenith.subscriptions.SubscriptionServices.calculate#SubscriptionTax"
+                          in-map="[organizationPartyId:sub.organizationPartyId, customerPartyId:sub.customerPartyId,
+                                   taxableAmount:taxableAmount, gstRate:(plan.taxRate ?: 18),
+                                   productTaxCode:plan.productTaxCode]" out-map="taxOut"/>
+            <set field="taxAmount" from="taxOut.taxAmount"/>
+            <set field="totalAmount" from="(taxableAmount + taxAmount).setScale(2, java.math.RoundingMode.HALF_UP)"/>
 
             <set field="periodFrom" from="sub.lastBillingDate ?: sub.startDate"/>
             <set field="periodTo" from="sub.nextBillingDate ?: sub.endDate"/>
@@ -482,8 +500,9 @@
                           in-map="[subscriptionId:subscriptionId, invoiceNumber:invoiceNumber,
                                    invoiceDate:now, periodFrom:periodFrom, periodTo:periodTo,
                                    baseAmount:baseAmount, discountAmount:0, taxableAmount:taxableAmount,
-                                   totalTaxAmount:taxAmount,
-                                   totalAmount:totalAmount, currencyUomId:sub.currencyUomId,
+                                   totalTaxAmount:taxAmount, cgstAmount:taxOut.cgstAmount, sgstAmount:taxOut.sgstAmount,
+                                   igstAmount:taxOut.igstAmount, placeOfSupply:taxOut.placeOfSupply,
+                                   supplyType:taxOut.supplyType, totalAmount:totalAmount, currencyUomId:sub.currencyUomId,
                                    organizationPartyId:sub.organizationPartyId, statusId:'SiDraft']"
                           out-map="invOut"/>
             <set field="subInvoiceId" from="invOut.subInvoiceId"/>
@@ -497,7 +516,12 @@
         </in-parameters>
         <actions>
             <entity-find-one entity-name="zenith.erp.subscriptions.Subscription" value-field="sub"/>
-            <if condition="!sub"><return error="true" message="Subscription not found"/></if>
+            <!-- Org-isolation: only the owning tenant (or an ADMIN, or an un-scoped billing job) may act on
+                 this subscription — block cross-tenant view/mutate/bill via a guessed id. -->
+            <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <if condition="sub == null || (activeOrg &amp;&amp; sub.organizationPartyId != activeOrg &amp;&amp; !ec.user.isInGroup('ADMIN'))">
+                <return error="true" message="Subscription not found for your account."/>
+            </if>
             <entity-find-one entity-name="zenith.erp.subscriptions.SubscriptionPlan" value-field="newPlan">
                 <field-map field-name="planId" from="newPlanId"/>
             </entity-find-one>
@@ -520,6 +544,51 @@
                                    activityDate:now, description:'Plan changed to ' + newPlan.planName,
                                    performedByPartyId:ec.user.userAccount?.partyId,
                                    oldValue:oldPlanId, newValue:newPlanId]"/>
+        </actions>
+    </service>
+
+    <!-- ===== Recurring billing: bill + advance every DUE Active subscription in one call =====
+         Unifies the two previously-manual, decoupled steps (Generate Invoice + Renew). Idempotent
+         (skips a period already invoiced) and org-agnostic (bills every tenant's due subs), so it is
+         safe to run repeatedly and can be wired to a scheduled ServiceJob to automate recurring billing.
+         Left MANUAL-run by default (no live cron seeded) — enabling automatic billing is a go-live
+         decision for the dev. Run on demand: zenith.subscriptions.SubscriptionServices.process#DueSubscriptions -->
+    <service verb="process" noun="DueSubscriptions" authenticate="anonymous-all">
+        <in-parameters>
+            <parameter name="organizationPartyId"/> <!-- optional: restrict to one tenant (else all) -->
+        </in-parameters>
+        <out-parameters>
+            <parameter name="billedCount" type="Integer"/>
+            <parameter name="skippedCount" type="Integer"/>
+        </out-parameters>
+        <actions>
+            <script>ec.user.loginAnonymousIfNoUser()</script>
+            <set field="billedCount" from="0" type="Integer"/>
+            <set field="skippedCount" from="0" type="Integer"/>
+            <set field="today" from="ec.user.nowTimestamp"/>
+            <entity-find entity-name="zenith.erp.subscriptions.Subscription" list="dueList">
+                <econdition field-name="statusId" value="SubActive"/>
+                <econdition field-name="nextBillingDate" operator="less-equals" from="today"/>
+                <econdition field-name="organizationPartyId" from="organizationPartyId" ignore-if-empty="true"/>
+            </entity-find>
+            <iterate list="dueList" entry="dueSub">
+                <!-- Idempotent: skip if the current period (periodTo == this next-billing date) is already invoiced. -->
+                <entity-find entity-name="zenith.erp.subscriptions.SubscriptionInvoice" list="periodInv">
+                    <econdition field-name="subscriptionId" from="dueSub.subscriptionId"/>
+                    <econdition field-name="periodTo" from="dueSub.nextBillingDate"/>
+                    <limit count="1"/>
+                </entity-find>
+                <if condition="periodInv">
+                    <then><set field="skippedCount" from="skippedCount + 1"/></then>
+                    <else>
+                        <service-call name="zenith.subscriptions.SubscriptionServices.generate#Invoice"
+                                      in-map="[subscriptionId:dueSub.subscriptionId]"/>
+                        <service-call name="zenith.subscriptions.SubscriptionServices.renew#Subscription"
+                                      in-map="[subscriptionId:dueSub.subscriptionId]"/>
+                        <set field="billedCount" from="billedCount + 1"/>
+                    </else>
+                </if>
+            </iterate>
         </actions>
     </service>
 
