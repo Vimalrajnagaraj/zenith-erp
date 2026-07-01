@@ -54,6 +54,82 @@
             <service-call name="create#zenith.erp.barcode.ProductBarcode" out-map="context"
                           in-map="[productId:productId, barcodeTypeEnumId:barcodeTypeEnumId,
                                    barcodeValue:barcodeValue, isPrimary:isPrimary, organizationPartyId:organizationPartyId]"/>
+
+            <!-- Single source of truth: the PRIMARY barcode is mirrored into Product.pseudoId (the code the
+                 till, exact-scan and label printing use). Also seed pseudoId if the product has none yet.
+                 Non-fatal — a mirror clash never blocks adding the barcode. -->
+            <if condition="isPrimary == 'Y' || !_prd?.pseudoId">
+                <service-call name="zenith.barcode.BarcodeServices.sync#PseudoIdFromBarcode" ignore-error="true"
+                              in-map="[productId:productId, barcodeValue:barcodeValue]"/>
+            </if>
+        </actions>
+    </service>
+
+    <!-- ===== Keep Product.pseudoId (billing code) and the primary ProductBarcode in sync (both ways) ===== -->
+    <service verb="sync" noun="PseudoIdFromBarcode">
+        <description>Mirror a (primary) barcode value into Product.pseudoId, unless it clashes with another product's code.</description>
+        <in-parameters>
+            <parameter name="productId" required="true"/>
+            <parameter name="barcodeValue" required="true"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="mantle.product.Product" value-field="prd"><field-map field-name="productId"/></entity-find-one>
+            <if condition="prd == null"><return/></if>
+            <set field="code" from="barcodeValue?.trim()"/>
+            <if condition="!code || prd.pseudoId == code"><return/></if>
+            <!-- Don't collide with another product's pseudoId in the same org (unique pseudo_id+owner). -->
+            <entity-find entity-name="mantle.product.Product" list="clash" limit="1">
+                <econdition field-name="pseudoId" from="code"/>
+                <econdition field-name="ownerPartyId" from="prd.ownerPartyId" ignore-if-empty="true"/>
+                <econdition field-name="productId" operator="not-equals" from="productId"/>
+            </entity-find>
+            <if condition="clash">
+                <return/> <!-- can't mirror; leave pseudoId as-is (the scan already reads ProductBarcode too) -->
+            </if>
+            <service-call name="update#mantle.product.Product" in-map="[productId:productId, pseudoId:code]"/>
+        </actions>
+    </service>
+
+    <service verb="sync" noun="BarcodeFromPseudoId">
+        <description>Reflect a directly-set Product.pseudoId back into the ProductBarcode table as the primary barcode.</description>
+        <in-parameters>
+            <parameter name="productId" required="true"/>
+            <parameter name="code"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="mantle.product.Product" value-field="prd"><field-map field-name="productId"/></entity-find-one>
+            <if condition="prd == null"><return/></if>
+            <set field="org" from="prd.ownerPartyId ?: ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <set field="c" from="code?.trim()"/>
+            <if condition="!c"><return/></if> <!-- blank code: leave the rich table untouched -->
+            <!-- If another product in the org already owns this barcode value, we can't mirror it (unique). -->
+            <entity-find entity-name="zenith.erp.barcode.ProductBarcode" list="other" limit="1">
+                <econdition field-name="organizationPartyId" from="org"/>
+                <econdition field-name="barcodeValue" from="c"/>
+                <econdition field-name="productId" operator="not-equals" from="productId"/>
+            </entity-find>
+            <if condition="other"><return/></if>
+            <!-- Demote this product's other primaries, then set/create this value as the primary barcode. -->
+            <entity-find entity-name="zenith.erp.barcode.ProductBarcode" list="prims">
+                <econdition field-name="productId"/>
+                <econdition field-name="isPrimary" value="Y"/>
+            </entity-find>
+            <iterate list="prims" entry="pp">
+                <if condition="pp.barcodeValue != c">
+                    <service-call name="update#zenith.erp.barcode.ProductBarcode" in-map="[barcodeId:pp.barcodeId, isPrimary:'N']"/>
+                </if>
+            </iterate>
+            <entity-find entity-name="zenith.erp.barcode.ProductBarcode" list="mine" limit="1">
+                <econdition field-name="productId"/>
+                <econdition field-name="barcodeValue" from="c"/>
+            </entity-find>
+            <if condition="mine">
+                <service-call name="update#zenith.erp.barcode.ProductBarcode" in-map="[barcodeId:mine[0].barcodeId, isPrimary:'Y', isActive:'Y']"/>
+            <else>
+                <service-call name="create#zenith.erp.barcode.ProductBarcode"
+                              in-map="[productId:productId, organizationPartyId:org, barcodeTypeEnumId:'BctInternal',
+                                       barcodeValue:c, isPrimary:'Y', isActive:'Y']"/>
+            </else></if>
         </actions>
     </service>
 
