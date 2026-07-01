@@ -141,26 +141,44 @@
             <parameter name="stockTransferId" required="true"/>
         </in-parameters>
         <actions>
-            <entity-find-one entity-name="zenith.erp.inventory.StockTransfer" value-field="stx"/>
+            <!-- for-update locks the row so two fast "Ship" clicks can't both pass the Draft check and
+                 double-deplete the source (the second waits, then sees StxInTransit and is blocked). -->
+            <entity-find-one entity-name="zenith.erp.inventory.StockTransfer" value-field="stx" for-update="true"/>
+            <if condition="stx == null"><return error="true" message="Transfer not found"/></if>
             <if condition="stx.statusId != 'StxDraft'">
                 <return error="true" message="Can only ship from Draft status"/>
             </if>
-            
+            <!-- E-Way Bill hard gate (was a soft addError inside the script): block the ship outright. -->
+            <if condition="stx.ewayBillRequired == 'Y' &amp;&amp; (!stx.transporterGstin || !stx.vehicleNumber)">
+                <return error="true" message="E-Way Bill is required: enter Transporter GSTIN and Vehicle Number before shipping."/>
+            </if>
+
             <script><![CDATA[
-                // Check eWay Bill requirement
-                if (stx.ewayBillRequired == 'Y') {
-                    if (!stx.transporterGstin || !stx.vehicleNumber) {
-                        ec.message.addError("E-Way Bill is required: Transporter GSTIN and Vehicle Number must be provided before shipping.")
-                        return
-                    }
-                }
-                
-                // Update status
-                ec.service.sync().name("update#zenith.erp.inventory.StockTransfer")
-                    .parameters([stockTransferId: stockTransferId, statusId: 'StxInTransit']).call()
-                // Remove the shipped stock from the SOURCE facility (per line)
                 def org = stx.organizationPartyId ?: ec.user.getPreference('ACTIVE_ORGANIZATION')
                 def shipItems = ec.entity.find("zenith.erp.inventory.StockTransferItem").condition("stockTransferId", stockTransferId).list()
+
+                // Negative-stock guard: never ship more than the source facility holds — but ONLY for
+                // stock-tracked products. A tenant that doesn't track inventory has on-hand 0 for
+                // everything, so guarding untracked products would wrongly block every transfer.
+                for (li in shipItems) {
+                    if (li.productId && li.quantity) {
+                        def prod = ec.entity.find("mantle.product.Product").condition("productId", li.productId).one()
+                        if (prod?.inventoryTracked == 'Y') {
+                            def srcAssets = ec.entity.find("mantle.product.asset.Asset")
+                                .condition("ownerPartyId", org).condition("productId", li.productId)
+                                .condition("facilityId", stx.fromFacilityId).list()
+                            def srcQoh = srcAssets ? (srcAssets.sum { it.quantityOnHandTotal ?: 0 } as BigDecimal) : BigDecimal.ZERO
+                            if ((li.quantity as BigDecimal).compareTo(srcQoh) > 0) {
+                                ec.message.addError("Not enough stock to ship product " + li.productId + " from the source facility: have " + srcQoh + ", need " + li.quantity + ".")
+                            }
+                        }
+                    }
+                }
+                if (ec.message.hasError()) return
+
+                // Update status, then remove the shipped stock from the SOURCE facility (per line).
+                ec.service.sync().name("update#zenith.erp.inventory.StockTransfer")
+                    .parameters([stockTransferId: stockTransferId, statusId: 'StxInTransit']).call()
                 for (li in shipItems) {
                     if (li.productId && li.quantity) {
                         ec.service.sync().name("zenith.inventory.InventoryStockServices.adjust#AssetOnHand")
@@ -177,7 +195,9 @@
             <parameter name="stockTransferId" required="true"/>
         </in-parameters>
         <actions>
-            <entity-find-one entity-name="zenith.erp.inventory.StockTransfer" value-field="stx"/>
+            <!-- for-update: two fast "Receive" clicks can't both pass the In-Transit check and double-add. -->
+            <entity-find-one entity-name="zenith.erp.inventory.StockTransfer" value-field="stx" for-update="true"/>
+            <if condition="stx == null"><return error="true" message="Transfer not found"/></if>
             <if condition="stx.statusId != 'StxInTransit'">
                 <return error="true" message="Can only receive if In Transit"/>
             </if>
@@ -232,6 +252,9 @@
         <actions>
             <entity-find-one entity-name="zenith.erp.inventory.StockAdjustment" value-field="adj"/>
             <if condition="!adj"><return error="true" message="Adjustment not found"/></if>
+            <if condition="(actualQuantity as BigDecimal).compareTo(BigDecimal.ZERO) &lt; 0">
+                <return error="true" message="Counted quantity cannot be negative."/>
+            </if>
             <set field="org" from="adj.organizationPartyId ?: ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
             <entity-find entity-name="mantle.product.asset.Asset" list="assets" limit="1">
                 <econdition field-name="ownerPartyId" from="org"/>
@@ -251,7 +274,8 @@
             <parameter name="stockAdjustmentId" required="true"/>
         </in-parameters>
         <actions>
-            <entity-find-one entity-name="zenith.erp.inventory.StockAdjustment" value-field="adj"/>
+            <!-- for-update: serialize concurrent Apply clicks so the same adjustment can't post twice. -->
+            <entity-find-one entity-name="zenith.erp.inventory.StockAdjustment" value-field="adj" for-update="true"/>
             <if condition="!adj"><return error="true" message="Adjustment not found"/></if>
             <if condition="adj.statusId == 'AdjApplied'"><return error="true" message="Already applied"/></if>
             <set field="org" from="adj.organizationPartyId ?: ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
