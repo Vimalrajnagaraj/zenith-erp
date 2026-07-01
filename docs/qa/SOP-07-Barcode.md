@@ -18,11 +18,11 @@
 
 This Standard Operating Procedure tells a tester **exactly how to manually test the Barcode surface A→Z**: creating/assigning barcodes (single, bulk, auto-generated), validating **EAN-13/EAN-8/UPC-A checksums**, enforcing **uniqueness** and **primary** selection, designing **label templates**, **previewing + printing** scannable labels, and — most importantly — **scanning a barcode at the POS Terminal and getting the right product into the cart**. The barcode is what makes fast checkout work, so the highest-value tests are the round-trips: *assign a barcode → print a label → scan that label → correct product appears*.
 
-> **Read this first (the single most important structural fact):** there are **two barcode systems** that do **not** fully talk to each other.
+> **Read this first (the key structural fact):** there are **two barcode stores**:
 > - The **Barcode module** (`/apps/zenith/barcode`) stores rich barcodes in the **`ProductBarcode`** entity (multiple per product, typed EAN/UPC/Code128, checksum-validated).
-> - **POS billing** (the Terminal scan, the `pos/Barcodes` grid, `pos/BarcodeLabels`) uses the product's **`pseudoId`** ("Item Code / Barcode") field.
+> - **POS billing** and the `pos/Barcodes` grid / `pos/BarcodeLabels` use the product's **`pseudoId`** ("Item Code / Barcode") field.
 >
-> **POS scanning resolves against `pseudoId` only — it does not query `ProductBarcode`.** So a barcode you add in *Product Barcodes* (FindBarcode) will **not** be found at the till unless the same value is also the product's `pseudoId`. Verifying this gap (§11, BC-060) is a primary objective of this SOP.
+> **As of commit 39642da the POS Terminal scan resolves BOTH** — `pseudoId` (exact) → `productId` → **`ProductBarcode.barcodeValue`** (org-scoped, active) → name/code substring. So a barcode added in *Product Barcodes* now scans at the till even if it isn't the `pseudoId`. Re-verify this (§11, BC-060). Label **printing** (`pos/BarcodeLabels`) still keys off `pseudoId`, so a product still needs a `pseudoId` to be *printed* from that screen.
 
 ---
 
@@ -224,7 +224,7 @@ Screens (open from the app menu):
 
 | ID | Type | Title | Steps | Expected result | Sev |
 |---|---|---|---|---|---|
-| BC-060 | SCAN | **ProductBarcode value does NOT scan at POS** | Add a value **only** in *Product Barcodes* (`ProductBarcode`), leave `pseudoId` blank → go to the Terminal and scan it | ⚠ Expected (current design): **no match** — POS reads `pseudoId`, not `ProductBarcode`. Confirm, and flag as the system gap; the two must be reconciled before relying on the rich barcode module for billing | S1 |
+| BC-060 | SCAN | **ProductBarcode value scans at POS** | Add a value **only** in *Product Barcodes* (`ProductBarcode`), leave `pseudoId` blank → go to the Terminal and scan it | The product is found and added to the cart. **[Fixed 39642da — the Terminal scan now resolves `pseudoId` → `productId` → `ProductBarcode.barcodeValue` (org-scoped, active) → substring. Verified a ProductBarcode-only value resolves to its product.]** | S1 |
 | BC-061 | SCAN | Same value as pseudoId **does** scan | Set that value as the product's `pseudoId` too → scan | Product resolves and adds to cart | S1 |
 
 ---
@@ -239,7 +239,7 @@ Screens (open from the app menu):
 | BC-071 | SCAN | Scanner Enter key | Scan with a real handheld (types digits + Enter) | Enter triggers add; no stray newline in the field | S2 |
 | BC-072 | SCAN | Type-ahead by name/code | Type a partial name / code | `lookupProducts` returns top matches (pseudoId/name/productId substring) | S3 |
 | BC-073 | SCAN | **Unknown barcode** | Scan a code with no product | Clear "not found" message; **nothing** added; cart unchanged | S2 |
-| BC-074 | SCAN | **Duplicate `pseudoId`** | Two products share a `pseudoId`; scan it | ⚠ `.one()` returns the **first** match → **wrong product risk**. Record which product is billed; this is why BC-041/042 matter | S1 |
+| BC-074 | SCAN | Duplicate `pseudoId` (prevented) | Attempt to give two products the same `pseudoId` in one org | A within-org duplicate is **blocked** — the DB enforces `UNIQUE (pseudo_id, owner_party_id)` and the save screens show a friendly error first. **[Verified 39642da — the scan also uses `list()` (not `one()`) and returns a clear "fix the duplicate" message rather than mis-billing, hardening the cross-org edge.]** | S2 |
 | BC-075 | SCAN | Leading zeros | Product `pseudoId` `0123456789012`; scan it | Resolves exactly (leading zeros preserved end-to-end) | S2 |
 | BC-076 | PERF | Large catalogue | Tenant with ~3000 products; scan | Resolves fast (indexed pseudoId path, not a full scan every time) | S3 |
 | BC-077 | EDGE | Whitespace / case | Scan with trailing space or different case | Record actual — does trim/case-insensitivity help or cause a false match? | S3 |
@@ -285,9 +285,9 @@ Console / Network: (attach)
 
 ## 15. Areas to probe hardest (attention map)
 
-1. **The two-system gap (BC-060/061)** — a `ProductBarcode` value is **not** found by the POS scan (which uses `pseudoId`). This is the single most important structural issue: the rich barcode module and the billing scan don't share a source of truth. Prove it and flag it for reconciliation.
-2. **Duplicate `pseudoId` → wrong product billed (BC-041/042/074)** — there is **no DB uniqueness on `pseudoId`** (only `ProductBarcode` has the unique index). The bulk grid *warns* but confirm whether it *prevents* a duplicate save; `.one()` at the till silently picks the first match.
-3. **EAN/UPC checksum enforcement (BC-013/014/015)** — a bad-checksum EAN must be rejected by `add#ProductBarcode`; the plain `pseudoId` field has **no** such guard (BC-059).
+1. **The two-system gap (BC-060/061)** — **[Fixed 39642da]** the POS scan now resolves `ProductBarcode` values too, not just `pseudoId`, so the rich barcode module and the billing scan share a lookup. Re-verify a ProductBarcode-only value scans at the till.
+2. **Duplicate `pseudoId` (BC-041/042/074)** — corrected finding: the DB **does** enforce `UNIQUE (pseudo_id, owner_party_id)`, so a within-org duplicate can't be created; the save screens show a friendly error before the constraint fires, and the scan now uses `list()` + a clear duplicate message for the cross-org edge. (My initial SOP claim of "no DB uniqueness" was wrong — verified the constraint exists.)
+3. **Checksum guards (BC-013/014/015/059)** — `add#ProductBarcode` enforces EAN/UPC checksums; **[Fixed 39642da]** EditProduct's `pseudoId` now gets an **advisory** EAN/UPC check-digit validation (warns on a malformed numeric 8/12/13-digit code, never blocks free-form internal codes) plus a uniqueness + org-isolation guard.
 4. **Printed-label-scans-back correctness (BC-052/053)** — the whole point: the Code128 SVG must decode to exactly the stored code. Scan a real printed/preview label with a phone; verify byte-for-byte, including leading zeros.
 5. **POS resolution order & no-match (BC-070/073/074/075)** — exact `pseudoId` first, then productId, then substring; unknown must add nothing; leading zeros preserved.
 6. **Multi-tenant isolation (§13)** — same barcode value in two tenants must resolve to each tenant's own product; A's till must never find B's product.
@@ -305,4 +305,4 @@ Console / Network: (attach)
 
 ---
 
-*End of Part 7 — Barcode. Related: Part 3 — POS (the Terminal scan + checkout); Part 5 — Inventory (EditProduct holds the `pseudoId`). The headline items to raise with the dev: reconcile the `ProductBarcode` module with the POS `pseudoId` scan (one source of truth), and decide whether `pseudoId` should get the same uniqueness + checksum guards the `ProductBarcode` model already enforces.*
+*End of Part 7 — Barcode. Related: Part 3 — POS (the Terminal scan + checkout); Part 5 — Inventory (EditProduct holds the `pseudoId`). The three headline gaps were addressed (commit 39642da): the POS scan now resolves `ProductBarcode` values as well as `pseudoId`; `pseudoId` uniqueness is enforced by the DB (`UNIQUE (pseudo_id, owner_party_id)`) plus friendly guards on the save screens; and EditProduct's `pseudoId` gained an advisory EAN/UPC check-digit validation + org-isolation. Still worth a dev decision: whether the two stores should be fully unified (e.g. mirror a primary `ProductBarcode` into `pseudoId`, or migrate billing entirely onto `ProductBarcode`) so there is a single source of truth, and whether label printing should read `ProductBarcode` too.*
