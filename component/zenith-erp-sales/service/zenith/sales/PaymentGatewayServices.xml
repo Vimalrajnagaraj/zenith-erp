@@ -23,16 +23,12 @@
             <set field="externalLinkId" value="plink_${ec.l10n.format(ec.user.nowTimestamp, 'yyyyMMddHHmmss')}"/>
             <set field="paymentUrl" value="https://checkout.${gatewayType.toLowerCase()}.com/pay/${externalLinkId}"/>
 
-            <!-- Create PaymentLink record -->
-            <entity-make-value entity-name="zenith.erp.sales.PaymentLink" value-field="plink"/>
-            <set field="plink.invoiceId" from="invoiceId"/>
-            <set field="plink.externalLinkId" from="externalLinkId"/>
-            <set field="plink.paymentUrl" from="paymentUrl"/>
-            <set field="plink.amount" from="amount"/>
-            <set field="plink.statusId" value="CREATED"/>
-            <set field="plink.expiryDate" from="ec.user.nowTimestamp + 30"/> <!-- Expires in 30 days -->
-            <entity-create value-field="plink"/>
-            <set field="paymentLinkId" from="plink.paymentLinkId"/>
+            <!-- Create PaymentLink record via the auto CrUD service so the sequenced primary key is
+                 generated (a raw entity-create left paymentLinkId null → not-null violation). -->
+            <service-call name="create#zenith.erp.sales.PaymentLink" out-map="plCreate"
+                in-map="[invoiceId:invoiceId, externalLinkId:externalLinkId, paymentUrl:paymentUrl,
+                         amount:amount, statusId:'CREATED', expiryDate:(ec.user.nowTimestamp + 30)]"/>
+            <set field="paymentLinkId" from="plCreate.paymentLinkId"/>
 
             <!-- In a real scenario, an HTTP request to the gateway API would be placed here -->
             <message>Mock Payment Link Generated: ${paymentUrl}</message>
@@ -74,11 +70,44 @@
             </if>
 
             <if condition="status == 'paid'">
-                <set field="plink.statusId" value="PAID"/>
-                <entity-update value-field="plink"/>
-                
-                <!-- Automatically create Payment and apply to Invoice -->
-                <!-- Use mantle.account.PaymentServices.create#Payment -->
+                <!-- Idempotency: settle the invoice only once, even if the gateway retries the callback. -->
+                <if condition="plink.statusId != 'PAID'">
+                    <set field="plink.statusId" value="PAID"/>
+                    <entity-update value-field="plink"/>
+
+                    <!-- Record the payment and mark the invoice paid. Previously this was only a comment, so the
+                         link flipped to PAID but the invoice stayed unpaid and no Payment was recorded.
+                         We record a Payment linked to the invoice (fromParty=customer, toParty=organization) for
+                         the audit trail, then set the invoice to InvoicePmtRecvd. The Payment is kept at
+                         PmntPromised so it does NOT trigger Mantle's GL-posting/auto-apply cascade: this instance
+                         tracks invoices by status, not double-entry ledger (the revenue control account is a
+                         non-postable summary account, so full GL posting is not used here). -->
+                    <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="inv">
+                        <field-map field-name="invoiceId" from="plink.invoiceId"/>
+                    </entity-find-one>
+                    <if condition="inv != null &amp;&amp; inv.statusId != 'InvoicePmtRecvd' &amp;&amp; inv.statusId != 'InvoiceCancelled' &amp;&amp; inv.statusId != 'InvoiceWriteOff'">
+                        <!-- Record a Payment linked to the invoice for the audit trail. Kept at PmntPromised so it
+                             does not trigger Mantle's GL-posting/auto-apply cascade. -->
+                        <service-call name="create#mantle.account.payment.Payment" out-map="payOut"
+                            in-map="[fromPartyId:inv.toPartyId, toPartyId:inv.fromPartyId, forInvoiceId:inv.invoiceId,
+                                     paymentTypeEnumId:'PtInvoicePayment', paymentInstrumentEnumId:'PiWireTransfer',
+                                     amount:plink.amount, amountUomId:inv.currencyUomId, effectiveDate:ec.user.nowTimestamp,
+                                     paymentRefNum:transactionId, statusId:'PmntPromised']"/>
+                        <!-- Mark the invoice paid. A direct entity-update is used (not update#Invoice) because this
+                             instance tracks invoices by status rather than Mantle double-entry GL: the revenue
+                             control account is a non-postable summary account, so the Payment cannot be applied
+                             through the ledger, and the update#Invoice service's status flow rejects
+                             ->InvoicePmtRecvd while unpaidTotal is non-zero ("Invoice not fully paid"). We settle
+                             the header fields directly to reflect the gateway payment. -->
+                        <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="invUpd">
+                            <field-map field-name="invoiceId" from="plink.invoiceId"/>
+                        </entity-find-one>
+                        <set field="invUpd.statusId" value="InvoicePmtRecvd"/>
+                        <set field="invUpd.appliedPaymentsTotal" from="inv.invoiceTotal ?: plink.amount"/>
+                        <set field="invUpd.unpaidTotal" from="0"/>
+                        <entity-update value-field="invUpd"/>
+                    </if>
+                </if>
             </if>
             <if condition="status == 'failed'">
                 <set field="plink.statusId" value="CANCELLED"/>

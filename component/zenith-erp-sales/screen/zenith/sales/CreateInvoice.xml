@@ -6,29 +6,40 @@
     <parameter name="partyId"/>
 
     <transition name="createInvoice">
-        <!-- 1. Resolve Document Type based on parameters -->
-        <script>
-            def docType = "Tax Invoice"
-            def __it = ec.web.parameters.invoiceType
-            if (__it == 'BillOfSupply') docType = "Bill of Supply"
-            else if (__it == 'ExportInvoice') docType = "Export Invoice"
-            
-            // Generate basic invoice ID
-            inMap = [fromPartyId: ec.user.getPreference('ACTIVE_ORGANIZATION'), toPartyId: ec.web.parameters.toPartyId, invoiceDate: ec.web.parameters.invoiceDate, currencyUomId: 'INR'] + [
-                invoiceTypeEnumId: 'InvoiceSales',
-                statusId: 'InvoiceInProcess',
-                documentType: docType
-            ]
-        </script>
-        <service-call name="create#mantle.account.invoice.Invoice" out-map="createOut" in-map="[fromPartyId:ec.user.getPreference(&apos;ACTIVE_ORGANIZATION&apos;), toPartyId:ec.web.parameters.toPartyId, invoiceDate:ec.web.parameters.invoiceDate, currencyUomId:&apos;INR&apos;, invoiceTypeEnumId:&apos;InvoiceSales&apos;, statusId:&apos;InvoiceInProcess&apos;, documentType:(ec.web.parameters.invoiceType == &apos;BillOfSupply&apos; ? &apos;Bill of Supply&apos; : (ec.web.parameters.invoiceType == &apos;ExportInvoice&apos; ? &apos;Export Invoice&apos; : &apos;Tax Invoice&apos;))]"/>
-        
-        <!-- Generate generic GST Invoice Number if not provided -->
-        <if condition="!ec.web.parameters.gstInvoiceNumber">
-            <set field="__yy" from="Integer.parseInt(ec.l10n.format(ec.user.nowTimestamp, 'yy'))"/>
-            <set field="__fy" from="ec.l10n.format(ec.user.nowTimestamp, 'yy') + '-' + (__yy + 1)"/>
-            <service-call name="update#mantle.account.invoice.Invoice" in-map="[invoiceId:createOut.invoiceId, gstInvoiceNumber:('INV/' + __fy + '/' + createOut.invoiceId), financialYearPrefix:__fy]"/>
-        </if>
-        
+        <actions>
+            <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <!-- Trim the optional manual number; blank/whitespace becomes null (Groovy truthiness). -->
+            <set field="manualNum" from="ec.web.parameters.gstInvoiceNumber?.trim()"/>
+
+            <!-- Invoice-number uniqueness (org-scoped): a manually-entered number must not collide with an
+                 existing invoice in the same organization. Different tenants may reuse numbers, so scope by
+                 fromPartyId. Auto-generated numbers embed the (globally unique) invoiceId, so they can't clash. -->
+            <if condition="manualNum">
+                <entity-find entity-name="mantle.account.invoice.Invoice" list="dupInvs">
+                    <econdition field-name="fromPartyId" from="activeOrg"/>
+                    <econdition field-name="gstInvoiceNumber" from="manualNum"/>
+                </entity-find>
+                <if condition="dupInvs">
+                    <return error="true" message="Invoice number '${manualNum}' is already used by another invoice in your organization. Enter a unique number, or leave it blank to auto-generate."/>
+                </if>
+            </if>
+
+            <set field="docType" from="ec.web.parameters.invoiceType == 'BillOfSupply' ? 'Bill of Supply' : (ec.web.parameters.invoiceType == 'ExportInvoice' ? 'Export Invoice' : 'Tax Invoice')"/>
+            <service-call name="create#mantle.account.invoice.Invoice" out-map="createOut"
+                in-map="[fromPartyId:activeOrg, toPartyId:ec.web.parameters.toPartyId, invoiceDate:ec.web.parameters.invoiceDate, currencyUomId:'INR', invoiceTypeEnumId:'InvoiceSales', statusId:'InvoiceInProcess', documentType:docType]"/>
+
+            <if condition="manualNum">
+                <!-- Honor the user-supplied invoice number (it was previously dropped entirely). -->
+                <service-call name="update#mantle.account.invoice.Invoice" in-map="[invoiceId:createOut.invoiceId, gstInvoiceNumber:manualNum]"/>
+            <else>
+                <!-- Auto-generate a unique GST invoice number: INV/<FY>/<invoiceId>. -->
+                <set field="__yy" from="Integer.parseInt(ec.l10n.format(ec.user.nowTimestamp, 'yy'))"/>
+                <set field="__fy" from="ec.l10n.format(ec.user.nowTimestamp, 'yy') + '-' + (__yy + 1)"/>
+                <service-call name="update#mantle.account.invoice.Invoice" in-map="[invoiceId:createOut.invoiceId, gstInvoiceNumber:('INV/' + __fy + '/' + createOut.invoiceId), financialYearPrefix:__fy]"/>
+            </else>
+            </if>
+        </actions>
+
         <default-response url="../EditInvoice">
             <parameter name="invoiceId" value="${createOut.invoiceId}"/>
         </default-response>
