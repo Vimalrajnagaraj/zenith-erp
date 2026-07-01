@@ -129,10 +129,30 @@
             <parameter name="unitAmount" type="BigDecimal"/>
             <parameter name="batchNumber"><description>Optional lot to move (batch-tracked products). Validated against
                 the sending facility's stock; blank = the ship auto-picks the earliest-expiry lot.</description></parameter>
+            <parameter name="serialNumbers" type="List"><description>Optional serialNumberIds to move (serial-tracked products).
+                When given, sets the line quantity to the count of selected serials; blank = Receive auto-relocates the first N.</description></parameter>
         </in-parameters>
         <actions>
             <entity-find-one entity-name="mantle.product.Product" value-field="prod"><field-map field-name="productId"/></entity-find-one>
+            <entity-find-one entity-name="zenith.erp.inventory.StockTransfer" value-field="stx"/>
             <set field="fromAssetId" from="null"/>
+
+            <!-- If the user picked specific serials, confirm each is an in-stock unit of THIS product at the
+                 sender, then set the quantity to the number chosen. -->
+            <script><![CDATA[
+                serIds = (serialNumbers instanceof List) ? serialNumbers : (serialNumbers ? [serialNumbers] : [])
+                serIds = serIds.findAll { it }
+                validSerials = []
+                for (sid in serIds) {
+                    def sn = ec.entity.find("zenith.erp.inventory.ProductSerialNumber").condition("serialNumberId", sid).one()
+                    if (sn == null || sn.productId != productId || sn.statusId != 'SnInStock'
+                        || (stx?.fromFacilityId && sn.facilityId != stx.fromFacilityId)) {
+                        ec.message.addError("Serial " + (sn?.serialNumber ?: sid) + " isn't an in-stock unit of this product at the sending facility.")
+                    } else { validSerials.add(sn) }
+                }
+            ]]></script>
+            <if condition="ec.message.hasError()"><return/></if>
+            <if condition="validSerials"><set field="quantity" from="validSerials.size() as BigDecimal"/></if>
             <!-- If the user picked a specific lot, confirm that lot of THIS product is in stock at the sender
                  and remember its asset so ship/receive carry the exact batch (identity + expiry). -->
             <if condition="batchNumber">
@@ -149,10 +169,18 @@
                 </if>
                 <set field="fromAssetId" from="batchAssets[0].assetId"/>
             </if>
-            <service-call name="create#zenith.erp.inventory.StockTransferItem"
+            <service-call name="create#zenith.erp.inventory.StockTransferItem" out-map="createdItem"
                 in-map="[stockTransferId:stockTransferId, productId:productId, quantity:quantity,
                          unitAmount:(unitAmount ?: prod?.mrpAmount), productTaxCode:prod?.productTaxCode,
                          batchNumber:batchNumber, fromAssetId:fromAssetId]"/>
+            <!-- Record the chosen serial units against the new line so Receive relocates exactly these. -->
+            <if condition="validSerials">
+                <iterate list="validSerials" entry="sn">
+                    <service-call name="create#zenith.erp.inventory.StockTransferItemSerial"
+                        in-map="[stockTransferId:stockTransferId, transferItemSeqId:createdItem.transferItemSeqId,
+                                 serialNumberId:sn.serialNumberId, serialNumber:sn.serialNumber]"/>
+                </iterate>
+            </if>
         </actions>
     </service>
 
@@ -281,23 +309,30 @@
                                          quantityDiff:qr, reason:("Transfer in " + stockTransferId)]).call()
                     }
 
-                    // Serial-tracked: relocate the moved units' serials to the destination facility + audit row,
-                    // so a serial's recorded location follows the physical goods.
+                    // Serial-tracked: relocate the serials to the destination facility + audit row, so a
+                    // serial's recorded location follows the physical goods. Move the units the user PICKED
+                    // for this line if any; otherwise fall back to the first N in-stock serials at the source.
                     if (prod?.enableSerialTracking == 'Y') {
-                        def moveN = qr.setScale(0, java.math.RoundingMode.DOWN).intValue()
-                        if (moveN > 0) {
-                            def serials = ec.entity.find("zenith.erp.inventory.ProductSerialNumber")
+                        def picked = ec.entity.find("zenith.erp.inventory.StockTransferItemSerial")
+                            .condition("stockTransferId", stockTransferId).condition("transferItemSeqId", li.transferItemSeqId).list()
+                        def serials
+                        if (picked) {
+                            serials = picked.collect { ec.entity.find("zenith.erp.inventory.ProductSerialNumber").condition("serialNumberId", it.serialNumberId).one() }.findAll { it != null }
+                        } else {
+                            def moveN = qr.setScale(0, java.math.RoundingMode.DOWN).intValue()
+                            serials = moveN > 0 ? ec.entity.find("zenith.erp.inventory.ProductSerialNumber")
                                 .condition("productId", li.productId).condition("facilityId", stx.fromFacilityId)
-                                .condition("statusId", "SnInStock").orderBy("receivedDate,serialNumberId").limit(moveN).list()
-                            for (sn in serials) {
-                                ec.service.sync().name("update#zenith.erp.inventory.ProductSerialNumber")
-                                    .parameters([serialNumberId:sn.serialNumberId, facilityId:stx.toFacilityId]).call()
-                                ec.service.sync().name("create#zenith.erp.inventory.SerialNumberHistory").parameters([
-                                    serialNumberId:sn.serialNumberId, eventDate:ec.user.nowTimestamp, eventType:'Transfer',
-                                    fromFacilityId:stx.fromFacilityId, toFacilityId:stx.toFacilityId,
-                                    referenceType:'StockTransfer', referenceId:stockTransferId, performedByUserId:ec.user.userId,
-                                    notes:('Relocated by stock transfer ' + stockTransferId)]).call()
-                            }
+                                .condition("statusId", "SnInStock").orderBy("receivedDate,serialNumberId").limit(moveN).list() : []
+                        }
+                        for (sn in serials) {
+                            if (sn == null) continue
+                            ec.service.sync().name("update#zenith.erp.inventory.ProductSerialNumber")
+                                .parameters([serialNumberId:sn.serialNumberId, facilityId:stx.toFacilityId]).call()
+                            ec.service.sync().name("create#zenith.erp.inventory.SerialNumberHistory").parameters([
+                                serialNumberId:sn.serialNumberId, eventDate:ec.user.nowTimestamp, eventType:'Transfer',
+                                fromFacilityId:stx.fromFacilityId, toFacilityId:stx.toFacilityId,
+                                referenceType:'StockTransfer', referenceId:stockTransferId, performedByUserId:ec.user.userId,
+                                notes:('Relocated by stock transfer ' + stockTransferId)]).call()
                         }
                     }
 
