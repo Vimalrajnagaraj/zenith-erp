@@ -157,33 +157,63 @@
                 def org = stx.organizationPartyId ?: ec.user.getPreference('ACTIVE_ORGANIZATION')
                 def shipItems = ec.entity.find("zenith.erp.inventory.StockTransferItem").condition("stockTransferId", stockTransferId).list()
 
-                // Negative-stock guard: never ship more than the source facility holds — but ONLY for
-                // stock-tracked products. A tenant that doesn't track inventory has on-hand 0 for
-                // everything, so guarding untracked products would wrongly block every transfer.
+                // Validate every line before moving anything (don't partially ship).
+                //  - Batch-tracked product: a line moves from ONE source batch (its own batch, else the
+                //    earliest-expiry batch) so the batch identity + expiry can follow the goods (Receive
+                //    recreates it at the destination). If that batch can't cover the qty, block with a
+                //    clear message rather than silently losing traceability.
+                //  - Other tracked products: just check the source facility on-hand (no negative stock).
+                //  - Untracked products (non-tracking tenants, on-hand 0): no guard.
+                def picks = [:]  // transferItemSeqId -> chosen source batch Asset
                 for (li in shipItems) {
-                    if (li.productId && li.quantity) {
-                        def prod = ec.entity.find("mantle.product.Product").condition("productId", li.productId).one()
-                        if (prod?.inventoryTracked == 'Y') {
-                            def srcAssets = ec.entity.find("mantle.product.asset.Asset")
-                                .condition("ownerPartyId", org).condition("productId", li.productId)
-                                .condition("facilityId", stx.fromFacilityId).list()
-                            def srcQoh = srcAssets ? (srcAssets.sum { it.quantityOnHandTotal ?: 0 } as BigDecimal) : BigDecimal.ZERO
-                            if ((li.quantity as BigDecimal).compareTo(srcQoh) > 0) {
-                                ec.message.addError("Not enough stock to ship product " + li.productId + " from the source facility: have " + srcQoh + ", need " + li.quantity + ".")
-                            }
+                    if (!li.productId || !li.quantity) continue
+                    def prod = ec.entity.find("mantle.product.Product").condition("productId", li.productId).one()
+                    def qty = li.quantity as BigDecimal
+                    if (prod?.enableBatchTracking == 'Y') {
+                        def bf = ec.entity.find("mantle.product.asset.Asset")
+                            .condition("ownerPartyId", org).condition("productId", li.productId)
+                            .condition("facilityId", stx.fromFacilityId)
+                            .condition("quantityOnHandTotal", org.moqui.entity.EntityCondition.GREATER_THAN, BigDecimal.ZERO)
+                        if (li.batchNumber) bf.condition("batchNumber", li.batchNumber)
+                        def batches = bf.orderBy("expiryDate,receivedDate,assetId").list()
+                        if (!batches) { ec.message.addError("No stock of " + li.productId + " at the source facility to ship."); continue }
+                        def picked = batches[0]
+                        if (qty.compareTo((picked.quantityOnHandTotal ?: 0) as BigDecimal) > 0) {
+                            ec.message.addError("Batch " + (picked.batchNumber ?: '(unnamed)') + " of " + li.productId + " has only " + picked.quantityOnHandTotal + " at the source; choose a batch with enough stock or split this transfer line."); continue
+                        }
+                        picks[li.transferItemSeqId] = picked
+                    } else if (prod?.inventoryTracked == 'Y') {
+                        def srcAssets = ec.entity.find("mantle.product.asset.Asset")
+                            .condition("ownerPartyId", org).condition("productId", li.productId)
+                            .condition("facilityId", stx.fromFacilityId).list()
+                        def srcQoh = srcAssets ? (srcAssets.sum { it.quantityOnHandTotal ?: 0 } as BigDecimal) : BigDecimal.ZERO
+                        if (qty.compareTo(srcQoh) > 0) {
+                            ec.message.addError("Not enough stock to ship product " + li.productId + " from the source facility: have " + srcQoh + ", need " + li.quantity + ".")
                         }
                     }
                 }
                 if (ec.message.hasError()) return
 
-                // Update status, then remove the shipped stock from the SOURCE facility (per line).
+                // All lines valid — move stock out of the source.
                 ec.service.sync().name("update#zenith.erp.inventory.StockTransfer")
                     .parameters([stockTransferId: stockTransferId, statusId: 'StxInTransit']).call()
                 for (li in shipItems) {
-                    if (li.productId && li.quantity) {
+                    if (!li.productId || !li.quantity) continue
+                    def qty = li.quantity as BigDecimal
+                    def picked = picks[li.transferItemSeqId]
+                    if (picked != null) {
+                        // Deplete the SPECIFIC source batch (via the batch-aware stock service) and stamp the
+                        // batch on the line so Receive can recreate it at the destination with its expiry.
                         ec.service.sync().name("zenith.inventory.InventoryStockServices.adjust#AssetOnHand")
                             .parameters([organizationPartyId:org, productId:li.productId, facilityId:stx.fromFacilityId,
-                                         quantityDiff:(-((li.quantity ?: 0) as BigDecimal)), reason:("Transfer out " + stockTransferId)]).call()
+                                         batchNumber:picked.batchNumber, quantityDiff:(-qty), reason:("Transfer out " + stockTransferId)]).call()
+                        ec.service.sync().name("update#zenith.erp.inventory.StockTransferItem").parameters([
+                            stockTransferId:stockTransferId, transferItemSeqId:li.transferItemSeqId,
+                            batchNumber:picked.batchNumber, fromAssetId:picked.assetId]).call()
+                    } else {
+                        ec.service.sync().name("zenith.inventory.InventoryStockServices.adjust#AssetOnHand")
+                            .parameters([organizationPartyId:org, productId:li.productId, facilityId:stx.fromFacilityId,
+                                         quantityDiff:(-qty), reason:("Transfer out " + stockTransferId)]).call()
                     }
                 }
             ]]></script>
@@ -211,14 +241,49 @@
                 def recItems = ec.entity.find("zenith.erp.inventory.StockTransferItem").condition("stockTransferId", stockTransferId).list()
                 for (li in recItems) {
                     def qr = (li.quantityReceived != null) ? li.quantityReceived : li.quantity
-                    if (li.productId && qr) {
+                    if (!li.productId || !qr) continue
+                    qr = qr as BigDecimal
+                    def prod = ec.entity.find("mantle.product.Product").condition("productId", li.productId).one()
+
+                    if (prod?.enableBatchTracking == 'Y' && li.fromAssetId) {
+                        // Carry the batch number + expiry/mfg/mrp to the destination facility (so Expiry Risk
+                        // stays accurate) instead of dropping it into a generic no-batch asset. The batch-aware
+                        // stock service finds-or-creates the destination batch asset and adds the qty.
+                        def src = ec.entity.find("mantle.product.asset.Asset").condition("assetId", li.fromAssetId).one()
                         ec.service.sync().name("zenith.inventory.InventoryStockServices.adjust#AssetOnHand")
                             .parameters([organizationPartyId:org, productId:li.productId, facilityId:stx.toFacilityId,
-                                         quantityDiff:((qr ?: 0) as BigDecimal), reason:("Transfer in " + stockTransferId)]).call()
-                        if (li.quantityReceived == null) {
-                            ec.service.sync().name("update#zenith.erp.inventory.StockTransferItem")
-                                .parameters([stockTransferId:stockTransferId, transferItemSeqId:li.transferItemSeqId, quantityReceived:li.quantity]).call()
+                                         batchNumber:li.batchNumber, quantityDiff:qr, reason:("Transfer in " + stockTransferId),
+                                         expiryDate:src?.expiryDate, manufacturingDate:src?.manufacturingDate,
+                                         mrpAmount:src?.mrpAmount, valuationRate:src?.valuationRate]).call()
+                    } else {
+                        ec.service.sync().name("zenith.inventory.InventoryStockServices.adjust#AssetOnHand")
+                            .parameters([organizationPartyId:org, productId:li.productId, facilityId:stx.toFacilityId,
+                                         quantityDiff:qr, reason:("Transfer in " + stockTransferId)]).call()
+                    }
+
+                    // Serial-tracked: relocate the moved units' serials to the destination facility + audit row,
+                    // so a serial's recorded location follows the physical goods.
+                    if (prod?.enableSerialTracking == 'Y') {
+                        def moveN = qr.setScale(0, java.math.RoundingMode.DOWN).intValue()
+                        if (moveN > 0) {
+                            def serials = ec.entity.find("zenith.erp.inventory.ProductSerialNumber")
+                                .condition("productId", li.productId).condition("facilityId", stx.fromFacilityId)
+                                .condition("statusId", "SnInStock").orderBy("receivedDate,serialNumberId").limit(moveN).list()
+                            for (sn in serials) {
+                                ec.service.sync().name("update#zenith.erp.inventory.ProductSerialNumber")
+                                    .parameters([serialNumberId:sn.serialNumberId, facilityId:stx.toFacilityId]).call()
+                                ec.service.sync().name("create#zenith.erp.inventory.SerialNumberHistory").parameters([
+                                    serialNumberId:sn.serialNumberId, eventDate:ec.user.nowTimestamp, eventType:'Transfer',
+                                    fromFacilityId:stx.fromFacilityId, toFacilityId:stx.toFacilityId,
+                                    referenceType:'StockTransfer', referenceId:stockTransferId, performedByUserId:ec.user.userId,
+                                    notes:('Relocated by stock transfer ' + stockTransferId)]).call()
+                            }
                         }
+                    }
+
+                    if (li.quantityReceived == null) {
+                        ec.service.sync().name("update#zenith.erp.inventory.StockTransferItem")
+                            .parameters([stockTransferId:stockTransferId, transferItemSeqId:li.transferItemSeqId, quantityReceived:li.quantity]).call()
                     }
                 }
             ]]></script>
