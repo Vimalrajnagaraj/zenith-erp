@@ -85,6 +85,11 @@
                         sgstAmount = cgstAmount
                     }
                 }
+                // Reverse charge: the supplier collects no GST (the buyer self-assesses). Keep the rates for
+                // the invoice's RCM declaration but zero the collected amounts.
+                if (curInv.isReverseCharge == 'Y') {
+                    igstAmount = 0.0; cgstAmount = 0.0; sgstAmount = 0.0
+                }
 
                 // Call standard create item service but pass extended fields
                 def inMap = context + [
@@ -113,6 +118,48 @@
                     invoiceId: invoiceId,
                     totalCgst: tCgst, totalSgst: tSgst, totalIgst: tIgst, totalTaxableAmount: tTaxable
                 ]).call()
+            </script>
+        </actions>
+        <default-response url="."/>
+    </transition>
+
+    <transition name="setReverseCharge">
+        <actions>
+            <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="curInv"/>
+            <if condition="curInv == null || (activeOrg &amp;&amp; curInv.fromPartyId != activeOrg &amp;&amp; !ec.user.isInGroup('ADMIN'))">
+                <return error="true" message="Invoice not found for your account."/>
+            </if>
+            <!-- The reverse-charge flag is a tax attribute of the bill; lock it once the invoice is issued. -->
+            <if condition="curInv.statusId != 'InvoiceInProcess'">
+                <return error="true" message="This invoice has been issued so its reverse-charge status can no longer be changed. Raise a credit or debit note instead."/>
+            </if>
+            <script>
+                def rcm = (isReverseCharge == 'Y') ? 'Y' : 'N'
+                ec.service.sync().name("update#mantle.account.invoice.Invoice").parameters([invoiceId:invoiceId, isReverseCharge:rcm]).call()
+                // Re-tax every line: RCM on -> collect zero; RCM off -> restore the amount from the stored rate.
+                def invItems = ec.entity.find("mantle.account.invoice.InvoiceItem").condition("invoiceId", invoiceId).list()
+                for (def it : invItems) {
+                    def taxable = (it.taxableAmount ?: ((it.quantity?:1)*(it.amount?:0))) as BigDecimal
+                    def cA = new BigDecimal(0), sA = new BigDecimal(0), iA = new BigDecimal(0)
+                    if (rcm != 'Y') {
+                        cA = taxable.multiply((it.cgstRate ?: 0.0) as BigDecimal).divide(new BigDecimal(100), 2, java.math.RoundingMode.HALF_UP)
+                        sA = taxable.multiply((it.sgstRate ?: 0.0) as BigDecimal).divide(new BigDecimal(100), 2, java.math.RoundingMode.HALF_UP)
+                        iA = taxable.multiply((it.igstRate ?: 0.0) as BigDecimal).divide(new BigDecimal(100), 2, java.math.RoundingMode.HALF_UP)
+                    }
+                    ec.service.sync().name("update#mantle.account.invoice.InvoiceItem").parameters([
+                        invoiceId:invoiceId, invoiceItemSeqId:it.invoiceItemSeqId,
+                        cgstAmount:cA, sgstAmount:sA, igstAmount:iA]).call()
+                }
+                ec.service.sync().name("mantle.account.InvoiceServices.update#InvoiceTotals").parameters([invoiceId:invoiceId]).call()
+                def items2 = ec.entity.find("mantle.account.invoice.InvoiceItem").condition("invoiceId", invoiceId).list()
+                def tCgst = 0.0, tSgst = 0.0, tIgst = 0.0, tTaxable = 0.0
+                for (def it : items2) {
+                    tCgst += (it.cgstAmount ?: 0.0); tSgst += (it.sgstAmount ?: 0.0); tIgst += (it.igstAmount ?: 0.0)
+                    tTaxable += (it.taxableAmount ?: ((it.quantity?:1)*(it.amount?:0)))
+                }
+                ec.service.sync().name("update#mantle.account.invoice.Invoice").parameters([
+                    invoiceId:invoiceId, totalCgst:tCgst, totalSgst:tSgst, totalIgst:tIgst, totalTaxableAmount:tTaxable]).call()
             </script>
         </actions>
         <default-response url="."/>
@@ -352,6 +399,22 @@
                         <container style="col-3"><label text="CGST" type="strong" style="text-indigo-2 block"/><label text="${currSymbol}${ec.l10n.format(invoice.totalCgst ?: 0, '#,##0.00')}" type="p" style="q-my-none"/></container>
                         <container style="col-3"><label text="SGST" type="strong" style="text-indigo-2 block"/><label text="${currSymbol}${ec.l10n.format(invoice.totalSgst ?: 0, '#,##0.00')}" type="p" style="q-my-none"/></container>
                     </container>
+                </container>
+
+                <!-- Reverse Charge (RCM) -->
+                <container style="zenith-card q-pa-md bg-white shadow-1 border-radius-md q-mb-md">
+                    <label text="Reverse Charge (RCM)" type="h5" style="text-primary text-weight-bold q-mb-sm border-bottom q-pb-sm"/>
+                    <label text="Under reverse charge the buyer pays GST directly to the government, so this invoice collects none. Status: ${(invoice?.isReverseCharge == 'Y') ? 'ON — no GST charged to the customer' : 'OFF — GST charged normally'}." type="p" style="text-grey-8 q-mb-sm"/>
+                    <form-single name="ReverseChargeForm" transition="setReverseCharge">
+                        <field name="invoiceId"><default-field><hidden/></default-field></field>
+                        <field name="isReverseCharge"><default-field title="Reverse charge">
+                            <drop-down no-current-selected-key="${invoice?.isReverseCharge ?: 'N'}">
+                                <option key="N" text="No — charge GST normally"/>
+                                <option key="Y" text="Yes — reverse charge (collect no GST)"/>
+                            </drop-down>
+                        </default-field></field>
+                        <field name="submitButton"><default-field title=""><submit text="Apply &amp; re-tax items" style="q-btn bg-indigo-7 text-white text-weight-bold q-px-md border-radius-sm glossy"/></default-field></field>
+                    </form-single>
                 </container>
             </row-col>
         </container-row>
