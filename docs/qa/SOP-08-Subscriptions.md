@@ -199,8 +199,8 @@ Usage card shows users / POS terminals / products / monthly txns / stores / loya
 | ID | Type | Title | Steps | Expected result | Sev |
 |---|---|---|---|---|---|
 | MS-020 | FUNC | Upgrade plan | Pick a higher plan → Upgrade | tenant.planId swapped, new SubActive subscription; limits/modules update | S2 |
-| MS-021 | EDGE | **No proration / no invoice** | Upgrade mid-cycle | ⚠ Immediate swap, **no proration and no invoice generated** — record actual (revenue/UX consideration) | S3 |
-| MS-022 | EDGE | **Downgrade below current usage** | On a tenant over the target plan's limits, downgrade | ⚠ `change#Plan` **does not call `check#UsageLimits`** → the downgrade **succeeds despite being over limit** (limits are display-only). Confirm + flag | S2 |
+| MS-021 | FUNC | **Upgrade proration** | Upgrade mid-cycle (e.g. 15 of 30 days left) | A **payable** prorated invoice for the price difference × remaining/total days appears (SiSent, pay via Razorpay — never auto-charged). **[Fixed 2bc34c0 — verified 999→2499 at 15/30 days → SAAS invoice subtotal 750 + GST.]** Downgrade → no immediate charge; the lower price applies next renewal | S2 |
+| MS-022 | SEC | **Downgrade below current usage blocked** | On a tenant over the target plan's limits, downgrade | Rejected with the specific over-limit metrics. **[Fixed 2bc34c0 — `change#Plan` now calls `check#UsageLimits` for the TARGET plan; verified a downgrade to a 1-product plan was blocked with 3 products.]** | S2 |
 | MS-023 | LIFE | Cancel subscription | Cancel | autoRenew off; tenant stays active until period end (unless immediate); status reflects cancellation | S2 |
 
 ## 14. Module access gating (plan → modules)
@@ -289,4 +289,4 @@ Records touched:  subscription / invoice / payment ids
 
 ---
 
-*End of Part 8 — Subscriptions & My Subscription. Related: Part 6 — Tax (the GST engine subscription invoices now use); Part 2 — Contacts (the customer parties billed); Auth/Signup (tenant provisioning for the SaaS side). The Part-A cross-tenant IDOR + missing ownership guards, the flat-tax/no-head-split on `generate#Invoice`, and the shared SINV numbering were **fixed** (commit 96ef7b6), and a `process#DueSubscriptions` recurring-billing service was added (still manual-run — the dev decides when to schedule it). Still open for dev on Part B: downgrade-below-usage is not blocked, upgrade/downgrade has no proration/invoice, and Razorpay must stay test-mode until go-live.*
+*End of Part 8 — Subscriptions & My Subscription. Related: Part 6 — Tax (the GST engine subscription invoices now use); Part 2 — Contacts (the customer parties billed); Auth/Signup (tenant provisioning for the SaaS side). The Part-A cross-tenant IDOR + missing ownership guards, the flat-tax/no-head-split on `generate#Invoice`, and the shared SINV numbering were **fixed** (commit 96ef7b6), and a `process#DueSubscriptions` recurring-billing service was added (still manual-run — the dev decides when to schedule it). Part B: the over-limit-downgrade block and mid-cycle **upgrade proration** are now implemented (commit 2bc34c0) — an upgrade raises a payable prorated invoice (Razorpay), a downgrade takes effect with the lower price from the next renewal, and a downgrade below current usage is rejected. Razorpay must still stay **test-mode** until go-live (an operational control, not a code fix).*
