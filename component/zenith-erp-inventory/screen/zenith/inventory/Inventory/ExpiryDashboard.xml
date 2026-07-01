@@ -11,21 +11,25 @@
             cal.add(Calendar.DAY_OF_YEAR, 90)
             Timestamp thresholdDate = new Timestamp(cal.getTimeInMillis())
 
-            def assetList = ec.entity.find("mantle.product.asset.Asset")
+            // Org isolation (primary guard): a tenant sees only its own expiring stock; a super-admin with
+            // no active org sees all. Asset is not covered by the active-org entity-filter set, so scope it
+            // here explicitly — do NOT rely on the Product join below to hide other tenants' stock.
+            def activeOrg = ec.user.getPreference('ACTIVE_ORGANIZATION')
+            def assetFind = ec.entity.find("mantle.product.asset.Asset")
                 .condition("expiryDate", org.moqui.entity.EntityCondition.LESS_THAN_EQUAL_TO, thresholdDate)
                 .condition("quantityOnHandTotal", org.moqui.entity.EntityCondition.GREATER_THAN, BigDecimal.ZERO)
-                .list()
+            if (activeOrg && activeOrg != '_NA_') assetFind.condition("ownerPartyId", activeOrg)
+            def assetList = assetFind.list()
 
             BigDecimal totalVal = BigDecimal.ZERO
             List expList = []
             for (def asset : assetList) {
+                def product = ec.entity.find("mantle.product.Product").condition("productId", asset.productId).one()
+                if (product == null) { continue }  // orphaned/not-visible product — skip, don't value it
                 def valRate = asset.valuationRate ?: BigDecimal.ZERO
                 def qoh = asset.quantityOnHandTotal ?: BigDecimal.ZERO
                 def val = valRate.multiply(qoh)
                 totalVal = totalVal.add(val)
-                
-                def product = ec.entity.find("mantle.product.Product").condition("productId", asset.productId).one()
-                if (product == null) { totalVal = totalVal.subtract(val); continue }
                 expList.add([
                     assetId: asset.assetId,
                     productName: product?.productName ?: 'Unknown',
@@ -35,7 +39,7 @@
                     batchNumber: asset.batchNumber ?: 'N/A'
                 ])
             }
-            
+
             expiryOut = [totalExpiryValue: totalVal, expiringAssets: expList]
         ]]></script>
     </actions>
