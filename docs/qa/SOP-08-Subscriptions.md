@@ -151,21 +151,21 @@ This SOP tells a tester **exactly how to manually test both recurring-billing su
 | ID | Type | Title | Steps | Expected result | Sev |
 |---|---|---|---|---|---|
 | SB-030 | FUNC | Generate first invoice | SubActive subscription → **Generate Invoice** | `SINV/FY/NNNNN` created; **setup fee included** on the first only | S2 |
-| SB-031 | GST | **Intra-state split on the invoice** | Customer in the tenant's state, ₹1000 @18% | Expect CGST 90 + SGST 90 on the **invoice**. ⚠ `generate#Invoice` uses **FLAT tax** and leaves `cgstAmount/sgstAmount/igstAmount/placeOfSupply` **NULL** — the split computed on the Subscription at create-time is **not carried to the invoice**. Record actual — a GST invoice with no head split is non-compliant | **S1** |
-| SB-032 | GST | **Inter-state split on the invoice** | Customer in another state | Expect IGST 180 on the invoice; same null-split gap likely | **S1** |
-| SB-033 | GST | Discount on the invoice | Subscription created with a discount | ⚠ `generate#Invoice` hardcodes `discountAmount = 0` → the invoice may **not reflect the discount**. Record actual | S2 |
-| SB-034 | GST | **Invoice number is org-scoped?** | Generate invoices on **two** tenants; compare `SINV` numbers | ⚠ The SINV series is **NOT org-scoped** (shared across tenants) → gaps/overlaps in each tenant's sequence — a GST consecutiveness problem. (Contrast: SUB numbers ARE org-scoped.) | S2 |
+| SB-031 | GST | **Intra-state split on the invoice** | Customer in the tenant's state, ₹1000 @18% | CGST 90 + SGST 90 + place-of-supply on the **invoice**. **[Fixed 96ef7b6 — `generate#Invoice` now routes through `calculate#SubscriptionTax` (the India engine); verified CGST 90 + SGST 90, POS 27, INTRA_STATE stored on the invoice.]** | **S1** |
+| SB-032 | GST | **Inter-state split on the invoice** | Customer in another state | IGST 180 on the invoice. **[Fixed 96ef7b6 — verified IGST 180, POS 29, INTER_STATE.]** | **S1** |
+| SB-033 | GST | Discount on the invoice | Subscription created with a discount | The invoice total is discounted (the subscription's `billingAmount` is stored net-of-discount); the `discountAmount` field is not itemised (shows 0) — record whether the total is correct (it should be) | S3 |
+| SB-034 | GST | **Invoice number is org-scoped** | Generate invoices on **two** tenants; compare `SINV` numbers | Each tenant has its own consecutive `SINV/FY/NNNNN`. **[Fixed 96ef7b6 — the series is now org-scoped like SUB; verified SINV/26-27/00001, /00002 within one org.]** | S2 |
 | SB-035 | GST | Tax-exclusive base | Verify the base | Prices are tax-**exclusive**; GST added on top; total = base + tax | S2 |
 | SB-036 | FUNC | Invoices screen | `/apps/zenith/subscriptions/Invoices` → open a generated invoice | Shows period, amounts, status (Draft/Sent/Paid/Overdue…); status editable | S3 |
-| SB-037 | EDGE | **No recurring billing job** | Wait for a due subscription to auto-bill | ⚠ There is **no scheduled/cron job** — billing is **entirely manual** (open each sub, click Generate + Renew). Confirm nothing auto-generates; this is a functional gap to raise | S2 |
+| SB-037 | FUNC | **Recurring billing job** | Run `process#DueSubscriptions` (or its scheduled job, once the dev enables it) | **[Added 96ef7b6 — one idempotent, org-agnostic call bills + advances every DUE Active subscription, unifying the formerly decoupled Generate + Renew. Verified billedCount=1 then 0 on re-run.]** Note: still **manual-run by default** (no live cron seeded) — automatic billing is a dev go-live decision | S2 |
 
 ## 10. Part A multi-tenant isolation (test explicitly — known gaps)
 
 | ID | Type | Title | Steps | Expected result | Sev |
 |---|---|---|---|---|---|
 | ISO-001 | ISO | List scoped | Tenant A lists subscriptions/invoices | Only A's rows | S1 |
-| ISO-002 | SEC | **View another tenant's subscription** | As tenant A, open `EditSubscription?subscriptionId=<B's id>` | ⚠ Should be blocked. Detail load has **no org check** → A may **see B's subscription, invoices, activity**. Confirm + flag (Critical IDOR) | **S1** |
-| ISO-003 | SEC | **Mutate/bill another tenant's subscription** | As A, call **Renew / Change Plan / Generate Invoice** on B's subscription | ⚠ These 3 have **no ownership guard** → A could renew/re-plan/bill B's subscription. (Activate/Pause/Resume/Cancel **are** guarded.) Confirm + flag | **S1** |
+| ISO-002 | SEC | **View another tenant's subscription** | As tenant A, open `EditSubscription?subscriptionId=<B's id>` | Redirected back to the list — **not** shown. **[Fixed 96ef7b6 — a pre-action redirects a non-owner (ADMIN exempt) before any data renders; verified the screen still renders for the owner/admin.]** | **S1** |
+| ISO-003 | SEC | **Mutate/bill another tenant's subscription** | As A, call **Renew / Change Plan / Generate Invoice** on B's subscription | Blocked ("not found for your account"). **[Fixed 96ef7b6 — all three now carry the same ownership guard as activate/pause/resume/cancel.]** | **S1** |
 | ISO-004 | ISO | Plans/discounts scoped | A lists Plans/Discounts | Only A's + the global seed rows (flag the seeds) | S2 |
 
 ---
@@ -266,10 +266,10 @@ Records touched:  subscription / invoice / payment ids
 
 ## 18. Areas to probe hardest (attention map)
 
-1. **Part A cross-tenant access (ISO-002/003)** — `EditSubscription` loads by id with **no org check**, and **Renew / Change Plan / Generate Invoice** have **no ownership guard**. A tenant may view — and *bill* — another tenant's subscription. This is the top risk; confirm and flag as Critical.
-2. **GST head-split missing on the actual invoice (SB-031/032/033)** — `generate#Invoice` uses **flat tax**, leaves CGST/SGST/IGST/placeOfSupply **NULL**, and ignores the discount (hardcoded 0). The split computed on the Subscription at create-time is **not** carried to the `SubscriptionInvoice` — a non-compliant GST invoice.
-3. **Subscription invoice numbering not org-scoped (SB-034)** — the `SINV` series is shared across tenants, breaking per-tenant GST consecutiveness.
-4. **No recurring-billing automation for Part A (SB-037, XF-003)** — billing is entirely manual, and Renew vs Generate are decoupled (dates advance without a bill, or a bill without advancing dates).
+1. **Part A cross-tenant access (ISO-002/003) — FIXED 96ef7b6.** `EditSubscription` now redirects a non-owner, and Renew / Change Plan / Generate Invoice carry the ownership guard. Re-verify a tenant can't view or bill another tenant's subscription by id.
+2. **GST head-split on the actual invoice (SB-031/032) — FIXED 96ef7b6.** `generate#Invoice` now routes through the India engine and stores the CGST/SGST vs IGST split + place of supply. Re-verify intra CGST+SGST and inter IGST on the *invoice*.
+3. **Subscription invoice numbering (SB-034) — FIXED 96ef7b6.** The `SINV` series is now org-scoped like SUB. Re-verify per-tenant consecutiveness.
+4. **Recurring-billing automation (SB-037, XF-003) — ADDED 96ef7b6.** `process#DueSubscriptions` bills + advances every due Active subscription idempotently in one call (unifying Generate + Renew). Still **manual-run** (no live cron) — verify the dev's schedule/enable decision before relying on automatic billing.
 5. **Downgrade below current usage not blocked (MS-022)** — `change#Plan` never calls `check#UsageLimits`.
 6. **Module gating is server-side and fail-open (MS-031/033)** — verify an out-of-plan module (including `subscriptions`) is actually **redirected**, not merely hidden; suspended tenants are blocked.
 7. **Razorpay is real (MS-040/041/042)** — never make a real payment; verify the own-invoice check, the not-configured error, and replay/idempotency.
@@ -289,4 +289,4 @@ Records touched:  subscription / invoice / payment ids
 
 ---
 
-*End of Part 8 — Subscriptions & My Subscription. Related: Part 6 — Tax (the GST engine subscription invoices should use); Part 2 — Contacts (the customer parties billed); Auth/Signup (tenant provisioning for the SaaS side). Before any live subscription billing, triage with the dev: the Part-A cross-tenant IDOR + missing ownership guards, the flat-tax/no-head-split on generate#Invoice, the shared SINV numbering, and the absence of a recurring-billing job.*
+*End of Part 8 — Subscriptions & My Subscription. Related: Part 6 — Tax (the GST engine subscription invoices now use); Part 2 — Contacts (the customer parties billed); Auth/Signup (tenant provisioning for the SaaS side). The Part-A cross-tenant IDOR + missing ownership guards, the flat-tax/no-head-split on `generate#Invoice`, and the shared SINV numbering were **fixed** (commit 96ef7b6), and a `process#DueSubscriptions` recurring-billing service was added (still manual-run — the dev decides when to schedule it). Still open for dev on Part B: downgrade-below-usage is not blocked, upgrade/downgrade has no proration/invoice, and Razorpay must stay test-mode until go-live.*
