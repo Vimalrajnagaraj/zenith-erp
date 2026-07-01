@@ -391,7 +391,7 @@ These are the most likely defects in this module — spend extra time here:
 4. **The `inventoryTracked` flag (IV-012, IV-069, IV-114, IV-131, XF-005)** — a product only deplete-on-sale once tracked; adjustments/opening flip it on for **all facilities** (intended: entering a count = you now track that product). Confirm the flag's lifecycle and its POS side-effects.
 5. **Inter-state transfer IGST + e-Way Bill (IV-075, IV-076, IV-077, XF-002)** — *e-Way gate fixed* (now a hard block if transporter GSTIN / vehicle no. are missing). Still verify the **IGST branch-transfer invoice** is correct for a different-GSTIN transfer.
 6. **Valuation with zero cost (IV-041, IV-056, IV-101)** — no MRP/acquire cost → stock valued at 0. Confirm whether that's acceptable or a data-quality trap.
-7. **Batch/serial traceability (IV-084, IV-094)** — transfers can drop batch numbers and do **not** move a serial's location. Flag any traceability break.
+7. **Batch/serial traceability (IV-084, IV-094)** — *fixed*: a batch-tracked transfer now moves from one source lot and **recreates that lot (with its expiry) at the destination**; serial-tracked transfers **relocate the moved serials** to the destination facility with a history audit row. Re-test that a lot's expiry still shows in Expiry Risk after a transfer, and that a moved serial reports the new facility.
 8. **Partial/over receipts & transfers (IV-053, IV-054, IV-080, IV-081)** — no shrinkage/overage reconciliation; missing units simply vanish.
 9. **Not-yet-wired features** — **QC quarantine/approval** and **WMS pick-list** services are **mock stubs** (received goods go straight to Available). Don't test them as live; note them as gaps.
 10. **Facility isolation (IV-035)** — facilities rely on Mantle-level owner scoping with no explicit screen econdition; confirm a tenant genuinely cannot open another org's facility by id.
@@ -409,4 +409,4 @@ These are the most likely defects in this module — spend extra time here:
 
 ---
 
-*End of Part 5 — Inventory. Related: Part 3 — POS (counter billing depletes stock); Part 4 — Sales; Purchase (receipts add stock) and Accounting (valuation) are separate parts. The Expiry-Risk isolation check (IV-103), the negative-stock behaviour, and the inter-state transfer IGST/e-Way flow should be triaged with the dev before any live use.*
+*End of Part 5 — Inventory. Related: Part 3 — POS (counter billing depletes stock); Part 4 — Sales; Purchase (receipts add stock) and Accounting (valuation) are separate parts. Remaining known gaps to triage with the dev: QC quarantine/approval and the WMS pick-list are mock stubs (not wired), and there is no per-line batch/serial **picker** in the transfer UI yet (ship auto-selects the earliest-expiry lot).*
