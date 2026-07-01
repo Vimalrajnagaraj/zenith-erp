@@ -2,51 +2,227 @@
 <services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
           xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
 
+    <!-- Real GSTR-1 (outward supplies) generation: aggregates the period's sales invoices into
+         B2B / B2C-Large / B2C-Small / Export / HSN-summary records and a GSTN-schema JSON payload.
+         (Replaces the earlier demo stub. Does NOT file with the GSTN portal — that needs API creds.) -->
     <service verb="generate" noun="Gstr1Data">
-        <description>Aggregate all sales invoices for a return period into GSTR-1 format</description>
         <in-parameters>
             <parameter name="organizationPartyId" required="true"/>
             <parameter name="returnPeriod" required="true"/> <!-- MMYYYY -->
+            <parameter name="financialYear"/>
         </in-parameters>
         <out-parameters>
             <parameter name="filingId"/>
+            <parameter name="invoiceCount" type="Integer"/>
         </out-parameters>
         <actions>
-            <!-- Mock implementation for demo purposes -->
-            <entity-make-value entity-name="zenith.erp.india.gstr1.Gstr1Filing" value-field="filing"/>
-            <set field="filing.organizationPartyId" from="organizationPartyId"/>
-            <set field="filing.returnPeriod" from="returnPeriod"/>
-            <set field="filing.filingDate" from="ec.user.nowTimestamp"/>
-            <set field="filing.statusId" value="DRAFT"/>
-            <entity-create value-field="filing"/>
-            <set field="filingId" from="filing.filingId"/>
+            <if condition="!(returnPeriod ==~ /\d{6}/)">
+                <return error="true" message="Return period must be MMYYYY (e.g. 042026)."/>
+            </if>
+            <script><![CDATA[
+                import java.sql.Timestamp
+                import groovy.json.JsonOutput
 
-            <!-- In a real implementation, we would query Invoice and InvoiceItem, 
-                 group by B2B/B2C, Export, HSN, and insert into the respective GSTR1 entities -->
-            
-            <service-call name="zenith.india.Gstr1Services.generate#Gstr1HsnSummary" in-map="[filingId:filingId]"/>
+                def round2 = { v -> ((v ?: 0.0) as BigDecimal).setScale(2, java.math.RoundingMode.HALF_UP) }
+
+                // --- Period window [1st of month, 1st of next month) ---
+                int mm = returnPeriod.substring(0,2) as int
+                int yyyy = returnPeriod.substring(2) as int
+                def cal = java.util.Calendar.getInstance()
+                cal.clear(); cal.set(yyyy, mm - 1, 1, 0, 0, 0)
+                def periodStart = new Timestamp(cal.getTimeInMillis())
+                cal.add(java.util.Calendar.MONTH, 1)
+                def periodEnd = new Timestamp(cal.getTimeInMillis())
+
+                // --- Seller GST config ---
+                def cfg = ec.entity.find("zenith.erp.india.IndiaGstConfig")
+                    .condition("organizationPartyId", organizationPartyId).one()
+                def orgGstin = cfg?.gstin ?: ""
+                def orgState = cfg?.stateCode ?: ""
+
+                // --- Fresh filing (clear any prior DRAFT for this org+period, incl. child records) ---
+                def prior = ec.entity.find("zenith.erp.india.gstr1.Gstr1Filing")
+                    .condition("organizationPartyId", organizationPartyId)
+                    .condition("returnPeriod", returnPeriod).condition("statusId", "DRAFT").list()
+                for (def pf : prior) {
+                    ["Gstr1B2bRecord","Gstr1B2clRecord","Gstr1B2csRecord","Gstr1CdnrRecord","Gstr1HsnSummary","Gstr1ExportRecord"].each { en ->
+                        ec.entity.find("zenith.erp.india.gstr1." + en).condition("filingId", pf.filingId).deleteAll()
+                    }
+                    pf.delete()
+                }
+                def filing = ec.entity.makeValue("zenith.erp.india.gstr1.Gstr1Filing")
+                filing.setSequencedIdPrimary()
+                filing.organizationPartyId = organizationPartyId
+                filing.returnPeriod = returnPeriod
+                filing.financialYear = financialYear
+                filing.filingDate = ec.user.nowTimestamp
+                filing.statusId = "DRAFT"
+                filing.create()
+                filingId = filing.filingId
+
+                // --- Pull the period's sales invoices for this org (exclude cancelled) ---
+                def invoices = ec.entity.find("mantle.account.invoice.Invoice")
+                    .condition("fromPartyId", organizationPartyId)
+                    .condition("invoiceTypeEnumId", "in", ["InvoiceSales","InvoiceCreditMemo"])
+                    .condition("invoiceDate", ">=", periodStart)
+                    .condition("invoiceDate", "<", periodEnd)
+                    .condition("statusId", "!=", "InvoiceCancelled")
+                    .disableAuthz().list()
+
+                def hsnMap = [:]   // "hsn|rate" -> accumulator
+                def b2csMap = [:]  // "pos|rate" -> accumulator (B2C small, summarised)
+                int invCount = 0
+
+                def acc = { m, k -> m[k] ?: (m[k] = [taxable:0.0, cgst:0.0, sgst:0.0, igst:0.0, cess:0.0, qty:0.0]) }
+
+                for (def inv : invoices) {
+                    invCount++
+                    def isCdn = (inv.invoiceTypeEnumId == "InvoiceCreditMemo") || (inv.creditDebitNoteType != null)
+                    def buyerGstin = inv.buyerGstin
+                    def pos = inv.placeOfSupplyStateCode ?: (buyerGstin ? buyerGstin.substring(0,2) : null) ?: orgState
+                    def invNo = inv.gstInvoiceNumber ?: inv.customInvoiceNumber ?: inv.invoiceId
+                    def isExport = inv.isExport == "Y"
+                    def isRcm = inv.isReverseCharge == "Y"
+                    def invType = isExport ? (inv.isWithPayment == "Y" ? "WPAY" : "WOPAY")
+                                 : (inv.isSezSupply == "Y" ? (inv.isWithPayment == "Y" ? "SEZWP" : "SEZWOP") : "Regular")
+
+                    def items = ec.entity.find("mantle.account.invoice.InvoiceItem")
+                        .condition("invoiceId", inv.invoiceId).disableAuthz().list()
+
+                    // group this invoice's lines by GST rate + accumulate HSN summary
+                    def rateMap = [:]
+                    def invValue = 0.0
+                    for (def it : items) {
+                        def taxable = (it.taxableAmount ?: ((it.quantity ?: 1) * (it.amount ?: 0))) as BigDecimal
+                        def cg = (it.cgstAmount ?: 0.0) as BigDecimal
+                        def sg = (it.sgstAmount ?: 0.0) as BigDecimal
+                        def ig = (it.igstAmount ?: 0.0) as BigDecimal
+                        def cs = (it.cessAmount ?: 0.0) as BigDecimal
+                        def rate = ((it.cgstRate ?: 0.0) + (it.sgstRate ?: 0.0) + (it.igstRate ?: 0.0)) as BigDecimal
+                        def a = acc(rateMap, rate)
+                        a.taxable += taxable; a.cgst += cg; a.sgst += sg; a.igst += ig; a.cess += cs
+                        a.qty += (it.quantity ?: 0.0)
+                        invValue += taxable + cg + sg + ig + cs
+                        def hk = (it.hsnSacCode ?: "NA") + "|" + rate
+                        def h = acc(hsnMap, hk); h.taxable += taxable; h.cgst += cg; h.sgst += sg; h.igst += ig; h.cess += cs; h.qty += (it.quantity ?: 0.0)
+                        h.hsn = (it.hsnSacCode ?: "NA"); h.rate = rate
+                    }
+
+                    for (def e : rateMap.entrySet()) {
+                        def rate = e.key; def a = e.value
+                        if (isExport) {
+                            def r = ec.entity.makeValue("zenith.erp.india.gstr1.Gstr1ExportRecord"); r.setSequencedIdPrimary()
+                            r.filingId = filingId; r.invoiceId = inv.invoiceId
+                            r.exportType = (inv.isWithPayment == "Y") ? "WPAY" : "WOPAY"
+                            r.invoiceNumber = invNo; r.invoiceDate = inv.invoiceDate; r.invoiceValue = round2(invValue)
+                            r.portCode = inv.portCode; r.shippingBillNumber = inv.shippingBillNumber; r.shippingBillDate = inv.shippingBillDate
+                            r.rate = rate; r.taxableValue = round2(a.taxable); r.igstAmount = round2(a.igst); r.create()
+                        } else if (buyerGstin) {
+                            def r = ec.entity.makeValue("zenith.erp.india.gstr1.Gstr1B2bRecord"); r.setSequencedIdPrimary()
+                            r.filingId = filingId; r.invoiceId = inv.invoiceId; r.buyerGstin = buyerGstin
+                            r.invoiceNumber = invNo; r.invoiceDate = inv.invoiceDate; r.invoiceValue = round2(invValue)
+                            r.placeOfSupply = pos; r.reverseCharge = isRcm ? "Y" : "N"; r.invoiceType = invType
+                            r.rate = rate; r.taxableValue = round2(a.taxable)
+                            r.cgstAmount = round2(a.cgst); r.sgstAmount = round2(a.sgst); r.igstAmount = round2(a.igst); r.cessAmount = round2(a.cess)
+                            r.create()
+                        } else if (pos != orgState && invValue > 250000) {
+                            // B2C Large: inter-state, unregistered, invoice value > 2.5L
+                            def r = ec.entity.makeValue("zenith.erp.india.gstr1.Gstr1B2clRecord"); r.setSequencedIdPrimary()
+                            r.filingId = filingId; r.invoiceId = inv.invoiceId; r.invoiceNumber = invNo
+                            r.invoiceDate = inv.invoiceDate; r.invoiceValue = round2(invValue); r.placeOfSupply = pos
+                            r.rate = rate; r.taxableValue = round2(a.taxable); r.igstAmount = round2(a.igst); r.cessAmount = round2(a.cess); r.create()
+                        } else {
+                            // B2C Small: summarised by place-of-supply + rate
+                            def b = acc(b2csMap, pos + "|" + rate)
+                            b.taxable += a.taxable; b.cgst += a.cgst; b.sgst += a.sgst; b.igst += a.igst; b.cess += a.cess
+                            b.pos = pos; b.rate = rate
+                        }
+                    }
+                }
+
+                // B2C Small rollups
+                for (def e : b2csMap.entrySet()) {
+                    def b = e.value
+                    def r = ec.entity.makeValue("zenith.erp.india.gstr1.Gstr1B2csRecord"); r.setSequencedIdPrimary()
+                    r.filingId = filingId; r.placeOfSupply = b.pos; r.rate = b.rate
+                    r.taxableValue = round2(b.taxable); r.cgstAmount = round2(b.cgst); r.sgstAmount = round2(b.sgst)
+                    r.igstAmount = round2(b.igst); r.cessAmount = round2(b.cess); r.create()
+                }
+                // HSN summary
+                for (def e : hsnMap.entrySet()) {
+                    def h = e.value
+                    def r = ec.entity.makeValue("zenith.erp.india.gstr1.Gstr1HsnSummary"); r.setSequencedIdPrimary()
+                    r.filingId = filingId; r.hsnSacCode = h.hsn; r.rate = h.rate; r.totalQuantity = h.qty
+                    r.taxableValue = round2(h.taxable); r.totalValue = round2(h.taxable + h.cgst + h.sgst + h.igst + h.cess)
+                    r.cgstAmount = round2(h.cgst); r.sgstAmount = round2(h.sgst); r.igstAmount = round2(h.igst); r.cessAmount = round2(h.cess)
+                    r.create()
+                }
+
+                invoiceCount = invCount
+            ]]></script>
+            <!-- Build the GSTN-schema JSON from the records we just wrote -->
+            <service-call name="zenith.india.Gstr1Services.export#Gstr1Json" in-map="[filingId:filingId]" out-map="jsonOut"/>
+            <entity-find-one entity-name="zenith.erp.india.gstr1.Gstr1Filing" value-field="fUpd"/>
+            <set field="fUpd.jsonPayload" from="jsonOut.jsonPayload"/>
+            <entity-update value-field="fUpd"/>
         </actions>
     </service>
 
-    <service verb="generate" noun="Gstr1HsnSummary">
+    <!-- Screen alias: the Gstr1Returns screen calls extract#Gstr1Data. -->
+    <service verb="extract" noun="Gstr1Data">
         <in-parameters>
-            <parameter name="filingId" required="true"/>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="returnPeriod" required="true"/>
+            <parameter name="financialYear"/>
         </in-parameters>
+        <out-parameters><parameter name="filingId"/><parameter name="invoiceCount" type="Integer"/></out-parameters>
         <actions>
-            <!-- Mock HSN Summary Generation -->
+            <service-call name="zenith.india.Gstr1Services.generate#Gstr1Data" in-map="context" out-map="context"/>
         </actions>
     </service>
 
     <service verb="export" noun="Gstr1Json">
-        <in-parameters>
-            <parameter name="filingId" required="true"/>
-        </in-parameters>
-        <out-parameters>
-            <parameter name="jsonPayload"/>
-        </out-parameters>
+        <in-parameters><parameter name="filingId" required="true"/></in-parameters>
+        <out-parameters><parameter name="jsonPayload"/></out-parameters>
         <actions>
-            <!-- Mock JSON generation matching the GSTN schema -->
-            <set field="jsonPayload" value="{&quot;gstin&quot;:&quot;MOCKGSTIN&quot;,&quot;fp&quot;:&quot;042023&quot;,&quot;b2b&quot;:[],&quot;b2cs&quot;:[],&quot;hsn&quot;:[]}"/>
+            <script><![CDATA[
+                import groovy.json.JsonOutput
+                def filing = ec.entity.find("zenith.erp.india.gstr1.Gstr1Filing").condition("filingId", filingId).one()
+                def cfg = filing ? ec.entity.find("zenith.erp.india.IndiaGstConfig").condition("organizationPartyId", filing.organizationPartyId).one() : null
+                def n2 = { v -> ((v ?: 0.0) as BigDecimal).setScale(2, java.math.RoundingMode.HALF_UP) }
+
+                // B2B: nest invoices under each buyer GSTIN (GSTN schema: ctin -> inv[] -> itms[])
+                def b2bByCtin = [:]
+                ec.entity.find("zenith.erp.india.gstr1.Gstr1B2bRecord").condition("filingId", filingId).list().each { r ->
+                    def ctin = b2bByCtin[r.buyerGstin] ?: (b2bByCtin[r.buyerGstin] = [ctin:r.buyerGstin, inv:[:]])
+                    def inv = ctin.inv[r.invoiceNumber] ?: (ctin.inv[r.invoiceNumber] = [
+                        inum:r.invoiceNumber, idt:(r.invoiceDate?.toString() ?: ""), val:n2(r.invoiceValue),
+                        pos:r.placeOfSupply, rchrg:r.reverseCharge, inv_typ:r.invoiceType, itms:[]])
+                    inv.itms << [rt:r.rate, txval:n2(r.taxableValue), camt:n2(r.cgstAmount), samt:n2(r.sgstAmount), iamt:n2(r.igstAmount), csamt:n2(r.cessAmount)]
+                }
+                def b2b = b2bByCtin.values().collect { c -> [ctin:c.ctin, inv:c.inv.values() as List] }
+
+                def b2cs = ec.entity.find("zenith.erp.india.gstr1.Gstr1B2csRecord").condition("filingId", filingId).list().collect { r ->
+                    [sply_ty:(r.igstAmount && r.igstAmount > 0 ? "INTER" : "INTRA"), pos:r.placeOfSupply, typ:"OE",
+                     rt:r.rate, txval:n2(r.taxableValue), camt:n2(r.cgstAmount), samt:n2(r.sgstAmount), iamt:n2(r.igstAmount), csamt:n2(r.cessAmount)]
+                }
+                def b2cl = ec.entity.find("zenith.erp.india.gstr1.Gstr1B2clRecord").condition("filingId", filingId).list().collect { r ->
+                    [inum:r.invoiceNumber, idt:(r.invoiceDate?.toString() ?: ""), val:n2(r.invoiceValue), pos:r.placeOfSupply,
+                     rt:r.rate, txval:n2(r.taxableValue), iamt:n2(r.igstAmount), csamt:n2(r.cessAmount)]
+                }
+                def exp = ec.entity.find("zenith.erp.india.gstr1.Gstr1ExportRecord").condition("filingId", filingId).list().collect { r ->
+                    [exp_typ:r.exportType, inum:r.invoiceNumber, idt:(r.invoiceDate?.toString() ?: ""), val:n2(r.invoiceValue),
+                     sbnum:r.shippingBillNumber, sbdt:(r.shippingBillDate?.toString() ?: ""), rt:r.rate, txval:n2(r.taxableValue), iamt:n2(r.igstAmount)]
+                }
+                def hsn = ec.entity.find("zenith.erp.india.gstr1.Gstr1HsnSummary").condition("filingId", filingId).list().withIndex().collect { r, i ->
+                    [num:(i+1), hsn_sc:r.hsnSacCode, rt:r.rate, qty:r.totalQuantity, txval:n2(r.taxableValue),
+                     camt:n2(r.cgstAmount), samt:n2(r.sgstAmount), iamt:n2(r.igstAmount), csamt:n2(r.cessAmount)]
+                }
+
+                def payload = [gstin:(cfg?.gstin ?: ""), fp:(filing?.returnPeriod ?: ""), gt:0, cur_gt:0,
+                               b2b:b2b, b2cl:b2cl, b2cs:b2cs, exp:exp, hsn:[data:hsn]]
+                jsonPayload = JsonOutput.prettyPrint(JsonOutput.toJson(payload))
+            ]]></script>
         </actions>
     </service>
 

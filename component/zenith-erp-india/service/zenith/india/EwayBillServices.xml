@@ -51,19 +51,28 @@
                 <econdition field-name="invoiceId"/>
             </entity-find>
 
+            <!-- Real registered trader names + a safe buyer state code (Invoice has no buyerStateCode field;
+                 derive it from the place of supply, else the buyer GSTIN, else the seller state). -->
+            <entity-find-one entity-name="mantle.party.PartyDetail" value-field="sellerP"><field-map field-name="partyId" from="invoice.fromPartyId"/></entity-find-one>
+            <entity-find-one entity-name="mantle.party.PartyDetail" value-field="buyerP"><field-map field-name="partyId" from="invoice.toPartyId"/></entity-find-one>
+            <set field="sellerName" from="sellerP?.organizationName ?: ((sellerP?.firstName ?: '') + ' ' + (sellerP?.lastName ?: '')).trim()"/>
+            <set field="buyerName" from="buyerP?.organizationName ?: ((buyerP?.firstName ?: '') + ' ' + (buyerP?.lastName ?: '')).trim()"/>
+            <set field="buyerStateCode" from="invoice.placeOfSupplyStateCode ?: (invoice.buyerGstin ? invoice.buyerGstin.substring(0,2) : invoice.supplierStateCode)"/>
+
             <script><![CDATA[
+                def toInt = { s -> (s != null && s.toString().isInteger()) ? (s.toString() as Integer) : 0 }
                 def payload = [
-                    supplyType: invoice.b2bB2cType == 'B2B' ? "O" : "O", // O-Outward
-                    subSupplyType: invoice.isExport == 'Y' ? 3 : 1, // 1-Supply, 3-Export
+                    supplyType: "O", // Outward (sales)
+                    subSupplyType: invoice.isExport == 'Y' ? 3 : (invoice.isSezSupply == 'Y' ? 2 : 1), // 1-Supply, 2-SEZ, 3-Export
                     docType: invoice.documentType == 'TAX_INVOICE' ? "INV" : (invoice.documentType == 'BILL_OF_SUPPLY' ? "BIL" : "CHL"),
                     docNo: invoice.gstInvoiceNumber ?: invoice.invoiceId,
                     docDate: ec.l10n.format(invoice.invoiceDate, "dd/MM/yyyy"),
                     fromGstin: invoice.supplierGstin,
-                    fromTrdName: "ZetaERP Seller",
-                    fromStateCode: invoice.supplierStateCode ? invoice.supplierStateCode as Integer : 0,
+                    fromTrdName: sellerName ?: invoice.supplierGstin,
+                    fromStateCode: toInt(invoice.supplierStateCode),
                     toGstin: invoice.buyerGstin ?: "URP",
-                    toTrdName: "Buyer Name",
-                    toStateCode: invoice.buyerStateCode ? invoice.buyerStateCode as Integer : 0,
+                    toTrdName: buyerName ?: (invoice.buyerGstin ?: "URP"),
+                    toStateCode: toInt(buyerStateCode),
                     totalValue: invoice.totalTaxableAmount ?: 0.0,
                     cgstValue: invoice.totalCgst ?: 0.0,
                     sgstValue: invoice.totalSgst ?: 0.0,
@@ -80,7 +89,7 @@
                 for (item in items) {
                     payload.itemList.add([
                         productName: item.description ?: "Product",
-                        hsnCode: item.hsnSacCode ? item.hsnSacCode as Integer : 123456,
+                        hsnCode: (item.hsnSacCode != null && item.hsnSacCode.isInteger()) ? (item.hsnSacCode as Integer) : (item.hsnSacCode ?: ""),
                         quantity: item.quantity ?: 1.0,
                         qtyUnit: "NOS",
                         taxableAmount: item.taxableAmount ?: 0.0,
@@ -104,23 +113,14 @@
                 validUptoMock = new java.sql.Timestamp(cal.getTimeInMillis())
             ]]></script>
 
-            <entity-make-value entity-name="zenith.erp.india.IndiaEwayBill" value-field="ewayBill"/>
-            <set field="ewayBill.invoiceId" from="invoiceId"/>
-            <set field="ewayBill.ewayBillNumber" from="ewbNumberMock"/>
-            <set field="ewayBill.supplyType" from="payload.supplyType"/>
-            <set field="ewayBill.docType" from="payload.docType"/>
-            <set field="ewayBill.fromStateCode" from="invoice.supplierStateCode"/>
-            <set field="ewayBill.toStateCode" from="invoice.buyerStateCode"/>
-            <set field="ewayBill.transportMode" from="transportMode"/>
-            <set field="ewayBill.transporterId" from="transporterId ?: invoice.transporterId"/>
-            <set field="ewayBill.vehicleNumber" from="vehicleNumber ?: invoice.vehicleNumber"/>
-            <set field="ewayBill.validFrom" from="ec.user.nowTimestamp"/>
-            <set field="ewayBill.validUpto" from="validUptoMock"/>
-            <set field="ewayBill.statusId" value="GENERATED"/>
-            <set field="ewayBill.jsonPayload" from="jsonPayloadStr"/>
-            <entity-create value-field="ewayBill"/>
-            
-            <set field="ewayBillId" from="ewayBill.ewayBillId"/>
+            <!-- Auto-CrUD create# generates the sequenced PK (a bare entity-create left ewayBillId null). -->
+            <service-call name="create#zenith.erp.india.IndiaEwayBill" out-map="ewbOut"
+                in-map="[invoiceId:invoiceId, ewayBillNumber:ewbNumberMock, supplyType:payload.supplyType,
+                         docType:payload.docType, fromStateCode:invoice.supplierStateCode, toStateCode:buyerStateCode,
+                         transportMode:transportMode, transporterId:(transporterId ?: invoice.transporterId),
+                         vehicleNumber:(vehicleNumber ?: invoice.vehicleNumber), validFrom:ec.user.nowTimestamp,
+                         validUpto:validUptoMock, statusId:'GENERATED', jsonPayload:jsonPayloadStr]"/>
+            <set field="ewayBillId" from="ewbOut.ewayBillId"/>
             <set field="ewayBillNumber" from="ewbNumberMock"/>
             <set field="validUpto" from="validUptoMock"/>
         </actions>

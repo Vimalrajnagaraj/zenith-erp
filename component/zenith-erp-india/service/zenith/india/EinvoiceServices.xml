@@ -51,14 +51,37 @@
                 <econdition field-name="invoiceId"/>
             </entity-find>
 
+            <!-- Compliance guards: e-Invoice is only for a tax invoice to a registered buyer (B2B) or an
+                 export/SEZ supply — never a Bill of Supply (composition) or a plain B2C sale. -->
+            <if condition="invoice.documentType == 'BILL_OF_SUPPLY' || invoice.isCompositionDealer == 'Y'">
+                <return error="true" message="e-Invoice is not valid for a Bill of Supply / composition supply."/>
+            </if>
+            <if condition="!invoice.supplierGstin">
+                <return error="true" message="The supplier GSTIN is missing on this invoice; e-Invoice cannot be generated."/>
+            </if>
+            <if condition="!invoice.buyerGstin &amp;&amp; invoice.isExport != 'Y' &amp;&amp; invoice.isSezSupply != 'Y'">
+                <return error="true" message="e-Invoice requires a registered buyer (B2B) or an export/SEZ supply — a B2C invoice cannot be e-invoiced."/>
+            </if>
+            <iterate list="items" entry="hsnChk">
+                <if condition="!hsnChk.hsnSacCode">
+                    <return error="true" message="Every line needs an HSN/SAC code for e-Invoice (line ${hsnChk.invoiceItemSeqId} is missing one)."/>
+                </if>
+            </iterate>
+            <!-- Real registered party names (the NIC payload must not carry placeholders). -->
+            <entity-find-one entity-name="mantle.party.PartyDetail" value-field="sellerP"><field-map field-name="partyId" from="invoice.fromPartyId"/></entity-find-one>
+            <entity-find-one entity-name="mantle.party.PartyDetail" value-field="buyerP"><field-map field-name="partyId" from="invoice.toPartyId"/></entity-find-one>
+            <set field="sellerName" from="sellerP?.organizationName ?: ((sellerP?.firstName ?: '') + ' ' + (sellerP?.lastName ?: '')).trim()"/>
+            <set field="buyerName" from="buyerP?.organizationName ?: ((buyerP?.firstName ?: '') + ' ' + (buyerP?.lastName ?: '')).trim()"/>
+
             <!-- Generate NIC JSON Payload structure using Groovy -->
             <script><![CDATA[
                 def payload = [
                     Version: "1.1",
                     TranDtls: [
                         TaxSch: "GST",
-                        SupTyp: invoice.b2bB2cType == 'B2B' ? 'B2B' : (invoice.isExport == 'Y' ? 'EXPWP' : 'B2B'),
-                        RegRev: invoice.isReverseCharge ?: "N",
+                        SupTyp: invoice.isExport == 'Y' ? (invoice.isWithPayment == 'Y' ? 'EXPWP' : 'EXPWOP')
+                              : (invoice.isSezSupply == 'Y' ? (invoice.isWithPayment == 'Y' ? 'SEZWP' : 'SEZWOP') : 'B2B'),
+                        RegRev: invoice.isReverseCharge == 'Y' ? 'Y' : 'N',
                         IgstOnIntra: "N"
                     ],
                     DocDtls: [
@@ -68,18 +91,18 @@
                     ],
                     SellerDtls: [
                         Gstin: invoice.supplierGstin,
-                        LglNm: "ZetaERP Seller",
-                        Loc: "City",
-                        Pin: 100000,
+                        LglNm: sellerName ?: invoice.supplierGstin,
+                        Loc: "",
+                        Pin: (invoice.dispatchFromPincode ?: "") as String,
                         Stcd: invoice.supplierStateCode
                     ],
                     BuyerDtls: [
                         Gstin: invoice.buyerGstin ?: "URP",
-                        LglNm: "Buyer Name",
+                        LglNm: buyerName ?: (invoice.buyerGstin ?: "URP"),
                         Pos: invoice.placeOfSupplyStateCode,
-                        Loc: "City",
-                        Pin: 200000,
-                        Stcd: invoice.buyerStateCode ?: invoice.placeOfSupplyStateCode
+                        Loc: "",
+                        Pin: (invoice.deliveryToPincode ?: "") as String,
+                        Stcd: invoice.placeOfSupplyStateCode
                     ],
                     ItemList: [],
                     ValDtls: [
@@ -88,7 +111,7 @@
                         SgstVal: invoice.totalSgst ?: 0.0,
                         IgstVal: invoice.totalIgst ?: 0.0,
                         CesVal: invoice.totalCess ?: 0.0,
-                        TotInvVal: (invoice.totalTaxableAmount ?: 0.0) + (invoice.totalCgst ?: 0.0) + (invoice.totalSgst ?: 0.0) + (invoice.totalIgst ?: 0.0) + (invoice.totalCess ?: 0.0)
+                        TotInvVal: ((invoice.totalTaxableAmount ?: 0.0) + (invoice.totalCgst ?: 0.0) + (invoice.totalSgst ?: 0.0) + (invoice.totalIgst ?: 0.0) + (invoice.totalCess ?: 0.0) + (invoice.roundOffAmount ?: 0.0)).setScale(2, java.math.RoundingMode.HALF_UP)
                     ]
                 ]
 
@@ -98,7 +121,7 @@
                         SlNo: (seq++).toString(),
                         PrdDesc: item.description ?: "Product",
                         IsServc: "N",
-                        HsnCd: item.hsnSacCode ?: "123456",
+                        HsnCd: item.hsnSacCode,
                         Qty: item.quantity ?: 1.0,
                         Unit: "NOS",
                         UnitPrice: item.amount ?: 0.0,
@@ -128,16 +151,11 @@
             <set field="ackNo" from="ackNoMock"/>
             <set field="ackDate" from="ec.user.nowTimestamp"/>
 
-            <entity-make-value entity-name="zenith.erp.india.IndiaEinvoice" value-field="einvoice"/>
-            <set field="einvoice.invoiceId" from="invoiceId"/>
-            <set field="einvoice.irn" from="irn"/>
-            <set field="einvoice.signedQrCode" from="signedQrCode"/>
-            <set field="einvoice.ackNumber" from="ackNo"/>
-            <set field="einvoice.ackDate" from="ackDate"/>
-            <set field="einvoice.statusId" value="GENERATED"/>
-            <set field="einvoice.jsonPayload" from="jsonPayloadStr"/>
-            <entity-create value-field="einvoice"/>
-            <set field="einvoiceId" from="einvoice.einvoiceId"/>
+            <!-- Auto-CrUD create# generates the sequenced PK (a bare entity-create left einvoiceId null). -->
+            <service-call name="create#zenith.erp.india.IndiaEinvoice" out-map="einvOut"
+                in-map="[invoiceId:invoiceId, irn:irn, signedQrCode:signedQrCode, ackNumber:ackNo,
+                         ackDate:ackDate, statusId:'GENERATED', jsonPayload:jsonPayloadStr]"/>
+            <set field="einvoiceId" from="einvOut.einvoiceId"/>
         </actions>
     </service>
 
