@@ -183,7 +183,7 @@ A **Quotation** is an order in status `OrderProposed`; an **Order** is `OrderPla
 | ID | Type | Title | Steps | Expected result | Sev |
 |---|---|---|---|---|---|
 | SL-050 | FUNC | Status change | Set status InProcess → Approved → Sent → Paid | Status updates; reflected in the list | S3 |
-| SL-051 | EDGE | ⚠ Edit a finalized/paid invoice | Set status to Paid, then edit/delete a line item | **Record actual — KNOWN GAP (§17):** there is no lock, so the issued invoice **can be altered**. This must be treated as a **defect** — a paid/issued tax invoice should be immutable | S1 |
+| SL-051 | EDGE | Edit a finalized/issued invoice | Set status past In-Process (Finalized/Sent/etc.), then try to add/delete a line item | **FIXED:** line items can only change while the invoice is a **draft (In-Process)**. Once issued, add/delete is blocked ("This invoice has been issued and its line items can no longer be changed. Raise a credit or debit note to correct it."). Drafts remain fully editable | S1 |
 | SL-052 | EDGE | Manual duplicate number | Set `gstInvoiceNumber` to a value already used | **Record actual** — no uniqueness check is visible; a **duplicate invoice number** is a legal problem (S1) | S1 |
 | SL-053 | FUNC | Find invoices | FindInvoice, search by no./customer/GSTIN/status | Org-scoped list; columns incl. IRN; ledger link | S2 |
 | SL-054 | ISO | Cross-tenant invoice | As tenant A, open `EditInvoice?invoiceId=<tenant-B>` | **Blocked** — "Invoice not found for your account." (verify the add/delete/update actions are all guarded) | S1 |
@@ -305,7 +305,7 @@ Evidence:         screenshot + Console/Network (mandatory for GST, ISO, SEC)
 These are the most likely defects in this module — spend extra time here:
 
 1. **GST correctness (§9.2, XF-002)** — the single most important thing. Intra vs inter-state, discounts, mixed rates, and the **"missing state → defaults to IGST"** behaviour (SL-045). Do the math by hand.
-2. **⚠ Issued invoices are editable (SL-051)** — no status lock; a paid/finalized tax invoice can have items added/deleted. Treat as a **Critical defect** and a legal risk.
+2. **Issued-invoice immutability (SL-051)** — *fixed*: line items are locked once the invoice leaves draft. Regression-test that drafts still edit and issued invoices refuse add/delete. **Separately, a real GST bug was found here:** the intra/inter-state check reads a non-existent field on the address entity, so it errors when both parties have addresses or falls back to IGST (the SL-045 behaviour) — flag for a follow-up fix.
 3. **⚠ Invoice-number uniqueness (SL-052)** — manual `gstInvoiceNumber` has no duplicate check.
 4. **⚠ Payment doesn't close the invoice (SL-082)** — payment link → PAID, but the invoice stays unpaid; no Payment recorded.
 5. **Validation gaps** — negative qty (SL-046), zero amount (SL-047), no GSTIN/HSN format check, no credit-limit enforcement, RCM/Export flags stored but **not applied** to GST.
