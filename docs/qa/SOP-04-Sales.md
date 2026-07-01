@@ -173,7 +173,7 @@ A **Quotation** is an order in status `OrderProposed`; an **Order** is `OrderPla
 | SL-042 | GST | Line discount | qty 10 × ₹100, 10% discount, 18% | taxable 900; tax 162; grand 1062 | S1 |
 | SL-043 | GST | Mixed rates | items at 5%, 12%, 18% | each line taxed at its own rate; header sums correct | S1 |
 | SL-044 | GST | 0% / exempt | a 0% line | no tax added; appears on the invoice correctly | S3 |
-| SL-045 | GST | Missing buyer state | buyer address has no state | **Record actual** — code defaults to **IGST** when state is unknown; confirm this is acceptable (likely wrong for a local sale) | S2 |
+| SL-045 | GST | Missing buyer state | buyer has no tax registration / region | **PARTLY FIXED:** intra/inter-state now uses the parties' **registered state** (tax-registration `regionGeoId`), not a broken address lookup (which used to crash or always pick IGST). If a party has **no tax registration**, region is unknown → still defaults to **IGST** — set up GSTINs so the split is correct | S2 |
 | SL-046 | EDGE | Negative quantity | qty = −5 | **Record actual** — there is **no negative-qty check**; the line and totals go negative. Flag (S3) | S3 |
 | SL-047 | EDGE | Zero qty / zero price | qty 0 or price 0 | **Record actual** — no zero-amount check; an empty/zero invoice can be created | S3 |
 | SL-048 | EDGE | Huge / decimal qty | qty 999999 / 2.5 | Handled; precision = 2 decimals, HALF_UP | S4 |
@@ -305,7 +305,8 @@ Evidence:         screenshot + Console/Network (mandatory for GST, ISO, SEC)
 These are the most likely defects in this module — spend extra time here:
 
 1. **GST correctness (§9.2, XF-002)** — the single most important thing. Intra vs inter-state, discounts, mixed rates, and the **"missing state → defaults to IGST"** behaviour (SL-045). Do the math by hand.
-2. **Issued-invoice immutability (SL-051)** — *fixed*: line items are locked once the invoice leaves draft. Regression-test that drafts still edit and issued invoices refuse add/delete. **Separately, a real GST bug was found here:** the intra/inter-state check reads a non-existent field on the address entity, so it errors when both parties have addresses or falls back to IGST (the SL-045 behaviour) — flag for a follow-up fix.
+2. **Issued-invoice immutability (SL-051)** — *fixed*: line items are locked once the invoice leaves draft.
+3. **GST intra/inter-state (SL-045)** — *fixed*: now uses the tax-registration state (`regionGeoId`), removing the crash and the always-IGST fallback. **Separate open bug found here:** the manual EditInvoice "Add Item" doesn't persist a line at all (`create#InvoiceItem` no-ops silently) — the Order→Invoice path works, but manual add on an invoice needs a fix.
 3. **⚠ Invoice-number uniqueness (SL-052)** — manual `gstInvoiceNumber` has no duplicate check.
 4. **⚠ Payment doesn't close the invoice (SL-082)** — payment link → PAID, but the invoice stays unpaid; no Payment recorded.
 5. **Validation gaps** — negative qty (SL-046), zero amount (SL-047), no GSTIN/HSN format check, no credit-limit enforcement, RCM/Export flags stored but **not applied** to GST.
