@@ -253,8 +253,8 @@ Products carry `hsnCode` (8-char) / `sacCode`; `IndiaHsnCode` maps a code → `d
 
 | ID | Type | Title | Steps | Expected result | Sev |
 |---|---|---|---|---|---|
-| TX-060 | FUNC | Generate e-Invoice | On a B2B tax invoice, generate e-Invoice | Returns a 64-char **IRN**, ack no./date, signed QR; `IndiaEinvoice` row `GENERATED` | S2 |
-| TX-061 | GST | JSON payload correct | Inspect the NIC JSON | Seller/buyer GSTIN + state, item HSN/qty/rate, **CGST/SGST vs IGST** matching the invoice, ValDtls totals tie to the invoice | S1 |
+| TX-060 | FUNC | Generate e-Invoice | On a B2B tax invoice, generate e-Invoice | Returns a 64-char **IRN**, ack no./date, signed QR; `IndiaEinvoice` row `GENERATED`. **[Fixed e744058 — was failing to persist (null PK); now works. Guards added: rejects Bill of Supply/composition, requires supplier GSTIN + a registered buyer (B2B) or export/SEZ + HSN on every line. Verified B2C correctly rejected.]** | S2 |
+| TX-061 | GST | JSON payload correct | Inspect the NIC JSON | Real seller/buyer legal names (not placeholders), GSTIN + state, item HSN/qty/rate, **CGST/SGST vs IGST** matching the invoice, correct **SupTyp** (B2B/EXPWP/EXPWOP/SEZWP/SEZWOP) + **RegRev**, ValDtls incl. round-off tie to the invoice. **[Fixed e744058.]** ⚠ Still MOCK: the NIC API call (random IRN) — real filing needs NIC credentials | S1 |
 | TX-062 | FUNC | Cancel e-Invoice | Cancel with a reason | Status `CANCELLED`, reason/date stored | S3 |
 | TX-063 | EDGE | e-Invoice on B2C / exempt | Try to generate for a B2C or Bill-of-Supply doc | Handled per rule (e-Invoice is B2B/export only) — record actual | S3 |
 | TX-064 | FUNC | QR code | Generate the QR | Base64 QR renders; encodes the signed invoice | S3 |
@@ -281,8 +281,8 @@ Products carry `hsnCode` (8-char) / `sacCode`; `IndiaHsnCode` maps a code → `d
 
 | ID | Type | Title | Steps | Expected result | Sev |
 |---|---|---|---|---|---|
-| TX-080 | FUNC | Generate GSTR-1 | Pick a return period (MMYYYY) → Generate | A `Gstr1Filing` (DRAFT) with B2B / B2C(S) / HSN sections populated | S2 |
-| TX-081 | GST | **Totals tie to invoices** | Cross-check the return against the period's invoices | B2B taxable + tax = sum of B2B invoices; B2C(S) grouped by **place of supply + rate**; HSN summary groups by HSN + rate; **grand totals reconcile** | S1 |
+| TX-080 | FUNC | Generate GSTR-1 | Pick a return period (MMYYYY) → Generate | A `Gstr1Filing` (DRAFT) with B2B / B2C(S) / HSN sections populated. **[Implemented e744058 — real aggregation replaced the mock stub; the screen's broken service call was repointed. Verified: B2B IGST 180, B2C(S) CGST/SGST 45, 2 HSN rows, real GSTN-schema JSON.]** | S2 |
+| TX-081 | GST | **Totals tie to invoices** | Cross-check the return against the period's invoices | B2B taxable + tax = sum of B2B invoices; B2C(S) grouped by **place of supply + rate**; B2C(L) for inter-state unregistered >₹2.5L; HSN summary groups by HSN + rate; **grand totals reconcile** | S1 |
 | TX-082 | GST | B2B vs B2C split | Mix registered + unregistered buyers | Registered → **B2B** (by buyer GSTIN); unregistered → **B2C(S)** (by POS + rate) | S1 |
 | TX-083 | FUNC | Download JSON | Download the GSTR-1 JSON | Valid GSTN-schema JSON (gstin, fp, b2b[], b2cs[], hsn[]) | S2 |
 | TX-084 | EDGE | Cancelled invoices excluded | Include a cancelled invoice in the period | Excluded from the return | S2 |
@@ -367,4 +367,8 @@ These are the highest-risk spots — spend extra time here:
 
 ---
 
-*End of Part 6 — Tax. Related: Part 3 — POS (billing calls the GST engine); Part 4 — Sales (invoice GST); Part 5 — Inventory (inter-state transfer IGST + e-Way); Accounting holds GSTR-2/GSTR-3B and the tax ledger. Composition (zero GST / Bill of Supply), reverse-charge (seller collects zero + UI toggle), the GSTIN-less intra default, export/SEZ zero-rating (LUT 0% default with a per-invoice with-payment override), and TCS (₹50 lakh @ 0.1%) were reviewed and fixed/confirmed (commits b52c711, 809bc4e). GSTR-1/e-Invoice/e-Way payload fidelity and the composition/RCM ITC treatment still warrant a dev walkthrough before any live filing.*
+*End of Part 6 — Tax. Related: Part 3 — POS (billing calls the GST engine); Part 4 — Sales (invoice GST); Part 5 — Inventory (inter-state transfer IGST + e-Way); Accounting holds GSTR-2/GSTR-3B and the tax ledger.*
+
+*Reviewed and fixed/confirmed: composition (zero GST / Bill of Supply), reverse-charge (seller collects zero + UI toggle), the GSTIN-less intra default, export/SEZ zero-rating (LUT 0% default with a per-invoice with-payment override), TCS (₹50 lakh @ 0.1%) — commits b52c711, 809bc4e; **real GSTR-1 generation** (B2B/B2CL/B2CS/HSN/Export + GSTN JSON, replacing the mock), **e-Invoice & e-Way payload fidelity + compliance guards** (real party names, correct supply types, safe state/HSN, round-off, null-PK persistence), and **ITC treatment for composition/RCM vendor bills** — commits e744058, 48cc82a.*
+
+***The one remaining go-live dependency is the real NIC / GSTN portal integration** — the e-Invoice IRN, e-Way Bill number, and GSTR-1 filing are still generated locally as MOCKs (the JSON payloads are now faithful, but no data is transmitted). Wiring the live NIC/GSTN APIs needs the tenant's API credentials and is a deliberate go-live step — do not enable it against production without those credentials and a controlled cutover.*
