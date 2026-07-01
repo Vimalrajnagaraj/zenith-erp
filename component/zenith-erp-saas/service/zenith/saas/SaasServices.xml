@@ -280,26 +280,36 @@
         </in-parameters>
         <actions>
             <entity-find-one entity-name="zenith.erp.saas.SaasTenant" value-field="tenant"/>
+            <if condition="!tenant"><return error="true" message="Tenant not found."/></if>
             <set field="oldPlanId" from="tenant.planId"/>
             <entity-find-one entity-name="zenith.erp.saas.SaasPlan" value-field="newPlan">
                 <field-map field-name="planId" from="newPlanId"/>
             </entity-find-one>
+            <if condition="!newPlan"><return error="true" message="Plan not found."/></if>
 
-            <!-- Update tenant plan -->
-            <service-call name="update#zenith.erp.saas.SaasTenant"
-                in-map="[tenantId:tenantId, planId:newPlanId]"/>
+            <!-- Block a change (e.g. a downgrade) that would leave the tenant OVER the target plan's limits. -->
+            <service-call name="zenith.saas.SaasServices.check#UsageLimits"
+                in-map="[tenantId:tenantId, planId:newPlanId]" out-map="limitOut"/>
+            <if condition="limitOut.withinLimits == false">
+                <return error="true" message="Can't switch to ${newPlan.planName}: your current usage exceeds that plan's limits (${limitOut.violations.join('; ')}). Reduce usage first, or choose a larger plan."/>
+            </if>
 
-            <!-- Create new subscription, expire old -->
+            <!-- Current active subscription (its price + remaining days) BEFORE we expire it — for proration. -->
             <entity-find entity-name="zenith.erp.saas.SaasSubscription" list="activeSubs">
                 <econdition field-name="tenantId"/>
                 <econdition field-name="statusId" value="SubActive"/>
+                <order-by field-name="-startDate"/>
             </entity-find>
+            <set field="curSub" from="activeSubs ? activeSubs[0] : null"/>
+            <set field="subAmount" from="billingCycle == 'Yearly' ? newPlan.yearlyPrice : newPlan.monthlyPrice"/>
+
+            <!-- Swap plan: update tenant, expire old sub(s), create the new active subscription. -->
+            <service-call name="update#zenith.erp.saas.SaasTenant"
+                in-map="[tenantId:tenantId, planId:newPlanId]"/>
             <iterate list="activeSubs" entry="oldSub">
                 <service-call name="update#zenith.erp.saas.SaasSubscription"
                     in-map="[subscriptionId:oldSub.subscriptionId, statusId:'SubExpired']"/>
             </iterate>
-
-            <set field="subAmount" from="billingCycle == 'Yearly' ? newPlan.yearlyPrice : newPlan.monthlyPrice"/>
             <script><![CDATA[
                 import java.time.LocalDate
                 def today = LocalDate.now()
@@ -312,11 +322,85 @@
                          renewalDate:renewalDate, amount:subAmount,
                          currencyUomId:tenant.currencyUomId]"/>
 
+            <!-- UPGRADE proration: raise a payable invoice for the prorated price difference over the days
+                 remaining in the current cycle (tenant pays it via Razorpay — never auto-charged).
+                 Downgrade -> no immediate charge; the lower price applies from the next renewal. -->
+            <set field="proratedDiff" from="0" type="BigDecimal"/>
+            <if condition="curSub != null">
+                <script><![CDATA[
+                    def diff = ((subAmount ?: 0) as BigDecimal) - ((curSub.amount ?: 0) as BigDecimal)
+                    context.proratedDiff = 0.0
+                    if (diff > 0 && curSub.renewalDate != null) {
+                        def _prToday = java.time.LocalDate.now()
+                        def _prRenew = new java.sql.Date(curSub.renewalDate.getTime()).toLocalDate()
+                        def _prStart = curSub.startDate != null ? new java.sql.Date(curSub.startDate.getTime()).toLocalDate() : _prRenew.minusMonths(1)
+                        long cycleDays = Math.max(1L, java.time.temporal.ChronoUnit.DAYS.between(_prStart, _prRenew))
+                        long remainingDays = java.time.temporal.ChronoUnit.DAYS.between(_prToday, _prRenew)
+                        if (remainingDays < 0) remainingDays = 0
+                        if (remainingDays > cycleDays) remainingDays = cycleDays
+                        context.proratedDiff = ((diff * remainingDays) / cycleDays).setScale(2, java.math.RoundingMode.HALF_UP)
+                    }
+                ]]></script>
+            </if>
+            <if condition="proratedDiff &gt; 0">
+                <service-call name="zenith.saas.SaasServices.create#ProrationInvoice"
+                    in-map="[tenantId:tenantId, amount:proratedDiff, description:('Prorated upgrade to ' + newPlan.planName)]"/>
+            </if>
+
             <service-call name="create#zenith.erp.saas.SaasAuditLog"
                 in-map="[tenantId:tenantId, eventType:'PLAN_CHANGE', eventDate:ec.user.nowTimestamp,
-                         userId:ec.user.userId, description:('Plan changed from ' + oldPlanId + ' to ' + newPlanId)]"/>
+                         userId:ec.user.userId, description:('Plan changed from ' + oldPlanId + ' to ' + newPlanId + (proratedDiff &gt; 0 ? ' (prorated upgrade ' + proratedDiff + ')' : ''))]"/>
 
-            <message>Plan changed to ${newPlan.planName}.</message>
+            <message>Plan changed to ${newPlan.planName}.${proratedDiff &gt; 0 ? ' A prorated upgrade invoice of ' + proratedDiff + ' + GST has been raised.' : ''}</message>
+        </actions>
+    </service>
+
+    <!-- Payable prorated plan-change invoice (ZETAERP -> tenant), same SAAS-yyyyMM-NNNN series + GST as the
+         renewal cron. Status SiSent so it shows on My Subscription for Razorpay payment. Never auto-charges. -->
+    <service verb="create" noun="ProrationInvoice">
+        <in-parameters>
+            <parameter name="tenantId" required="true"/>
+            <parameter name="amount" type="BigDecimal" required="true"/>
+            <parameter name="description"/>
+        </in-parameters>
+        <out-parameters><parameter name="saasInvoiceId"/></out-parameters>
+        <actions>
+            <script><![CDATA[
+                import java.time.LocalDate
+                def tenant = ec.entity.find("zenith.erp.saas.SaasTenant").condition("tenantId", tenantId).disableAuthz().one()
+                if (tenant == null) return
+                def today = java.sql.Date.valueOf(LocalDate.now())
+                def _prefix = 'SAAS-' + LocalDate.now().toString().substring(0,7).replace('-','') + '-'
+                def _lastInv = ec.entity.find("zenith.erp.saas.SaasInvoice")
+                    .condition("invoiceNumber", "like", _prefix + '%').orderBy("-invoiceNumber").disableAuthz().list()
+                int _nextSeq = 1
+                if (_lastInv) { try { _nextSeq = (_lastInv[0].invoiceNumber.toString().substring(_prefix.length()) as Integer) + 1 } catch (Exception _ne) { _nextSeq = _lastInv.size() + 1 } }
+                def invoiceNumber = _prefix + String.format('%04d', _nextSeq)
+
+                def taxOut = ec.service.sync().name("zenith.subscriptions.SubscriptionServices.calculate#SubscriptionTax")
+                    .parameter("organizationPartyId", "ZETAERP").parameter("customerPartyId", tenant.organizationPartyId)
+                    .parameter("taxableAmount", amount).parameter("gstRate", 18).disableAuthz().call()
+                def _taxAmount = taxOut?.taxAmount ?: 0
+                def _totalAmount = taxOut?.totalAmount ?: amount
+
+                def invResult = ec.service.sync().name("create#zenith.erp.saas.SaasInvoice")
+                    .parameter("tenantId", tenantId).parameter("invoiceNumber", invoiceNumber)
+                    .parameter("invoiceDate", today).parameter("dueDate", java.sql.Date.valueOf(LocalDate.now().plusDays(7)))
+                    .parameter("periodFrom", today).parameter("periodTo", today)
+                    .parameter("subtotal", amount).parameter("taxAmount", _taxAmount)
+                    .parameter("cgstAmount", taxOut?.cgstAmount).parameter("sgstAmount", taxOut?.sgstAmount)
+                    .parameter("igstAmount", taxOut?.igstAmount).parameter("placeOfSupply", taxOut?.placeOfSupply)
+                    .parameter("totalAmount", _totalAmount).parameter("currencyUomId", tenant.currencyUomId ?: 'INR')
+                    .parameter("statusId", "SiSent").parameter("notes", description ?: 'Prorated plan-change charge')
+                    .disableAuthz().call()
+                context.saasInvoiceId = invResult.saasInvoiceId
+
+                ec.service.sync().name("create#zenith.erp.saas.SaasAuditLog")
+                    .parameter("tenantId", tenantId).parameter("eventType", "PRORATION_INVOICE")
+                    .parameter("eventDate", ec.user.nowTimestamp)
+                    .parameter("description", (description ?: 'Proration') + ': ' + _totalAmount + ' (subtotal ' + amount + ' + GST ' + _taxAmount + '), invoice ' + invoiceNumber)
+                    .disableAuthz().call()
+            ]]></script>
         </actions>
     </service>
 
@@ -411,9 +495,12 @@
 
     <!-- ==================== USAGE LIMIT CHECK ==================== -->
     <service verb="check" noun="UsageLimits">
-        <description>Check if tenant is within plan limits. Returns violations list.</description>
+        <description>Check if a tenant's current usage fits within a plan's limits. Returns violations list.
+            Defaults to the tenant's current plan; pass planId to test a target plan (used to block a
+            downgrade that would leave the tenant over the smaller plan's limits).</description>
         <in-parameters>
             <parameter name="tenantId" required="true"/>
+            <parameter name="planId"/> <!-- optional target plan; default = tenant's current plan -->
         </in-parameters>
         <out-parameters>
             <parameter name="withinLimits" type="Boolean"/>
@@ -422,7 +509,7 @@
         <actions>
             <entity-find-one entity-name="zenith.erp.saas.SaasTenant" value-field="tenant"/>
             <entity-find-one entity-name="zenith.erp.saas.SaasPlan" value-field="plan">
-                <field-map field-name="planId" from="tenant.planId"/>
+                <field-map field-name="planId" from="planId ?: tenant.planId"/>
             </entity-find-one>
 
             <set field="violations" from="[]"/>
