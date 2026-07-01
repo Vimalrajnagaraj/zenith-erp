@@ -6,7 +6,7 @@
     <parameter name="invoiceId" required="true"/>
 
     <transition name="findInvoice"><default-response url="../FindInvoice"/></transition>
-    
+
     <transition name="updateInvoice">
         <actions>
             <!-- Org-isolation: re-check ownership by PK before update (block cross-tenant IDOR). Sales invoice org = fromPartyId. -->
@@ -21,102 +21,96 @@
     </transition>
 
     <transition name="addItem">
-        <script>
-            // Get state codes
-            def invoice = ec.entity.find("mantle.account.invoice.Invoice").condition("invoiceId", invoiceId).one()
-            // Org-isolation: re-check ownership by PK before mutating (block cross-tenant IDOR). Sales invoice org = fromPartyId.
-            def _activeOrg = ec.user.getPreference('ACTIVE_ORGANIZATION')
-            if (invoice == null || (_activeOrg &amp;&amp; invoice.fromPartyId != _activeOrg &amp;&amp; !ec.user.isInGroup('ADMIN'))) {
-                ec.message.addError("Invoice not found for your account."); return
-            }
-            // Issued-invoice immutability: a tax invoice is only editable while it is a draft (In-Process).
-            // Once finalized/sent/etc. it is a legal record and its line items must not change.
-            if (invoice.statusId != 'InvoiceInProcess') {
-                ec.message.addError("This invoice has been issued (status: " + invoice.statusId + ") so its line items can no longer be changed. To correct it, raise a credit or debit note."); return
-            }
-
-            // GST intra/inter-state is decided by the parties' registered state (tax-registration
-            // regionGeoId) — the same source the invoice service uses. (Previously read stateProvinceGeoId
-            // off PartyContactMechInfo, which has no such field, so it errored or always fell back to IGST.)
-            def _sReg = ec.service.sync().name("zenith.tax.TaxServices.get#PartyTaxRegistration").parameters([partyId:invoice.fromPartyId]).call()
-            def _bReg = ec.service.sync().name("zenith.tax.TaxServices.get#PartyTaxRegistration").parameters([partyId:invoice.toPartyId]).call()
-            def sellerState = _sReg?.regionGeoId
-            def buyerState = _bReg?.regionGeoId
-            def isInterstate = true
-            if (sellerState &amp;&amp; buyerState &amp;&amp; sellerState == buyerState) {
-                isInterstate = false
-            }
-
-            def qty = new BigDecimal(quantity ?: 0)
-            def price = new BigDecimal(amount ?: 0)
-            // Sync price with Inventory and Pricing: auto-fill when the user leaves Unit Price blank
-            if (price.signum() == 0 &amp;&amp; productId) {
-                try {
-                    def _pr = ec.service.sync().name("zenith.pricing.PricingServices.calculate#Price")
-                                .parameters([productId:productId, quantity:(qty.signum()>0?qty:1), organizationPartyId:invoice.fromPartyId, customerPartyId:invoice.toPartyId]).call()
-                    if (_pr?.unitPrice != null &amp;&amp; (_pr.unitPrice as BigDecimal).signum() == 1) price = _pr.unitPrice as BigDecimal
-                } catch (Exception e) { }
-                if (price.signum() == 0) {
-                    def _p = ec.entity.find("mantle.product.Product").condition("productId", productId).one()
-                    if (_p?.mrpAmount != null) price = _p.mrpAmount as BigDecimal
+        <actions>
+            <!-- Org-isolation: re-check ownership by PK before mutating (block cross-tenant IDOR). Sales invoice org = fromPartyId. -->
+            <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="curInv"/>
+            <if condition="curInv == null || (activeOrg &amp;&amp; curInv.fromPartyId != activeOrg &amp;&amp; !ec.user.isInGroup('ADMIN'))">
+                <return error="true" message="Invoice not found for your account."/>
+            </if>
+            <!-- Issued-invoice immutability: a tax invoice is only editable while it is a draft (In-Process).
+                 Once finalized/sent/etc. it is a legal record and its line items must not change. -->
+            <if condition="curInv.statusId != 'InvoiceInProcess'">
+                <return error="true" message="This invoice has been issued (status: ${curInv.statusId}) so its line items can no longer be changed. To correct it, raise a credit or debit note."/>
+            </if>
+            <script>
+                // GST intra/inter-state is decided by the parties' registered state (tax-registration
+                // regionGeoId) — the same source the invoice service uses. (Previously read stateProvinceGeoId
+                // off PartyContactMechInfo, which has no such field, so it errored or always fell back to IGST.)
+                def _sReg = ec.service.sync().name("zenith.tax.TaxServices.get#PartyTaxRegistration").parameters([partyId:curInv.fromPartyId]).call()
+                def _bReg = ec.service.sync().name("zenith.tax.TaxServices.get#PartyTaxRegistration").parameters([partyId:curInv.toPartyId]).call()
+                def sellerState = _sReg?.regionGeoId
+                def buyerState = _bReg?.regionGeoId
+                def isInterstate = true
+                if (sellerState &amp;&amp; buyerState &amp;&amp; sellerState == buyerState) {
+                    isInterstate = false
                 }
-            }
-            def taxableVal = qty.multiply(price)
-            def taxPct = new BigDecimal(taxPercentage ?: 0)
 
-            def igstRate = 0.0
-            def cgstRate = 0.0
-            def sgstRate = 0.0
-            def igstAmount = 0.0
-            def cgstAmount = 0.0
-            def sgstAmount = 0.0
-
-            if (taxPct > 0) {
-                if (isInterstate) {
-                    igstRate = taxPct
-                    igstAmount = taxableVal.multiply(taxPct).divide(new BigDecimal(100), 2, java.math.RoundingMode.HALF_UP)
-                } else {
-                    cgstRate = taxPct.divide(new BigDecimal(2), 2, java.math.RoundingMode.HALF_UP)
-                    sgstRate = cgstRate
-                    cgstAmount = taxableVal.multiply(cgstRate).divide(new BigDecimal(100), 2, java.math.RoundingMode.HALF_UP)
-                    sgstAmount = cgstAmount
+                def qty = new BigDecimal(quantity ?: 0)
+                def price = new BigDecimal(amount ?: 0)
+                // Sync price with Inventory and Pricing: auto-fill when the user leaves Unit Price blank
+                if (price.signum() == 0 &amp;&amp; productId) {
+                    try {
+                        def _pr = ec.service.sync().name("zenith.pricing.PricingServices.calculate#Price")
+                                    .parameters([productId:productId, quantity:(qty.signum()>0?qty:1), organizationPartyId:curInv.fromPartyId, customerPartyId:curInv.toPartyId]).call()
+                        if (_pr?.unitPrice != null &amp;&amp; (_pr.unitPrice as BigDecimal).signum() == 1) price = _pr.unitPrice as BigDecimal
+                    } catch (Exception e) { }
+                    if (price.signum() == 0) {
+                        def _p = ec.entity.find("mantle.product.Product").condition("productId", productId).one()
+                        if (_p?.mrpAmount != null) price = _p.mrpAmount as BigDecimal
+                    }
                 }
-            }
+                def taxableVal = qty.multiply(price)
+                def taxPct = new BigDecimal(taxPercentage ?: 0)
 
-            // Call standard create item service but pass extended fields
-            def inMap = context + [
-                itemTypeEnumId: 'ItemSales',
-                amount: price,
-                taxableAmount: taxableVal,
-                igstRate: igstRate, igstAmount: igstAmount,
-                cgstRate: cgstRate, cgstAmount: cgstAmount,
-                sgstRate: sgstRate, sgstAmount: sgstAmount
-            ]
-            ec.service.sync().name("create#mantle.account.invoice.InvoiceItem").parameters(inMap).call()
-            
-            // Trigger recalculation of totals
-            ec.service.sync().name("mantle.account.InvoiceServices.calculate#InvoiceTotal").parameters([invoiceId:invoiceId]).call()
-        </script>
-        
-        <!-- Custom script to aggregate Indian GST values -->
-        <script>
-            // Org-isolation: skip aggregation/write if caller is not the owner (block cross-tenant IDOR). Sales invoice org = fromPartyId.
-            def _inv = ec.entity.find("mantle.account.invoice.Invoice").condition("invoiceId", invoiceId).one()
-            def _aOrg2 = ec.user.getPreference('ACTIVE_ORGANIZATION')
-            if (_inv == null || (_aOrg2 &amp;&amp; _inv.fromPartyId != _aOrg2 &amp;&amp; !ec.user.isInGroup('ADMIN'))) { return }
-            def invItems = ec.entity.find("mantle.account.invoice.InvoiceItem").condition("invoiceId", invoiceId).list()
-            def tCgst = 0.0, tSgst = 0.0, tIgst = 0.0, tTaxable = 0.0
-            for (def it : invItems) {
-                tCgst += (it.cgstAmount ?: 0.0)
-                tSgst += (it.sgstAmount ?: 0.0)
-                tIgst += (it.igstAmount ?: 0.0)
-                tTaxable += (it.taxableAmount ?: ((it.quantity?:1)*(it.amount?:0)))
-            }
-            ec.service.sync().name("update#mantle.account.invoice.Invoice").parameters([
-                invoiceId: invoiceId,
-                totalCgst: tCgst, totalSgst: tSgst, totalIgst: tIgst, totalTaxableAmount: tTaxable
-            ]).call()
-        </script>
+                def igstRate = 0.0
+                def cgstRate = 0.0
+                def sgstRate = 0.0
+                def igstAmount = 0.0
+                def cgstAmount = 0.0
+                def sgstAmount = 0.0
+
+                if (taxPct > 0) {
+                    if (isInterstate) {
+                        igstRate = taxPct
+                        igstAmount = taxableVal.multiply(taxPct).divide(new BigDecimal(100), 2, java.math.RoundingMode.HALF_UP)
+                    } else {
+                        cgstRate = taxPct.divide(new BigDecimal(2), 2, java.math.RoundingMode.HALF_UP)
+                        sgstRate = cgstRate
+                        cgstAmount = taxableVal.multiply(cgstRate).divide(new BigDecimal(100), 2, java.math.RoundingMode.HALF_UP)
+                        sgstAmount = cgstAmount
+                    }
+                }
+
+                // Call standard create item service but pass extended fields
+                def inMap = context + [
+                    itemTypeEnumId: 'ItemSales',
+                    amount: price,
+                    taxableAmount: taxableVal,
+                    igstRate: igstRate, igstAmount: igstAmount,
+                    cgstRate: cgstRate, cgstAmount: cgstAmount,
+                    sgstRate: sgstRate, sgstAmount: sgstAmount
+                ]
+                ec.service.sync().name("create#mantle.account.invoice.InvoiceItem").parameters(inMap).call()
+
+                // Refresh the header grand total (invoiceTotal/unpaidTotal) from the items.
+                ec.service.sync().name("mantle.account.InvoiceServices.update#InvoiceTotals").parameters([invoiceId:invoiceId]).call()
+
+                // Aggregate Indian GST totals onto the invoice header (custom fields).
+                def invItems = ec.entity.find("mantle.account.invoice.InvoiceItem").condition("invoiceId", invoiceId).list()
+                def tCgst = 0.0, tSgst = 0.0, tIgst = 0.0, tTaxable = 0.0
+                for (def it : invItems) {
+                    tCgst += (it.cgstAmount ?: 0.0)
+                    tSgst += (it.sgstAmount ?: 0.0)
+                    tIgst += (it.igstAmount ?: 0.0)
+                    tTaxable += (it.taxableAmount ?: ((it.quantity?:1)*(it.amount?:0)))
+                }
+                ec.service.sync().name("update#mantle.account.invoice.Invoice").parameters([
+                    invoiceId: invoiceId,
+                    totalCgst: tCgst, totalSgst: tSgst, totalIgst: tIgst, totalTaxableAmount: tTaxable
+                ]).call()
+            </script>
+        </actions>
         <default-response url="."/>
     </transition>
 
@@ -134,7 +128,7 @@
             </if>
             <service-call name="delete#mantle.account.invoice.InvoiceItem" in-map="context"/>
         <script>
-            ec.service.sync().name("mantle.account.InvoiceServices.calculate#InvoiceTotal").parameters([invoiceId:invoiceId]).call()
+            ec.service.sync().name("mantle.account.InvoiceServices.update#InvoiceTotals").parameters([invoiceId:invoiceId]).call()
 
             // Re-aggregate GST values
             def invItems = ec.entity.find("mantle.account.invoice.InvoiceItem").condition("invoiceId", invoiceId).list()
