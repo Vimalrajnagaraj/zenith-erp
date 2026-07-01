@@ -214,18 +214,18 @@ Open from the app menu → **Tax**. Screen URLs (`/apps/zenith/tax/…` — lowe
 |---|---|---|---|---|---|
 | GST-020 | GST | B2B classification | Buyer **has** GSTIN | `b2bB2cType = B2B`; documentType **Tax Invoice** | S2 |
 | GST-021 | GST | B2C small vs large | Buyer no GSTIN, total ₹2,00,000 then ₹3,00,000 | **B2C_SMALL** (<₹2.5L) then **B2C_LARGE** (≥₹2.5L) | S3 |
-| GST-022 | GST | Composition → Bill of Supply | Org `isCompositionScheme=Y` | documentType **BILL OF SUPPLY**; ⚠ a composition dealer must **not** charge GST to the customer — verify the customer isn't charged CGST/SGST (record actual; flag if tax is shown) | S1 |
-| GST-023 | GST | Export invoice | Invoice `isExport=Y` (buyer country ≠ IND) | documentType **EXPORT INVOICE**; **IGST 0%** (zero-rated); LUT/Bond or Shipping-Bill fields available | S1 |
-| GST-024 | GST | SEZ supply | `isSezSupply=Y` | supplyType **SEZ**; **IGST 0** (zero-rated) even intra-state | S1 |
-| GST-025 | GST | Reverse charge (RCM) | Invoice `isReverseCharge=Y` | ⚠ under RCM the **seller doesn't collect GST** (buyer self-pays). Verify the buyer isn't charged GST on the invoice and `itcEligible` behaves per RCM — **record actual**; the engine currently still computes the rate, so flag if the customer is charged | S1 |
-| GST-026 | GST | TCS threshold | Cumulative B2B sales cross the configured threshold | TCS (0.1%) starts applying via `TcsCumulativeTracker`; **verify the threshold + rate match the intended TCS rule** with the dev | S3 |
+| GST-022 | GST | Composition → Bill of Supply | Org `isCompositionScheme=Y` | documentType **BILL OF SUPPLY** and **zero GST charged to the customer** (a composition dealer pays composition tax itself). **[Fixed b52c711 — `calculate#Tax` now returns zero tax for a composition org; verified tax 0, no CGST/SGST lines.]** | S1 |
+| GST-023 | GST | Export invoice | Invoice `isExport=Y` (buyer country ≠ IND) | documentType **EXPORT INVOICE**; **IGST 0%** (zero-rated); LUT/Bond or Shipping-Bill fields available. ⚠ Note: `calculate#Tax` computes `isExport` but does not yet pass it to the engine (export path not fully wired) — record actual, flag for dev | S1 |
+| GST-024 | GST | SEZ supply | `isSezSupply=Y` | supplyType **SEZ**; the engine currently charges **IGST at the slab rate** (SEZ-with-payment-of-IGST, refund-eligible), not 0% — confirm which SEZ model (LUT zero-rated vs IGST-paid) is intended with the dev | S2 |
+| GST-025 | GST | Reverse charge (RCM) | Invoice `isReverseCharge=Y` | Under RCM the **seller does not collect GST** (buyer self-assesses). **[Fixed b52c711 — `calculate#Gst` now zeroes CGST/SGST/IGST/CESS and marks supplyType `*_RCM` when `isReverseCharge=Y`, threaded through `calculate#Tax`; verified tax 0, no breakdown.]** Verify `itcEligible` behaves per RCM. (Wiring the per-invoice RCM flag from the UI/product is a separate feature.) | S1 |
+| GST-026 | GST | TCS threshold | Cumulative sales cross the threshold | TCS (0.1%) applies via `TcsCumulativeTracker` on the amount exceeding **₹50,00,000 (₹50 lakh)** — **confirmed correct per §206C(1H)** (code `limit=5000000`, rate 0.001). No change needed | S3 |
 
 ### 10.4 The engine's edge cases (probe hard)
 
 | ID | Type | Title | Inputs | Expected result | Sev |
 |---|---|---|---|---|---|
-| GST-030 | EDGE | **B2C to another state** | `CUST_B2C` (no GSTIN) whose delivery is in a **different** state; goods sale | ⚠ Place-of-supply for goods is the delivery location. The engine defaults a **GSTIN-less** buyer's state to the **seller's** state → **intra-state (CGST+SGST)**. Verify whether an inter-state B2C sale should be **IGST**; record actual + flag | S2 |
-| GST-031 | EDGE | Missing seller/buyer state | A party with **no** `regionGeoId` and no org fallback | Record actual — the engine falls back to org state, else may error. **Compare with the Sales `addItem` path**, which historically fell back to **IGST** on a missing registration (inconsistent default) — flag any mismatch | S2 |
+| GST-030 | EDGE | **B2C to another state** | `CUST_B2C` (no GSTIN) whose delivery is in a **different** state; goods sale | The engine defaults a **GSTIN-less** buyer to the **seller's** state → **intra-state (CGST+SGST)**. This is the correct legal default when the buyer's location is unknown (POS falls back to seller state). If the app later captures a B2C delivery state, place-of-supply should switch to IGST — record actual | S3 |
+| GST-031 | EDGE | Consistent GSTIN-less default across paths | Same product billed via **POS**, **Sales `add#InvoiceItem`**, and the **Sales EditInvoice screen** with a GSTIN-less buyer | All three now default to **intra-state (CGST+SGST)**. **[Fixed b52c711 — the EditInvoice screen `addItem` previously defaulted `isInterstate=true` (wrongly IGST); now defaults intra, matching the engine and `add#InvoiceItem`.]** | S2 |
 | GST-032 | EDGE | Unknown HSN | Product with an HSN not in `IndiaHsnCode` | No slab resolved → verify it errors clearly or falls back sensibly (not silently zero-tax) | S2 |
 | GST-033 | EDGE | No slab on product | Product with no `gstSlabId`/HSN/category | Verify a clear failure, not a silent 0% (a taxed good billed at 0% is an under-charge) | S2 |
 | GST-034 | EDGE | Negative / credit note | A credit note (negative amounts) | Tax reverses proportionally (negative CGST/SGST/IGST); split matches the original | S2 |
@@ -344,9 +344,9 @@ Documents touched: invoice / registration / filing / IRN / e-Way ids
 These are the highest-risk spots — spend extra time here:
 
 1. **Intra vs inter-state split (GST-001/002, XF-001)** — the single most important thing. CGST+SGST for same-state, IGST for cross-state, driven by the parties' GSTIN state. Do the math by hand on every caller (POS, Sales, Purchase, Transfer).
-2. **The default when a buyer has no GSTIN / no state (GST-030, GST-031, TX-036)** — the engine defaults a GSTIN-less buyer to the **seller's** state → intra-state, while the Sales `addItem` path historically defaulted a missing registration to **IGST**. Confirm the intended rule and that the callers agree; an inter-state B2C goods sale billed as CGST+SGST is wrong.
-3. **Composition scheme (GST-022)** — must issue a **Bill of Supply with no GST charged to the customer**; verify the customer isn't charged CGST/SGST.
-4. **Reverse charge (GST-025)** — the **seller must not collect** GST; verify the buyer isn't charged and ITC/accounting is right.
+2. **The default when a buyer has no GSTIN / no state (GST-030, GST-031, TX-036)** — all paths (POS, `add#InvoiceItem`, EditInvoice screen) now default a GSTIN-less buyer to the **seller's** state → intra-state (CGST+SGST), the correct default when the buyer location is unknown. **[Fixed b52c711 — the EditInvoice screen previously defaulted to IGST.]** Still re-verify the three callers agree after any tax change.
+3. **Composition scheme (GST-022)** — must issue a **Bill of Supply with no GST charged to the customer**. **[Fixed b52c711 — `calculate#Tax` now returns zero tax for a composition org.]** Re-verify no CGST/SGST lines appear.
+4. **Reverse charge (GST-025)** — the **seller must not collect** GST. **[Fixed b52c711 — `calculate#Gst` now zeroes the collected tax under `isReverseCharge=Y`.]** Re-verify the buyer isn't charged and ITC/accounting is right; the per-invoice RCM flag wiring from the UI is a separate follow-up.
 5. **CESS (GST-010)** — charged on the **taxable value**, on top of GST, not on the GST amount.
 6. **Tax-inclusive extraction & rounding (GST-011..014)** — `taxable = MRP×100/(100+rate)`, HALF_UP 2dp per amount, invoice total to nearest rupee. A drifting paisa on many lines compounds.
 7. **Export / SEZ zero-rating (GST-023/024)** — 0% IGST, correct document type, LUT/shipping-bill fields.
@@ -367,4 +367,4 @@ These are the highest-risk spots — spend extra time here:
 
 ---
 
-*End of Part 6 — Tax. Related: Part 3 — POS (billing calls the GST engine); Part 4 — Sales (invoice GST); Part 5 — Inventory (inter-state transfer IGST + e-Way); Accounting holds GSTR-2/GSTR-3B and the tax ledger. The intra/inter-state split, the missing-GSTIN default, composition/RCM handling, and GSTR-1/e-Invoice fidelity should be triaged with the dev before any live filing.*
+*End of Part 6 — Tax. Related: Part 3 — POS (billing calls the GST engine); Part 4 — Sales (invoice GST); Part 5 — Inventory (inter-state transfer IGST + e-Way); Accounting holds GSTR-2/GSTR-3B and the tax ledger. Composition (zero GST / Bill of Supply), reverse-charge (seller collects zero), the GSTIN-less intra default, and TCS (₹50 lakh @ 0.1%) were reviewed and fixed/confirmed (commit b52c711). Still open for dev: the export path (`isExport` not passed to the engine), the SEZ model (IGST-paid vs LUT zero-rated), and wiring the per-invoice RCM flag from the UI — triage these plus GSTR-1/e-Invoice fidelity before any live filing.*
