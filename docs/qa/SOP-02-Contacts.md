@@ -139,6 +139,7 @@ Contacts can be created from the Dashboard, Customers, Vendors, or All-Contacts 
 | CT-011 | FUNC | Create company customer | Customers → Add Company → Business name/email/phone → Save | Company created; Type shows "Business/Organization" | S2 |
 | CT-012 | FUNC | Create vendor | Vendors → Add Company/Person → Save | Created with role Vendor/Supplier; appears in Vendors, not necessarily Customers | S2 |
 | CT-013 | FUNC | Create with full tax detail | All Contacts → Add Company → fill GSTIN, PAN, GST registration type, TDS | All values saved and visible on the profile and in the directory's Tax Info column | S2 |
+| CT-013a | EDGE | **PAN validation consistent Create vs Edit** | On **New Customer/Vendor**, enter an invalid PAN (`1234567890`, `ABC12`, digits-only, wrong pattern) → Save; then repeat on **Edit Contact** | **[Fixed 621d3c1]** Both forms now reject it with the same message ("A PAN is 10 characters, e.g. ABCDE1234F.") and don't save; a valid PAN (`abcde1234f`) saves upper-cased (`ABCDE1234F`); blank is allowed on both. Previously Create accepted any PAN while Edit blocked it | S3 |
 | CT-014 | FUNC | Role choice respected | All Contacts → Add Person, set Role = Vendor | Contact appears under Vendors, not Customers | S2 |
 
 ### 8.2 Validation & edge cases
