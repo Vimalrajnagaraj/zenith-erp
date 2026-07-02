@@ -234,8 +234,14 @@ Create these as you go; record the exact values you used in the *Actual* column 
 
 | ID | Type | Title | Steps | Expected result | Sev |
 |---|---|---|---|---|---|
-| ONB-001 | FUNC | Full email signup (wizard) | Open `/get-started`, fill all required fields with valid data, choose Starter, submit | Tenant + admin user created; user is **auto-logged-in** and lands on `/apps/zenith` | S1 |
-| ONB-002 | FUNC | Legacy signup confirmation | Repeat via `/signup` | Lands on `/signup-success` showing **Organization ID** (uppercase subdomain), **Username** (email), and **subdomain.zetaclantech.com**, plus a "save your Org ID" notice and a **Go to Login** link | S2 |
+| ONB-001 | FUNC | Full email signup (wizard) | Open `/get-started`, fill all required fields with valid data, choose Starter, submit | **[Changed — ZE-ONB-002, 24a0a01]** Tenant + admin user created **UNVERIFIED**; user is **NOT** logged in — lands on `/signup-success?verify=1` ("Verify your email to activate your account" + a **Resend verification email** link). A verification email (subject *"Verify your ZetaERP email"*) is sent | S1 |
+| ONB-002 | FUNC | Legacy signup confirmation | Repeat via `/signup` | Lands on `/signup-success`. For an email/password signup this now shows the **verify-your-email** state (see ONB-001); the legacy "Organization ID / Username / subdomain / Go to Login" details block only shows without `verify=1` | S2 |
+| ONB-005 | FUNC | Email-verify hard gate — verify link | After ONB-001, open the link in the email → `/Login/verifyEmail?token=…` | Account activated (EMAIL_VERIFIED=Y, token consumed), user **logged in** and redirected to the dashboard. Re-clicking the same link → *"This verification link is invalid or has already been used."* | S1 |
+| ONB-006 | SEC | Email-verify hard gate — login blocked before verify | After ONB-001 (do **not** verify), try to log in with the new Org ID + email + password | **Blocked**: correct credentials do **not** reach the dashboard — redirected to `/signup-success?verify=1` (verify-your-email page). Only after clicking the link does login succeed | S1 |
+| ONB-007 | FUNC | Resend verification | On the verify page, click **Resend verification email** | Generic confirmation ("If your email still needs verifying, we've sent a fresh link…"); a new email arrives; no account-existence disclosure | S2 |
+| ONB-008 | FUNC | Google signup skips the gate | Sign up via **Continue with Google** (new Gmail) | Google email is pre-verified → **no** verify step; logs straight into `/apps/zenith` (EMAIL_VERIFIED=Y set automatically) | S2 |
+| ONB-009 | VAL | Invalid email format rejected | Signup with `adminEmail` = `abc`, `a@`, `a@b` | Rejected with *"Please enter a valid email address."*; no account created | S2 |
+| ONB-00A | SEC | Existing tenants never gated | Log in as MARUTHI / any pre-existing user | Logs in normally — no verify prompt (only NEW email/password signups get EMAIL_VERIFIED='N'; existing accounts have no such preference) | S1 |
 | ONB-003 | FUNC | Page renders fully | Open `/get-started` | All three sections, the trial message ("14-day free trial · No credit card required"), and the "Already have an account? Sign in" link render | S2 |
 | ONB-004 | FUNC | Defaults pre-selected | Inspect dropdowns on load | Country = India, Industry = Retail (General), Plan = Starter pre-selected | S3 |
 
