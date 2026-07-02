@@ -115,6 +115,7 @@ The Settings area opens from the app menu → **Settings & Roles** and is **admi
 |---|---|---|---|---|---|
 | ST-011 | FUNC | Open company setup | Open Settings → Company Setup | Shows **your own** org: Org Code, Name, Country, Currency, PAN, TAN, CIN, GSTIN records, FY start, settings | S2 |
 | ST-012 | FUNC | Edit company profile | On a **throwaway tenant**, change Name / PAN / TAN / CIN → Update | Persists after reload | S2 |
+| ST-012a | FUNC | **Contact Information save** | On a **throwaway tenant**, in Contact Information: (a) change Company Email to a new valid value → Update Contact; (b) clear it → Update; (c) enter an invalid email; (d) same for Phone | **[Fixed 385e00b]** (a) a valid new email/phone **persists**; (b) clearing **persists** (the field stays empty — no silent revert); (c) an invalid email is **rejected** with "Enter a valid company email, e.g. name@company.com." (no 500); all show a **"Contact information saved."** confirmation. (Previously: update/create hit non-existent services or silently no-op'd, and clearing reverted with no feedback.) | S2 |
 | ST-013 | FUNC | Financial-year start | Set FY Start month → Save | Persists; document numbering FY reflects it (e.g. `INV/26-27/…`) | S2 |
 | ST-014 | FUNC | Company settings key/values | View the settings list; edit a value | Persists | S3 |
 | ST-015 | EDGE | Bad PAN/TAN/CIN | Enter malformed values | **Record actual** — is format validated? (likely not server-side) | S3 |
