@@ -164,8 +164,8 @@ Contacts can be created from the Dashboard, Customers, Vendors, or All-Contacts 
 
 | ID | Type | Title | Steps | Expected result | Sev |
 |---|---|---|---|---|---|
-| CT-040 | FUNC | Customers list renders | Open Customers | Columns: ID (link), Customer Name, Type badge, GST Number (+ "Valid" badge when present), PAN, Actions (Orders, Invoices) | S2 |
-| CT-041 | FUNC | Open a profile | Click an ID or name | Opens that contact's EditContact profile | S2 |
+| CT-040 | FUNC | Customers list renders | Open Customers | Columns: ID **(link)**, Customer Name **(link)**, Type badge, GST Number (+ "Valid" badge when present), PAN, Actions (Orders, Invoices). **[ZE-CONTACTS-007]** Both the ID **and** the Name are now anchors to the profile | S2 |
+| CT-041 | FUNC | Open a profile | Click an ID **or the Customer Name** | **[Fixed — ZE-CONTACTS-007, this commit]** Either opens that contact's EditContact profile (`…/Contacts/EditContact?partyId=<id>`). The Name renders as a link (pointer cursor); previously only the ID chip was clickable. Same applies to the Vendors list | S2 |
 | CT-042 | FUNC | Column search — company | Type a company name in the Company Search box → Find | Only matching companies listed | S2 |
 | CT-043 | FUNC | Column search — first/last name | Search by first or last name | Matching people listed | S2 |
 | CT-044 | FUNC | Filter by Type | Set Type = Person / Organization | List filters accordingly | S3 |
