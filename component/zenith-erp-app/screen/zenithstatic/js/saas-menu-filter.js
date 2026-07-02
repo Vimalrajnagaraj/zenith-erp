@@ -9,9 +9,12 @@
         var isTenant = !!cfg.isSaasTenant;
         var hasAll = !!cfg.hasAllAccess;
         var posOnly = !!cfg.posOnly;
+        // ZE-SETTINGS-0203: Settings is admin-only. Default TRUE unless the server explicitly says false,
+        // so a missing flag (e.g. the XHR fallback) never hides Settings from a real admin.
+        var isAdmin = cfg.isAdmin !== false;
         var allowedSet = {};
         (cfg.modules || []).forEach(function(m) { allowedSet[String(m).toLowerCase()] = true; });
-        var alwaysAllowed = { "dashboard":true, "settings":true, "saas-admin":true, "my-subscription":true };
+        var alwaysAllowed = { "dashboard":true, "saas-admin":true, "my-subscription":true };
         var lastFiltered = null;
 
         function filterMenu(list) {
@@ -29,6 +32,9 @@
                     var name = ss.name ? ss.name.toLowerCase() : "";
                     // POS-only cashier: show only the POS module, hide everything else.
                     if (posOnly) return name === "pos";
+                    // Settings is admin-only (ZENITH_ADMIN/ADMIN) regardless of plan — hide it from
+                    // everyone else so they don't navigate into an "Access Restricted" wall.
+                    if (name === "settings") return isAdmin;
                     if (name === "saas-admin" && isTenant) return false;
                     if (name === "my-subscription" && !isTenant) return false;
                     if (!isTenant || hasAll) return true;
@@ -56,6 +62,7 @@
                 isSaasTenant: el.getAttribute("data-tenant") === "true",
                 hasAllAccess: el.getAttribute("data-all") === "true",
                 posOnly: el.getAttribute("data-pos-only") === "true",
+                isAdmin: el.getAttribute("data-is-admin") !== "false",
                 modules: JSON.parse(el.getAttribute("data-modules") || "[]")
             };
         } catch (e) { return null; }
