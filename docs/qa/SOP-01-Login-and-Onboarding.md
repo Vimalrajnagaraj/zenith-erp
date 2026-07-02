@@ -180,8 +180,8 @@ Create these as you go; record the exact values you used in the *Actual* column 
 
 | ID | Type | Title | Steps | Expected result | Sev |
 |---|---|---|---|---|---|
-| LOGIN-050 | FUNC | Reset request (valid user) | Use "Forgot password", enter a QA username | A reset email is sent to that account's email; UI confirms without revealing account existence | S2 |
-| LOGIN-051 | SEC | Reset request (unknown user) | Enter an unknown username | Same neutral confirmation — **must not** reveal that the account doesn't exist | S2 |
+| LOGIN-050 | SEC | Reset request (valid user) | Use "Forgot password", enter a QA username | **[Fixed 7a0959d — ZE-AUTH-011]** The reset happens (password set, email sent) and the UI shows only the generic **"If an account matches that username, a password reset has been sent to its registered email address."** — it **never displays the reset password on screen** (Moqui's email-fail fallback used to print it in plain text → account-takeover) and does **not** name the username. Inspect the full response: no plaintext password, no "…of username `<x>`" | S1 |
+| LOGIN-051 | SEC | Reset request (unknown user) | Enter an unknown username | **[Fixed 7a0959d]** Byte-identical generic confirmation to LOGIN-050 — never "No account found", never reveals the account doesn't exist | S2 |
 | LOGIN-052 | FUNC | Reset link works | Open the link from the email | Lands on Change Password with username (and reset code) pre-filled | S2 |
 | LOGIN-053 | EDGE | Reset link reuse / expiry | Use the link twice / after expiry | Second use or expired link is rejected gracefully | S3 |
 
