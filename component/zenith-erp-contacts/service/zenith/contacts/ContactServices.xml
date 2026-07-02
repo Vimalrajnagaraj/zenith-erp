@@ -103,6 +103,7 @@
             <parameter name="emailAddress"/>
             <parameter name="countryCode"/>
             <parameter name="contactNumber"/>
+            <parameter name="allowDuplicate" default-value="N"><description>Y to skip the same-phone duplicate check.</description></parameter>
             <parameter name="taxRegistrationNumber"/>
             <parameter name="taxRegistrationTypeEnumId"/>
             <parameter name="gstin"><description>Optional GSTIN; if given it is validated and stored as an IndiaGstin record.</description></parameter>
@@ -149,6 +150,32 @@
             <!-- Validate/normalise the phone (reject letters + absurd length) before anything is created. -->
             <service-call name="zenith.contacts.ContactServices.normalize#PhoneNumber"
                           in-map="[countryCode:countryCode, contactNumber:contactNumber]" out-map="context"/>
+            <if condition="ec.message.hasError()"><return/></if>
+
+            <!-- Duplicate detection: a POS/ERP identifies customers by phone, so block a second contact with
+                 the same primary phone in THIS org (allowDuplicate='Y' overrides; skipped for an org-less
+                 admin). The message names the existing contact so the user can edit/merge it instead. -->
+            <script><![CDATA[
+                def _org = ec.user.getPreference('ACTIVE_ORGANIZATION') ?: '_NA_'
+                if (contactNumber && allowDuplicate != 'Y' && _org) {
+                    def matches = ec.entity.find("mantle.party.contact.PartyContactMechTelecomNumber")
+                        .condition("contactMechPurposeId", "PhonePrimary")
+                        .condition("contactNumber", contactNumber)
+                        .conditionDate("fromDate", "thruDate", ec.user.nowTimestamp)
+                        .disableAuthz().list()
+                    def dupName = null
+                    for (row in matches) {
+                        def pty = ec.entity.find("mantle.party.Party").condition("partyId", row.partyId).disableAuthz().one()
+                        if (pty == null || pty.ownerPartyId != _org) continue
+                        def per = ec.entity.find("mantle.party.Person").condition("partyId", row.partyId).disableAuthz().one()
+                        def nm = per ? ((per.firstName ?: '') + ' ' + (per.lastName ?: '')).trim() : null
+                        if (!nm) nm = ec.entity.find("mantle.party.Organization").condition("partyId", row.partyId).disableAuthz().one()?.organizationName
+                        dupName = nm ?: row.partyId
+                        break
+                    }
+                    if (dupName) ec.message.addError("A contact '" + dupName + "' with phone " + contactNumber + " already exists in your account. Edit or merge that contact instead of creating a duplicate.")
+                }
+            ]]></script>
             <if condition="ec.message.hasError()"><return/></if>
 
             <if condition="partyTypeEnumId == 'PtyOrganization'">
