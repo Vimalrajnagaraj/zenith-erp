@@ -24,6 +24,9 @@
                 def email = (gid?.email ?: adminEmail)?.trim()?.toLowerCase()
                 def gsub = gid?.googleSub
                 def pwd = gid ? null : adminPassword   // Google = passwordless; email signup keeps its password
+                context.needsVerification = false
+                // ZE-ONB-002: email/password signups must supply a valid email FORMAT (Google emails are pre-validated).
+                if (!gid && (!email || !(email ==~ /[^@\s]+@[^@\s]+\.[^@\s]+/))) { ec.message.addError("Please enter a valid email address."); return }
                 boolean alreadyDisabled = ec.artifactExecution.disableAuthz()
                 try {
                     def result = ec.service.sync().name("zenith.saas.SaasServices.provision#Tenant")
@@ -34,12 +37,24 @@
                         .disableAuthz().requireNewTransaction(true).call()
                     if (ec.message.hasError()) return
                     context.putAll(result)
-                    // Log the new user straight in (passwordless for Google; for email signup we have the password)
-                    if (gid) { ec.user.internalLoginUser(email) } else { ec.user.loginUser(email, adminPassword) }
-                    ec.web.session.removeAttribute("googleIdentity")
+                    if (gid) {
+                        // Google already verified the email -> mark verified and log in immediately.
+                        ec.entity.makeValue("moqui.security.UserPreference")
+                            .setAll([userId:result.userId, preferenceKey:"EMAIL_VERIFIED", preferenceValue:"Y"]).createOrUpdate()
+                        ec.user.internalLoginUser(email)
+                        ec.web.session.removeAttribute("googleIdentity")
+                    } else {
+                        // ZE-ONB-002 hard gate: DO NOT log in. Send a verification link; login stays blocked until verified.
+                        ec.service.sync().name("zenith.saas.SaasServices.send#SignupVerification")
+                            .parameters([email:email, firstName:fName]).disableAuthz().call()
+                        ec.web.session.setAttribute("pendingVerifyEmail", email)
+                        context.needsVerification = true
+                    }
                 } finally { if (!alreadyDisabled) ec.artifactExecution.enableAuthz() }
             ]]></script>
         </actions>
+        <conditional-response url="/signup-success" parameter-map="[verify:'1']"><condition>
+            <expression>needsVerification</expression></condition></conditional-response>
         <default-response url="/apps/zenith"/>
         <error-response url="."/>
     </transition>

@@ -740,4 +740,44 @@
         </actions>
     </service>
 
+    <!-- ZE-ONB-002: email-verification hard gate. Marks the account's email unverified, stores a one-time
+         token, and emails a verify link. Reusable for the initial signup send AND for resend. Idempotent:
+         no-op if already verified; looks the user up by username(=email) so callers pass only the email. -->
+    <service verb="send" noun="SignupVerification" authenticate="anonymous-all">
+        <description>Sets EMAIL_VERIFIED=N + a token for the email's account and sends the verification link.</description>
+        <in-parameters>
+            <parameter name="email" required="true"/>
+            <parameter name="firstName"/>
+        </in-parameters>
+        <out-parameters><parameter name="sent" type="Boolean"/></out-parameters>
+        <actions>
+            <script><![CDATA[
+                context.sent = false
+                def em = email?.trim()?.toLowerCase()
+                if (!em) return
+                def ua = ec.entity.find("moqui.security.UserAccount").condition("username", em).disableAuthz().one()
+                if (ua == null) return
+                def uid = ua.userId
+                def ev = ec.entity.find("moqui.security.UserPreference").condition("userId", uid)
+                    .condition("preferenceKey", "EMAIL_VERIFIED").disableAuthz().one()
+                if (ev?.preferenceValue == "Y") return   // already verified: nothing to send
+                def token = java.util.UUID.randomUUID().toString().replace("-", "")
+                ec.entity.makeValue("moqui.security.UserPreference")
+                    .setAll([userId:uid, preferenceKey:"EMAIL_VERIFIED", preferenceValue:"N"]).createOrUpdate()
+                ec.entity.makeValue("moqui.security.UserPreference")
+                    .setAll([userId:uid, preferenceKey:"EMAIL_VERIFY_TOKEN", preferenceValue:token]).createOrUpdate()
+                def verifyUrl = "https://erp.zetaclantech.com/Login/verifyEmail?token=" + token
+                try {
+                    ec.service.sync().name("org.moqui.impl.EmailServices.send#EmailTemplate")
+                        .parameters([emailTemplateId:"EMAIL_VERIFY", toAddresses:em,
+                            bodyParameters:[verifyUrl:verifyUrl, firstName:(firstName ?: ua.userFullName ?: "")]])
+                        .disableAuthz().call()
+                    context.sent = true
+                } catch (Exception e) {
+                    ec.logger.error("EMAIL_VERIFY send failed for " + em + ": " + e.message)
+                }
+            ]]></script>
+        </actions>
+    </service>
+
 </services>

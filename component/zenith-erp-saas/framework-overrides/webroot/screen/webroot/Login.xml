@@ -79,6 +79,26 @@ along with this software (see the LICENSE.md file). If not, see
                 </script>
             </if>
 
+            <!-- ZE-ONB-002: email-verification hard gate. Block login until a NEW email/password signup verifies
+                 its email. Only such signups get EMAIL_VERIFIED='N' (Google is pre-verified); existing accounts
+                 have no such preference so they are NEVER gated (backward-compatible). On block, log the user
+                 back out, stash their email, and route them to the "verify your email" page (with a resend). -->
+            <if condition="ec.user.userId &amp;&amp; !ec.web.sessionAttributes.moquiAuthcFactorRequired">
+                <script><![CDATA[
+                    boolean adDis = ec.artifactExecution.disableAuthz()
+                    try {
+                        def ev = ec.entity.find("moqui.security.UserPreference")
+                            .condition("userId", ec.user.userId).condition("preferenceKey", "EMAIL_VERIFIED").one()
+                        if (ev?.preferenceValue == "N") {
+                            emailUnverified = true
+                            def ua = ec.entity.find("moqui.security.UserAccount").condition("userId", ec.user.userId).one()
+                            if (ua?.username) ec.web.session.setAttribute("pendingVerifyEmail", ua.username)
+                        }
+                    } finally { if (!adDis) ec.artifactExecution.enableAuthz() }
+                ]]></script>
+                <if condition="emailUnverified"><script>ec.user.logoutUser()</script></if>
+            </if>
+
             <!-- Validate Organization ID after successful login -->
             <if condition="ec.user.userId &amp;&amp; organizationId">
                 <script><![CDATA[
@@ -167,6 +187,8 @@ along with this software (see the LICENSE.md file). If not, see
                 ]]></script>
             </if>
         </actions>
+        <conditional-response url="/signup-success" parameter-map="[verify:'1']"><condition>
+            <expression>emailUnverified</expression></condition></conditional-response>
         <conditional-response url="."><condition>
             <expression>orgLoginFailed</expression></condition></conditional-response>
         <!-- no longer using SecondFactor screen, now built into Login screen to better support more scenarios:
@@ -213,6 +235,50 @@ along with this software (see the LICENSE.md file). If not, see
             </script>
         </actions>
         <default-response url="."/>
+    </transition>
+    <!-- ZE-ONB-002: consume an email-verification token (clicked from the verify email). GET link, no CSRF
+         token. Marks EMAIL_VERIFIED=Y, deletes the one-time token, logs the user in, -> dashboard. -->
+    <transition name="verifyEmail" require-session-token="false" read-only="true">
+        <actions>
+            <script><![CDATA[
+                ec.artifactExecution.disableAuthz()
+                verifyOk = false
+                if (token) {
+                    def tp = ec.entity.find("moqui.security.UserPreference")
+                        .condition("preferenceKey", "EMAIL_VERIFY_TOKEN").condition("preferenceValue", token).disableAuthz().list()
+                    if (tp) {
+                        def uid = tp[0].userId
+                        ec.entity.makeValue("moqui.security.UserPreference")
+                            .setAll([userId:uid, preferenceKey:"EMAIL_VERIFIED", preferenceValue:"Y"]).createOrUpdate()
+                        def tv = ec.entity.find("moqui.security.UserPreference").condition("userId", uid)
+                            .condition("preferenceKey", "EMAIL_VERIFY_TOKEN").disableAuthz().one()
+                        if (tv != null) tv.delete()
+                        def ua = ec.entity.find("moqui.security.UserAccount").condition("userId", uid).disableAuthz().one()
+                        if (ua?.username) { ec.user.internalLoginUser(ua.username); ec.web.session.removeAttribute("pendingVerifyEmail") }
+                        verifyOk = true
+                    }
+                }
+                if (!verifyOk) ec.message.addError("This verification link is invalid or has already been used. Please sign in, or sign up again.")
+            ]]></script>
+        </actions>
+        <conditional-response url="/apps/zenith"><condition><expression>verifyOk</expression></condition></conditional-response>
+        <default-response url="."/>
+    </transition>
+    <!-- ZE-ONB-002: resend the verification link to the pending signup email (kept in session at signup / at the
+         login gate). Generic message (no account enumeration). -->
+    <transition name="resendVerification" require-session-token="false" read-only="true">
+        <actions>
+            <script><![CDATA[
+                ec.artifactExecution.disableAuthz()
+                def em = ec.web.session.getAttribute("pendingVerifyEmail")
+                if (em) {
+                    ec.service.sync().name("zenith.saas.SaasServices.send#SignupVerification")
+                        .parameters([email:em]).disableAuthz().call()
+                }
+                ec.message.addMessage("If your email still needs verifying, we've sent a fresh link. Please check your inbox and spam folder.")
+            ]]></script>
+        </actions>
+        <default-response url="/signup-success" parameter-map="[verify:'1']"/>
     </transition>
     <transition name="changePassword">
         <parameter name="username" from="ec.web?.sessionAttributes?.moquiPreAuthcUsername ?: username"/>
