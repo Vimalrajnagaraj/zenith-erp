@@ -157,7 +157,7 @@
                                         </fo:table-cell>
                                         <fo:table-cell>
                                             <fo:block font-weight="bold">Reverse Charge:</fo:block>
-                                            <fo:block font-size="9pt">${((invoice.isReverseCharge)!'N' == 'Y')?string('Yes', 'No')}</fo:block>
+                                            <fo:block font-size="9pt">${(((invoice.isReverseCharge)!'N') == 'Y')?string('Yes', 'No')}</fo:block>
                                         </fo:table-cell>
                                     </fo:table-row>
                                 </fo:table-body>
@@ -247,7 +247,7 @@
                         <fo:table-cell>
                             <fo:block font-weight="bold" font-size="8pt" margin-bottom="2pt">Amount in Words:<fo:inline font-weight="normal" text-decoration="underline"> ${amountWords}</fo:inline></fo:block>
                             <fo:block font-weight="bold" font-size="8pt" margin-bottom="2pt">Payment terms: <fo:inline font-weight="normal">Immediate Payment</fo:inline></fo:block>
-                            <fo:block font-weight="bold" font-size="8pt" margin-bottom="8pt">Whether tax is payable under reverse charge: <fo:inline font-weight="normal">${((invoice.isReverseCharge)!'N' == 'Y')?string('Yes', 'No')}</fo:inline></fo:block>
+                            <fo:block font-weight="bold" font-size="8pt" margin-bottom="8pt">Whether tax is payable under reverse charge: <fo:inline font-weight="normal">${(((invoice.isReverseCharge)!'N') == 'Y')?string('Yes', 'No')}</fo:inline></fo:block>
                             
                             <fo:block font-weight="bold" font-size="8pt" margin-bottom="2pt">Terms &amp; Conditions</fo:block>
                             <fo:block font-size="7pt" margin-bottom="1pt">01) Notify us within 2 days of delivery in case of issues.</fo:block>

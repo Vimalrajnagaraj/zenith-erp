@@ -21,6 +21,58 @@
             </entity-find>
         </if>
 
+        <!-- ZE-POS-009: the FTL renders item.cgstAmount/sgstAmount/igstAmount and invoice.totalCgst/
+             totalSgst/totalIgst, but nothing provided them (the GST split lives in TaxLineDetail and the
+             item extension fields) -> GST columns printed "-", Taxes 0.00, and Total/amount-in-words used
+             the tax-less invoiceTotal. Enrich the data here; the FTL contract stays unchanged. -->
+        <script><![CDATA[
+            if (invoice != null) {
+                def rmode = java.math.RoundingMode.HALF_UP
+                def totCgst = BigDecimal.ZERO, totSgst = BigDecimal.ZERO, totIgst = BigDecimal.ZERO
+                def enriched = []
+                for (it0 in invoiceItems) {
+                    def m = new LinkedHashMap(it0)
+                    def tlds = ec.entity.find("zenith.erp.tax.TaxLineDetail")
+                        .condition("referenceType", "InvoiceItem").condition("referenceId", invoice.invoiceId)
+                        .condition("referenceSeqId", it0.invoiceItemSeqId).list()
+                    // The item's stored totalTaxAmount is authoritative: an EXPLICIT 0 means a tax-off line —
+                    // ignore any stale TaxLineDetail rows (seen when the tax toggle changed mid-sale). Only a
+                    // NULL item tax (older/manual rows) lets the breakdown rows speak for themselves.
+                    if (it0.totalTaxAmount != null && ((it0.totalTaxAmount as BigDecimal) == 0)) tlds = null
+                    if (tlds) {
+                        for (tl in tlds) {
+                            def nm = (tl.taxName ?: '').toUpperCase()
+                            def amt = (tl.taxAmount ?: 0) as BigDecimal
+                            def rt = (tl.taxRate ?: 0) as BigDecimal
+                            if (nm.contains('CGST')) { m.cgstAmount = ((m.cgstAmount ?: 0) as BigDecimal) + amt; m.cgstRate = rt }
+                            else if (nm.contains('SGST') || nm.contains('UTGST')) { m.sgstAmount = ((m.sgstAmount ?: 0) as BigDecimal) + amt; m.sgstRate = rt }
+                            else if (nm.contains('IGST')) { m.igstAmount = ((m.igstAmount ?: 0) as BigDecimal) + amt; m.igstRate = rt }
+                        }
+                    } else if (((it0.totalTaxAmount ?: 0) as BigDecimal) > 0) {
+                        // no stored breakdown (older rows): default to the intra-state 50/50 CGST/SGST split
+                        def itax = (it0.totalTaxAmount ?: 0) as BigDecimal
+                        def half = (itax / 2).setScale(2, rmode)
+                        m.cgstAmount = half; m.sgstAmount = itax - half
+                        def taxable = (it0.taxableAmount ?: 0) as BigDecimal
+                        if (taxable > 0) { m.cgstRate = (half * 100 / taxable).setScale(2, rmode); m.sgstRate = m.cgstRate }
+                    }
+                    if (m.cgstAmount) totCgst += m.cgstAmount as BigDecimal
+                    if (m.sgstAmount) totSgst += m.sgstAmount as BigDecimal
+                    if (m.igstAmount) totIgst += m.igstAmount as BigDecimal
+                    enriched.add(m)
+                }
+                invoiceItems = enriched
+                // Grand total = items total + header tax + round-off. Safe from double-count: NO invoice in
+                // this system stores tax as invoice items (verified); tax-less invoices get +0 (unchanged).
+                def inv = new LinkedHashMap(invoice)
+                inv.totalCgst = totCgst; inv.totalSgst = totSgst; inv.totalIgst = totIgst
+                // explicit null check — a stored 0 is authoritative (Groovy ?: would treat 0 as missing)
+                def hdrTax = (invoice.totalTaxAmount != null ? invoice.totalTaxAmount : (totCgst + totSgst + totIgst)) as BigDecimal
+                inv.invoiceTotal = ((invoice.invoiceTotal ?: 0) as BigDecimal) + hdrTax + ((invoice.roundOffAmount ?: 0) as BigDecimal)
+                invoice = inv
+            }
+        ]]></script>
+
         <!-- Safely fetch party details without triggering contact services that crash on null IDs -->
         <entity-find-one entity-name="mantle.party.PartyDetail" value-field="supplier">
             <field-map field-name="partyId" from="invoice?.fromPartyId"/>
