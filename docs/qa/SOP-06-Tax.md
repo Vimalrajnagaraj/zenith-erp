@@ -155,6 +155,14 @@ Open from the app menu → **Tax**. Screen URLs (`/apps/zenith/tax/…` — lowe
 
 > **Note (ZE-TAX sweep):** Tax **Authorities & Rates are GLOBAL master data (no org)** — unlike Exemptions/Registrations they are NOT org-scoped, so every tenant sees the same list (correct). Create/edit/delete are restricted to super-admins via `store#`/`delete#TaxAuthority` and `store#`/`delete#TaxRate`; delete is refused while referenced. **Known pre-existing issue:** the zenith `tax_rate` FK points at mantle `tax_authority` (not `ZENITH_TAX_AUTHORITY`), so creating a zenith TaxRate against a zenith authority FK-fails — table is empty/unused (India uses `IndiaGstSlab`).
 
+**Screen:** `TaxEngines` (Global Tax Engines — external providers Avalara AvaTax / TaxJar).
+
+| ID | Type | Title | Steps | Expected result | Sev |
+|---|---|---|---|---|---|
+| TX-018a | VAL | **Tax Engine config validation** | Add Tax Engine → leave a field blank / bad endpoint / mismatched provider → Save | Rejected: missing fields listed; endpoint must be `https://…`; Avalara→must be an avatax/avalara URL, TaxJar→a taxjar URL. A valid config saves (ZE-TAX-011) | S2 |
+
+> **Note (ZE-TAX-011):** `saveConfig` now runs `save#TaxEngineConfig` (required fields + https URL + provider/endpoint plausibility). **Limitation:** the API *secret* is NOT authenticated against the provider — `calculate#GlobalTax` is still a MOCK (no real Avalara/TaxJar client), so a live "Test Connection" is a go-live dependency (like the NIC/GSTN mocks). The secret is masked (`<password>`) and never shown in the list.
+
 ### 8.3 Tax Exemptions
 
 **Screen:** `FindTaxExemption`, `EditTaxExemption`. Entity `TaxExemption` (party and/or product, type Full/ZeroRated/ReverseCharge/Export/SEZ/…, effective dates).
