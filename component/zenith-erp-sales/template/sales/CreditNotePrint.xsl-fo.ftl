@@ -3,11 +3,9 @@
 <#macro encodeText textValue>${(Static["org.moqui.util.StringUtilities"].encodeForXmlAttribute(textValue!"", false))!""}</#macro>
 <#macro formatINR amount>${ec.l10n.format(amount!0, "#,##0.00")}</#macro>
 
-<#assign amountWords = "">
-<#if invoice.invoiceTotal??>
-    <#assign amt = invoice.invoiceTotal?string("0")?number>
-    <#assign amountWords = ec.l10n.format(amt, "spellout") + " Rupees Only">
-</#if>
+<#-- ZE-POS-009 sweep: words come from the screen (Indian numbering). The old ec.l10n.format(amt,
+     "spellout") treated "spellout" as a literal decimal-format prefix -> printed "spellout118". -->
+<#assign amountWords = (amountInWords)!"">
 
 <fo:root xmlns:fo="http://www.w3.org/1999/XSL/Format" font-family="Helvetica, sans-serif" font-size="8pt">
     <fo:layout-master-set>

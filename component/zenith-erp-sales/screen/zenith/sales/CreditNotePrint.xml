@@ -18,6 +18,76 @@
             </entity-find>
         </if>
 
+        <!-- ZE-POS-009 sweep: same defect as InvoicePrint — the FTL renders item.cgstAmount/sgstAmount/
+             igstAmount and invoice.totalCgst/totalSgst/totalIgst but nothing provided them, and
+             invoice.invoiceTotal (words + Total) excludes tax. Enrich identically (see InvoicePrint.xml). -->
+        <script><![CDATA[
+            if (invoice != null) {
+                def rmode = java.math.RoundingMode.HALF_UP
+                def totCgst = BigDecimal.ZERO, totSgst = BigDecimal.ZERO, totIgst = BigDecimal.ZERO
+                def enriched = []
+                for (it0 in invoiceItems) {
+                    def m = new LinkedHashMap(it0)
+                    def tlds = ec.entity.find("zenith.erp.tax.TaxLineDetail")
+                        .condition("referenceType", "InvoiceItem").condition("referenceId", invoice.invoiceId)
+                        .condition("referenceSeqId", it0.invoiceItemSeqId).list()
+                    // stored totalTaxAmount is authoritative: explicit 0 = tax-off line, ignore stale breakdowns
+                    if (it0.totalTaxAmount != null && ((it0.totalTaxAmount as BigDecimal) == 0)) tlds = null
+                    if (tlds) {
+                        for (tl in tlds) {
+                            def nm = (tl.taxName ?: '').toUpperCase()
+                            def amt = (tl.taxAmount ?: 0) as BigDecimal
+                            def rt = (tl.taxRate ?: 0) as BigDecimal
+                            if (nm.contains('CGST')) { m.cgstAmount = ((m.cgstAmount ?: 0) as BigDecimal) + amt; m.cgstRate = rt }
+                            else if (nm.contains('SGST') || nm.contains('UTGST')) { m.sgstAmount = ((m.sgstAmount ?: 0) as BigDecimal) + amt; m.sgstRate = rt }
+                            else if (nm.contains('IGST')) { m.igstAmount = ((m.igstAmount ?: 0) as BigDecimal) + amt; m.igstRate = rt }
+                        }
+                    } else if (((it0.totalTaxAmount ?: 0) as BigDecimal) > 0) {
+                        def itax = (it0.totalTaxAmount ?: 0) as BigDecimal
+                        def half = (itax / 2).setScale(2, rmode)
+                        m.cgstAmount = half; m.sgstAmount = itax - half
+                        def taxable = (it0.taxableAmount ?: 0) as BigDecimal
+                        if (taxable > 0) { m.cgstRate = (half * 100 / taxable).setScale(2, rmode); m.sgstRate = m.cgstRate }
+                    }
+                    if (m.cgstAmount) totCgst += m.cgstAmount as BigDecimal
+                    if (m.sgstAmount) totSgst += m.sgstAmount as BigDecimal
+                    if (m.igstAmount) totIgst += m.igstAmount as BigDecimal
+                    enriched.add(m)
+                }
+                invoiceItems = enriched
+                def inv = new LinkedHashMap(invoice)
+                inv.totalCgst = totCgst; inv.totalSgst = totSgst; inv.totalIgst = totIgst
+                def hdrTax = (invoice.totalTaxAmount != null ? invoice.totalTaxAmount : (totCgst + totSgst + totIgst)) as BigDecimal
+                // keep a NULL total NULL (legacy notes render blank words/0 totals exactly as before)
+                if (invoice.invoiceTotal != null || hdrTax != 0G || invoice.roundOffAmount != null)
+                    inv.invoiceTotal = ((invoice.invoiceTotal ?: 0) as BigDecimal) + hdrTax + ((invoice.roundOffAmount ?: 0) as BigDecimal)
+                invoice = inv
+                // Amount in words (Indian numbering) — the FTL's old l10n "spellout" printed "spellout<amt>"
+                amountInWords = null
+                if (inv.invoiceTotal != null) {
+                    long __n = (inv.invoiceTotal as BigDecimal).setScale(0, java.math.RoundingMode.FLOOR).longValue()
+                    def __o = ['','One','Two','Three','Four','Five','Six','Seven','Eight','Nine','Ten','Eleven','Twelve','Thirteen','Fourteen','Fifteen','Sixteen','Seventeen','Eighteen','Nineteen']
+                    def __t = ['','','Twenty','Thirty','Forty','Fifty','Sixty','Seventy','Eighty','Ninety']
+                    Closure __h = { int x ->
+                        StringBuilder bb = new StringBuilder(); int hh=(int)(x/100); int rr=x%100
+                        if (hh>0) { bb.append(__o[hh]).append(' Hundred'); if (rr>0) bb.append(' ') }
+                        if (rr>0) { if (rr<20) bb.append(__o[rr]) else { bb.append(__t[(int)(rr/10)]); if (rr%10>0) bb.append(' ').append(__o[rr%10]) } }
+                        return bb.toString()
+                    }
+                    long c=__n.intdiv(10000000); __n=__n%10000000
+                    long l=__n.intdiv(100000); __n=__n%100000
+                    long t=__n.intdiv(1000); __n=__n%1000
+                    long h=__n
+                    StringBuilder w=new StringBuilder()
+                    if (c>0) w.append(__h((int)c)).append(' Crore ')
+                    if (l>0) w.append(__h((int)l)).append(' Lakh ')
+                    if (t>0) w.append(__h((int)t)).append(' Thousand ')
+                    if (h>0) w.append(__h((int)h))
+                    amountInWords = (w.toString().trim() ?: 'Zero') + ' Rupees Only'
+                }
+            }
+        ]]></script>
+
         <entity-find-one entity-name="mantle.party.PartyDetail" value-field="supplier">
             <field-map field-name="partyId" from="invoice?.fromPartyId"/>
         </entity-find-one>
