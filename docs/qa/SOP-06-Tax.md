@@ -309,6 +309,10 @@ Products carry `hsnCode` (8-char) / `sacCode`; `IndiaHsnCode` maps a code → `d
 | TX-083 | FUNC | Download JSON | Download the GSTR-1 JSON | Valid GSTN-schema JSON (gstin, fp, b2b[], b2cs[], hsn[]) | S2 |
 | TX-084 | EDGE | Cancelled invoices excluded | Include a cancelled invoice in the period | Excluded from the return | S2 |
 | TX-085 | EDGE | Empty period | A period with no sales | Clean empty return; no crash | S3 |
+| TX-086 | ERR | **Generate with no active org** | As a super-admin (or any user with no active company), click Generate GSTR-1 | Friendly message `Select a company before generating GSTR-1…`; **no raw 500 / stack trace**; no filing created (ZE-TAX-009) | S2 |
+| TX-087 | ERR | Generate with blank period | Clear the Return Period → Generate | Friendly `Enter a Return Period in MMYYYY format…`; no 500 | S3 |
+
+> **Note (ZE-TAX-009):** `generateGstr1` now validates prerequisites (active org + return period) with readable messages and wraps `extract#Gstr1Data` in try/catch, so a missing org (or any service failure) shows a message instead of a raw `Internal Server Error 500`. The generation logic itself is unchanged.
 
 ---
 
