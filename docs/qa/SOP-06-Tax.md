@@ -187,6 +187,7 @@ Open from the app menu → **Tax**. Screen URLs (`/apps/zenith/tax/…` — lowe
 | TX-031 | CFG | Register a customer's GSTIN | Add a GSTIN for `CUST_SAME` (state 29) and `CUST_OTHER` (state 27) | Each party's `regionGeoId` = its GSTIN state; `isDefault` set | S1 |
 | TX-032 | GST | GSTIN → state extraction | Confirm the state code the system derives | `regionGeoId` matches GSTIN first two digits for every party | S1 |
 | TX-033 | GST | **GSTIN format validation** | Enter an invalid GSTIN (too short; bad state code `99`; wrong pattern; bad checksum) | `validate#Gstin` rejects with a clear reason; a valid 15-char GSTIN passes and returns state + PAN | S2 |
+| TX-033a | VAL | **GSTIN format on the Registrations screen** | New/Edit Registration → Type=GSTIN (India) → number `cfsadfsdgsd` → Save | **Rejected** (`That GSTIN doesn't look valid. A GSTIN is 15 characters…`); a valid 15-char GSTIN saves (normalised to upper-case); a lowercase valid GSTIN is upper-cased; non-GSTIN types (PAN/…) are not pattern-checked (ZE-TAX-007) | S2 |
 | TX-034 | EDGE | Duplicate GSTIN | Register the **same** GSTIN twice | Blocked (unique index) — record actual | S2 |
 | TX-035 | FUNC | Default vs multiple regs | Give a party two registrations, one `isDefault=Y` | `get#PartyTaxRegistration` returns the default (`-isDefault,-isPrimary` order) | S3 |
 | TX-036 | EDGE | Party with no registration | A customer with **no** GSTIN/registration | `get#PartyTaxRegistration` returns nothing → downstream must handle (see TX-047) — record what the engine does | S2 |
@@ -196,7 +197,7 @@ Open from the app menu → **Tax**. Screen URLs (`/apps/zenith/tax/…` — lowe
 | TX-040 | FUNC | Delete a registration | Click **Delete** → confirm | Row removed from list & DB | S2 |
 | TX-041 | ISO | Cross-tenant edit/delete blocked | Tenant B edits/deletes Tenant A's registration by direct id | **Denied** (`You do not have access to this tax registration.`); GSTIN preserved | S1 |
 
-> **Note (ZE-TAX-006):** the Registrations list gained an Edit screen + Delete. **Edit** (`store#TaxRegistration`) and **Delete** (`delete#TaxRegistration`) both verify org ownership before mutating (ADMIN exempt) — critical because a registration's `regionGeoId` drives GST intra/inter-state, so cross-tenant tampering must be impossible. `create#TaxRegistration` (onboarding/contact setup) and `get#PartyTaxRegistration` (the calc read) are unchanged.
+> **Note (ZE-TAX-006):** the Registrations list gained an Edit screen + Delete. **Edit** (`store#TaxRegistration`) and **Delete** (`delete#TaxRegistration`) both verify org ownership before mutating (ADMIN exempt) — critical because a registration's `regionGeoId` drives GST intra/inter-state, so cross-tenant tampering must be impossible. `get#PartyTaxRegistration` (the calc read) is unchanged. **ZE-TAX-007:** `create#TaxRegistration` + `store#TaxRegistration` now reject a malformed GSTIN when Type=GSTIN (India) and upper-case it (same regex as the Contacts path); onboarding callers use `ignore-error`, so an invalid GSTIN is simply skipped there rather than breaking signup.
 
 ---
 
