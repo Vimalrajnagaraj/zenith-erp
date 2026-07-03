@@ -236,6 +236,7 @@ POS calls the India GST engine (`calculate#Tax`) at add/reprice/mode-change/tax-
 | ID | Type | Title | Steps | Expected result | Sev |
 |---|---|---|---|---|---|
 | PS-090 | FUNC | Bill becomes an invoice | Complete a sale → check Sales | A finalized Sales invoice is created (async), **idempotent** (one per bill via `linkedInvoiceId`), using the POS bill number as the tax-invoice number | S2 |
+| PS-090a | TAX | **Printed invoice matches the receipt (GST)** | GST sale → print the Tax Invoice (InvoicePrint) and compare to the receipt | Per-item **CGST/SGST/IGST + rates** shown; **Taxes = POS tax**, **Total = POS payable** (incl. round-off); amount-in-words matches the grand total; "reverse charge" renders Yes/No with **no inline template error**. A tax-OFF bill prints Taxes 0.00 / no GST columns even if stale TaxLineDetail rows exist (ZE-POS-009) | S2 |
 | PS-091 | GST | Invoice GST matches | Compare the invoice's GST to the bill | Same CGST/SGST/IGST breakdown carried to the invoice items; **Tax Invoice if tax>0 else Bill of Supply** | S1 |
 | PS-092 | FUNC | Stock depletes | Sell an inventory-tracked product | Stock reduces on completion (only for `inventoryTracked='Y'` products) | S2 |
 
