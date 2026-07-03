@@ -163,8 +163,12 @@ Open from the app menu → **Tax**. Screen URLs (`/apps/zenith/tax/…` — lowe
 | TX-022 | VAL | Mandatory fields on create | New Tax Exemption → leave Tax Authority / Exemption Type / both Party & Product blank → Create | **Blocked** with `Please fill the required field(s): …`; no record saved (ZE-TAX-002) | S2 |
 | TX-023 | VAL | Mandatory fields on update | Open an exemption → clear Tax Authority / Type / Party+Product → Update | **Blocked** with the field list; **existing values unchanged** (not nulled) | S2 |
 | TX-024 | EDGE | Effective date order | Set Effective Thru **before** Effective From → Save | Blocked: `Effective Thru cannot be before Effective From.` | S3 |
+| TX-025 | UI | Edit & Delete actions present | Open the Tax Exemptions list | Each row shows an **Edit** link and a **Delete** action (ZE-TAX-004) | S2 |
+| TX-026 | FUNC | Delete a record | Click **Delete** on a row → confirm | Row removed from list & DB; stays on the list | S2 |
+| TX-027 | ISO | Cross-tenant delete blocked | Tenant B attempts to delete Tenant A's exemption (direct id) | **Denied** (`You do not have access to this tax exemption.`); row preserved | S1 |
+| TX-028 | ISO | List is org-scoped | Log in as two tenants; compare the Exemptions list | Each tenant sees only its own exemptions; super-admin sees all | S1 |
 
-> **Note (ZE-TAX-002):** at least **one of Party / Product** is required (an exemption may be party-based *or* product-based), plus Tax Authority and Exemption Type. Editing never wipes the record's org tag. Enforced server-side in `zenith.tax.TaxServices.store#TaxExemption` (both create & update route through it).
+> **Note (ZE-TAX-002/004):** at least **one of Party / Product** is required (an exemption may be party-based *or* product-based), plus Tax Authority and Exemption Type. Editing never wipes the record's org tag. Enforced server-side in `zenith.tax.TaxServices.store#TaxExemption` (create & update). **Delete** goes through `zenith.tax.TaxServices.delete#TaxExemption`, which verifies org ownership (ADMIN exempt) so a tenant can only delete its own records; the list find is org-scoped too.
 
 ---
 
