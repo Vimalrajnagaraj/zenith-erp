@@ -1044,6 +1044,9 @@ window._posOffline = (function() {
                     if (bill) openSettleOverlay(bill);
                 });
             });
+        }).catch(function(){
+            // Never leave the page silently stuck on "Loading…" if the fetch/JSON fails (ZE-POS-002).
+            if (root) root.innerHTML = '<div style="text-align:center;padding:40px;color:#c62828">Could not load credit bills — please refresh the page.</div>';
         });
     }
     function openSettleOverlay(bill) {
