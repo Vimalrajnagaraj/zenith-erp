@@ -185,7 +185,13 @@ Open from the app menu → **Tax**. Screen URLs (`/apps/zenith/tax/…` — lowe
 | TX-034 | EDGE | Duplicate GSTIN | Register the **same** GSTIN twice | Blocked (unique index) — record actual | S2 |
 | TX-035 | FUNC | Default vs multiple regs | Give a party two registrations, one `isDefault=Y` | `get#PartyTaxRegistration` returns the default (`-isDefault,-isPrimary` order) | S3 |
 | TX-036 | EDGE | Party with no registration | A customer with **no** GSTIN/registration | `get#PartyTaxRegistration` returns nothing → downstream must handle (see TX-047) — record what the engine does | S2 |
-| TX-037 | ISO | Registrations scoped | As tenant A, list registrations | Only A's parties/GSTINs; **no** tenant B rows | S1 |
+| TX-037 | ISO | Registrations scoped | As tenant A, list registrations | Only A's parties/GSTINs; **no** tenant B rows (list find is org-filtered; super-admin sees all) | S1 |
+| TX-038 | UI | Edit & Delete actions present | Open the Tax Registrations list | Each row shows an **Edit** link (→ EditTaxRegistration) and a **Delete** action (ZE-TAX-006) | S2 |
+| TX-039 | VAL | Edit mandatory fields | Edit a registration → clear Party / Authority / Type / Number → Update | **Blocked** (`Please fill the required field(s): …`); row unchanged; reversed dates also blocked | S2 |
+| TX-040 | FUNC | Delete a registration | Click **Delete** → confirm | Row removed from list & DB | S2 |
+| TX-041 | ISO | Cross-tenant edit/delete blocked | Tenant B edits/deletes Tenant A's registration by direct id | **Denied** (`You do not have access to this tax registration.`); GSTIN preserved | S1 |
+
+> **Note (ZE-TAX-006):** the Registrations list gained an Edit screen + Delete. **Edit** (`store#TaxRegistration`) and **Delete** (`delete#TaxRegistration`) both verify org ownership before mutating (ADMIN exempt) — critical because a registration's `regionGeoId` drives GST intra/inter-state, so cross-tenant tampering must be impossible. `create#TaxRegistration` (onboarding/contact setup) and `get#PartyTaxRegistration` (the calc read) are unchanged.
 
 ---
 
