@@ -2929,7 +2929,16 @@ window.posToggleFullscreen = function() {
             }
         }
 
-        /* --- Category strip: AJAX --- */
+        /* --- Category strip: AJAX. ZE-POS-0204: ALL ITEMS used to grey-out the grid (opacity 0.4 +
+           pointer-events none) until a FULL page re-fetch of every tile returned — a 5-10s freeze on
+           large catalogs. The full grid is the landing state, so cache it once and restore INSTANTLY
+           on ALL ITEMS (grid stays tappable); a background fetch keeps the cache fresh. Specific
+           category tabs keep the fetch path (small responses). --- */
+        var __allGridCache = null;
+        (function() { try {
+            var g = document.querySelector('.pos-product-grid');
+            if (g && !CATID) __allGridCache = g.innerHTML;
+        } catch(e) {} })();
         document.querySelectorAll('.pos-cat-strip a').forEach(function(link) {
             link.addEventListener('click', function(e) {
                 e.preventDefault();
@@ -2939,11 +2948,20 @@ window.posToggleFullscreen = function() {
                 document.querySelectorAll('.pos-cat-strip a').forEach(function(a) { a.style.background = '#455a64'; });
                 this.style.background = '#1565c0';
                 var grid = document.querySelector('.pos-product-grid');
-                if (grid) { grid.style.opacity = '0.4'; grid.style.pointerEvents = 'none'; }
                 var searchInput = document.querySelector('.pos-search-bar input[name="searchTerm"]');
                 if (searchInput) searchInput.value = '';
+                if (newCatId === '' && __allGridCache && grid) {
+                    grid.innerHTML = __allGridCache;   // instant — the till never waits on the network
+                    fetchScreen({catId: '', searchTerm: ''}).then(function(doc) {
+                        var ng = doc.querySelector('.pos-product-grid');
+                        if (ng) { __allGridCache = ng.innerHTML; if (CATID === '') { var g2 = document.querySelector('.pos-product-grid'); if (g2) g2.innerHTML = ng.innerHTML; } }
+                    });
+                    return;
+                }
+                if (grid) { grid.style.opacity = '0.4'; grid.style.pointerEvents = 'none'; }
                 fetchScreen({catId: newCatId, searchTerm: ''}).then(function(doc) {
                     swapGrid(doc);
+                    if (newCatId === '') { var ng = doc.querySelector('.pos-product-grid'); if (ng) __allGridCache = ng.innerHTML; }
                     var grid = document.querySelector('.pos-product-grid');
                     if (grid) grid.style.pointerEvents = '';
                 });
