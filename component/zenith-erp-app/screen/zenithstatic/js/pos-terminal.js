@@ -202,7 +202,7 @@ window._posOffline = (function() {
         document.addEventListener('change', function(e){ if(e.target.classList&&e.target.classList.contains('ofl-qi')){ var i=+e.target.dataset.i; var nq=Number(e.target.value); if(isNaN(nq)||nq<=0)cart.splice(i,1); else cart[i].qty=nq; render(); } });
     }
     setTimeout(boot, 1500);
-    return { boot:boot, active:active, add:add, scan:scan, sync:sync, render:render, cacheCatalog:cacheCatalog, search:search, lookup:lookup, catalogSize:catalogSize };
+    return { boot:boot, active:active, add:add, scan:scan, sync:sync, render:render, cacheCatalog:cacheCatalog, search:search, lookup:lookup, catalogSize:catalogSize, getQueue:getQueue };
 })();
 
 /* === Product Import screen: manual add + search auto-fill + CSV (external JS, so the
@@ -488,8 +488,38 @@ window._posOffline = (function() {
                     });
                 });
             }).catch(function() {
-                // Never leave the panel stuck on "Loading…" — surface a retryable error.
-                if (listEl) listEl.innerHTML = '<div style="text-align:center;padding:40px;color:#c62828">Couldn&#39;t load bill history &mdash; check your connection and try again.</div>';
+                // ZE-POS-017: while offline, show the bills saved on THIS device (pending sync) instead of
+                // a bare connection error. Falls back to the error only when there is nothing queued.
+                var showErr = function() {
+                    if (listEl) listEl.innerHTML = '<div style="text-align:center;padding:40px;color:#c62828">Couldn&#39;t load bill history &mdash; check your connection and try again.</div>';
+                };
+                if (window._posOffline && window._posOffline.getQueue) {
+                    window._posOffline.getQueue().then(function(q) {
+                        if (!q || !q.length) { showErr(); return; }
+                        var s = (search || '').toLowerCase();
+                        var rows = q.filter(function(x) {
+                            if (!s) return true;
+                            if (String(x.total || '').indexOf(s) !== -1) return true;
+                            if ((x.paymentMethod || '').toLowerCase().indexOf(s) !== -1) return true;
+                            return (x.items || []).some(function(it) { return (it.name || '').toLowerCase().indexOf(s) !== -1; });
+                        });
+                        var h = '<div style="background:#c62828;color:#fff;padding:8px 12px;border-radius:8px;font-size:12px;font-weight:700;margin-bottom:8px">&#9888; OFFLINE &mdash; ' + q.length + ' bill' + (q.length > 1 ? 's' : '') + ' saved on this device; they sync and get bill numbers when back online</div>';
+                        if (!rows.length) h += '<div style="text-align:center;padding:30px;color:#999">No offline bills match "' + search + '"</div>';
+                        rows.forEach(function(x) {
+                            var when = ''; try { when = new Date(x.ts).toLocaleString(); } catch (e) { when = x.ts || ''; }
+                            var n = (x.items || []).reduce(function(a, it) { return a + (Number(it.qty) || 0); }, 0);
+                            h += '<div style="padding:12px 14px;border:1px dashed #c62828;border-radius:10px;margin-bottom:8px;background:#fff8f8">'
+                                + '<div style="display:flex;justify-content:space-between;align-items:center">'
+                                + '<span style="background:#c62828;color:#fff;padding:1px 8px;border-radius:4px;font-size:10px;font-weight:700">OFFLINE &mdash; PENDING SYNC</span>'
+                                + '<span style="font-weight:800;font-size:16px;color:#2e7d32">&#8377;' + Number(x.total || 0).toFixed(2) + '</span></div>'
+                                + '<div style="display:flex;justify-content:space-between;margin-top:4px;font-size:12px;color:#777">'
+                                + '<span>' + when + '</span>'
+                                + '<span>' + (x.items || []).length + ' item' + ((x.items || []).length !== 1 ? 's' : '') + ' &middot; qty ' + n + ' &middot; ' + (x.paymentMethod || '') + '</span>'
+                                + '</div></div>';
+                        });
+                        if (listEl) listEl.innerHTML = h;
+                    }).catch(showErr);
+                } else showErr();
             });
         }
         function openBillDetail(bill) {

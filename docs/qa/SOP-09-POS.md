@@ -260,6 +260,7 @@ POS calls the India GST engine (`calculate#Tax`) at add/reprice/mode-change/tax-
 |---|---|---|---|---|---|
 | PS-110 | FUNC | Offline config | OfflineMode → enable + export catalog | Catalog exported (**org-scoped**); PWA installable (manifest/sw) | S3 |
 | PS-111 | EDGE | Offline sale sync | (Dev-assisted) queue an offline sale, sync | Idempotent via `OFFLINE:<id>` payment ref — **no double-post** on retry | S2 |
+| PS-111a | FUNC | **Bill History while offline** | Go offline → make offline sales → open Bill History (F8) | Shows the **bills saved on this device** ("OFFLINE — PENDING SYNC" rows: amount, time, items, method, with the pending-sync banner), NOT a bare connection error; search filters by amount/item/method; error message only when nothing is queued; back online the normal server history returns (ZE-POS-017) | S2 |
 | PS-112 | FUNC | Reports | Reports → Bill-wise / Item-wise / Payment-wise / User-wise / Cancelled | Org-scoped totals reconcile to the session/bills | S3 |
 | PS-113 | FUNC | Bill register / audit | BillNumberRegister; BillAuditReport | Consecutive numbers listed; amendment audit shows who changed what | S2 |
 
