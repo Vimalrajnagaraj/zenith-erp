@@ -207,6 +207,7 @@ POS calls the India GST engine (`calculate#Tax`) at add/reprice/mode-change/tax-
 | PS-071 | FUNC | Amend receipt reprint | After amend | The updated receipt reprints from the same receipt data | S2 |
 | PS-072 | FUNC | Credit / pay-later | Complete a sale as **credit** | Bill created `isCredit='Y'`, paid 0; a per-phone customer party is created deterministically | S2 |
 | PS-073 | PAY | Settle a credit bill | Credit Bills → the page **loads the outstanding dues list** (each row = customer + due), then settle | Page loads dues (NOT stuck on "Loading credit bills…"); settle records the payment via `Terminal/ajaxCart action=settleCredit`; `isCredit` clears when fully paid (ZE-POS-002: the page needs a rendered `moquiSessionToken` or the ajaxCart POST 401s and the list hangs) | S2 |
+| PS-073a | FUNC | **Credit bill status in Transactions** | Transactions History → find a completed credit bill with a balance | Status reads **"Credit — Due &lt;outstanding&gt;"**, NOT "Completed" (the sale is `PtCompleted` but the receivable is open). Fully-settled/normal bills read "Completed"; voided read "Voided" (ZE-POS-004, display-only — underlying `statusId` unchanged) | S2 |
 
 ---
 
