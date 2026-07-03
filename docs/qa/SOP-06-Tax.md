@@ -159,7 +159,12 @@ Open from the app menu → **Tax**. Screen URLs (`/apps/zenith/tax/…` — lowe
 | TX-018 | CFG | Create party exemption | Exempt a party (e.g. Government) → Save | Created, org-scoped | S3 |
 | TX-019 | FUNC | Exemption honoured | Bill a product/party with an **active** exemption | `check#TaxExemption` returns exempt → no GST charged on that line | S2 |
 | TX-020 | EDGE | Expired exemption | Bill after the exemption's `effectiveThru` | Exemption **not** applied (GST charged); verify the date check | S3 |
-| TX-021 | EDGE | Product vs party exemption | One line exempt-product, one taxable | Only the exempt line is zero-taxed | S3 |
+| TX-021 | EDGE | Product vs party exemption | One line exempt-product, one taxable | Only the exempt line is zero-taxed | S2 |
+| TX-022 | VAL | Mandatory fields on create | New Tax Exemption → leave Tax Authority / Exemption Type / both Party & Product blank → Create | **Blocked** with `Please fill the required field(s): …`; no record saved (ZE-TAX-002) | S2 |
+| TX-023 | VAL | Mandatory fields on update | Open an exemption → clear Tax Authority / Type / Party+Product → Update | **Blocked** with the field list; **existing values unchanged** (not nulled) | S2 |
+| TX-024 | EDGE | Effective date order | Set Effective Thru **before** Effective From → Save | Blocked: `Effective Thru cannot be before Effective From.` | S3 |
+
+> **Note (ZE-TAX-002):** at least **one of Party / Product** is required (an exemption may be party-based *or* product-based), plus Tax Authority and Exemption Type. Editing never wipes the record's org tag. Enforced server-side in `zenith.tax.TaxServices.store#TaxExemption` (both create & update route through it).
 
 ---
 
