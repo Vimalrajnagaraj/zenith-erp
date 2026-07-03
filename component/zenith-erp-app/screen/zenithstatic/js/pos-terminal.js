@@ -435,6 +435,11 @@ window._posOffline = (function() {
             if (isTax && Number(sm.tax||0) > 0) h += '<tr><td>Tax</td><td class="r">' + f2(sm.tax) + '</td></tr>';
             h += '</table><div class="sep2"></div>';
             h += '<table><tr><td class="tot">' + (isTax ? 'GRAND TOTAL' : 'TOTAL') + '</td><td class="r tot">' + f2(sm.total) + '</td></tr></table>';
+            if (d.isCredit) {
+                h += '<div class="sep"></div>';
+                h += '<div class="c b" style="border:1px dashed #000;padding:3px 2px;font-size:12px">** CREDIT / PAY LATER (UNPAID) **</div>';
+                h += '<table><tr><td class="b">Amount Due</td><td class="r b">' + f2(d.outstanding) + '</td></tr></table>';
+            }
             h += '<div class="c b" style="font-size:13px;margin-top:6px">Thank You !!</div>';
             h += '<div class="c" style="margin-top:6px;font-size:7px;color:#666">Powered by ZetaERP &middot; visit www.zetaclantech.com</div>';
             h += '</div>';
