@@ -31,7 +31,12 @@
     <transition name="updatePostalAddress">
         <actions>
             <service-call name="zenith.contacts.ContactServices.assert#ContactAccess" in-map="[partyId:partyId]" out-map="_acc"/>
-            <if condition="_acc.allowed"><service-call name="mantle.party.ContactServices.update#PostalAddress"/></if>
+            <!-- ZE-POS-013: was update#PostalAddress, a service that does NOT exist in mantle; explicit
+                 in-map because bare calls do not see the posted web parameters here -->
+            <if condition="_acc.allowed"><service-call name="mantle.party.ContactServices.update#PartyPostalAddress"
+                in-map="[partyId:partyId, contactMechId:contactMechId, contactMechPurposeId:contactMechPurposeId,
+                         address1:address1, address2:address2, city:city, postalCode:postalCode,
+                         stateProvinceGeoId:stateProvinceGeoId, countryGeoId:countryGeoId]"/></if>
         </actions>
         <default-response url="."/>
     </transition>
@@ -52,6 +57,46 @@
                     <service-call name="mantle.party.ContactServices.create#TelecomNumber"/>
                 </if>
             </if>
+        </actions>
+        <default-response url="."/>
+    </transition>
+    <!-- ZE-POS-013: edit + remove existing contact details. ContactMech is immutable in mantle, so
+         email edit = create the new one + expire the old link; phone/address use mantle's update#Party*
+         services (same new+expire pattern); remove = delete#PartyContactMech (expires, history kept —
+         the panel lists are date-filtered so expired rows disappear). All org-guarded. -->
+    <transition name="updateEmailAddress">
+        <actions>
+            <service-call name="zenith.contacts.ContactServices.assert#ContactAccess" in-map="[partyId:partyId]" out-map="_acc"/>
+            <if condition="_acc.allowed">
+                <if condition="!emailAddress || !(emailAddress ==~ /^[^@\s]+@[^@\s]+\.[^@\s]+$/)">
+                    <return error="true" message="Enter a valid email address."/></if>
+                <service-call name="mantle.party.ContactServices.create#EmailAddress"
+                              in-map="[partyId:partyId, emailAddress:emailAddress, contactMechPurposeId:contactMechPurposeId]"/>
+                <service-call name="mantle.party.ContactServices.delete#PartyContactMech"
+                              in-map="[partyId:partyId, contactMechId:oldContactMechId]"/>
+            </if>
+        </actions>
+        <default-response url="."/>
+    </transition>
+    <transition name="updatePhoneNumber">
+        <actions>
+            <service-call name="zenith.contacts.ContactServices.assert#ContactAccess" in-map="[partyId:partyId]" out-map="_acc"/>
+            <if condition="_acc.allowed">
+                <service-call name="zenith.contacts.ContactServices.normalize#PhoneNumber"
+                              in-map="[countryCode:countryCode, contactNumber:contactNumber]" out-map="context"/>
+                <if condition="!ec.message.hasError()">
+                    <service-call name="mantle.party.ContactServices.update#PartyTelecomNumber"
+                                  in-map="[partyId:partyId, contactMechId:contactMechId, contactMechPurposeId:contactMechPurposeId,
+                                           countryCode:countryCode, contactNumber:contactNumber]"/>
+                </if>
+            </if>
+        </actions>
+        <default-response url="."/>
+    </transition>
+    <transition name="deletePartyContactMech">
+        <actions>
+            <service-call name="zenith.contacts.ContactServices.assert#ContactAccess" in-map="[partyId:partyId]" out-map="_acc"/>
+            <if condition="_acc.allowed"><service-call name="mantle.party.ContactServices.delete#PartyContactMech" in-map="[partyId:partyId, contactMechId:contactMechId, contactMechPurposeId:contactMechPurposeId]"/></if>
         </actions>
         <default-response url="."/>
     </transition>
@@ -500,6 +545,22 @@
                     <form-list name="EmailListForm" list="emailList" skip-form="true">
                         <field name="infoString"><default-field title="Email"><display/></default-field></field>
                         <field name="contactMechPurposeId"><default-field title="Purpose"><display/></default-field></field>
+                        <field name="editEmail"><default-field title="">
+                            <container-dialog id="EditEmailDialog" button-text="Edit" button-class="q-btn--flat text-primary">
+                                <form-single name="EditEmailForm" transition="updateEmailAddress">
+                                    <field name="partyId"><default-field><hidden default-value="${partyId}"/></default-field></field>
+                                    <field name="oldContactMechId"><default-field><hidden default-value="${contactMechId}"/></default-field></field>
+                                    <field name="contactMechPurposeId"><default-field><hidden default-value="${contactMechPurposeId ?: 'EmailPrimary'}"/></default-field></field>
+                                    <field name="emailAddress"><default-field title="Email"><text-line size="30" default-value="${infoString}"/></default-field></field>
+                                    <field name="submitButton"><default-field title=""><submit text="Save"/></default-field></field>
+                                </form-single>
+                            </container-dialog>
+                        </default-field></field>
+                        <field name="removeEmail"><default-field title="">
+                            <link url="deletePartyContactMech" text="Remove" icon="delete" class="q-btn--flat text-negative"
+                                  parameter-map="[partyId:partyId, contactMechId:contactMechId, contactMechPurposeId:contactMechPurposeId]"
+                                  confirmation="Remove this email address?"/>
+                        </default-field></field>
                         <field name="findButton"><header-field title="Find"><submit/></header-field></field>
                 </form-list>
                 </box-body></container-box>
@@ -526,6 +587,23 @@
                     <form-list name="PhoneListForm" list="phoneList" skip-form="true">
                         <field name="countryCode"><default-field title="Code"><display text="+${countryCode}"/></default-field></field>
                         <field name="contactNumber"><default-field title="Number"><display/></default-field></field>
+                        <field name="editPhone"><default-field title="">
+                            <container-dialog id="EditPhoneDialog" button-text="Edit" button-class="q-btn--flat text-primary">
+                                <form-single name="EditPhoneForm" transition="updatePhoneNumber">
+                                    <field name="partyId"><default-field><hidden default-value="${partyId}"/></default-field></field>
+                                    <field name="contactMechId"><default-field><hidden default-value="${contactMechId}"/></default-field></field>
+                                    <field name="contactMechPurposeId"><default-field><hidden default-value="${contactMechPurposeId ?: 'PhonePrimary'}"/></default-field></field>
+                                    <field name="countryCode"><default-field title="Country"><text-line size="4" default-value="${countryCode}"/></default-field></field>
+                                    <field name="contactNumber"><default-field title="Number"><text-line size="12" default-value="${contactNumber}"/></default-field></field>
+                                    <field name="submitButton"><default-field title=""><submit text="Save"/></default-field></field>
+                                </form-single>
+                            </container-dialog>
+                        </default-field></field>
+                        <field name="removePhone"><default-field title="">
+                            <link url="deletePartyContactMech" text="Remove" icon="delete" class="q-btn--flat text-negative"
+                                  parameter-map="[partyId:partyId, contactMechId:contactMechId, contactMechPurposeId:contactMechPurposeId]"
+                                  confirmation="Remove this phone number?"/>
+                        </default-field></field>
                         <field name="findButton"><header-field title="Find"><submit/></header-field></field>
                 </form-list>
                 </box-body></container-box>
@@ -565,6 +643,37 @@
                     <form-list name="AddressListForm" list="addressList" skip-form="true">
                         <field name="address1"><default-field title="Address"><display text="${address1}${address2 ? ', ' + address2 : ''}"/></default-field></field>
                         <field name="cityState"><default-field title="City/State"><display text="${city ?: ''}, ${postalCode ?: ''}"/></default-field></field>
+                        <field name="editAddress"><default-field title="">
+                            <container-dialog id="EditAddressDialog" button-text="Edit" button-class="q-btn--flat text-primary">
+                                <form-single name="EditAddressForm" transition="updatePostalAddress">
+                                    <field name="partyId"><default-field><hidden default-value="${partyId}"/></default-field></field>
+                                    <field name="contactMechId"><default-field><hidden default-value="${contactMechId}"/></default-field></field>
+                                    <field name="contactMechPurposeId"><default-field><hidden default-value="${contactMechPurposeId ?: 'PostalPrimary'}"/></default-field></field>
+                                    <field name="address1"><default-field title="Address Line 1"><text-line size="40" default-value="${address1}"/></default-field></field>
+                                    <field name="address2"><default-field title="Address Line 2"><text-line size="40" default-value="${address2 ?: ''}"/></default-field></field>
+                                    <field name="city"><default-field><text-line size="20" default-value="${city ?: ''}"/></default-field></field>
+                                    <field name="postalCode"><default-field title="PIN Code"><text-line size="6" maxlength="6" default-value="${postalCode ?: ''}"/></default-field></field>
+                                    <field name="stateProvinceGeoId"><default-field title="State">
+                                        <drop-down allow-empty="true" no-current-selected-key="${stateProvinceGeoId ?: ''}">
+                                            <entity-options key="${toGeoId}" text="${geoName}">
+                                                <entity-find entity-name="moqui.basic.GeoAssocAndToDetail">
+                                                    <econdition field-name="geoId" from="companyCountry"/>
+                                                    <econdition field-name="geoAssocTypeEnumId" value="GAT_REGIONS"/>
+                                                    <order-by field-name="geoName"/>
+                                                </entity-find>
+                                            </entity-options>
+                                        </drop-down>
+                                    </default-field></field>
+                                    <field name="countryGeoId"><default-field><hidden default-value="${countryGeoId ?: companyCountry}"/></default-field></field>
+                                    <field name="submitButton"><default-field title=""><submit text="Save"/></default-field></field>
+                                </form-single>
+                            </container-dialog>
+                        </default-field></field>
+                        <field name="removeAddress"><default-field title="">
+                            <link url="deletePartyContactMech" text="Remove" icon="delete" class="q-btn--flat text-negative"
+                                  parameter-map="[partyId:partyId, contactMechId:contactMechId, contactMechPurposeId:contactMechPurposeId]"
+                                  confirmation="Remove this address?"/>
+                        </default-field></field>
                         <field name="findButton"><header-field title="Find"><submit/></header-field></field>
                 </form-list>
                 </box-body></container-box>
