@@ -172,7 +172,9 @@ POS calls the India GST engine (`calculate#Tax`) at add/reprice/mode-change/tax-
 | PS-043 | PAY | **Split payment** | SPLIT → e.g. ₹50 Cash + ₹68 UPI on a ₹118 bill | Each >0 amount records its own PosPayment; completes; **sum must be ≥ payable** | S1 |
 | PS-044 | PAY | **Split under total (rejected)** | Split amounts sum **< payable** | **Rejected** — sale does not complete | S1 |
 | PS-045 | PAY | **No double-charge on retry** | Double-click Pay / re-submit after completing | The payment path is **locked/idempotent** — no second charge, no second bill | S1 |
-| PS-046 | PAY | Over-payment change on split | Split summing > payable | Change computed correctly | S2 |
+| PS-046 | PAY | Over-payment change on split | Split summing > payable | Change computed correctly; but **non-cash (Card/UPI/etc.) tenders may NOT exceed payable** — only CASH can over-tender (change is returned from cash). Card/UPI over the bill total is **rejected** (ZE-POS-0208) | S1 |
+| PS-047 | PAY | **Split non-cash over-tender (rejected)** | Split where Card+UPI (non-cash) sum **> payable**, e.g. UPI ₹5,000 + Cash ₹3,000 on a ₹200 bill | **Rejected** at complete#PosTransaction ("Card/UPI/non-cash payments exceed the bill total…") — atomic, no bill number minted; prevents un-returnable "change" corrupting session cash reconciliation (ZE-POS-0208) | S1 |
+| PS-048 | UI | **Split inputs legible in dark mode** | Open SPLIT (F4) on Safari/Mac with OS dark mode; type amounts, unfocus | Cash/Card/UPI amount + reference inputs stay legible (white field / dark text via explicit `color`+`background`+`color-scheme:light`), not dark-on-dark (ZE-POS-0209) | S3 |
 
 ### 7.6 Complete → receipt → new sale
 
