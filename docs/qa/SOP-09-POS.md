@@ -280,6 +280,7 @@ POS calls the India GST engine (`calculate#Tax`) at add/reprice/mode-change/tax-
 |---|---|---|---|---|---|
 | PS-120 | UI | Terminal on a real till screen | 1366×768 / 1080p / a small 10" tablet | Grid + cart + payment fit; no clipping; big tap targets | S3 |
 | PS-121 | UI | **/qapps bounces to /apps** | Open `/qapps/zenith/pos/Terminal` | Redirects to `/apps/...` (the rich terminal is /apps-only) | S2 |
+| PS-121a | NAV | **Dashboard "Manage" shortcut tiles open** | Dashboard → click each Manage tile (Expenses, Cash Entry, Stock, Wastage, Kitchen, Import, Sales Mode, Receipts, Sessions, Terminals, Price Overrides, Credit Bills) | Each opens its screen (NOT a 404). Tiles link to the absolute `/apps/zenith/pos/<Screen>` — a raw `<a href="goX">` transition name resolves to `.../pos/goX` (sibling) → 404 on both surfaces (ZE-POS-003) | S2 |
 | PS-122 | A11Y | Keyboard shortcuts | F1 (Cash) / F2 (Card) / F3 (UPI) / F10 (New Sale) | Fire the right action; visible focus | S3 |
 | PS-123 | SEC | XSS in product/customer name | Product/customer name `<img src=x onerror=alert(1)>` | Escaped in the cart, grid, receipt, and history; never executes | S1 |
 | PS-124 | SEC | Transitions need the session token | (Dev) POST a cart/pay transition without the token | Rejected (offline export/sync are deliberately token-free — verify those are still org-scoped) | S2 |
