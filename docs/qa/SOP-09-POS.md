@@ -183,7 +183,9 @@ POS calls the India GST engine (`calculate#Tax`) at add/reprice/mode-change/tax-
 | PS-052 | FUNC | Receipt never blocks a sale | Force a receipt error (e.g. no template) | The sale stays completed; response flags `receiptUnavailable` — **the completed sale is never lost/undone** | S1 |
 | PS-053 | FUNC | **Auto-advance to new sale** | Wait ~2.2s after the sale | Auto-advances to a fresh empty sale; a **pointer-down cancels** the auto-advance; the summary does **not** loop back | S2 |
 | PS-054 | FUNC | New Sale / F10 | Click New Sale (or F10) | Fresh empty cart; the previous completed bill is not carried forward | S2 |
-| PS-055 | FUNC | Receipt PDF | Download the receipt PDF | XSL-FO PDF renders with the same content | S3 |
+| PS-055 | FUNC | Receipt PDF | Open a bill in **PosTransactions → EditTransaction** (back-office) and click **Download PDF**; also the post-sale summary's Download-PDF button | Downloads the server XSL-FO PDF (`/fop/apps/zenith/pos/ReceiptPdf?transactionId=…`, filename `Receipt-<id>.pdf`), same content as the printed receipt (items/qty/tax split/total/change/bill no.), using **this org's** receipt template (ZE-POS-0210) | S3 |
+
+> **Note (ZE-POS-0210):** the ReceiptPdf XSL-FO screen existed but errored on every render (invalid FreeMarker `as number`; missing `encode="false"`/`no-boundary-comment`; missing `standalone="true"` so the POS chrome wrapped its `fo:root`). Fixed, org-scoped the template to the bill's org, and wired a reliable **Download PDF** in EditTransaction (via `/fop`, like sales InvoicePrint) plus repointed the post-sale Terminal buttons `/apps`→`/fop`. The reliable path is EditTransaction (the post-sale summary auto-advances ~2.2s).
 
 ### 7.7 Hold / Recall / Void
 
