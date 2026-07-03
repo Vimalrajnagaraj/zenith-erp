@@ -121,6 +121,7 @@ The POS is at **`/apps/zenith/pos/<screen>`** (lowercase `pos`; the checkout is 
 | PS-002 | LIFE | One open session per terminal | Open a 2nd session on a terminal that already has one **with sales** | Blocked; an empty prior session is auto-closed instead | S2 |
 | PS-003 | FUNC | Tap a product | Tap a grid tile | Line added to cart instantly (optimistic); total updates; cart is a PtCreated txn | S1 |
 | PS-004 | FUNC | Category tabs | Click a category tab, then "ALL ITEMS" | Grid filters to that category / shows all (org's products) | S3 |
+| PS-004a | PERF | **ALL ITEMS is instant** | From any category tab, click ALL ITEMS and immediately tap a tile | The full grid restores **instantly from cache** (never greyed/disabled, tiles tappable at once); a background refresh keeps it fresh (ZE-POS-0204 — used to freeze 5–10s on large catalogs) | S2 |
 | PS-005 | FUNC | Product search | Type a name/code in the grid search | Grid filters (org-scoped) | S3 |
 | PS-006 | FUNC | Qty + / − | Use +/− on a line | Qty and line total recompute; tax recomputes | S2 |
 | PS-007 | EDGE | **Qty edit never deletes** | Set a line qty to 0 / empty / negative | Line is **not** deleted (reverts / floors); **only the × button removes** | S2 |
