@@ -314,6 +314,10 @@ Products carry `hsnCode` (8-char) / `sacCode`; `IndiaHsnCode` maps a code → `d
 
 > **Note (ZE-TAX-009):** `generateGstr1` now validates prerequisites (active org + return period) with readable messages and wraps `extract#Gstr1Data` in try/catch, so a missing org (or any service failure) shows a message instead of a raw `Internal Server Error 500`. The generation logic itself is unchanged.
 
+| TX-088 | SEC | **No raw backend errors (system-wide)** | Trigger any backend 500 (e.g. an unguarded exception) on /qapps or /vapps | A generic `Something went wrong on our end…` toast — **never** the raw exception message, `errorName`, HTTP 500, or internal path. Real validation/business messages still show normally (ZE-TAX-010) | S2 |
+
+> **Note (ZE-TAX-010, cross-cutting):** raw 500 exception details are no longer shown in the UI. A framework-override (`zenithstatic/js/error-handler.js`, loaded via `qapps.xml`/`vapps.xml`) wraps `moqui.handleAjaxError` to genericize server errors that carry no structured message; the server still logs full detail. /apps (CombinedBase renderer) never had the raw-toast path.
+
 ---
 
 # 15. MULTI-TENANT ISOLATION (high priority)
