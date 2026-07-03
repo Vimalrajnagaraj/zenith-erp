@@ -56,10 +56,22 @@
                                 <#if invoice.documentType??><@encodeText invoice.documentType?upper_case/><#else>TAX INVOICE</#if>
                                 (Original for Recipient)
                             </fo:block>
-                            <#-- QR Code Placeholder Box -->
-                            <fo:block border="1pt solid #ccc" width="30mm" height="30mm" margin-left="15mm" padding="2mm" text-align="center" color="#ccc">
-                                [ QR CODE ]
+                            <#-- ZE-POS-010: the old "[ QR CODE ]" placeholder was a dead decorative box. Render a
+                                 real scannable DataMatrix (2D barcode) of the invoice number via the barcode4j FOP
+                                 extension (barcode4j-fop-ext on the classpath); omit entirely when there is no number. -->
+                            <#assign bcMsg = (invoice.gstInvoiceNumber)!((invoice.customInvoiceNumber)!'')>
+                            <#if bcMsg?has_content>
+                            <fo:block text-align="center" margin-top="1mm">
+                                <fo:instream-foreign-object>
+                                    <barcode:barcode xmlns:barcode="http://barcode4j.krysalis.org/ns" message="${bcMsg}">
+                                        <barcode:datamatrix>
+                                            <barcode:module-width>0.7mm</barcode:module-width>
+                                        </barcode:datamatrix>
+                                    </barcode:barcode>
+                                </fo:instream-foreign-object>
                             </fo:block>
+                            <fo:block font-size="6pt" color="#666" text-align="center">Scan: ${bcMsg}</fo:block>
+                            </#if>
                         </fo:table-cell>
                         
                         <#-- Supplier Details -->
