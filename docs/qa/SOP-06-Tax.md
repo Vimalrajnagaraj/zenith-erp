@@ -160,6 +160,7 @@ Open from the app menu → **Tax**. Screen URLs (`/apps/zenith/tax/…` — lowe
 | ID | Type | Title | Steps | Expected result | Sev |
 |---|---|---|---|---|---|
 | TX-018a | VAL | **Tax Engine config validation** | Add Tax Engine → leave a field blank / bad endpoint / mismatched provider → Save | Rejected: missing fields listed; endpoint must be `https://…`; Avalara→must be an avatax/avalara URL, TaxJar→a taxjar URL. A valid config saves (ZE-TAX-011) | S2 |
+| TX-018b | VAL | **No duplicate provider config** | Add a second config for a provider that already has one | **Blocked**: `A configuration for … already exists. Delete the existing one…`. A different provider is allowed; the per-row **Delete** removes a config so it can be replaced (ZE-TAX-012) | S2 |
 
 > **Note (ZE-TAX-011):** `saveConfig` now runs `save#TaxEngineConfig` (required fields + https URL + provider/endpoint plausibility). **Limitation:** the API *secret* is NOT authenticated against the provider — `calculate#GlobalTax` is still a MOCK (no real Avalara/TaxJar client), so a live "Test Connection" is a go-live dependency (like the NIC/GSTN mocks). The secret is masked (`<password>`) and never shown in the list.
 
