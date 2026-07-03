@@ -324,6 +324,53 @@
         </actions>
     </service>
 
+    <!-- ZE-POS-012: guarded hard-delete for a mistakenly-created contact. BLOCKED when the party is
+         referenced by business documents (invoices / orders / POS bills) — history must stay intact;
+         use the Disabled flag for those. Org-guarded like every other mutation (assert#ContactAccess).
+         Any unexpected FK reference is caught and turned into the same "disable instead" message. -->
+    <service verb="delete" noun="Contact">
+        <in-parameters><parameter name="partyId" required="true"/></in-parameters>
+        <actions>
+            <service-call name="zenith.contacts.ContactServices.assert#ContactAccess" in-map="[partyId:partyId]" out-map="_acc"/>
+            <if condition="!_acc.allowed"><return error="true" message="Contact not found for your account"/></if>
+            <script><![CDATA[
+                def refs = []
+                if (ec.entity.find("mantle.account.invoice.Invoice").condition("toPartyId", partyId).count() +
+                    ec.entity.find("mantle.account.invoice.Invoice").condition("fromPartyId", partyId).count() > 0) refs.add("invoices")
+                if (ec.entity.find("mantle.order.OrderPart").condition("customerPartyId", partyId).count() +
+                    ec.entity.find("mantle.order.OrderPart").condition("vendorPartyId", partyId).count() > 0) refs.add("orders")
+                if (ec.entity.find("zenith.erp.pos.PosTransaction").condition("customerPartyId", partyId).count() > 0) refs.add("POS bills")
+                if (refs) {
+                    ec.message.addError("Cannot delete: this contact is on " + refs.join(", ") + ". Set the contact to Disabled instead (Edit -> Disabled -> Y).")
+                    return
+                }
+                try {
+                    def pcms = ec.entity.find("mantle.party.contact.PartyContactMech").condition("partyId", partyId).list()
+                    def cmIds = pcms*.contactMechId.unique()
+                    ec.entity.find("mantle.party.contact.PartyContactMech").condition("partyId", partyId).deleteAll()
+                    for (cmId in cmIds) {
+                        ec.entity.find("mantle.party.contact.TelecomNumber").condition("contactMechId", cmId).deleteAll()
+                        ec.entity.find("mantle.party.contact.PostalAddress").condition("contactMechId", cmId).deleteAll()
+                        ec.entity.find("mantle.party.contact.ContactMech").condition("contactMechId", cmId).deleteAll()
+                    }
+                    ec.entity.find("zenith.erp.contacts.PartyTag").condition("partyId", partyId).deleteAll()
+                    ec.entity.find("zenith.erp.contacts.CustomerGroupMember").condition("partyId", partyId).deleteAll()
+                    ec.entity.find("zenith.erp.tax.TaxRegistration").condition("partyId", partyId).deleteAll()
+                    ec.entity.find("zenith.erp.india.IndiaGstin").condition("partyId", partyId).deleteAll()
+                    ec.entity.find("mantle.party.PartyIdentification").condition("partyId", partyId).deleteAll()
+                    ec.entity.find("mantle.party.PartyRole").condition("partyId", partyId).deleteAll()
+                    ec.entity.find("mantle.party.Person").condition("partyId", partyId).deleteAll()
+                    ec.entity.find("mantle.party.Organization").condition("partyId", partyId).deleteAll()
+                    ec.entity.find("mantle.party.Party").condition("partyId", partyId).deleteAll()
+                    ec.message.addMessage("Contact deleted.")
+                } catch (Exception e) {
+                    ec.logger.warn("delete#Contact blocked for " + partyId + ": " + e.message)
+                    ec.message.addError("Cannot delete this contact — it is referenced by other records. Set it to Disabled instead (Edit -> Disabled -> Y).")
+                }
+            ]]></script>
+        </actions>
+    </service>
+
     <service verb="add" noun="ContactTag">
         <in-parameters>
             <parameter name="partyId" required="true"/>
