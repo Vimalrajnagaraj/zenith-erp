@@ -137,6 +137,8 @@ Open from the app menu → **Tax**. Screen URLs (`/apps/zenith/tax/…` — lowe
 | TX-010 | CFG | List authorities | Open FindTaxAuthority | Lists authorities (e.g. Central GST, State GST); org-scoped where applicable | S3 |
 | TX-011 | CFG | Create/edit authority | Create a State authority for a region → Save → edit | Persists; type + region correct | S3 |
 | TX-012 | EDGE | Authority without region | Create a "State" authority with no region | Record actual — verify it's allowed/blocked sensibly | S3 |
+| TX-011a | SEC | **Authorities are platform-admin-only** | As a normal tenant, open FindTaxAuthority | **Read-only**: no "New", no Edit link, no Delete. Direct POST to create/update/delete → `Only a platform administrator...`; nothing changes | S1 |
+| TX-011b | FUNC | Super-admin delete authority | As super-admin, delete an **unreferenced** authority vs a **referenced/parent** one | Unreferenced deletes; referenced → `Cannot delete: ... used by N record(s). Deactivate it instead.` | S2 |
 
 ### 8.2 Tax Rates & GST Slabs
 
@@ -149,6 +151,9 @@ Open from the app menu → **Tax**. Screen URLs (`/apps/zenith/tax/…` — lowe
 | TX-015 | GST | Exempt & special | Inspect `GST_EXEMPT`, precious-metal (0.1/0.25/1/3), composition (COMP_1/5/6) | Rates as labelled; exempt = 0 | S3 |
 | TX-016 | CFG | Create/edit a rate | Create a TaxRate under an authority → effective dates → Save | Persists; effective-from/thru honoured | S3 |
 | TX-017 | EDGE | Overlapping effective dates | Two active rates for the same authority/category with overlapping dates | Record actual — which one wins; flag if ambiguous | S3 |
+| TX-016a | SEC | **Rates are platform-admin-only** | As a normal tenant, open FindTaxRate | Read-only (no New/Edit/Delete); the statutory GST slabs below stay visible. Direct POST → `Only a platform administrator...` | S1 |
+
+> **Note (ZE-TAX sweep):** Tax **Authorities & Rates are GLOBAL master data (no org)** — unlike Exemptions/Registrations they are NOT org-scoped, so every tenant sees the same list (correct). Create/edit/delete are restricted to super-admins via `store#`/`delete#TaxAuthority` and `store#`/`delete#TaxRate`; delete is refused while referenced. **Known pre-existing issue:** the zenith `tax_rate` FK points at mantle `tax_authority` (not `ZENITH_TAX_AUTHORITY`), so creating a zenith TaxRate against a zenith authority FK-fails — table is empty/unused (India uses `IndiaGstSlab`).
 
 ### 8.3 Tax Exemptions
 
