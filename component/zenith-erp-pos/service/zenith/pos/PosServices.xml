@@ -1733,6 +1733,42 @@
         </actions>
     </service>
 
+    <!-- ZE-POS-007 follow-up: nightly SAFETY NET that voids PtCreated carts stranded on long-closed
+         sessions. The session-boundary cleanup (close / open start-fresh / open same-terminal auto-close /
+         freshSale) should prevent these entirely; this cron catches anything that slips through (e.g. a
+         future code path that closes a session without the discard). HARD RAILS: never touches a cart on
+         an open session (mid-sale), never touches a numbered bill, and SKIPS (warns about) any PtCreated
+         cart that somehow has payments — that is money and needs a human. Runs with no user (cron) so it
+         logs in anonymous first (see scheduled-job-auth pattern). Voids (not deletes) per the established
+         orphan-cleanup precedent: PosTransaction has many FK children. -->
+    <service verb="void" noun="OrphanedPosCarts" authenticate="anonymous-all">
+        <in-parameters><parameter name="olderThanHours" type="Integer" default="24"/></in-parameters>
+        <out-parameters><parameter name="voidedCount" type="Integer"/></out-parameters>
+        <actions>
+            <script><![CDATA[
+                ec.user.loginAnonymousIfNoUser()
+                def cutoff = new java.sql.Timestamp(ec.user.nowTimestamp.time - (olderThanHours ?: 24) * 3600000L)
+                voidedCount = 0
+                ec.entity.find("zenith.erp.pos.PosTransaction").condition("statusId", "PtCreated").list().each { st ->
+                    if (st.transactionNumber) return                 // numbered = issued; never touch (belt+suspenders — PtCreated should never have one)
+                    if (!st.sessionId) return                        // unknown provenance — leave alone
+                    def sess = ec.entity.find("zenith.erp.pos.PosSession").condition("sessionId", st.sessionId).one()
+                    if (!sess || sess.statusId != 'PsClosed') return // open/live session — a cashier may be mid-sale; NEVER touch
+                    if (sess.closeDate == null || sess.closeDate.after(cutoff)) return  // grace period after close
+                    def payCount = ec.entity.find("zenith.erp.pos.PosPayment").condition("transactionId", st.transactionId).count()
+                    if (payCount > 0 || ((st.paidAmount ?: 0) as BigDecimal) > 0) {
+                        ec.logger.warn("void#OrphanedPosCarts: SKIPPING PtCreated cart " + st.transactionId + " on closed session " + st.sessionId + " — it has recorded payments; needs manual review")
+                        return
+                    }
+                    st.statusId = 'PtVoided'
+                    st.update()
+                    voidedCount++
+                }
+                if (voidedCount) ec.logger.info("void#OrphanedPosCarts: voided " + voidedCount + " orphaned PtCreated cart(s) on sessions closed > " + (olderThanHours ?: 24) + "h")
+            ]]></script>
+        </actions>
+    </service>
+
     <!-- ZE-POS-0210 follow-up: enforce one default receipt template per org. Called after a template
          create/update; if the saved template is the org's default, un-defaults the org's other
          templates so an org can never end up with two defaults (which would make the org-scoped
