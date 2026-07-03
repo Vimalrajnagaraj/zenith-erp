@@ -219,7 +219,7 @@ POS calls the India GST engine (`calculate#Tax`) at add/reprice/mode-change/tax-
 | ID | Type | Title | Steps | Expected result | Sev |
 |---|---|---|---|---|---|
 | PS-080 | LIFE | Close session | Close with closing cash | `expected = opening + cash received − change given`; **cash difference** computed; leftover PtCreated cart discarded; idempotent (re-close is a no-op) | S2 |
-| PS-081 | LIFE | Stale-cart cleanup | Open a cart, don't pay, re-open the session / start fresh | Abandoned PtCreated carts are retired (open/close/freshSale cleanup) — no old items reappear | S2 |
+| PS-081 | LIFE | Stale-cart cleanup | Open a cart, don't pay, re-open the session / start fresh | Abandoned PtCreated carts are retired at **session boundaries** — close#PosSession, open#PosSession (BOTH paths: start-fresh AND same-terminal empty-session auto-close, ZE-POS-007), and freshSale=Y — no old items reappear, no orphaned PtCreated rows on closed sessions. **There is deliberately NO time-based cart expiry**: within an open session the cart survives idle + refresh (a cashier mid-sale must not lose the cart); "cart still there after 5 min idle + refresh in the same session" is correct behaviour, not a defect | S2 |
 | PS-082 | LIFE | Cash entry / movement | Record a cash in/out | Reflected in the session cash reconciliation | S3 |
 
 ### 8.2 Bill numbering (race-safe, org-scoped)
