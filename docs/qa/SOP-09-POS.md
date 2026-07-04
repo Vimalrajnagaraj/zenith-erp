@@ -216,14 +216,15 @@ POS calls the India GST engine (`calculate#Tax`) at add/reprice/mode-change/tax-
 
 ### 7.9 Role-based navigation — POS-only cashier (ZENITH_CASHIER)
 
-A user whose **only** Zenith role is **ZENITH_CASHIER** (not the super-admin) is **POS-only by design**: the ZenithApp gate bounces the app root, the Dashboard, and every non-POS module straight to the billing terminal (till snappiness — the /apps optimistic cart). The terminal must not *show* affordances that dead-loop for that role. Test with a sole-ZENITH_CASHIER login **on the throwaway tenant** (never a live cashier).
+A user whose **only** Zenith role is **ZENITH_CASHIER** (not the super-admin) is **till-first**: on login the ZenithApp gate lands them straight on the billing terminal (snappy — the /apps optimistic cart), but they **may step out to the Dashboard and Inventory** (create/manage products) and back. Every **other** module still bounces to the terminal. Test with a sole-ZENITH_CASHIER login **on the throwaway tenant** (never a live cashier).
 
 | ID | Type | Title | Steps | Expected result | Sev |
 |---|---|---|---|---|---|
-| PS-090 | FUNC | **Cashier lands in POS** | Log in as a sole-ZENITH_CASHIER user | Lands on `/apps/zenith/pos/Terminal` (app root / Dashboard / any non-POS module all bounce here) — deliberate, not an accidental redirect (ZE-POS-0201 S1/S2) | S2 |
-| PS-091 | FUNC | **No dead back-office buttons** | On the cashier's terminal header, look for ITEM / CATALOGUE / ← APP | **ITEM and CATALOGUE are hidden** (they point at Inventory, which the gate bounces back → used to dead-loop to POS — ZE-POS-0201 Symptom 3). The brand **logo is not a link**. HISTORY / CREDIT BILLS / CUSTOMER (POS-module) stay | S2 |
-| PS-092 | FUNC | **Cashier has a clean exit** | Click the header **LOGOUT** (replaces ← APP for cashiers); also the no-session screen's control | Logs the cashier out (`/Login/logout` → login), instead of the old "← APP / Back to App" that looped back to POS | S2 |
-| PS-093 | FUNC | **Non-cashier is unaffected** | Open the terminal as an **admin/manager** (broader role) | ITEM, CATALOGUE and **← APP** (→ app dashboard) all still show; the logo is still a link. The POS-only trim applies to cashiers only | S2 |
+| PS-090 | FUNC | **Cashier lands in POS** | Log in as a sole-ZENITH_CASHIER user | Lands on `/apps/zenith/pos/Terminal` (the bare app root bounces here) — deliberate till-first landing, not an accidental redirect (ZE-POS-0201 S1) | S2 |
+| PS-091 | FUNC | **Cashier can create items** | On the cashier's terminal header, click **+ ITEM** and **CATALOGUE** | Both **open** the Inventory product / catalogue screens (a new tab) and render — no 403, no bounce back to POS (ZE-POS-0201 Symptom 3; needs both the loosened gate AND the `ZENITH_CASHIER → Z_INVENTORY` authz grant) | S2 |
+| PS-092 | FUNC | **Cashier reaches the Dashboard** | Click the header **⌂ DASHBOARD** (or the brand logo); also the no-session "← Back to App" | Opens `/apps/zenith/Dashboard` (renders, not bounced). The cashier's Dashboard shows **only the POS + Inventory tiles** (every other module is hidden — clicking one would bounce). A **⏻ LOGOUT** button gives a clean end-of-shift exit (`/Login/logout`) | S2 |
+| PS-093 | GATE | **Other modules still bounce** | As the cashier, hit `/apps/zenith/Accounting/...` (or Sales/HR) by URL | Redirected back to `/apps/zenith/pos/Terminal` — only POS + Inventory + Dashboard are reachable | S2 |
+| PS-094 | FUNC | **Non-cashier is unaffected** | Open the terminal as an **admin/manager** (broader role) | ITEM, CATALOGUE and **← APP** (→ app dashboard) all show; no cashier-only ⌂ DASHBOARD / ⏻ LOGOUT buttons; the logo links to `/qapps/zenith`. The till-first trim applies to cashiers only | S2 |
 
 ---
 
