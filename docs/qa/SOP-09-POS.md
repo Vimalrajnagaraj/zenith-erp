@@ -214,6 +214,17 @@ POS calls the India GST engine (`calculate#Tax`) at add/reprice/mode-change/tax-
 | PS-073 | PAY | Settle a credit bill | Credit Bills → the page **loads the outstanding dues list** (each row = customer + due), then settle | Page loads dues (NOT stuck on "Loading credit bills…"); settle records the payment via `Terminal/ajaxCart action=settleCredit`; `isCredit` clears when fully paid (ZE-POS-002: the page needs a rendered `moquiSessionToken` or the ajaxCart POST 401s and the list hangs) | S2 |
 | PS-073a | FUNC | **Credit bill status in Transactions** | Transactions History → find a completed credit bill with a balance | Status reads **"Credit — Due &lt;outstanding&gt;"**, NOT "Completed" (the sale is `PtCompleted` but the receivable is open). Fully-settled/normal bills read "Completed"; voided read "Voided" (ZE-POS-004, display-only — underlying `statusId` unchanged) | S2 |
 
+### 7.9 Role-based navigation — POS-only cashier (ZENITH_CASHIER)
+
+A user whose **only** Zenith role is **ZENITH_CASHIER** (not the super-admin) is **POS-only by design**: the ZenithApp gate bounces the app root, the Dashboard, and every non-POS module straight to the billing terminal (till snappiness — the /apps optimistic cart). The terminal must not *show* affordances that dead-loop for that role. Test with a sole-ZENITH_CASHIER login **on the throwaway tenant** (never a live cashier).
+
+| ID | Type | Title | Steps | Expected result | Sev |
+|---|---|---|---|---|---|
+| PS-090 | FUNC | **Cashier lands in POS** | Log in as a sole-ZENITH_CASHIER user | Lands on `/apps/zenith/pos/Terminal` (app root / Dashboard / any non-POS module all bounce here) — deliberate, not an accidental redirect (ZE-POS-0201 S1/S2) | S2 |
+| PS-091 | FUNC | **No dead back-office buttons** | On the cashier's terminal header, look for ITEM / CATALOGUE / ← APP | **ITEM and CATALOGUE are hidden** (they point at Inventory, which the gate bounces back → used to dead-loop to POS — ZE-POS-0201 Symptom 3). The brand **logo is not a link**. HISTORY / CREDIT BILLS / CUSTOMER (POS-module) stay | S2 |
+| PS-092 | FUNC | **Cashier has a clean exit** | Click the header **LOGOUT** (replaces ← APP for cashiers); also the no-session screen's control | Logs the cashier out (`/Login/logout` → login), instead of the old "← APP / Back to App" that looped back to POS | S2 |
+| PS-093 | FUNC | **Non-cashier is unaffected** | Open the terminal as an **admin/manager** (broader role) | ITEM, CATALOGUE and **← APP** (→ app dashboard) all still show; the logo is still a link. The POS-only trim applies to cashiers only | S2 |
+
 ---
 
 # 8. SESSIONS, BILL NUMBERING & INVOICE SYNC
