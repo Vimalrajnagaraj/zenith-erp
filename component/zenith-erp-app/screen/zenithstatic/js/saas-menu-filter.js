@@ -30,8 +30,9 @@
                 if (!item.subscreens || !item.subscreens.length) continue;
                 var filtered = item.subscreens.filter(function(ss) {
                     var name = ss.name ? ss.name.toLowerCase() : "";
-                    // POS-only cashier: show only the POS module, hide everything else.
-                    if (posOnly) return name === "pos";
+                    // POS-only cashier: till-first, but may step into POS + Inventory (create/manage
+                    // items) — plus Dashboard (alwaysAllowed below). Everything else stays hidden.
+                    if (posOnly) return name === "pos" || name === "inventory";
                     // Settings is admin-only (ZENITH_ADMIN/ADMIN) regardless of plan — hide it from
                     // everyone else so they don't navigate into an "Access Restricted" wall.
                     if (name === "settings") return isAdmin;
