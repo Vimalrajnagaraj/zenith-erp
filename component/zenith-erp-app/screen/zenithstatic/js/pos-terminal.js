@@ -2767,9 +2767,9 @@ window.posToggleFullscreen = function() {
             };
         })();
 
-        window._posAjax = function(pid, price) {
+        window._posAjax = function(pid, price, name) {
             if (!navigator.onLine && window._posOffline) { window._posOffline.add(pid, price); return; }
-            OPT.add(pid, price);
+            OPT.add(pid, price, name);
         };
         window._posScan = function(code) {
             if (!navigator.onLine && window._posOffline) { window._posOffline.scan(code); return; }
@@ -3462,8 +3462,11 @@ window.posToggleFullscreen = function() {
         var si = document.getElementById('cartInlineSearch');
         var dd = document.getElementById('cartSearchDropdown');
         if (!si || !dd) { setTimeout(initCartSearch, 300); return; }
-        var dt, aidx = -1;
+        var dt, aidx = -1, keyTimes = [];
         function esc(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+        // A physical barcode scanner emits keys far faster (<50ms apart) than a human types.
+        function isScan() { if (keyTimes.length < 3) return false; var avg = (keyTimes[keyTimes.length - 1] - keyTimes[0]) / (keyTimes.length - 1); return avg < 50; }
+        si.addEventListener('keypress', function() { keyTimes.push(Date.now()); if (keyTimes.length > 30) keyTimes.shift(); });
         si.addEventListener('input', function() {
             var t = this.value.trim(); clearTimeout(dt); aidx = -1;
             if (!si.dataset.syncing) {
@@ -3492,7 +3495,7 @@ window.posToggleFullscreen = function() {
                     var h = '';
                     for (var i = 0; i < data.length; i++) {
                         var p = data[i];
-                        h += '<div class="cart-dd-item" data-pid="' + esc(p.productId) + '" data-price="' + p.mrpAmount + '" style="padding:8px 12px;cursor:pointer;border-bottom:1px solid #eee;font-size:14px;background:#fff">';
+                        h += '<div class="cart-dd-item" data-pid="' + esc(p.productId) + '" data-price="' + p.mrpAmount + '" data-name="' + esc(p.productName || '').replace(/"/g, '&quot;') + '" style="padding:8px 12px;cursor:pointer;border-bottom:1px solid #eee;font-size:14px;background:#fff">';
                         h += '<span class="dd-price" style="float:right;color:#e53935;font-weight:bold;font-size:14px">' + esc('' + p.mrpAmount) + '</span>';
                         h += '<span class="dd-name" style="font-weight:600;color:#000;font-size:14px">' + esc(p.productName || '') + '</span>';
                         h += '<div class="dd-code" style="font-size:12px;color:#555;margin-top:2px">' + esc(p.pseudoId || '') + '</div></div>';
@@ -3507,17 +3510,20 @@ window.posToggleFullscreen = function() {
             else if (e.key === 'ArrowUp') { e.preventDefault(); aidx = Math.max(aidx - 1, 0); }
             else if (e.key === 'Enter') {
                 e.preventDefault(); var v = si.value.trim(); if (!v) return;
-                if (items.length > 0) {
+                // Fast entry (a scanner) or no dropdown match => let the server resolve the code by
+                // pseudoId/barcode via _posScan. A human picking a result adds by productId AND passes
+                // the product NAME so the optimistic line reads the name, not the bare code (ZE-POS-0207).
+                if (isScan() || items.length === 0) {
+                    if (window._posScan) window._posScan(v);
+                } else {
                     var el = (aidx >= 0 && items[aidx]) ? items[aidx] : items[0];
-                    if (window._posAjax) { window._posAjax(el.dataset.pid, el.dataset.price); dd.style.display = 'none'; si.value = ''; si.focus();
-                        var gi = document.querySelector('.pos-search-bar input[name="searchTerm"]');
-                        if (gi) { gi.value = ''; } if (window._gridSearch) window._gridSearch('');
-                        return; }
+                    if (window._posAjax) window._posAjax(el.dataset.pid, el.dataset.price, el.dataset.name);
                 }
-                dd.style.display = 'none'; si.value = '';
-                var gi2 = document.querySelector('.pos-search-bar input[name="searchTerm"]');
-                if (gi2) gi2.value = '';
+                dd.style.display = 'none'; si.value = ''; si.focus();
+                var gi = document.querySelector('.pos-search-bar input[name="searchTerm"]');
+                if (gi) gi.value = '';
                 if (window._gridSearch) window._gridSearch('');
+                keyTimes = [];
             }
             else if (e.key === 'Escape') { dd.style.display = 'none'; }
             for (var i = 0; i < items.length; i++) items[i].style.background = (i === aidx) ? '#e8f5e9' : '#fff';
@@ -3526,7 +3532,7 @@ window.posToggleFullscreen = function() {
             var item = e.target.closest('.cart-dd-item');
             if (!item) return;
             if (window._posAjax) {
-                window._posAjax(item.dataset.pid, item.dataset.price);
+                window._posAjax(item.dataset.pid, item.dataset.price, item.dataset.name);
                 dd.style.display = 'none'; si.value = ''; si.focus();
                 var gi = document.querySelector('.pos-search-bar input[name="searchTerm"]');
                 if (gi) gi.value = '';
