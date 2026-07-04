@@ -13,6 +13,7 @@
     </transition>
 
     <transition name="addItem">
+        <actions>
         <script>
             if (!hsnSacCode) {
                 ec.message.addError("HSN/SAC Code is strictly required under Indian GST Law.")
@@ -22,21 +23,35 @@
             // Get state codes
             def invoice = ec.entity.find("mantle.account.invoice.Invoice").condition("invoiceId", invoiceId).one()
             
-            def vendorAddress = ec.entity.find("mantle.party.contact.PartyContactMechInfo")
+            // Resolve each party's postal-address state via PostalAddress (PartyContactMechInfo has no
+            // stateProvinceGeoId field). Used to pick intra-state CGST/SGST vs inter-state IGST.
+            def vendorPcm = ec.entity.find("mantle.party.contact.PartyContactMechInfo")
                                 .condition("partyId", invoice.fromPartyId)
                                 .condition("contactMechTypeEnumId", "CmtPostalAddress").list().first()
-            def buyerAddress = ec.entity.find("mantle.party.contact.PartyContactMechInfo")
+            def buyerPcm = ec.entity.find("mantle.party.contact.PartyContactMechInfo")
                                 .condition("partyId", invoice.toPartyId)
                                 .condition("contactMechTypeEnumId", "CmtPostalAddress").list().first()
-            
+            def vendorState = vendorPcm ? ec.entity.find("mantle.party.contact.PostalAddress").condition("contactMechId", vendorPcm.contactMechId).one()?.stateProvinceGeoId : null
+            def buyerState = buyerPcm ? ec.entity.find("mantle.party.contact.PostalAddress").condition("contactMechId", buyerPcm.contactMechId).one()?.stateProvinceGeoId : null
+
             def isInterstate = true
-            if (vendorAddress &amp;&amp; buyerAddress &amp;&amp; vendorAddress.stateProvinceGeoId == buyerAddress.stateProvinceGeoId) {
+            if (vendorState &amp;&amp; buyerState &amp;&amp; vendorState == buyerState) {
                 isInterstate = false
             }
 
             def qty = new BigDecimal(quantity ?: 0)
             def price = new BigDecimal(amount ?: 0)
-            def taxableVal = qty.multiply(price)
+            def lineGross = qty.multiply(price)
+            // Per-line trade discount (0-100%), applied BEFORE GST so it reduces the taxable value —
+            // the standard Indian GST treatment for a discount shown on the invoice. Optional: a blank
+            // or 0 discount leaves taxableVal = qty x price exactly as before (no-op for existing bills).
+            def discPct = new BigDecimal(discountPercent ?: 0)
+            if (discPct &lt; 0 || discPct &gt; 100) {
+                ec.message.addError("Discount % must be between 0 and 100.")
+                return
+            }
+            def discAmt = lineGross.multiply(discPct).divide(new BigDecimal(100), 2, java.math.RoundingMode.HALF_UP)
+            def taxableVal = lineGross.subtract(discAmt)
             def taxPct = new BigDecimal(taxPercentage ?: 0)
 
             def igstRate = 0.0
@@ -60,15 +75,14 @@
 
             def inMap = context + [
                 itemTypeEnumId: 'ItemInventory',
+                discountPercent: discPct, discountAmount: discAmt,
                 taxableAmount: taxableVal,
                 igstRate: igstRate, igstAmount: igstAmount,
                 cgstRate: cgstRate, cgstAmount: cgstAmount,
                 sgstRate: sgstRate, sgstAmount: sgstAmount
             ]
             ec.service.sync().name("create#mantle.account.invoice.InvoiceItem").parameters(inMap).call()
-            
-            // Trigger recalculation of totals
-            ec.service.sync().name("mantle.account.InvoiceServices.calculate#InvoiceTotal").parameters([invoiceId:invoiceId]).call()
+            // (Invoice totals are set by the aggregation script below — no mantle calculate#InvoiceTotal here.)
         </script>
         
         <!-- Custom script to aggregate Indian GST values -->
@@ -83,19 +97,20 @@
             }
             ec.service.sync().name("update#mantle.account.invoice.Invoice").parameters([
                 invoiceId: invoiceId,
-                totalCgst: tCgst, totalSgst: tSgst, totalIgst: tIgst, totalTaxableAmount: tTaxable
+                totalCgst: tCgst, totalSgst: tSgst, totalIgst: tIgst, totalTaxableAmount: tTaxable,
+                invoiceTotal: tTaxable
             ]).call()
         </script>
+        </actions>
 
         <default-response url="."/>
     </transition>
 
     <transition name="deleteItem">
-        <service-call name="delete#mantle.account.invoice.InvoiceItem"/>
+        <actions>
+        <service-call name="delete#mantle.account.invoice.InvoiceItem" in-map="context"/>
         <script>
-            ec.service.sync().name("mantle.account.InvoiceServices.calculate#InvoiceTotal").parameters([invoiceId:invoiceId]).call()
-            
-            // Re-aggregate GST values
+            // Re-aggregate GST + totals after the delete.
             def invItems = ec.entity.find("mantle.account.invoice.InvoiceItem").condition("invoiceId", invoiceId).list()
             def tCgst = 0.0, tSgst = 0.0, tIgst = 0.0, tTaxable = 0.0
             for (def it : invItems) {
@@ -106,9 +121,11 @@
             }
             ec.service.sync().name("update#mantle.account.invoice.Invoice").parameters([
                 invoiceId: invoiceId,
-                totalCgst: tCgst, totalSgst: tSgst, totalIgst: tIgst, totalTaxableAmount: tTaxable
+                totalCgst: tCgst, totalSgst: tSgst, totalIgst: tIgst, totalTaxableAmount: tTaxable,
+                invoiceTotal: tTaxable
             ]).call()
         </script>
+        </actions>
         <default-response url="."/>
     </transition>
 
@@ -284,8 +301,12 @@
                             </drop-down>
                         </default-field></field>
                         
+                        <field name="discountPercent"><default-field title="Discount (%)">
+                            <text-line size="8" input-type="number" default-value="0"/>
+                        </default-field></field>
+
                         <field name="submitButton"><default-field title="Add Item"><submit icon="fa fa-plus" type="primary"/></default-field></field>
-                        
+
                         <field-layout>
                             <field-ref name="productId"/>
                             <field-ref name="description"/>
@@ -297,6 +318,7 @@
                                 <field-ref name="amount"/>
                                 <field-ref name="taxPercentage"/>
                             </field-row>
+                            <field-ref name="discountPercent"/>
                             <field-ref name="submitButton"/>
                         </field-layout>
                     </form-single>
@@ -309,7 +331,11 @@
                 <field name="hsnSacCode"><default-field title="HSN/SAC"><label text="${hsnSacCode ?: '-'}" type="span" style="zenith-badge grey"/></default-field></field>
                 <field name="quantity"><default-field><label text="${quantity}" type="span" style="text-dark"/></default-field></field>
                 <field name="amount"><default-field title="Unit Price"><label text="${ec.l10n.format(amount ?: 0, '#,##,##0.00')}" type="span"/></default-field></field>
-                
+
+                <field name="lineDisc"><default-field title="Discount">
+                    <label text="${(discountPercent &amp;&amp; discountPercent &gt; 0) ? (discountPercent + '% (' + currSymbol + ec.l10n.format(discountAmount ?: 0, '#,##0.00') + ')') : '-'}" type="span" style="text-orange-9"/>
+                </default-field></field>
+
                 <!-- GST Breakdown -->
                 <field name="gstBreakdown"><default-field title="Tax Paid">
                     <label text="${igstRate ? ('IGST: ' + igstRate + '% (₹' + igstAmount + ')') : ''}" type="span" style="block text-grey-8 text-caption"/>
@@ -319,7 +345,7 @@
                 </default-field></field>
 
                 <field name="total"><default-field title="Total (Inc Tax)">
-                    <label text="${currSymbol}${ec.l10n.format(((quantity ?: 0) * (amount ?: 0)) + (igstAmount ?: 0) + (cgstAmount ?: 0) + (sgstAmount ?: 0), '#,##,##0.00')}" type="span" style="text-weight-bold text-dark"/>
+                    <label text="${currSymbol}${ec.l10n.format((taxableAmount ?: ((quantity ?: 0) * (amount ?: 0))) + (igstAmount ?: 0) + (cgstAmount ?: 0) + (sgstAmount ?: 0), '#,##,##0.00')}" type="span" style="text-weight-bold text-dark"/>
                 </default-field></field>
                 
                 <field name="deleteItem">
