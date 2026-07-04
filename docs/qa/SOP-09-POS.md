@@ -123,6 +123,9 @@ The POS is at **`/apps/zenith/pos/<screen>`** (lowercase `pos`; the checkout is 
 | PS-004 | FUNC | Category tabs | Click a category tab, then "ALL ITEMS" | Grid filters to that category / shows all (org's products) | S3 |
 | PS-004a | PERF | **ALL ITEMS is instant** | From any category tab, click ALL ITEMS and immediately tap a tile | The full grid restores **instantly from cache** (never greyed/disabled, tiles tappable at once); a background refresh keeps it fresh (ZE-POS-0204 — used to freeze 5–10s on large catalogs) | S2 |
 | PS-005 | FUNC | Product search | Type a name/code in the grid search | Grid filters (org-scoped) | S3 |
+| PS-005a | FUNC | **Search-bar add = qty 1** | In the green cart search box type a name/code, pick a result (click or Enter) | Line added at **qty 1** (same as a grid tile), exactly ONE `ajaxCart` addItem POST (ZE-POS-0206 — the unguarded inline cart-search engine used to double-fire → qty 2, double-billed) | S1 |
+| PS-005b | FUNC | Search-add shows the name | Add a product via the search box | Cart line shows the **product name** (code as secondary text), not the bare code twice (ZE-POS-0207 — search-add passed no name → optimistic line read `name‖pid`) | S3 |
+| PS-005c | FUNC | Search box still scans | Fire a physical barcode scanner into the search box | Fast entry (or no dropdown match) resolves the code server-side via `_posScan` (pseudoId/barcode) and adds once | S2 |
 | PS-006 | FUNC | Qty + / − | Use +/− on a line | Qty and line total recompute; tax recomputes | S2 |
 | PS-007 | EDGE | **Qty edit never deletes** | Set a line qty to 0 / empty / negative | Line is **not** deleted (reverts / floors); **only the × button removes** | S2 |
 | PS-008 | FUNC | Price edit | Type a new unit price on a line | Line reprices; logged as a price override; line marked manual-price | S2 |
