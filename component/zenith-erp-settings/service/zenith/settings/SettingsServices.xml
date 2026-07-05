@@ -62,9 +62,12 @@
             <parameter name="userGroupId" required="true"/>
         </in-parameters>
         <actions>
-            <!-- ZE-ROLE-001: last-administrator protection. Never let the organisation (for the tenant admin
-                 role ZENITH_ADMIN) or the platform (for ADMIN) be left with zero administrators. Count OTHER
-                 users who still hold the role, scoped to the target's organisation for ZENITH_ADMIN. -->
+            <!-- ZE-ROLE-001: last-administrator protection. Never let a scope be left with zero administrators.
+                 For the platform role ADMIN the scope is the whole system. For the tenant role ZENITH_ADMIN the
+                 scope is the target's ORGANISATION — i.e. the users sharing one of the target's TENANT_ groups.
+                 An org-less ZENITH_ADMIN (hand-provisioned, no TENANT_ group) is its own scope: the set of
+                 org-less admins. Either way we block only when NO OTHER user in the SAME scope holds the role,
+                 so the behaviour is consistent whether or not the target belongs to a tenant. -->
             <if condition="userGroupId == 'ZENITH_ADMIN' || userGroupId == 'ADMIN'">
                 <script><![CDATA[
                     def adminUserIds = ec.entity.find("moqui.security.UserGroupMember")
@@ -73,17 +76,30 @@
                             .list()*.userId.unique()
                     def others = adminUserIds.findAll { it != userId }
                     if (userGroupId == 'ZENITH_ADMIN' && others) {
-                        // keep only other admins who share an organisation (TENANT_ group) with the target
-                        def tgtTenants = ec.entity.find("moqui.security.UserGroupMember").condition("userId", userId)
-                                .list()*.userGroupId.findAll { it != null && it.startsWith('TENANT_') } as Set
-                        if (tgtTenants) {
-                            others = others.findAll { o ->
-                                ec.entity.find("moqui.security.UserGroupMember").condition("userId", o)
-                                        .list()*.userGroupId.any { it != null && it.startsWith('TENANT_') && tgtTenants.contains(it) }
-                            }
+                        // A user's organisation membership is authoritatively the PrtEmployee/Member/Agent ->
+                        // OrgInternal party relationship (what setup#UserOrganizationInfo uses); the TENANT_
+                        // group is a secondary signal that some accounts have and some (e.g. Google admins)
+                        // do not. Use the UNION so no real tenant admin is ever mis-scoped as org-less.
+                        def orgsOf = { uid ->
+                            def pid = ec.entity.find("moqui.security.UserAccount").condition("userId", uid).one()?.partyId
+                            if (!pid) return ([] as Set)
+                            ec.entity.find("mantle.party.PartyRelationship").condition("fromPartyId", pid)
+                                    .condition("toRoleTypeId", "OrgInternal")
+                                    .conditionDate("fromDate", "thruDate", ec.user.nowTimestamp)
+                                    .list()*.toPartyId as Set
+                        }
+                        def tenantsOf = { uid -> ec.entity.find("moqui.security.UserGroupMember").condition("userId", uid)
+                                .list()*.userGroupId.findAll { it != null && it.startsWith('TENANT_') } as Set }
+                        def tgtOrgs = orgsOf(userId); def tgtTenants = tenantsOf(userId)
+                        if (tgtOrgs || tgtTenants) {
+                            // scope to other admins in the SAME organisation (shared OrgInternal org OR TENANT_ group)
+                            others = others.findAll { o -> orgsOf(o).any { tgtOrgs.contains(it) } || tenantsOf(o).any { tgtTenants.contains(it) } }
+                        } else {
+                            // truly org-less admin: its scope is the set of other org-less admins
+                            others = others.findAll { o -> orgsOf(o).isEmpty() && tenantsOf(o).isEmpty() }
                         }
                     }
-                    if (!others) ec.message.addError("Cannot remove the last administrator role — the organisation must keep at least one administrator. Assign an admin role to another user first.")
+                    if (!others) ec.message.addError("Cannot remove the last administrator role — this organisation must keep at least one administrator. Assign an admin role to another user first.")
                 ]]></script>
             </if>
             <if condition="!ec.message.hasError()">
