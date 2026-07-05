@@ -57,7 +57,8 @@
         var isAdmin = cfg.isAdmin !== false;
         var allowedSet = {};
         (cfg.modules || []).forEach(function(m) { allowedSet[String(m).toLowerCase()] = true; });
-        var alwaysAllowed = { "dashboard":true, "saas-admin":true, "my-subscription":true };
+        // "mypassword" is the self-service sign-in-password screen (ZE-AUTH-001) — every user may reach it.
+        var alwaysAllowed = { "dashboard":true, "saas-admin":true, "my-subscription":true, "mypassword":true };
         var lastFiltered = null;
 
         function filterMenu(list) {
@@ -75,7 +76,7 @@
                     var name = ss.name ? ss.name.toLowerCase() : "";
                     // POS-only cashier: till-first, but may step into POS + Inventory (create/manage
                     // items) — plus Dashboard (alwaysAllowed below). Everything else stays hidden.
-                    if (posOnly) return name === "pos" || name === "inventory";
+                    if (posOnly) return name === "pos" || name === "inventory" || name === "mypassword";
                     // Settings is admin-only (ZENITH_ADMIN/ADMIN) regardless of plan — hide it from
                     // everyone else so they don't navigate into an "Access Restricted" wall.
                     if (name === "settings") return isAdmin;
