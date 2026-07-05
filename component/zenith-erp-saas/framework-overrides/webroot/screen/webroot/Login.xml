@@ -73,10 +73,27 @@ along with this software (see the LICENSE.md file). If not, see
                  pending, collapse whatever it produced into one generic message so the response is
                  identical whether or not the username exists. -->
             <if condition="!ec.user.userId &amp;&amp; !ec.web.sessionAttributes.moquiAuthcFactorRequired &amp;&amp; !ec.web?.sessionAttributes?.moquiPreAuthcUsername">
-                <script>
+                <script><![CDATA[
                     ec.message.clearAll()
                     ec.message.addError("The username or password you entered is incorrect.")
-                </script>
+                    // ZE-ROLE-002: if the credentials are actually correct but the account is DISABLED, tell
+                    // the user clearly instead of the misleading generic message. We verify the password
+                    // first so this never becomes a username-enumeration oracle — only someone who knows the
+                    // account's password (the legitimate owner) ever sees the "disabled" message.
+                    boolean _dz = ec.artifactExecution.disableAuthz()
+                    try {
+                        def ua = username ? ec.entity.find("moqui.security.UserAccount").condition("username", username).one() : null
+                        if (ua?.disabled == "Y" && ua.currentPassword && password) {
+                            def token = new org.apache.shiro.authc.UsernamePasswordToken((String) ua.username, (String) password)
+                            def info = new org.apache.shiro.authc.SimpleAuthenticationInfo((String) ua.username, (String) ua.currentPassword,
+                                    new org.apache.shiro.lang.util.SimpleByteSource((String) (ua.passwordSalt ?: "")), "moquiRealm")
+                            if (ec.ecfi.getCredentialsMatcher(ua.passwordHashType, "Y".equals(ua.passwordBase64)).doCredentialsMatch(token, info)) {
+                                ec.message.clearAll()
+                                ec.message.addError("Your account has been disabled. Please contact your administrator.")
+                            }
+                        }
+                    } finally { if (!_dz) ec.artifactExecution.enableAuthz() }
+                ]]></script>
             </if>
 
             <!-- ZE-ONB-002: email-verification hard gate. Block login until a NEW email/password signup verifies
@@ -139,10 +156,14 @@ along with this software (see the LICENSE.md file). If not, see
                                     orgValidationError = "That Organization ID is invalid, or your account doesn't have access to it."
                                     orgValidationFailed = true
                                 } else {
+                                    // ZE-ROLE-002: org membership is stored as PrtEmployee OR PrtAgent (and
+                                    // future PrtMember) relationships to the org — not only PrtEmployee. The
+                                    // narrow check wrongly rejected valid PrtAgent members with "Organization
+                                    // ID is invalid". Match the same relationship types setup#UserOrganizationInfo does.
                                     def relList = ec.entity.find("mantle.party.PartyRelationship")
                                             .condition("fromPartyId", userAcct.partyId)
                                             .condition("toPartyId", orgPartyId)
-                                            .condition("relationshipTypeEnumId", "PrtEmployee")
+                                            .condition("relationshipTypeEnumId", "in", ["PrtEmployee", "PrtAgent", "PrtMember"])
                                             .conditionDate("fromDate", "thruDate", ec.user.nowTimestamp).list()
                                     if (!relList) {
                                         orgValidationError = "That Organization ID is invalid, or your account doesn't have access to it."
@@ -167,7 +188,10 @@ along with this software (see the LICENSE.md file). If not, see
                     <set field="orgLoginFailed" value="true"/>
                 </if>
             </if>
-            <if condition="ec.user.userId &amp;&amp; !organizationId">
+            <!-- ZE-ROLE-002: platform super-admins (ADMIN) are cross-tenant and are already exempt from the
+                 org-validation block above, so they must NOT be forced to supply an Organization ID here
+                 either — otherwise a valid admin is blocked from logging in with correct credentials. -->
+            <if condition="ec.user.userId &amp;&amp; !organizationId &amp;&amp; !ec.user.isInGroup('ADMIN')">
                 <script>
                     ec.user.logoutUser()
                     ec.message.addError("Organization ID is required")
