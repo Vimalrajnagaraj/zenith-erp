@@ -520,10 +520,19 @@
                  each row are untouched; org/operator/carrier party fields are left alone. Per-row update so
                  audited entities (Invoice) keep their audit trail. -->
             <script><![CDATA[
+                // Move rows whose party field = the duplicate onto the survivor. If that field is part of the
+                // entity's PK it CAN'T be updated in place (e.g. ShipmentParty.partyId) — so re-create the row
+                // for the survivor via store# (idempotent) and leave the disabled duplicate's row as-is;
+                // otherwise update in place. Auto-detecting the PK keeps this safe when new entities are added.
                 def _reparent = { entityName, field ->
                     ec.entity.find(entityName).condition(field, mergedPartyId).list().each { row ->
-                        row.set(field, survivingPartyId)
-                        row.update()
+                        if (row.getPrimaryKeys().containsKey(field)) {
+                            def m = new HashMap(row); m[field] = survivingPartyId
+                            ec.service.sync().name("store#" + entityName).parameters(m).call()
+                        } else {
+                            row.set(field, survivingPartyId)
+                            row.update()
+                        }
                     }
                 }
                 // Core transactional history
@@ -535,20 +544,16 @@
                 _reparent("mantle.account.payment.Payment", "toPartyId")
                 _reparent("zenith.erp.pos.PosTransaction", "customerPartyId")
                 // Secondary customer records: shipments, subscriptions, loyalty, and customer balances
-                // (store credit, gift cards). All non-PK party fields, so a plain update moves them.
+                // (store credit, gift cards). ShipmentParty.partyId is in its PK — the helper detects that
+                // and re-creates the survivor's row rather than updating in place.
                 _reparent("mantle.shipment.Shipment", "fromPartyId")
                 _reparent("mantle.shipment.Shipment", "toPartyId")
+                _reparent("mantle.shipment.ShipmentParty", "partyId")
                 _reparent("zenith.erp.subscriptions.Subscription", "customerPartyId")
                 _reparent("zenith.erp.loyalty.LoyaltyMember", "partyId")
                 _reparent("zenith.erp.giftcard.StoreCredit", "partyId")
                 _reparent("zenith.erp.giftcard.GiftCard", "issuedToPartyId")
                 _reparent("zenith.erp.giftcard.GiftCard", "purchasedByPartyId")
-                // ShipmentParty has partyId in its PK (can't update in place) — re-add the survivor to each
-                // of the duplicate's shipments (store# is idempotent); the disabled duplicate's link is left as-is.
-                ec.entity.find("mantle.shipment.ShipmentParty").condition("partyId", mergedPartyId).list().each { sp ->
-                    ec.service.sync().name("store#mantle.shipment.ShipmentParty")
-                        .parameters([shipmentId: sp.shipmentId, partyId: survivingPartyId, roleTypeId: sp.roleTypeId]).call()
-                }
             ]]></script>
 
             <service-call name="update#mantle.party.Party"
