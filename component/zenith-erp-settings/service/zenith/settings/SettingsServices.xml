@@ -62,14 +62,40 @@
             <parameter name="userGroupId" required="true"/>
         </in-parameters>
         <actions>
-            <entity-find entity-name="moqui.security.UserGroupMember" list="memberList">
-                <econdition field-name="userId"/>
-                <econdition field-name="userGroupId"/>
-            </entity-find>
-            <iterate list="memberList" entry="member">
-                <service-call name="delete#moqui.security.UserGroupMember"
-                              in-map="[userGroupId:member.userGroupId, userId:member.userId, fromDate:member.fromDate]"/>
-            </iterate>
+            <!-- ZE-ROLE-001: last-administrator protection. Never let the organisation (for the tenant admin
+                 role ZENITH_ADMIN) or the platform (for ADMIN) be left with zero administrators. Count OTHER
+                 users who still hold the role, scoped to the target's organisation for ZENITH_ADMIN. -->
+            <if condition="userGroupId == 'ZENITH_ADMIN' || userGroupId == 'ADMIN'">
+                <script><![CDATA[
+                    def adminUserIds = ec.entity.find("moqui.security.UserGroupMember")
+                            .condition("userGroupId", userGroupId)
+                            .conditionDate("fromDate", "thruDate", ec.user.nowTimestamp)
+                            .list()*.userId.unique()
+                    def others = adminUserIds.findAll { it != userId }
+                    if (userGroupId == 'ZENITH_ADMIN' && others) {
+                        // keep only other admins who share an organisation (TENANT_ group) with the target
+                        def tgtTenants = ec.entity.find("moqui.security.UserGroupMember").condition("userId", userId)
+                                .list()*.userGroupId.findAll { it != null && it.startsWith('TENANT_') } as Set
+                        if (tgtTenants) {
+                            others = others.findAll { o ->
+                                ec.entity.find("moqui.security.UserGroupMember").condition("userId", o)
+                                        .list()*.userGroupId.any { it != null && it.startsWith('TENANT_') && tgtTenants.contains(it) }
+                            }
+                        }
+                    }
+                    if (!others) ec.message.addError("Cannot remove the last administrator role — the organisation must keep at least one administrator. Assign an admin role to another user first.")
+                ]]></script>
+            </if>
+            <if condition="!ec.message.hasError()">
+                <entity-find entity-name="moqui.security.UserGroupMember" list="memberList">
+                    <econdition field-name="userId"/>
+                    <econdition field-name="userGroupId"/>
+                </entity-find>
+                <iterate list="memberList" entry="member">
+                    <service-call name="delete#moqui.security.UserGroupMember"
+                                  in-map="[userGroupId:member.userGroupId, userId:member.userId, fromDate:member.fromDate]"/>
+                </iterate>
+            </if>
         </actions>
     </service>
 
