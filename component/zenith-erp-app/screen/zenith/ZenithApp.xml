@@ -3,7 +3,59 @@
         xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
         require-authentication="true" default-menu-title="ZetaERP">
 
-    <always-actions><set field="html_title" value="ZetaERP"/></always-actions>
+    <always-actions>
+        <set field="html_title" value="ZetaERP"/>
+        <script><![CDATA[
+            // VIEW-ONLY write enforcement (ST-077), and No-Access for writes (ST-078). pre-actions do NOT run
+            // for transition requests, so module WRITE authz MUST be checked here in always-actions. A data
+            // write is a POST to a screen TRANSITION (targetTransitionActualName != null); a list SEARCH/filter
+            // posts to the SCREEN itself (ttan == null) and every GET is a read -> both pass. For a non-admin,
+            // non-POS-cashier user POSTing to a gateable module: block when NONE of their roles holds AUTHZA_ALL
+            // on that module's Z_<MOD> group (i.e. they have only VIEW, or no grant at all). ADMIN and
+            // ZENITH_ADMIN are exempt; framework column/find-pref transitions are whitelisted; ANY error FAILS
+            // OPEN so a write is never blocked on a gate fault. MARUTHI-safe: its cashiers are posOnly AND hold
+            // AUTHZA_ALL on every module they use; its admins are ZENITH_ADMIN.
+            try {
+                if (ec.web != null && ec.user.userId != null && !ec.user.isInGroup("ADMIN") && !ec.user.isInGroup("ZENITH_ADMIN")
+                        && "POST".equalsIgnoreCase(ec.web.getRequest()?.getMethod() ?: "")) {
+                    def _ttan = sri.screenUrlInfo?.targetTransitionActualName
+                    def _fwTx = ['formSelectColumns','formSaveColumns','formSaveFind','formDeleteFind'] as Set
+                    if (_ttan && !_fwTx.contains(_ttan)) {
+                        def _gate = ['pos','sales','purchase','inventory','accounting','contacts','crm','hr','payroll',
+                            'attendance','timeoff','recruitment','expenses','manufacturing','quality','maintenance','fleet',
+                            'helpdesk','marketing','ecommerce','events','subscriptions','documents','approvals','integrations',
+                            'website','studio','plm','fieldservice','discuss','sign','project','timesheets','tax','pricing','barcode'] as Set
+                        def uri = ec.web.getRequest()?.getRequestURI()
+                        def segs = uri ? uri.split('/').findAll{it} : []
+                        int zi = segs.findIndexOf{it.toLowerCase()=='zenith'}
+                        def _rm = (zi >= 0 && zi + 1 < segs.size()) ? segs[zi + 1].toLowerCase() : null
+                        def _zr = (ec.user.userGroupIdSet ?: []).findAll { it?.startsWith("ZENITH_") && it != "ZENITH_ALL" }
+                        boolean _posOnly = (_zr.size() == 1 && _zr.contains("ZENITH_CASHIER"))
+                        if (_rm && _gate.contains(_rm) && !_posOnly) {
+                            def _myG = (ec.user.userGroupIdSet ?: []) as List
+                            boolean hasFull = true
+                            if (_myG) {
+                                boolean _dz = ec.artifactExecution.disableAuthz()
+                                try {
+                                    hasFull = ec.entity.find("moqui.security.ArtifactAuthz")
+                                            .condition("artifactGroupId", "Z_" + _rm.toUpperCase())
+                                            .condition("userGroupId", "in", _myG)
+                                            .condition("authzActionEnumId", "AUTHZA_ALL")
+                                            .condition("authzTypeEnumId", "in", ["AUTHZT_ALLOW", "AUTHZT_ALWAYS"])
+                                            .count() > 0
+                                } finally { if (!_dz) ec.artifactExecution.enableAuthz() }
+                            }
+                            if (!hasFull) {
+                                ec.message.addError("Your role has view-only access to this module — you can't make changes here.")
+                                def _shw = (uri ?: "").startsWith('/qapps/') ? '/qapps' : '/apps'
+                                sri.sendRedirectAndStopRender(_shw + "/zenith/Dashboard")
+                            }
+                        }
+                    }
+                }
+            } catch (Throwable e) { /* fail OPEN — never block a write on a gate error */ }
+        ]]></script>
+    </always-actions>
 
     <transition name="askCopilot" read-only="true" begin-transaction="false">
         <actions>
