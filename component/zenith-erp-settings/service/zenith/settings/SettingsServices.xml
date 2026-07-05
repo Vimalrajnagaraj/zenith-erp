@@ -122,4 +122,44 @@
         </actions>
     </service>
 
+    <service verb="delete" noun="User">
+        <description>ZE-ROLE-010: permanently delete a user so the username can be reused. Succeeds ONLY for a
+            history-less user — the DB enforces FKs on party (240) and user_account (24), so a user with any
+            activity (orders, bills, contacts, logins, ...) makes the delete fail and the whole thing roll back;
+            we catch that and tell the admin to disable instead (which preserves records). The caller and any
+            administrator are refused up front so nobody can delete themselves or the last admin.</description>
+        <in-parameters><parameter name="userId" required="true"/></in-parameters>
+        <actions>
+            <if condition="userId == ec.user.userId"><return error="true" message="You can't delete your own account."/></if>
+            <entity-find-count entity-name="moqui.security.UserGroupMember" count-field="_adminCount">
+                <econdition field-name="userId"/>
+                <econdition field-name="userGroupId" operator="in" value="ADMIN,ZENITH_ADMIN"/>
+                <date-filter/>
+            </entity-find-count>
+            <if condition="_adminCount &gt; 0"><return error="true" message="This user is an administrator. Remove the administrator role first, or disable the account instead of deleting it."/></if>
+            <script><![CDATA[
+                def uacct = ec.entity.find("moqui.security.UserAccount").condition("userId", userId).one()
+                if (uacct == null) { ec.message.addError("That user no longer exists."); return }
+                def pid = uacct.partyId
+                boolean _d = ec.artifactExecution.disableAuthz()
+                try {
+                    // the user's own login-scoped records
+                    ec.entity.find("moqui.security.UserGroupMember").condition("userId", userId).deleteAll()
+                    ec.entity.find("moqui.security.UserPreference").condition("userId", userId).deleteAll()
+                    uacct.delete()
+                    // person/party: FK-fails (and rolls the whole transaction back) if the party has ANY
+                    // business link, which is exactly the guard we want — only a truly unused party deletes.
+                    if (pid) {
+                        ec.entity.find("mantle.party.PartyRole").condition("partyId", pid).deleteAll()
+                        ec.entity.find("mantle.party.Person").condition("partyId", pid).one()?.delete()
+                        ec.entity.find("mantle.party.Party").condition("partyId", pid).one()?.delete()
+                    }
+                    ec.message.addMessage("User deleted. Their username is now free to reuse.")
+                } catch (Exception e) {
+                    ec.message.addError("This user has activity in the system (transactions, contacts or history) and can't be permanently deleted. Disable the account instead — it blocks sign-in but keeps their records.")
+                } finally { if (!_d) ec.artifactExecution.enableAuthz() }
+            ]]></script>
+        </actions>
+    </service>
+
 </services>
