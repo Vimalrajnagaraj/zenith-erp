@@ -2,9 +2,52 @@
     if (window._saasMenuFilterLoaded) return;
     window._saasMenuFilterLoaded = true;
 
+    // ZE-AUTH-002: The role/plan menu filter runs client-side (below), so without this guard the full
+    // module list — including admin-only items (Settings) and non-plan modules — would render and flash
+    // for a moment before being removed, briefly exposing privileged navigation. We therefore hide the
+    // top-level module nav items until the filter has run, then reveal only the allowed set. This only
+    // applies to users who actually get filtered (a server-embedded config is present); the platform
+    // super-admin has no embedded config and is untouched. A fail-safe timer always reveals so the menu
+    // can never stay hidden if something goes wrong.
+    var HIDE_ID = "zmf-menu-pending";
+    function injectHide() {
+        if (document.getElementById(HIDE_ID)) return;
+        var st = document.createElement("style");
+        st.id = HIDE_ID;
+        st.textContent = '.q-drawer a.q-item[href^="/qapps/zenith/"]{visibility:hidden !important;}';
+        (document.head || document.documentElement).appendChild(st);
+    }
+    function reveal() {
+        var st = document.getElementById(HIDE_ID);
+        if (st && st.parentNode) st.parentNode.removeChild(st);
+    }
+
+    function readEmbedded() {
+        // Vue strips <script> from screen templates, so the server embeds the
+        // config in a hidden div's data-* attributes (which survive compile).
+        var el = document.getElementById("zenith-saas-cfg");
+        if (!el) return null;
+        try {
+            return {
+                isSaasTenant: el.getAttribute("data-tenant") === "true",
+                hasAllAccess: el.getAttribute("data-all") === "true",
+                posOnly: el.getAttribute("data-pos-only") === "true",
+                isAdmin: el.getAttribute("data-is-admin") !== "false",
+                modules: JSON.parse(el.getAttribute("data-modules") || "[]")
+            };
+        } catch (e) { return null; }
+    }
+
+    // The Quasar (/qapps) shell renders its module menu client-side via Vue, so the full list — including
+    // admin-only Settings and non-plan modules — paints before the filter below can trim it. Hide the
+    // module nav up front on /qapps and reveal only once the filter has run. (The /apps shell renders the
+    // menu server-side and this Vue filter never touches it, so no hiding there.) Fail-safe reveal ensures
+    // the menu can never stay hidden.
+    if (location.pathname.indexOf('/qapps/') === 0) { injectHide(); setTimeout(reveal, 3000); }
+
     function startFilter(cfg) {
         var app = document.getElementById("apps-root");
-        if (!app || !app.__vue__) return;
+        if (!app || !app.__vue__) { reveal(); return; }
         var vm = app.__vue__;
         var isTenant = !!cfg.isSaasTenant;
         var hasAll = !!cfg.hasAllAccess;
@@ -50,30 +93,22 @@
 
         vm.$watch("navMenuList", function(newList) {
             filterMenu(newList);
+            // Reveal only once the module menu is actually populated AND filtered — revealing on an early
+            // empty pass would let the full list paint (and flash) when it populates a moment later. Wait
+            // for Vue to re-render the filtered list, so the removed items are gone before anything shows.
+            var ready = newList && newList.some(function(it) {
+                return it && it.name === "zenith" && it.subscreens && it.subscreens.length;
+            });
+            if (ready) vm.$nextTick(reveal);
         }, { immediate: true });
-    }
-
-    function readEmbedded() {
-        // Vue strips <script> from screen templates, so the server embeds the
-        // config in a hidden div's data-* attributes (which survive compile).
-        var el = document.getElementById("zenith-saas-cfg");
-        if (!el) return null;
-        try {
-            return {
-                isSaasTenant: el.getAttribute("data-tenant") === "true",
-                hasAllAccess: el.getAttribute("data-all") === "true",
-                posOnly: el.getAttribute("data-pos-only") === "true",
-                isAdmin: el.getAttribute("data-is-admin") !== "false",
-                modules: JSON.parse(el.getAttribute("data-modules") || "[]")
-            };
-        } catch (e) { return null; }
     }
 
     function boot() {
         var app = document.getElementById("apps-root");
         if (!(app && app.__vue__)) return false;
-        // Prefer the server-embedded config (zero extra round-trip, applies on
-        // first paint). Fall back to the saasConfig XHR only if it is absent.
+        // Prefer the server-embedded config (zero extra round-trip, applies on first paint). Re-read it
+        // each attempt: on /qapps the hidden config div is rendered by Vue AFTER this script first runs,
+        // so a one-time read at load would miss it. Fall back to the saasConfig XHR only if it is absent.
         var embedded = window.__zenithSaasCfg || readEmbedded();
         if (embedded) {
             startFilter(embedded);
@@ -82,12 +117,15 @@
         var vm = app.__vue__;
         $.ajax({
             type: "GET", url: vm.appRootPath + "/apps/zenith/saasConfig", dataType: "json",
-            success: function(cfg) { if (cfg) startFilter(cfg); }
+            success: function(cfg) { if (cfg) startFilter(cfg); else reveal(); },
+            error: function() { reveal(); }
         });
         return true;
     }
 
+    // Poll tightly for the Vue app so the filter applies as early as possible (minimising the brief
+    // pending window). Falls back to the fail-safe reveal above if the app never mounts.
     var checkReady = setInterval(function() {
         if (boot()) clearInterval(checkReady);
-    }, 200);
+    }, 30);
 })();
