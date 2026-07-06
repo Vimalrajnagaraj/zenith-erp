@@ -28,13 +28,26 @@
                         if (_p?.mrpAmount != null) price = _p.mrpAmount as BigDecimal
                     }
                 }
-                def inMap = context + [unitAmount: price]
+                // ZE-SALES-0309: create#OrderItem requires the order part seq id. mantle create#Order makes
+                // one OrderPart (seq '01'); look it up so Add Item doesn't fail with "Field cannot be empty
+                // (Order Part Seq ID)". Falls back to '01' if somehow none exists.
+                def _parts = ec.entity.find("mantle.order.OrderPart").condition("orderId", orderId).orderBy("orderPartSeqId").list()
+                def _partSeq = _parts ? _parts[0].orderPartSeqId : '01'
+                def inMap = context + [unitAmount: price, orderPartSeqId: _partSeq]
                 ec.service.sync().name("mantle.order.OrderServices.create#OrderItem").parameters(inMap).call()
             </script>
         </actions>
         <default-response url="."/>
     </transition>
     <transition name="printOrder" read-only="true">
+        <!-- ZE-SALES-0311: don't emit a zero-value PDF for an item-less order; send the user back with a note. -->
+        <actions>
+            <entity-find-count entity-name="mantle.order.OrderItem" count-field="itemCount"><econdition field-name="orderId"/></entity-find-count>
+            <if condition="itemCount == 0"><message>This order has no items yet. Add at least one item before downloading the PDF.</message></if>
+        </actions>
+        <conditional-response url="." url-type="screen">
+            <condition><expression>itemCount == 0</expression></condition>
+        </conditional-response>
         <default-response url="${ec.web.getWebappRootUrl(false, null)}/fop/apps/zenith/sales/OrderPrint" url-type="plain">
             <parameter name="orderId"/>
             <parameter name="filename" value="Order-${orderId}.pdf"/>
@@ -92,7 +105,18 @@
             <econdition field-name="orderId"/>
         </entity-find>
         <set field="orderPart" from="orderParts?.getFirst()"/>
-        
+
+        <!-- ZE-SALES-0312: currency symbol for the banner (the screen showed amounts with no symbol). INR tenant -> Rs. -->
+        <set field="currSymbol" from="order?.currencyUomId == 'INR' ? '₹' : (order?.currencyUomId == 'USD' ? '$' : ((order?.currencyUomId ?: '') + ' '))"/>
+
+        <!-- ZE-SALES-0310: offer only the current status + its valid next states (from the order status flow),
+             so the dropdown no longer lists e-commerce statuses (Wish List / Gift Registry / Auto Reorder) or
+             transitions the backend would reject. -->
+        <entity-find entity-name="moqui.basic.StatusFlowTransition" list="_stTrans">
+            <econdition field-name="statusId" from="order?.statusId"/>
+        </entity-find>
+        <set field="allowedStatusIds" from="(([order?.statusId] + _stTrans.collect{ it.toStatusId }).findAll{ it }).unique()"/>
+
         <entity-find entity-name="mantle.order.OrderItem" list="orderItems">
             <econdition field-name="orderId"/>
             <order-by field-name="orderItemSeqId"/>
@@ -128,6 +152,7 @@
                                 <entity-options key="${statusId}" text="${description}">
                                     <entity-find entity-name="moqui.basic.StatusItem">
                                         <econdition field-name="statusTypeId" value="OrderHeader"/>
+                                        <econdition field-name="statusId" operator="in" from="allowedStatusIds"/>
                                         <order-by field-name="sequenceNum"/>
                                     </entity-find>
                                 </entity-options>
