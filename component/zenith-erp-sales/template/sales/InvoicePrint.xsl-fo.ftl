@@ -220,7 +220,7 @@
                             <#assign totalItem = taxable + (item.cgstAmount!0) + (item.sgstAmount!0) + (item.igstAmount!0)>
                             <fo:table-row font-size="7.5pt" border-bottom="0.5pt solid ${colorBg}">
                                 <fo:table-cell padding="4pt"><fo:block text-align="center">${item_index+1}</fo:block></fo:table-cell>
-                                <fo:table-cell padding="4pt"><fo:block><@encodeText (item.description)!""/></fo:block></fo:table-cell>
+                                <fo:table-cell padding="4pt"><fo:block><@encodeText (item.description)!""/></fo:block><#if (item.discountPercent!0)?number != 0><fo:block font-size="6pt" color="#c0392b">Less ${item.discountPercent}% discount (Rs. <@formatINR item.discountAmount!0/>)</fo:block></#if></fo:table-cell>
                                 <fo:table-cell padding="4pt"><fo:block text-align="center">${item.hsnSacCode!"-"}</fo:block></fo:table-cell>
                                 <fo:table-cell padding="4pt"><fo:block text-align="right">Rs. <@formatINR item.amount!0/></fo:block></fo:table-cell>
                                 <fo:table-cell padding="4pt"><fo:block text-align="center">${item.quantity!"1.00"}</fo:block></fo:table-cell>
