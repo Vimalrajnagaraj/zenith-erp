@@ -209,6 +209,13 @@
 
     <actions>
         <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="invoice"/>
+        <!-- ZE-SALES-017 (SL-071): explicit org guard on the DISPLAY load — the MANTLE_ACTIVE_ORG authz filter
+             is bypassed in a standalone/CSV render, so a crafted invoiceId could otherwise dump another
+             tenant's items + change-history. Null a foreign note; super-admin/ADMIN (no active org) see all. -->
+        <set field="_dispOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+        <if condition="invoice != null &amp;&amp; _dispOrg &amp;&amp; invoice.fromPartyId != _dispOrg &amp;&amp; !ec.user.isInGroup('ADMIN')">
+            <set field="invoice" from="null"/>
+        </if>
         <!-- ZE-SALES-002 f/u: editable only while a draft (In-Process); gate the add/edit/delete controls. -->
         <set field="isDraft" from="invoice?.statusId == 'InvoiceInProcess'"/>
 
@@ -221,10 +228,13 @@
         </entity-find>
         <set field="allowedStatusIds" from="(([invoice?.statusId] + _stTrans.collect{ it.toStatusId }).findAll{ it }).unique()"/>
 
-        <entity-find entity-name="mantle.account.invoice.InvoiceItem" list="invoiceItems">
-            <econdition field-name="invoiceId"/>
-            <order-by field-name="invoiceItemSeqId"/>
-        </entity-find>
+        <set field="invoiceItems" from="[]"/>
+        <if condition="invoice != null">
+            <entity-find entity-name="mantle.account.invoice.InvoiceItem" list="invoiceItems">
+                <econdition field-name="invoiceId"/>
+                <order-by field-name="invoiceItemSeqId"/>
+            </entity-find>
+        </if>
 
         <entity-find-one entity-name="mantle.party.PartyDetail" value-field="supplier">
             <field-map field-name="partyId" from="invoice?.fromPartyId"/>
@@ -240,6 +250,22 @@
         
         <set field="docTitle" from="invoice.documentType ?: 'Credit Note'"/>
         <set field="avatarColor" from="invoice.documentType == 'Debit Note' ? 'linear-gradient(135deg, #f59e0b, #d97706)' : 'linear-gradient(135deg, #10b981, #059669)'"/>
+
+        <!-- ZE-SALES-017 (SL-071): change history for THIS note. Moqui auto-logs field changes to
+             EntityAuditLog (who/when/old/new); surface them here. Scoped to invoice != null (org-checked
+             above) so it can't leak another tenant's history. Whitelist meaningful fields — hide the internal
+             payment/GL/timestamp churn. -->
+        <set field="historyFieldMap" from="[statusId:'Status', gstInvoiceNumber:'Note Number', supplierGstin:'Supplier GSTIN', buyerGstin:'Buyer GSTIN', isReverseCharge:'Reverse Charge', placeOfSupplyStateCode:'Place of Supply', invoiceMessage:'Reason', documentType:'Document Type', invoiceTotal:'Total Amount', totalTaxableAmount:'Taxable Amount', totalTaxAmount:'Tax Amount', totalCgst:'CGST', totalSgst:'SGST', totalIgst:'IGST', originalInvoiceId:'Original Invoice', toPartyId:'Customer', invoiceDate:'Note Date']"/>
+        <set field="noteHistory" from="[]"/>
+        <if condition="invoice != null">
+            <entity-find entity-name="moqui.entity.EntityAuditLog" list="noteHistory">
+                <econdition field-name="changedEntityName" value="mantle.account.invoice.Invoice"/>
+                <econdition field-name="pkPrimaryValue" from="invoiceId"/>
+                <econdition field-name="changedFieldName" operator="in" value="statusId,gstInvoiceNumber,supplierGstin,buyerGstin,isReverseCharge,placeOfSupplyStateCode,invoiceMessage,documentType,invoiceTotal,totalTaxableAmount,totalTaxAmount,totalCgst,totalSgst,totalIgst,originalInvoiceId,toPartyId,invoiceDate"/>
+                <order-by field-name="-changedDate"/>
+                <limit count="200"/>
+            </entity-find>
+        </if>
     </actions>
 
     <widgets>
@@ -421,6 +447,27 @@
                 </default-field></field>
                 <field name="findButton"><header-field title="Find"><submit/></header-field></field>
                 </form-list>
+        </container>
+
+        <!-- ZE-SALES-017 (SL-071): Change History / audit trail for this note -->
+        <container style="zenith-card bg-white shadow-1 border-radius-lg q-pa-lg q-mt-lg">
+            <label text="Change History" type="h5" style="text-primary text-weight-bold q-my-none"/>
+            <label text="Every edit to this note is recorded automatically — who changed it, when, and the old and new value." type="p" style="text-grey-7 q-mt-xs q-mb-md"/>
+            <form-list name="NoteHistoryForm" list="noteHistory" skip-form="true">
+                <row-actions>
+                    <entity-find-one entity-name="moqui.security.UserAccount" value-field="_hu"><field-map field-name="userId" from="changedByUserId"/></entity-find-one>
+                    <set field="whoChanged" from="_hu?.username ?: (changedByUserId ?: 'System')"/>
+                    <set field="fieldLabel" from="historyFieldMap[changedFieldName] ?: changedFieldName"/>
+                    <set field="oldVal" from="oldValueText != null ? (oldValueText.startsWith('Invoice') ? oldValueText.substring(7) : oldValueText) : '(none)'"/>
+                    <set field="newVal" from="newValueText != null ? (newValueText.startsWith('Invoice') ? newValueText.substring(7) : newValueText) : '-'"/>
+                </row-actions>
+                <field name="changedDate"><header-field title="When" show-order-by="true"/><default-field><display format="dd MMM yyyy, hh:mm a"/></default-field></field>
+                <field name="whoCol"><header-field title="Changed By"/><default-field><display text="${whoChanged}"/></default-field></field>
+                <field name="fieldCol"><header-field title="Field"/><default-field><display text="${fieldLabel}" style="text-weight-bold"/></default-field></field>
+                <field name="oldCol"><header-field title="Old Value"/><default-field><display text="${oldVal}" style="text-grey-7"/></default-field></field>
+                <field name="newCol"><header-field title="New Value"/><default-field><display text="${newVal}" style="text-weight-bold text-primary"/></default-field></field>
+            </form-list>
+            <label text="No changes recorded yet." type="p" style="text-grey-6 q-pa-md text-center" condition="!noteHistory"/>
         </container>
 
     </widgets>
