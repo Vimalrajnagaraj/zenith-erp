@@ -17,8 +17,32 @@
             <set field="__activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
             <if condition="origInv != null &amp;&amp; origInv.fromPartyId == __activeOrg">
                 <set field="cnType" from="documentType == 'Debit Note' ? 'InvoiceSalesDebit' : 'InvoiceSalesReturn'"/>
+                <!-- ZE-SALES-005 f/u: a manually-entered Note Number must be unique within the org (mirrors
+                     CreateInvoice; different tenants may reuse numbers, so scope by fromPartyId). Matches any
+                     invoice OR note in the org, so a note number can't collide with an invoice number. -->
+                <set field="manualNum" from="ec.web.parameters.gstInvoiceNumber?.trim()"/>
+                <if condition="manualNum">
+                    <entity-find entity-name="mantle.account.invoice.Invoice" list="dupNotes">
+                        <econdition field-name="fromPartyId" from="__activeOrg"/>
+                        <econdition field-name="gstInvoiceNumber" from="manualNum"/>
+                    </entity-find>
+                    <if condition="dupNotes">
+                        <return error="true" message="Note number '${manualNum}' is already used by another document in your organization. Enter a unique number, or leave it blank to auto-generate."/>
+                    </if>
+                </if>
                 <service-call name="create#mantle.account.invoice.Invoice" out-map="createOut"
                     in-map="[invoiceTypeEnumId:cnType, statusId:'InvoiceInProcess', fromPartyId:origInv.fromPartyId, toPartyId:origInv.toPartyId, originalInvoiceId:originalInvoiceId, documentType:documentType, invoiceMessage:invoiceMessage, invoiceDate:(invoiceDate ?: ec.user.nowTimestamp), currencyUomId:(origInv.currencyUomId ?: 'INR')]"/>
+                <!-- ZE-SALES-005 f/u: assign the note number - honor a manual one, else auto-generate a per-FY
+                     series (CN/26-27/<id> for a credit note, DN/... for a debit note), like the invoice number. -->
+                <if condition="manualNum">
+                    <service-call name="update#mantle.account.invoice.Invoice" in-map="[invoiceId:createOut.invoiceId, gstInvoiceNumber:manualNum]"/>
+                    <else>
+                        <set field="__yy" from="Integer.parseInt(ec.l10n.format(ec.user.nowTimestamp, 'yy'))"/>
+                        <set field="__fy" from="ec.l10n.format(ec.user.nowTimestamp, 'yy') + '-' + (__yy + 1)"/>
+                        <set field="__pfx" from="documentType == 'Debit Note' ? 'DN' : 'CN'"/>
+                        <service-call name="update#mantle.account.invoice.Invoice" in-map="[invoiceId:createOut.invoiceId, gstInvoiceNumber:(__pfx + '/' + __fy + '/' + createOut.invoiceId), financialYearPrefix:__fy]"/>
+                    </else>
+                </if>
                 <else>
                     <script>ec.message.addError("Original Invoice " + (originalInvoiceId ?: '') + " not found.")</script>
                 </else>
