@@ -54,7 +54,7 @@
                                     <fo:table-column column-width="47.5mm"/>
                                     <fo:table-body>
                                         <fo:table-row border-bottom="0.5pt solid black">
-                                            <fo:table-cell padding="3pt" border-right="0.5pt solid black"><fo:block font-weight="bold">Document No.</fo:block><fo:block font-weight="bold" font-size="10pt">${orderId}</fo:block></fo:table-cell>
+                                            <fo:table-cell padding="3pt" border-right="0.5pt solid black"><fo:block font-weight="bold">Document No.</fo:block><fo:block font-weight="bold" font-size="10pt">${(order.zenithDocNumber)!orderId}</fo:block></fo:table-cell>
                                             <fo:table-cell padding="3pt"><fo:block font-weight="bold">Date</fo:block><fo:block font-weight="bold" font-size="10pt">${ec.l10n.format(order.entryDate, dateFormat)}</fo:block></fo:table-cell>
                                         </fo:table-row>
                                         <fo:table-row border-bottom="0.5pt solid black">
