@@ -13,6 +13,17 @@
     </transition>
 
     <transition name="addItem">
+        <actions>
+        <!-- ZE-SALES-002 f/u: match EditInvoice - org-isolation + draft-only guard, and run inside <actions>
+             so the new item actually commits (a bare <script> under <transition> does not persist its writes). -->
+        <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+        <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="curInv"/>
+        <if condition="curInv == null || (activeOrg &amp;&amp; curInv.fromPartyId != activeOrg &amp;&amp; !ec.user.isInGroup('ADMIN'))">
+            <return error="true" message="Credit note not found for your account."/>
+        </if>
+        <if condition="curInv.statusId != 'InvoiceInProcess'">
+            <return error="true" message="This credit/debit note has been issued (status: ${curInv.statusId}) so its items can no longer be changed."/>
+        </if>
         <script>
             // Get state codes
             def invoice = ec.entity.find("mantle.account.invoice.Invoice").condition("invoiceId", invoiceId).one()
@@ -84,12 +95,23 @@
                 totalCgst: tCgst, totalSgst: tSgst, totalIgst: tIgst, totalTaxableAmount: tTaxable
             ]).call()
         </script>
-
+        </actions>
         <default-response url="."/>
     </transition>
 
     <transition name="deleteItem">
-        <service-call name="delete#mantle.account.invoice.InvoiceItem"/>
+        <actions>
+        <!-- ZE-SALES-002 f/u: match EditInvoice - org-isolation + draft-only guard, inside <actions> so the
+             totals recompute commits. -->
+        <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+        <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="curInv"/>
+        <if condition="curInv == null || (activeOrg &amp;&amp; curInv.fromPartyId != activeOrg &amp;&amp; !ec.user.isInGroup('ADMIN'))">
+            <return error="true" message="Credit note not found for your account."/>
+        </if>
+        <if condition="curInv.statusId != 'InvoiceInProcess'">
+            <return error="true" message="This credit/debit note has been issued so its items can no longer be changed."/>
+        </if>
+        <service-call name="delete#mantle.account.invoice.InvoiceItem" in-map="context"/>
         <script>
             ec.service.sync().name("mantle.account.InvoiceServices.update#InvoiceTotals").parameters([invoiceId:invoiceId]).call()
             
@@ -107,6 +129,53 @@
                 totalCgst: tCgst, totalSgst: tSgst, totalIgst: tIgst, totalTaxableAmount: tTaxable
             ]).call()
         </script>
+        </actions>
+        <default-response url="."/>
+    </transition>
+
+    <!-- ZE-SALES-002 f/u: edit a line's quantity / unit price (mirrors EditInvoice updateItem). Same guards;
+         recompute the line's GST amounts from its stored rates, then refresh the note + Indian-GST totals. -->
+    <transition name="updateItem">
+        <actions>
+            <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="curInv"/>
+            <if condition="curInv == null || (activeOrg &amp;&amp; curInv.fromPartyId != activeOrg &amp;&amp; !ec.user.isInGroup('ADMIN'))">
+                <return error="true" message="Credit note not found for your account."/>
+            </if>
+            <if condition="curInv.statusId != 'InvoiceInProcess'">
+                <return error="true" message="This credit/debit note has been issued (status: ${curInv.statusId}) so its items can no longer be changed."/>
+            </if>
+            <script><![CDATA[
+                def item = ec.entity.find("mantle.account.invoice.InvoiceItem")
+                            .condition("invoiceId", invoiceId).condition("invoiceItemSeqId", invoiceItemSeqId).one()
+                if (item == null) { ec.message.addError("Line item not found."); return }
+                def qty = new BigDecimal(quantity ?: 0)
+                def price = new BigDecimal(amount ?: 0)
+                if (qty.signum() <= 0) { ec.message.addError("Quantity must be greater than zero."); return }
+                if (price.signum() < 0) { ec.message.addError("Unit price cannot be negative."); return }
+                def taxableVal = qty.multiply(price)
+                def cgstRate = (item.cgstRate ?: 0.0) as BigDecimal
+                def sgstRate = (item.sgstRate ?: 0.0) as BigDecimal
+                def igstRate = (item.igstRate ?: 0.0) as BigDecimal
+                def cgstAmount = taxableVal.multiply(cgstRate).divide(new BigDecimal(100), 2, java.math.RoundingMode.HALF_UP)
+                def sgstAmount = taxableVal.multiply(sgstRate).divide(new BigDecimal(100), 2, java.math.RoundingMode.HALF_UP)
+                def igstAmount = taxableVal.multiply(igstRate).divide(new BigDecimal(100), 2, java.math.RoundingMode.HALF_UP)
+                if (curInv.isReverseCharge == 'Y') { cgstAmount = 0.0; sgstAmount = 0.0; igstAmount = 0.0 }
+                ec.service.sync().name("update#mantle.account.invoice.InvoiceItem").parameters([
+                    invoiceId:invoiceId, invoiceItemSeqId:invoiceItemSeqId,
+                    quantity:qty, amount:price, taxableAmount:taxableVal,
+                    cgstAmount:cgstAmount, sgstAmount:sgstAmount, igstAmount:igstAmount]).call()
+                ec.service.sync().name("mantle.account.InvoiceServices.update#InvoiceTotals").parameters([invoiceId:invoiceId]).call()
+                def invItems = ec.entity.find("mantle.account.invoice.InvoiceItem").condition("invoiceId", invoiceId).list()
+                def tCgst = 0.0, tSgst = 0.0, tIgst = 0.0, tTaxable = 0.0
+                for (def it : invItems) {
+                    tCgst += (it.cgstAmount ?: 0.0); tSgst += (it.sgstAmount ?: 0.0); tIgst += (it.igstAmount ?: 0.0)
+                    tTaxable += (it.taxableAmount ?: ((it.quantity?:1)*(it.amount?:0)))
+                }
+                ec.service.sync().name("update#mantle.account.invoice.Invoice").parameters([
+                    invoiceId:invoiceId, totalCgst:tCgst, totalSgst:tSgst, totalIgst:tIgst, totalTaxableAmount:tTaxable]).call()
+            ]]></script>
+        </actions>
         <default-response url="."/>
     </transition>
 
@@ -119,7 +188,9 @@
 
     <actions>
         <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="invoice"/>
-        
+        <!-- ZE-SALES-002 f/u: editable only while a draft (In-Process); gate the add/edit/delete controls. -->
+        <set field="isDraft" from="invoice?.statusId == 'InvoiceInProcess'"/>
+
         <entity-find entity-name="mantle.account.invoice.InvoiceItem" list="invoiceItems">
             <econdition field-name="invoiceId"/>
             <order-by field-name="invoiceItemSeqId"/>
@@ -236,7 +307,8 @@
         <container style="zenith-card q-pa-md bg-white shadow-1 border-radius-md q-mb-lg">
             <container style="row justify-between items-center q-mb-md border-bottom q-pb-sm">
                 <label text="Adjustment Items" type="h5" style="text-primary text-weight-bold q-my-none"/>
-                
+
+                <section name="AddItemSec" condition="isDraft"><widgets>
                 <container-dialog id="AddItemDialog" button-text="Add Adjustment" button-class="q-btn--flat bg-primary text-white border-radius-md">
                     <form-single name="AddItemForm" transition="addItem">
                         <field name="invoiceId"><default-field><hidden/></default-field></field>
@@ -267,6 +339,9 @@
                         <field name="submitButton"><default-field title="Add Item"><submit/></default-field></field>
                     </form-single>
                 </container-dialog>
+                </widgets><fail-widgets>
+                    <label text="Issued note - locked. Items can no longer be changed; reverse it with an opposite note if needed." type="span" style="text-caption text-warning text-weight-bold"/>
+                </fail-widgets></section>
             </container>
 
             <form-list name="InvoiceItemsForm" list="invoiceItems" skip-form="true" header-dialog="true" show-csv-button="true" show-xlsx-button="true" show-page-size="true">
@@ -288,11 +363,27 @@
                     <label text="${currSymbol}${ec.l10n.format(((quantity ?: 0) * (amount ?: 0)) + (igstAmount ?: 0) + (cgstAmount ?: 0) + (sgstAmount ?: 0), '#,##,##0.00')}" type="span" style="text-weight-bold text-dark"/>
                 </default-field></field>
                 
-                <field name="deleteItem">
-                    <default-field title=" ">
-                        <link url="deleteItem" parameter-map="[invoiceId:invoiceId, invoiceItemSeqId:invoiceItemSeqId]" icon="delete" style="text-danger" confirmation="Remove item?"/>
-                    </default-field>
-                </field>
+                <!-- ZE-SALES-002 f/u: per-row Edit (qty / unit price) on a DRAFT, mirroring EditInvoice. -->
+                <field name="editItem"><default-field title="">
+                    <section name="EditItemSec" condition="isDraft"><widgets>
+                        <container-dialog id="EditItemDialog" button-text="Edit" button-class="q-btn--flat text-primary">
+                            <form-single name="EditItemForm" transition="updateItem">
+                                <field name="invoiceId"><default-field><hidden default-value="${invoiceId}"/></default-field></field>
+                                <field name="invoiceItemSeqId"><default-field><hidden default-value="${invoiceItemSeqId}"/></default-field></field>
+                                <field name="itemLabel"><default-field title="Item"><label text="${description ?: ('#' + invoiceItemSeqId)}" type="span" style="text-dark text-weight-bold"/></default-field></field>
+                                <field name="quantity"><default-field title="Quantity"><text-line size="10" default-value="${quantity}"/></default-field></field>
+                                <field name="amount"><default-field title="Unit Price"><text-line size="15" default-value="${amount}"/></default-field></field>
+                                <field name="submitButton"><default-field title=""><submit text="Save" style="q-btn bg-primary text-white border-radius-sm glossy"/></default-field></field>
+                            </form-single>
+                        </container-dialog>
+                    </widgets></section>
+                </default-field></field>
+                <!-- ZE-SALES-002 f/u: delete carries text so /apps renders its FontAwesome icon; gated to drafts. -->
+                <field name="deleteItem"><default-field title=" ">
+                    <section name="DeleteItemSec" condition="isDraft"><widgets>
+                        <link url="deleteItem" text="Remove" parameter-map="[invoiceId:invoiceId, invoiceItemSeqId:invoiceItemSeqId]" icon="fa fa-trash-o" class="q-btn--flat text-negative" confirmation="Remove item?"/>
+                    </widgets></section>
+                </default-field></field>
                 <field name="findButton"><header-field title="Find"><submit/></header-field></field>
                 </form-list>
         </container>
