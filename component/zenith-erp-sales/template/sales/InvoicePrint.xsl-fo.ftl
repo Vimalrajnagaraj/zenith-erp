@@ -172,6 +172,13 @@
                                             <fo:block font-size="9pt">${(((invoice.isReverseCharge)!'N') == 'Y')?string('Yes', 'No')}</fo:block>
                                         </fo:table-cell>
                                     </fo:table-row>
+                                    <#-- ZE-SALES-016 f/u (SL-070): show the document status on the printed tax invoice -->
+                                    <fo:table-row>
+                                        <fo:table-cell>
+                                            <fo:block font-weight="bold">Status:</fo:block>
+                                            <fo:block font-size="10pt" font-weight="bold">${statusLabel!"-"}</fo:block>
+                                        </fo:table-cell>
+                                    </fo:table-row>
                                 </fo:table-body>
                             </fo:table>
                         </fo:table-cell>
