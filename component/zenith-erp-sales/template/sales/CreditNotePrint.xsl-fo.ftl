@@ -71,7 +71,8 @@
                                             <fo:table-cell padding="3pt" background-color="#f0f0f0"><fo:block font-weight="bold">Original Inv. Date</fo:block><fo:block><#if origInv?? && origInv.invoiceDate??>${ec.l10n.format(origInv.invoiceDate, dateFormat)}<#else>N/A</#if></fo:block></fo:table-cell>
                                         </fo:table-row>
                                         <fo:table-row>
-                                            <fo:table-cell padding="3pt" border-right="0.5pt solid black" number-columns-spanned="2"><fo:block font-weight="bold">Reason for Issuance:</fo:block><fo:block><@encodeText invoice.invoiceMessage ! 'Sales Return'/></fo:block></fo:table-cell>
+                                            <fo:table-cell padding="3pt" border-right="0.5pt solid black"><fo:block font-weight="bold">Reason for Issuance:</fo:block><fo:block><@encodeText invoice.invoiceMessage ! 'Sales Return'/></fo:block></fo:table-cell>
+                                            <fo:table-cell padding="3pt"><fo:block font-weight="bold">Status</fo:block><fo:block font-weight="bold" font-size="9pt">${statusLabel!"-"}</fo:block></fo:table-cell>
                                         </fo:table-row>
                                     </fo:table-body>
                                 </fo:table>
