@@ -58,7 +58,66 @@
                 in-map="[partyId:partyId, gstin:gstin, gstRegistrationType:gstRegistrationType,
                          stateCode:stateCode, isActive:'Y',
                          isCompositionScheme:(gstRegistrationType == 'Composition' ? 'Y' : 'N')]"/>
+            <!-- ZE-SALES-0306 f/u: a real GSTIN's own state code is authoritative, so drop any manual
+                 place-of-supply hint (a region-only, numberless tax registration) previously set on this
+                 party, otherwise it would shadow the GSTIN in get#PartyTaxRegistration. -->
+            <entity-find entity-name="zenith.erp.tax.TaxRegistration" list="_posRegs">
+                <econdition field-name="partyId"/>
+                <econdition field-name="registrationNumber" operator="is-null"/>
+            </entity-find>
+            <iterate list="_posRegs" entry="_pr"><entity-delete value-field="_pr"/></iterate>
             <message>GSTIN ${gstin} added.</message>
+        </actions>
+    </service>
+
+    <!-- ZE-SALES-0306 f/u: record a customer's PLACE OF SUPPLY (state) when they have NO GSTIN, so an
+         unregistered OUT-OF-STATE buyer is billed IGST. (A no-GSTIN buyer otherwise correctly defaults to
+         the seller's state -> intra / CGST+SGST.) Stored as a region-only tax registration (no number or
+         authority) which is exactly the regionGeoId get#PartyTaxRegistration reads. A GSTIN, if present,
+         is authoritative and sets the state itself, so this refuses for a GST-registered contact. A blank
+         regionGeoId clears the value. Org-isolation guarded. -->
+    <service verb="set" noun="ContactPlaceOfSupply">
+        <in-parameters>
+            <parameter name="partyId" required="true"/>
+            <parameter name="regionGeoId"/><!-- 2-digit GST state code (e.g. 27); blank clears the value -->
+        </in-parameters>
+        <actions>
+            <service-call name="zenith.contacts.ContactServices.assert#ContactAccess" in-map="[partyId:partyId]" out-map="_acc"/>
+            <if condition="!_acc.allowed"><return/></if>
+            <set field="regionGeoId" from="regionGeoId?.trim()"/>
+            <!-- our place-of-supply row is the party's region-only (numberless) tax registration -->
+            <entity-find entity-name="zenith.erp.tax.TaxRegistration" list="_regs">
+                <econdition field-name="partyId"/>
+                <econdition field-name="registrationNumber" operator="is-null"/>
+            </entity-find>
+            <if condition="!regionGeoId">
+                <!-- cleared -> remove any existing place-of-supply row and stop -->
+                <iterate list="_regs" entry="_pr"><entity-delete value-field="_pr"/></iterate>
+                <return/>
+            </if>
+            <!-- a GSTIN sets the state itself; don't let a manual value shadow it -->
+            <entity-find-count entity-name="zenith.erp.india.IndiaGstin" count-field="_gcnt">
+                <econdition field-name="partyId"/>
+                <econdition field-name="isActive" value="Y"/>
+            </entity-find-count>
+            <if condition="_gcnt &gt; 0">
+                <return error="true" message="This customer has a GSTIN, which already sets their state. Remove the GSTIN to set a state manually."/>
+            </if>
+            <!-- validate against the known Indian state codes -->
+            <entity-find-count entity-name="zenith.erp.india.IndiaState" count-field="_stCnt">
+                <econdition field-name="stateCode" from="regionGeoId"/>
+            </entity-find-count>
+            <if condition="_stCnt == 0"><return error="true" message="Please choose a valid state."/></if>
+            <if condition="_regs">
+                <service-call name="update#zenith.erp.tax.TaxRegistration"
+                    in-map="[registrationId:_regs[0].registrationId, regionGeoId:regionGeoId, isActive:'Y']"/>
+                <else>
+                    <service-call name="create#zenith.erp.tax.TaxRegistration"
+                        in-map="[partyId:partyId, regionGeoId:regionGeoId, isActive:'Y', isDefault:'Y', isPrimary:'N',
+                                 organizationPartyId:ec.user.getPreference('ACTIVE_ORGANIZATION')]"/>
+                </else>
+            </if>
+            <message>Place of supply set to state ${regionGeoId}.</message>
         </actions>
     </service>
 
@@ -255,6 +314,15 @@
                                        registrationTypeEnumId:taxRegistrationTypeEnumId ?: 'TrtGeneral',
                                        registrationNumber:taxRegistrationNumber,
                                        regionGeoId:regionGeoId]"/>
+            </if>
+
+            <!-- ZE-SALES-0306 f/u: for a NO-GSTIN customer, a chosen state IS the place of supply, so an
+                 out-of-state unregistered buyer is billed IGST. Skipped when a GSTIN was entered (its own
+                 state wins) or a numbered registration was supplied above. Best-effort (ignore-error): an
+                 invalid state must never block creating the customer. -->
+            <if condition="regionGeoId?.trim() &amp;&amp; !gstin?.trim() &amp;&amp; !taxRegistrationNumber?.trim()">
+                <service-call name="zenith.contacts.ContactServices.set#ContactPlaceOfSupply" ignore-error="true"
+                              in-map="[partyId:partyId, regionGeoId:regionGeoId]"/>
             </if>
         </actions>
     </service>
