@@ -23,6 +23,29 @@ reference), reassign the list-visibility report to a new ID (`ZE-USERS-002`) and
 as Not-Reproducible with the note above. Adjust the exact numbers to your convention —
 the point is *two IDs, not one*.
 
+## QA intake — re-test against the current build before filing
+
+Several S2 reports this cycle were **already resolved when they arrived**: the defect was
+real when the tester saw it, but the fix had shipped (or the data had been corrected)
+before the report reached dev. A re-test against the live build at filing time would have
+closed them with no dev round-trip.
+
+| Report | Filed | Status on arrival |
+|---|---|---|
+| `ZE-USERS-002` — reset pw asks "Old Password" | 2026-07-04 | Fixed **2026-07-05** by ZE-ROLE-003 (`448de53`) — one day later |
+| `ZE-USERS-001` (list-visibility) | 2026-07-04 | **Not reproducible** — create-then-refresh works on /apps and /qapps |
+| `ZE-SETTINGS-0203` — Settings "Access Restricted" | — | Gate works for admins; the tested account simply lacked `ZENITH_ADMIN` (data), since corrected |
+
+**Two cheap checks before filing (both dev-free):**
+1. **Re-run the exact repro on https://erp.zetaclantech.com right now.** If it passes, the
+   build already has the fix — don't file, or file as "was failing, now passes, please
+   confirm closed."
+2. **Record the build/date you tested against.** A report dated before the last deploy is a
+   prime suspect; noting it lets dev check the fix date first.
+
+This is a process fix on the QA side: dev can't stop pre-fix reports from being written,
+but a re-test gate at intake removes most of them before they cost a round-trip.
+
 ## Other collisions found while scanning the report set
 - **`ZE-AUTH-002`** appears in **two** files: `ZE-AUTH-002-Google-Login-UI-Switch-High.pdf`
   (standalone) **and** `ZE-INV-001_and_ZE-AUTH-002_Bug_Report.pdf` (bundled with `ZE-INV-001`).
