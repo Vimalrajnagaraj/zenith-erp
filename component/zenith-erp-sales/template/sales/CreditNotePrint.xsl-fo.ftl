@@ -134,7 +134,7 @@
                             <#assign taxable = item.taxableAmount ! ((item.quantity!1)*(item.amount!0))>
                             <fo:table-row font-size="7.5pt" border-bottom="0.1pt solid gray">
                                 <fo:table-cell padding="2pt" border-right="0.5pt solid black"><fo:block text-align="center">${item_index+1}</fo:block></fo:table-cell>
-                                <fo:table-cell padding="2pt" border-right="0.5pt solid black"><fo:block><@encodeText (item.description)!""/></fo:block></fo:table-cell>
+                                <fo:table-cell padding="2pt" border-right="0.5pt solid black"><fo:block><@encodeText (item.description)!""/></fo:block><#if (item.discountPercent!0)?number != 0><fo:block font-size="6pt" color="#c0392b">Less ${item.discountPercent}% discount (Rs. <@formatINR item.discountAmount!0/>)</fo:block></#if></fo:table-cell>
                                 <fo:table-cell padding="2pt" border-right="0.5pt solid black"><fo:block text-align="center">${item.hsnSacCode!"-"}</fo:block></fo:table-cell>
                                 <fo:table-cell padding="2pt" border-right="0.5pt solid black"><fo:block text-align="center">${item.quantity!"1"}</fo:block></fo:table-cell>
                                 <fo:table-cell padding="2pt" border-right="0.5pt solid black"><fo:block text-align="right"><@formatINR item.amount!0/></fo:block></fo:table-cell>
