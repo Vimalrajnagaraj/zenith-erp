@@ -8,6 +8,32 @@
         <default-response url="."/>
     </transition>
 
+    <!-- ZE-SALES-024 f/u (SL-084): add / remove a slab of a Tiered structure. Org-guarded via the parent
+         structure so a user can't attach or delete slabs on another tenant's commission structure. -->
+    <transition name="createTier">
+        <actions>
+            <entity-find-one entity-name="zenith.erp.sales.CommissionStructure" value-field="_cs"><field-map field-name="commissionId"/></entity-find-one>
+            <set field="_org" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <if condition="_cs == null || (_org &amp;&amp; _cs.organizationPartyId != _org &amp;&amp; !ec.user.isInGroup('ADMIN'))">
+                <return error="true" message="Commission structure not found for your account."/>
+            </if>
+            <service-call name="create#zenith.erp.sales.CommissionTier" in-map="[commissionId:commissionId, minAmount:minAmount, rate:rate]"/>
+        </actions>
+        <default-response url="."/>
+    </transition>
+    <transition name="deleteTier">
+        <actions>
+            <entity-find-one entity-name="zenith.erp.sales.CommissionTier" value-field="_t"/>
+            <entity-find-one entity-name="zenith.erp.sales.CommissionStructure" value-field="_cs"><field-map field-name="commissionId" from="_t?.commissionId"/></entity-find-one>
+            <set field="_org" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <if condition="_t == null || (_org &amp;&amp; _cs?.organizationPartyId != _org &amp;&amp; !ec.user.isInGroup('ADMIN'))">
+                <return error="true" message="Slab not found for your account."/>
+            </if>
+            <service-call name="delete#zenith.erp.sales.CommissionTier" in-map="[commissionTierId:commissionTierId]"/>
+        </actions>
+        <default-response url="."/>
+    </transition>
+
     <actions>
         <entity-find entity-name="zenith.erp.sales.CommissionStructure" list="structures">
             <econdition field-name="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
@@ -17,6 +43,29 @@
             <search-form-inputs default-order-by="-calculatedDate"/>
             <econdition field-name="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
         </entity-find>
+
+        <!-- ZE-SALES-024 f/u (SL-084): Tiered structures (for the slab-add dropdown) + their slabs, scoped to
+             this org's tiered structures, for the nested Tier Slabs editor. -->
+        <script><![CDATA[
+            def _ts = []; def _tieredIds = []; def _nameById = [:]
+            for (cs in structures) {
+                if (cs.commissionTypeEnumId != 'CmtTiered') continue
+                def pd = ec.entity.find("mantle.party.PartyDetail").condition("partyId", cs.partyId).one()
+                def nm = ((pd?.firstName ?: '') + ' ' + (pd?.lastName ?: '')).trim() ?: cs.partyId
+                _ts.add([commissionId: cs.commissionId, label: nm])
+                _tieredIds.add(cs.commissionId); _nameById[cs.commissionId] = nm
+            }
+            tieredStructs = _ts
+            def _tiers = []
+            if (_tieredIds) {
+                for (t in ec.entity.find("zenith.erp.sales.CommissionTier").condition("commissionId", "in", _tieredIds).orderBy("minAmount").list()) {
+                    def m = new LinkedHashMap(t)
+                    m.salesperson = _nameById[t.commissionId] ?: t.commissionId
+                    _tiers.add(m)
+                }
+            }
+            commissionTiers = _tiers
+        ]]></script>
     </actions>
 
     <widgets>
@@ -38,10 +87,9 @@
                                 <econdition field-name="enumTypeId" value="CommissionType"/>
                             </entity-find>
                         </entity-options></drop-down></default-field></field>
-                    <!-- ZE-SALES-024 f/u (SL-084): the rate means different things per type — label it so, and
-                         expose minAmount so a Tiered (slab) structure can set its qualifying threshold. -->
+                    <!-- ZE-SALES-024 f/u (SL-084): the rate means different things per type — label it so. For a
+                         Tiered structure the slabs (amount bands) are managed in the Tier Slabs editor below. -->
                     <field name="rate"><default-field title="Rate (% for Percentage/Tiered, ₹/unit for Fixed Per Unit, flat ₹ for Fixed Per Order)"><text-line size="8"/></default-field></field>
-                    <field name="minAmount"><default-field title="Min Order Amount (Tiered slab only)"><text-line size="10"/></default-field></field>
                     <field name="validFrom"><default-field><date-time type="date"/></default-field></field>
                     <field name="validTo"><default-field><date-time type="date"/></default-field></field>
                     <field name="submitBtn"><default-field title="Create"><submit/></default-field></field>
@@ -59,9 +107,41 @@
                     <display-entity entity-name="moqui.basic.Enumeration" key-field-name="enumId" text="${description}"/>
                 </default-field></field>
                 <field name="rate"><default-field title="Rate / Amount"><display/></default-field></field>
-                <field name="minAmount"><default-field title="Min Order Amt"><display format="#,##0.00"/></default-field></field>
                 <field name="validFrom"><default-field title="From"><display format="dd-MMM-yyyy"/></default-field></field>
                 <field name="validTo"><default-field title="To"><display format="dd-MMM-yyyy"/></default-field></field>
+            </form-list>
+        </container>
+
+        <!-- ZE-SALES-024 f/u (SL-084): nested slab editor for Tiered structures — manage a salesperson's bands
+             in one place. The highest band whose "Order Amount ≥" the order total reaches sets the rate. -->
+        <container style="row items-center justify-between q-mb-md q-mt-lg">
+            <container style="column">
+                <label text="Tier Slabs" type="h5" style="text-weight-bold q-my-none"/>
+                <label text="For a 'Tiered (Slab)' salesperson, add one band per amount threshold — the highest band the order total reaches sets the commission rate." type="p" style="text-grey-7 text-caption q-mb-none"/>
+            </container>
+            <section name="AddTierSec" condition="tieredStructs"><widgets>
+                <container-dialog id="AddTier" button-text="Add Slab" type="success">
+                    <form-single name="TierForm" transition="createTier">
+                        <field name="commissionId"><default-field title="Tiered Salesperson">
+                            <drop-down><list-options list="tieredStructs" key="${commissionId}" text="${label}"/></drop-down>
+                        </default-field></field>
+                        <field name="minAmount"><default-field title="Order Amount ≥ (₹)"><text-line size="10"/></default-field></field>
+                        <field name="rate"><default-field title="Rate %"><text-line size="6"/></default-field></field>
+                        <field name="submitBtn"><default-field title="Add Slab"><submit/></default-field></field>
+                    </form-single>
+                </container-dialog>
+            </widgets><fail-widgets>
+                <label text="Create a salesperson with type 'Tiered (Slab)' above first, then add slabs here." type="span" style="text-caption text-warning text-weight-bold"/>
+            </fail-widgets></section>
+        </container>
+        <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-lg">
+            <form-list name="TierList" list="commissionTiers" skip-form="true">
+                <field name="salesperson"><default-field title="Salesperson"><label text="${salesperson}" type="strong" style="text-dark"/></default-field></field>
+                <field name="minAmount"><default-field title="Order Amount ≥"><display format="#,##,##0.00"/></default-field></field>
+                <field name="rate"><default-field title="Rate %"><display/></default-field></field>
+                <field name="remove"><default-field title="">
+                    <link url="deleteTier" text="Remove" parameter-map="[commissionTierId:commissionTierId]" icon="fa fa-trash-o" class="q-btn--flat text-negative" confirmation="Remove this slab?"/>
+                </default-field></field>
             </form-list>
         </container>
 
