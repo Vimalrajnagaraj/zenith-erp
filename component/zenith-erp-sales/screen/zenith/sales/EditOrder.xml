@@ -28,11 +28,22 @@
                         if (_p?.mrpAmount != null) price = _p.mrpAmount as BigDecimal
                     }
                 }
-                // ZE-SALES-0309: create#OrderItem requires the order part seq id. mantle create#Order makes
-                // one OrderPart (seq '01'); look it up so Add Item doesn't fail with "Field cannot be empty
-                // (Order Part Seq ID)". Falls back to '01' if somehow none exists.
+                // ZE-SALES-0309 / ZE-SALES-024 (SL-084): create#OrderItem requires an EXISTING OrderPart. mantle
+                // create#Order normally makes one (seq '01'), but an order with none (odd creation path / import)
+                // broke Add Item — first with "Field cannot be empty (Order Part Seq ID)", and after 0309's blind
+                // '01' fallback, with an FK violation (order_part_seq_id '01' not present in order_part). So look
+                // up the part, and CREATE one when the order has none, before adding the item.
                 def _parts = ec.entity.find("mantle.order.OrderPart").condition("orderId", orderId).orderBy("orderPartSeqId").list()
-                def _partSeq = _parts ? _parts[0].orderPartSeqId : '01'
+                def _partSeq
+                if (_parts) {
+                    _partSeq = _parts[0].orderPartSeqId
+                } else {
+                    // A minimal part satisfies create#OrderItem's FK; its parties (nullable on OrderPart) can be
+                    // set elsewhere. OrderHeader carries no vendor/customer — those live on OrderPart.
+                    ec.service.sync().name("create#mantle.order.OrderPart")
+                        .parameters([orderId: orderId, orderPartSeqId: '01']).call()
+                    _partSeq = '01'
+                }
                 def inMap = context + [unitAmount: price, orderPartSeqId: _partSeq]
                 ec.service.sync().name("mantle.order.OrderServices.create#OrderItem").parameters(inMap).call()
             </script>
@@ -105,6 +116,31 @@
         <error-response url="."/>
     </transition>
 
+    <!-- ZE-SALES-024 (SL-084): assign a salesperson to this order and calculate their commission from the
+         configured rate. Wires up CommissionServices.calculate#Commission, which had NO caller (orphaned) — so
+         a salesperson could never be assigned to an order and no commission was ever calculated. -->
+    <transition name="calculateCommission">
+        <actions>
+            <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <entity-find-one entity-name="mantle.order.OrderHeader" value-field="_ord"/>
+            <entity-find entity-name="mantle.order.OrderPart" list="_ordParts"><econdition field-name="orderId"/></entity-find>
+            <set field="_ovendor" from="_ordParts ? _ordParts[0].vendorPartyId : null"/>
+            <if condition="_ord == null || (activeOrg &amp;&amp; _ovendor &amp;&amp; _ovendor != activeOrg &amp;&amp; !ec.user.isInGroup('ADMIN'))">
+                <return error="true" message="Order not found for your account."/>
+            </if>
+            <if condition="!partyId">
+                <return error="true" message="Select a salesperson to calculate commission."/>
+            </if>
+            <!-- idempotent: clear any not-yet-approved commission for THIS order so re-assigning recalculates
+                 cleanly (keeps Approved/Paid rows). Scoped by orderId (globally unique) so disableAuthz is safe. -->
+            <script>
+                ec.entity.find("zenith.erp.sales.CommissionTransaction").condition("orderId", orderId).condition("statusId", "ComCalculated").disableAuthz().deleteAll()
+            </script>
+            <service-call name="zenith.sales.CommissionServices.calculate#Commission" in-map="[orderId:orderId, partyId:partyId]"/>
+        </actions>
+        <default-response url="."/>
+    </transition>
+
     <actions>
         <entity-find-one entity-name="mantle.order.OrderHeader" value-field="order"/>
         
@@ -135,6 +171,40 @@
         <entity-find-one entity-name="mantle.party.PartyDetail" value-field="vendor">
             <field-map field-name="partyId" from="orderPart?.vendorPartyId"/>
         </entity-find-one>
+
+        <!-- ZE-SALES-024 (SL-084): configured salespeople (for the assign dropdown) + any commission already
+             calculated for this order. -->
+        <entity-find entity-name="zenith.erp.sales.CommissionStructure" list="commStructures">
+            <econdition field-name="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+            <econdition field-name="isActive" value="Y"/>
+            <order-by field-name="partyId"/>
+        </entity-find>
+        <script><![CDATA[
+            def _sp = []; def _seen = [:]
+            for (cs in commStructures) {
+                if (_seen[cs.partyId]) continue
+                _seen[cs.partyId] = true
+                def pd = ec.entity.find("mantle.party.PartyDetail").condition("partyId", cs.partyId).one()
+                def nm = ((pd?.firstName ?: '') + ' ' + (pd?.lastName ?: '')).trim() ?: cs.partyId
+                _sp.add([partyId: cs.partyId, label: nm + '  (' + (cs.rate ?: 0) + '%)'])
+            }
+            commSalespeople = _sp
+        ]]></script>
+        <entity-find entity-name="zenith.erp.sales.CommissionTransaction" list="orderCommissions">
+            <econdition field-name="orderId"/>
+            <order-by field-name="-calculatedDate"/>
+        </entity-find>
+        <script><![CDATA[
+            def _oc = []
+            for (t in orderCommissions) {
+                def m = new LinkedHashMap(t)
+                def cs = t.commissionId ? ec.entity.find("zenith.erp.sales.CommissionStructure").condition("commissionId", t.commissionId).one() : null
+                def pd = cs?.partyId ? ec.entity.find("mantle.party.PartyDetail").condition("partyId", cs.partyId).one() : null
+                m.salespersonName = pd ? (((pd.firstName ?: '') + ' ' + (pd.lastName ?: '')).trim() ?: cs.partyId) : (cs?.partyId ?: 'Unassigned')
+                _oc.add(m)
+            }
+            orderCommissions = _oc
+        ]]></script>
     </actions>
 
     <widgets>
@@ -223,6 +293,33 @@
                 </container>
             </row-col>
         </container-row>
+
+        <!-- ZE-SALES-024 (SL-084): assign a salesperson to this order + auto-calculate their commission. -->
+        <container style="zenith-card q-pa-md bg-white shadow-1 border-radius-md q-mb-lg">
+            <label text="Salesperson &amp; Commission" type="h5" style="text-primary text-weight-bold q-mb-md border-bottom q-pb-sm"/>
+            <container style="row items-center justify-between q-mb-md">
+                <label text="Assign a salesperson to earn commission on this order — the amount is calculated automatically from their configured rate on the order total (${currSymbol}${ec.l10n.format(order.grandTotal ?: 0, '#,##,##0.00')})." type="p" style="text-grey-7 text-caption q-my-none"/>
+                <section name="AssignCommission" condition="commSalespeople"><widgets>
+                    <form-single name="CommissionForm" transition="calculateCommission">
+                        <field name="orderId"><default-field><hidden default-value="${orderId}"/></default-field></field>
+                        <field name="partyId"><default-field title="Salesperson">
+                            <drop-down><list-options list="commSalespeople" key="${partyId}" text="${label}"/></drop-down>
+                        </default-field></field>
+                        <field name="submitButton"><default-field title=""><submit text="Assign &amp; Calculate" icon="calculate" style="bg-teal-7 text-white text-weight-bold q-ml-sm border-radius-sm"/></default-field></field>
+                        <field-layout><field-row><field-ref name="partyId"/><field-ref name="submitButton"/></field-row></field-layout>
+                    </form-single>
+                </widgets><fail-widgets>
+                    <label text="No commission structures configured yet — set one up in Sales → Commissions first." type="span" style="text-caption text-warning text-weight-bold"/>
+                </fail-widgets></section>
+            </container>
+            <form-list name="OrderCommissionList" list="orderCommissions" skip-form="true">
+                <field name="salespersonName"><default-field title="Salesperson"><label text="${salespersonName}" type="strong" style="text-dark"/></default-field></field>
+                <field name="calculatedDate"><default-field title="Calculated"><display format="dd-MMM-yyyy HH:mm"/></default-field></field>
+                <field name="orderAmount"><default-field title="Order Total"><label text="${currSymbol}${ec.l10n.format(orderAmount ?: 0, '#,##,##0.00')}" type="span"/></default-field></field>
+                <field name="commissionAmount"><default-field title="Commission"><label text="${currSymbol}${ec.l10n.format(commissionAmount ?: 0, '#,##,##0.00')}" type="strong" style="text-teal-8"/></default-field></field>
+                <field name="statusId"><default-field title="Status"><display-entity entity-name="moqui.basic.StatusItem" key-field-name="statusId" text="${description}"/></default-field></field>
+            </form-list>
+        </container>
 
         <container style="zenith-card q-pa-md bg-white shadow-1 border-radius-md q-mb-lg">
             <container style="row justify-between items-center q-mb-md border-bottom q-pb-sm">
