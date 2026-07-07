@@ -3,6 +3,42 @@
         xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
         default-menu-title="Expiry Risk Dashboard" default-menu-index="2">
 
+    <!-- ZE-INV-001 (IV-100): the Expiry Risk module had no way to create expiry-tracked stock (the only flow that
+         sets an expiry date is ReceiveInventory, which needs a purchase order), so the dashboard was always empty.
+         This adds a direct "Add Expiring Stock" entry that creates an Asset with an expiry date, batch, quantity
+         and a valuationRate (which is what the dashboard values by — ReceiveInventory only set acquireCost), owned
+         by the active org so it shows for that tenant. Also writes the AssetDetail ledger entry so the on-hand
+         quantity persists (a direct qoh with no ledger receipt gets zeroed on the first sale). -->
+    <transition name="createExpiryStock">
+        <actions>
+            <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <if condition="!productId"><return error="true" message="Please select a product."/></if>
+            <if condition="!expiryDate"><return error="true" message="Please enter an expiry date."/></if>
+            <script><![CDATA[
+                def _numOk = { v -> v != null && v.toString().trim() != '' && (v.toString().trim() ==~ /\d*\.?\d+/) }
+                if (!_numOk(quantity)) { ec.message.addError("Quantity must be a number greater than zero."); return }
+                def _qty = new BigDecimal(quantity)
+                if (_qty.signum() <= 0) { ec.message.addError("Quantity must be greater than zero."); return }
+                def _rate = _numOk(unitValue) ? new BigDecimal(unitValue) : BigDecimal.ZERO
+                def _org = (activeOrg && activeOrg != '_NA_') ? activeOrg : null
+                def inMap = [
+                    assetTypeEnumId:'AstTpInventory', classEnumId:'AsClsInventory', statusId:'AstAvailable',
+                    productId:productId, quantityOnHandTotal:_qty, availableToPromiseTotal:_qty,
+                    valuationRate:_rate, acquireCost:_rate, expiryDate:expiryDate, receivedDate:ec.user.nowTimestamp
+                ]
+                if (_org) inMap.ownerPartyId = _org
+                if (facilityId) inMap.facilityId = facilityId
+                if (batchNumber) inMap.batchNumber = batchNumber
+                def _a = ec.service.sync().name("create#mantle.product.asset.Asset").parameters(inMap).call()
+                ec.service.sync().name("create#mantle.product.asset.AssetDetail").parameters([
+                    assetId:_a.assetId, productId:productId, effectiveDate:ec.user.nowTimestamp,
+                    quantityOnHandDiff:_qty, availableToPromiseDiff:_qty, description:'Expiry-tracked stock added']).call()
+                ec.message.addMessage("Added " + _qty + " units (expiry " + expiryDate + "). It will appear below if it expires within 90 days.")
+            ]]></script>
+        </actions>
+        <default-response url="."/>
+    </transition>
+
     <actions>
         <script><![CDATA[
             import java.sql.Timestamp
@@ -45,6 +81,41 @@
     </actions>
 
     <widgets>
+        <!-- ZE-INV-001 (IV-100): direct entry to create expiry-tracked stock so the dashboard can be populated. -->
+        <container style="row items-center justify-between q-mb-md">
+            <label text="Track batches that will expire soon and act before they go to waste." type="span" style="text-grey-7 text-caption"/>
+            <container-dialog id="AddExpiryStockDialog" button-text="Add Expiring Stock" button-icon="fa fa-plus-circle"
+                              button-class="q-btn bg-primary text-white text-weight-bold border-radius-md q-px-md">
+                <form-single name="AddExpiryStockForm" transition="createExpiryStock">
+                    <field name="productId"><default-field title="Product">
+                        <drop-down allow-empty="false">
+                            <entity-options key="${productId}" text="${pseudoId} - ${productName}">
+                                <entity-find entity-name="mantle.product.Product">
+                                    <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+                                    <order-by field-name="productName"/>
+                                </entity-find>
+                            </entity-options>
+                        </drop-down>
+                    </default-field></field>
+                    <field name="batchNumber"><default-field title="Batch / Lot (Optional)"><text-line size="20"/></default-field></field>
+                    <field name="quantity"><default-field title="Quantity"><text-line size="10"/></default-field></field>
+                    <field name="unitValue"><default-field title="Value per Unit (${currSymbol})"><text-line size="10"/></default-field></field>
+                    <field name="expiryDate"><default-field title="Expiry Date"><date-time type="date"/></default-field></field>
+                    <field name="facilityId"><default-field title="Store / Warehouse (Optional)">
+                        <drop-down allow-empty="true">
+                            <entity-options key="${facilityId}" text="${facilityName}">
+                                <entity-find entity-name="mantle.facility.Facility">
+                                    <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+                                    <order-by field-name="facilityName"/>
+                                </entity-find>
+                            </entity-options>
+                        </drop-down>
+                    </default-field></field>
+                    <field name="submitButton"><default-field title=""><submit text="Add Stock"/></default-field></field>
+                </form-single>
+            </container-dialog>
+        </container>
+
         <container-row>
             <row-col lg="4" md="6">
                 <container-box>
