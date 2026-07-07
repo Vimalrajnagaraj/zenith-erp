@@ -46,6 +46,14 @@
                 <return error="true" message="This invoice has been issued (status: ${curInv.statusId}) so its line items can no longer be changed. To correct it, raise a credit or debit note."/>
             </if>
             <script>
+                // ZE-SALES-001 (SL-032/SL-046): reject non-numeric Quantity/Unit Price/Discount up front so a
+                // typo like "wads" returns a friendly error instead of a BigDecimal NumberFormatException (which
+                // would break the add and the GST math). Blank is allowed (price auto-fills; qty defaults to 0).
+                def _numOk = { v -> !v || v.toString().trim() == '' || (v.toString().trim() ==~ /-?\d*\.?\d+/) }
+                if (!_numOk(quantity) || !_numOk(amount) || !_numOk(discountPercent)) {
+                    ec.message.addError("Quantity, Unit Price and Discount must be numbers (letters aren't allowed).")
+                    return
+                }
                 // GST intra/inter-state is decided by the parties' registered state (tax-registration
                 // regionGeoId) — the same source the invoice service uses. (Previously read stateProvinceGeoId
                 // off PartyContactMechInfo, which has no such field, so it errored or always fell back to IGST.)
@@ -118,8 +126,15 @@
                     igstAmount = 0.0; cgstAmount = 0.0; sgstAmount = 0.0
                 }
 
+                // ZE-SALES-002 (SL-032): the line-items grid shows the item description; when the user picks a
+                // product but leaves the Description box blank it saved null and the grid read "N/A". Default the
+                // description to the product's name so the grid shows the product, not N/A.
+                def _prodForDesc = productId ? ec.entity.find("mantle.product.Product").condition("productId", productId).one() : null
+                def _finalDesc = ((description ?: '').toString().trim()) ?: (_prodForDesc?.productName ?: '')
+
                 // Call standard create item service but pass extended fields
                 def inMap = context + [
+                    description: _finalDesc,
                     itemTypeEnumId: 'ItemSales',
                     amount: price,
                     taxableAmount: taxableVal,
@@ -247,6 +262,12 @@
                 def item = ec.entity.find("mantle.account.invoice.InvoiceItem")
                             .condition("invoiceId", invoiceId).condition("invoiceItemSeqId", invoiceItemSeqId).one()
                 if (item == null) { ec.message.addError("Line item not found."); return }
+                // ZE-SALES-001 (SL-032/SL-046): reject non-numeric input before parsing (avoids NumberFormatException).
+                def _numOk = { v -> !v || v.toString().trim() == '' || (v.toString().trim() ==~ /-?\d*\.?\d+/) }
+                if (!_numOk(quantity) || !_numOk(amount) || !_numOk(discountPercent)) {
+                    ec.message.addError("Quantity, Unit Price and Discount must be numbers (letters aren't allowed).")
+                    return
+                }
                 def qty = new BigDecimal(quantity ?: 0)
                 def price = new BigDecimal(amount ?: 0)
                 if (qty.signum() <= 0) { ec.message.addError("Quantity must be greater than zero."); return }
@@ -303,6 +324,16 @@
              add / edit / delete controls on this so an issued invoice reads cleanly as locked, instead of
              showing controls that the server then rejects. -->
         <set field="isDraft" from="invoice?.statusId == 'InvoiceInProcess'"/>
+
+        <!-- ZE-SALES-003 (SL-050): the status dropdown listed EVERY invoice status, so choosing an invalid jump
+             (e.g. In-Process -> Payment Received) reached mantle's status-flow validation and threw a hard red
+             banner. Offer only the current status + its valid next states in the sales (InvoiceReceivable) flow,
+             so invalid jumps aren't selectable. Same pattern as ZE-SALES-0302 for orders/quotes. -->
+        <entity-find entity-name="moqui.basic.StatusFlowTransition" list="_invStTrans">
+            <econdition field-name="statusFlowId" value="InvoiceReceivable"/>
+            <econdition field-name="statusId" from="invoice?.statusId"/>
+        </entity-find>
+        <set field="allowedInvStatusIds" from="(([invoice?.statusId] + _invStTrans.collect{ it.toStatusId }).findAll{ it }).unique()"/>
 
         <set field="invoiceItems" from="[]"/>
         <if condition="invoice != null">
@@ -405,7 +436,7 @@
                             <drop-down current="selected">
                                 <entity-options key="${statusId}" text="${description}">
                                     <entity-find entity-name="moqui.basic.StatusItem">
-                                        <econdition field-name="statusTypeId" value="Invoice"/>
+                                        <econdition field-name="statusId" operator="in" from="allowedInvStatusIds"/>
                                         <order-by field-name="sequenceNum"/>
                                     </entity-find>
                                 </entity-options>
@@ -670,6 +701,31 @@
             </form-list>
             <label text="No changes recorded yet." type="p" style="text-grey-6 q-pa-md text-center" condition="!noteHistory"/>
         </container>
+
+        <!-- ZE-SALES-001 (SL-032/SL-046): make the Add/Edit Item Quantity, Unit Price and Discount boxes
+             numeric-only in the browser so letters are rejected immediately (the server-side check is the
+             backstop). /apps renders injected scripts (same pattern as WarrantyPolicies); the modal forms are
+             already in the DOM, so type them on load and re-assert after any click (dialog open). -->
+        <render-mode><text type="html"><![CDATA[
+<script>
+(function(){
+  function makeNumeric(){
+    var sel = 'input[name="quantity"],input[name="amount"],input[name="discountPercent"]';
+    var nodes = document.querySelectorAll(sel);
+    for (var k=0; k<nodes.length; k++){
+      var i = nodes[k];
+      if (i.getAttribute('type') !== 'number'){
+        i.setAttribute('type','number'); i.setAttribute('step','any');
+        i.setAttribute('min','0'); i.setAttribute('inputmode','decimal');
+      }
+    }
+  }
+  if (document.readyState !== 'loading'){ makeNumeric(); }
+  else { document.addEventListener('DOMContentLoaded', makeNumeric); }
+  document.addEventListener('click', function(){ setTimeout(makeNumeric, 250); }, true);
+})();
+</script>
+]]></text></render-mode>
 
     </widgets>
 </screen>
