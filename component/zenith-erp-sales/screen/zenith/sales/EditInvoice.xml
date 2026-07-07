@@ -32,6 +32,42 @@
         <default-response url="."/>
     </transition>
 
+    <transition name="markPaidCash">
+        <actions>
+            <!-- ZE-SALES-003 f/u: one-click "cash sale -> paid" for a counter invoice, so the cashier doesn't have
+                 to click through Finalized -> Sent -> Acked -> Payment Received. Records a cash Payment for the
+                 grand total (kept at PmntPromised so it does NOT trigger Mantle's GL-posting/auto-apply cascade —
+                 this instance tracks invoices by status, not double-entry GL) and settles the invoice to Payment
+                 Received. Mirrors the proven PaymentGatewayServices flow; a direct entity-update is used because
+                 update#Invoice's status flow rejects ->PmtRecvd while unpaidTotal != 0. Org-scoped; draft + items only. -->
+            <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="curInv"/>
+            <if condition="curInv == null || (activeOrg &amp;&amp; curInv.fromPartyId != activeOrg &amp;&amp; !ec.user.isInGroup('ADMIN'))">
+                <return error="true" message="Invoice not found for your account."/>
+            </if>
+            <if condition="curInv.statusId != 'InvoiceInProcess'">
+                <return error="true" message="Only a draft (In-Process) invoice can be marked paid with this shortcut."/>
+            </if>
+            <entity-find-count entity-name="mantle.account.invoice.InvoiceItem" count-field="_itemCnt"><econdition field-name="invoiceId"/></entity-find-count>
+            <if condition="_itemCnt == 0">
+                <return error="true" message="Add at least one item before marking this invoice paid."/>
+            </if>
+            <script><![CDATA[
+                def _grand = ((curInv.invoiceTotal ?: 0) + (curInv.totalCgst ?: 0) + (curInv.totalSgst ?: 0) + (curInv.totalIgst ?: 0)) as BigDecimal
+                ec.service.sync().name("create#mantle.account.payment.Payment").parameters([
+                    fromPartyId: curInv.toPartyId, toPartyId: curInv.fromPartyId, forInvoiceId: curInv.invoiceId,
+                    paymentTypeEnumId: 'PtInvoicePayment', paymentInstrumentEnumId: 'PiCash',
+                    amount: _grand, amountUomId: curInv.currencyUomId, effectiveDate: ec.user.nowTimestamp,
+                    statusId: 'PmntPromised']).call()
+                def _iu = ec.entity.find("mantle.account.invoice.Invoice").condition("invoiceId", invoiceId).one()
+                _iu.statusId = 'InvoicePmtRecvd'; _iu.appliedPaymentsTotal = _grand; _iu.unpaidTotal = 0
+                _iu.update()
+                ec.message.addMessage("Invoice marked as paid by cash (₹" + _grand + ").")
+            ]]></script>
+        </actions>
+        <default-response url="."/>
+    </transition>
+
     <transition name="addItem">
         <actions>
             <!-- Org-isolation: re-check ownership by PK before mutating (block cross-tenant IDOR). Sales invoice org = fromPartyId. -->
@@ -445,6 +481,13 @@
                         <field name="submitButton"><default-field title=""><submit text="Update Status" style="q-btn bg-primary text-white border-radius-sm glossy"/></default-field></field>
                         <field-layout><field-row><field-ref name="statusId"/><field-ref name="submitButton"/></field-row></field-layout>
                     </form-single>
+                    <!-- ZE-SALES-003 f/u: one-click cash-sale shortcut on a draft counter invoice with items. -->
+                    <section name="MarkPaidSec" condition="isDraft &amp;&amp; invoiceItems"><widgets>
+                        <form-single name="MarkPaidForm" transition="markPaidCash">
+                            <field name="invoiceId"><default-field><hidden default-value="${invoiceId}"/></default-field></field>
+                            <field name="submitButton"><default-field title=""><submit text="Mark Paid (Cash)" icon="fa fa-money-bill-wave" style="q-btn bg-green-7 text-white text-weight-bold border-radius-sm q-ml-sm glossy"/></default-field></field>
+                        </form-single>
+                    </widgets></section>
                 </container>
             </container>
             
