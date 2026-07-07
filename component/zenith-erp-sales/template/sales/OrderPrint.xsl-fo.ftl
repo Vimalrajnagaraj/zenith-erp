@@ -65,6 +65,12 @@
                                             <fo:table-cell padding="3pt" border-right="0.5pt solid black"><fo:block font-weight="bold">Currency</fo:block><fo:block><@encodeText order.currencyUomId!"INR"/></fo:block></fo:table-cell>
                                             <fo:table-cell padding="3pt"><fo:block font-weight="bold">Sales Channel</fo:block><fo:block><@encodeText order.salesChannelEnumId!""/></fo:block></fo:table-cell>
                                         </fo:table-row>
+                                        <#-- ZE-SALES-0308 f/u: a sales order converted from a quote carries the original QTN number for traceability -->
+                                        <#if (order.originatingQuoteNumber)?? && order.originatingQuoteNumber?has_content>
+                                        <fo:table-row border-bottom="0.5pt solid black">
+                                            <fo:table-cell padding="3pt" number-columns-spanned="2"><fo:block font-weight="bold">Ref. Quote No. <fo:inline font-weight="normal"><@encodeText order.originatingQuoteNumber/></fo:inline></fo:block></fo:table-cell>
+                                        </fo:table-row>
+                                        </#if>
                                     </fo:table-body>
                                 </fo:table>
                             </fo:table-cell>
