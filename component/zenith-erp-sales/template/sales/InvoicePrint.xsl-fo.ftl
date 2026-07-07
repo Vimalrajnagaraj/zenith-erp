@@ -113,7 +113,8 @@
                                 <#elseif (customer.firstName)?has_content><@encodeText customer.firstName/> <@encodeText customer.lastName!"" />
                                 <#else>[Not Provided]</#if>
                             </fo:block>
-                            <fo:block font-size="7pt" margin-bottom="1pt">Place of Supply: ${(invoice.placeOfSupplyStateCode)!"-"}</fo:block>
+                            <fo:block font-size="7pt" margin-bottom="1pt">Place of Supply: ${placeOfSupplyDisplay!((invoice.placeOfSupplyStateCode)!"-")}</fo:block>
+                            <#if (placeOfSupplyIsFallback)!false><fo:block font-size="6pt" color="#7a5c00" margin-bottom="1pt">Buyer unregistered — place of supply defaults to supplier's state (intra-state GST).</fo:block></#if>
                             <fo:block font-size="7pt" margin-top="4pt">GSTIN: ${(invoice.buyerGstin)!"Unregistered"}</fo:block>
                         </fo:table-cell>
                         
@@ -129,7 +130,7 @@
                                 <#elseif (customer.firstName)?has_content><@encodeText customer.firstName/> <@encodeText customer.lastName!"" />
                                 <#else>[Not Provided]</#if>
                             </fo:block>
-                            <fo:block font-size="7pt" margin-bottom="1pt">Place of Supply: ${(invoice.placeOfSupplyStateCode)!"-"}</fo:block>
+                            <fo:block font-size="7pt" margin-bottom="1pt">Place of Supply: ${placeOfSupplyDisplay!((invoice.placeOfSupplyStateCode)!"-")}</fo:block>
                         </fo:table-cell>
 
                         <fo:table-cell><fo:block/></fo:table-cell>
