@@ -13,15 +13,22 @@
 
     <actions>
         <set field="org" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-        <service-call name="zenith.sales.SalesForecastServices.forecast#Sales" out-map="fc" in-map="[organizationPartyId:org, horizonDays:14]"/>
-        <service-call name="zenith.sales.SalesForecastServices.forecast#CategorySales" out-map="catFc" in-map="[organizationPartyId:org, topN:6, horizonDays:14]"/>
-        <entity-find entity-name="zenith.erp.sales.SalesRevenueForecast" list="histList">
-            <econdition field-name="organizationPartyId" from="org"/>
-            <econdition field-name="dimension" value="Overall"/>
-            <order-by field-name="periodDate"/>
-        </entity-find>
-        <set field="weeklyList" from="fc.weeklyPoints ?: []"/>
-        <set field="catList" from="catFc.categories ?: []"/>
+        <!-- ZE-SALES-026 f/u (SL-089): forecast#Sales has organizationPartyId REQUIRED, so with no active org
+             the whole screen crashed with a raw "Field cannot be empty" error (a platform-admin, or a user
+             before an org is selected). Skip the forecast and show a friendly message instead. -->
+        <set field="noOrg" from="!org || org == '_NA_'"/>
+        <if condition="!noOrg">
+            <service-call name="zenith.sales.SalesForecastServices.forecast#Sales" out-map="fc" in-map="[organizationPartyId:org, horizonDays:14]"/>
+            <service-call name="zenith.sales.SalesForecastServices.forecast#CategorySales" out-map="catFc" in-map="[organizationPartyId:org, topN:6, horizonDays:14]"/>
+            <entity-find entity-name="zenith.erp.sales.SalesRevenueForecast" list="histList">
+                <econdition field-name="organizationPartyId" from="org"/>
+                <econdition field-name="dimension" value="Overall"/>
+                <order-by field-name="periodDate"/>
+            </entity-find>
+        </if>
+        <set field="weeklyList" from="fc?.weeklyPoints ?: []"/>
+        <set field="catList" from="catFc?.categories ?: []"/>
+        <set field="histList" from="histList ?: []"/>
         <set field="sym" value="₹"/>
         <script><![CDATA[
             def fmt = { v -> ec.l10n.format((v ?: 0) as BigDecimal, "#,##,##0") }
@@ -33,58 +40,61 @@
                 if (d.toString().contains("footfall")) return up ? "More customers coming in" : "Fewer customers coming in"
                 return up ? "Customers spending more each visit" : "Customers spending a little less"
             }
-            trendNice = trendWord(fc.trendLabel)
-            driverNice = driverWord(fc.primaryDriver)
-            confNice = confWord(fc.confidencePct)
-            hasData = (fc.confidencePct != null)
-            confColor = (fc.confidencePct != null && fc.confidencePct >= 60) ? "success" : (fc.confidencePct != null && fc.confidencePct >= 45 ? "warning" : "grey")
-            perDay = (fc.projectedNext7 != null) ? (fc.projectedNext7 / 7.0) : 0
-            // plain-words summary built from the numbers
-            if (hasData) {
-                plain = "Over the next 7 days you're likely to sell about " + sym + fmt(fc.projectedNext7) +
-                    " — roughly " + sym + fmt(perDay) + " a day. Sales are " + trendNice.toLowerCase() +
-                    ", and " + (fc.peakDay ?: "the weekend") + " is usually your busiest day. " +
-                    "Expect around " + fmt(fc.next7Traffic) + " customers spending about " + sym + fmt(fc.next7Aov) + " each. " +
-                    "The main change right now: " + driverNice.toLowerCase() + ". " +
-                    "How sure are we? " + confNice + " — and this gets sharper every day as more sales come in."
-            } else {
-                plain = "We need a couple of weeks of sales before we can predict reliably. Keep billing through the POS and check back soon."
-            }
-            catList.each { it.dirNice = trendWord(it.trend); it.relWord = confWord(it.confidencePct) }
-
-            // ZE-SALES-026 (SL-089): a single glance-able lead line (replaces the dense paragraph), and
-            // bar-chart prep for the product-group breakdown (biggest group first, proportional bar widths).
-            if (hasData) {
-                leadLine = "You're on track to sell about " + sym + fmt(fc.projectedNext7) + " this week — sales are " +
-                    trendNice.toLowerCase() + ", and " + driverNice.substring(0,1).toLowerCase() + driverNice.substring(1) + "."
-            } else {
+            // ZE-SALES-026 f/u (SL-089): safe defaults so the widgets never NPE when there's no org / no forecast.
+            trendNice = "—"; driverNice = "—"; perDay = 0; hasData = false; catChartHtml = ""
+            confNice = confWord(null); confColor = "grey"
+            if (fc == null) {
+                plain = noOrg ? "Choose your business from the organization picker at the top of the page to see its sales forecast."
+                              : "We need a couple of weeks of sales before we can predict reliably. Keep billing through the POS and check back soon."
                 leadLine = plain
-            }
-            catList = catList.sort { -((it.projectedNext7 ?: 0) as BigDecimal) }
-            def _maxCat = catList ? (catList.collect { (it.projectedNext7 ?: 0) as BigDecimal }.max()) : null
-            catList.each { c ->
-                def v = (c.projectedNext7 ?: 0) as BigDecimal
-                c.barPct = (_maxCat != null && _maxCat > 0) ? (v * 100 / _maxCat).setScale(1, java.math.RoundingMode.HALF_UP) : (0 as BigDecimal)
-            }
-            // Build the horizontal bar chart as raw HTML — Moqui containers put `style` into `class`, so a
-            // proportional-width bar needs real inline styles, which only render-mode HTML provides.
-            def _esc = { s -> (s ?: '').toString().replace('&','&amp;').replace('<','&lt;').replace('>','&gt;') }
-            def _barColor = { t -> (t == 'growing') ? '#2e9e6a' : (t == 'softening' ? '#d9534f' : '#5c6bc0') }
-            def _b = new StringBuilder()
-            _b.append('<div style="font-size:0.9rem;">')
-            _b.append('<div style="display:flex;align-items:center;gap:12px;padding-bottom:6px;font-size:0.68rem;text-transform:uppercase;letter-spacing:.04em;color:#9a9aa8;font-weight:700;">')
-            _b.append('<div style="width:24%;">Group</div><div style="flex:1;">Share of next 7 days</div><div style="width:96px;text-align:right;">Next 7 days</div><div style="width:64px;text-align:right;">Per day</div><div style="width:118px;text-align:center;">Direction</div></div>')
-            catList.each { c ->
-                _b.append('<div style="display:flex;align-items:center;gap:12px;padding:9px 0;border-bottom:1px solid rgba(128,128,128,0.14);">')
-                _b.append('<div style="width:24%;font-weight:600;">' + _esc(c.category) + '</div>')
-                _b.append('<div style="flex:1;background:rgba(128,128,140,0.16);border-radius:8px;height:15px;overflow:hidden;"><div style="width:' + (c.barPct ?: 0) + '%;min-width:2px;background:' + _barColor(c.trend) + ';height:15px;border-radius:8px;"></div></div>')
-                _b.append('<div style="width:96px;text-align:right;font-weight:700;">' + sym + fmt(c.projectedNext7) + '</div>')
-                _b.append('<div style="width:64px;text-align:right;color:#9a9aa8;">' + sym + fmt(c.perDay) + '</div>')
-                _b.append('<div style="width:118px;text-align:center;color:#7a7a88;font-size:0.82rem;">' + _esc(c.dirNice) + '</div>')
+            } else {
+                trendNice = trendWord(fc.trendLabel)
+                driverNice = driverWord(fc.primaryDriver)
+                confNice = confWord(fc.confidencePct)
+                hasData = (fc.confidencePct != null)
+                confColor = (fc.confidencePct != null && fc.confidencePct >= 60) ? "success" : (fc.confidencePct != null && fc.confidencePct >= 45 ? "warning" : "grey")
+                perDay = (fc.projectedNext7 != null) ? (fc.projectedNext7 / 7.0) : 0
+                // plain-words summary + a single glance-able lead line (replaces the dense paragraph)
+                if (hasData) {
+                    plain = "Over the next 7 days you're likely to sell about " + sym + fmt(fc.projectedNext7) +
+                        " — roughly " + sym + fmt(perDay) + " a day. Sales are " + trendNice.toLowerCase() +
+                        ", and " + (fc.peakDay ?: "the weekend") + " is usually your busiest day. " +
+                        "Expect around " + fmt(fc.next7Traffic) + " customers spending about " + sym + fmt(fc.next7Aov) + " each. " +
+                        "The main change right now: " + driverNice.toLowerCase() + ". " +
+                        "How sure are we? " + confNice + " — and this gets sharper every day as more sales come in."
+                    leadLine = "You're on track to sell about " + sym + fmt(fc.projectedNext7) + " this week — sales are " +
+                        trendNice.toLowerCase() + ", and " + driverNice.substring(0,1).toLowerCase() + driverNice.substring(1) + "."
+                } else {
+                    plain = "We need a couple of weeks of sales before we can predict reliably. Keep billing through the POS and check back soon."
+                    leadLine = plain
+                }
+                catList.each { it.dirNice = trendWord(it.trend); it.relWord = confWord(it.confidencePct) }
+                catList = catList.sort { -((it.projectedNext7 ?: 0) as BigDecimal) }
+                def _maxCat = catList ? (catList.collect { (it.projectedNext7 ?: 0) as BigDecimal }.max()) : null
+                catList.each { c ->
+                    def v = (c.projectedNext7 ?: 0) as BigDecimal
+                    c.barPct = (_maxCat != null && _maxCat > 0) ? (v * 100 / _maxCat).setScale(1, java.math.RoundingMode.HALF_UP) : (0 as BigDecimal)
+                }
+                // Build the horizontal bar chart as raw HTML — Moqui containers put `style` into `class`, so a
+                // proportional-width bar needs real inline styles, which only render-mode HTML provides.
+                def _esc = { s -> (s ?: '').toString().replace('&','&amp;').replace('<','&lt;').replace('>','&gt;') }
+                def _barColor = { t -> (t == 'growing') ? '#2e9e6a' : (t == 'softening' ? '#d9534f' : '#5c6bc0') }
+                def _b = new StringBuilder()
+                _b.append('<div style="font-size:0.9rem;">')
+                _b.append('<div style="display:flex;align-items:center;gap:12px;padding-bottom:6px;font-size:0.68rem;text-transform:uppercase;letter-spacing:.04em;color:#9a9aa8;font-weight:700;">')
+                _b.append('<div style="width:24%;">Group</div><div style="flex:1;">Share of next 7 days</div><div style="width:96px;text-align:right;">Next 7 days</div><div style="width:64px;text-align:right;">Per day</div><div style="width:118px;text-align:center;">Direction</div></div>')
+                catList.each { c ->
+                    _b.append('<div style="display:flex;align-items:center;gap:12px;padding:9px 0;border-bottom:1px solid rgba(128,128,128,0.14);">')
+                    _b.append('<div style="width:24%;font-weight:600;">' + _esc(c.category) + '</div>')
+                    _b.append('<div style="flex:1;background:rgba(128,128,140,0.16);border-radius:8px;height:15px;overflow:hidden;"><div style="width:' + (c.barPct ?: 0) + '%;min-width:2px;background:' + _barColor(c.trend) + ';height:15px;border-radius:8px;"></div></div>')
+                    _b.append('<div style="width:96px;text-align:right;font-weight:700;">' + sym + fmt(c.projectedNext7) + '</div>')
+                    _b.append('<div style="width:64px;text-align:right;color:#9a9aa8;">' + sym + fmt(c.perDay) + '</div>')
+                    _b.append('<div style="width:118px;text-align:center;color:#7a7a88;font-size:0.82rem;">' + _esc(c.dirNice) + '</div>')
+                    _b.append('</div>')
+                }
                 _b.append('</div>')
+                catChartHtml = _b.toString()
             }
-            _b.append('</div>')
-            catChartHtml = _b.toString()
         ]]></script>
     </actions>
 
@@ -177,7 +187,7 @@
 
         </widgets><fail-widgets>
             <container style="zenith-card q-pa-lg bg-indigo-1 border-radius-lg shadow-1 q-mb-md text-center">
-                <label text="Building your forecast" type="h5" style="text-primary text-weight-bold q-my-none"/>
+                <label text="${noOrg ? 'Select your organization' : 'Building your forecast'}" type="h5" style="text-primary text-weight-bold q-my-none"/>
                 <label text="${plain}" type="p" style="text-grey-8 q-mt-sm q-mb-none"/>
             </container>
         </fail-widgets></section>
