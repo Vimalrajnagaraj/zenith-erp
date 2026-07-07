@@ -41,10 +41,41 @@
                 </entity-find>
                 <set field="commissionAmount" from="0" type="BigDecimal"/>
                 <set field="structId" from="null"/>
+                <!-- ZE-SALES-024 f/u (SL-084): compute per the structure's commission TYPE. Previously EVERY type
+                     was treated as a percentage (grandTotal x rate/100), so "Fixed Per Order Rs.500" wrongly
+                     billed 500% of the order and "Fixed Per Unit" ignored quantity. -->
                 <if condition="structures">
-                    <set field="struct" from="structures[0]"/>
-                    <set field="structId" from="struct.commissionId"/>
-                    <set field="commissionAmount" from="((order.grandTotal ?: 0) * (struct.rate ?: 0)) / 100" type="BigDecimal"/>
+                    <script><![CDATA[
+                        def struct = structures[0]
+                        structId = struct.commissionId
+                        def gt = (order.grandTotal ?: 0) as BigDecimal
+                        def rate = (struct.rate ?: 0) as BigDecimal
+                        def rmode = java.math.RoundingMode.HALF_UP
+                        def type = struct.commissionTypeEnumId
+                        def amt
+                        if (type == 'CmtFixedPerOrder') {
+                            // rate holds a flat Rs. amount for the whole order (not a percent)
+                            amt = rate
+                        } else if (type == 'CmtFixedPerUnit') {
+                            // rate holds Rs. per unit -> multiply by the total units on the order
+                            def units = BigDecimal.ZERO
+                            for (oi in ec.entity.find("mantle.order.OrderItem").condition("orderId", orderId).list())
+                                units += (oi.quantity ?: 0) as BigDecimal
+                            amt = rate * units
+                        } else if (type == 'CmtTiered') {
+                            // slab: among the party's active tiered rows, the highest minAmount threshold the order
+                            // total reaches wins; apply that slab's rate as a percent. One row / no minAmount -> a
+                            // single rate% band. Order below the lowest slab's minAmount -> 0.
+                            def tiers = structures.findAll { it.commissionTypeEnumId == 'CmtTiered' && ((it.minAmount ?: 0) as BigDecimal) <= gt }
+                            def best = tiers ? tiers.max { (it.minAmount ?: 0) as BigDecimal } : null
+                            if (best) structId = best.commissionId
+                            amt = best ? (gt * ((best.rate ?: 0) as BigDecimal) / 100) : BigDecimal.ZERO
+                        } else {
+                            // CmtPercentage, and any unknown type, falls back to percentage of sale
+                            amt = gt * rate / 100
+                        }
+                        commissionAmount = amt.setScale(2, rmode)
+                    ]]></script>
                 </if>
                 <set field="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
                 <service-call name="create#zenith.erp.sales.CommissionTransaction"
