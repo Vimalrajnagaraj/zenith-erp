@@ -158,7 +158,26 @@
             <if condition="_itemCnt == 0">
                 <return error="true" message="This quote has no items yet — add at least one product before converting it to a sales order."/>
             </if>
-            <service-call name="update#mantle.order.OrderHeader" in-map="[orderId:orderId, statusId:'OrderPlaced']"/>
+            <!-- ZE-SALES-0308 f/u: converting a quote makes it a REAL order — reclassify documentType to
+                 SALES_ORDER and mint a fresh SO/26-27/xxxxx number so it reads as an order (list/print), not the
+                 old QTN quote number, and so a later cancellation is treated as a cancelled ORDER (not a dead
+                 quote that FindOrder hides). Fail-open, and mint only on the FIRST conversion (guarded by the
+                 current documentType) so a re-convert never double-consumes the SO sequence. -->
+            <script><![CDATA[
+                def _oh = ec.entity.find("mantle.order.OrderHeader").condition("orderId", orderId).one()
+                def _upd = [orderId:orderId, statusId:'OrderPlaced', documentType:'SALES_ORDER']
+                if (_oh?.documentType != 'SALES_ORDER') {
+                    try {
+                        def _hasSeq = activeOrg && ec.entity.find("zenith.erp.base.SystemSequence").condition("organizationPartyId", activeOrg).condition("sequenceType", "SALES_ORDER").disableAuthz().count() > 0
+                        if (_hasSeq) {
+                            def _seq = ec.service.sync().name("zenith.base.SequenceServices.get#NextSequence")
+                                        .parameters([organizationPartyId:activeOrg, sequenceType:'SALES_ORDER']).call()
+                            if (_seq?.sequenceValue) { _upd.zenithDocNumber = _seq.sequenceValue; _upd.displayId = _seq.sequenceValue }
+                        }
+                    } catch (Exception e) { ec.logger.warn("SO number on convert skipped: " + e.message) }
+                }
+                ec.service.sync().name("update#mantle.order.OrderHeader").parameters(_upd).call()
+            ]]></script>
         </actions>
         <default-response url="../EditOrder"><parameter name="orderId" value="${orderId}"/></default-response>
         <error-response url="."/>
