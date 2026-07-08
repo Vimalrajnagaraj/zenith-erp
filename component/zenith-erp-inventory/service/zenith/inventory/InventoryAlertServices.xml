@@ -12,16 +12,20 @@
         <out-parameters>
             <parameter name="alertEnabled"/>
             <parameter name="alertDays" type="Integer"/>
+            <parameter name="alertEmail"/>
         </out-parameters>
         <actions>
             <script><![CDATA[
                 alertEnabled = 'Y'
                 alertDays = 30
+                alertEmail = 'N'
                 if (organizationPartyId) {
                     def _en = ec.entity.find("zenith.erp.base.CompanySettings").condition("organizationPartyId", organizationPartyId).condition("settingKey", "EXPIRY_ALERT_ENABLED").disableAuthz().one()
                     if (_en?.settingValue == 'N') alertEnabled = 'N'
                     def _d = ec.entity.find("zenith.erp.base.CompanySettings").condition("organizationPartyId", organizationPartyId).condition("settingKey", "EXPIRY_ALERT_DAYS").disableAuthz().one()
                     if (_d?.settingValue) { try { alertDays = Integer.parseInt(_d.settingValue.toString().trim()) } catch (Exception e) {} }
+                    def _em = ec.entity.find("zenith.erp.base.CompanySettings").condition("organizationPartyId", organizationPartyId).condition("settingKey", "EXPIRY_ALERT_EMAIL").disableAuthz().one()
+                    if (_em?.settingValue == 'Y') alertEmail = 'Y'
                 }
                 if (alertDays == null || alertDays < 1) alertDays = 30
             ]]></script>
@@ -34,6 +38,7 @@
             <parameter name="organizationPartyId" required="true"/>
             <parameter name="alertDays"/>
             <parameter name="alertEnabled"/>
+            <parameter name="alertEmail"/>
         </in-parameters>
         <actions>
             <script><![CDATA[
@@ -50,6 +55,7 @@
                     _upsert('EXPIRY_ALERT_DAYS', _n.toString())
                 }
                 _upsert('EXPIRY_ALERT_ENABLED', (alertEnabled == 'Y' || alertEnabled == true || alertEnabled == 'true') ? 'Y' : 'N')
+                _upsert('EXPIRY_ALERT_EMAIL', (alertEmail == 'Y' || alertEmail == true || alertEmail == 'true') ? 'Y' : 'N')
                 // config changed -> forget the last-sent signature so the next run re-evaluates under the new rule
                 def _sig = ec.entity.find("zenith.erp.base.CompanySettings").condition("organizationPartyId", organizationPartyId).condition("settingKey", "EXPIRY_ALERT_SIG").disableAuthz().one()
                 if (_sig) _sig.delete()
@@ -124,6 +130,26 @@
                                 def _nm = ec.makeNotificationMessage().topic("ExpiryAlert").title(_title).message(_body)
                                 _nm.userId(_uid); _nm.send()
                             } catch (Exception _ne) { ec.logger.warn("ExpiryAlert notify failed for " + _uid + ": " + _ne.message) }
+                        }
+                        // Optional email digest (opt-in per tenant, default off) via the same SYSTEM server as
+                        // EMAIL_VERIFY / PASSWORD_RESET. One email per distinct user address; failures are logged, not fatal.
+                        def _emRow = ec.entity.find("zenith.erp.base.CompanySettings").condition("organizationPartyId", _org).condition("settingKey", "EXPIRY_ALERT_EMAIL").disableAuthz().one()
+                        if (_emRow?.settingValue == 'Y') {
+                            def _orgRec = ec.entity.find("mantle.party.Organization").condition("partyId", _org).disableAuthz().one()
+                            def _orgName = _orgRec?.organizationName ?: 'Your organization'
+                            def _emails = []
+                            for (def _uid : _uids) {
+                                def _ua = ec.entity.find("moqui.security.UserAccount").condition("userId", _uid).disableAuthz().one()
+                                if (_ua?.emailAddress) _emails.add(_ua.emailAddress.toString().trim())
+                            }
+                            for (def _em : _emails.findAll { it }.unique()) {
+                                try {
+                                    ec.service.sync().name("org.moqui.impl.EmailServices.send#EmailTemplate").parameters([
+                                        emailTemplateId:"EXPIRY_ALERT", toAddresses:_em,
+                                        bodyParameters:[orgName:_orgName, count:_count, days:_days, valueAtRisk:_val,
+                                                        dashboardUrl:"https://erp.zetaclantech.com/apps/zenith/Inventory/ExpiryDashboard"]]).disableAuthz().call()
+                                } catch (Exception _ee) { ec.logger.warn("ExpiryAlert email failed for " + _em + ": " + _ee.message) }
+                            }
                         }
                         if (_lastRow) ec.service.sync().name("update#zenith.erp.base.CompanySettings").parameters([organizationPartyId:_org, settingKey:"EXPIRY_ALERT_SIG", settingValue:_sig]).call()
                         else ec.service.sync().name("create#zenith.erp.base.CompanySettings").parameters([organizationPartyId:_org, settingKey:"EXPIRY_ALERT_SIG", settingValue:_sig]).call()
