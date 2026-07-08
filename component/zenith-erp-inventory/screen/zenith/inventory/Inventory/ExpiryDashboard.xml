@@ -39,6 +39,50 @@
         <default-response url="."/>
     </transition>
 
+    <!-- ZE-INV-007 (IV-106): UPDATE an existing expiry lot (expiry date, quantity, value, batch) from the dashboard.
+         On save the dashboard re-renders (url=".") so the list + Risk Summary reflect the change immediately. The
+         asset is looked up with disableAuthz but an EXPLICIT owner==active-org guard keeps a tenant from editing
+         another tenant's stock (a super-admin with no active org may edit any). A quantity change also writes an
+         AssetDetail ledger diff so the on-hand persists (matching the create path). -->
+    <transition name="updateExpiryStock">
+        <actions>
+            <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <if condition="!assetId"><return error="true" message="Missing stock reference."/></if>
+            <if condition="!expiryDate"><return error="true" message="Please enter an expiry date."/></if>
+            <script><![CDATA[
+                def _asset = ec.entity.find("mantle.product.asset.Asset").condition("assetId", assetId).disableAuthz().one()
+                if (_asset == null) { ec.message.addError("Stock not found."); return }
+                if (activeOrg && activeOrg != '_NA_' && _asset.ownerPartyId != activeOrg) { ec.message.addError("You can only edit stock owned by your organization."); return }
+                def _numOk = { v -> v != null && v.toString().trim() != '' && (v.toString().trim() ==~ /\d*\.?\d+/) }
+                if (!_numOk(quantity)) { ec.message.addError("Quantity must be a number greater than zero."); return }
+                def _newQty = new BigDecimal(quantity.toString().trim())
+                if (_newQty.signum() <= 0) { ec.message.addError("Quantity must be greater than zero."); return }
+                def _rate = _numOk(unitValue) ? new BigDecimal(unitValue.toString().trim()) : (_asset.valuationRate ?: BigDecimal.ZERO)
+                def _oldQty = _asset.quantityOnHandTotal ?: BigDecimal.ZERO
+                def _bn = (batchNumber != null && batchNumber.toString().trim() != '' && batchNumber.toString().trim() != 'N/A') ? batchNumber.toString().trim() : null
+                // metadata (expiry / value / batch) — a plain field update; on-hand is ledger-driven, handled below
+                ec.service.sync().name("update#mantle.product.asset.Asset")
+                    .parameters([assetId:assetId, expiryDate:expiryDate, valuationRate:_rate, acquireCost:_rate, batchNumber:_bn]).call()
+                // quantity change -> write an AssetDetail adjustment. Moqui recomputes quantityOnHandTotal from the
+                // SUM of AssetDetail diffs, so the diff is (target - ledger sum), NOT (target - qoh) — this lands the
+                // on-hand exactly on the target even for legacy/migrated lots whose qoh was set without a ledger.
+                if (_newQty.compareTo(_oldQty) != 0) {
+                    def _qohSum = BigDecimal.ZERO; def _atpSum = BigDecimal.ZERO
+                    for (def d : ec.entity.find("mantle.product.asset.AssetDetail").condition("assetId", assetId).disableAuthz().list()) {
+                        _qohSum = _qohSum.add(d.quantityOnHandDiff ?: BigDecimal.ZERO)
+                        _atpSum = _atpSum.add(d.availableToPromiseDiff ?: BigDecimal.ZERO)
+                    }
+                    ec.service.sync().name("create#mantle.product.asset.AssetDetail").parameters([
+                        assetId:assetId, effectiveDate:ec.user.nowTimestamp,
+                        quantityOnHandDiff:_newQty.subtract(_qohSum), availableToPromiseDiff:_newQty.subtract(_atpSum),
+                        description:'Expiry stock quantity corrected']).call()
+                }
+                ec.message.addMessage("Updated stock " + assetId + " — expiry " + expiryDate + ", qty " + _newQty + ".")
+            ]]></script>
+        </actions>
+        <default-response url="."/>
+    </transition>
+
     <!-- ZE-INV-004 (IV-103): the filter form submits here and just re-renders the dashboard; the actions read
          searchText / withinDays from the request and narrow the list. -->
     <transition name="filterExpiry">
@@ -208,6 +252,23 @@
                     <!-- ZE-INV-002 f/u: flag when a row is valued at retail (MRP) or has no valuation, so the mixed
                          basis is transparent; blank for the normal cost basis. -->
                     <label text="${valueBasis == 'MRP' ? '(at MRP)' : (valueBasis == 'unvalued' ? '(not valued)' : '')}" type="span" style="text-caption text-grey-6"/>
+                </default-field></field>
+                <!-- ZE-INV-007 (IV-106): per-row Edit — update this lot's expiry / quantity / value / batch. The
+                     dialog id interpolates per row; the form name is STATIC so its action resolves to the transition
+                     (a per-row ${}-name would leave the action pointing at the screen and the submit would no-op). -->
+                <field name="editAction"><header-field title=""/><default-field>
+                    <container-dialog id="EditExpiry_${assetId}" button-text="Edit" button-icon="fa fa-pencil"
+                                      button-class="q-btn--flat text-primary text-caption q-px-sm">
+                        <form-single name="EditExpiryForm" transition="updateExpiryStock">
+                            <field name="assetId"><default-field><hidden default-value="${assetId}"/></default-field></field>
+                            <field name="lotLabel"><default-field title="Editing"><display text="${productName} — ${assetId}"/></default-field></field>
+                            <field name="expiryDate"><default-field title="Expiry Date"><date-time type="date" default-value="${expiryDate ? ec.l10n.format(expiryDate, 'yyyy-MM-dd') : ''}"/></default-field></field>
+                            <field name="quantity"><default-field title="Quantity"><text-line size="10" default-value="${quantity}"/></default-field></field>
+                            <field name="unitValue"><default-field title="Value per Unit (${currSymbol})"><text-line size="10" default-value="${valuationRate}"/></default-field></field>
+                            <field name="batchNumber"><default-field title="Batch / Lot (Optional)"><text-line size="20" default-value="${batchNumber == 'N/A' ? '' : batchNumber}"/></default-field></field>
+                            <field name="submitButton"><default-field title=""><submit text="Save Changes"/></default-field></field>
+                        </form-single>
+                    </container-dialog>
                 </default-field></field>
             </form-list>
         </box-body></container-box>
