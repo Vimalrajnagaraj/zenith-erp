@@ -103,4 +103,62 @@
         </actions>
     </service>
 
+    <!-- ZE-INV-007 f/u: one-off (idempotent) reconciliation of legacy/migrated lots whose on-hand was set without a
+         matching AssetDetail ledger (e.g. direct SQL / migration inserts). For each inventory asset where
+         quantityOnHandTotal != SUM(AssetDetail.quantityOnHandDiff), it seeds ONE "opening balance" AssetDetail for the
+         gap so the ledger sum equals the on-hand. It NEVER changes quantityOnHandTotal — a RAW entity insert is used
+         (the create#AssetDetail SERVICE would move on-hand; the raw insert only writes the ledger row), so it is a true
+         no-op for on-hand and safe to run alongside live POS sales. Already-consistent lots (gap 0) are skipped, so
+         re-running is a no-op. dryRun (default true) only reports. -->
+    <service verb="reconcile" noun="AssetLedgers" authenticate="true">
+        <in-parameters>
+            <parameter name="organizationPartyId"><description>Optional: scope to one tenant; blank = all tenants</description></parameter>
+            <parameter name="dryRun" type="Boolean" default="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="scanned" type="Integer"/>
+            <parameter name="reconciled" type="Integer"/>
+            <parameter name="report"/>
+        </out-parameters>
+        <actions>
+            <script><![CDATA[
+                def _find = ec.entity.find("mantle.product.asset.Asset").condition("assetTypeEnumId", "AstTpInventory").disableAuthz()
+                if (organizationPartyId) _find.condition("ownerPartyId", organizationPartyId)
+                def _assets = _find.list()
+                int _scanned = 0; int _reconciled = 0
+                def _perOrg = [:]
+                for (def a : _assets) {
+                    if (a.quantityOnHandTotal == null) continue
+                    _scanned++
+                    def _details = ec.entity.find("mantle.product.asset.AssetDetail").condition("assetId", a.assetId).disableAuthz().list()
+                    def _qohSum = BigDecimal.ZERO; def _atpSum = BigDecimal.ZERO; def _minEff = null
+                    for (def d : _details) {
+                        _qohSum = _qohSum.add(d.quantityOnHandDiff ?: BigDecimal.ZERO)
+                        _atpSum = _atpSum.add(d.availableToPromiseDiff ?: BigDecimal.ZERO)
+                        if (d.effectiveDate != null && (_minEff == null || d.effectiveDate.getTime() < _minEff.getTime())) _minEff = d.effectiveDate
+                    }
+                    def _origQoh = (a.quantityOnHandTotal ?: BigDecimal.ZERO)
+                    def _origAtp = (a.availableToPromiseTotal ?: BigDecimal.ZERO)
+                    def _qohGap = _origQoh.subtract(_qohSum)
+                    def _atpGap = _origAtp.subtract(_atpSum)
+                    if (_qohGap.compareTo(BigDecimal.ZERO) == 0 && _atpGap.compareTo(BigDecimal.ZERO) == 0) continue
+                    _reconciled++
+                    _perOrg[a.ownerPartyId ?: '(none)'] = (_perOrg[a.ownerPartyId ?: '(none)'] ?: 0) + 1
+                    if (!dryRun) {
+                        // opening date: asset receipt/acquire, else just before the earliest existing ledger row, else now
+                        def _eff = a.receivedDate ?: a.acquiredDate ?: _minEff ?: ec.user.nowTimestamp
+                        // RAW insert — does NOT touch quantityOnHandTotal (the service create#AssetDetail would)
+                        ec.entity.makeValue("mantle.product.asset.AssetDetail").setAll([
+                            assetId: a.assetId, productId: a.productId, effectiveDate: _eff,
+                            quantityOnHandDiff: _qohGap, availableToPromiseDiff: _atpGap,
+                            description: 'Opening balance (ledger reconciliation)']).setSequencedIdPrimary().create()
+                    }
+                }
+                scanned = _scanned
+                reconciled = _reconciled
+                report = (dryRun ? '[DRY RUN] ' : '[APPLIED] ') + 'scanned ' + _scanned + ' inventory lots; ' + _reconciled + ' need an opening ledger entry. Per org: ' + _perOrg
+            ]]></script>
+        </actions>
+    </service>
+
 </services>
