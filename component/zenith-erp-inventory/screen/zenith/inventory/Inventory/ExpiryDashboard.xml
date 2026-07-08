@@ -106,6 +106,18 @@
         <default-response url="."/>
     </transition>
 
+    <!-- ZE-INV-008 (IV-107): save this tenant's expiry-alert threshold + on/off -->
+    <transition name="saveAlertSettings">
+        <actions>
+            <set field="_org" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <if condition="!_org || _org == '_NA_'"><return error="true" message="Select an organization before changing alert settings."/></if>
+            <service-call name="zenith.inventory.InventoryAlertServices.set#ExpiryAlertConfig"
+                in-map="[organizationPartyId: _org, alertDays: alertDays, alertEnabled: alertEnabled]"/>
+            <script>ec.message.addMessage("Expiry alert settings saved.")</script>
+        </actions>
+        <default-response url="."/>
+    </transition>
+
     <!-- ZE-INV-006 (IV-105): CSV export of the same (org-scoped, filtered, sorted) list, streamed as a download.
          read-only so it can be invoked from a GET link with the filter/sort URL params (like the print transitions);
          it only reads + writes the response, no data mutation. -->
@@ -144,17 +156,45 @@
     </transition>
 
     <actions>
+        <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
         <!-- ZE-INV-006 (IV-105): the list is built by the shared get#ExpiryRisk service (org isolation, value
              fallback, supplier, search+filter, sort) so the screen and the CSV export return the same data. -->
         <service-call name="zenith.inventory.InventoryServices.get#ExpiryRisk" out-map="expiryOut"
-            in-map="[organizationPartyId: ec.user.getPreference('ACTIVE_ORGANIZATION'),
+            in-map="[organizationPartyId: activeOrg,
                      searchText: ec.context.searchText, withinDays: ec.context.withinDays, orderByField: ec.context.orderByField]"/>
+        <!-- ZE-INV-008 (IV-107): alert config + the live "expiring within your window" banner numbers -->
+        <service-call name="zenith.inventory.InventoryAlertServices.get#ExpiryAlertConfig" out-map="alertCfg"
+            in-map="[organizationPartyId: activeOrg]"/>
+        <script><![CDATA[
+            def _ad = (alertCfg?.alertDays ?: 30) as Integer
+            alertDays = _ad.toString()
+            alertEnabled = alertCfg?.alertEnabled ?: 'Y'
+            def _items = (expiryOut?.expiringAssets ?: []).findAll { it.daysToExpiry != null && (it.daysToExpiry as Integer) <= _ad }
+            alertCount = _items.size()
+            def _av = BigDecimal.ZERO
+            for (def r : _items) { _av = _av.add(r.value ?: BigDecimal.ZERO) }
+            alertValue = _av
+        ]]></script>
     </actions>
 
     <widgets>
         <!-- ZE-INV-001 (IV-100): direct entry to create expiry-tracked stock so the dashboard can be populated. -->
         <container style="row items-center justify-between q-mb-md">
             <label text="Track batches that will expire soon and act before they go to waste." type="span" style="text-grey-7 text-caption"/>
+            <container style="row q-gutter-sm items-center">
+            <!-- ZE-INV-008 (IV-107): configure the per-tenant expiry-alert threshold + on/off -->
+            <container-dialog id="ExpiryAlertSettingsDialog" button-text="Alert Settings" button-icon="fa fa-bell"
+                              button-class="q-btn bg-grey-3 text-dark text-weight-bold border-radius-md q-px-md">
+                <form-single name="ExpiryAlertSettingsForm" transition="saveAlertSettings">
+                    <field name="alertEnabled"><default-field title="Expiry alerts">
+                        <drop-down allow-empty="false"><option key="Y" text="On — notify me"/><option key="N" text="Off"/></drop-down>
+                    </default-field></field>
+                    <field name="alertDays"><default-field title="Notify when a lot is expiring within">
+                        <drop-down allow-empty="false"><option key="7" text="7 days"/><option key="15" text="15 days"/><option key="30" text="30 days"/><option key="60" text="60 days"/><option key="90" text="90 days"/></drop-down>
+                    </default-field></field>
+                    <field name="submitButton"><default-field title=""><submit text="Save Settings"/></default-field></field>
+                </form-single>
+            </container-dialog>
             <container-dialog id="AddExpiryStockDialog" button-text="Add Expiring Stock" button-icon="fa fa-plus-circle"
                               button-class="q-btn bg-primary text-white text-weight-bold border-radius-md q-px-md">
                 <form-single name="AddExpiryStockForm" transition="createExpiryStock">
@@ -185,6 +225,7 @@
                     <field name="submitButton"><default-field title=""><submit text="Add Stock"/></default-field></field>
                 </form-single>
             </container-dialog>
+            </container>
         </container>
 
         <container-row>
@@ -193,7 +234,7 @@
                     <box-header title="Risk Summary"/>
                     <box-body>
                         <label text="Value of stock expiring (next 90 days)" type="h5" style="text-muted"/>
-                        <label text="${currSymbol}${ec.l10n.formatCurrency(expiryOut.totalExpiryValue ?: 0, companyCurrency)}" type="h2" style="text-danger"/>
+                        <label text="${currSymbol}${ec.l10n.format(expiryOut.totalExpiryValue ?: 0, '#,##,##0.00')}" type="h2" style="text-danger"/>
                     </box-body>
                 </container-box>
             </row-col>
@@ -201,7 +242,25 @@
                 <container-box>
                     <box-header title="Action Required"/>
                     <box-body>
-                        <label text="The items below will expire within 90 days. Try to sell them first, run an offer, or return them to the supplier before they go to waste." type="p"/>
+                        <!-- ZE-INV-008 (IV-107): live alert banner driven by the tenant's alert threshold/on-off -->
+                        <section name="ExpiryAlertActive">
+                            <condition><expression>alertEnabled == 'Y' &amp;&amp; alertCount &gt; 0</expression></condition>
+                            <widgets>
+                                <label text="⚠ ${alertCount} item(s) expiring within ${alertDays} days — ${currSymbol}${ec.l10n.format(alertValue ?: 0, '#,##,##0.00')} at risk. Sell them, run an offer, or return them to the supplier before they go to waste." type="p" style="text-danger text-weight-bold"/>
+                                <label text="Your team is notified in-app when the list of expiring lots changes. Adjust the window with “Alert Settings”." type="span" style="text-caption text-grey-7"/>
+                            </widgets>
+                            <fail-widgets>
+                                <section name="ExpiryAlertOff">
+                                    <condition><expression>alertEnabled != 'Y'</expression></condition>
+                                    <widgets>
+                                        <label text="Expiry alerts are OFF for your organization. Turn them on in “Alert Settings” to be notified about products nearing expiry." type="p" style="text-grey-7"/>
+                                    </widgets>
+                                    <fail-widgets>
+                                        <label text="Nothing is expiring within your ${alertDays}-day alert window. The list below still shows everything within 90 days so you can plan ahead." type="p" style="text-positive"/>
+                                    </fail-widgets>
+                                </section>
+                            </fail-widgets>
+                        </section>
                     </box-body>
                 </container-box>
             </row-col>

@@ -1,0 +1,138 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <!-- ZE-INV-008 (IV-107): configurable Expiry Risk notifications. Per-tenant threshold + on/off stored in
+         CompanySettings (EXPIRY_ALERT_ENABLED / EXPIRY_ALERT_DAYS); a daily job raises in-app notifications; the
+         dashboard shows a live banner. Defaults: enabled, 30-day window. -->
+
+    <!-- Read a tenant's alert config with sensible defaults (enabled, 30 days). -->
+    <service verb="get" noun="ExpiryAlertConfig">
+        <in-parameters><parameter name="organizationPartyId"/></in-parameters>
+        <out-parameters>
+            <parameter name="alertEnabled"/>
+            <parameter name="alertDays" type="Integer"/>
+        </out-parameters>
+        <actions>
+            <script><![CDATA[
+                alertEnabled = 'Y'
+                alertDays = 30
+                if (organizationPartyId) {
+                    def _en = ec.entity.find("zenith.erp.base.CompanySettings").condition("organizationPartyId", organizationPartyId).condition("settingKey", "EXPIRY_ALERT_ENABLED").disableAuthz().one()
+                    if (_en?.settingValue == 'N') alertEnabled = 'N'
+                    def _d = ec.entity.find("zenith.erp.base.CompanySettings").condition("organizationPartyId", organizationPartyId).condition("settingKey", "EXPIRY_ALERT_DAYS").disableAuthz().one()
+                    if (_d?.settingValue) { try { alertDays = Integer.parseInt(_d.settingValue.toString().trim()) } catch (Exception e) {} }
+                }
+                if (alertDays == null || alertDays < 1) alertDays = 30
+            ]]></script>
+        </actions>
+    </service>
+
+    <!-- Save a tenant's alert config. Clears the last-sent signature so the next job run re-alerts under the new rule. -->
+    <service verb="set" noun="ExpiryAlertConfig">
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="alertDays"/>
+            <parameter name="alertEnabled"/>
+        </in-parameters>
+        <actions>
+            <script><![CDATA[
+                def _upsert = { k, v ->
+                    def _e = ec.entity.find("zenith.erp.base.CompanySettings").condition("organizationPartyId", organizationPartyId).condition("settingKey", k).disableAuthz().one()
+                    if (_e) ec.service.sync().name("update#zenith.erp.base.CompanySettings").parameters([organizationPartyId:organizationPartyId, settingKey:k, settingValue:v]).call()
+                    else ec.service.sync().name("create#zenith.erp.base.CompanySettings").parameters([organizationPartyId:organizationPartyId, settingKey:k, settingValue:v]).call()
+                }
+                if (alertDays != null && alertDays.toString().trim() != '') {
+                    int _n = 30
+                    try { _n = Integer.parseInt(alertDays.toString().trim()) } catch (Exception e) {}
+                    if (_n < 1) _n = 1
+                    if (_n > 365) _n = 365
+                    _upsert('EXPIRY_ALERT_DAYS', _n.toString())
+                }
+                _upsert('EXPIRY_ALERT_ENABLED', (alertEnabled == 'Y' || alertEnabled == true || alertEnabled == 'true') ? 'Y' : 'N')
+                // config changed -> forget the last-sent signature so the next run re-evaluates under the new rule
+                def _sig = ec.entity.find("zenith.erp.base.CompanySettings").condition("organizationPartyId", organizationPartyId).condition("settingKey", "EXPIRY_ALERT_SIG").disableAuthz().one()
+                if (_sig) _sig.delete()
+            ]]></script>
+        </actions>
+    </service>
+
+    <!-- Scheduled daily: for each tenant with alerts enabled, notify its users (in-app) about lots expiring within
+         the tenant's window. De-duped by a signature of the expiring-lot set, so an unchanged set is not re-sent
+         (notify on change, not every day). Runs with no user under the cron -> loginAnonymousIfNoUser first. -->
+    <service verb="send" noun="ExpiryAlerts" authenticate="anonymous-all">
+        <in-parameters>
+            <parameter name="organizationPartyId"><description>Optional: only this tenant; blank = all</description></parameter>
+            <parameter name="dryRun" type="Boolean" default="false"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="notified" type="Integer"/>
+            <parameter name="report"/>
+        </out-parameters>
+        <actions>
+            <script><![CDATA[
+                ec.user.loginAnonymousIfNoUser()
+                def _orgs = []
+                if (organizationPartyId) { _orgs = [organizationPartyId] }
+                else { _orgs = ec.entity.find("mantle.party.PartyRole").condition("roleTypeId", "OrgInternal").disableAuthz().list().collect { it.partyId }.unique() }
+                int _notified = 0
+                def _log = []
+                for (def _org : _orgs) {
+                    // config (default enabled / 30d when unset)
+                    def _en = ec.entity.find("zenith.erp.base.CompanySettings").condition("organizationPartyId", _org).condition("settingKey", "EXPIRY_ALERT_ENABLED").disableAuthz().one()
+                    if (_en?.settingValue == 'N') continue
+                    int _days = 30
+                    def _d = ec.entity.find("zenith.erp.base.CompanySettings").condition("organizationPartyId", _org).condition("settingKey", "EXPIRY_ALERT_DAYS").disableAuthz().one()
+                    if (_d?.settingValue) { try { _days = Integer.parseInt(_d.settingValue.toString().trim()) } catch (Exception e) {} }
+                    if (_days < 1) _days = 30
+
+                    Calendar _cal = Calendar.getInstance(); _cal.add(Calendar.DAY_OF_YEAR, _days)
+                    def _thr = new java.sql.Timestamp(_cal.getTimeInMillis())
+                    def _assets = ec.entity.find("mantle.product.asset.Asset").condition("assetTypeEnumId", "AstTpInventory")
+                        .condition("ownerPartyId", _org)
+                        .condition("expiryDate", org.moqui.entity.EntityCondition.LESS_THAN_EQUAL_TO, _thr)
+                        .condition("quantityOnHandTotal", org.moqui.entity.EntityCondition.GREATER_THAN, BigDecimal.ZERO)
+                        .disableAuthz().list()
+                    if (_assets.isEmpty()) continue
+
+                    BigDecimal _val = BigDecimal.ZERO
+                    def _ids = []
+                    for (def a : _assets) {
+                        _ids.add(a.assetId)
+                        def _r = BigDecimal.ZERO
+                        if (a.valuationRate != null && (a.valuationRate as BigDecimal).signum() > 0) _r = a.valuationRate as BigDecimal
+                        else if (a.acquireCost != null && (a.acquireCost as BigDecimal).signum() > 0) _r = a.acquireCost as BigDecimal
+                        else if (a.mrpAmount != null && (a.mrpAmount as BigDecimal).signum() > 0) _r = a.mrpAmount as BigDecimal
+                        _val = _val.add(_r.multiply(a.quantityOnHandTotal ?: BigDecimal.ZERO))
+                    }
+                    def _count = _assets.size()
+                    // de-dupe: same expiring-set as last alert -> skip (notify on change only)
+                    def _sig = (_days + '|' + _ids.sort().join(',')).hashCode().toString()
+                    def _lastRow = ec.entity.find("zenith.erp.base.CompanySettings").condition("organizationPartyId", _org).condition("settingKey", "EXPIRY_ALERT_SIG").disableAuthz().one()
+                    if (_lastRow?.settingValue == _sig) continue
+
+                    def _title = _count + ' product' + (_count == 1 ? '' : 's') + ' expiring within ' + _days + ' days'
+                    _log.add(_org + ':' + _count + ' items')
+                    _notified++
+                    if (!dryRun) {
+                        def _uids = ec.entity.find("moqui.security.UserPreference").condition("preferenceKey", "ACTIVE_ORGANIZATION").condition("preferenceValue", _org).disableAuthz().selectField("userId").list().collect { it.userId }.unique()
+                        def _body = [count:_count, days:_days, valueAtRisk:_val, organizationPartyId:_org,
+                                     link:'/apps/zenith/Inventory/ExpiryDashboard',
+                                     text:_title + '. Review the Expiry Risk dashboard to sell, discount or return them.']
+                        for (def _uid : _uids) {
+                            try {
+                                def _nm = ec.makeNotificationMessage().topic("ExpiryAlert").title(_title).message(_body)
+                                _nm.userId(_uid); _nm.send()
+                            } catch (Exception _ne) { ec.logger.warn("ExpiryAlert notify failed for " + _uid + ": " + _ne.message) }
+                        }
+                        if (_lastRow) ec.service.sync().name("update#zenith.erp.base.CompanySettings").parameters([organizationPartyId:_org, settingKey:"EXPIRY_ALERT_SIG", settingValue:_sig]).call()
+                        else ec.service.sync().name("create#zenith.erp.base.CompanySettings").parameters([organizationPartyId:_org, settingKey:"EXPIRY_ALERT_SIG", settingValue:_sig]).call()
+                    }
+                }
+                notified = _notified
+                report = (dryRun ? '[DRY RUN] ' : '[SENT] ') + 'tenants alerted: ' + _notified + '. Detail: ' + _log
+            ]]></script>
+        </actions>
+    </service>
+
+</services>
