@@ -63,21 +63,38 @@
                 // metadata (expiry / value / batch) — a plain field update; on-hand is ledger-driven, handled below
                 ec.service.sync().name("update#mantle.product.asset.Asset")
                     .parameters([assetId:assetId, expiryDate:expiryDate, valuationRate:_rate, acquireCost:_rate, batchNumber:_bn]).call()
-                // quantity change -> write an AssetDetail adjustment. Moqui recomputes quantityOnHandTotal from the
-                // SUM of AssetDetail diffs, so the diff is (target - ledger sum), NOT (target - qoh) — this lands the
-                // on-hand exactly on the target even for legacy/migrated lots whose qoh was set without a ledger.
+                // A quantity change is a formal Inventory Adjustment: record a StockAdjustment header (who / when /
+                // reason / org) + a StockAdjustmentItem line (product / lot / system vs actual qty), so the correction
+                // is visible in the Stock Adjustments audit trail — not just a bare ledger line. Created already-applied
+                // because we post the ledger right here (the shared apply#StockAdjustment is product-level, not lot-
+                // precise, so we can't reuse it for a specific expiry lot).
                 if (_newQty.compareTo(_oldQty) != 0) {
+                    def _reason = (adjustReason != null && adjustReason.toString().trim() != '') ? adjustReason.toString().trim() : 'PhysicalCount'
+                    def _saOrg = (activeOrg && activeOrg != '_NA_') ? activeOrg : _asset.ownerPartyId
+                    def _sa = ec.service.sync().name("create#zenith.erp.inventory.StockAdjustment").parameters([
+                        organizationPartyId:_saOrg, facilityId:_asset.facilityId, adjustmentType:_reason,
+                        adjustmentDate:ec.user.nowTimestamp, statusId:'AdjApplied', adjustedBy:ec.user.userId,
+                        remarks:'Expiry Risk dashboard — lot ' + assetId + ' qty ' + _oldQty + ' → ' + _newQty]).call()
+                    ec.service.sync().name("create#zenith.erp.inventory.StockAdjustmentItem").parameters([
+                        stockAdjustmentId:_sa.stockAdjustmentId, productId:_asset.productId, assetId:assetId,
+                        systemQuantity:_oldQty, actualQuantity:_newQty, differenceQuantity:_newQty.subtract(_oldQty),
+                        valuationRate:_rate, remarks:'Edited from Expiry Risk dashboard']).call()
+                    // Post the ledger for THIS lot. Moqui recomputes quantityOnHandTotal from the SUM of AssetDetail
+                    // diffs, so the diff is (target - ledger sum), NOT (target - qoh) — this lands the on-hand exactly
+                    // on target even for legacy/migrated lots whose qoh was set without a ledger, and reconciles it.
                     def _qohSum = BigDecimal.ZERO; def _atpSum = BigDecimal.ZERO
                     for (def d : ec.entity.find("mantle.product.asset.AssetDetail").condition("assetId", assetId).disableAuthz().list()) {
                         _qohSum = _qohSum.add(d.quantityOnHandDiff ?: BigDecimal.ZERO)
                         _atpSum = _atpSum.add(d.availableToPromiseDiff ?: BigDecimal.ZERO)
                     }
                     ec.service.sync().name("create#mantle.product.asset.AssetDetail").parameters([
-                        assetId:assetId, effectiveDate:ec.user.nowTimestamp,
+                        assetId:assetId, productId:_asset.productId, effectiveDate:ec.user.nowTimestamp,
                         quantityOnHandDiff:_newQty.subtract(_qohSum), availableToPromiseDiff:_newQty.subtract(_atpSum),
-                        description:'Expiry stock quantity corrected']).call()
+                        description:'Stock adjustment ' + _sa.stockAdjustmentId + ' (' + _reason + ')']).call()
+                    ec.message.addMessage("Updated stock " + assetId + " — qty " + _oldQty + " → " + _newQty + " (adjustment " + _sa.stockAdjustmentId + " logged). Expiry " + expiryDate + ".")
+                } else {
+                    ec.message.addMessage("Updated stock " + assetId + " — expiry " + expiryDate + ".")
                 }
-                ec.message.addMessage("Updated stock " + assetId + " — expiry " + expiryDate + ", qty " + _newQty + ".")
             ]]></script>
         </actions>
         <default-response url="."/>
@@ -264,6 +281,15 @@
                             <field name="lotLabel"><default-field title="Editing"><display text="${productName} — ${assetId}"/></default-field></field>
                             <field name="expiryDate"><default-field title="Expiry Date"><date-time type="date" default-value="${expiryDate ? ec.l10n.format(expiryDate, 'yyyy-MM-dd') : ''}"/></default-field></field>
                             <field name="quantity"><default-field title="Quantity"><text-line size="10" default-value="${quantity}"/></default-field></field>
+                            <!-- ZE-INV-007 f/u: a quantity change is logged as an Inventory Adjustment with this reason -->
+                            <field name="adjustReason"><default-field title="Reason (if quantity changed)">
+                                <drop-down allow-empty="false">
+                                    <option key="PhysicalCount" text="Physical count / recount"/>
+                                    <option key="Damage" text="Damaged"/>
+                                    <option key="Expiry" text="Expired / spoiled"/>
+                                    <option key="WriteOff" text="Write-off"/>
+                                </drop-down>
+                            </default-field></field>
                             <field name="unitValue"><default-field title="Value per Unit (${currSymbol})"><text-line size="10" default-value="${valuationRate}"/></default-field></field>
                             <field name="batchNumber"><default-field title="Batch / Lot (Optional)"><text-line size="20" default-value="${batchNumber == 'N/A' ? '' : batchNumber}"/></default-field></field>
                             <field name="submitButton"><default-field title=""><submit text="Save Changes"/></default-field></field>
