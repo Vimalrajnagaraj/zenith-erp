@@ -45,102 +45,38 @@
         <default-response url="."/>
     </transition>
 
+    <!-- ZE-INV-006 (IV-105): CSV export of the same (org-scoped, filtered, sorted) list, streamed as a download.
+         read-only so it can be invoked from a GET link with the filter/sort URL params (like the print transitions);
+         it only reads + writes the response, no data mutation. -->
+    <transition name="exportCsv" read-only="true">
+        <actions>
+            <service-call name="zenith.inventory.InventoryServices.get#ExpiryRisk" out-map="_ex"
+                in-map="[organizationPartyId: ec.user.getPreference('ACTIVE_ORGANIZATION'),
+                         searchText: ec.context.searchText, withinDays: ec.context.withinDays, orderByField: ec.context.orderByField]"/>
+            <script><![CDATA[
+                def esc = { s -> '"' + (s == null ? '' : s.toString()).replace('"','""') + '"' }
+                def sb = new StringBuilder()
+                sb.append("Stock ID,Product Name,Batch/Lot,Supplier,Expiry Date,Days to Expiry,Quantity,Value at Risk,Valuation Basis\r\n")
+                for (def r : (_ex.expiringAssets ?: [])) {
+                    def _basis = (r.valueBasis == 'MRP') ? 'MRP (retail)' : (r.valueBasis == 'unvalued' ? 'not valued' : 'cost')
+                    def _days = (r.daysToExpiry != null && r.daysToExpiry <= 0) ? 'EXPIRED' : ('' + r.daysToExpiry)
+                    def _exp = r.expiryDate ? ec.l10n.format(r.expiryDate, 'yyyy-MM-dd') : ''
+                    sb.append([esc(r.assetId), esc(r.productName), esc(r.batchNumber), esc(r.supplierName), esc(_exp), esc(_days), esc(r.quantity), esc(r.value), esc(_basis)].join(',')).append("\r\n")
+                }
+                ec.web.response.setContentType("text/csv; charset=UTF-8")
+                ec.web.response.addHeader("Content-Disposition", "attachment; filename=\"expiry-risk-report.csv\"")
+                def w = ec.web.response.getWriter(); w.write(sb.toString()); w.flush()
+            ]]></script>
+        </actions>
+        <default-response type="none"/>
+    </transition>
+
     <actions>
-        <script><![CDATA[
-            import java.sql.Timestamp
-            
-            Calendar cal = Calendar.getInstance()
-            cal.add(Calendar.DAY_OF_YEAR, 90)
-            Timestamp thresholdDate = new Timestamp(cal.getTimeInMillis())
-
-            // Org isolation (primary guard): a tenant sees only its own expiring stock; a super-admin with
-            // no active org sees all. Asset is not covered by the active-org entity-filter set, so scope it
-            // here explicitly — do NOT rely on the Product join below to hide other tenants' stock.
-            def activeOrg = ec.user.getPreference('ACTIVE_ORGANIZATION')
-            def assetFind = ec.entity.find("mantle.product.asset.Asset")
-                .condition("expiryDate", org.moqui.entity.EntityCondition.LESS_THAN_EQUAL_TO, thresholdDate)
-                .condition("quantityOnHandTotal", org.moqui.entity.EntityCondition.GREATER_THAN, BigDecimal.ZERO)
-            if (activeOrg && activeOrg != '_NA_') assetFind.condition("ownerPartyId", activeOrg)
-            def assetList = assetFind.list()
-
-            BigDecimal totalVal = BigDecimal.ZERO
-            List expList = []
-            def _supCache = [:]  // ZE-INV-004 f/u: supplier name per acquire order (avoid re-querying the same PO)
-            for (def asset : assetList) {
-                def product = ec.entity.find("mantle.product.Product").condition("productId", asset.productId).one()
-                if (product == null) { continue }  // orphaned/not-visible product — skip, don't value it
-                // ZE-INV-004 f/u: supplier for PO-received lots (Asset.acquireOrderId -> OrderPart.vendorPartyId ->
-                // party name). Manual-add / POS / migration lots have no PO, so supplier stays blank.
-                def _oid = asset.acquireOrderId
-                def supplierName = ''
-                if (_oid) {
-                    if (!_supCache.containsKey(_oid)) {
-                        def _sn = ''
-                        def _op = ec.entity.find("mantle.order.OrderPart").condition("orderId", _oid).disableAuthz().list().find { it.vendorPartyId != null }
-                        if (_op?.vendorPartyId) {
-                            def _v = ec.entity.find("mantle.party.PartyDetail").condition("partyId", _op.vendorPartyId).disableAuthz().one()
-                            if (_v) _sn = _v.organizationName ?: ((_v.firstName ?: '') + ' ' + (_v.lastName ?: '')).trim()
-                        }
-                        _supCache[_oid] = _sn
-                    }
-                    supplierName = _supCache[_oid]
-                }
-                // ZE-INV-002 f/u: value at cost (valuationRate), but fall back to acquireCost then MRP so stock
-                // created without a valuationRate (legacy POS/migration lots) still shows a value at risk, not ₹0.
-                def _pos = { v -> (v != null && (v as BigDecimal).signum() > 0) ? (v as BigDecimal) : null }
-                def valRate = _pos(asset.valuationRate) ?: _pos(asset.acquireCost)
-                def valBasis = (valRate != null) ? 'cost' : null
-                if (valRate == null) { valRate = _pos(asset.mrpAmount); if (valRate != null) valBasis = 'MRP' }
-                if (valRate == null) { valRate = BigDecimal.ZERO; valBasis = 'unvalued' }
-                def qoh = asset.quantityOnHandTotal ?: BigDecimal.ZERO
-                def val = valRate.multiply(qoh)
-                totalVal = totalVal.add(val)
-                expList.add([
-                    assetId: asset.assetId,
-                    productName: product?.productName ?: 'Unknown',
-                    supplierName: supplierName,
-                    expiryDate: asset.expiryDate,
-                    quantity: qoh,
-                    value: val,
-                    valueBasis: valBasis,
-                    batchNumber: asset.batchNumber ?: 'N/A'
-                ])
-            }
-
-            // ZE-INV-004 (IV-103): search + filter. searchText matches product name / stock id / batch (contains,
-            // case-insensitive); withinDays narrows by remaining days ('7'/'30'/'60' = expiring within N days,
-            // 'expired' = already past). Recompute the Risk Summary total from the filtered set so the headline and
-            // the list agree.
-            def _search = (ec.context.searchText ?: '').toString().trim().toLowerCase()
-            def _within = (ec.context.withinDays ?: '').toString().trim()
-            def _nowMs = ec.user.nowTimestamp.getTime()
-            if (_search) {
-                expList = expList.findAll { r ->
-                    (((r.productName ?: '') + ' ' + (r.assetId ?: '') + ' ' + (r.batchNumber ?: '') + ' ' + (r.supplierName ?: '')).toLowerCase().contains(_search))
-                }
-            }
-            if (_within) {
-                expList = expList.findAll { r ->
-                    def d = r.expiryDate ? (int)((r.expiryDate.getTime() - _nowMs) / 86400000L) : 999
-                    (_within == 'expired') ? (d <= 0) : (d <= (_within as Integer))
-                }
-            }
-            def _ft = BigDecimal.ZERO
-            for (def r : expList) { _ft = _ft.add(r.value ?: BigDecimal.ZERO) }
-            totalVal = _ft
-
-            // ZE-INV-003 (IV-102): sortable list. The list is built in Groovy (not a plain entity-find), so the
-            // column sort links set orderByField and we sort here. Default = soonest expiry first (most useful for
-            // an expiry-risk view). A leading '-' means descending; null values sort last.
-            def _ob = (ec.context.orderByField ?: 'expiryDate').toString()
-            def _desc = _ob.startsWith('-')
-            def _fld = _desc ? _ob.substring(1) : _ob
-            if (!(_fld in ['assetId','productName','batchNumber','supplierName','expiryDate','quantity','value'])) _fld = 'expiryDate'
-            def _nc = { a, b -> (a == null && b == null) ? 0 : (a == null ? 1 : (b == null ? -1 : (a <=> b))) }
-            expList.sort { x, y -> def c = _nc(x[_fld], y[_fld]); _desc ? -c : c }
-
-            expiryOut = [totalExpiryValue: totalVal, expiringAssets: expList]
-        ]]></script>
+        <!-- ZE-INV-006 (IV-105): the list is built by the shared get#ExpiryRisk service (org isolation, value
+             fallback, supplier, search+filter, sort) so the screen and the CSV export return the same data. -->
+        <service-call name="zenith.inventory.InventoryServices.get#ExpiryRisk" out-map="expiryOut"
+            in-map="[organizationPartyId: ec.user.getPreference('ACTIVE_ORGANIZATION'),
+                     searchText: ec.context.searchText, withinDays: ec.context.withinDays, orderByField: ec.context.orderByField]"/>
     </actions>
 
     <widgets>
@@ -223,6 +159,14 @@
                     </field-row>
                 </field-layout>
             </form-single>
+
+            <!-- ZE-INV-006 (IV-105): export the current (org-scoped, filtered, sorted) list as CSV. Standalone link
+                 (a <link> inside a form-single renders as a submit button, not a downloadable anchor). -->
+            <container style="row justify-end q-mb-sm">
+                <link url="/apps/zenith/Inventory/ExpiryDashboard/exportCsv?searchText=${java.net.URLEncoder.encode((ec.context.searchText ?: '').toString(), 'UTF-8')}&amp;withinDays=${ec.context.withinDays ?: ''}&amp;orderByField=${ec.context.orderByField ?: ''}"
+                      url-type="plain" text="Export CSV" icon="fa fa-download"
+                      style="q-btn bg-teal-7 text-white text-weight-bold border-radius-sm q-px-md"/>
+            </container>
 
             <form-list name="ExpiringAssetsForm" list="expiryOut.expiringAssets" skip-form="true">
                 <row-actions>

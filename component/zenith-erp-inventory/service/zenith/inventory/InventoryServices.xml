@@ -1,7 +1,15 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
 
+    <!-- Expiry Risk list used by BOTH the ExpiryDashboard screen and its CSV export, so the value fallback
+         (ZE-INV-002), supplier (ZE-INV-004), search/filter (ZE-INV-004) and sort (ZE-INV-003) stay in one place. -->
     <service verb="get" noun="ExpiryRisk">
+        <in-parameters>
+            <parameter name="organizationPartyId"/>  <!-- org isolation; blank/_NA_ = all (super-admin) -->
+            <parameter name="searchText"/>            <!-- product / stock id / batch / supplier contains -->
+            <parameter name="withinDays"/>            <!-- '7'/'30'/'60' = within N days; 'expired' = past; '' = all 90d -->
+            <parameter name="orderByField" default-value="expiryDate"/>
+        </in-parameters>
         <out-parameters>
             <parameter name="totalExpiryValue" type="BigDecimal"/>
             <parameter name="expiringAssets" type="List"/>
@@ -9,35 +17,71 @@
         <actions>
             <script><![CDATA[
                 import java.sql.Timestamp
-                
                 Calendar cal = Calendar.getInstance()
                 cal.add(Calendar.DAY_OF_YEAR, 90)
                 Timestamp thresholdDate = new Timestamp(cal.getTimeInMillis())
 
-                def assetList = ec.entity.find("mantle.product.asset.Asset")
+                // Org isolation (explicit — Asset isn't in the active-org entity-filter set).
+                def assetFind = ec.entity.find("mantle.product.asset.Asset")
                     .condition("expiryDate", org.moqui.entity.EntityCondition.LESS_THAN_EQUAL_TO, thresholdDate)
                     .condition("quantityOnHandTotal", org.moqui.entity.EntityCondition.GREATER_THAN, BigDecimal.ZERO)
-                    .list()
+                if (organizationPartyId && organizationPartyId != '_NA_') assetFind.condition("ownerPartyId", organizationPartyId)
+                def assetList = assetFind.list()
 
-                BigDecimal totalVal = BigDecimal.ZERO
+                def _nowMs = ec.user.nowTimestamp.getTime()
                 List expList = []
+                def _supCache = [:]
                 for (def asset : assetList) {
-                    def valRate = asset.valuationRate ?: BigDecimal.ZERO
-                    def qoh = asset.quantityOnHandTotal ?: BigDecimal.ZERO
-                    def val = valRate.multiply(qoh)
-                    totalVal = totalVal.add(val)
-                    
                     def product = ec.entity.find("mantle.product.Product").condition("productId", asset.productId).one()
+                    if (product == null) { continue }
+                    // supplier for PO-received lots (acquireOrderId -> OrderPart.vendorPartyId -> party name)
+                    def _oid = asset.acquireOrderId
+                    def supplierName = ''
+                    if (_oid) {
+                        if (!_supCache.containsKey(_oid)) {
+                            def _sn = ''
+                            def _op = ec.entity.find("mantle.order.OrderPart").condition("orderId", _oid).disableAuthz().list().find { it.vendorPartyId != null }
+                            if (_op?.vendorPartyId) {
+                                def _v = ec.entity.find("mantle.party.PartyDetail").condition("partyId", _op.vendorPartyId).disableAuthz().one()
+                                if (_v) _sn = _v.organizationName ?: ((_v.firstName ?: '') + ' ' + (_v.lastName ?: '')).trim()
+                            }
+                            _supCache[_oid] = _sn
+                        }
+                        supplierName = _supCache[_oid]
+                    }
+                    // value at cost (valuationRate) -> acquireCost -> MRP; tag the basis
+                    def _pos = { v -> (v != null && (v as BigDecimal).signum() > 0) ? (v as BigDecimal) : null }
+                    def valRate = _pos(asset.valuationRate) ?: _pos(asset.acquireCost)
+                    def valBasis = (valRate != null) ? 'cost' : null
+                    if (valRate == null) { valRate = _pos(asset.mrpAmount); if (valRate != null) valBasis = 'MRP' }
+                    if (valRate == null) { valRate = BigDecimal.ZERO; valBasis = 'unvalued' }
+                    def qoh = asset.quantityOnHandTotal ?: BigDecimal.ZERO
+                    def _days = asset.expiryDate ? (int)((asset.expiryDate.getTime() - _nowMs) / 86400000L) : 999
                     expList.add([
-                        assetId: asset.assetId,
-                        productName: product?.productName ?: 'Unknown',
-                        expiryDate: asset.expiryDate,
-                        quantity: qoh,
-                        value: val,
-                        batchNumber: asset.batchNumber ?: 'N/A'
+                        assetId: asset.assetId, productName: product?.productName ?: 'Unknown', supplierName: supplierName,
+                        expiryDate: asset.expiryDate, daysToExpiry: _days, quantity: qoh,
+                        value: valRate.multiply(qoh), valueBasis: valBasis, batchNumber: asset.batchNumber ?: 'N/A'
                     ])
                 }
-                
+
+                // search + within-days filter
+                def _search = (searchText ?: '').toString().trim().toLowerCase()
+                def _within = (withinDays ?: '').toString().trim()
+                if (_search) expList = expList.findAll { r ->
+                    (((r.productName ?: '') + ' ' + (r.assetId ?: '') + ' ' + (r.batchNumber ?: '') + ' ' + (r.supplierName ?: '')).toLowerCase().contains(_search) )
+                }
+                if (_within) expList = expList.findAll { r -> (_within == 'expired') ? (r.daysToExpiry <= 0) : (r.daysToExpiry <= (_within as Integer)) }
+
+                BigDecimal totalVal = BigDecimal.ZERO
+                for (def r : expList) { totalVal = totalVal.add(r.value ?: BigDecimal.ZERO) }
+
+                // sort (leading '-' = desc, whitelist, nulls last)
+                def _ob = (orderByField ?: 'expiryDate').toString()
+                def _desc = _ob.startsWith('-'); def _fld = _desc ? _ob.substring(1) : _ob
+                if (!(_fld in ['assetId','productName','batchNumber','supplierName','expiryDate','quantity','value'])) _fld = 'expiryDate'
+                def _nc = { a, b -> (a == null && b == null) ? 0 : (a == null ? 1 : (b == null ? -1 : (a <=> b))) }
+                expList.sort { x, y -> def c = _nc(x[_fld], y[_fld]); _desc ? -c : c }
+
                 totalExpiryValue = totalVal
                 expiringAssets = expList
             ]]></script>
