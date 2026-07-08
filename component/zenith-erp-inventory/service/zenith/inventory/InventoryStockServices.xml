@@ -161,4 +161,47 @@
         </actions>
     </service>
 
+    <!-- ZE-INV-007 f/u: re-home ORPHANED inventory lots — an asset with no ownerPartyId whose PRODUCT is owned by a
+         tenant is that tenant's stock (a migration/creation gap left the asset unowned, so it is invisible in the
+         tenant's org-scoped inventory/expiry views). Set the asset owner to its product's owner via update#Asset
+         (cache-safe, unlike a raw SQL write). On-hand is NOT touched. Only NULL-owner lots are moved; a lot already
+         owned by a DIFFERENT org is never reassigned. dryRun (default) only reports; organizationPartyId (optional)
+         limits to orphans whose product is owned by that tenant. Idempotent (a re-homed lot is no longer NULL-owner). -->
+    <service verb="rehome" noun="OrphanAssets" authenticate="true">
+        <in-parameters>
+            <parameter name="organizationPartyId"><description>Optional: only orphans whose PRODUCT is owned by this org</description></parameter>
+            <parameter name="dryRun" type="Boolean" default="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="scanned" type="Integer"/>
+            <parameter name="rehomed" type="Integer"/>
+            <parameter name="report"/>
+        </out-parameters>
+        <actions>
+            <script><![CDATA[
+                def _all = ec.entity.find("mantle.product.asset.Asset").condition("assetTypeEnumId", "AstTpInventory").disableAuthz().list()
+                int _scanned = 0; int _rehomed = 0
+                def _perOrg = [:]; def _log = []
+                for (def a : _all) {
+                    if (a.ownerPartyId != null) continue                 // only owner-less lots
+                    _scanned++
+                    if (a.productId == null) continue
+                    def _p = ec.entity.find("mantle.product.Product").condition("productId", a.productId).disableAuthz().one()
+                    def _newOwner = _p?.ownerPartyId
+                    if (_newOwner == null) continue                      // product also unowned -> tenant unknown, skip
+                    if (organizationPartyId && _newOwner != organizationPartyId) continue
+                    _rehomed++
+                    _perOrg[_newOwner] = (_perOrg[_newOwner] ?: 0) + 1
+                    _log.add(a.assetId + ' (qoh ' + (a.quantityOnHandTotal ?: 0) + ') -> ' + _newOwner)
+                    if (!dryRun) {
+                        ec.service.sync().name("update#mantle.product.asset.Asset").parameters([assetId:a.assetId, ownerPartyId:_newOwner]).call()
+                    }
+                }
+                scanned = _scanned
+                rehomed = _rehomed
+                report = (dryRun ? '[DRY RUN] ' : '[APPLIED] ') + 'scanned ' + _scanned + ' owner-less inventory lots; ' + _rehomed + ' re-homed to their product owner. Per org: ' + _perOrg + '. Detail: ' + _log
+            ]]></script>
+        </actions>
+    </service>
+
 </services>
