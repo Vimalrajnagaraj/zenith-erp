@@ -280,81 +280,26 @@
                             def out = ec.service.sync().name("zenith.inventory.AdvancedForecastServices.forecast#ProductDemand").parameter("productId", pid).parameter("horizonDays", period).parameter("organizationPartyId", org).call()
                             def r = out?.result
                             if (r && r.forecastDemand != null) {
+                                double rop = (r.reorderPoint ?: 0) as double
+                                double ss = (r.safetyStock ?: 0) as double
+                                int sugg = (r.suggestedOrderQty ?: 0) as int
                                 def existing = ec.entity.find("zenith.erp.inventory.DemandForecast").condition("productId", pid).condition("periodStart", todaySql).list()
                                 if (!existing) {
                                     ec.service.sync().name("create#zenith.erp.inventory.DemandForecast").parameters([
                                         productId: pid, periodStart: todaySql, periodEnd: java.sql.Date.valueOf(today.plusDays(period)),
-                                        forecastQuantity: r.forecastDemand, forecastMethodEnumId: (r.methodEnumId ?: "FmSeasonal"), actualQuantity: null, accuracyPercent: null
+                                        forecastQuantity: r.forecastDemand, forecastMethodEnumId: (r.methodEnumId ?: "FmSeasonal"), actualQuantity: null, accuracyPercent: null,
+                                        reorderPoint: rop, safetyStock: ss, suggestedOrderQty: sugg
                                     ]).call()
                                     fc++
                                 }
-                                // ---- 3) REORDER alert: compare real stock-on-hand vs the forecast reorder point ----
+                                // ---- 3) REORDER alert: delegate to shared check#ProductReorder (also used by the intraday cycle#ReorderCheck) ----
                                 try {
-                                    double rop = (r.reorderPoint ?: 0) as double
-                                    double ss = (r.safetyStock ?: 0) as double
-                                    int sugg = (r.suggestedOrderQty ?: 0) as int
                                     if (rop > 0) {
-                                        double soh = 0.0; boolean tracked = false; List trackedAssetIds = []
-                                        ec.entity.find("mantle.product.asset.Asset").condition("productId", pid).condition("ownerPartyId", org)
-                                            .selectField("assetId").selectField("quantityOnHandTotal").selectField("hasQuantity").list().each {
-                                                soh += ((it.quantityOnHandTotal ?: 0) as double)
-                                                if (it.hasQuantity == 'Y') { tracked = true; trackedAssetIds.add(it.assetId) }
-                                            }
-                                        // ZE-DF-002 (IV-111): fire only for a quantity-tracked product (hasQuantity='Y' — the reliable flag;
-                                        // was gated on originalQuantity>0 which imported stock never has, so alerts never fired at all).
-                                        // ZE-DF-003 (IV-111 f/u): a positive-but-low on-hand always alerts (LowStock -> Reorder -> Critical).
-                                        // A tracked lot sitting at EXACTLY 0 is ambiguous: 'never counted' (imported, no ledger — skip it, else
-                                        // ~1139 unmaintained MARUTHI lots would flood 'reorder everything') vs 'maintained down to a genuine
-                                        // stockout' (the lot has AssetDetail ledger movements — the single most important alert to surface).
-                                        // So the 0/negative case fires an out-of-stock Critical ONLY when the lot has real ledger history.
-                                        boolean maintainedStockout = false
-                                        if (tracked && soh <= 0 && trackedAssetIds) {
-                                            maintainedStockout = ec.entity.find("mantle.product.asset.AssetDetail").condition("assetId", "in", trackedAssetIds).count() > 0
-                                        }
-                                        if (tracked && (soh > 0 || maintainedStockout)) {
-                                            String rdir = null
-                                            if (soh <= 0) rdir = "Critical"
-                                            else if (soh <= ss) rdir = "Critical"
-                                            else if (soh <= rop) rdir = "Reorder"
-                                            else if (soh <= rop * 1.2) rdir = "LowStock"
-                                            if (rdir != null) {
-                                                def pn = row.productName ?: pid
-                                                String lvl = (soh <= 0) ? "out of stock" : (rdir == "Critical" ? "critically low" : (rdir == "Reorder" ? "at the reorder point" : "getting low"))
-                                                String rmsg = "Stock of '" + pn + "' is " + lvl + ": " + ((int)Math.round(soh)) + " units on hand vs a reorder point of " + ((int)Math.round(rop)) + " units (safety stock " + ((int)Math.round(ss)) + "). Suggested order about " + sugg + " units."
-                                                // ZE-DF-004 (IV-111 f/u): severity rank so a same-day alert ESCALATES, never downgrades. Ranks
-                                                // getting-low(1) < reorder(2) < critically-low(3) < out-of-stock(4); out-of-stock outranks
-                                                // critically-low even though both are direction=Critical.
-                                                int newSev = (soh <= 0) ? 4 : (rdir == "Critical" ? 3 : (rdir == "Reorder" ? 2 : 1))
-                                                def rdup = ec.entity.find("zenith.erp.inventory.DemandAlert").condition("productId", pid).condition("alertDate", todaySql).condition("alertType", "Reorder").list()
-                                                def exAlert = rdup ? rdup[0] : null
-                                                int exSev = 0
-                                                if (exAlert != null) { double exSoh = (exAlert.stockOnHand ?: 0) as double; exSev = (exSoh <= 0) ? 4 : (exAlert.direction == "Critical" ? 3 : (exAlert.direction == "Reorder" ? 2 : 1)) }
-                                                boolean doNotify = false
-                                                if (exAlert == null) {
-                                                    ec.service.sync().name("create#zenith.erp.inventory.DemandAlert").parameters([
-                                                        organizationPartyId: org, productId: pid, productName: pn, alertDate: todaySql, alertType: "Reorder", direction: rdir,
-                                                        reorderPoint: rop, stockOnHand: soh, message: rmsg, statusId: "AlertNew", createdStamp: ec.user.nowTimestamp
-                                                    ]).call()
-                                                    alerts++; doNotify = true
-                                                } else if (newSev > exSev) {
-                                                    // Worsened within the day (e.g. getting low -> out of stock): upgrade the SAME row in place and
-                                                    // re-surface it (AlertNew) + re-notify. Direct .update() bypasses the status-flow service check
-                                                    // (same reason acknowledgeAlert updates directly). Equal/lower severity today = leave it (no spam).
-                                                    exAlert.direction = rdir; exAlert.stockOnHand = soh; exAlert.reorderPoint = rop
-                                                    exAlert.message = rmsg; exAlert.statusId = "AlertNew"; exAlert.update()
-                                                    alerts++; doNotify = true
-                                                }
-                                                if (doNotify) {
-                                                    try {
-                                                        def uids = ec.entity.find("moqui.security.UserPreference").condition("preferenceKey","ACTIVE_ORGANIZATION").condition("preferenceValue", org).selectField("userId").list().collect { it.userId }.unique()
-                                                        for (uid in uids) {
-                                                            def nm = ec.makeNotificationMessage().topic("DemandAlert").title("Reorder alert: " + pn).message([productName: pn, type: "Reorder", level: rdir, stockOnHand: (int)Math.round(soh), reorderPoint: (int)Math.round(rop), text: rmsg])
-                                                            nm.userId(uid); nm.send()
-                                                        }
-                                                    } catch (Exception ne2) { ec.logger.warn("Reorder notify failed: " + ne2.message) }
-                                                }
-                                            }
-                                        }
+                                        def rout = ec.service.sync().name("zenith.inventory.AdvancedForecastServices.check#ProductReorder").parameters([
+                                            organizationPartyId: org, productId: pid, productName: (row.productName ?: pid),
+                                            reorderPoint: rop, safetyStock: ss, suggestedOrderQty: sugg, alertDate: todaySql
+                                        ]).call()
+                                        if (rout?.alerted) alerts++
                                     }
                                 } catch (Exception re) { ec.logger.warn("Reorder check failed for " + pid + ": " + re.message) }
                             }
@@ -419,6 +364,143 @@
          diagnose WHY the forecast and reality differed.
        ============================================================================ -->
     <!-- SECURITY: not allow-remote (in-process Copilot/cron only; see forecast#ProductDemand). -->
+    <!-- ZE-DF-005 (IV-111): SHARED reorder-alert logic. Compares a product's current stock-on-hand to a given
+         reorder point and creates OR escalates today's Reorder DemandAlert (never downgrades). Called by
+         cycle#DemandForecast (daily, freshly computed reorder point) AND cycle#ReorderCheck (intraday, stored
+         reorder point). Severity + escalation + genuine-stockout rules: see ZE-DF-002/003/004. -->
+    <service verb="check" noun="ProductReorder" authenticate="false" transaction-timeout="120">
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="productId" required="true"/>
+            <parameter name="productName"/>
+            <parameter name="reorderPoint" type="BigDecimal"/>
+            <parameter name="safetyStock" type="BigDecimal"/>
+            <parameter name="suggestedOrderQty" type="BigDecimal"/>
+            <parameter name="alertDate" type="Date"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="alerted" type="Boolean"/>
+            <parameter name="direction"/>
+        </out-parameters>
+        <actions>
+            <script><![CDATA[
+                import org.moqui.context.ExecutionContext
+                ExecutionContext ec = context.ec
+                alerted = false; direction = null
+                double rop = (reorderPoint ?: 0) as double
+                double ss = (safetyStock ?: 0) as double
+                int sugg = (suggestedOrderQty ?: 0) as int
+                if (rop > 0) {
+                    def org = organizationPartyId
+                    def pid = productId
+                    def todaySql = alertDate ?: java.sql.Date.valueOf(ec.user.nowTimestamp.toLocalDateTime().toLocalDate())
+                    def pn = productName ?: pid
+                    double soh = 0.0; boolean tracked = false; List trackedAssetIds = []
+                    ec.entity.find("mantle.product.asset.Asset").condition("productId", pid).condition("ownerPartyId", org)
+                        .selectField("assetId").selectField("quantityOnHandTotal").selectField("hasQuantity").list().each {
+                            soh += ((it.quantityOnHandTotal ?: 0) as double)
+                            if (it.hasQuantity == 'Y') { tracked = true; trackedAssetIds.add(it.assetId) }
+                        }
+                    // ZE-DF-002/003: alert only for a quantity-tracked product; the exact-0 case only when the lot has
+                    // AssetDetail ledger history (maintained down to a real stockout) vs a never-counted imported zero.
+                    boolean maintainedStockout = false
+                    if (tracked && soh <= 0 && trackedAssetIds) {
+                        maintainedStockout = ec.entity.find("mantle.product.asset.AssetDetail").condition("assetId", "in", trackedAssetIds).count() > 0
+                    }
+                    if (tracked && (soh > 0 || maintainedStockout)) {
+                        String rdir = null
+                        if (soh <= 0) rdir = "Critical"
+                        else if (soh <= ss) rdir = "Critical"
+                        else if (soh <= rop) rdir = "Reorder"
+                        else if (soh <= rop * 1.2) rdir = "LowStock"
+                        if (rdir != null) {
+                            String lvl = (soh <= 0) ? "out of stock" : (rdir == "Critical" ? "critically low" : (rdir == "Reorder" ? "at the reorder point" : "getting low"))
+                            String rmsg = "Stock of '" + pn + "' is " + lvl + ": " + ((int)Math.round(soh)) + " units on hand vs a reorder point of " + ((int)Math.round(rop)) + " units (safety stock " + ((int)Math.round(ss)) + "). Suggested order about " + sugg + " units."
+                            // ZE-DF-004: severity rank so a same-day alert ESCALATES, never downgrades.
+                            int newSev = (soh <= 0) ? 4 : (rdir == "Critical" ? 3 : (rdir == "Reorder" ? 2 : 1))
+                            def rdup = ec.entity.find("zenith.erp.inventory.DemandAlert").condition("productId", pid).condition("alertDate", todaySql).condition("alertType", "Reorder").list()
+                            def exAlert = rdup ? rdup[0] : null
+                            int exSev = 0
+                            if (exAlert != null) { double exSoh = (exAlert.stockOnHand ?: 0) as double; exSev = (exSoh <= 0) ? 4 : (exAlert.direction == "Critical" ? 3 : (exAlert.direction == "Reorder" ? 2 : 1)) }
+                            boolean doNotify = false
+                            if (exAlert == null) {
+                                ec.service.sync().name("create#zenith.erp.inventory.DemandAlert").parameters([
+                                    organizationPartyId: org, productId: pid, productName: pn, alertDate: todaySql, alertType: "Reorder", direction: rdir,
+                                    reorderPoint: rop, stockOnHand: soh, message: rmsg, statusId: "AlertNew", createdStamp: ec.user.nowTimestamp
+                                ]).call()
+                                alerted = true; doNotify = true
+                            } else if (newSev > exSev) {
+                                // worsened within the day: upgrade the SAME row + re-surface (AlertNew) + re-notify.
+                                // direct .update() bypasses the status-flow service check (same as acknowledgeAlert). equal/lower = leave it.
+                                exAlert.direction = rdir; exAlert.stockOnHand = soh; exAlert.reorderPoint = rop
+                                exAlert.message = rmsg; exAlert.statusId = "AlertNew"; exAlert.update()
+                                alerted = true; doNotify = true
+                            }
+                            direction = rdir
+                            if (doNotify) {
+                                try {
+                                    def uids = ec.entity.find("moqui.security.UserPreference").condition("preferenceKey","ACTIVE_ORGANIZATION").condition("preferenceValue", org).selectField("userId").list().collect { it.userId }.unique()
+                                    for (uid in uids) {
+                                        def nm = ec.makeNotificationMessage().topic("DemandAlert").title("Reorder alert: " + pn).message([productName: pn, type: "Reorder", level: rdir, stockOnHand: (int)Math.round(soh), reorderPoint: (int)Math.round(rop), text: rmsg])
+                                        nm.userId(uid); nm.send()
+                                    }
+                                } catch (Exception ne2) { ec.logger.warn("Reorder notify failed: " + ne2.message) }
+                            }
+                        }
+                    }
+                }
+            ]]></script>
+        </actions>
+    </service>
+
+    <!-- ZE-DF-005 (IV-111): LIGHTWEIGHT intraday reorder re-check. Reads the reorder point cycle#DemandForecast
+         already stored TODAY (no forecast recompute) and re-checks it against current stock-on-hand, so a same-day
+         dip -> stockout escalates automatically between the daily 01:30 forecast runs. Wired to a 4-hourly cron. -->
+    <service verb="cycle" noun="ReorderCheck" authenticate="false" transaction-timeout="900">
+        <in-parameters>
+            <parameter name="organizationPartyId"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="summary"/>
+            <parameter name="productsChecked" type="Integer"/>
+            <parameter name="alertsRaised" type="Integer"/>
+        </out-parameters>
+        <actions>
+            <script><![CDATA[
+                import org.moqui.context.ExecutionContext
+                ExecutionContext ec = context.ec
+                ec.user.loginAnonymousIfNoUser()
+                boolean _d = ec.artifactExecution.disableAuthz()
+                int checked = 0, raised = 0
+                try {
+                    def today = ec.user.nowTimestamp.toLocalDateTime().toLocalDate()
+                    def todaySql = java.sql.Date.valueOf(today)
+                    // today's stored forecasts that carry a positive reorder point (cheap: one indexed read, no forecast math)
+                    def fcRows = ec.entity.find("zenith.erp.inventory.DemandForecast").condition("periodStart", todaySql).condition("reorderPoint", ">", 0).list()
+                    for (fcRow in fcRows) {
+                        def prod = ec.entity.find("mantle.product.Product").condition("productId", fcRow.productId).useCache(true).one()
+                        def owner = prod?.ownerPartyId
+                        if (!owner) continue
+                        if (organizationPartyId && owner != organizationPartyId) continue
+                        checked++
+                        def rout = ec.service.sync().name("zenith.inventory.AdvancedForecastServices.check#ProductReorder").parameters([
+                            organizationPartyId: owner, productId: fcRow.productId, productName: (prod.productName ?: fcRow.productId),
+                            reorderPoint: fcRow.reorderPoint, safetyStock: fcRow.safetyStock, suggestedOrderQty: fcRow.suggestedOrderQty, alertDate: todaySql
+                        ]).call()
+                        if (rout?.alerted) raised++
+                    }
+                    productsChecked = checked; alertsRaised = raised
+                    summary = "Reorder re-check: " + checked + " product(s) compared to stock-on-hand, " + raised + " alert(s) raised or escalated."
+                    ec.logger.info(summary)
+                } catch (Exception e) {
+                    ec.logger.error("cycle#ReorderCheck failed: " + e.message, e)
+                    summary = "Reorder re-check hit an error after " + checked + " product(s): " + e.message
+                    productsChecked = checked; alertsRaised = raised
+                } finally { if (!_d) ec.artifactExecution.enableAuthz() }
+            ]]></script>
+        </actions>
+    </service>
+
     <service verb="explain" noun="ForecastVariance" transaction-timeout="120">
         <in-parameters>
             <parameter name="productName"/>
