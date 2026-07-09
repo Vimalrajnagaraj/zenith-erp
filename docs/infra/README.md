@@ -81,7 +81,23 @@ See [[project_qapps-nav-menu-collapse]].
 > RECOMPUTES that hash on RESTART, so after any change to a served static asset you must **restart moqui** (not just
 > reload the file) for returning users to refetch it.
 
-> ⚠️ The host `Dockerfile`'s `FROM moqui/moqui:latest` does not currently resolve locally or via pull (the base is
-> tagged `ghcr.io/moqui/moqui-framework:latest` on the box). A from-scratch rebuild needs a resolvable base first;
-> the nav patch step itself is verified against `ghcr.io/moqui/moqui-framework:latest`. Not fixed here (pre-existing,
-> and the running image is already patched).
+### Dockerfile base + user (fixed 2026-07-09)
+The old `FROM moqui/moqui:latest` no longer resolved (not local, not pullable), and the trailing
+`chown moqui:moqui` + `USER moqui` were stale — no `moqui` user exists in any available base and the running
+image is **root** (`Config.User` empty). Verified the running image is really `ghcr.io/moqui/moqui-framework`
++ COPYed components: the `moqui-framework-4.0.0.jar` md5, `runtime/version.json`, and User/Entrypoint/Cmd all
+match. So the Dockerfile now uses `FROM ghcr.io/moqui/moqui-framework@sha256:6bd31bf…` (pinned by digest,
+runs as root, no `chown`/`USER`). **Verified:** a full `docker build` succeeds and the image is a faithful
+reproduction of the running one — identical framework jar (md5 `df7e767…`), identical real component set,
+identical User/Entrypoint/Cmd, plus the nav patch (3 items). A live boot was NOT run (single-server prod:
+a 2nd Moqui would contend for the ~4 GB free RAM and share the live DB); the structural identity to the
+already-serving image is the assurance. The running image itself was NOT rebuilt — it's already patched via
+`docker commit`; this Dockerfile is for the next from-scratch build. To upgrade Moqui, bump the digest.
+
+> ⚠️ Two pre-existing, out-of-scope items found while verifying the build (neither affects the running app):
+> (1) the build context `/opt/deploy/deploy/zenith-erp/` has drifted from the running container because the
+> `moqui-deploy` pipeline uploads into the container + `docker commit`s, without updating this source dir — so
+> a from-scratch rebuild reproduces the framework + configs faithfully but its component tree is only as fresh
+> as this dir; keep it in sync (or build from the git component mirror). (2) That dir also holds 7 stray non-
+> component files (`fix_*.py`, `update_*.py`, `standardize_ui.py`, `test_output.html`) that get COPYed into
+> `runtime/component/`; Moqui ignores them (not components) but they're clutter worth removing.
