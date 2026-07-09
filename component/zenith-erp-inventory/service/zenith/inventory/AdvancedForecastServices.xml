@@ -318,16 +318,33 @@
                                             else if (soh <= rop) rdir = "Reorder"
                                             else if (soh <= rop * 1.2) rdir = "LowStock"
                                             if (rdir != null) {
+                                                def pn = row.productName ?: pid
+                                                String lvl = (soh <= 0) ? "out of stock" : (rdir == "Critical" ? "critically low" : (rdir == "Reorder" ? "at the reorder point" : "getting low"))
+                                                String rmsg = "Stock of '" + pn + "' is " + lvl + ": " + ((int)Math.round(soh)) + " units on hand vs a reorder point of " + ((int)Math.round(rop)) + " units (safety stock " + ((int)Math.round(ss)) + "). Suggested order about " + sugg + " units."
+                                                // ZE-DF-004 (IV-111 f/u): severity rank so a same-day alert ESCALATES, never downgrades. Ranks
+                                                // getting-low(1) < reorder(2) < critically-low(3) < out-of-stock(4); out-of-stock outranks
+                                                // critically-low even though both are direction=Critical.
+                                                int newSev = (soh <= 0) ? 4 : (rdir == "Critical" ? 3 : (rdir == "Reorder" ? 2 : 1))
                                                 def rdup = ec.entity.find("zenith.erp.inventory.DemandAlert").condition("productId", pid).condition("alertDate", todaySql).condition("alertType", "Reorder").list()
-                                                if (!rdup) {
-                                                    def pn = row.productName ?: pid
-                                                    String lvl = (soh <= 0) ? "out of stock" : (rdir == "Critical" ? "critically low" : (rdir == "Reorder" ? "at the reorder point" : "getting low"))
-                                                    String rmsg = "Stock of '" + pn + "' is " + lvl + ": " + ((int)Math.round(soh)) + " units on hand vs a reorder point of " + ((int)Math.round(rop)) + " units (safety stock " + ((int)Math.round(ss)) + "). Suggested order about " + sugg + " units."
+                                                def exAlert = rdup ? rdup[0] : null
+                                                int exSev = 0
+                                                if (exAlert != null) { double exSoh = (exAlert.stockOnHand ?: 0) as double; exSev = (exSoh <= 0) ? 4 : (exAlert.direction == "Critical" ? 3 : (exAlert.direction == "Reorder" ? 2 : 1)) }
+                                                boolean doNotify = false
+                                                if (exAlert == null) {
                                                     ec.service.sync().name("create#zenith.erp.inventory.DemandAlert").parameters([
                                                         organizationPartyId: org, productId: pid, productName: pn, alertDate: todaySql, alertType: "Reorder", direction: rdir,
                                                         reorderPoint: rop, stockOnHand: soh, message: rmsg, statusId: "AlertNew", createdStamp: ec.user.nowTimestamp
                                                     ]).call()
-                                                    alerts++
+                                                    alerts++; doNotify = true
+                                                } else if (newSev > exSev) {
+                                                    // Worsened within the day (e.g. getting low -> out of stock): upgrade the SAME row in place and
+                                                    // re-surface it (AlertNew) + re-notify. Direct .update() bypasses the status-flow service check
+                                                    // (same reason acknowledgeAlert updates directly). Equal/lower severity today = leave it (no spam).
+                                                    exAlert.direction = rdir; exAlert.stockOnHand = soh; exAlert.reorderPoint = rop
+                                                    exAlert.message = rmsg; exAlert.statusId = "AlertNew"; exAlert.update()
+                                                    alerts++; doNotify = true
+                                                }
+                                                if (doNotify) {
                                                     try {
                                                         def uids = ec.entity.find("moqui.security.UserPreference").condition("preferenceKey","ACTIVE_ORGANIZATION").condition("preferenceValue", org).selectField("userId").list().collect { it.userId }.unique()
                                                         for (uid in uids) {
