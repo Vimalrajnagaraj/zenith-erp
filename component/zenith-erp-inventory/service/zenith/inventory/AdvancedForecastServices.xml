@@ -453,9 +453,10 @@
         </actions>
     </service>
 
-    <!-- ZE-DF-005 (IV-111): LIGHTWEIGHT intraday reorder re-check. Reads the reorder point cycle#DemandForecast
-         already stored TODAY (no forecast recompute) and re-checks it against current stock-on-hand, so a same-day
-         dip -> stockout escalates automatically between the daily 01:30 forecast runs. Wired to a 4-hourly cron. -->
+    <!-- ZE-DF-005/006/007 (IV-111): LIGHTWEIGHT intraday reorder re-check. Reads the reorder point cycle#DemandForecast
+         already stored TODAY (no forecast recompute) and re-checks it vs current stock-on-hand, so a same-day dip ->
+         stockout escalates between the daily 01:30 forecast runs. Cron fires hourly 24/7; each tenant is only checked
+         when the current hour (IST) is inside ITS configured business hours (REORDER_OPEN_HOUR/CLOSE_HOUR, default 8-22). -->
     <service verb="cycle" noun="ReorderCheck" authenticate="false" transaction-timeout="900">
         <in-parameters>
             <parameter name="organizationPartyId"/>
@@ -475,6 +476,10 @@
                 try {
                     def today = ec.user.nowTimestamp.toLocalDateTime().toLocalDate()
                     def todaySql = java.sql.Date.valueOf(today)
+                    // ZE-DF-007: gate each tenant by ITS business hours. nowHour is IST (container/scheduler run Asia/Kolkata).
+                    int nowHour = ec.user.nowTimestamp.toLocalDateTime().getHour()
+                    def orgAllowed = [:]   // org -> boolean, computed once per org per run
+                    int skippedClosed = 0
                     // today's stored forecasts that carry a positive reorder point (cheap: one indexed read, no forecast math)
                     def fcRows = ec.entity.find("zenith.erp.inventory.DemandForecast").condition("periodStart", todaySql).condition("reorderPoint", ">", 0).list()
                     for (fcRow in fcRows) {
@@ -482,6 +487,16 @@
                         def owner = prod?.ownerPartyId
                         if (!owner) continue
                         if (organizationPartyId && owner != organizationPartyId) continue
+                        if (!orgAllowed.containsKey(owner)) {
+                            def cfg = ec.service.sync().name("zenith.inventory.AdvancedForecastServices.get#ReorderCheckConfig").parameters([organizationPartyId: owner]).call()
+                            int oh = (cfg?.openHour ?: 8) as int; int ch = (cfg?.closeHour ?: 22) as int
+                            boolean within
+                            if (oh == ch) within = true
+                            else if (oh < ch) within = (nowHour >= oh && nowHour < ch)
+                            else within = (nowHour >= oh || nowHour < ch)
+                            orgAllowed[owner] = within
+                        }
+                        if (!orgAllowed[owner]) { skippedClosed++; continue }
                         checked++
                         def rout = ec.service.sync().name("zenith.inventory.AdvancedForecastServices.check#ProductReorder").parameters([
                             organizationPartyId: owner, productId: fcRow.productId, productName: (prod.productName ?: fcRow.productId),
@@ -490,7 +505,7 @@
                         if (rout?.alerted) raised++
                     }
                     productsChecked = checked; alertsRaised = raised
-                    summary = "Reorder re-check: " + checked + " product(s) compared to stock-on-hand, " + raised + " alert(s) raised or escalated."
+                    summary = "Reorder re-check: " + checked + " product(s) compared to stock-on-hand, " + raised + " alert(s) raised or escalated" + (skippedClosed > 0 ? (" (" + skippedClosed + " skipped, outside business hours)") : "") + "."
                     ec.logger.info(summary)
                 } catch (Exception e) {
                     ec.logger.error("cycle#ReorderCheck failed: " + e.message, e)
@@ -500,6 +515,56 @@
             ]]></script>
         </actions>
     </service>
+
+    <!-- ZE-DF-007 (IV-111): per-tenant business hours for the reorder re-check, stored in CompanySettings
+         (REORDER_OPEN_HOUR / REORDER_CLOSE_HOUR, hours 0-23 / 1-24 IST). Default 08:00-22:00 when unset, so
+         behaviour is unchanged for tenants who never configure it. Read by cycle#ReorderCheck; set from the
+         Demand Forecast screen's Business Hours dialog. -->
+    <service verb="get" noun="ReorderCheckConfig">
+        <in-parameters><parameter name="organizationPartyId"/></in-parameters>
+        <out-parameters>
+            <parameter name="openHour" type="Integer"/>
+            <parameter name="closeHour" type="Integer"/>
+        </out-parameters>
+        <actions>
+            <script><![CDATA[
+                openHour = 8; closeHour = 22
+                if (organizationPartyId) {
+                    def _o = ec.entity.find("zenith.erp.base.CompanySettings").condition("organizationPartyId", organizationPartyId).condition("settingKey", "REORDER_OPEN_HOUR").disableAuthz().one()
+                    if (_o?.settingValue) { try { openHour = Integer.parseInt(_o.settingValue.toString().trim()) } catch (Exception e) {} }
+                    def _c = ec.entity.find("zenith.erp.base.CompanySettings").condition("organizationPartyId", organizationPartyId).condition("settingKey", "REORDER_CLOSE_HOUR").disableAuthz().one()
+                    if (_c?.settingValue) { try { closeHour = Integer.parseInt(_c.settingValue.toString().trim()) } catch (Exception e) {} }
+                }
+                if (openHour == null || openHour < 0 || openHour > 23) openHour = 8
+                if (closeHour == null || closeHour < 1 || closeHour > 24) closeHour = 22
+            ]]></script>
+        </actions>
+    </service>
+
+    <service verb="set" noun="ReorderCheckConfig">
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="openHour"/>
+            <parameter name="closeHour"/>
+        </in-parameters>
+        <actions>
+            <script><![CDATA[
+                def _upsert = { k, v ->
+                    def _e = ec.entity.find("zenith.erp.base.CompanySettings").condition("organizationPartyId", organizationPartyId).condition("settingKey", k).disableAuthz().one()
+                    if (_e) ec.service.sync().name("update#zenith.erp.base.CompanySettings").parameters([organizationPartyId:organizationPartyId, settingKey:k, settingValue:v]).call()
+                    else ec.service.sync().name("create#zenith.erp.base.CompanySettings").parameters([organizationPartyId:organizationPartyId, settingKey:k, settingValue:v]).call()
+                }
+                int _oh = 8, _ch = 22
+                try { _oh = Integer.parseInt(openHour.toString().trim()) } catch (Exception e) {}
+                try { _ch = Integer.parseInt(closeHour.toString().trim()) } catch (Exception e) {}
+                if (_oh < 0 || _oh > 23) _oh = 8
+                if (_ch < 1 || _ch > 24) _ch = 22
+                _upsert('REORDER_OPEN_HOUR', _oh.toString())
+                _upsert('REORDER_CLOSE_HOUR', _ch.toString())
+            ]]></script>
+        </actions>
+    </service>
+
 
     <service verb="explain" noun="ForecastVariance" transaction-timeout="120">
         <in-parameters>
