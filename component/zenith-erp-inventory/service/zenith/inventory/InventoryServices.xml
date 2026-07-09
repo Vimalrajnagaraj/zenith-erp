@@ -28,27 +28,32 @@
                 if (organizationPartyId && organizationPartyId != '_NA_') assetFind.condition("ownerPartyId", organizationPartyId)
                 def assetList = assetFind.list()
 
+                // ZE-INV-011 (IV-111): batch-load products + suppliers up front to avoid an N+1 (was one Product
+                // query per asset + per-order supplier queries, so the page slowed in proportion to the number
+                // of expiring lots). Now 3 set-based lookups regardless of asset count.
+                def _pids = assetList.collect { it.productId }.findAll { it }.unique()
+                def _prodMap = [:]
+                if (_pids) ec.entity.find("mantle.product.Product").condition("productId", "in", _pids).list().each { _prodMap[it.productId] = it }
+
+                def _oids = assetList.collect { it.acquireOrderId }.findAll { it }.unique()
+                def _orderVendor = [:]
+                if (_oids) ec.entity.find("mantle.order.OrderPart").condition("orderId", "in", _oids).disableAuthz().list().each {
+                    if (it.vendorPartyId && !_orderVendor.containsKey(it.orderId)) _orderVendor[it.orderId] = it.vendorPartyId
+                }
+                def _vids = _orderVendor.values().findAll { it }.unique()
+                def _vendorName = [:]
+                if (_vids) ec.entity.find("mantle.party.PartyDetail").condition("partyId", "in", _vids).disableAuthz().list().each {
+                    _vendorName[it.partyId] = it.organizationName ?: ((it.firstName ?: '') + ' ' + (it.lastName ?: '')).trim()
+                }
+
                 def _nowMs = ec.user.nowTimestamp.getTime()
                 List expList = []
-                def _supCache = [:]
                 for (def asset : assetList) {
-                    def product = ec.entity.find("mantle.product.Product").condition("productId", asset.productId).one()
+                    def product = _prodMap[asset.productId]
                     if (product == null) { continue }
                     // supplier for PO-received lots (acquireOrderId -> OrderPart.vendorPartyId -> party name)
-                    def _oid = asset.acquireOrderId
-                    def supplierName = ''
-                    if (_oid) {
-                        if (!_supCache.containsKey(_oid)) {
-                            def _sn = ''
-                            def _op = ec.entity.find("mantle.order.OrderPart").condition("orderId", _oid).disableAuthz().list().find { it.vendorPartyId != null }
-                            if (_op?.vendorPartyId) {
-                                def _v = ec.entity.find("mantle.party.PartyDetail").condition("partyId", _op.vendorPartyId).disableAuthz().one()
-                                if (_v) _sn = _v.organizationName ?: ((_v.firstName ?: '') + ' ' + (_v.lastName ?: '')).trim()
-                            }
-                            _supCache[_oid] = _sn
-                        }
-                        supplierName = _supCache[_oid]
-                    }
+                    def _vid = asset.acquireOrderId ? _orderVendor[asset.acquireOrderId] : null
+                    def supplierName = _vid ? (_vendorName[_vid] ?: '') : ''
                     // value at cost (valuationRate) -> acquireCost -> MRP; tag the basis
                     def _pos = { v -> (v != null && (v as BigDecimal).signum() > 0) ? (v as BigDecimal) : null }
                     def valRate = _pos(asset.valuationRate) ?: _pos(asset.acquireCost)
