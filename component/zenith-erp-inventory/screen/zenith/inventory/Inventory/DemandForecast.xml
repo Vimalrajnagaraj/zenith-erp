@@ -183,6 +183,7 @@
             // and show its forecast + sales history. forecast#ProductDemand returns a plain-English summary that
             // already distinguishes has-sales vs "No sales history found ... a forecast cannot be produced yet".
             context.checkDone = false; context.checkFound = false; context.checkHasForecast = false
+            context.checkTracked = false; context.checkSoh = 0; context.checkMaintained = false; context.checkReorderEligible = false
             def _cn = ec.context.checkProductName
             if (_cn != null) _cn = _cn.toString().trim()
             if (_cn && orgId && orgId != '_NA_') {
@@ -203,6 +204,24 @@
                     def _r = _fout?.result
                     context.checkResult = _r
                     context.checkHasForecast = (_r != null && _r.forecastDemand != null)
+                    // IV-114: mirror check#ProductReorder EXACTLY so the tester can see whether this product is
+                    // eligible for low-stock/reorder alerts. tracked = has >=1 org-scoped Asset with hasQuantity='Y';
+                    // soh = sum(quantityOnHandTotal); maintainedStockout = tracked lot has AssetDetail ledger history.
+                    // Reorder alert fires iff tracked && (soh > 0 || maintainedStockout). Untracked -> excluded.
+                    double _soh = 0.0; boolean _tracked = false; List _tAssetIds = []
+                    ec.entity.find("mantle.product.asset.Asset").condition("productId", _prod.productId).condition("ownerPartyId", orgId)
+                        .selectField("assetId").selectField("quantityOnHandTotal").selectField("hasQuantity").disableAuthz().list().each {
+                            _soh += ((it.quantityOnHandTotal ?: 0) as double)
+                            if (it.hasQuantity == 'Y') { _tracked = true; _tAssetIds.add(it.assetId) }
+                        }
+                    boolean _maintained = false
+                    if (_tracked && _soh <= 0 && _tAssetIds) {
+                        _maintained = ec.entity.find("mantle.product.asset.AssetDetail").condition("assetId", "in", _tAssetIds).disableAuthz().count() > 0
+                    }
+                    context.checkTracked = _tracked
+                    context.checkSoh = (int) Math.round(_soh)
+                    context.checkMaintained = _maintained
+                    context.checkReorderEligible = (_tracked && (_soh > 0 || _maintained))
                 }
             }
             // ZE-DF-008 f/u: does this org have Store operating hours? If so they OVERRIDE the setting below,
@@ -289,6 +308,20 @@
         <container style="zenith-card bg-white shadow-2 border-radius-md q-pa-md q-mb-md">
             <label text="Check a product's forecast" type="h6" style="text-primary text-weight-bold q-my-none"/>
             <label text="Start typing a product's name (or ID) and pick it from the list — then see its sales history and forecast. A brand-new product that hasn't sold yet is included." type="p" style="text-grey-6 text-caption q-mb-sm"/>
+            <!-- IV-114: /apps is Bootstrap, so the Quasar bg-*-1 colour classes are transparent here (theme CSS only
+                 tints them in dark mode). Inject a scoped light/dark tint + left accent so the three tracking states
+                 read at a glance. Scoped to .iv114-track so nothing else on the screen is affected. -->
+            <render-mode><text type="html"><![CDATA[
+                <style>
+                    .iv114-track .bg-green-1, .iv114-track .bg-amber-1, .iv114-track .bg-grey-2 { border-left: 4px solid transparent; }
+                    .iv114-track .bg-green-1 { background-color:#ecfdf3 !important; border-left-color:#16a34a; }
+                    .iv114-track .bg-amber-1 { background-color:#fffbeb !important; border-left-color:#d97706; }
+                    .iv114-track .bg-grey-2  { background-color:#f3f4f6 !important; border-left-color:#9ca3af; }
+                    body.body--dark .iv114-track .bg-green-1 { background-color:#14271b !important; border-left-color:#2f9e5f; }
+                    body.body--dark .iv114-track .bg-amber-1 { background-color:#2a2417 !important; border-left-color:#b8811f; }
+                    body.body--dark .iv114-track .bg-grey-2  { background-color:#26262a !important; border-left-color:#6b7280; }
+                </style>
+            ]]></text></render-mode>
             <form-single name="CheckProductForm" transition="checkProduct">
                 <field name="checkProductName"><default-field title="Product">
                     <!-- IV-113 (ZE-DF-009 f/u): after submit, a server-search select2 knows only the raw value (productId),
@@ -308,6 +341,29 @@
                     <container style="bg-grey-1 q-pa-md border-radius-md q-mt-sm">
                         <label text="${checkPseudo ? checkPseudo + ' — ' : ''}${checkPName}" type="h6" style="text-dark text-weight-bold q-mb-xs"/>
                         <label text="${checkSummary}" type="p" style="text-grey-9 q-mb-sm"/>
+                        <!-- IV-114: does this product feed the low-stock/reorder alerts? Mirrors check#ProductReorder's
+                             gate exactly (tracked && (soh > 0 || ledger history)) so the tester can confirm that an
+                             untracked product is excluded. Three mutually-exclusive states. -->
+                        <container style="iv114-track">
+                        <section name="CheckTrackedOn"><condition><expression>checkReorderEligible</expression></condition><widgets>
+                            <container style="bg-green-1 q-pa-md border-radius-md q-mb-sm">
+                                <label text="Stock tracking: On" type="p" style="text-green-8 text-weight-bold q-mb-none"/>
+                                <label text="This product is stock-tracked (${checkSoh} on hand), so it's eligible for low-stock and reorder alerts." type="p" style="text-grey-9 q-mb-none"/>
+                            </container>
+                        </widgets></section>
+                        <section name="CheckTrackedPending"><condition><expression>checkTracked &amp;&amp; !checkReorderEligible</expression></condition><widgets>
+                            <container style="bg-amber-1 q-pa-md border-radius-md q-mb-sm">
+                                <label text="Stock tracking: On — no stock recorded yet" type="p" style="text-grey-9 text-weight-bold q-mb-none"/>
+                                <label text="This product is set up for stock tracking, but no stock has been counted for it yet (0 on hand, no stock movements). Low-stock alerts will begin once you record its stock." type="p" style="text-grey-9 q-mb-none"/>
+                            </container>
+                        </widgets></section>
+                        <section name="CheckUntracked"><condition><expression>!checkTracked</expression></condition><widgets>
+                            <container style="bg-grey-2 q-pa-md border-radius-md q-mb-sm">
+                                <label text="Stock tracking: Off" type="p" style="text-grey-9 text-weight-bold q-mb-none"/>
+                                <label text="This product isn't stock-tracked, so it's excluded from low-stock and reorder alerts — only unusual-selling (demand-shift) alerts apply. Set up its stock in Inventory to enable low-stock alerts." type="p" style="text-grey-8 q-mb-none"/>
+                            </container>
+                        </widgets></section>
+                        </container>
                         <section name="CheckHasFc"><condition><expression>checkHasForecast</expression></condition><widgets>
                             <container-row>
                                 <row-col lg="3" md="6"><container style="q-pa-sm">
