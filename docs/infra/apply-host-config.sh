@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Re-apply ALL host config (nginx + systemd) from this repo to the server.
+# Re-apply ALL host config (nginx + systemd + moqui image build inputs) from this repo to the server.
 #
 # nginx runs on the HOST (not Docker) and terminates TLS with Cloudflare in front, so host
 # config is NOT carried by the moqui-deploy image pipeline. This script is the one-command
@@ -36,5 +36,12 @@ say "validate + reload nginx (aborts WITHOUT reload if the config is bad — sit
 say "systemd: moqui :8080 port guard (re-blocks external access on boot)"
 put systemd/moqui-port-guard.service         /etc/systemd/system/moqui-port-guard.service
 "${SSH[@]}" "systemctl daemon-reload && systemctl enable --now moqui-port-guard.service && echo '   moqui-port-guard active'"
+
+say "moqui image build inputs (Dockerfile + framework patches). Placed on the host; applied on the NEXT"
+say "image build (does NOT rebuild here — a rebuild is a deliberate deploy step, not a config sync)."
+"${SSH[@]}" "mkdir -p /opt/deploy/deploy/framework-patches"
+put deploy/Dockerfile                        /opt/deploy/deploy/Dockerfile
+put framework-patches/patch-webroot-nav.sh   /opt/deploy/deploy/framework-patches/patch-webroot-nav.sh
+"${SSH[@]}" "chmod +x /opt/deploy/deploy/framework-patches/patch-webroot-nav.sh"
 
 say "Done — host config now matches the repo."

@@ -54,3 +54,34 @@ internet bypassing Cloudflare/nginx/TLS (nginx→`127.0.0.1:8080` over loopback 
 `cp` to `/etc/systemd/system/`, then `systemctl daemon-reload && systemctl enable --now moqui-port-guard.service`.
 The permanent fix would be binding `127.0.0.1:8080:8080` in docker-compose, but that needs a container
 recreate (avoided — see CLAUDE.md rule #5).
+
+## moqui image build inputs (`/opt/deploy/deploy/`)
+The moqui image is built from `/opt/deploy/deploy/Dockerfile` (`FROM moqui/moqui:latest` + `COPY ./zenith-erp/`).
+Framework overrides that must survive an image rebuild live here (the running image is otherwise a `docker commit`
+of runtime edits, which a from-scratch rebuild would discard).
+
+| Repo path | Server path |
+|---|---|
+| `deploy/Dockerfile` | `/opt/deploy/deploy/Dockerfile` |
+| `framework-patches/patch-webroot-nav.sh` | `/opt/deploy/deploy/framework-patches/patch-webroot-nav.sh` |
+
+### `framework-patches/patch-webroot-nav.sh` — ZE-INV-012 / IV-113 (2026-07-09)
+The Moqui /qapps left-nav **module submenus wouldn't collapse**: the framework component `m-menu-nav-item` rendered
+each active-trail module as `<q-expansion-item :value="true" … @input="go">` — `:value="true"` is a frozen constant
+(expand state = active route, not a toggle) and `@input="go"` makes the chevron NAVIGATE, so an open submenu could
+never be collapsed. The patch swaps `:value="true"` + `@input="go"` for **`default-opened expand-separate-toggle-icon`**
+(keeping `:to`): the chevron becomes an independent real toggle, the label still navigates via `:to`. It edits the
+SERVED, minified `base-component/webroot/screen/webroot/js/WebrootVue.qvt.min.js` (prod serves `*.min.js`), is
+**idempotent** (no-ops if already patched) and **self-verifying** (fails the build if it doesn't match exactly 3 menu
+items — so a Moqui upgrade that changes the template can't silently ship the bug). The Dockerfile `RUN`s it, so a
+rebuild keeps the fix. Verified: byte-identical (md5) to the hand-verified fix, and the build step patches 3 items.
+See [[project_qapps-nav-menu-collapse]].
+
+> Static-asset delivery note: the min.js is cache-busted by a single global `?v=<hash>` (`immutable`, 1yr). Moqui
+> RECOMPUTES that hash on RESTART, so after any change to a served static asset you must **restart moqui** (not just
+> reload the file) for returning users to refetch it.
+
+> ⚠️ The host `Dockerfile`'s `FROM moqui/moqui:latest` does not currently resolve locally or via pull (the base is
+> tagged `ghcr.io/moqui/moqui-framework:latest` on the box). A from-scratch rebuild needs a resolvable base first;
+> the nav patch step itself is verified against `ghcr.io/moqui/moqui-framework:latest`. Not fixed here (pre-existing,
+> and the running image is already patched).

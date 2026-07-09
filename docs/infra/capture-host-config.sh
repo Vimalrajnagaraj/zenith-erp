@@ -20,4 +20,8 @@ pull /etc/nginx/conf.d/cloudflare-realip.conf       nginx/conf.d/cloudflare-real
 pull /etc/nginx/sites-enabled/erp.zetaclantech.com  nginx/sites-enabled/erp.zetaclantech.com
 pull /etc/nginx/sites-available/zenith_erp.conf     nginx/sites-enabled/zenith_erp.conf
 pull /etc/systemd/system/moqui-port-guard.service   systemd/moqui-port-guard.service
+echo "==> Capturing moqui image build inputs (Dockerfile + framework patches)"
+"${SSH[@]}" "mkdir -p /opt/deploy/deploy/framework-patches" >/dev/null 2>&1 || true
+pull /opt/deploy/deploy/Dockerfile                          deploy/Dockerfile
+pull /opt/deploy/deploy/framework-patches/patch-webroot-nav.sh  framework-patches/patch-webroot-nav.sh
 echo "==> Done. Review 'git diff docs/infra' and commit."
