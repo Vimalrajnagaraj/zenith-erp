@@ -476,8 +476,8 @@
                 try {
                     def today = ec.user.nowTimestamp.toLocalDateTime().toLocalDate()
                     def todaySql = java.sql.Date.valueOf(today)
-                    // ZE-DF-007: gate each tenant by ITS business hours. nowHour is IST (container/scheduler run Asia/Kolkata).
-                    int nowHour = ec.user.nowTimestamp.toLocalDateTime().getHour()
+                    // ZE-DF-007/008: gate each tenant by whether it is open right now (IST) - Store operating hours if
+                    // configured (source of truth), else the per-tenant CompanySettings window (default 8-22). Once per org.
                     def orgAllowed = [:]   // org -> boolean, computed once per org per run
                     int skippedClosed = 0
                     // today's stored forecasts that carry a positive reorder point (cheap: one indexed read, no forecast math)
@@ -488,13 +488,8 @@
                         if (!owner) continue
                         if (organizationPartyId && owner != organizationPartyId) continue
                         if (!orgAllowed.containsKey(owner)) {
-                            def cfg = ec.service.sync().name("zenith.inventory.AdvancedForecastServices.get#ReorderCheckConfig").parameters([organizationPartyId: owner]).call()
-                            int oh = (cfg?.openHour ?: 8) as int; int ch = (cfg?.closeHour ?: 22) as int
-                            boolean within
-                            if (oh == ch) within = true
-                            else if (oh < ch) within = (nowHour >= oh && nowHour < ch)
-                            else within = (nowHour >= oh || nowHour < ch)
-                            orgAllowed[owner] = within
+                            def oc = ec.service.sync().name("zenith.inventory.AdvancedForecastServices.check#OrgReorderOpen").parameters([organizationPartyId: owner]).call()
+                            orgAllowed[owner] = (oc?.open == true)
                         }
                         if (!orgAllowed[owner]) { skippedClosed++; continue }
                         checked++
@@ -564,6 +559,79 @@
             ]]></script>
         </actions>
     </service>
+
+    <!-- ZE-DF-008 (IV-111): resolve whether an org is OPEN right now for the reorder check, with Store operating
+         hours (zenith.erp.stores) as the SINGLE SOURCE OF TRUTH when configured, falling back to the per-tenant
+         CompanySettings window (default 8-22 IST) otherwise. The whole store lookup is wrapped so ANY problem
+         (or the common case of no stores) falls back to the settings window -> today's behaviour is unchanged
+         until store hours are actually populated. Org is "open" if ANY of its active stores is open now. -->
+    <service verb="check" noun="OrgReorderOpen" authenticate="false" transaction-timeout="60">
+        <in-parameters><parameter name="organizationPartyId" required="true"/></in-parameters>
+        <out-parameters>
+            <parameter name="open" type="Boolean"/>
+            <parameter name="source"/>
+        </out-parameters>
+        <actions>
+            <script><![CDATA[
+                import org.moqui.context.ExecutionContext
+                ExecutionContext ec = context.ec
+                open = false; source = 'settings'
+                def now = ec.user.nowTimestamp.toLocalDateTime()   // IST (container/scheduler run Asia/Kolkata)
+                int nowMin = now.getHour() * 60 + now.getMinute()
+                int nowHour = now.getHour()
+                def dowNames = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun']
+                String dowStr = dowNames[now.getDayOfWeek().getValue() - 1]   // Mon=1 .. Sun=7
+                def todayDate = java.sql.Date.valueOf(now.toLocalDate())
+
+                def toMin = { s ->
+                    if (!s) return null
+                    try { def p = s.toString().trim().split(':'); int h = Integer.parseInt(p[0].trim()); int m = (p.length > 1 ? Integer.parseInt(p[1].trim()) : 0); return (h * 60 + m) as Integer }
+                    catch (Exception e) { return null }
+                }
+                def within = { Integer o, Integer c ->
+                    if (o == null || c == null) return null
+                    if (o == c) return true                          // 24h
+                    if (o < c) return (nowMin >= o && nowMin < c)
+                    return (nowMin >= o || nowMin < c)               // wraps midnight
+                }
+
+                // ---- SOURCE OF TRUTH: Store operating hours, when the org has any store with hours defined for today ----
+                try {
+                    def stores = ec.entity.find("zenith.erp.stores.Store").condition("organizationPartyId", organizationPartyId)
+                        .disableAuthz().selectField("storeId").selectField("statusId").list()
+                    boolean anyDefined = false; boolean openNow = false
+                    for (st in stores) {
+                        if (st.statusId != null && st.statusId != 'StActive') continue   // skip inactive/closed/renovation
+                        String sid = st.storeId
+                        def hol = ec.entity.find("zenith.erp.stores.StoreHoliday").condition("storeId", sid).condition("holidayDate", todayDate).disableAuthz().one()
+                        if (hol != null) {                            // holiday overrides the weekly hours for today
+                            anyDefined = true
+                            if (within(toMin(hol.openTime), toMin(hol.closeTime)) == true) openNow = true
+                            continue                                  // blank holiday times => closed today
+                        }
+                        def oh = ec.entity.find("zenith.erp.stores.StoreOperatingHours").condition("storeId", sid).condition("dayOfWeek", dowStr).disableAuthz().one()
+                        if (oh != null) {
+                            anyDefined = true
+                            if (oh.isClosed != 'Y' && within(toMin(oh.openTime), toMin(oh.closeTime)) == true) openNow = true
+                        }
+                    }
+                    if (anyDefined) { open = openNow; source = 'store'; return }
+                } catch (Exception e) {
+                    ec.logger.warn("check#OrgReorderOpen: store-hours lookup failed for " + organizationPartyId + ", falling back to settings: " + e.message)
+                }
+
+                // ---- FALLBACK: per-tenant CompanySettings window (default 8-22 IST) ----
+                def cfg = ec.service.sync().name("zenith.inventory.AdvancedForecastServices.get#ReorderCheckConfig").parameters([organizationPartyId: organizationPartyId]).call()
+                int oh2 = (cfg?.openHour ?: 8) as int; int ch2 = (cfg?.closeHour ?: 22) as int
+                boolean w2
+                if (oh2 == ch2) w2 = true
+                else if (oh2 < ch2) w2 = (nowHour >= oh2 && nowHour < ch2)
+                else w2 = (nowHour >= oh2 || nowHour < ch2)
+                open = w2; source = 'settings'
+            ]]></script>
+        </actions>
+    </service>
+
 
 
     <service verb="explain" noun="ForecastVariance" transaction-timeout="120">
