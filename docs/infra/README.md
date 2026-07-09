@@ -94,10 +94,24 @@ a 2nd Moqui would contend for the ~4 GB free RAM and share the live DB); the str
 already-serving image is the assurance. The running image itself was NOT rebuilt — it's already patched via
 `docker commit`; this Dockerfile is for the next from-scratch build. To upgrade Moqui, bump the digest.
 
-> ⚠️ Two pre-existing, out-of-scope items found while verifying the build (neither affects the running app):
-> (1) the build context `/opt/deploy/deploy/zenith-erp/` has drifted from the running container because the
-> `moqui-deploy` pipeline uploads into the container + `docker commit`s, without updating this source dir — so
-> a from-scratch rebuild reproduces the framework + configs faithfully but its component tree is only as fresh
-> as this dir; keep it in sync (or build from the git component mirror). (2) That dir also holds 7 stray non-
-> component files (`fix_*.py`, `update_*.py`, `standardize_ui.py`, `test_output.html`) that get COPYed into
-> `runtime/component/`; Moqui ignores them (not components) but they're clutter worth removing.
+### Build-context component sync (fixed 2026-07-09)
+The build context `/opt/deploy/deploy/zenith-erp/` had drifted badly from the running container: the
+`moqui-deploy` pipeline uploads changed files INTO the container and `docker commit`s, but never updated
+this source dir. It also held a vestigial ancient `.git` (23 tracked files, unrelated history) and 7 stray
+non-component files (`fix_*.py`, `update_*.py`, `standardize_ui.py`, `test_output.html`). Reconciled it from
+the running container so it's now byte-identical to the live component tree (820 files, 56 components), and
+added **`sync-build-context.sh`** (container → build-context) to re-sync before any future rebuild. Also added
+`RUN rm -rf runtime/component/zenith-erp-*` to the Dockerfile before the COPY — the base image carries a
+STALE zenith-erp-* copy and `COPY` merges (doesn't delete since-removed screens), so without the clear a
+rebuild resurrected ~16 deleted Settings screens. **Verified:** a full `docker build` now yields a zenith-erp-*
+tree byte-identical to the running container (820 files).
+
+| Repo path | Purpose |
+|---|---|
+| `sync-build-context.sh` | refresh `/opt/deploy/deploy/zenith-erp/` from the running container before a rebuild |
+
+> ⚠️ One git-vs-container drift noted at sync time (NOT fixed — out of scope, doesn't affect the running app):
+> the repo's `zenith-erp-timesheets/.../MyTimesheets.xml` has a null-safe name-concat improvement that was
+> committed to git but never deployed, so the LIVE app runs the older version. The build context was synced
+> from the CONTAINER (live truth), so a rebuild reproduces the running app. If that improvement should go live,
+> deploy it normally; if not, revert it in git so the repo mirrors production.

@@ -10,6 +10,10 @@
 # resolves and no `moqui` user exists, and the running image is NOT `USER moqui` (Config.User is empty),
 # so those lines were stale and are removed. Do NOT re-add a chown to a moqui user against this base.
 FROM ghcr.io/moqui/moqui-framework@sha256:6bd31bf1123f4871a5831fe35617fe719c4197a5f14e21547e9357d4d203ef34
+# The base carries a STALE copy of the zenith-erp-* components. COPY merges (it doesn't delete files that
+# were later removed from the app), so overlaying onto the base resurrects since-deleted screens. Clear the
+# base's zenith components first so the COPY below is an EXACT reproduction of the current component tree.
+RUN rm -rf /opt/moqui/runtime/component/zenith-erp-*
 COPY ./zenith-erp/ /opt/moqui/runtime/component/
 COPY ./MoquiDevConf.xml /opt/moqui/runtime/conf/MoquiDevConf.xml
 COPY ./qz-private-key.pem /opt/moqui/WEB-INF/classes/qz-private-key.pem
