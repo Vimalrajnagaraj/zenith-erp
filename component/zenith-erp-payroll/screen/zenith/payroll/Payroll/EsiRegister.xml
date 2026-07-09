@@ -88,8 +88,8 @@
         <set field="cal" from="new java.util.GregorianCalendar()"/>
         <set field="currentYear" from="cal.get(java.util.Calendar.YEAR)"/>
         <set field="currentMonth" from="cal.get(java.util.Calendar.MONTH) + 1"/>
-        <set field="filterYear" from="ec.web?.requestParameters?.filterYear ?: currentYear"/>
-        <set field="filterMonth" from="ec.web?.requestParameters?.filterMonth ?: currentMonth"/>
+        <set field="filterYear" from="((ec.web?.requestParameters?.filterYear ?: currentYear).toString()) as Integer"/>
+        <set field="filterMonth" from="((ec.web?.requestParameters?.filterMonth ?: currentMonth).toString()) as Integer"/>
 
         <!-- ESI Configuration -->
         <entity-find entity-name="zenith.erp.india.EsiConfiguration" list="esiConfigs">
@@ -119,6 +119,33 @@
         <set field="totalEsiRemittance" from="totalEsiEmployee + totalEsiEmployer" type="BigDecimal"/>
 
         <set field="monthNames" from="['','Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']"/>
+
+        <!-- ZE-DF-001 f/u (IV-110): pre-upload checks — flag rows likely to be rejected by the ESIC MC portal
+             so they can be fixed before filing. Read-only; does not affect the export. -->
+        <script><![CDATA[
+            def two = new BigDecimal('2'); def three = new BigDecimal('3'); def cap = new BigDecimal(21000)
+            esiIssues = []
+            for (def d : esiData) {
+                def name = ((d.firstName ?: '') + ' ' + (d.lastName ?: '')).trim()
+                def probs = []
+                def ip = (d.esiNumber ?: '').toString().trim()
+                if (!ip) probs.add('IP/ESI number missing')
+                else if (!ip.matches('[0-9]{10}')) probs.add('IP number not 10 digits')
+                if (!name) probs.add('Name blank')
+                def gross = (d.grossPay ?: 0) as BigDecimal
+                if (gross <= 0) probs.add('Gross wages are 0')
+                if (gross > cap) probs.add('Gross > 21000 (ESI should not apply)')
+                def eeExp = gross.multiply(new BigDecimal('0.0075'))
+                def ee = (d.esiEmployeeAmount ?: 0) as BigDecimal
+                if ((ee - eeExp).abs() > two) probs.add('Employee ESI not ~0.75% of gross (has ' + ee + ', expected ~' + eeExp.setScale(0, java.math.RoundingMode.HALF_UP) + ')')
+                def erExp = gross.multiply(new BigDecimal('0.0325'))
+                def er = (d.esiEmployerAmount ?: 0) as BigDecimal
+                if ((er - erExp).abs() > three) probs.add('Employer ESI not ~3.25% of gross (has ' + er + ', expected ~' + erExp.setScale(0, java.math.RoundingMode.HALF_UP) + ')')
+                if (d.paidDays == null || !d.payslipId) probs.add('No payslip linked — "No of Days" is blank')
+                if (probs) esiIssues.add([code: (d.employeeCode ?: '?'), name: (name ?: '?'), ip: ip, problems: probs.join('; ')])
+            }
+            esiReadyCount = esiData.size() - esiIssues.size()
+        ]]></script>
     </actions>
 
     <widgets>
@@ -162,6 +189,28 @@
                 </widgets></section>
             </container>
         </container>
+
+        <!-- ZE-DF-001 f/u (IV-110): pre-upload validation panel -->
+        <container-row>
+            <row-col lg="12">
+                <section name="EsiIssuesPanel"><condition><expression>esiIssues</expression></condition><widgets>
+                    <container style="bg-orange-1 shadow-2 q-pa-md q-mb-md border-radius-lg">
+                        <label text="⚠ Pre-upload checks: ${esiIssues.size()} of ${esiData.size()} employees need attention before you file the ESIC MC (${esiReadyCount} look ready). Fix these, then re-download." type="p" style="text-orange-9 text-weight-bold q-mb-sm"/>
+                        <form-list name="EsiIssuesForm" list="esiIssues" skip-form="true">
+                            <field name="code"><header-field title="Emp Code"/><default-field><display/></default-field></field>
+                            <field name="name"><header-field title="Name"/><default-field><display/></default-field></field>
+                            <field name="ip"><header-field title="IP Number"/><default-field><display/></default-field></field>
+                            <field name="problems"><header-field title="Issues to fix before filing"/><default-field><display/></default-field></field>
+                        </form-list>
+                    </container>
+                </widgets></section>
+                <section name="EsiReadyPanel"><condition><expression>!esiIssues &amp;&amp; esiData</expression></condition><widgets>
+                    <container style="bg-green-1 shadow-2 q-pa-sm q-mb-md border-radius-lg">
+                        <label text="✓ Pre-upload checks passed — all ${esiData.size()} employees look ready for the ESIC MC. Still verify one file on the ESIC portal before relying on it." type="p" style="text-green-9 text-weight-bold q-my-none"/>
+                    </container>
+                </widgets></section>
+            </row-col>
+        </container-row>
 
         <!-- Summary Cards -->
         <container-row>

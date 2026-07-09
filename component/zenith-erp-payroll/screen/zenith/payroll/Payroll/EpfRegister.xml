@@ -90,8 +90,8 @@
         <set field="cal" from="new java.util.GregorianCalendar()"/>
         <set field="currentYear" from="cal.get(java.util.Calendar.YEAR)"/>
         <set field="currentMonth" from="cal.get(java.util.Calendar.MONTH) + 1"/>
-        <set field="filterYear" from="ec.web?.requestParameters?.filterYear ?: currentYear"/>
-        <set field="filterMonth" from="ec.web?.requestParameters?.filterMonth ?: currentMonth"/>
+        <set field="filterYear" from="((ec.web?.requestParameters?.filterYear ?: currentYear).toString()) as Integer"/>
+        <set field="filterMonth" from="((ec.web?.requestParameters?.filterMonth ?: currentMonth).toString()) as Integer"/>
 
         <!-- EPF Configuration -->
         <entity-find entity-name="zenith.erp.india.EpfConfiguration" list="epfConfigs">
@@ -126,6 +126,32 @@
         </script>
         <set field="totalEmployerCost" from="totalErPf + totalPension + totalAdmin + totalEdli" type="BigDecimal"/>
         <set field="totalRemittance" from="totalEmpPf + totalEmployerCost" type="BigDecimal"/>
+
+        <!-- ZE-DF-001 f/u (IV-110): pre-upload checks — flag rows likely to be rejected by the EPFO ECR portal
+             so they can be fixed before filing. Read-only; does not affect the export. -->
+        <script><![CDATA[
+            def two = new BigDecimal('2'); def five = new BigDecimal('5'); def cap = new BigDecimal(15000)
+            epfIssues = []
+            for (def d : epfData) {
+                def name = ((d.firstName ?: '') + ' ' + (d.lastName ?: '')).trim()
+                def probs = []
+                def uan = (d.uanNumber ?: '').toString().trim()
+                if (!uan) probs.add('UAN missing')
+                else if (!uan.matches('[0-9]{12}')) probs.add('UAN not 12 digits')
+                if (!name) probs.add('Name blank')
+                def epfW = (d.epfWages ?: 0) as BigDecimal
+                if (epfW <= 0) probs.add('EPF wages are 0')
+                def eeExp = epfW.multiply(new BigDecimal('0.12'))
+                def ee = (d.epfEmployeeAmount ?: 0) as BigDecimal
+                if ((ee - eeExp).abs() > two) probs.add('Employee PF not ~12% of EPF wages (has ' + ee + ', expected ~' + eeExp.setScale(0, java.math.RoundingMode.HALF_UP) + ')')
+                def epsExp = epfW.min(cap).multiply(new BigDecimal('0.0833'))
+                def eps = (d.epfEmployerPensionAmount ?: 0) as BigDecimal
+                if ((eps - epsExp).abs() > five) probs.add('EPS not ~8.33% of capped wages (has ' + eps + ', expected ~' + epsExp.setScale(0, java.math.RoundingMode.HALF_UP) + ')')
+                if (!d.payslipId) probs.add('No payslip linked — NCP days default to 0')
+                if (probs) epfIssues.add([code: (d.employeeCode ?: '?'), name: (name ?: '?'), uan: uan, problems: probs.join('; ')])
+            }
+            epfReadyCount = epfData.size() - epfIssues.size()
+        ]]></script>
     </actions>
 
     <widgets>
@@ -171,6 +197,28 @@
                 </widgets></section>
             </container>
         </container>
+
+        <!-- ZE-DF-001 f/u (IV-110): pre-upload validation panel -->
+        <container-row>
+            <row-col lg="12">
+                <section name="EpfIssuesPanel"><condition><expression>epfIssues</expression></condition><widgets>
+                    <container style="bg-orange-1 shadow-2 q-pa-md q-mb-md border-radius-lg">
+                        <label text="⚠ Pre-upload checks: ${epfIssues.size()} of ${epfData.size()} employees need attention before you file the ECR (${epfReadyCount} look ready). Fix these, then re-download." type="p" style="text-orange-9 text-weight-bold q-mb-sm"/>
+                        <form-list name="EpfIssuesForm" list="epfIssues" skip-form="true">
+                            <field name="code"><header-field title="Emp Code"/><default-field><display/></default-field></field>
+                            <field name="name"><header-field title="Name"/><default-field><display/></default-field></field>
+                            <field name="uan"><header-field title="UAN"/><default-field><display/></default-field></field>
+                            <field name="problems"><header-field title="Issues to fix before filing"/><default-field><display/></default-field></field>
+                        </form-list>
+                    </container>
+                </widgets></section>
+                <section name="EpfReadyPanel"><condition><expression>!epfIssues &amp;&amp; epfData</expression></condition><widgets>
+                    <container style="bg-green-1 shadow-2 q-pa-sm q-mb-md border-radius-lg">
+                        <label text="✓ Pre-upload checks passed — all ${epfData.size()} employees look ready for the ECR. Still verify one file on the EPFO portal before relying on it." type="p" style="text-green-9 text-weight-bold q-my-none"/>
+                    </container>
+                </widgets></section>
+            </row-col>
+        </container-row>
 
         <!-- Summary -->
         <container-row>
