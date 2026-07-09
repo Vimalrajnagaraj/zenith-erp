@@ -67,6 +67,10 @@
         </actions>
         <default-response url="."/>
     </transition>
+    <!-- IV-113 (ZE-DF-009): submit a product name/id -> re-render with its forecast + sales history (below) -->
+    <transition name="checkProduct">
+        <default-response url="."/>
+    </transition>
 
     <actions>
         <set field="orgId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
@@ -133,6 +137,32 @@
             context.openHourOptions = _open
             context.closeHourOptions = _close
             context.reorderHoursText = _lbl(_oh) + " – " + _lbl(_ch)
+            // IV-113 (ZE-DF-009): "Check a product" — look up ANY product (incl. a brand-new one with no sales)
+            // and show its forecast + sales history. forecast#ProductDemand returns a plain-English summary that
+            // already distinguishes has-sales vs "No sales history found ... a forecast cannot be produced yet".
+            context.checkDone = false; context.checkFound = false; context.checkHasForecast = false
+            def _cn = ec.context.checkProductName
+            if (_cn != null) _cn = _cn.toString().trim()
+            if (_cn && orgId && orgId != '_NA_') {
+                context.checkDone = true
+                context.checkQuery = _cn
+                def _prod = ec.entity.find("mantle.product.Product").condition("productId", _cn).condition("ownerPartyId", orgId).disableAuthz().one()
+                if (_prod == null) {
+                    def _pl = ec.entity.find("mantle.product.Product").condition("ownerPartyId", orgId).condition("productName", "like", "%" + _cn + "%").disableAuthz().orderBy("productName").limit(1).list()
+                    if (_pl) _prod = _pl[0]
+                }
+                if (_prod != null) {
+                    context.checkFound = true
+                    context.checkPName = _prod.productName
+                    context.checkPseudo = _prod.pseudoId
+                    def _fout = ec.service.sync().name("zenith.inventory.AdvancedForecastServices.forecast#ProductDemand")
+                        .parameters([productId: _prod.productId, organizationPartyId: orgId, horizonDays: 14]).call()
+                    context.checkSummary = _fout?.summary
+                    def _r = _fout?.result
+                    context.checkResult = _r
+                    context.checkHasForecast = (_r != null && _r.forecastDemand != null)
+                }
+            }
             // ZE-DF-008 f/u: does this org have Store operating hours? If so they OVERRIDE the setting below,
             // so show a note. Stays false (note hidden) until the stores module is actually used -> no dead pointer.
             context.hasStoreHours = false
@@ -212,6 +242,54 @@
                 </container>
             </row-col>
         </container-row>
+
+        <!-- IV-113 (ZE-DF-009): check any single product's forecast + sales history, incl. a brand-new no-sales product -->
+        <container style="zenith-card bg-white shadow-2 border-radius-md q-pa-md q-mb-md">
+            <label text="Check a product's forecast" type="h6" style="text-primary text-weight-bold q-my-none"/>
+            <label text="Type a product's name (or ID) to see its sales history and forecast — including a brand-new product that hasn't sold yet." type="p" style="text-grey-6 text-caption q-mb-sm"/>
+            <form-single name="CheckProductForm" transition="checkProduct">
+                <field name="checkProductName"><default-field title="Product name or ID"><text-line size="32"/></default-field></field>
+                <field name="submitButton"><default-field title=""><submit text="Check forecast" icon="search"/></default-field></field>
+            </form-single>
+            <section name="CheckResult"><condition><expression>checkDone</expression></condition><widgets>
+                <section name="CheckNotFound"><condition><expression>!checkFound</expression></condition><widgets>
+                    <container style="bg-yellow-1 q-pa-md border-radius-md q-mt-sm">
+                        <label text="No product found matching “${checkQuery}”. Check the spelling, or open Products to see the exact name." type="p" style="text-grey-8 q-mb-none"/>
+                    </container>
+                </widgets></section>
+                <section name="CheckFound"><condition><expression>checkFound</expression></condition><widgets>
+                    <container style="bg-grey-1 q-pa-md border-radius-md q-mt-sm">
+                        <label text="${checkPseudo ? checkPseudo + ' — ' : ''}${checkPName}" type="h6" style="text-dark text-weight-bold q-mb-xs"/>
+                        <label text="${checkSummary}" type="p" style="text-grey-9 q-mb-sm"/>
+                        <section name="CheckHasFc"><condition><expression>checkHasForecast</expression></condition><widgets>
+                            <container-row>
+                                <row-col lg="3" md="6"><container style="q-pa-sm">
+                                    <label text="Sales so far" type="p" style="text-grey-7 text-weight-bold text-caption q-mb-none"/>
+                                    <label text="~${checkResult.avgDailyDemand}/day over ${checkResult.historyDays} days" type="p" style="text-dark text-weight-bold q-mb-none"/>
+                                </container></row-col>
+                                <row-col lg="3" md="6"><container style="q-pa-sm">
+                                    <label text="Expected (next ${checkResult.horizonDays} days)" type="p" style="text-grey-7 text-weight-bold text-caption q-mb-none"/>
+                                    <label text="${checkResult.forecastDemand} units" type="p" style="text-primary text-weight-bold q-mb-none"/>
+                                </container></row-col>
+                                <row-col lg="3" md="6"><container style="q-pa-sm">
+                                    <label text="Reorder at" type="p" style="text-grey-7 text-weight-bold text-caption q-mb-none"/>
+                                    <label text="${checkResult.reorderPoint} units" type="p" style="text-warning text-weight-bold q-mb-none"/>
+                                </container></row-col>
+                                <row-col lg="3" md="6"><container style="q-pa-sm">
+                                    <label text="Confidence" type="p" style="text-grey-7 text-weight-bold text-caption q-mb-none"/>
+                                    <label text="${checkResult.confidencePct != null ? checkResult.confidencePct + '%' : 'building up'}" type="p" style="text-info text-weight-bold q-mb-none"/>
+                                </container></row-col>
+                            </container-row>
+                        </widgets></section>
+                        <section name="CheckNoSales"><condition><expression>!checkHasForecast</expression></condition><widgets>
+                            <container style="bg-blue-1 q-pa-md border-radius-md">
+                                <label text="No sales history yet — so no forecast can be made for this product. It will appear here (and in the “How our past predictions did” list below) automatically once it starts selling." type="p" style="text-blue-9 q-mb-none"/>
+                            </container>
+                        </widgets></section>
+                    </container>
+                </widgets></section>
+            </widgets></section>
+        </container>
 
         <container style="zenith-card bg-white shadow-2 border-radius-md q-pa-md q-mb-md">
             <label text="What needs your attention" type="h6" style="text-primary text-weight-bold q-my-none"/>
