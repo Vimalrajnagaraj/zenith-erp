@@ -22,3 +22,8 @@ COPY ./qz-private-key.pem /opt/moqui/WEB-INF/classes/qz-private-key.pem
 # rebuilds. Source of truth: docs/infra/framework-patches/patch-webroot-nav.sh.
 COPY ./framework-patches/patch-webroot-nav.sh /tmp/patch-webroot-nav.sh
 RUN sh /tmp/patch-webroot-nav.sh && rm /tmp/patch-webroot-nav.sh
+# ZE-INV-015 (IV-119): patch BOTH web shells' top breadcrumb so a crumb with subscreens NAVIGATES on a
+# single click (was a menu-opener that never navigated). Idempotent + self-verifying (fails the build if
+# the framework breadcrumb template changed). Source: docs/infra/framework-patches/patch-webroot-breadcrumb.sh.
+COPY ./framework-patches/patch-webroot-breadcrumb.sh /tmp/patch-webroot-breadcrumb.sh
+RUN sh /tmp/patch-webroot-breadcrumb.sh && rm /tmp/patch-webroot-breadcrumb.sh
