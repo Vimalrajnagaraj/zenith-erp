@@ -100,6 +100,34 @@ server {
         access_log off;
     }
 
+    # Vue single-file components (.qvue/.vue) — ZE-INV-018.
+    # These are STATIC UI assets loaded in bulk by httpVueLoader during SPA boot, but
+    # the js/css regex above does NOT match them, so without this block they fall into
+    # `location /` and are rate-limited by `limit_req zone=general` (30r/s, burst 50).
+    # A single /qapps boot fetches many components in one burst -> trips the limit ->
+    # nginx returns 503 (intermittent, seen on ActiveOrgNav.qvue), which the app then
+    # surfaces as a scary "contact support" toast. Serve them like other static assets
+    # (NO rate limit). Their URLs carry no ?v cache-bust, so revalidate rather than pin
+    # immutable-1y (avoid the year-long-stale trap the sw.js block below warns about).
+    location ~* \.(qvue|vue)$ {
+        proxy_pass http://moqui_backend;
+        proxy_hide_header Set-Cookie;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection "";
+
+        expires 1h;
+        add_header Cache-Control "public, must-revalidate";
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+        add_header Permissions-Policy "camera=(), microphone=(), geolocation=(self)" always;
+        add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+        access_log off;
+    }
+
     # Image and icon caching
     location ~* \.(png|jpg|jpeg|gif|ico|svg|webp)$ {
         proxy_pass http://moqui_backend;
