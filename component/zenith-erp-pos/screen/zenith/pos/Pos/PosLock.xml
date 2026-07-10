@@ -1,0 +1,219 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- ZE-INV-014 f/u (IV-118): POS terminal idle-lock. The billing terminal locks after N idle minutes
+     and re-arms with the cashier's own 4-digit PIN (falls back to their login password until a PIN is
+     set) WITHOUT a full logout — the session (and the open cart) is preserved. This screen hosts the
+     JSON endpoints the client (pos-idle-lock.js) calls, plus a small self-service UI to set the PIN and
+     the per-shop auto-lock timeout. Terminal.xml is deliberately NOT touched. -->
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
+        require-authentication="true" default-menu-include="false" default-menu-title="Screen Lock">
+
+    <!-- config: read-only JSON for the client on the terminal. idleMin (per shop), whether this cashier
+         has a PIN set, and their display name. GET-safe (no CSRF needed). -->
+    <transition name="config" read-only="true" begin-transaction="false">
+        <actions><script><![CDATA[
+            def out = [idleMin: 0, hasPin: false, name: ""]
+            boolean _d = ec.artifactExecution.disableAuthz()
+            try {
+                def orgId = ec.user.getPreference("ACTIVE_ORGANIZATION")
+                if (orgId && orgId != '_NA_') {
+                    def m = ec.entity.find("moqui.security.UserPreference").condition("userId", orgId)
+                        .condition("preferenceKey", "POS_IDLE_LOCK_MIN").one()?.preferenceValue
+                    if (m) { try { out.idleMin = Math.max(0, Math.min(240, (m.toString().trim() as int))) } catch (Exception e) { out.idleMin = 0 } }
+                }
+                def uid = ec.user.userId
+                if (uid) {
+                    out.hasPin = (ec.entity.find("moqui.security.UserPreference").condition("userId", uid)
+                        .condition("preferenceKey", "POS_UNLOCK_PIN_HASH").one()?.preferenceValue) ? true : false
+                    def _ua = ec.entity.find("moqui.security.UserAccount").condition("userId", uid).one()
+                    out.name = _ua?.userFullName ?: (ec.user.username ?: "")
+                }
+            } finally { if (!_d) ec.artifactExecution.enableAuthz() }
+            ec.web.sendJsonResponse(out)
+        ]]></script></actions>
+        <default-response type="none"/>
+    </transition>
+
+    <!-- verify: unlock attempt for the CURRENT session user only (no IDOR — userId is never taken from
+         input). Accepts a 4-digit PIN (salted-SHA-256 compare) or the login password (Shiro matcher, the
+         fallback used until a PIN is set). Per-session failure counter; after MAXFAILS the client is told
+         to sign out fully. POST + moquiSessionToken (CSRF-protected). -->
+    <transition name="verify" begin-transaction="false">
+        <parameter name="credential"/>
+        <parameter name="mode"/>
+        <actions><script><![CDATA[
+            import java.security.MessageDigest
+            int MAXFAILS = 5
+            def sess = ec.web.session
+            int fails = 0
+            try { def f = sess.getAttribute("posUnlockFails"); if (f != null) fails = f as int } catch (Exception e) {}
+            def cred = (credential ?: "").toString()
+            def out = [ok: false, locked: false, attemptsLeft: Math.max(0, MAXFAILS - fails), passwordOnly: false]
+            boolean _d = ec.artifactExecution.disableAuthz()
+            try {
+                def uid = ec.user.userId
+                if (!uid) { out.expired = true; ec.web.sendJsonResponse(out); return }
+                boolean ok = false
+                def stored = ec.entity.find("moqui.security.UserPreference").condition("userId", uid)
+                    .condition("preferenceKey", "POS_UNLOCK_PIN_HASH").one()?.preferenceValue
+                if ((mode ?: "") == "pin" && stored && cred ==~ /\d{4,6}/) {
+                    def parts = stored.toString().split(":", 2)
+                    if (parts.length == 2) {
+                        def calc = MessageDigest.getInstance("SHA-256").digest((parts[0] + ":" + cred).getBytes("UTF-8")).encodeHex().toString()
+                        ok = (calc == parts[1])
+                    }
+                } else {
+                    // password fallback (also the path when no PIN is set) — verify via Shiro like the login does
+                    def ua = ec.entity.find("moqui.security.UserAccount").condition("userId", uid).one()
+                    out.passwordOnly = !stored
+                    if (ua?.currentPassword && cred) {
+                        def token = new org.apache.shiro.authc.UsernamePasswordToken((String) ua.username, (String) cred)
+                        def info = new org.apache.shiro.authc.SimpleAuthenticationInfo((String) ua.username, (String) ua.currentPassword,
+                                new org.apache.shiro.lang.util.SimpleByteSource((String) (ua.passwordSalt ?: "")), "moquiRealm")
+                        ok = ec.ecfi.getCredentialsMatcher(ua.passwordHashType, "Y".equals(ua.passwordBase64)).doCredentialsMatch(token, info)
+                    }
+                }
+                if (ok) {
+                    sess.setAttribute("posUnlockFails", 0)
+                    out.ok = true
+                } else {
+                    fails = fails + 1
+                    sess.setAttribute("posUnlockFails", fails)
+                    out.attemptsLeft = Math.max(0, MAXFAILS - fails)
+                    out.locked = (fails >= MAXFAILS)
+                }
+            } finally { if (!_d) ec.artifactExecution.enableAuthz() }
+            ec.web.sendJsonResponse(out)
+        ]]></script></actions>
+        <default-response type="none"/>
+    </transition>
+
+    <!-- setPin: the current cashier sets/changes/removes their own 4-digit unlock PIN (salted SHA-256).
+         userId is forced to the session user (no IDOR). POST + moquiSessionToken. -->
+    <transition name="setPin" begin-transaction="false">
+        <parameter name="pin"/>
+        <parameter name="clear"/>
+        <actions><script><![CDATA[
+            import java.security.MessageDigest
+            import java.security.SecureRandom
+            def out = [ok: false, msg: ""]
+            boolean _d = ec.artifactExecution.disableAuthz()
+            try {
+                def uid = ec.user.userId
+                if (!uid) { out.msg = "Please sign in again."; ec.web.sendJsonResponse(out); return }
+                def existing = ec.entity.find("moqui.security.UserPreference").condition("userId", uid)
+                    .condition("preferenceKey", "POS_UNLOCK_PIN_HASH").one()
+                if (clear == 'Y' || clear == 'true') {
+                    if (existing != null) existing.delete()
+                    out.ok = true; out.msg = "PIN removed. You'll unlock with your password."
+                } else {
+                    def p = (pin ?: "").toString().trim()
+                    if (!(p ==~ /\d{4}/)) { out.msg = "Enter exactly 4 digits."; ec.web.sendJsonResponse(out); return }
+                    byte[] sb = new byte[16]; new SecureRandom().nextBytes(sb)
+                    def salt = sb.encodeHex().toString()
+                    def hash = MessageDigest.getInstance("SHA-256").digest((salt + ":" + p).getBytes("UTF-8")).encodeHex().toString()
+                    def val = salt + ":" + hash
+                    if (existing != null) { existing.preferenceValue = val; existing.update() }
+                    else { ec.entity.makeValue("moqui.security.UserPreference").set("userId", uid).set("preferenceKey", "POS_UNLOCK_PIN_HASH").set("preferenceValue", val).create() }
+                    out.ok = true; out.msg = "Unlock PIN saved."
+                }
+            } finally { if (!_d) ec.artifactExecution.enableAuthz() }
+            ec.web.sendJsonResponse(out)
+        ]]></script></actions>
+        <default-response type="none"/>
+    </transition>
+
+    <!-- saveConfig: set the per-shop auto-lock timeout (minutes; 0 = off). Stored under userId=orgId, the
+         same convention DiscountSettings uses for shop-level POS settings. Normal form POST. -->
+    <transition name="saveConfig">
+        <actions><script><![CDATA[
+            def orgId = ec.user.getPreference("ACTIVE_ORGANIZATION")
+            if (!orgId || orgId == '_NA_') { ec.message.addError("No shop is selected for this session."); return }
+            int mins = 0
+            try { mins = (context.idleMin ?: '0').toString().trim() as int } catch (Exception e) { mins = 0 }
+            if (mins < 0) mins = 0
+            if (mins > 240) mins = 240
+            boolean _d = ec.artifactExecution.disableAuthz()
+            try {
+                def ex = ec.entity.find("moqui.security.UserPreference").condition("userId", orgId).condition("preferenceKey", "POS_IDLE_LOCK_MIN").one()
+                if (ex != null) { ex.preferenceValue = mins.toString(); ex.update() }
+                else { ec.entity.makeValue("moqui.security.UserPreference").set("userId", orgId).set("preferenceKey", "POS_IDLE_LOCK_MIN").set("preferenceValue", mins.toString()).create() }
+            } finally { if (!_d) ec.artifactExecution.enableAuthz() }
+            ec.message.addMessage(mins > 0 ? ("Auto-lock set to " + mins + " minute" + (mins == 1 ? "" : "s") + ". Reopen the billing screen for it to take effect.") : "Auto-lock turned off.")
+        ]]></script></actions>
+        <default-response url="."/>
+    </transition>
+    <transition name="goTerminal"><default-response url="../Terminal"/></transition>
+
+    <actions><script><![CDATA[
+        def orgId = ec.user.getPreference('ACTIVE_ORGANIZATION')
+        hasOrg = (orgId && orgId != '_NA_')
+        boolean _d = ec.artifactExecution.disableAuthz()
+        try {
+            def rd = { u, k -> ec.entity.find("moqui.security.UserPreference").condition("userId", u).condition("preferenceKey", k).one()?.preferenceValue }
+            def m = hasOrg ? rd(orgId, 'POS_IDLE_LOCK_MIN') : null
+            curIdleMin = (m != null && m.toString().trim() != '') ? m.toString().trim() : '0'
+            idleDisplay = (curIdleMin == '0' || curIdleMin == '') ? 'Off' : ('Locks after ' + curIdleMin + ' min idle')
+            pinDisplay = (ec.user.userId && rd(ec.user.userId, 'POS_UNLOCK_PIN_HASH')) ? 'Set' : 'Not set (unlock with your password)'
+        } finally { if (!_d) ec.artifactExecution.enableAuthz() }
+    ]]></script></actions>
+
+    <widgets>
+        <render-mode><text type="html,qvt" template="true"><![CDATA[<details id="posHelp_lock" open style="background:#e8f0fe;border:1px solid #4285f4;border-left:6px solid #1a73e8;border-radius:10px;padding:10px 16px;margin:8px 12px 4px 12px;font-family:Segoe UI,Arial,sans-serif"><summary style="cursor:pointer;font-weight:800;font-size:15px;color:#174ea6;outline:none">&#128274; Till auto-lock &mdash; quick help</summary><div style="font-size:13px;color:#202124;line-height:1.9;margin-top:8px">Keep the billing screen safe when a cashier steps away &mdash; without logging out or losing the open bill.<br><b>1</b>&nbsp;<b>Auto-lock</b> &mdash; how long the till may sit untouched before it locks. The open cart is kept; the cashier just re-enters a code to carry on.<br><b>2</b>&nbsp;<b>My unlock PIN</b> &mdash; each cashier sets a quick 4-digit code. Until they set one, they unlock with their normal login password.</div></details>]]></text></render-mode>
+
+        <container style="row items-center justify-between q-mb-lg q-px-md">
+            <label text="Till Auto-Lock" type="h4" style="text-weight-bold q-my-none"/>
+            <link url="goTerminal" text="Back to Billing" icon="fa fa-arrow-left" btn-type="primary" style="q-btn--dense"/>
+        </container>
+
+        <section name="NoOrgWarn"><condition><expression>!hasOrg</expression></condition><widgets>
+            <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mx-md">
+                <label text="No shop is selected for this session, so auto-lock cannot be configured. Open the POS for your shop first, then come back here." type="p" style="text-negative text-weight-medium"/>
+            </container>
+        </widgets></section>
+
+        <section name="LockForm"><condition><expression>hasOrg</expression></condition><widgets>
+            <container style="row q-col-gutter-md q-px-md">
+                <container style="col-12 col-md-6">
+                    <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg">
+                        <label text="Auto-lock this shop's tills" type="h6" style="text-weight-bold q-mb-xs"/>
+                        <label text="Current: ${idleDisplay}" type="p" style="text-grey-8 q-mb-md"/>
+                        <form-single name="LockConfigForm" transition="saveConfig">
+                            <field name="idleMin"><default-field title="Lock after (minutes idle) — 0 turns it off">
+                                <drop-down><option key="0" text="Off"/><option key="2" text="2 minutes"/><option key="3" text="3 minutes"/><option key="5" text="5 minutes"/><option key="10" text="10 minutes"/><option key="15" text="15 minutes"/><option key="30" text="30 minutes"/></drop-down>
+                            </default-field></field>
+                            <field name="submitBtn"><default-field title=""><submit text="Save auto-lock"/></default-field></field>
+                        </form-single>
+                    </container>
+                </container>
+                <container style="col-12 col-md-6">
+                    <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg">
+                        <label text="My unlock PIN" type="h6" style="text-weight-bold q-mb-xs"/>
+                        <label text="Status: ${pinDisplay}" type="p" style="text-grey-8 q-mb-md"/>
+                        <render-mode><text type="html,qvt"><![CDATA[
+                            <div id="pinSetBox" style="max-width:320px">
+                              <input id="pinInput" type="password" inputmode="numeric" autocomplete="off" maxlength="4" placeholder="New 4-digit PIN"
+                                style="width:100%;box-sizing:border-box;padding:10px 12px;font-size:18px;letter-spacing:6px;text-align:center;border:1px solid #cfd8dc;border-radius:8px;margin-bottom:10px"/>
+                              <div style="display:flex;gap:8px">
+                                <button type="button" id="pinSaveBtn" style="flex:1;padding:10px;border:0;border-radius:8px;background:#4F46E5;color:#fff;font-weight:700;font-size:14px;cursor:pointer">Save PIN</button>
+                                <button type="button" id="pinClearBtn" style="flex:0 0 auto;padding:10px 14px;border:1px solid #cfd8dc;border-radius:8px;background:#f5f5f5;color:#37474f;font-weight:600;font-size:14px;cursor:pointer">Remove</button>
+                              </div>
+                              <div id="pinMsg" style="margin-top:10px;font-size:13px;min-height:18px"></div>
+                            </div>
+                            <img src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" alt="" style="display:none" onload="(function(){try{
+                              var tok=function(){try{if(window.moqui&&window.moqui.webrootVue&&window.moqui.webrootVue.moquiSessionToken)return window.moqui.webrootVue.moquiSessionToken;}catch(e){}return '';};
+                              var inp=document.getElementById('pinInput'),msg=document.getElementById('pinMsg'),sv=document.getElementById('pinSaveBtn'),cl=document.getElementById('pinClearBtn');
+                              if(!inp||inp.dataset.b)return; inp.dataset.b='1';
+                              inp.addEventListener('input',function(){inp.value=inp.value.replace(/[^0-9]/g,'').slice(0,4);});
+                              function post(params){var p=new URLSearchParams();for(var k in params){p.append(k,params[k]);}p.append('moquiSessionToken',tok());
+                                return fetch('setPin',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p,credentials:'same-origin'}).then(function(r){return r.json();});}
+                              sv.addEventListener('click',function(){msg.style.color='#37474f';msg.textContent='Saving...';post({pin:inp.value}).then(function(r){msg.style.color=r.ok?'#2e7d32':'#c62828';msg.textContent=r.msg||(r.ok?'Saved.':'Could not save.');if(r.ok)inp.value='';}).catch(function(){msg.style.color='#c62828';msg.textContent='Network error, try again.';});});
+                              cl.addEventListener('click',function(){msg.style.color='#37474f';msg.textContent='Removing...';post({clear:'Y'}).then(function(r){msg.style.color=r.ok?'#2e7d32':'#c62828';msg.textContent=r.msg||'';}).catch(function(){msg.style.color='#c62828';msg.textContent='Network error, try again.';});});
+                            }catch(e){}})()"/>
+                        ]]></text></render-mode>
+                    </container>
+                </container>
+            </container>
+        </widgets></section>
+    </widgets>
+</screen>
