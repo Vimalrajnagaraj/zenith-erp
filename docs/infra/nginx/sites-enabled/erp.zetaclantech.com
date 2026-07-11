@@ -63,7 +63,9 @@ server {
 
     # Zenith theme CSS - short cache for updates
     location = /zenithstatic/css/zenith-theme-v4.css {
-        proxy_pass http://moqui_backend;
+        proxy_pass http://moqui_static;
+        proxy_next_upstream error timeout http_500 http_502;
+        proxy_next_upstream_tries 2;
         proxy_hide_header Set-Cookie;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
@@ -82,7 +84,9 @@ server {
 
     # Static asset caching - versioned assets
     location ~* \.(js|css|woff2?|ttf|eot|otf)$ {
-        proxy_pass http://moqui_backend;
+        proxy_pass http://moqui_static;
+        proxy_next_upstream error timeout http_500 http_502;
+        proxy_next_upstream_tries 2;
         proxy_hide_header Set-Cookie;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
@@ -110,7 +114,9 @@ server {
     # (NO rate limit). Their URLs carry no ?v cache-bust, so revalidate rather than pin
     # immutable-1y (avoid the year-long-stale trap the sw.js block below warns about).
     location ~* \.(qvue|vue)$ {
-        proxy_pass http://moqui_backend;
+        proxy_pass http://moqui_static;
+        proxy_next_upstream error timeout http_500 http_502;
+        proxy_next_upstream_tries 2;
         proxy_hide_header Set-Cookie;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
