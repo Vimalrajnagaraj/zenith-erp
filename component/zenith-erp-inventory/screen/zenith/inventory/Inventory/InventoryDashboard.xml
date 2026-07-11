@@ -18,11 +18,38 @@
             facilitiesCount= ef.find("mantle.facility.Facility").condition("ownerPartyId", orgId).count()
             trackedCount   = ef.find("mantle.product.Product").condition("ownerPartyId", orgId).condition("inventoryTracked", "Y").count()
 
-            // ----- Stock value + units in hand (across all stores) -----
-            def svRows = ef.find("zenith.erp.inventory.StockByFacilityView").condition("ownerPartyId", orgId).list()
-            java.math.BigDecimal stockValue = 0G
-            java.math.BigDecimal totalUnits = 0G
-            for (r in svRows) { stockValue += (r.totalValue ?: 0G); totalUnits += (r.totalQoh ?: 0G) }
+            // ----- Stock value + units in hand (across ALL of the org's inventory) -----
+            // ZE-INV-001/IV-001: sum per ASSET (not the by-facility view). Two fixes:
+            //  (1) the by-facility view INNER-joins Facility, so opening stock that has no facility yet
+            //      (facilityId null) was dropped -> "0 units in stock" even though the catalog shows it;
+            //  (2) value now falls back valuationRate -> acquireCost -> product MRP (same as the Expiry
+            //      dashboard, ZE-INV-002), so MRP-priced stock is no longer valued at ₹0.
+            // NOTE: no explicit type — a `BigDecimal x = ...` at script top level is a LOCAL var in Groovy
+            // and never reaches the screen binding, so ${stockValue}/${totalUnits} rendered as 0 no matter
+            // what this loop computed (the original latent cause of "₹0 / 0 units"). Bare assignment = binding.
+            stockValue = 0G
+            totalUnits = 0G
+            def _mrpCache = [:]
+            def stockAssets = ef.find("mantle.product.asset.Asset").condition("ownerPartyId", orgId)
+                                .condition("assetTypeEnumId", "AstTpInventory")
+                                .condition("quantityOnHandTotal", EntityCondition.GREATER_THAN, 0G).list()
+            for (a in stockAssets) {
+                def qoh = (a.quantityOnHandTotal ?: 0G) as java.math.BigDecimal
+                totalUnits += qoh
+                def vr = a.valuationRate ? (a.valuationRate as java.math.BigDecimal) : null
+                def ac = a.acquireCost ? (a.acquireCost as java.math.BigDecimal) : null
+                def rate = (vr != null && vr > 0G) ? vr : ((ac != null && ac > 0G) ? ac : null)
+                if (rate == null) {
+                    def mrp = _mrpCache[a.productId]
+                    if (mrp == null) {
+                        def p = ef.find("mantle.product.Product").condition("productId", a.productId).one()
+                        mrp = (p?.mrpAmount ?: 0G) as java.math.BigDecimal
+                        _mrpCache[a.productId] = mrp
+                    }
+                    rate = mrp
+                }
+                stockValue += qoh * (rate ?: 0G)
+            }
 
             // ----- Low stock (only for items that actually track quantity) -----
             int lowStockCnt = 0
