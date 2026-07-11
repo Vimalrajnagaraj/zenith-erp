@@ -395,6 +395,91 @@
         </actions>
     </service>
 
+    <!-- XF-004: edit a DRAFT transfer's header (destination / date / notes). The SOURCE is fixed once
+         product lines exist (their lot/serial picks came from that sender) — to change it, remove the
+         lines first (or delete + recreate). Recomputes the inter-state IGST placeholder invoice so the
+         header stays consistent with create#StockTransfer. Blocked once shipped (stock has moved). -->
+    <service verb="edit" noun="StockTransfer">
+        <in-parameters>
+            <parameter name="stockTransferId" required="true"/>
+            <parameter name="fromFacilityId"/>
+            <parameter name="toFacilityId"/>
+            <parameter name="transferDate" type="Timestamp"/>
+            <parameter name="remarks"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.inventory.StockTransfer" value-field="stx" for-update="true"/>
+            <if condition="stx == null"><return error="true" message="Transfer not found"/></if>
+            <if condition="stx.statusId != 'StxDraft'">
+                <return error="true" message="Only a draft transfer can be edited — this one has already been shipped."/>
+            </if>
+            <entity-find entity-name="zenith.erp.inventory.StockTransferItem" list="_items">
+                <econdition field-name="stockTransferId"/>
+            </entity-find>
+            <if condition="fromFacilityId &amp;&amp; fromFacilityId != stx.fromFacilityId &amp;&amp; _items">
+                <return error="true" message="Remove the product lines before changing the source warehouse — they were picked from the current source."/>
+            </if>
+            <set field="newFrom" from="fromFacilityId ?: stx.fromFacilityId"/>
+            <set field="newTo" from="toFacilityId ?: stx.toFacilityId"/>
+            <service-call name="update#zenith.erp.inventory.StockTransfer"
+                in-map="[stockTransferId:stockTransferId, fromFacilityId:newFrom, toFacilityId:newTo,
+                         transferDate:transferDate, remarks:remarks]"/>
+            <!-- keep the inter-state IGST placeholder consistent (mirrors create#StockTransfer) -->
+            <script><![CDATA[
+                def fromFac = ec.entity.find("mantle.facility.Facility").condition("facilityId", newFrom).one()
+                def toFac = ec.entity.find("mantle.facility.Facility").condition("facilityId", newTo).one()
+                def interState = (fromFac?.taxRegistrationNumber && toFac?.taxRegistrationNumber
+                                  && fromFac.taxRegistrationNumber != toFac.taxRegistrationNumber)
+                if (interState && !stx.igstInvoiceId) {
+                    def inv = ec.service.sync().name("create#mantle.account.invoice.Invoice").parameters([
+                        invoiceTypeEnumId:'InvoiceSales', statusId:'InvoiceInProcess',
+                        fromPartyId:stx.organizationPartyId, toPartyId:stx.organizationPartyId,
+                        invoiceDate:ec.user.nowTimestamp, description:'IGST Invoice for Branch Transfer']).call()
+                    ec.service.sync().name("update#zenith.erp.inventory.StockTransfer")
+                        .parameters([stockTransferId:stockTransferId, igstInvoiceId:inv.invoiceId]).call()
+                } else if (!interState && stx.igstInvoiceId) {
+                    // now intra-state: void the placeholder invoice + detach it
+                    def inv = ec.entity.find("mantle.account.invoice.Invoice").condition("invoiceId", stx.igstInvoiceId).one()
+                    if (inv && inv.statusId != 'InvoiceCancelled') { inv.statusId = 'InvoiceCancelled'; inv.update() }
+                    def ev = ec.entity.find("zenith.erp.inventory.StockTransfer").condition("stockTransferId", stockTransferId).one()
+                    if (ev) { ev.igstInvoiceId = null; ev.update() }
+                }
+            ]]></script>
+        </actions>
+    </service>
+
+    <!-- XF-004: delete a DRAFT transfer (nothing shipped, so no stock has moved). Removes its serial
+         picks + product lines + voids the placeholder IGST invoice, then deletes the header. A shipped
+         or received transfer is BLOCKED (stock has moved) — reverse it with a return transfer instead. -->
+    <service verb="delete" noun="StockTransfer">
+        <in-parameters>
+            <parameter name="stockTransferId" required="true"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.inventory.StockTransfer" value-field="stx" for-update="true"/>
+            <if condition="stx == null"><return error="true" message="Transfer not found"/></if>
+            <if condition="stx.statusId != 'StxDraft'">
+                <return error="true" message="Only a draft transfer can be deleted. This one has already shipped — the stock has moved, so reverse it with a return transfer instead."/>
+            </if>
+            <entity-find entity-name="zenith.erp.inventory.StockTransferItemSerial" list="_ser">
+                <econdition field-name="stockTransferId"/>
+            </entity-find>
+            <iterate list="_ser" entry="_s"><entity-delete value-field="_s"/></iterate>
+            <entity-find entity-name="zenith.erp.inventory.StockTransferItem" list="_it">
+                <econdition field-name="stockTransferId"/>
+            </entity-find>
+            <iterate list="_it" entry="_i"><entity-delete value-field="_i"/></iterate>
+            <if condition="stx.igstInvoiceId">
+                <script><![CDATA[
+                    // placeholder IGST invoice (never finalized in the draft flow): void it rather than hard-delete
+                    def inv = ec.entity.find("mantle.account.invoice.Invoice").condition("invoiceId", stx.igstInvoiceId).one()
+                    if (inv && inv.statusId != 'InvoiceCancelled') { inv.statusId = 'InvoiceCancelled'; inv.update() }
+                ]]></script>
+            </if>
+            <entity-delete value-field="stx"/>
+        </actions>
+    </service>
+
     <service verb="create" noun="StockAdjustment">
         <in-parameters>
             <parameter name="facilityId" required="true"/>
