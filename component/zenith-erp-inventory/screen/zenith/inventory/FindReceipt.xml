@@ -5,6 +5,39 @@
 
     <transition name="receiveInventory"><default-response url="../ReceiveInventory"/></transition>
 
+    <!-- XF-002: receive incoming stock DIRECTLY, without a purchase order (opening stock, walk-in
+         supplier delivery, or a branch transfer). Adds the qty to the chosen store via the canonical
+         adjust#AssetOnHand (find-or-create org asset + on-hand + AssetDetail ledger). Does NOT flip
+         Product.inventoryTracked, so it never changes POS depletion for non-tracking tenants (MARUTHI-safe). -->
+    <transition name="receiveDirectStock">
+        <actions>
+            <!-- ZE-INV-010: enforce Inventory write access (defense-in-depth; the central gate is fail-open) -->
+            <service-call name="zenith.base.SecurityServices.check#ModuleWriteAccess" out-map="_wac" in-map="[moduleId:'inventory']"/>
+            <if condition="!(_wac?.canWrite)"><return error="true" message="You have view-only access to Inventory — you can't receive stock here."/></if>
+            <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <if condition="!productId"><return error="true" message="Please select a product to receive."/></if>
+            <if condition="!facilityId"><return error="true" message="Please choose the store / warehouse to receive into."/></if>
+            <script><![CDATA[
+                def _numOk = { v -> v != null && v.toString().trim() != '' && (v.toString().trim() ==~ /\d*\.?\d+/) }
+                if (!_numOk(quantityDiff)) { ec.message.addError("Quantity received must be a number greater than zero."); return }
+                def _qty = new BigDecimal(quantityDiff.toString().trim())
+                if (_qty.signum() <= 0) { ec.message.addError("Quantity received must be greater than zero."); return }
+                def _org = (activeOrg && activeOrg != '_NA_') ? activeOrg : null
+                if (!_org) { ec.message.addError("No active organization is selected — cannot receive stock."); return }
+                def inMap = [organizationPartyId:_org, productId:productId, quantityDiff:_qty,
+                             facilityId:facilityId, reason:'Direct goods receipt']
+                if (batchNumber) inMap.batchNumber = batchNumber
+                if (expiryDate) inMap.expiryDate = expiryDate
+                if (manufacturingDate) inMap.manufacturingDate = manufacturingDate
+                if (_numOk(mrpAmount)) inMap.mrpAmount = new BigDecimal(mrpAmount.toString().trim())
+                if (_numOk(valuationRate)) inMap.valuationRate = new BigDecimal(valuationRate.toString().trim())
+                ec.service.sync().name("zenith.inventory.InventoryStockServices.adjust#AssetOnHand").parameters(inMap).call()
+                if (!ec.message.hasError()) ec.message.addMessage("Received ${_qty} units into stock. Open Stock Levels to verify the updated quantity.")
+            ]]></script>
+        </actions>
+        <default-response url="."/>
+    </transition>
+
     <actions>
         <entity-find entity-name="mantle.party.PartyRole" list="internalOrgRoles">
             <econdition field-name="roleTypeId" value="InternalOrganization"/>
@@ -25,14 +58,49 @@
             <econdition field-name="statusId" operator="in" value="OrderApproved,OrderCompleted"/>
             <search-form-inputs default-order-by="-orderDate,orderId"/>
         </entity-find>
+
+        <!-- XF-002: options for the direct-receive dialog (org-scoped). -->
+        <entity-find entity-name="mantle.product.Product" list="prodList">
+            <econdition field-name="ownerPartyId" from="activeOrgId" ignore-if-empty="true"/>
+            <order-by field-name="productName"/>
+        </entity-find>
+        <entity-find entity-name="mantle.facility.Facility" list="facilityList">
+            <econdition field-name="ownerPartyId" from="activeOrgId" ignore-if-empty="true"/>
+            <order-by field-name="facilityName"/>
+        </entity-find>
     </actions>
 
     <widgets>
         <container style="row items-center justify-between q-mb-lg">
             <container>
                 <label text="Receiving (Incoming Stock)" type="h3" style="text-primary text-weight-bold q-my-none"/>
-                <label text="When goods arrive from a supplier, open the matching purchase order here and record what came in." type="p" style="text-grey-7 q-mt-sm q-mb-none"/>
+                <label text="Receive against a purchase order below, or use Receive Stock Directly for goods that arrived without one." type="p" style="text-grey-7 q-mt-sm q-mb-none"/>
             </container>
+            <!-- XF-002: always-available Save/Receive action (no PO required). -->
+            <section name="DirectReceiveToolbar">
+                <condition><expression>invCanWrite</expression></condition>
+                <widgets>
+                    <container-dialog id="DirectReceiveDialog" button-text="Receive Stock Directly" button-class="btn btn-success text-weight-bold">
+                        <label text="Receive Stock Directly (no purchase order)" type="h5" style="text-primary text-weight-bold q-mb-xs"/>
+                        <label text="Use this when goods arrive without a matching purchase order — opening stock, a walk-in supplier delivery, or a branch transfer. The quantity is added to the chosen store and shows immediately in Stock Levels." type="p" style="text-grey-7 q-mb-md"/>
+                        <form-single name="DirectReceiveForm" transition="receiveDirectStock">
+                            <field name="productId"><default-field title="Product">
+                                <drop-down><list-options list="prodList" key="${productId}" text="${pseudoId ? (pseudoId + ' — ') : ''}${productName}"/></drop-down>
+                            </default-field></field>
+                            <field name="facilityId"><default-field title="Store / Warehouse to receive into">
+                                <drop-down allow-empty="false"><list-options list="facilityList" key="${facilityId}" text="${facilityName}"/></drop-down>
+                            </default-field></field>
+                            <field name="quantityDiff"><default-field title="Quantity Received"><text-line size="10"/></default-field></field>
+                            <field name="valuationRate"><default-field title="Unit Cost (optional)"><text-line size="10"/></default-field></field>
+                            <field name="batchNumber"><default-field title="Batch / Lot Number (optional)"><text-line size="20"/></default-field></field>
+                            <field name="manufacturingDate"><default-field title="Manufacturing Date (optional)"><date-time type="date"/></default-field></field>
+                            <field name="expiryDate"><default-field title="Expiry Date (optional)"><date-time type="date"/></default-field></field>
+                            <field name="mrpAmount"><default-field title="Batch MRP (optional)"><text-line size="10"/></default-field></field>
+                            <field name="submitButton"><default-field title="Receive into stock"><submit text="Receive Stock" icon="login"/></default-field></field>
+                        </form-single>
+                    </container-dialog>
+                </widgets>
+            </section>
         </container>
 
         <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md">
@@ -98,8 +166,8 @@
                 <condition><expression>!poList</expression></condition>
                 <widgets>
                     <container style="text-center q-pa-xl">
-                        <label text="No orders are waiting to be received right now." type="h6" style="text-grey-8 text-weight-bold q-mb-xs"/>
-                        <label text="When you approve a purchase order in the Purchase module, it shows up here — then use the Receive Stock button to record what actually arrived." type="p" style="text-grey-6 q-mb-none"/>
+                        <label text="No purchase orders are waiting to be received right now." type="h6" style="text-grey-8 text-weight-bold q-mb-xs"/>
+                        <label text="Approve a purchase order in the Purchase module and it shows up here — or use Receive Stock Directly (top right) to record incoming goods that have no purchase order." type="p" style="text-grey-6 q-mb-none"/>
                     </container>
                 </widgets>
             </section>
