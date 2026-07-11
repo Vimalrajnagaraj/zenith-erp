@@ -33,17 +33,16 @@
                 <order-by field-name="assetId"/>
             </entity-find>
             <set field="asset" from="assets ? assets[0] : null"/>
-            <!-- ZE-INV-001 f/u: never leave stock facility-less — it's invisible in the by-facility views (Stock
-                 Levels list, dashboard KPI). When the caller gave no facility and the target lot has none, default
-                 to the org's PRIMARY (first) facility. Applies on create AND heals an existing facility-less lot.
-                 The FIND above stays facility-agnostic (ignore-if-empty), so we still reuse the existing lot rather
-                 than spawn a duplicate; if the org has no facility at all we leave it null (nothing to assign). -->
+            <!-- ZE-INV-001/002 f/u: never leave stock facility-less — it's invisible in the by-facility views
+                 (Stock Levels list, dashboard KPI). When the caller gave no facility and the target lot has none,
+                 default to the org's PRIMARY facility — CREATING a default "<Org> - Main Store" if the org has
+                 none at all (ensure#OrgDefaultFacility), so a brand-new org's first opening stock lands in a real
+                 store instead of "— No store —" (ZE-INV-002). Applies on create AND heals an existing facility-less
+                 lot. The FIND above stays facility-agnostic (ignore-if-empty), so we still reuse the existing lot. -->
             <if condition="!facilityId &amp;&amp; (asset == null || !asset.facilityId)">
-                <entity-find entity-name="mantle.facility.Facility" list="_orgFacs" limit="1">
-                    <econdition field-name="ownerPartyId" from="organizationPartyId"/>
-                    <order-by field-name="facilityId"/>
-                </entity-find>
-                <if condition="_orgFacs"><set field="facilityId" from="_orgFacs[0].facilityId"/></if>
+                <service-call name="zenith.inventory.InventoryStockServices.ensure#OrgDefaultFacility"
+                              out-map="_edf" in-map="[organizationPartyId:organizationPartyId]"/>
+                <set field="facilityId" from="_edf.facilityId"/>
             </if>
             <if condition="asset == null">
                 <service-call name="create#mantle.product.asset.Asset" out-map="createAsset"
@@ -63,6 +62,41 @@
                 in-map="[assetId:asset.assetId, productId:productId, effectiveDate:effectiveDate,
                          quantityOnHandDiff:quantityDiff, availableToPromiseDiff:quantityDiff, description:reason]"/>
             <set field="assetId" from="asset.assetId"/>
+        </actions>
+    </service>
+
+    <!-- ZE-INV-002 (IV-002): return the org's primary facility, CREATING a default "<Org> - Main Store"
+         (FcTpRetailStore) if the org has NONE — so stock never has to sit with no location ("— No store —").
+         Idempotent: a no-op once the org has any facility (returns the first by facilityId, exactly as the old
+         inline lookup did). Called from adjust#AssetOnHand's facility-default path (covers every opening-stock /
+         receiving / adjustment); safe to also call at org onboarding. -->
+    <service verb="ensure" noun="OrgDefaultFacility" authenticate="false">
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="facilityId"/>
+            <parameter name="created" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <entity-find entity-name="mantle.facility.Facility" list="_facs" limit="1">
+                <econdition field-name="ownerPartyId" from="organizationPartyId"/>
+                <order-by field-name="facilityId"/>
+            </entity-find>
+            <if condition="_facs">
+                <set field="facilityId" from="_facs[0].facilityId"/>
+                <set field="created" from="false"/>
+            <else>
+                <!-- name it "<Org Name> - Main Store" to match the app's primary-facility convention -->
+                <entity-find-one entity-name="mantle.party.Organization" value-field="_org">
+                    <field-map field-name="partyId" from="organizationPartyId"/>
+                </entity-find-one>
+                <set field="_nm" from="(_org?.organizationName ? (_org.organizationName + ' - Main Store') : 'Main Store')"/>
+                <service-call name="create#mantle.facility.Facility" out-map="_cf"
+                              in-map="[facilityName:_nm, facilityTypeEnumId:'FcTpRetailStore', ownerPartyId:organizationPartyId]"/>
+                <set field="facilityId" from="_cf.facilityId"/>
+                <set field="created" from="true"/>
+            </else></if>
         </actions>
     </service>
 
