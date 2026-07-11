@@ -20,12 +20,40 @@
             <order-by field-name="productName"/>
         </entity-find>
         
-        <set field="totalValuation" from="0"/>
-        <script>
-            for (def stock : stockList) {
-                totalValuation += (stock.totalValue ?: 0)
+        <set field="currSymbol" value="₹"/>
+        <script><![CDATA[
+            import org.moqui.entity.EntityCondition
+            def ef = ec.entity
+            // ZE-INV-001 f/u: value stock from Assets directly (valuationRate -> acquireCost -> product MRP),
+            // NOT the view's totalValue (= sum(acquireCost): 0 for MRP-priced stock). Drives BOTH the per-row
+            // Stock Value and the facility valuation KPI. Keyed product|lot to line up with the by-facility rows.
+            stockValueByRow = [:]
+            def _mrpCache = [:]
+            totalValuation = 0G
+            def _fa = ef.find("mantle.product.asset.Asset")
+                        .condition("facilityId", facilityId)
+                        .condition("assetTypeEnumId", "AstTpInventory")
+                        .condition("quantityOnHandTotal", EntityCondition.GREATER_THAN, 0G).list()
+            for (a in _fa) {
+                def qoh = (a.quantityOnHandTotal ?: 0G) as java.math.BigDecimal
+                def vr = a.valuationRate ? (a.valuationRate as java.math.BigDecimal) : null
+                def ac = a.acquireCost ? (a.acquireCost as java.math.BigDecimal) : null
+                def rate = (vr != null && vr > 0G) ? vr : ((ac != null && ac > 0G) ? ac : null)
+                if (rate == null) {
+                    def mrp = _mrpCache[a.productId]
+                    if (mrp == null) {
+                        def p = ef.find("mantle.product.Product").condition("productId", a.productId).one()
+                        mrp = (p?.mrpAmount ?: 0G) as java.math.BigDecimal
+                        _mrpCache[a.productId] = mrp
+                    }
+                    rate = mrp
+                }
+                def val = qoh * (rate ?: 0G)
+                totalValuation += val
+                def k = (a.productId ?: '') + '|' + (a.lotId ?: '')
+                stockValueByRow[k] = (stockValueByRow[k] ?: 0G) + val
             }
-        </script>
+        ]]></script>
         
         <entity-find-one entity-name="moqui.basic.Enumeration" value-field="facTypeEnum">
             <field-map field-name="enumId" from="facility?.facilityTypeEnumId"/>
@@ -128,7 +156,7 @@
                         
                         <field name="totalValue">
                             <default-field title="Stock Value (${currSymbol})">
-                                <label text="${ec.l10n.format(totalValue ?: 0, '#,##,##0.00')}" type="span"/>
+                                <label text="${ec.l10n.format((stockValueByRow[(productId ?: '') + '|' + (lotId ?: '')] ?: 0), '#,##,##0.00')}" type="span"/>
                             </default-field>
                         </field>
                     </form-list>
