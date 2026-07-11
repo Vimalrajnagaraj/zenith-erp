@@ -14,6 +14,13 @@
                 def p = ec.web.parameters
                 try {
                     if (!p.productId) { ec.web.sendJsonResponse([success:false, error:'Missing product']); return }
+                    // ZE-INV-001 f/u: reject negative prices with a clear message. (A negative would otherwise be
+                    // silently dropped -> set#PosModePrice treats price<=0 as "clear the mode".) Blank/0 = clear.
+                    def parseBd = { v -> if (v == null || v.toString().trim() == '') return null; try { return v.toString().trim() as BigDecimal } catch (ex) { return null } }
+                    def rtBd = parseBd(p.retailPrice); def wsBd = parseBd(p.wholesalePrice); def emBd = parseBd(p.employeePrice)
+                    if ((rtBd != null && rtBd < 0G) || (wsBd != null && wsBd < 0G) || (emBd != null && emBd < 0G)) {
+                        ec.web.sendJsonResponse([success:false, error:"Prices can't be negative — enter a positive amount (or leave blank to clear)."]); return
+                    }
                     // Retail price = product MRP; only update when a positive value was entered.
                     if (p.retailPrice != null && p.retailPrice.toString().trim() != '')
                         ec.service.sync().name("zenith.pos.PosServices.set#PosModePrice")
@@ -28,7 +35,15 @@
                         .parameters([productId:p.productId, salesModeId:'EMPLOYEE',
                                      price:(p.employeePrice != null && p.employeePrice.toString().trim() != '' ? (p.employeePrice as BigDecimal) : null)]).call()
                     if (ec.message.hasError()) { def em = ec.message.errorsString; ec.message.clearErrors(); ec.web.sendJsonResponse([success:false, error:em]); return }
-                    ec.web.sendJsonResponse([success:true])
+                    // ZE-INV-001 f/u: soft warning (NOT a block — it can be legitimate). Wholesale is normally
+                    // <= retail; if it's higher it's usually a typo, so save but flag it. Retail = product MRP;
+                    // if retail wasn't changed this save, compare against the product's current mrpAmount.
+                    def effRetail = rtBd
+                    if (effRetail == null) { def _pr = ec.entity.find("mantle.product.Product").condition("productId", p.productId).one(); effRetail = (_pr?.mrpAmount != null) ? (_pr.mrpAmount as BigDecimal) : null }
+                    def warn = null
+                    if (wsBd != null && wsBd > 0G && effRetail != null && effRetail > 0G && wsBd > effRetail)
+                        warn = "Saved — but the Wholesale price (₹" + wsBd.stripTrailingZeros().toPlainString() + ") is higher than Retail (₹" + effRetail.stripTrailingZeros().toPlainString() + "). Wholesale is usually lower; please double-check."
+                    ec.web.sendJsonResponse([success:true, warning:warn])
                 } catch (Exception e) { ec.web.sendJsonResponse([success:false, error:e.message]) }
             ]]></script>
         </actions>
@@ -188,7 +203,7 @@
         <script>
         (function(){
             function tok(){ try{ if(window.moqui&&window.moqui.webrootVue&&window.moqui.webrootVue.moquiSessionToken) return window.moqui.webrootVue.moquiSessionToken; }catch(e){} return ''; }
-            function note(btn,msg,ok){ var o=btn.textContent,c=btn.style.background; btn.textContent=msg; btn.style.background=ok?'#1b5e20':'#c62828'; setTimeout(function(){ btn.textContent=o; btn.style.background=c; },1800); }
+            function note(btn,msg,color){ var o=btn.textContent,c=btn.style.background; btn.textContent=msg; btn.style.background=color; setTimeout(function(){ btn.textContent=o; btn.style.background=c; },2400); }
             // Live "what the customer pays" preview: base price + the product's GST.
             function recalc(inp){
                 var tr=inp.closest&&inp.closest('tr'); if(!tr) return;
@@ -211,8 +226,8 @@
                     moquiSessionToken:tok() });
                 fetch('ProductPricing/savePrices',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body,credentials:'same-origin'})
                     .then(function(r){return r.json();})
-                    .then(function(d){ btn.disabled=false; if(d&&d.success){ note(btn,'✓ Saved',true); } else { note(btn,'✗ '+((d&&d.error)||'Error'),false); } })
-                    .catch(function(e){ btn.disabled=false; note(btn,'✗ '+e.message,false); });
+                    .then(function(d){ btn.disabled=false; if(d&&d.success){ if(d.warning){ note(btn,'⚠ Saved','#e65100'); alert(d.warning); } else { note(btn,'✓ Saved','#1b5e20'); } } else { note(btn,'✗ '+((d&&d.error)||'Error'),'#c62828'); } })
+                    .catch(function(e){ btn.disabled=false; note(btn,'✗ '+e.message,'#c62828'); });
             });
         })();
         </script>
