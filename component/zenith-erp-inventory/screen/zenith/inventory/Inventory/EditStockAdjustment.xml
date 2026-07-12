@@ -6,38 +6,80 @@
     <parameter name="stockAdjustmentId" required="true"/>
 
     <transition name="addItem">
-        <service-call name="zenith.inventory.InventoryServices.add#StockAdjustmentItem" in-map="context"/>
+        <actions>
+            <!-- ZE-INV-IV-06A: block adding a line to another tenant's adjustment via a forged POST -->
+            <service-call name="zenith.inventory.InventoryServices.assert#StockAdjustmentAccess" in-map="[stockAdjustmentId:stockAdjustmentId]" out-map="_acc"/>
+            <if condition="!_acc.allowed"><return error="true" message="You do not have access to this stock adjustment."/></if>
+            <service-call name="zenith.inventory.InventoryServices.add#StockAdjustmentItem" in-map="context"/>
+        </actions>
         <default-response url="."><parameter name="stockAdjustmentId"/></default-response>
     </transition>
     <transition name="deleteItem">
-        <service-call name="delete#zenith.erp.inventory.StockAdjustmentItem"
-                      in-map="[stockAdjustmentId:stockAdjustmentId, adjustmentItemSeqId:adjustmentItemSeqId]"/>
+        <actions>
+            <!-- ZE-INV-IV-06A: block removing a line from another tenant's adjustment -->
+            <service-call name="zenith.inventory.InventoryServices.assert#StockAdjustmentAccess" in-map="[stockAdjustmentId:stockAdjustmentId]" out-map="_acc"/>
+            <if condition="!_acc.allowed"><return error="true" message="You do not have access to this stock adjustment."/></if>
+            <service-call name="delete#zenith.erp.inventory.StockAdjustmentItem"
+                          in-map="[stockAdjustmentId:stockAdjustmentId, adjustmentItemSeqId:adjustmentItemSeqId]"/>
+        </actions>
         <default-response url="."><parameter name="stockAdjustmentId"/></default-response>
     </transition>
     <transition name="applyAdjustment">
-        <service-call name="zenith.inventory.InventoryServices.apply#StockAdjustment" in-map="[stockAdjustmentId:stockAdjustmentId]"/>
+        <actions>
+            <!-- ZE-INV-IV-06A: block applying another tenant's adjustment to their live stock -->
+            <service-call name="zenith.inventory.InventoryServices.assert#StockAdjustmentAccess" in-map="[stockAdjustmentId:stockAdjustmentId]" out-map="_acc"/>
+            <if condition="!_acc.allowed"><return error="true" message="You do not have access to this stock adjustment."/></if>
+            <service-call name="zenith.inventory.InventoryServices.apply#StockAdjustment" in-map="[stockAdjustmentId:stockAdjustmentId]"/>
+        </actions>
         <default-response url="../StockAdjustments"/>
     </transition>
     <transition name="back"><default-response url="../StockAdjustments"/></transition>
 
     <actions>
-        <set field="orgId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-        <entity-find-one entity-name="zenith.erp.inventory.StockAdjustment" value-field="adj"/>
-        <entity-find entity-name="zenith.erp.inventory.StockAdjustmentItem" list="itemList">
-            <econdition field-name="stockAdjustmentId" from="stockAdjustmentId"/>
-            <order-by field-name="adjustmentItemSeqId"/>
-        </entity-find>
-        <entity-find entity-name="mantle.product.Product" list="prodList">
-            <econdition field-name="ownerPartyId" from="orgId"/>
-            <order-by field-name="productName"/>
-        </entity-find>
-        <set field="isApplied" from="adj?.statusId == 'AdjApplied'"/>
-        <set field="typeNice" from="adj?.adjustmentType == 'PhysicalCount' ? 'Physical count' : (adj?.adjustmentType == 'WriteOff' ? 'Write off' : (adj?.adjustmentType ?: ''))"/>
+        <!-- ZE-INV-IV-06A: org-isolation guard — a tenant user may only open an adjustment owned by their
+             active organization (super-admins exempt). Without this, any logged-in user could view (and, via
+             the transitions above, edit/apply) another tenant's adjustment by guessing the id in the URL.
+             Runs BEFORE any record is loaded so a foreign record is never exposed. -->
+        <service-call name="zenith.inventory.InventoryServices.assert#StockAdjustmentAccess" in-map="[stockAdjustmentId:stockAdjustmentId]" out-map="_acc"/>
+        <!-- Blocked: flag it and load NOTHING (so no foreign data is ever fetched or exposed); the widgets
+             show a plain "not part of your account" panel. NB: do NOT <return/> here — a return in screen
+             actions halts the whole render including widgets, so the panel would never show. And do NOT
+             sri.sendRedirectAndStopRender — in /apps this subscreen renders after the outer shell has
+             committed the HTTP response, so a redirect throws IllegalStateException("Committed"). -->
+        <set field="noAccess" from="!_acc.allowed"/>
+        <if condition="_acc.allowed">
+            <set field="orgId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <entity-find-one entity-name="zenith.erp.inventory.StockAdjustment" value-field="adj"/>
+            <entity-find entity-name="zenith.erp.inventory.StockAdjustmentItem" list="itemList">
+                <econdition field-name="stockAdjustmentId" from="stockAdjustmentId"/>
+                <order-by field-name="adjustmentItemSeqId"/>
+            </entity-find>
+            <entity-find entity-name="mantle.product.Product" list="prodList">
+                <econdition field-name="ownerPartyId" from="orgId"/>
+                <order-by field-name="productName"/>
+            </entity-find>
+            <set field="isApplied" from="adj?.statusId == 'AdjApplied'"/>
+            <set field="typeNice" from="adj?.adjustmentType == 'PhysicalCount' ? 'Physical count' : (adj?.adjustmentType == 'WriteOff' ? 'Write off' : (adj?.adjustmentType ?: ''))"/>
+        </if>
     </actions>
 
     <widgets>
         <link url="back" text="← Back to Stock Adjustments" link-type="anchor" style="text-grey-7"/>
 
+        <!-- ZE-INV-IV-06A: cross-tenant / missing record — show a plain notice, never another org's data -->
+        <section name="NoAccess">
+            <condition><expression>noAccess</expression></condition>
+            <widgets>
+                <container style="zenith-card bg-white shadow-2 border-radius-md q-pa-lg q-mt-sm text-center">
+                    <label text="That stock adjustment isn't part of your account." type="h6" style="text-grey-8 q-mb-xs"/>
+                    <label text="It may belong to another organization, or it may not exist. Use “Back to Stock Adjustments” above to return to your list." type="p" style="text-grey-6 q-mb-none"/>
+                </container>
+            </widgets>
+        </section>
+
+        <section name="TheAdjustment">
+        <condition><expression>!noAccess</expression></condition>
+        <widgets>
         <container style="zenith-card bg-white shadow-2 border-radius-md q-pa-md q-mt-sm q-mb-md">
             <container style="row items-center justify-between">
                 <container style="column">
@@ -119,6 +161,8 @@
                     <label text="✓ This adjustment has been applied — your stock is updated." type="p" style="text-success text-weight-bold q-mb-none"/>
                 </container>
             </widgets>
+        </section>
+        </widgets>
         </section>
     </widgets>
 </screen>
