@@ -45,11 +45,27 @@
     <transition name="searchProductsForImport">
         <actions><script><![CDATA[
             def term = (ec.web.parameters.term ?: '').toString().toLowerCase().trim()
+            def rawTerm = (ec.web.parameters.term ?: '').toString().trim()
+            def _ao = ec.user.getPreference('ACTIVE_ORGANIZATION')
             def results = []
             if (term) {
-                def all = ec.entity.find("mantle.product.Product").condition("productTypeEnumId", "PtAsset")
-                    .orderBy("productName").limit(500).list()
-                def matched = all.findAll { p -> (p.productName ?: '').toLowerCase().contains(term) || (p.pseudoId ?: '').toLowerCase().contains(term) }
+                // ZE-BC-090: (a) org-isolate the product search — a tenant edits only THEIR products (this query
+                //   was cross-org: it returned other tenants' products); (b) also resolve a rich ProductBarcode
+                //   (EAN/UPC/Code128/…) added via the Barcode module, so lookup matches the Billing Terminal scan.
+                //   Both scoped to the active org; an admin with no active org (null/'_NA_') sees all.
+                def allQ = ec.entity.find("mantle.product.Product").condition("productTypeEnumId", "PtAsset")
+                if (_ao && _ao != '_NA_') allQ.condition("ownerPartyId", _ao)
+                def matched = allQ.orderBy("productName").limit(500).list().findAll { p ->
+                    (p.productName ?: '').toLowerCase().contains(term) || (p.pseudoId ?: '').toLowerCase().contains(term) }
+                // exact barcode match — fetch the product directly so it's found even past the name-search limit
+                def bcQ = ec.entity.find("zenith.erp.barcode.ProductBarcode").condition("barcodeValue", rawTerm).condition("isActive", "Y")
+                if (_ao && _ao != '_NA_') bcQ.condition("organizationPartyId", _ao)
+                bcQ.list().collect { it.productId }.unique().each { pid ->
+                    if (!matched.any { it.productId == pid }) {
+                        def bp = ec.entity.find("mantle.product.Product").condition("productId", pid).one()
+                        if (bp != null && (!_ao || _ao == '_NA_' || bp.ownerPartyId == _ao)) matched.add(bp)
+                    }
+                }
                 if (matched.size() > 12) matched = matched.subList(0, 12)
                 matched.each { p ->
                     results.add([sku:(p.pseudoId ?: ''), name:(p.productName ?: ''), description:(p.description ?: ''),
