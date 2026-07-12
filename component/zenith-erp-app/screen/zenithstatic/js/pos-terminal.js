@@ -2551,6 +2551,11 @@ window.posToggleFullscreen = function() {
             var _cs = document.getElementById('cartScroll'); var _ps = _cs ? _cs.scrollTop : 0; var _pc = (lastCartData && lastCartData.items) ? lastCartData.items.length : 0;
             tb.innerHTML = h;
             if (_cs) { if (d.items.length > _pc) _cs.scrollTop = _cs.scrollHeight; else _cs.scrollTop = _ps; }
+            /* ZE-BC-091: after any cart re-render, return focus to the barcode search box so scanning
+               survives a qty/price/remove button click (the reported "scanner dead after changing qty
+               until the input is clicked" bug). Skip if the user is in a form field (editing qty/price
+               inline, a modal, etc.) so we never yank focus mid-edit. */
+            try { var _ae = document.activeElement; if (!(_ae && (_ae.tagName === 'INPUT' || _ae.tagName === 'TEXTAREA' || _ae.tagName === 'SELECT'))) { var _sib = document.getElementById('cartInlineSearch'); if (_sib) _sib.focus(); } } catch (e) {}
             var sm = document.querySelector('.pos-summary');
             if (sm) {
                 extractHeldInfo(document);
@@ -3465,8 +3470,8 @@ window.posToggleFullscreen = function() {
         var dt, aidx = -1, keyTimes = [];
         function esc(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
         // A physical barcode scanner emits keys far faster (<50ms apart) than a human types.
-        function isScan() { if (keyTimes.length < 3) return false; var avg = (keyTimes[keyTimes.length - 1] - keyTimes[0]) / (keyTimes.length - 1); return avg < 50; }
-        si.addEventListener('keypress', function() { keyTimes.push(Date.now()); if (keyTimes.length > 30) keyTimes.shift(); });
+        function isScan() { if (keyTimes.length < 3) return false; var avg = (keyTimes[keyTimes.length - 1] - keyTimes[0]) / (keyTimes.length - 1); return avg < 160; }  /* ZE-BC-090: was 50ms — too tight for Safari/Edge Bluetooth-HID delivery (scans misread as typing). Chrome is ~20ms so unaffected; server scanAdd also resolves by name, so a misclassified fast-type still finds the product. */
+        si.addEventListener('keydown', function(e) { if (e.key && e.key.length === 1) { keyTimes.push(Date.now()); if (keyTimes.length > 30) keyTimes.shift(); } });  /* ZE-BC-090: was 'keypress' (deprecated + fires unreliably for HID input in Safari/Edge); keydown fires consistently — track printable keys only. */
         si.addEventListener('input', function() {
             var t = this.value.trim(); clearTimeout(dt); aidx = -1;
             if (!si.dataset.syncing) {
@@ -3513,11 +3518,12 @@ window.posToggleFullscreen = function() {
                 // Fast entry (a scanner) or no dropdown match => let the server resolve the code by
                 // pseudoId/barcode via _posScan. A human picking a result adds by productId AND passes
                 // the product NAME so the optimistic line reads the name, not the bare code (ZE-POS-0207).
-                if (isScan() || items.length === 0) {
+                if (aidx >= 0 && items[aidx]) {   /* ZE-BC-090: honour an explicit keyboard-navigated dropdown pick first, so the widened isScan() can't hijack it */
+                    if (window._posAjax) window._posAjax(items[aidx].dataset.pid, items[aidx].dataset.price, items[aidx].dataset.name);
+                } else if (isScan() || items.length === 0) {
                     if (window._posScan) window._posScan(v);
                 } else {
-                    var el = (aidx >= 0 && items[aidx]) ? items[aidx] : items[0];
-                    if (window._posAjax) window._posAjax(el.dataset.pid, el.dataset.price, el.dataset.name);
+                    if (window._posAjax) window._posAjax(items[0].dataset.pid, items[0].dataset.price, items[0].dataset.name);
                 }
                 dd.style.display = 'none'; si.value = ''; si.focus();
                 var gi = document.querySelector('.pos-search-bar input[name="searchTerm"]');
