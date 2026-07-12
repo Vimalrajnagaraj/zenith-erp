@@ -27,3 +27,11 @@ RUN sh /tmp/patch-webroot-nav.sh && rm /tmp/patch-webroot-nav.sh
 # the framework breadcrumb template changed). Source: docs/infra/framework-patches/patch-webroot-breadcrumb.sh.
 COPY ./framework-patches/patch-webroot-breadcrumb.sh /tmp/patch-webroot-breadcrumb.sh
 RUN sh /tmp/patch-webroot-breadcrumb.sh && rm /tmp/patch-webroot-breadcrumb.sh
+# ZE-INV-IV-033: suppress the benign ZTF_ASSET/ZTF_FACILITY "not included in view-entity" ERROR spam from
+# ArtifactExecutionFacadeImpl. StockByFacilityView/ProductStockView LEFT-joined Asset/Facility members can't
+# carry the filter's ownerPartyId alias without dropping facility-less/stock-less rows (ZE-INV-002 regression),
+# so Moqui logs-and-SKIPS those filters — isolation stays intact via the Product filter. Only the log line is
+# suppressed (same as the framework's own "Error warming entity cache" RegexFilter). Idempotent + self-verifying.
+# Source: docs/infra/framework-patches/patch-log4j2-authzfilter.sh.
+COPY ./framework-patches/patch-log4j2-authzfilter.sh /tmp/patch-log4j2-authzfilter.sh
+RUN sh /tmp/patch-log4j2-authzfilter.sh && rm /tmp/patch-log4j2-authzfilter.sh
