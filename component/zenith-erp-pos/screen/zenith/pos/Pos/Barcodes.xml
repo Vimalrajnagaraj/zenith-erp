@@ -17,9 +17,19 @@
                     def code = (p.code ?: '').toString().trim()
                     def ev = ec.entity.find("mantle.product.Product").condition("productId", p.productId).one()
                     if (!ev) { ec.web.sendJsonResponse([success:false, error:'Unknown product']); return }
+                    // Org isolation (ZE-SEC-JSON): only mutate THIS org's products — the MANTLE_ACTIVE_ORG filter
+                    // does NOT apply in a transition, so verify ownership explicitly (super-admin exempt).
+                    // Prevents overwriting another tenant's scan code via a forged productId.
+                    def _bcAo = ec.user.getPreference('ACTIVE_ORGANIZATION')
+                    if (!ec.user.isInGroup('ADMIN') && (!_bcAo || _bcAo == '_NA_' || ev.ownerPartyId != _bcAo)) {
+                        ec.web.sendJsonResponse([success:false, error:'You do not have access to this product.']); return }
                     if (code != '') {
-                        // A barcode must be unique — two products sharing a code break scanning.
-                        def clash = ec.entity.find("mantle.product.Product").condition("pseudoId", code).list().find { it.productId != p.productId }
+                        // A barcode must be unique WITHIN the org — two products sharing a code break scanning.
+                        // Scope the clash check to the product's own org: pseudoId is unique on (pseudo_id, owner_party_id),
+                        // so a different org legitimately reusing the code is allowed (and must not leak that org's name).
+                        def clashFinder = ec.entity.find("mantle.product.Product").condition("pseudoId", code)
+                        if (ev.ownerPartyId) clashFinder.condition("ownerPartyId", ev.ownerPartyId)
+                        def clash = clashFinder.list().find { it.productId != p.productId }
                         if (clash) { ec.web.sendJsonResponse([success:false, error:'Code already used by ' + (clash.productName ?: clash.productId)]); return }
                     }
                     // Update via a fresh mutable value (the found value is read-only); null clears the code.
