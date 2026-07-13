@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- ZE-SEC-JSON f/u (2026-07-13): org-scoped replacement for SimpleScreens' searchPartyList party
+     type-ahead. The stock framework transition (component://SimpleScreens/template/party/PartyForms.xml)
+     LEAKS cross-tenant: its value-resolution branch echoes ANY party's name for an exact partyId with no
+     org check, and its ElasticSearch branch only scopes if the user has a MANTLE_ACTIVE_ORG find-filter.
+     This version scopes EXPLICITLY to the active organization (super-admin exempt) and searches the DB
+     directly (ElasticSearch-independent — OpenSearch is not reachable in this deployment, so the stock
+     search branch returned nothing anyway). read-only="true" so the GET-based dynamic-options works. -->
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
+        require-authentication="true">
+
+    <transition name="searchPartyList" read-only="true">
+        <parameter name="term"/>
+        <parameter name="roleTypeId"/>
+        <parameter name="partyTypeEnumId"/>
+        <parameter name="pageIndex"/>
+        <actions>
+            <set field="term" from="(ec.web.parameters.term ?: '').toString().trim()"/>
+            <if condition="!term"><script>ec.web.sendJsonResponse([])</script><return/></if>
+
+            <set field="_ao" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <set field="_scoped" from="!ec.user.isInGroup('ADMIN') &amp;&amp; _ao != null &amp;&amp; _ao != '_NA_'"/>
+            <set field="_orgFilter" from="_scoped ? _ao : null"/>
+
+            <!-- value-resolution: an exact partyId re-displays the picked value. Org-scoped so a forged id
+                 from another tenant cannot echo that party's name. -->
+            <entity-find-one entity-name="mantle.party.PartyDetail" value-field="pd">
+                <field-map field-name="partyId" from="term"/>
+            </entity-find-one>
+            <if condition="pd != null &amp;&amp; (!_scoped || pd.ownerPartyId == _ao)">
+                <script>ec.web.sendJsonResponse([[value:pd.partyId, label:ec.resource.expand('PartyNameTemplate', '', pd)]])</script>
+                <return/>
+            </if>
+
+            <!-- name / id search, org-scoped via the DB (ElasticSearch-independent). -->
+            <set field="_roleList" from="roleTypeId ? roleTypeId.toString().split(',').collect{ it.trim() } : null"/>
+            <entity-find entity-name="mantle.party.PartyDetailAndRole" list="_pList" limit="25" distinct="true">
+                <econdition field-name="ownerPartyId" from="_orgFilter" ignore-if-empty="true"/>
+                <econdition field-name="roleTypeId" operator="in" from="_roleList" ignore-if-empty="true"/>
+                <econdition field-name="partyTypeEnumId" from="partyTypeEnumId" ignore-if-empty="true"/>
+                <econditions combine="or">
+                    <econdition field-name="organizationName" operator="like" value="%${term}%" ignore-case="true"/>
+                    <econdition field-name="firstName" operator="like" value="%${term}%" ignore-case="true"/>
+                    <econdition field-name="lastName" operator="like" value="%${term}%" ignore-case="true"/>
+                    <econdition field-name="partyId" operator="like" value="%${term}%" ignore-case="true"/>
+                </econditions>
+                <order-by field-name="organizationName,firstName,lastName"/>
+            </entity-find>
+            <script><![CDATA[
+                def seen = [:]
+                def outList = []
+                for (prow in _pList) {
+                    if (seen[prow.partyId]) continue
+                    seen[prow.partyId] = true
+                    outList.add([value: prow.partyId, label: ec.resource.expand('PartyNameTemplate', '', prow)])
+                }
+                ec.web.sendJsonResponse(outList)
+            ]]></script>
+        </actions>
+        <default-response type="none"/>
+    </transition>
+</screen>
