@@ -55,6 +55,31 @@ internet bypassing Cloudflare/nginx/TLS (nginx→`127.0.0.1:8080` over loopback 
 The permanent fix would be binding `127.0.0.1:8080:8080` in docker-compose, but that needs a container
 recreate (avoided — see CLAUDE.md rule #5).
 
+## OpenSearch (`deploy-opensearch-1`)
+Moqui uses OpenSearch (env `elasticsearch_url=http://opensearch:9200`) for `search#DataDocuments`
+(party/product/global DataDocument search, back-office party type-aheads). It is UP and indexed;
+indexing/writes work. Health note for future debugging: **the moqui container has no `curl`** (only
+`wget`/`nc`/`busybox`) — `curl: not found` is NOT "unreachable". Reach OpenSearch from moqui with
+`docker exec deploy-moqui-1 wget -qO- http://opensearch:9200/...`; the opensearch container has `curl`.
+
+### `opensearch/disable-task-resource-tracking.sh` — ZE-SEC-JSON f/u (2026-07-13)
+All `search#DataDocuments` calls were failing with `org.eclipse.jetty.http.BadMessageException: 400:
+BAD_QUOTES_IN_TOKEN`, so every ES-backed search silently returned nothing. Cause: OpenSearch 2.15 adds
+a non-standard `_search` **response** header `TASK_RESOURCE_USAGE: {"action":...,"taskResourceUsage":{...}}`
+whose value is raw JSON with quotes, which Moqui's Jetty RestClient rejects while parsing the response.
+The header is emitted when the dynamic cluster setting `task_resource_tracking.enabled` is true (NOT
+`task_resource_consumers.enabled`, a different setting that was already false). Fix: set it false
+(persistent, dynamic → no restart; `search_backpressure.mode` is `monitor_only` so nothing is enforced).
+The script is idempotent + self-verifying (fails if the header is still present). **A persistent cluster
+setting lives in OpenSearch cluster metadata (the data volume), not opensearch.yml/compose — RE-RUN this
+after any OpenSearch data-volume recreation.** Reverse with `{"persistent":{"task_resource_tracking.enabled":null}}`.
+A durable alternative (survives OpenSearch upgrades re-adding such headers) is a Moqui-side RestClient
+Jetty-compliance patch — not applied. See [[project_pos-barcode-screens]] (ZE-SEC-JSON).
+
+| Repo path | Applies to |
+|---|---|
+| `opensearch/disable-task-resource-tracking.sh` | run against `deploy-opensearch-1` (or `ES=<url>`) |
+
 ## moqui image build inputs (`/opt/deploy/deploy/`)
 The moqui image is built from `/opt/deploy/deploy/Dockerfile` (`FROM moqui/moqui:latest` + `COPY ./zenith-erp/`).
 Framework overrides that must survive an image rebuild live here (the running image is otherwise a `docker commit`
