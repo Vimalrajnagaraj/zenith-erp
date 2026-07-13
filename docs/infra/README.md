@@ -80,6 +80,21 @@ Jetty-compliance patch — not applied. See [[project_pos-barcode-screens]] (ZE-
 |---|---|
 | `opensearch/disable-task-resource-tracking.sh` | run against `deploy-opensearch-1` (or `ES=<url>`) |
 
+### Reindexing a DataDocument index (e.g. `mantle_party`) — maintenance (2026-07-13)
+The DataDocument indexes can drift from the DB. `mantle_party` had 263 orphan docs (indexed parties
+no longer in the DB) + 60 live parties missing. **Root cause of orphans: direct-SQL `DELETE FROM party`
+(throwaway-test cleanups across sessions) bypass Moqui's entity delete → the ES feed never removes them.
+Real app deletes go through Moqui services and DO propagate — so this is a test-artifact accumulation, not
+a production bug.** To rebuild an index to match the DB:
+1. **Re-feed all current docs** (additive, no empty-index window) — call service
+   `org.moqui.search.SearchServices.index#DataFeedDocuments` with `dataFeedId=MantleSearch`,
+   `dataDocumentId=MantleParty` (find the feed via `data_feed_document.data_document_id`). Fixes missing docs.
+2. **Delete orphans** — diff indexed `_id`s (`POST mantle_party/_search {"size":N,"_source":false}`) against
+   `SELECT party_id FROM party`; `POST mantle_party/_delete_by_query {"query":{"ids":{"values":[...]}}}` on the
+   set that is indexed-but-not-in-DB. Verify `_count` == live party count.
+Verified 2026-07-13: mantle_party rebuilt to exactly 292 docs (= live parties), 0 orphans, Moqui ES search
+returns real results (MARUTHI/100000). See [[project_pos-barcode-screens]].
+
 ## moqui image build inputs (`/opt/deploy/deploy/`)
 The moqui image is built from `/opt/deploy/deploy/Dockerfile` (`FROM moqui/moqui:latest` + `COPY ./zenith-erp/`).
 Framework overrides that must survive an image rebuild live here (the running image is otherwise a `docker commit`
