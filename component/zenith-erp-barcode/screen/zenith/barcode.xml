@@ -17,6 +17,15 @@
     <transition name="renderLabels" read-only="true">
         <parameter name="printJobId"/>
         <parameter name="barcodeId"/>
+        <!-- batch mode (the shared renderer for the POS bulk printer): a list of products + copies each -->
+        <parameter name="productIds"/>
+        <parameter name="copies"/>
+        <parameter name="labelId"/>
+        <parameter name="w"/>
+        <parameter name="h"/>
+        <parameter name="showName"/>
+        <parameter name="showPrice"/>
+        <parameter name="showSku"/>
         <actions>
             <script><![CDATA[
                 def RM = java.math.RoundingMode.HALF_UP
@@ -50,6 +59,32 @@
                         def prd = ec.entity.find("mantle.product.Product").condition("productId", bc.productId).one()
                         labels.add([value:bc.barcodeValue, fmt:(fmtMap[bc.barcodeTypeEnumId] ?: 'CODE128'),
                             name:(prd?.productName ?: bc.productId), price:(prd?.mrpAmount), sku:(prd?.pseudoId ?: '')])
+                    }
+                } else if (productIds) {
+                    // BATCH mode (single source of truth for the POS bulk printer): render N copies of each
+                    // selected product's label, honoring an explicit template (labelId), else ad-hoc w/h/show*
+                    // params (POS "Custom size"), else the org default template.
+                    int cp = (copies?.toString()?.isInteger()) ? (copies as int) : 1
+                    if (cp < 1) cp = 1; if (cp > 200) cp = 200
+                    if (labelId) {
+                        tpl = ec.entity.find("zenith.erp.barcode.BarcodeLabel").condition("labelId", labelId).one()
+                        if (tpl != null && !_isAdmin && tpl.organizationPartyId != _ao) { _denied(); return }
+                    }
+                    if (tpl == null && (w || h || showName || showPrice || showSku)) {
+                        tpl = [columnsPerRow:3, showProductName:(showName ?: 'Y'), showPrice:(showPrice ?: 'Y'),
+                               showSku:(showSku ?: 'N'), labelWidth:(w ? (w as BigDecimal) : null), labelHeight:(h ? (h as BigDecimal) : null)]
+                    }
+                    if (tpl == null && _ao) tpl = ec.entity.find("zenith.erp.barcode.BarcodeLabel").condition("isDefault","Y").condition("organizationPartyId", _ao).one()
+                    productIds.split(",").findAll { it }.each { pid ->
+                        def prd = ec.entity.find("mantle.product.Product").condition("productId", pid).one()
+                        if (prd == null) return
+                        // org guard: never render another tenant's product (super-admin exempt); skip foreign
+                        if (!_isAdmin && (prd.ownerPartyId == null || _ao == null || prd.ownerPartyId != _ao)) return
+                        def pb = ec.entity.find("zenith.erp.barcode.ProductBarcode").condition("productId", pid).condition("isActive","Y").orderBy("-isPrimary").list()
+                        def bcType = pb ? pb[0].barcodeTypeEnumId : 'BctCode128'
+                        def bcVal = pb ? pb[0].barcodeValue : (prd.pseudoId ?: pid)
+                        for (int i=0;i<cp;i++) labels.add([value:(bcVal ?: ''), fmt:(fmtMap[bcType] ?: 'CODE128'),
+                            name:(prd.productName ?: pid), price:(prd.mrpAmount), sku:(prd.pseudoId ?: '')])
                     }
                 }
                 int cols = (tpl?.columnsPerRow ?: 3) as int
