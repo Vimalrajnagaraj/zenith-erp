@@ -19,15 +19,25 @@
     }
     function esc(s){ return (s||'').replace(/[&<>"]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
     function picked(){ return Array.prototype.slice.call(document.querySelectorAll('.bl-pick:checked')); }
-    function opts(){ var sz=(document.getElementById('bl-size').value||'50,25').split(','); return { w:parseFloat(sz[0]), h:parseFloat(sz[1]),
-        copies:Math.max(1,Math.min(200,parseInt(document.getElementById('bl-copies').value||'1',10)||1)), price:document.getElementById('bl-showprice').checked }; }
+    // A selected Label template drives size + Show/Hide (Name/Price/SKU); "Custom size" (no template)
+    // keeps the manual size dropdown + Show-price checkbox and shows name/sku, as before.
+    function opts(){
+        var copies=Math.max(1,Math.min(200,parseInt(document.getElementById('bl-copies').value||'1',10)||1));
+        var tsel=document.getElementById('bl-template');
+        var topt=(tsel && tsel.value)? tsel.options[tsel.selectedIndex] : null;
+        if(topt){ return { w:parseFloat(topt.getAttribute('data-w'))||50, h:parseFloat(topt.getAttribute('data-h'))||30, copies:copies,
+            showName:topt.getAttribute('data-showname')!=='N', price:topt.getAttribute('data-showprice')!=='N', showSku:topt.getAttribute('data-showsku')==='Y' }; }
+        var sz=(document.getElementById('bl-size').value||'50,25').split(',');
+        return { w:parseFloat(sz[0]), h:parseFloat(sz[1]), copies:copies,
+            showName:true, price:document.getElementById('bl-showprice').checked, showSku:true };
+    }
     function labelHtml(name, code, price, o){
         var mod = o.w>=65?1.7:(o.w>=50?1.4:1.1);
         var bh = Math.round(o.h*1.4);
         return '<div class="bl-label" style="width:'+o.w+'mm;height:'+o.h+'mm;box-sizing:border-box;border:1px solid #eee;padding:1.5mm;display:flex;flex-direction:column;align-items:center;justify-content:center;overflow:hidden;page-break-inside:avoid">'
-            + '<div style="font-size:2.6mm;font-weight:600;line-height:1.1;text-align:center;max-height:3mm;overflow:hidden;width:100%">'+esc(name)+'</div>'
+            + (o.showName?'<div style="font-size:2.6mm;font-weight:600;line-height:1.1;text-align:center;max-height:3mm;overflow:hidden;width:100%">'+esc(name)+'</div>':'')
             + '<div style="width:100%;flex:1;display:flex;align-items:center;min-height:0">'+barcodeSVG(code,mod,bh)+'</div>'
-            + '<div style="font-size:2.4mm;letter-spacing:0.3mm">'+esc(code)+'</div>'
+            + (o.showSku?'<div style="font-size:2.4mm;letter-spacing:0.3mm">'+esc(code)+'</div>':'')
             + (o.price&&price?'<div style="font-size:2.8mm;font-weight:800">₹'+esc(price)+'</div>':'')
             + '</div>';
     }
@@ -63,6 +73,13 @@
         else if(t.id==='bl-print'){ doPrint(); }
         else if(t.id==='bl-all'){ document.querySelectorAll('.bl-pick').forEach(function(c){c.checked=true;}); }
         else if(t.id==='bl-none'){ document.querySelectorAll('.bl-pick').forEach(function(c){c.checked=false;}); }
+    });
+    // Template selected -> hide the manual size + price controls (the template drives them); Custom -> show.
+    document.addEventListener('change', function(ev){
+        var t=ev.target; if(!t || t.id!=='bl-template') return;
+        var custom=!t.value;
+        var sw=document.getElementById('bl-size-wrap'); if(sw) sw.style.display=custom?'':'none';
+        var pw=document.getElementById('bl-price-wrap'); if(pw) pw.style.display=custom?'flex':'none';
     });
     // expose for inline onclick fallback / debugging
     window.blPreview = doPreview; window.blPrint = doPrint; window.blBarcodeSVG = barcodeSVG;
