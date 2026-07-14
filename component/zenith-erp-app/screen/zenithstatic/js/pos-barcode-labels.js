@@ -30,18 +30,25 @@
     }
     function frame(){ return document.getElementById('bl-frame'); }
     function show(){ var a=document.getElementById('bl-preview-area'); if(a) a.style.display='block'; }
+    // The renderer is now a server round-trip; show a "Generating…" state so the load never looks blank.
+    function loading(on){
+        var l=document.getElementById('bl-loading'); if(l) l.style.display=on?'block':'none';
+        var f=frame(); if(f) f.style.display=on?'none':'block';
+    }
     function doPreview(){
         var url=buildUrl(); if(!url){ alert('Tick at least one product first.'); return; }
         var f=frame(); if(!f) return;
-        f.onload=null; show(); f.src=url;
+        show(); loading(true);
+        f.onload=function(){ loading(false); };
+        f.src=url;
         var a=document.getElementById('bl-preview-area'); if(a) a.scrollIntoView({behavior:'smooth',block:'nearest'});
     }
     function doPrint(){
         var url=buildUrl(); if(!url){ alert('Tick at least one product first.'); return; }
         var f=frame(); if(!f) return;
-        show();
+        show(); loading(true);
         // give the in-frame barcodes (JsBarcode/QR) a moment to draw, then print the iframe
-        f.onload=function(){ setTimeout(function(){ try{ f.contentWindow.focus(); f.contentWindow.print(); }catch(e){} }, 500); };
+        f.onload=function(){ loading(false); setTimeout(function(){ try{ f.contentWindow.focus(); f.contentWindow.print(); }catch(e){} }, 500); };
         f.src=url;
     }
     // Document-level delegation: independent of when the qvt markup mounts.
