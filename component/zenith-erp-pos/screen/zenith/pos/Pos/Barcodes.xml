@@ -32,11 +32,19 @@
                         def clash = clashFinder.list().find { it.productId != p.productId }
                         if (clash) { ec.web.sendJsonResponse([success:false, error:'Code already used by ' + (clash.productName ?: clash.productId)]); return }
                     }
-                    // Update via a fresh mutable value (the found value is read-only); null clears the code.
+                    // Update via a fresh mutable value (the found value is read-only).
                     ec.entity.makeValue("mantle.product.Product").set("productId", p.productId).set("pseudoId", (code != '' ? code : null)).update()
-                    // Keep the rich ProductBarcode table in sync (mirror this code as the product's primary
-                    // barcode). Best-effort — never let this fail the code save.
-                    try { ec.service.sync().name("zenith.barcode.BarcodeServices.sync#BarcodeFromPseudoId").parameters([productId:p.productId, code:(code != '' ? code : null)]).call() } catch (Exception se) {}
+                    if (code != '') {
+                        // Keep the rich ProductBarcode table in sync (mirror this code as the product's
+                        // primary barcode). Best-effort — never let this fail the code save.
+                        try { ec.service.sync().name("zenith.barcode.BarcodeServices.sync#BarcodeFromPseudoId").parameters([productId:p.productId, code:code]).call() } catch (Exception se) {}
+                    } else {
+                        // REMOVE a code: Moqui reverts a nulled pseudoId back to the productId (its "no code"
+                        // state), and sync#BarcodeFromPseudoId no-ops on a blank code — so without this the rich
+                        // ProductBarcode rows would linger and keep the product scannable. Delete them so the
+                        // barcode is TRULY removed (this is the org's product; ownership was verified above).
+                        ec.entity.find("zenith.erp.barcode.ProductBarcode").condition("productId", p.productId).list().each { it.delete() }
+                    }
                     ec.web.sendJsonResponse([success:true, code:code])
                 } catch (Exception e) { ec.web.sendJsonResponse([success:false, error:e.message]) }
             ]]></script>
@@ -66,16 +74,20 @@
             if (posOrg) pf.condition("ownerPartyId", posOrg)
             def candidates = pf.orderBy("productName").limit(5000).list()
 
+            // A pseudoId equal to the productId is Moqui's "no code" state (a cleared code reverts to the PK),
+            // so treat it as empty everywhere — status, dup detection, search, and the row's code box.
+            def effCode = { pr -> def c = (pr.pseudoId ?: '').trim(); (c == '' || c == pr.productId) ? '' : c }
+
             // Duplicate-code detection across ALL of the tenant's products (codes shared by 2+ products).
             def codeCounts = [:]
-            candidates.each { pr -> def c = (pr.pseudoId ?: '').trim(); if (c != '') codeCounts[c] = (codeCounts[c] ?: 0) + 1 }
+            candidates.each { pr -> def c = effCode(pr); if (c != '') codeCounts[c] = (codeCounts[c] ?: 0) + 1 }
             def dupCodes = codeCounts.findAll { it.value > 1 }.keySet()
-            missingTotal = candidates.count { (it.pseudoId ?: '').trim() == '' }
-            dupTotal = candidates.count { def c = (it.pseudoId ?: '').trim(); c != '' && dupCodes.contains(c) }
+            missingTotal = candidates.count { effCode(it) == '' }
+            dupTotal = candidates.count { def c = effCode(it); c != '' && dupCodes.contains(c) }
 
             def termLower = (searchTerm ?: '').toLowerCase().trim()
             def filtered = candidates.findAll { pr ->
-                (termLower == '' || (pr.productName ?: '').toLowerCase().contains(termLower) || (pr.pseudoId ?: '').toLowerCase().contains(termLower)) &&
+                (termLower == '' || (pr.productName ?: '').toLowerCase().contains(termLower) || effCode(pr).toLowerCase().contains(termLower)) &&
                 (catProdIds == null || catProdIds.contains(pr.productId))
             }
             totalCount = filtered.size()
@@ -88,7 +100,7 @@
             def pageProds = (from < totalCount) ? filtered.subList(from, to) : []
 
             rows = pageProds.collect { pr ->
-                def c = (pr.pseudoId ?: '').trim()
+                def c = effCode(pr)
                 def status = (c == '') ? 'missing' : (dupCodes.contains(c) ? 'dup' : 'ok')
                 [productId: pr.productId, productName: (pr.productName ?: pr.productId), code: c, status: status]
             }
@@ -101,7 +113,7 @@
             <!-- The /qapps SPA strips <script> tags from screen content, so bootstrap the external
                  save logic via an <img onload> attribute (inline event attributes survive); a script
                  element created with appendChild executes normally. -->
-            <img src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" alt="" style="display:none" onload="if(!window.__bcBoot){window.__bcBoot=1;var s=document.createElement('script');s.src='/zenithstatic/js/pos-barcodes.js?v=1';document.body.appendChild(s);}"/>
+            <img src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" alt="" style="display:none" onload="if(!window.__bcBoot){window.__bcBoot=1;var s=document.createElement('script');s.src='/zenithstatic/js/pos-barcodes.js?v=2';document.body.appendChild(s);}"/>
             <div style="font-size:22px;font-weight:800;color:#1a237e;margin-bottom:2px">&#128290; Barcodes</div>
             <div style="font-size:13px;color:#5f6368;margin-bottom:12px">Give every product a code so it can be <b>scanned</b> at billing.</div>
 
@@ -156,7 +168,7 @@
                             <#elseif r.status == 'dup'><span style="color:#e65100">&#9888; Duplicate</span>
                             <#else><span style="color:#2e7d32">&#10004; OK</span></#if>
                         </td>
-                        <td style="padding:5px 8px;text-align:center"><button type="button" class="bc-save" style="padding:7px 14px;background:#2e7d32;color:#fff;border:none;border-radius:6px;font-size:13px;font-weight:700;cursor:pointer">Save</button></td>
+                        <td style="padding:5px 8px;text-align:center;white-space:nowrap"><button type="button" class="bc-save" style="padding:7px 14px;background:#2e7d32;color:#fff;border:none;border-radius:6px;font-size:13px;font-weight:700;cursor:pointer">Save</button><#if r.status != 'missing'> <button type="button" class="bc-remove" title="Remove this product's code / barcode" style="padding:7px 12px;background:#fff;color:#c62828;border:1px solid #e0a3a3;border-radius:6px;font-size:13px;font-weight:700;cursor:pointer">Remove</button></#if></td>
                     </tr>
                     </#list>
                     <#if !(rows?has_content)>
