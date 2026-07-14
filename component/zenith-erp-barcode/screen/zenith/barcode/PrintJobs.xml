@@ -3,19 +3,54 @@
         xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
         default-menu-title="Print Jobs" default-menu-index="4">
 
+    <parameter name="printJobId"/>
+
     <transition name="createPrintJob">
-        <service-call name="zenith.barcode.BarcodeServices.create#PrintJob"/>
-        <default-response url="."/>
+        <service-call name="zenith.barcode.BarcodeServices.create#PrintJob" out-map="context"
+                      in-map="[labelId:labelId,
+                               items:(productId ? [[productId:productId, quantity:((quantity?.toString()?.isInteger()) ? (quantity as Integer) : 1)]] : [])]"/>
+        <!-- land on the builder for the new job so more products can be added before printing -->
+        <default-response url="." parameter-map="[printJobId:printJobId]"/>
+    </transition>
+    <transition name="addItem">
+        <service-call name="zenith.barcode.BarcodeServices.add#PrintJobItem"
+                      in-map="[printJobId:printJobId, productId:productId, quantity:quantity]"/>
+        <default-response url="." parameter-map="[printJobId:printJobId]"/>
+    </transition>
+    <transition name="removeItem">
+        <service-call name="zenith.barcode.BarcodeServices.remove#PrintJobItem"
+                      in-map="[printJobId:printJobId, productId:productId]"/>
+        <default-response url="." parameter-map="[printJobId:printJobId]"/>
     </transition>
     <transition name="completePrintJob">
-        <service-call name="update#zenith.erp.barcode.BarcodePrintJob" in-map="[printJobId:printJobId, statusId:'BpCompleted', completedDate:ec.user.nowTimestamp]"/>
+        <service-call name="zenith.barcode.BarcodeServices.complete#PrintJob" in-map="[printJobId:printJobId]"/>
         <default-response url="."/>
     </transition>
 
     <actions>
+        <set field="_ao" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+        <if condition="_ao == '_NA_'"><set field="_ao" from="null"/></if>
+
         <entity-find entity-name="zenith.erp.barcode.BarcodePrintJob" list="printJobs">
             <search-form-inputs default-order-by="-createdDate"/>
+            <!-- org isolation: a transition/standalone find runs outside the MANTLE_ACTIVE_ORG filter -->
+            <econdition field-name="organizationPartyId" from="_ao" ignore-if-empty="true"/>
         </entity-find>
+
+        <!-- builder context: only when a job is selected AND the caller owns it (super-admin exempt) -->
+        <if condition="printJobId">
+            <entity-find-one entity-name="zenith.erp.barcode.BarcodePrintJob" value-field="curJob"/>
+            <if condition="curJob != null &amp;&amp; (ec.user.isInGroup('ADMIN') || (_ao != null &amp;&amp; curJob.organizationPartyId == _ao))">
+                <set field="showBuilder" from="true"/>
+                <entity-find-one entity-name="zenith.erp.barcode.BarcodeLabel" value-field="curLabel">
+                    <field-map field-name="labelId" from="curJob.labelId"/></entity-find-one>
+                <set field="curLabelName" from="curLabel?.labelName ?: '(none)'"/>
+                <entity-find entity-name="zenith.erp.barcode.BarcodePrintJobItem" list="jobItems">
+                    <econdition field-name="printJobId"/>
+                    <order-by field-name="productId"/>
+                </entity-find>
+            </if>
+        </if>
     </actions>
 
     <widgets>
@@ -24,15 +59,79 @@
             <container-dialog id="NewPrintJob" button-text="New Print Job" type="success">
                 <form-single name="NewPrintJobForm" transition="createPrintJob">
                     <field name="labelId"><default-field title="Label Template">
-                        <drop-down><entity-options key="${labelId}" text="${labelName}">
+                        <drop-down allow-empty="false"><entity-options key="${labelId}" text="${labelName}">
                             <entity-find entity-name="zenith.erp.barcode.BarcodeLabel">
+                                <econdition field-name="organizationPartyId" from="_ao" ignore-if-empty="true"/>
                                 <order-by field-name="labelName"/>
                             </entity-find>
                         </entity-options></drop-down></default-field></field>
-                    <field name="submitBtn"><default-field title="Create"><submit/></default-field></field>
+                    <field name="productId"><default-field title="Product">
+                        <drop-down allow-empty="false"><entity-options key="${productId}" text="${productName} (${pseudoId})">
+                            <entity-find entity-name="mantle.product.Product">
+                                <econdition field-name="ownerPartyId" from="_ao" ignore-if-empty="true"/>
+                                <order-by field-name="productName"/>
+                            </entity-find>
+                        </entity-options></drop-down></default-field></field>
+                    <field name="quantity"><default-field title="Quantity (labels)"><text-line size="6" default-value="1"/></default-field></field>
+                    <field name="submitBtn"><default-field title="Create &amp; Add Products"><submit/></default-field></field>
                 </form-single>
             </container-dialog>
         </container>
+
+        <!-- ============ Builder panel: add/remove products, then print ============ -->
+        <section name="BuilderSection">
+            <condition><expression>showBuilder</expression></condition>
+            <widgets>
+                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-lg">
+                    <container style="row items-center justify-between q-mb-md">
+                        <label text="Print Job #${curJob.printJobId}" type="h5" style="text-weight-bold q-my-none"/>
+                        <link url="." text="Close" parameter-map="[printJobId:'']" btn-type="grey"/>
+                    </container>
+                    <container style="row q-gutter-md q-mb-md">
+                        <label text="Template: ${curLabelName}" type="span" style="text-grey-7"/>
+                        <label text="Status: ${curJob.statusId}" type="span" style="text-grey-7"/>
+                        <label text="Total Labels: ${curJob.totalLabels ?: 0}" type="span" style="text-weight-bold"/>
+                    </container>
+
+                    <!-- add a product line -->
+                    <form-single name="AddItemForm" transition="addItem">
+                        <field name="printJobId"><default-field><hidden default-value="${printJobId}"/></default-field></field>
+                        <field name="productId"><default-field title="Product">
+                            <drop-down allow-empty="false"><entity-options key="${productId}" text="${productName} (${pseudoId})">
+                                <entity-find entity-name="mantle.product.Product">
+                                    <econdition field-name="ownerPartyId" from="_ao" ignore-if-empty="true"/>
+                                    <order-by field-name="productName"/>
+                                </entity-find>
+                            </entity-options></drop-down></default-field></field>
+                        <field name="quantity"><default-field title="Quantity"><text-line size="6" default-value="1"/></default-field></field>
+                        <field name="addBtn"><default-field title="Add Product"><submit/></default-field></field>
+                    </form-single>
+
+                    <form-list name="JobItemsForm" list="jobItems" skip-form="true">
+                        <field name="productId"><default-field title="Product">
+                            <display-entity entity-name="mantle.product.Product" key-field-name="productId" text="${productName}"/>
+                        </default-field></field>
+                        <field name="barcodeValue"><default-field title="Barcode"><display/></default-field></field>
+                        <field name="quantity"><default-field title="Qty"><display/></default-field></field>
+                        <field name="removeLink"><default-field title="">
+                            <link url="removeItem" text="Remove" parameter-map="[printJobId:printJobId, productId:productId]" btn-type="negative"/>
+                        </default-field></field>
+                    </form-list>
+                    <section name="NoItems"><condition><expression>!jobItems</expression></condition><widgets>
+                        <label text="No products yet — add one above so the job generates labels." type="p" style="text-grey-7 q-mt-md"/>
+                    </widgets></section>
+
+                    <container style="row q-gutter-sm q-mt-md">
+                        <section name="PrintBtnSec"><condition><expression>jobItems</expression></condition><widgets>
+                            <link url="../renderLabels" text="Print Labels" parameter-map="[printJobId:printJobId, moquiSessionToken:ec.web.sessionToken]" link-type="anchor" btn-type="primary"/>
+                        </widgets></section>
+                        <section name="MarkBuilderSec"><condition><expression>curJob.statusId != 'BpCompleted'</expression></condition><widgets>
+                            <link url="completePrintJob" text="Mark Printed" parameter-map="[printJobId:printJobId]" btn-type="positive"/>
+                        </widgets></section>
+                    </container>
+                </container>
+            </widgets>
+        </section>
 
         <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg">
             <form-list name="PrintJobsForm" list="printJobs" skip-form="true">
@@ -44,6 +143,9 @@
                 <field name="statusId"><default-field title="Status"><display/></default-field></field>
                 <field name="createdDate"><default-field title="Created"><display format="dd-MMM-yyyy HH:mm"/></default-field></field>
                 <field name="completedDate"><default-field title="Completed"><display format="dd-MMM-yyyy HH:mm"/></default-field></field>
+                <field name="buildLink"><default-field title="">
+                    <link url="." text="Build / Add Items" parameter-map="[printJobId:printJobId]" btn-type="info"/>
+                </default-field></field>
                 <field name="printLink"><default-field title="Labels">
                     <link url="../renderLabels" text="Print Labels" parameter-map="[printJobId:printJobId, moquiSessionToken:ec.web.sessionToken]" link-type="anchor"/>
                 </default-field></field>

@@ -202,33 +202,131 @@
         <out-parameters><parameter name="printJobId"/></out-parameters>
         <actions>
             <set field="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-            <set field="totalLabels" from="0" type="Integer"/>
-            <if condition="items">
-                <iterate list="items" entry="item">
-                    <set field="totalLabels" from="totalLabels + (item.quantity ?: 1)" type="Integer"/>
-                </iterate>
-            </if>
+            <if condition="organizationPartyId == '_NA_'"><set field="organizationPartyId" from="null"/></if>
 
             <service-call name="create#zenith.erp.barcode.BarcodePrintJob" out-map="jobOut"
                           in-map="[labelId:labelId, organizationPartyId:organizationPartyId, statusId:'BpPending', createdDate:ec.user.nowTimestamp,
-                                   totalLabels:totalLabels, createdByUserId:ec.user.userId]"/>
+                                   totalLabels:0, createdByUserId:ec.user.userId]"/>
             <set field="printJobId" from="jobOut.printJobId"/>
 
             <if condition="items">
                 <iterate list="items" entry="item">
-                    <!-- Get primary barcode -->
-                    <entity-find entity-name="zenith.erp.barcode.ProductBarcode" list="barcodes" limit="1">
-                        <econdition field-name="productId" from="item.productId"/>
-                        <econdition field-name="isActive" value="Y"/>
-                        <order-by field-name="-isPrimary"/>
-                    </entity-find>
-                    <set field="bcValue" from="barcodes ? barcodes[0].barcodeValue : item.productId"/>
-
-                    <service-call name="create#zenith.erp.barcode.BarcodePrintJobItem"
-                                  in-map="[printJobId:printJobId, organizationPartyId:organizationPartyId, productId:item.productId,
-                                           quantity:item.quantity ?: 1, barcodeValue:bcValue]"/>
+                    <entity-find-one entity-name="mantle.product.Product" value-field="_ip">
+                        <field-map field-name="productId" from="item.productId"/></entity-find-one>
+                    <!-- Only add real products the caller's org owns (super-admin exempt); silently skip foreign/unknown. -->
+                    <if condition="_ip != null &amp;&amp; (ec.user.isInGroup('ADMIN') || _ip.ownerPartyId == null || organizationPartyId == null || _ip.ownerPartyId == organizationPartyId)">
+                        <set field="qty" from="(item.quantity?.toString()?.isInteger()) ? (item.quantity as Integer) : 1"/>
+                        <if condition="qty &lt; 1"><set field="qty" from="1"/></if>
+                        <!-- Get primary barcode; fall back to the product code, then the id -->
+                        <entity-find entity-name="zenith.erp.barcode.ProductBarcode" list="barcodes" limit="1">
+                            <econdition field-name="productId" from="item.productId"/>
+                            <econdition field-name="isActive" value="Y"/>
+                            <order-by field-name="-isPrimary"/>
+                        </entity-find>
+                        <set field="bcValue" from="barcodes ? barcodes[0].barcodeValue : (_ip.pseudoId ?: item.productId)"/>
+                        <service-call name="create#zenith.erp.barcode.BarcodePrintJobItem"
+                                      in-map="[printJobId:printJobId, organizationPartyId:organizationPartyId, productId:item.productId,
+                                               quantity:qty, barcodeValue:bcValue]"/>
+                    </if>
                 </iterate>
+                <service-call name="zenith.barcode.BarcodeServices.recompute#PrintJobTotal" in-map="[printJobId:printJobId]"/>
             </if>
+        </actions>
+    </service>
+
+    <!-- Recompute a print job's label total from its items (single source of truth for totalLabels). -->
+    <service verb="recompute" noun="PrintJobTotal">
+        <in-parameters><parameter name="printJobId" required="true"/></in-parameters>
+        <actions>
+            <entity-find entity-name="zenith.erp.barcode.BarcodePrintJobItem" list="items">
+                <econdition field-name="printJobId"/>
+            </entity-find>
+            <set field="total" from="0" type="Integer"/>
+            <iterate list="items" entry="it">
+                <set field="total" from="total + ((it.quantity ?: 0) as Integer)" type="Integer"/>
+            </iterate>
+            <service-call name="update#zenith.erp.barcode.BarcodePrintJob" in-map="[printJobId:printJobId, totalLabels:total]"/>
+        </actions>
+    </service>
+
+    <!-- Add (or increment) a product line on a print job. Org-guarded: only the owning org (super-admin
+         exempt) may touch the job, and only its own products can be added (no cross-tenant product/leak). -->
+    <service verb="add" noun="PrintJobItem">
+        <in-parameters>
+            <parameter name="printJobId" required="true"/>
+            <parameter name="productId" required="true"/>
+            <parameter name="quantity" default-value="1"/>
+        </in-parameters>
+        <out-parameters><parameter name="printJobId"/></out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.barcode.BarcodePrintJob" value-field="job"/>
+            <if condition="job == null"><return error="true" message="Print job not found."/></if>
+            <set field="_ao" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <if condition="_ao == '_NA_'"><set field="_ao" from="null"/></if>
+            <set field="_isAdmin" from="ec.user.isInGroup('ADMIN')"/>
+            <if condition="!_isAdmin &amp;&amp; (job.organizationPartyId == null || !_ao || job.organizationPartyId != _ao)">
+                <return error="true" message="You do not have access to this print job."/></if>
+
+            <entity-find-one entity-name="mantle.product.Product" value-field="_prd"><field-map field-name="productId"/></entity-find-one>
+            <if condition="_prd == null"><return error="true" message="Product not found."/></if>
+            <if condition="!_isAdmin &amp;&amp; _prd.ownerPartyId != null &amp;&amp; _ao != null &amp;&amp; _prd.ownerPartyId != _ao">
+                <return error="true" message="You do not have access to this product."/></if>
+
+            <set field="qty" from="(quantity?.toString()?.isInteger()) ? (quantity as Integer) : 1"/>
+            <if condition="qty &lt; 1"><set field="qty" from="1"/></if>
+
+            <entity-find entity-name="zenith.erp.barcode.ProductBarcode" list="barcodes" limit="1">
+                <econdition field-name="productId"/>
+                <econdition field-name="isActive" value="Y"/>
+                <order-by field-name="-isPrimary"/>
+            </entity-find>
+            <set field="bcValue" from="barcodes ? barcodes[0].barcodeValue : (_prd.pseudoId ?: productId)"/>
+
+            <!-- PK is (printJobId, productId): re-adding the same product increments its quantity -->
+            <entity-find-one entity-name="zenith.erp.barcode.BarcodePrintJobItem" value-field="existingItem"/>
+            <if condition="existingItem != null">
+                <service-call name="update#zenith.erp.barcode.BarcodePrintJobItem"
+                              in-map="[printJobId:printJobId, productId:productId,
+                                       quantity:((existingItem.quantity ?: 0) as Integer) + qty, barcodeValue:bcValue]"/>
+            <else>
+                <service-call name="create#zenith.erp.barcode.BarcodePrintJobItem"
+                              in-map="[printJobId:printJobId, productId:productId, organizationPartyId:job.organizationPartyId,
+                                       quantity:qty, barcodeValue:bcValue]"/>
+            </else></if>
+            <service-call name="zenith.barcode.BarcodeServices.recompute#PrintJobTotal" in-map="[printJobId:printJobId]"/>
+        </actions>
+    </service>
+
+    <!-- Remove a product line from a print job (org-guarded). -->
+    <service verb="remove" noun="PrintJobItem">
+        <in-parameters>
+            <parameter name="printJobId" required="true"/>
+            <parameter name="productId" required="true"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.barcode.BarcodePrintJob" value-field="job"/>
+            <if condition="job == null"><return error="true" message="Print job not found."/></if>
+            <set field="_ao" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <if condition="_ao == '_NA_'"><set field="_ao" from="null"/></if>
+            <if condition="!ec.user.isInGroup('ADMIN') &amp;&amp; (job.organizationPartyId == null || !_ao || job.organizationPartyId != _ao)">
+                <return error="true" message="You do not have access to this print job."/></if>
+            <service-call name="delete#zenith.erp.barcode.BarcodePrintJobItem" in-map="[printJobId:printJobId, productId:productId]"/>
+            <service-call name="zenith.barcode.BarcodeServices.recompute#PrintJobTotal" in-map="[printJobId:printJobId]"/>
+        </actions>
+    </service>
+
+    <!-- Mark a print job completed (org-guarded — replaces the unguarded inline update in the screen). -->
+    <service verb="complete" noun="PrintJob">
+        <in-parameters><parameter name="printJobId" required="true"/></in-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.barcode.BarcodePrintJob" value-field="job"/>
+            <if condition="job == null"><return error="true" message="Print job not found."/></if>
+            <set field="_ao" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <if condition="_ao == '_NA_'"><set field="_ao" from="null"/></if>
+            <if condition="!ec.user.isInGroup('ADMIN') &amp;&amp; (job.organizationPartyId == null || !_ao || job.organizationPartyId != _ao)">
+                <return error="true" message="You do not have access to this print job."/></if>
+            <service-call name="update#zenith.erp.barcode.BarcodePrintJob"
+                          in-map="[printJobId:printJobId, statusId:'BpCompleted', completedDate:ec.user.nowTimestamp]"/>
         </actions>
     </service>
 
