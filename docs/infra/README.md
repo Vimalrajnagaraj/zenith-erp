@@ -5,6 +5,13 @@ These mirror the live host config on `root@167.233.117.229`. Moqui/Postgres run 
 container) and terminates TLS, with Cloudflare in front — so host config is NOT carried by the
 `moqui-deploy` image pipeline.
 
+## Repo guards
+- `lint-party-picker.sh` — fails if any screen re-introduces the stock, cross-tenant party
+  type-ahead (`searchPartyList` from SimpleScreens) instead of the org-scoped
+  `component://zenith-erp-base/screen/include/PartyPicker.xml`, or uses the picker without a
+  local PartyPicker include. Run before a deploy: `sh docs/infra/lint-party-picker.sh`.
+  See [[project_pos-barcode-screens]] (ZE-SEC-JSON).
+
 ## One-command sync (no more manual scp)
 - **Push repo → server** (rebuild recovery, or to ship a repo-side change):
   `bash docs/infra/apply-host-config.sh [user@host]`
