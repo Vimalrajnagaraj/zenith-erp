@@ -142,11 +142,25 @@
                             .condition("planId", tenant.planId).list()
                         context.moduleList = planModules
 
-                        // Count users in org
-                        def relCount = ec.entity.find("mantle.party.PartyRelationship")
-                            .condition("toPartyId", orgId)
-                            .condition("toRoleTypeId", "OrgInternal").count()
-                        context.userCount = relCount as int
+                        // ZE-MY-001: Count users in this tenant. Must match the "Users & Role Assignment" screen,
+                        // which scopes a tenant's users by its TENANT_* user group (the org anchor) — NOT by
+                        // PartyRelationship(OrgInternal). Most users added via Settings > Create User never got that
+                        // relationship, so the old count undercounted (showed 1 when 3 users existed). Count DISTINCT
+                        // non-disabled accounts (a disabled user can't log in, so it frees a seat).
+                        def _tenantGroups = ec.entity.find("moqui.security.UserGroupMember")
+                            .condition("userId", ec.user.userId).list()*.userGroupId.findAll { it?.startsWith('TENANT_') }.unique()
+                        def _uids = (_tenantGroups
+                            ? ec.entity.find("moqui.security.UserGroupMember").condition("userGroupId", "in", _tenantGroups).list()*.userId
+                            : ec.entity.find("moqui.security.UserPreference").condition("preferenceKey", "ACTIVE_ORGANIZATION")
+                                .condition("preferenceValue", orgId).list()*.userId) as Set
+                        _uids << ec.user.userId   // the viewer always counts
+                        int _activeUsers = 0
+                        if (_uids) {
+                            ec.entity.find("moqui.security.UserAccount").condition("userId", "in", new ArrayList(_uids)).list().each {
+                                if (it.disabled != 'Y') _activeUsers++
+                            }
+                        }
+                        context.userCount = _activeUsers
 
                         // Plan limits
                         context.maxUsers = plan?.maxUsers ?: 0
@@ -309,12 +323,25 @@
                                 <container style="row items-center q-mb-xs">
                                     <render-mode><text type="html"><![CDATA[<q-icon name="people" class="text-grey-7 q-mr-sm"/>]]></text></render-mode>
                                     <label text="Users: " style="text-grey-7"/>
-                                    <label text="${userCount}" style="text-weight-bold"/>
+                                    <label text="${userCount}" style="text-weight-bold ${(maxUsers > 0 &amp;&amp; userCount >= maxUsers) ? 'text-negative' : ''}"/>
                                     <label text=" / ${maxUsers == 0 ? 'Unlimited' : maxUsers}" style="text-grey-6"/>
                                 </container>
-                                <section name="UserWarning" condition="maxUsers > 0 &amp;&amp; userCount >= maxUsers">
+                                <!-- ZE-MY-001: clear over-limit warning. OVER the limit -> red "Limit Exceeded" with
+                                     a warning icon; exactly AT the limit -> amber "all seats in use". -->
+                                <section name="UserOverLimit" condition="maxUsers > 0 &amp;&amp; userCount > maxUsers">
                                     <widgets>
-                                        <label text="User limit reached!" style="text-negative text-caption q-ml-lg"/>
+                                        <container style="row items-center q-ml-lg">
+                                            <render-mode><text type="html"><![CDATA[<q-icon name="warning" class="text-negative q-mr-xs"/>]]></text></render-mode>
+                                            <label text="Limit Exceeded — using ${userCount} of ${maxUsers} user seats. Upgrade your plan or disable extra users." style="text-negative text-caption text-weight-medium"/>
+                                        </container>
+                                    </widgets>
+                                </section>
+                                <section name="UserAtLimit" condition="maxUsers > 0 &amp;&amp; userCount == maxUsers">
+                                    <widgets>
+                                        <container style="row items-center q-ml-lg">
+                                            <render-mode><text type="html"><![CDATA[<q-icon name="info" class="text-warning q-mr-xs"/>]]></text></render-mode>
+                                            <label text="All ${maxUsers} user seats are in use." style="text-warning text-caption text-weight-medium"/>
+                                        </container>
                                     </widgets>
                                 </section>
                             </container>
