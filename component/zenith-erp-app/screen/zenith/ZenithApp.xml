@@ -6,17 +6,27 @@
     <always-actions>
         <set field="html_title" value="ZetaERP"/>
         <script><![CDATA[
-            // VIEW-ONLY write enforcement (ST-077), and No-Access for writes (ST-078). pre-actions do NOT run
-            // for transition requests, so module WRITE authz MUST be checked here in always-actions. A data
-            // write is a POST to a screen TRANSITION (targetTransitionActualName != null); a list SEARCH/filter
-            // posts to the SCREEN itself (ttan == null) and every GET is a read -> both pass. For a non-admin,
-            // non-POS-cashier user POSTing to a gateable module: block when NONE of their roles holds AUTHZA_ALL
-            // on that module's Z_<MOD> group (i.e. they have only VIEW, or no grant at all). ADMIN and
-            // ZENITH_ADMIN are exempt; framework column/find-pref transitions are whitelisted; ANY error FAILS
-            // OPEN so a write is never blocked on a gate fault. MARUTHI-safe: its cashiers are posOnly AND hold
-            // AUTHZA_ALL on every module they use; its admins are ZENITH_ADMIN.
+            // Module WRITE gates. pre-actions do NOT run for transition requests, so anything that must stop a
+            // WRITE has to be checked here in always-actions (which DO run for transitions). A data write is a
+            // POST to a screen TRANSITION (targetTransitionActualName != null); a list SEARCH/filter posts to the
+            // SCREEN itself (ttan == null) and every GET is a read -> both pass. Moqui renders a non-read-only
+            // transition as a POST, so POST+ttan is the write surface. Framework column/find-pref transitions are
+            // whitelisted. ANY error FAILS OPEN so a write is never blocked on a gate fault.
+            //
+            // Two independent gates run here, mirroring the two in pre-actions so a transition is EXACTLY as
+            // permissive as the render:
+            //   1. PLAN gate (ZE-GATE-001) — the tenant's plan must include the module. Only the platform
+            //      super-admin (ADMIN) is exempt: a TENANT admin (ZENITH_ADMIN) cannot grant itself a module its
+            //      plan doesn't include, so ZENITH_ADMIN is NOT exempt here.
+            //   2. ROLE gate (ST-077 view-only / ST-078 no-access) — the user's roles must hold AUTHZA_ALL on the
+            //      module's Z_<MOD> group. ADMIN, ZENITH_ADMIN and POS-only cashiers are exempt.
+            //
+            // MARUTHI-safe: the plan gate can only block a module the RENDER gate already blocks (same module set,
+            // same condition), so nothing reachable in the UI becomes unreachable. MARUTHI is on PROFESSIONAL,
+            // whose module set is a strict superset of the STARTER set it previously ran on -> no-op. Its cashiers
+            // are posOnly (role-gate exempt) and 'pos' is in every plan; its admins are ZENITH_ADMIN.
             try {
-                if (ec.web != null && ec.user.userId != null && !ec.user.isInGroup("ADMIN") && !ec.user.isInGroup("ZENITH_ADMIN")
+                if (ec.web != null && ec.user.userId != null && !ec.user.isInGroup("ADMIN")
                         && "POST".equalsIgnoreCase(ec.web.getRequest()?.getMethod() ?: "")) {
                     def _ttan = sri.screenUrlInfo?.targetTransitionActualName
                     def _fwTx = ['formSelectColumns','formSaveColumns','formSaveFind','formDeleteFind'] as Set
@@ -29,26 +39,55 @@
                         def segs = uri ? uri.split('/').findAll{it} : []
                         int zi = segs.findIndexOf{it.toLowerCase()=='zenith'}
                         def _rm = (zi >= 0 && zi + 1 < segs.size()) ? segs[zi + 1].toLowerCase() : null
-                        def _zr = (ec.user.userGroupIdSet ?: []).findAll { it?.startsWith("ZENITH_") && it != "ZENITH_ALL" }
-                        boolean _posOnly = (_zr.size() == 1 && _zr.contains("ZENITH_CASHIER"))
-                        if (_rm && _gate.contains(_rm) && !_posOnly) {
-                            def _myG = (ec.user.userGroupIdSet ?: []) as List
-                            boolean hasFull = true
-                            if (_myG) {
-                                boolean _dz = ec.artifactExecution.disableAuthz()
+                        def _shw = (uri ?: "").startsWith('/qapps/') ? '/qapps' : '/apps'
+                        if (_rm && _gate.contains(_rm)) {
+                            boolean _blocked = false
+                            // ---- 1. PLAN gate (ZE-GATE-001) ----
+                            // Only gate when the request POSITIVELY resolves to an active SaaS tenant with a plan
+                            // module set; anything else (no org, not a tenant, lookup failure) passes.
+                            def _org = ec.user.getPreference('ACTIVE_ORGANIZATION')
+                            if (_org && _org != '_NA_') {
+                                def _mods = null
+                                boolean _dzp = ec.artifactExecution.disableAuthz()
                                 try {
-                                    hasFull = ec.entity.find("moqui.security.ArtifactAuthz")
-                                            .condition("artifactGroupId", "Z_" + _rm.toUpperCase())
-                                            .condition("userGroupId", "in", _myG)
-                                            .condition("authzActionEnumId", "AUTHZA_ALL")
-                                            .condition("authzTypeEnumId", "in", ["AUTHZT_ALLOW", "AUTHZT_ALWAYS"])
-                                            .count() > 0
-                                } finally { if (!_dz) ec.artifactExecution.enableAuthz() }
+                                    // cached: this runs on every write, incl. the POS cart hot path
+                                    def _tl = ec.entity.find("zenith.erp.saas.SaasTenant")
+                                            .condition("organizationPartyId", _org)
+                                            .condition("statusId", "SaasTenantActive").useCache(true).list()
+                                    if (_tl) {
+                                        _mods = new HashSet()
+                                        ec.entity.find("zenith.erp.saas.SaasPlanModule")
+                                                .condition("planId", _tl[0].planId).useCache(true).list()
+                                                .each { _mods.add(it.moduleId?.toLowerCase()) }
+                                    }
+                                } finally { if (!_dzp) ec.artifactExecution.enableAuthz() }
+                                if (_mods != null && !_mods.contains('all') && !_mods.contains(_rm)) {
+                                    ec.message.addError("That module isn't included in your current plan.")
+                                    sri.sendRedirectAndStopRender(_shw + "/zenith/Dashboard")
+                                    _blocked = true
+                                }
                             }
-                            if (!hasFull) {
-                                ec.message.addError("Your role has view-only access to this module — you can't make changes here.")
-                                def _shw = (uri ?: "").startsWith('/qapps/') ? '/qapps' : '/apps'
-                                sri.sendRedirectAndStopRender(_shw + "/zenith/Dashboard")
+                            // ---- 2. ROLE gate (ST-077 / ST-078) ----
+                            def _zr = (ec.user.userGroupIdSet ?: []).findAll { it?.startsWith("ZENITH_") && it != "ZENITH_ALL" }
+                            boolean _posOnly = (_zr.size() == 1 && _zr.contains("ZENITH_CASHIER"))
+                            if (!_blocked && !_posOnly && !ec.user.isInGroup("ZENITH_ADMIN")) {
+                                def _myG = (ec.user.userGroupIdSet ?: []) as List
+                                boolean hasFull = true
+                                if (_myG) {
+                                    boolean _dz = ec.artifactExecution.disableAuthz()
+                                    try {
+                                        hasFull = ec.entity.find("moqui.security.ArtifactAuthz")
+                                                .condition("artifactGroupId", "Z_" + _rm.toUpperCase())
+                                                .condition("userGroupId", "in", _myG)
+                                                .condition("authzActionEnumId", "AUTHZA_ALL")
+                                                .condition("authzTypeEnumId", "in", ["AUTHZT_ALLOW", "AUTHZT_ALWAYS"])
+                                                .count() > 0
+                                    } finally { if (!_dz) ec.artifactExecution.enableAuthz() }
+                                }
+                                if (!hasFull) {
+                                    ec.message.addError("Your role has view-only access to this module — you can't make changes here.")
+                                    sri.sendRedirectAndStopRender(_shw + "/zenith/Dashboard")
+                                }
                             }
                         }
                     }
