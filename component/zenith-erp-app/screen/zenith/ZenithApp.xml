@@ -6,30 +6,43 @@
     <always-actions>
         <set field="html_title" value="ZetaERP"/>
         <script><![CDATA[
-            // Module WRITE gates. pre-actions do NOT run for transition requests, so anything that must stop a
-            // WRITE has to be checked here in always-actions (which DO run for transitions). A data write is a
-            // POST to a screen TRANSITION (targetTransitionActualName != null); a list SEARCH/filter posts to the
-            // SCREEN itself (ttan == null) and every GET is a read -> both pass. Moqui renders a non-read-only
-            // transition as a POST, so POST+ttan is the write surface. Framework column/find-pref transitions are
-            // whitelisted. ANY error FAILS OPEN so a write is never blocked on a gate fault.
+            // Module gates for TRANSITIONS. pre-actions do NOT run for transition requests, so anything that must
+            // stop a transition has to be checked here in always-actions (which DO run for them). A transition
+            // request is one where targetTransitionActualName != null; a list SEARCH/filter posts to the SCREEN
+            // itself (ttan == null) and a plain screen GET is a render -> both fall through to the pre-actions
+            // gates. Framework column/find-pref transitions are whitelisted. ANY error FAILS OPEN so a request is
+            // never blocked on a gate fault.
             //
-            // Two independent gates run here, mirroring the two in pre-actions so a transition is EXACTLY as
-            // permissive as the render:
-            //   1. PLAN gate (ZE-GATE-001) — the tenant's plan must include the module. Only the platform
-            //      super-admin (ADMIN) is exempt: a TENANT admin (ZENITH_ADMIN) cannot grant itself a module its
-            //      plan doesn't include, so ZENITH_ADMIN is NOT exempt here.
-            //   2. ROLE gate (ST-077 view-only / ST-078 no-access) — the user's roles must hold AUTHZA_ALL on the
-            //      module's Z_<MOD> group. ADMIN, ZENITH_ADMIN and POS-only cashiers are exempt.
+            // Two gates run here, mirroring the two in pre-actions so a transition is EXACTLY as permissive as the
+            // render of the same module. They deliberately cover DIFFERENT surfaces:
+            //   1. PLAN gate (ZE-GATE-001 writes, ZE-GATE-002 reads) — the tenant's plan must include the module.
+            //      Runs on GET *and* POST transitions: a module you don't pay for should be neither readable nor
+            //      writable. Only the platform super-admin (ADMIN) is exempt — a TENANT admin (ZENITH_ADMIN)
+            //      cannot grant itself a module its plan doesn't include, so ZENITH_ADMIN is NOT exempt here.
+            //   2. ROLE gate (ST-077 view-only / ST-078 no-access) — WRITES ONLY (POST). Moqui renders a
+            //      non-read-only transition as a POST, so POST+ttan is the write surface. ADMIN, ZENITH_ADMIN and
+            //      POS-only cashiers are exempt.
+            //
+            // WHY THE ROLE GATE IS NOT EXTENDED TO READS (ZE-GATE-002, deliberate — do not "fix" without checking
+            // this): a screen in module A may legitimately GET a transition in module B, and the gate infers the
+            // module from the URL, so it cannot tell that call apart from a direct hit. A REAL instance exists:
+            // the POS screen zenith-erp-pos/.../Pos/BarcodeLabels.xml loads pos-barcode-labels.js, which GETs
+            // /apps/zenith/barcode/renderLabels (read-only, "the shared renderer for the POS bulk printer").
+            // ZENITH_CASHIER holds Z_POS=AUTHZA_ALL but has NO Z_BARCODE grant at all -> role-gating reads would
+            // silently break label printing for any cashier who is not posOnly (i.e. holds a 2nd role, cf.
+            // ZE-ROLES-001). The PLAN gate is safe for that same call because every plan containing 'pos' also
+            // contains 'barcode' (verified against saas_plan_module). If a future plan ever grants pos WITHOUT
+            // barcode, POS label printing breaks -> move renderLabels under /pos or whitelist it here.
             //
             // MARUTHI-safe: the plan gate can only block a module the RENDER gate already blocks (same module set,
             // same condition), so nothing reachable in the UI becomes unreachable. MARUTHI is on PROFESSIONAL,
             // whose module set is a strict superset of the STARTER set it previously ran on -> no-op. Its cashiers
             // are posOnly (role-gate exempt) and 'pos' is in every plan; its admins are ZENITH_ADMIN.
             try {
-                if (ec.web != null && ec.user.userId != null && !ec.user.isInGroup("ADMIN")
-                        && "POST".equalsIgnoreCase(ec.web.getRequest()?.getMethod() ?: "")) {
+                if (ec.web != null && ec.user.userId != null && !ec.user.isInGroup("ADMIN")) {
                     def _ttan = sri.screenUrlInfo?.targetTransitionActualName
                     def _fwTx = ['formSelectColumns','formSaveColumns','formSaveFind','formDeleteFind'] as Set
+                    boolean _isPost = "POST".equalsIgnoreCase(ec.web.getRequest()?.getMethod() ?: "")
                     if (_ttan && !_fwTx.contains(_ttan)) {
                         def _gate = ['pos','sales','purchase','inventory','accounting','contacts','crm','hr','payroll',
                             'attendance','timeoff','recruitment','expenses','manufacturing','quality','maintenance','fleet',
@@ -42,7 +55,7 @@
                         def _shw = (uri ?: "").startsWith('/qapps/') ? '/qapps' : '/apps'
                         if (_rm && _gate.contains(_rm)) {
                             boolean _blocked = false
-                            // ---- 1. PLAN gate (ZE-GATE-001) ----
+                            // ---- 1. PLAN gate (ZE-GATE-001 writes + ZE-GATE-002 reads): GET and POST ----
                             // Only gate when the request POSITIVELY resolves to an active SaaS tenant with a plan
                             // module set; anything else (no org, not a tenant, lookup failure) passes.
                             def _org = ec.user.getPreference('ACTIVE_ORGANIZATION')
@@ -50,7 +63,8 @@
                                 def _mods = null
                                 boolean _dzp = ec.artifactExecution.disableAuthz()
                                 try {
-                                    // cached: this runs on every write, incl. the POS cart hot path
+                                    // cached: this runs on EVERY module transition (reads too — type-aheads,
+                                    // lookups, exports) incl. the POS cart hot path, so it must not hit the DB
                                     def _tl = ec.entity.find("zenith.erp.saas.SaasTenant")
                                             .condition("organizationPartyId", _org)
                                             .condition("statusId", "SaasTenantActive").useCache(true).list()
@@ -67,10 +81,10 @@
                                     _blocked = true
                                 }
                             }
-                            // ---- 2. ROLE gate (ST-077 / ST-078) ----
+                            // ---- 2. ROLE gate (ST-077 / ST-078): WRITES ONLY — see the read note above ----
                             def _zr = (ec.user.userGroupIdSet ?: []).findAll { it?.startsWith("ZENITH_") && it != "ZENITH_ALL" }
                             boolean _posOnly = (_zr.size() == 1 && _zr.contains("ZENITH_CASHIER"))
-                            if (!_blocked && !_posOnly && !ec.user.isInGroup("ZENITH_ADMIN")) {
+                            if (_isPost && !_blocked && !_posOnly && !ec.user.isInGroup("ZENITH_ADMIN")) {
                                 def _myG = (ec.user.userGroupIdSet ?: []) as List
                                 boolean hasFull = true
                                 if (_myG) {
