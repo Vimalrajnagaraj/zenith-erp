@@ -8,15 +8,19 @@
 --
 -- Moqui does NOT DB-enforce every relationship, so an FK walk alone silently orphans rows whose tenant link
 -- is an *unenforced* relationship (pos_terminal.organization_party_id, visit.user_id, serial_number_history
--- .performed_by_user_id, ...). The engine closes that by deriving a REFERENCE VOCABULARY from the catalog:
--- the set of column names that appear in a REAL FK to a root entity (party/person/organization -> 'party',
--- user_account -> 'user', saas_tenant -> 'tenant', facility -> 'facility'). Any table carrying such a name
--- but WITHOUT an FK on it (the "_vgap" set) is an unenforced reference; those are seeded AND self-verified
--- against the tenant's captured id sets. Seed and verify use the SAME vocabulary, so a clean purge always
--- self-verifies, and the check is catalog-derived so it cannot go stale as entities are added.
--- The only residual boundary: a reference column whose name appears as an FK NOWHERE in the schema — nothing
--- in the catalog then marks it as a reference. The self-verify's value-based nature can't help there without
--- risking id-space collisions, so that single case stays out of scope by design.
+-- .performed_by_user_id, approved_by_user_id, ...). The engine closes that with _refcol: every UNENFORCED
+-- (no-FK) reference column to a root entity (party/person/organization -> party, user_account -> user,
+-- saas_tenant -> tenant, facility -> facility), identified TWO ways — by NAMING CONVENTION (a suffix->kind
+-- map: %party_id/%person_id/%department_id/%employee_id -> party; %user_id or %_by -> user; %facility_id ->
+-- facility; %tenant_id -> tenant) AND by the real-FK column vocabulary (for odd spellings like
+-- preferred_supplier_id). The closure propagates through _refcol AND real FKs; the SEED covers _refcol; the
+-- VERIFY sweeps _refcol. One set drives all three, so seed and verify are symmetric (a clean purge always
+-- self-verifies) and both update themselves as the schema grows. A value check makes an over-broad name
+-- harmless: a non-reference column never holds one of the tenant's ids, so it never matches.
+-- Residual boundary (now tiny, watched by lint-purge-vocabulary.sh): a root reference whose column name
+-- matches NEITHER a convention suffix NOR any FK column name — nothing in the catalog then marks it as a
+-- reference, and value-scanning arbitrary columns can't be made sound (Moqui id spaces overlap across
+-- entities). The lint flags any such name at schema-change time so it never lands silently.
 --
 -- SAFETY: refuses protected orgs; p_commit=false (dry run) issues NO DELETE, only counts; p_commit=true
 -- deletes AND self-verifies before returning (any residue RAISES -> caller's tx rolls back). Always eyeball
@@ -77,20 +81,44 @@ BEGIN
     WHERE c.contype='f' AND array_length(c.conkey,1)=1
       AND pt.relname IN ('party','person','organization','user_account','saas_tenant','facility');
 
-  -- _vgap = every occurrence of a vocabulary column on a table that has NO real FK on it. These are the
-  -- UNENFORCED references the FK walk can't see; they need explicit seeding + self-verification. (FK
-  -- occurrences are handled by the closure and are guaranteed clean, so they are excluded here — which also
-  -- keeps the seed/verify sweeps small and fast.)
-  CREATE TEMP TABLE _vgap ON COMMIT DROP AS
-    SELECT c.table_name AS tbl, v.col, v.kind, v.kindtbl, pk.pkcol
-    FROM _vocab v
-    JOIN information_schema.columns c ON c.column_name=v.col
-    JOIN pg_class rc ON rc.relname=c.table_name AND rc.relkind='r'
-    LEFT JOIN _pk pk ON pk.tbl=c.table_name
-    WHERE NOT EXISTS (
-      SELECT 1 FROM pg_constraint fc JOIN pg_class fct ON fct.oid=fc.conrelid
-      JOIN pg_attribute fca ON fca.attrelid=fc.conrelid AND fca.attnum=fc.conkey[1]
-      WHERE fc.contype='f' AND fct.relname=c.table_name AND fca.attname=v.col);
+  -- _refcol = every UNENFORCED (no-FK) reference column to a root entity, from BOTH sources:
+  --   (1) NAMING CONVENTION: a suffix -> kind map covering how Moqui names references. This is what catches
+  --       columns that are an FK NOWHERE, e.g. approved_by_user_id / operator_party_id / cashier_party_id /
+  --       from_facility_id — the FK vocabulary alone would miss these (they never appear in a constraint).
+  --   (2) FK VOCABULARY (_vocab): real-FK column names, to catch odd spellings the suffixes don't (e.g.
+  --       preferred_supplier_id).
+  -- FK occurrences are handled by the closure (guaranteed clean), so they are excluded here. The value check
+  -- at seed/verify time makes an over-broad NAME harmless: a non-reference column (gateway_customer_id holding
+  -- a Stripe id, a sort_by holding 'asc') never equals one of the tenant's ids, so it simply never matches.
+  -- Residual boundary (now tiny, watched by docs/infra/lint-purge-vocabulary.sh): a root reference whose name
+  -- matches NEITHER a convention suffix NOR any FK column name — nothing then marks it as a reference.
+  CREATE TEMP TABLE _refcol ON COMMIT DROP AS
+    WITH named AS (
+      SELECT c.table_name AS tbl, c.column_name AS col,
+        CASE WHEN c.column_name ~ '(party_id|person_id|department_id|employee_id)$' THEN 'party'
+             WHEN c.column_name ~ 'user_id$' OR c.column_name ~ '_by$'              THEN 'user'
+             WHEN c.column_name ~ 'facility_id$'                                    THEN 'facility'
+             WHEN c.column_name ~ 'tenant_id$'                                      THEN 'tenant' END AS kind
+      FROM information_schema.columns c
+      JOIN pg_class rc ON rc.relname=c.table_name AND rc.relkind='r' AND rc.relnamespace='public'::regnamespace
+      WHERE c.table_schema='public'
+        AND c.column_name ~ '(party_id|person_id|department_id|employee_id|user_id|facility_id|tenant_id|_by)$'
+      UNION
+      SELECT c.table_name, c.column_name, v.kind
+      FROM _vocab v JOIN information_schema.columns c ON c.column_name=v.col
+      JOIN pg_class rc ON rc.relname=c.table_name AND rc.relkind='r' AND rc.relnamespace='public'::regnamespace
+      WHERE c.table_schema='public'
+    )
+    SELECT n.tbl, n.col, n.kind,
+           CASE n.kind WHEN 'party' THEN 'party' WHEN 'user' THEN 'user_account'
+                       WHEN 'tenant' THEN 'saas_tenant' WHEN 'facility' THEN 'facility' END AS kindtbl,
+           pk.pkcol
+    FROM named n LEFT JOIN _pk pk ON pk.tbl=n.tbl
+    WHERE n.kind IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM pg_constraint fc JOIN pg_class fct ON fct.oid=fc.conrelid
+        JOIN pg_attribute fca ON fca.attrelid=fc.conrelid AND fca.attnum=fc.conkey[1]
+        WHERE fc.contype='f' AND fct.relname=n.tbl AND fca.attname=n.col);
 
   CREATE TEMP TABLE _mark(tbl text, pkval text, PRIMARY KEY(tbl,pkval)) ON COMMIT DROP;  -- expandable rows
   CREATE TEMP TABLE _pred(tbl text, col text, val text, PRIMARY KEY(tbl,col,val)) ON COMMIT DROP; -- delete predicates
@@ -133,8 +161,9 @@ BEGIN
       END IF;
     END LOOP;
 
-    -- (b) unenforced vocabulary references: rows whose value is in the referenced kind's id set
-    FOR r IN SELECT tbl, col, kindtbl, pkcol FROM _vgap
+    -- (b) unenforced reference columns (naming-convention + FK-vocabulary): rows whose value is in the
+    -- referenced kind's id set
+    FOR r IN SELECT tbl, col, kindtbl, pkcol FROM _refcol
     LOOP
       EXECUTE format(
         'INSERT INTO _pred SELECT %L,%L, ch.%I::text FROM %I ch '
@@ -194,30 +223,19 @@ BEGIN
   END LOOP;
 
   -- ---- SELF-VERIFY completeness (catalog-derived). After the deletes, NO row anywhere may still reference
-  -- the tenant's captured identifiers, via EITHER the systemic id-columns (%party_id / user_id / tenant_id /
-  -- facility_id) OR any unenforced vocabulary column (_vgap). id sets come from _mark (captured before the
-  -- deletes — the rows are gone now, so they can't be recomputed). A hit = the purge missed a table -> RAISE,
-  -- rolling the whole purge back so the operator sees exactly which table.column, never a silent orphan. ----
+  -- the tenant's captured identifiers through any unenforced reference column (_refcol — naming-convention +
+  -- FK-vocabulary, non-FK occurrences; FK occurrences are guaranteed clean by the closure). id sets come from
+  -- _mark (captured before the deletes — the rows are gone now, so they can't be recomputed). A hit = the
+  -- purge missed a table -> RAISE, rolling the whole purge back so the operator sees exactly which
+  -- table.column, never a silent orphan. Seed (loop b) and verify use the SAME _refcol, so a clean purge
+  -- always self-verifies. ----
   CREATE TEMP TABLE _idset(kind text, val text) ON COMMIT DROP;
   INSERT INTO _idset SELECT 'party',    pkval FROM _mark WHERE tbl='party';
   INSERT INTO _idset SELECT 'user',     pkval FROM _mark WHERE tbl='user_account';
   INSERT INTO _idset SELECT 'tenant',   pkval FROM _mark WHERE tbl='saas_tenant';
   INSERT INTO _idset SELECT 'facility', pkval FROM _mark WHERE tbl='facility';
   v_res := '';
-  FOR r IN
-    -- systemic id columns by name + every unenforced vocabulary occurrence
-    SELECT tbl, col, kind FROM (
-      SELECT c.table_name AS tbl, c.column_name AS col,
-             CASE WHEN c.column_name ~ 'party_id$' THEN 'party'
-                  WHEN c.column_name='user_id'     THEN 'user'
-                  WHEN c.column_name='tenant_id'   THEN 'tenant'
-                  WHEN c.column_name='facility_id' THEN 'facility' END AS kind
-      FROM information_schema.columns c
-      JOIN pg_class rc ON rc.relname=c.table_name AND rc.relkind='r'
-      WHERE c.column_name ~ 'party_id$' OR c.column_name IN ('user_id','tenant_id','facility_id')
-      UNION
-      SELECT tbl, col, kind FROM _vgap
-    ) q
+  FOR r IN SELECT tbl, col, kind FROM _refcol
   LOOP
     EXECUTE format('SELECT count(*) FROM %I t WHERE t.%I::text IN (SELECT val FROM _idset WHERE kind=%L)',
                    r.tbl, r.col, r.kind) INTO n;
@@ -229,22 +247,23 @@ BEGIN
 END;
 $fn$;
 
--- Standalone auditor: sweep every reference column (systemic id-names + the unenforced-reference vocabulary)
--- for rows still pointing at an org. Empty = provably clean of party-scoped references (not "clean per a
--- hand-picked list"). Use to confirm a purge or hunt orphans: SELECT * FROM ztest_tenant_residue('<org>');
+-- Standalone auditor: sweep every party-kind reference column (naming-convention + FK vocabulary) for rows
+-- still pointing at an org. Empty = provably clean of party-scoped references (not "clean per a hand-picked
+-- list"). Use to confirm a purge or hunt orphans: SELECT * FROM ztest_tenant_residue('<org>');
 CREATE OR REPLACE FUNCTION ztest_tenant_residue(p_org text)
 RETURNS TABLE(table_name text, column_name text, rows_n bigint) LANGUAGE plpgsql AS $fn$
 DECLARE r record; n bigint;
 BEGIN
   FOR r IN
     SELECT DISTINCT c.table_name AS tbl, c.column_name AS col
-    FROM pg_constraint fc
-    JOIN pg_class fct ON fct.oid=fc.confrelid
-    JOIN pg_attribute fca ON fca.attrelid=fc.conrelid AND fca.attnum=fc.conkey[1]
-    JOIN information_schema.columns c ON c.column_name=fca.attname
-    JOIN pg_class rc ON rc.relname=c.table_name AND rc.relkind='r'
-    WHERE fc.contype='f' AND array_length(fc.conkey,1)=1
-      AND fct.relname IN ('party','person','organization')   -- party-kind reference vocabulary
+    FROM information_schema.columns c
+    JOIN pg_class rc ON rc.relname=c.table_name AND rc.relkind='r' AND rc.relnamespace='public'::regnamespace
+    WHERE c.table_schema='public'
+      AND (c.column_name ~ '(party_id|person_id|department_id|employee_id)$'   -- party-kind names
+       OR c.column_name IN (SELECT DISTINCT ca.attname FROM pg_constraint fc   -- + odd real-FK spellings
+            JOIN pg_class pt ON pt.oid=fc.confrelid
+            JOIN pg_attribute ca ON ca.attrelid=fc.conrelid AND ca.attnum=fc.conkey[1]
+            WHERE fc.contype='f' AND pt.relname IN ('party','person','organization')))
     ORDER BY 1,2
   LOOP
     EXECUTE format('SELECT count(*) FROM %I WHERE %I::text=%L', r.tbl, r.col, p_org) INTO n;
