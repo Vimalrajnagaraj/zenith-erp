@@ -23,16 +23,21 @@
             //      non-read-only transition as a POST, so POST+ttan is the write surface. ADMIN, ZENITH_ADMIN and
             //      POS-only cashiers are exempt.
             //
+            // CROSS-MODULE TRANSITIONS (_sharedTx): a screen in module A may legitimately call a transition in
+            // module B, but the gate infers the module from the URL and so cannot tell that call apart from a
+            // direct hit. _sharedTx names those transitions and the OTHER modules whose plan also grants them, so
+            // the gate never depends on a coincidence of plan composition. Audited 2026-07-16: barcode/renderLabels
+            // is the ONLY cross-module transition in the codebase — every other cross-module URL targets a SCREEN
+            // (a render, gated in pre-actions). Add an entry here when a new shared transition appears.
+            //
             // WHY THE ROLE GATE IS NOT EXTENDED TO READS (ZE-GATE-002, deliberate — do not "fix" without checking
-            // this): a screen in module A may legitimately GET a transition in module B, and the gate infers the
-            // module from the URL, so it cannot tell that call apart from a direct hit. A REAL instance exists:
-            // the POS screen zenith-erp-pos/.../Pos/BarcodeLabels.xml loads pos-barcode-labels.js, which GETs
+            // this): the same URL-inference limit applies, but roles are far narrower than plans, so a role gate on
+            // reads breaks the shared call even with _sharedTx. The real instance: the POS screen
+            // zenith-erp-pos/.../Pos/BarcodeLabels.xml loads pos-barcode-labels.js, which GETs
             // /apps/zenith/barcode/renderLabels (read-only, "the shared renderer for the POS bulk printer").
             // ZENITH_CASHIER holds Z_POS=AUTHZA_ALL but has NO Z_BARCODE grant at all -> role-gating reads would
             // silently break label printing for any cashier who is not posOnly (i.e. holds a 2nd role, cf.
-            // ZE-ROLES-001). The PLAN gate is safe for that same call because every plan containing 'pos' also
-            // contains 'barcode' (verified against saas_plan_module). If a future plan ever grants pos WITHOUT
-            // barcode, POS label printing breaks -> move renderLabels under /pos or whitelist it here.
+            // ZE-ROLES-001).
             //
             // MARUTHI-safe: the plan gate can only block a module the RENDER gate already blocks (same module set,
             // same condition), so nothing reachable in the UI becomes unreachable. MARUTHI is on PROFESSIONAL,
@@ -48,6 +53,10 @@
                             'attendance','timeoff','recruitment','expenses','manufacturing','quality','maintenance','fleet',
                             'helpdesk','marketing','ecommerce','events','subscriptions','documents','approvals','integrations',
                             'website','studio','plm','fieldservice','discuss','sign','project','timesheets','tax','pricing','barcode'] as Set
+                        // "<urlModule>:<transitionName>" -> other modules that legitimately reach it (see note above).
+                        // barcode/renderLabels is the shared label renderer: the barcode module's own screens
+                        // (FindBarcode, PrintJobs) AND the POS bulk printer (pos/BarcodeLabels) both call it.
+                        def _sharedTx = ['barcode:renderLabels': ['pos'] as Set]
                         def uri = ec.web.getRequest()?.getRequestURI()
                         def segs = uri ? uri.split('/').findAll{it} : []
                         int zi = segs.findIndexOf{it.toLowerCase()=='zenith'}
@@ -75,10 +84,16 @@
                                                 .each { _mods.add(it.moduleId?.toLowerCase()) }
                                     }
                                 } finally { if (!_dzp) ec.artifactExecution.enableAuthz() }
-                                if (_mods != null && !_mods.contains('all') && !_mods.contains(_rm)) {
-                                    ec.message.addError("That module isn't included in your current plan.")
-                                    sri.sendRedirectAndStopRender(_shw + "/zenith/Dashboard")
-                                    _blocked = true
+                                if (_mods != null) {
+                                    // a shared transition is granted by ANY of its legitimate caller modules
+                                    def _also = _sharedTx[_rm + ':' + _ttan]
+                                    boolean _inPlan = _mods.contains('all') || _mods.contains(_rm) ||
+                                            (_also != null && _also.any { _mods.contains(it) })
+                                    if (!_inPlan) {
+                                        ec.message.addError("That module isn't included in your current plan.")
+                                        sri.sendRedirectAndStopRender(_shw + "/zenith/Dashboard")
+                                        _blocked = true
+                                    }
                                 }
                             }
                             // ---- 2. ROLE gate (ST-077 / ST-078): WRITES ONLY — see the read note above ----
