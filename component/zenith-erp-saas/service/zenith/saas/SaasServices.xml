@@ -302,21 +302,36 @@
                 <return error="true" message="Can't switch to ${newPlan.planName}: your current usage exceeds that plan's limits (${limitOut.violations.join('; ')}). Reduce usage first, or choose a larger plan."/>
             </if>
 
-            <!-- Current active subscription (its price + remaining days) BEFORE we expire it — for proration. -->
+            <!-- Current ACTIVE subscription (its price + remaining days) BEFORE we retire it — for proration.
+                 Deterministic tie-break: two subs written in one tx share startDate (day-granularity) AND can
+                 share lastUpdatedStamp, so -startDate alone is a dead tie (the ZE-MY-002 lesson) — order by
+                 -startDate then -lastUpdatedStamp and take the first. A Trial has no committed payment, so it is
+                 intentionally NOT a proration basis (curSub stays null → a trial upgrade raises no invoice). -->
             <entity-find entity-name="zenith.erp.saas.SaasSubscription" list="activeSubs">
                 <econdition field-name="tenantId"/>
                 <econdition field-name="statusId" value="SubActive"/>
                 <order-by field-name="-startDate"/>
+                <order-by field-name="-lastUpdatedStamp"/>
             </entity-find>
             <set field="curSub" from="activeSubs ? activeSubs[0] : null"/>
             <set field="subAmount" from="billingCycle == 'Yearly' ? newPlan.yearlyPrice : newPlan.monthlyPrice"/>
 
-            <!-- Swap plan: update tenant, expire old sub(s), create the new active subscription. -->
+            <!-- Swap plan: update tenant, retire ALL live subs, create the new active subscription. Retire the
+                 TRIAL too — an upgrade DURING trial must not leave the SubTrial behind: a paying tenant's dangling
+                 trial makes change#Plan's "current sub" pick ambiguous AND is a landmine for check#TrialExpiry
+                 (which would later suspend the paying tenant when the old trialEndDate passes). Use only VALID
+                 Default-flow transitions: SubActive→SubExpired, SubTrial→SubCancelled (SubTrial→SubExpired is not
+                 an allowed transition). Net result: exactly one active sub, no dangling trial. -->
             <service-call name="update#zenith.erp.saas.SaasTenant"
                 in-map="[tenantId:tenantId, planId:newPlanId]"/>
-            <iterate list="activeSubs" entry="oldSub">
+            <entity-find entity-name="zenith.erp.saas.SaasSubscription" list="liveSubs">
+                <econdition field-name="tenantId"/>
+                <econdition field-name="statusId" operator="in" from="['SubActive','SubTrial']"/>
+            </entity-find>
+            <iterate list="liveSubs" entry="oldSub">
                 <service-call name="update#zenith.erp.saas.SaasSubscription"
-                    in-map="[subscriptionId:oldSub.subscriptionId, statusId:'SubExpired']"/>
+                    in-map="[subscriptionId:oldSub.subscriptionId,
+                             statusId:(oldSub.statusId == 'SubTrial' ? 'SubCancelled' : 'SubExpired')]"/>
             </iterate>
             <script><![CDATA[
                 import java.time.LocalDate
