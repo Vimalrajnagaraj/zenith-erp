@@ -44,24 +44,30 @@ if [ "${ISSUED:-0}" -gt 0 ] && [ "$MODE" = "--commit" ]; then
   exit 1
 fi
 
+DROPFNS="DROP FUNCTION IF EXISTS ztest_purge_tenant(text,boolean); DROP FUNCTION IF EXISTS ztest_tenant_residue(text);"
+
 if [ "$MODE" = "--commit" ]; then
-  echo "=== COMMIT purge of org $ORG (atomic) ==="
+  echo "=== COMMIT purge of org $ORG (atomic; self-verifies completeness before COMMIT) ==="
+  # ztest_purge_tenant RAISES inside the tx if ANY row still references the tenant after the deletes, so a
+  # missed table aborts the COMMIT (nothing deleted) and names table.column. On success, confirm externally
+  # with the catalog-wide residue sweep too.
   { cat "$HERE/purge-tenant.sql"
-    printf "BEGIN;\nSELECT * FROM ztest_purge_tenant('%s', true) ORDER BY del_order, tbl_name;\nCOMMIT;\nDROP FUNCTION ztest_purge_tenant(text,boolean);\n" "$ORG"
+    printf "BEGIN;\nSELECT * FROM ztest_purge_tenant('%s', true) ORDER BY del_order, tbl_name;\nCOMMIT;\n" "$ORG"
+    printf "\\\\echo '=== residue sweep — EVERY %%party_id column in the schema (must be empty) ==='\n"
+    printf "SELECT * FROM ztest_tenant_residue('%s');\n" "$ORG"
+    printf "\\\\echo '=== billing baselines (plans 4 / plan_modules 76 must be intact) ==='\n"
+    printf "SELECT (SELECT count(*) FROM saas_plan) plans, (SELECT count(*) FROM saas_plan_module) plan_mods;\n"
+    printf "%s\n" "$DROPFNS"
   } | $PSQL
-  echo "=== residue (all must be 0) ==="
-  $PSQL -c "SELECT 'party' t, count(*) c FROM party WHERE party_id='$ORG' OR owner_party_id='$ORG'
-            UNION ALL SELECT 'organization', count(*) FROM organization WHERE party_id='$ORG'
-            UNION ALL SELECT 'saas_tenant', count(*) FROM saas_tenant WHERE organization_party_id='$ORG'
-            UNION ALL SELECT 'company_settings', count(*) FROM company_settings WHERE organization_party_id='$ORG'
-            UNION ALL SELECT 'system_sequence', count(*) FROM system_sequence WHERE organization_party_id='$ORG'
-            UNION ALL SELECT 'facility', count(*) FROM facility WHERE owner_party_id='$ORG';"
-  echo "=== billing baselines (plans 4 / plan_modules 76 must be intact) ==="
-  $PSQL -c "SELECT (SELECT count(*) FROM saas_plan) plans, (SELECT count(*) FROM saas_plan_module) plan_mods;"
+elif [ "$MODE" = "--audit" ]; then
+  echo "=== AUDIT — any row in the schema still referencing org $ORG via a %party_id column (empty = clean) ==="
+  { cat "$HERE/purge-tenant.sql"
+    printf "SELECT * FROM ztest_tenant_residue('%s');\n%s\n" "$ORG" "$DROPFNS"
+  } | $PSQL
 else
   echo "=== DRY RUN — rows that WOULD be deleted (no changes made) ==="
   { cat "$HERE/purge-tenant.sql"
-    printf "SELECT * FROM ztest_purge_tenant('%s', false) ORDER BY tbl_name;\nDROP FUNCTION ztest_purge_tenant(text,boolean);\n" "$ORG"
+    printf "SELECT * FROM ztest_purge_tenant('%s', false) ORDER BY tbl_name;\n%s\n" "$ORG" "$DROPFNS"
   } | $PSQL
-  echo "(re-run with --commit to delete)"
+  echo "(re-run with --commit to delete, or --audit to sweep an org for residue)"
 fi

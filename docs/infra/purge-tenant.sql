@@ -16,7 +16,7 @@
 CREATE OR REPLACE FUNCTION ztest_purge_tenant(p_org text, p_commit boolean DEFAULT false)
 RETURNS TABLE(del_order int, tbl_name text, rows_n bigint) LANGUAGE plpgsql AS $fn$
 DECLARE
-  r record; n bigint; v_changed boolean; v_ord int := 0; v_left int; v_where text; v_del bigint;
+  r record; n bigint; v_changed boolean; v_ord int := 0; v_left int; v_where text; v_del bigint; v_res text;
 BEGIN
   IF p_org IS NULL OR btrim(p_org) = '' OR p_org IN ('_NA_','100000','ZETAERP','ORG_ZETA') THEN
     RAISE EXCEPTION 'ztest_purge_tenant: refusing protected/empty org [%]', p_org;
@@ -90,20 +90,28 @@ BEGIN
     END IF;
   END LOOP;
 
-  -- ---- USER-owned sub-entities: Moqui DB-enforces NONE of its user_id relationships (verified: 0 FKs to
-  -- user_account across all 14 user_* / *_user tables), so deleting a user_account orphans its preferences,
-  -- group memberships, login history, saved finds, screen theme, etc. A row is user-owned exactly when
-  -- user_id is part of its PRIMARY KEY (an audit column like created_by_user_id never is). Seed those rows
-  -- for this tenant's users (already marked under 'user_account'). ----
+  -- ---- USER-owned rows: Moqui DB-enforces NONE of its user_id relationships (verified: 0 FKs to
+  -- user_account across every table carrying a user_id), so deleting a user_account orphans its preferences,
+  -- group memberships, login history, saved finds, screen theme, AND its visit/session rows. Rule: ANY table
+  -- with a column literally named 'user_id' is user-owned on that column (audit columns are created_by_user_id
+  -- / last_updated_..., never plain 'user_id'). This DELIBERATELY matches the self-verify sweep's user_id rule
+  -- (below) so a clean purge always self-verifies. Seed those rows for this tenant's users, and mark any that
+  -- are entities (single-col PK, e.g. visit.visit_id) so their own children expand. ----
   FOR r IN
-    SELECT DISTINCT c.relname AS tbl
-    FROM pg_index i JOIN pg_class c ON c.oid=i.indrelid
-    JOIN pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=ANY(i.indkey)
-    WHERE i.indisprimary AND a.attname='user_id' AND c.relkind='r' AND c.relname <> 'user_account'
+    SELECT c.table_name AS tbl, pk.pkcol
+    FROM information_schema.columns c
+    JOIN pg_class rc ON rc.relname=c.table_name AND rc.relkind='r'
+    LEFT JOIN _pk pk ON pk.tbl=c.table_name
+    WHERE c.column_name='user_id' AND c.table_name <> 'user_account'
   LOOP
     EXECUTE format(
       'INSERT INTO _pred SELECT %L, ''user_id'', x.user_id FROM (SELECT DISTINCT user_id FROM %I) x '
       'JOIN _mark m ON m.tbl=''user_account'' AND m.pkval=x.user_id ON CONFLICT DO NOTHING', r.tbl, r.tbl);
+    IF r.pkcol IS NOT NULL AND r.pkcol <> 'user_id' THEN
+      EXECUTE format(
+        'INSERT INTO _mark SELECT %L, x.%I::text FROM %I x JOIN _mark m ON m.tbl=''user_account'' AND m.pkval=x.user_id '
+        'WHERE x.%I IS NOT NULL ON CONFLICT DO NOTHING', r.tbl, r.pkcol, r.tbl, r.pkcol);
+    END IF;
   END LOOP;
 
   -- ---- transitive closure: propagate deletes to FK children until stable ----
@@ -165,6 +173,57 @@ BEGIN
       RAISE EXCEPTION 'ztest_purge_tenant: FK cycle among remaining tables [%]',
         (SELECT string_agg(tbl, ',') FROM _remain);
     END IF;
+  END LOOP;
+
+  -- ---- SELF-VERIFY completeness (catalog-derived, not a hand-picked table list). After the deletes, NO row
+  -- anywhere may still reference the tenant's captured identifiers. Build the id sets from _mark (captured
+  -- BEFORE deletion — the org/user/facility/tenant rows are now gone, so they can't be recomputed) and scan
+  -- EVERY table column named like a tenant identifier. A hit = the purge missed a table (typically a NEW
+  -- unenforced-scoping column on some entity) -> RAISE, which rolls the whole purge back so the operator sees
+  -- exactly which table.column instead of a silent orphan. This is what makes "the assertion will flag it"
+  -- actually true: the check is derived from the live catalog, so it cannot go stale. ----
+  CREATE TEMP TABLE _idset(kind text, val text) ON COMMIT DROP;
+  INSERT INTO _idset SELECT 'party',    pkval FROM _mark WHERE tbl='party';
+  INSERT INTO _idset SELECT 'user',     pkval FROM _mark WHERE tbl='user_account';
+  INSERT INTO _idset SELECT 'tenant',   pkval FROM _mark WHERE tbl='saas_tenant';
+  INSERT INTO _idset SELECT 'facility', pkval FROM _mark WHERE tbl='facility';
+  v_res := '';
+  FOR r IN
+    SELECT c.table_name AS tbl, c.column_name AS col,
+           CASE WHEN c.column_name ~ 'party_id$' THEN 'party'
+                WHEN c.column_name='user_id'     THEN 'user'
+                WHEN c.column_name='tenant_id'   THEN 'tenant'
+                WHEN c.column_name='facility_id' THEN 'facility' END AS kind
+    FROM information_schema.columns c
+    JOIN pg_class rc ON rc.relname=c.table_name AND rc.relkind='r'
+    WHERE c.column_name ~ 'party_id$' OR c.column_name IN ('user_id','tenant_id','facility_id')
+  LOOP
+    EXECUTE format('SELECT count(*) FROM %I t WHERE t.%I::text IN (SELECT val FROM _idset WHERE kind=%L)',
+                   r.tbl, r.col, r.kind) INTO n;
+    IF n > 0 THEN v_res := v_res || format('%s.%s=%s ', r.tbl, r.col, n); END IF;
+  END LOOP;
+  IF v_res <> '' THEN
+    RAISE EXCEPTION 'ztest_purge_tenant: RESIDUE remains after purge (missed unenforced-scoping column? add it to the seed section) -> %', v_res;
+  END IF;
+END;
+$fn$;
+
+-- Standalone auditor: sweep EVERY '%party_id' column in the schema for rows still pointing at an org. Empty
+-- result = provably clean (of party-scoped references), not "clean per a 6-table list". Use to confirm a
+-- purge or hunt orphans: SELECT * FROM ztest_tenant_residue('<org>');
+CREATE OR REPLACE FUNCTION ztest_tenant_residue(p_org text)
+RETURNS TABLE(table_name text, column_name text, rows_n bigint) LANGUAGE plpgsql AS $fn$
+DECLARE r record; n bigint;
+BEGIN
+  FOR r IN
+    SELECT c.table_name AS tbl, c.column_name AS col
+    FROM information_schema.columns c
+    JOIN pg_class rc ON rc.relname=c.table_name AND rc.relkind='r'
+    WHERE c.column_name ~ 'party_id$'
+    ORDER BY 1,2
+  LOOP
+    EXECUTE format('SELECT count(*) FROM %I WHERE %I=%L', r.tbl, r.col, p_org) INTO n;
+    IF n > 0 THEN table_name:=r.tbl; column_name:=r.col; rows_n:=n; RETURN NEXT; END IF;
   END LOOP;
 END;
 $fn$;
