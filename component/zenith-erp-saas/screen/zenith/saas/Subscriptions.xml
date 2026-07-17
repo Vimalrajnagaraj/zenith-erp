@@ -79,17 +79,36 @@
                 def today = LocalDate.now()
                 def newStart = java.sql.Date.valueOf(today.minusDays(cycleDays - dRem))
                 def newRenew = java.sql.Date.valueOf(today.plusDays(dRem))
-                // Make it Active (proration only applies to an active sub — a Trial upgrade raises no invoice) + mid-cycle.
+                // Guarantee a SINGLE active subscription so the proration basis is unambiguous. change#Plan picks
+                // the "current" sub via orderBy(-startDate) over SubActive rows; if a tenant carried more than one
+                // Active/Trial sub (e.g. an upgrade during trial leaves the trial behind), that pick is ambiguous
+                // and an upgrade can net to zero. Expire every OTHER Active/Trial sub for this tenant, make the
+                // chosen one Active + mid-cycle, and sync the tenant's plan to it. Now exactly one active sub exists.
+                def _others = ec.entity.find("zenith.erp.saas.SaasSubscription")
+                    .condition("tenantId", sub.tenantId)
+                    .condition("statusId", "in", ["SubActive","SubTrial"]).list()
+                int _expired = 0
+                _others.each { o ->
+                    if (o.subscriptionId != sub.subscriptionId) {
+                        ec.service.sync().name("update#zenith.erp.saas.SaasSubscription")
+                            .parameters([subscriptionId: o.subscriptionId, statusId: 'SubExpired']).call()
+                        _expired++
+                    }
+                }
                 ec.service.sync().name("update#zenith.erp.saas.SaasSubscription")
                     .parameters([subscriptionId: sub.subscriptionId, statusId: 'SubActive',
                                  startDate: newStart, renewalDate: newRenew]).call()
+                ec.service.sync().name("update#zenith.erp.saas.SaasTenant")
+                    .parameters([tenantId: sub.tenantId, planId: sub.planId]).call()
                 ec.service.sync().name("create#zenith.erp.saas.SaasAuditLog")
                     .parameters([tenantId: sub.tenantId, eventType: 'CYCLE_ADJUST', eventDate: ec.user.nowTimestamp,
                         userId: ec.user.userId,
-                        description: 'Prepared for proration testing: Active, ' + dRem + '/' + cycleDays +
-                            ' days remaining (start ' + newStart + ', renewal ' + newRenew + ')']).call()
-                ec.message.addMessage("Subscription ${sub.subscriptionId} is now Active with ${dRem} of ${cycleDays} days remaining. " +
-                    "Now upgrade this tenant's plan (Tenants → open the tenant → Change Plan) to generate the prorated invoice.")
+                        description: 'Prepared for proration testing: sole Active sub on ' + sub.planId + ', ' + dRem + '/' +
+                            cycleDays + ' days remaining (start ' + newStart + ', renewal ' + newRenew + ')' +
+                            (_expired > 0 ? '; expired ' + _expired + ' other active/trial sub(s)' : '')]).call()
+                ec.message.addMessage("Subscription ${sub.subscriptionId} is now the single Active subscription (plan ${sub.planId}) " +
+                    "with ${dRem} of ${cycleDays} days remaining${_expired > 0 ? ' (' + _expired + ' other sub(s) expired)' : ''}. " +
+                    "Now upgrade this tenant's plan to a higher one (Tenants → open the tenant → Change Plan) to generate the prorated invoice.")
             ]]></script>
         </actions>
         <default-response url="."/>
@@ -129,7 +148,7 @@
         <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md q-mb-lg">
             <label text="Proration Test Setup" type="h6" style="text-weight-bold"/>
             <label type="p" style="text-grey-7 text-caption q-mb-sm"
-                   text="Prepare a subscription for upgrade-proration testing: makes it Active and mid-cycle (e.g. 15 of 30 days remaining) by moving the start/renewal dates. Nothing is charged here, and the renewal date stays in the future. Then upgrade the tenant's plan (Tenants → open the tenant → Change Plan) to generate the prorated invoice. The flagship live tenant is protected."/>
+                   text="Prepare a subscription for upgrade-proration testing: makes it the tenant's SINGLE Active subscription and mid-cycle (e.g. 15 of 30 days remaining) by moving the start/renewal dates, expiring any other active/trial subs, and syncing the tenant's plan. Nothing is charged here, and the renewal date stays in the future. Then upgrade the tenant's plan to a higher one (Tenants → open the tenant → Change Plan) to generate the prorated invoice. The flagship live tenant is protected."/>
             <form-single name="SetCycleForm" transition="setSubscriptionCycle">
                 <field name="subscriptionId">
                     <default-field title="Active subscription">
