@@ -32,6 +32,48 @@
         </actions>
     </service>
 
+    <!-- ZE-GATE-004: the PLAN decision — "does a tenant holding <planModules> get <moduleId>[/<transitionName>]?" —
+         as a PURE function of its inputs. Extracted from the transition gate in ZenithApp.xml (which still owns the
+         org -> SaasTenant -> SaasPlanModule lookups; only the DECISION lives here) for one reason: while the decision
+         was welded to those lookups, the ONLY way to exercise a plan shape was to make the DB produce it, i.e. to
+         INSERT into saas_plan/saas_plan_module — platform billing config — just to run a test. Taking planModules as
+         a parameter turns that into a call: any shape, including ones no real plan has, with zero writes. Verify a
+         hypothesis about the gate with e.g.
+             check#ModulePlanAccess {moduleId:'barcode', transitionName:'renderLabels', planModules:['pos','contacts']}
+         The gate calls this with disableAuthz and blocks ONLY on inPlan==false, so a fault here fails OPEN exactly as
+         the inline code did (see the fail-open note in ZenithApp.xml).
+
+         SHARED-TX registry: a screen in module A may legitimately call a transition in module B, but the gate infers
+         the module from the URL and cannot tell that call apart from a direct hit at B. Each entry names such a
+         transition and the OTHER modules whose plan also grants it, so the gate never depends on a coincidence of
+         plan composition (ZE-GATE-003). This map is the SINGLE source of truth for that registry and is parsed by
+         docs/infra/lint-cross-module-transitions.sh, which FAILS if a cross-module transition reference exists in the
+         codebase without an entry here — keep the "// SHARED-TX" marker on every entry line. -->
+    <service verb="check" noun="ModulePlanAccess" authenticate="true" transaction="ignore">
+        <in-parameters>
+            <parameter name="moduleId" required="true"/>
+            <parameter name="transitionName"/>
+            <parameter name="planModules" type="List" required="true"/>
+        </in-parameters>
+        <out-parameters><parameter name="inPlan" type="Boolean"/></out-parameters>
+        <actions>
+            <script><![CDATA[
+                def _mods = new HashSet()
+                planModules.each { if (it != null) _mods.add(it.toString().toLowerCase()) }
+                def _m = moduleId.toString().toLowerCase()
+                // "<urlModule>:<transitionName>" -> other modules that legitimately reach it.
+                // barcode/renderLabels is the shared label renderer: the barcode module's own screens
+                // (FindBarcode, PrintJobs) AND the POS bulk printer (pos/BarcodeLabels) both call it.
+                def _sharedTx = [
+                    'barcode:renderLabels': ['pos'] as Set   // SHARED-TX
+                ]
+                def _also = transitionName ? _sharedTx[_m + ':' + transitionName.toString()] : null
+                inPlan = _mods.contains('all') || _mods.contains(_m) ||
+                        (_also != null && _also.any { _mods.contains(it) })
+            ]]></script>
+        </actions>
+    </service>
+
     <!-- ZE-INV-IV-031: reusable "your own organization(s)" list for the many org pickers across modules.
          Those pickers were EMPTY for every tenant: they query mantle.party.PartyDetailAndRole (which drags in
          mantle.party.Party), and the MANTLE_ACTIVE_ORG entity filter scopes Party by ownerPartyId=activeOrg —

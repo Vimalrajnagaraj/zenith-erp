@@ -23,12 +23,14 @@
             //      non-read-only transition as a POST, so POST+ttan is the write surface. ADMIN, ZENITH_ADMIN and
             //      POS-only cashiers are exempt.
             //
-            // CROSS-MODULE TRANSITIONS (_sharedTx): a screen in module A may legitimately call a transition in
-            // module B, but the gate infers the module from the URL and so cannot tell that call apart from a
-            // direct hit. _sharedTx names those transitions and the OTHER modules whose plan also grants them, so
-            // the gate never depends on a coincidence of plan composition. Audited 2026-07-16: barcode/renderLabels
-            // is the ONLY cross-module transition in the codebase — every other cross-module URL targets a SCREEN
-            // (a render, gated in pre-actions). Add an entry here when a new shared transition appears.
+            // CROSS-MODULE TRANSITIONS: a screen in module A may legitimately call a transition in module B, but the
+            // gate infers the module from the URL and so cannot tell that call apart from a direct hit. The plan
+            // decision + the _sharedTx registry that handles this now live in zenith.base.SecurityServices'
+            // check#ModulePlanAccess (ZE-GATE-004), which takes the module set as a PARAMETER — so any plan shape is
+            // testable by calling it, instead of INSERTing throwaway rows into saas_plan to build a fixture.
+            // Audited 2026-07-16: barcode/renderLabels is the ONLY cross-module transition in the codebase — every
+            // other cross-module URL targets a SCREEN (a render, gated in pre-actions). That is no longer a fact you
+            // have to remember: docs/infra/lint-cross-module-transitions.sh FAILS if a new one appears unregistered.
             //
             // WHY THE ROLE GATE IS NOT EXTENDED TO READS (ZE-GATE-002, deliberate — do not "fix" without checking
             // this): the same URL-inference limit applies, but roles are far narrower than plans, so a role gate on
@@ -53,10 +55,6 @@
                             'attendance','timeoff','recruitment','expenses','manufacturing','quality','maintenance','fleet',
                             'helpdesk','marketing','ecommerce','events','subscriptions','documents','approvals','integrations',
                             'website','studio','plm','fieldservice','discuss','sign','project','timesheets','tax','pricing','barcode'] as Set
-                        // "<urlModule>:<transitionName>" -> other modules that legitimately reach it (see note above).
-                        // barcode/renderLabels is the shared label renderer: the barcode module's own screens
-                        // (FindBarcode, PrintJobs) AND the POS bulk printer (pos/BarcodeLabels) both call it.
-                        def _sharedTx = ['barcode:renderLabels': ['pos'] as Set]
                         def uri = ec.web.getRequest()?.getRequestURI()
                         def segs = uri ? uri.split('/').findAll{it} : []
                         int zi = segs.findIndexOf{it.toLowerCase()=='zenith'}
@@ -85,11 +83,15 @@
                                     }
                                 } finally { if (!_dzp) ec.artifactExecution.enableAuthz() }
                                 if (_mods != null) {
-                                    // a shared transition is granted by ANY of its legitimate caller modules
-                                    def _also = _sharedTx[_rm + ':' + _ttan]
-                                    boolean _inPlan = _mods.contains('all') || _mods.contains(_rm) ||
-                                            (_also != null && _also.any { _mods.contains(it) })
-                                    if (!_inPlan) {
+                                    // The DECISION (incl. the _sharedTx cross-module registry) lives in
+                                    // check#ModulePlanAccess so every plan shape is testable by CALLING it with a
+                                    // synthetic module set — no saas_plan/saas_plan_module writes to construct a
+                                    // fixture. disableAuthz: the gate must not depend on the caller's service authz.
+                                    // Block ONLY on an explicit false, so a null/failed call fails OPEN as before.
+                                    def _pa = ec.service.sync().name("zenith.base.SecurityServices.check#ModulePlanAccess")
+                                            .parameters([moduleId: _rm, transitionName: _ttan, planModules: (_mods as List)])
+                                            .disableAuthz().call()
+                                    if (_pa?.inPlan == false) {
                                         ec.message.addError("That module isn't included in your current plan.")
                                         sri.sendRedirectAndStopRender(_shw + "/zenith/Dashboard")
                                         _blocked = true
