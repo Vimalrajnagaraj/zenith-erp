@@ -3,45 +3,55 @@
           xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
 
     <!-- ==================== TRIAL EXPIRY CHECK ==================== -->
+    <!-- ZE-SUB-007: expire+suspend each lapsed trial in its OWN transaction. Previously the whole batch ran in
+         ONE tx: any failing sub set rollback-only → the entire run rolled back (nothing suspended) YET the
+         counter still incremented, so it FALSELY logged "suspended N". (The failure was real: SubTrial→SubExpired
+         wasn't an allowed status transition — added now in SubscriptionEntities.xml.) Now one bad sub can't undo
+         the others, and the count reflects real successes. -->
     <service verb="check" noun="TrialExpiry" authenticate="anonymous-all">
-        <description>Checks all tenants with expired trials and suspends them. Runs daily via cron.</description>
+        <description>Suspends tenants whose trial has lapsed. Runs daily via cron.</description>
         <actions>
             <script><![CDATA[
                 import java.time.LocalDate
-
                 def today = java.sql.Date.valueOf(LocalDate.now())
                 def expiredSubs = ec.entity.find("zenith.erp.saas.SaasSubscription")
                     .condition("statusId", "SubTrial")
                     .condition("trialEndDate", "<", today)
-                    .list()
+                    .disableAuthz().list()
 
                 int expiredCount = 0
                 expiredSubs.each { sub ->
-                    // Expire the subscription
-                    ec.service.sync().name("update#zenith.erp.saas.SaasSubscription")
-                        .parameter("subscriptionId", sub.subscriptionId)
-                        .parameter("statusId", "SubExpired")
-                        .parameter("endDate", today)
+                    def res = ec.service.sync().name("zenith.saas.SaasLifecycleServices.expire#TrialSubscription")
+                        .parameters([subscriptionId: sub.subscriptionId, tenantId: sub.tenantId,
+                                     trialEndDate: sub.trialEndDate])
                         .disableAuthz().call()
-
-                    // Suspend the tenant
-                    ec.service.sync().name("update#zenith.erp.saas.SaasTenant")
-                        .parameter("tenantId", sub.tenantId)
-                        .parameter("statusId", "SaasTenantSuspended")
-                        .disableAuthz().call()
-
-                    // Audit log
-                    ec.service.sync().name("create#zenith.erp.saas.SaasAuditLog")
-                        .parameter("tenantId", sub.tenantId)
-                        .parameter("eventType", "TRIAL_EXPIRED")
-                        .parameter("eventDate", ec.user.nowTimestamp)
-                        .parameter("description", "Trial expired on ${sub.trialEndDate}. Tenant suspended.")
-                        .disableAuthz().call()
-
-                    expiredCount++
+                    if (res?.suspended) expiredCount++
+                    else ec.logger.warn("SaaS trial expiry: could not suspend tenant ${sub.tenantId} (sub ${sub.subscriptionId})")
                 }
                 if (expiredCount > 0) ec.logger.info("SaaS trial expiry: suspended ${expiredCount} tenant(s)")
             ]]></script>
+        </actions>
+    </service>
+
+    <!-- Expire ONE lapsed trial + suspend its tenant, in its own transaction (force-new) so a failure is isolated
+         to that tenant and never rolls back sibling suspensions. Returns suspended=true only when it committed. -->
+    <service verb="expire" noun="TrialSubscription" authenticate="anonymous-all" transaction="force-new">
+        <in-parameters>
+            <parameter name="subscriptionId" required="true"/>
+            <parameter name="tenantId" required="true"/>
+            <parameter name="trialEndDate"/>
+        </in-parameters>
+        <out-parameters><parameter name="suspended" type="Boolean"/></out-parameters>
+        <actions>
+            <set field="suspended" from="false"/>
+            <service-call name="update#zenith.erp.saas.SaasSubscription"
+                in-map="[subscriptionId:subscriptionId, statusId:'SubExpired', endDate:ec.user.nowTimestamp]"/>
+            <service-call name="update#zenith.erp.saas.SaasTenant"
+                in-map="[tenantId:tenantId, statusId:'SaasTenantSuspended']"/>
+            <service-call name="create#zenith.erp.saas.SaasAuditLog"
+                in-map="[tenantId:tenantId, eventType:'TRIAL_EXPIRED', eventDate:ec.user.nowTimestamp,
+                         description:('Trial expired on ' + trialEndDate + '. Tenant suspended.')]"/>
+            <set field="suspended" from="true"/>
         </actions>
     </service>
 
