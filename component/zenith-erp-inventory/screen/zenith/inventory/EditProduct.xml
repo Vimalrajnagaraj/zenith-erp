@@ -58,6 +58,26 @@
                 ]]></script>
             </if>
             <service-call name="update#mantle.product.Product" in-map="context"/>
+            <!-- ZE-PRC-008 (PRC-031): record a Price History (PriceChangeLog) row when the Selling Price (mrpAmount)
+                 changes on the product screen, so the change is auditable like a price-list edit. priceListId is
+                 null (this is the product-level MRP, not a price-list item). Best-effort — a log failure must never
+                 block the product save. First-time set (prev 0/null) => "Initial price set". -->
+            <script><![CDATA[
+                try {
+                    def _newMrp = (mrpAmount != null && mrpAmount.toString().trim() != '') ? (mrpAmount.toString().trim() as BigDecimal) : null
+                    def _oldMrp = curProd?.mrpAmount != null ? (curProd.mrpAmount as BigDecimal) : null
+                    if (_newMrp != null && (_oldMrp == null || _oldMrp.compareTo(_newMrp) != 0)) {
+                        def _prev = _oldMrp ?: 0G
+                        def _reasonIn = ec.context.changeReason
+                        def _reason = (_reasonIn != null && _reasonIn.toString().trim()) ? _reasonIn.toString().trim()
+                                      : ((_prev.compareTo(0G) == 0) ? 'Initial price set' : 'Price updated')
+                        ec.service.sync().name("create#zenith.erp.pricing.PriceChangeLog").parameters([
+                            organizationPartyId: curProd.ownerPartyId, productId: productId,
+                            previousPrice: _prev, newPrice: _newMrp, changeReason: _reason,
+                            changedByUserId: ec.user.userId, changeDate: ec.user.nowTimestamp]).call()
+                    }
+                } catch (Throwable e) { ec.logger.warn("Price history log skipped for product " + productId + ": " + e.message) }
+            ]]></script>
             <!-- Keep the rich ProductBarcode table in sync (mirror the code as the primary barcode).
                  Best-effort; never blocks the product save. -->
             <if condition="pseudoId">
@@ -80,6 +100,14 @@
 
         <entity-find entity-name="zenith.erp.inventory.StockByFacilityView" list="stockList">
             <econdition field-name="productId"/>
+        </entity-find>
+
+        <!-- ZE-PRC-008 (PRC-031): this product's Price History (mrpAmount changes + any price-list logs for it). -->
+        <entity-find entity-name="zenith.erp.pricing.PriceChangeLog" list="priceHistory">
+            <econdition field-name="productId"/>
+            <econdition field-name="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+            <order-by field-name="-changeDate"/>
+            <order-by field-name="-lastUpdatedStamp"/>
         </entity-find>
 
         <set field="currSymbol" value="₹"/>
@@ -276,6 +304,23 @@
                 <field name="totalAtp"><default-field title="Free to Sell"><label text="${totalAtp}" type="span"/></default-field></field>
                 <field name="rowStockValue"><default-field title="Stock Value (${currSymbol})"><label text="${ec.l10n.format((stockValueByRow[(facilityId ?: '') + '|' + (lotId ?: '')] ?: 0), '#,##,##0.00')}" type="span"/></default-field></field>
             </form-list>
+        </container>
+
+        <!-- ZE-PRC-008 (PRC-031): Price History for this product (Selling Price/MRP changes + any price-list logs). -->
+        <container style="zenith-card q-pa-md bg-white shadow-1 border-radius-md q-mb-lg">
+            <label text="Price History" type="h5" style="text-primary text-weight-bold q-mb-md border-bottom q-pb-sm"/>
+            <section name="HasPriceHistory"><condition><expression>priceHistory</expression></condition><widgets>
+                <form-list name="PriceHistoryList" list="priceHistory" skip-form="true">
+                    <field name="changeDate"><default-field title="Date"><display format="dd-MMM-yyyy HH:mm"/></default-field></field>
+                    <field name="previousPrice"><default-field title="Old Price"><display format="₹#,##0.00"/></default-field></field>
+                    <field name="newPrice"><default-field title="New Price"><display format="₹#,##0.00"/></default-field></field>
+                    <field name="changeReason"><default-field title="Reason"><display/></default-field></field>
+                    <field name="changedByUserId"><default-field title="Changed By"><display/></default-field></field>
+                </form-list>
+            </widgets></section>
+            <section name="NoPriceHistory"><condition><expression>!priceHistory</expression></condition><widgets>
+                <label text="No price changes recorded yet. Update the Selling Price above to start the history." type="p" style="text-grey-6 q-mb-none"/>
+            </widgets></section>
         </container>
         </widgets>
         </section>
