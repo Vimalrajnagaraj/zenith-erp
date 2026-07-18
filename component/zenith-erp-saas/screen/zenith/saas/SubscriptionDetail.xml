@@ -1,0 +1,168 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- ZE-SUB-009 (SB-021): a subscription details page with status-appropriate lifecycle actions. Reached by
+     clicking a subscription ID in SaaS Admin -> Subscriptions. Super-admin only (parent SaasAdmin pre-actions
+     gate the render; the transition re-checks ADMIN since pre-actions don't run for transitions). Destructive
+     actions (Pause/Cancel) are hard-blocked on the flagship live tenant (org 100000). -->
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
+        default-menu-title="Subscription" require-authentication="true">
+    <parameter name="subscriptionId" required="true"/>
+
+    <transition name="subAction">
+        <actions>
+            <script><![CDATA[
+                if (!ec.user.isInGroup("ADMIN")) { ec.message.addError("Access denied."); return }
+                def s = ec.entity.find("zenith.erp.saas.SaasSubscription").condition("subscriptionId", subscriptionId).one()
+                if (s == null) { ec.message.addError("Subscription not found."); return }
+                def cur = s.statusId
+                def tenant = ec.entity.find("zenith.erp.saas.SaasTenant").condition("tenantId", s.tenantId).one()
+                boolean flagship = (tenant?.organizationPartyId == '100000')
+                def audit = { ev, desc -> ec.service.sync().name("create#zenith.erp.saas.SaasAuditLog")
+                    .parameters([tenantId:s.tenantId, eventType:ev, eventDate:ec.user.nowTimestamp, userId:ec.user.userId, description:desc]).call() }
+                def setStatus = { to -> ec.service.sync().name("update#zenith.erp.saas.SaasSubscription")
+                    .parameters([subscriptionId:subscriptionId, statusId:to]).call() }
+
+                switch (action) {
+                    case 'activate':
+                        if (cur != 'SubTrial') { ec.message.addError("Only a Trial subscription can be activated."); return }
+                        setStatus('SubActive'); audit('SUB_ACTIVATE','Activated (Trial -> Active)'); ec.message.addMessage("Subscription activated."); break
+                    case 'pause':
+                        if (cur != 'SubActive') { ec.message.addError("Only an Active subscription can be paused."); return }
+                        if (flagship) { ec.message.addError("The flagship live tenant (MARUTHI) is protected from pause."); return }
+                        setStatus('SubPaused'); audit('SUB_PAUSE','Paused'); ec.message.addMessage("Subscription paused."); break
+                    case 'resume':
+                        if (cur != 'SubPaused') { ec.message.addError("Only a Paused subscription can be resumed."); return }
+                        setStatus('SubActive'); audit('SUB_RESUME','Resumed (Paused -> Active)'); ec.message.addMessage("Subscription resumed."); break
+                    case 'reactivate':
+                        if (cur != 'SubPastDue') { ec.message.addError("Only a Past-Due subscription can be reactivated."); return }
+                        setStatus('SubActive'); audit('SUB_REACTIVATE','Reactivated (Past Due -> Active)'); ec.message.addMessage("Subscription reactivated."); break
+                    case 'cancel':
+                        if (!(cur in ['SubTrial','SubActive','SubPaused','SubPastDue'])) { ec.message.addError("This subscription can't be cancelled from its current status."); return }
+                        if (flagship) { ec.message.addError("The flagship live tenant (MARUTHI) is protected from cancellation."); return }
+                        ec.service.sync().name("update#zenith.erp.saas.SaasSubscription")
+                            .parameters([subscriptionId:subscriptionId, statusId:'SubCancelled', cancelledDate:ec.user.nowTimestamp, cancelReason:'Cancelled by admin']).call()
+                        audit('SUB_CANCEL','Cancelled by admin'); ec.message.addMessage("Subscription cancelled."); break
+                    case 'renew':
+                    case 'generate':
+                        if (!(cur in ['SubTrial','SubActive','SubPastDue'])) { ec.message.addError("Can only invoice an Active / Trial / Past-Due subscription."); return }
+                        def plan = ec.entity.find("zenith.erp.saas.SaasPlan").condition("planId", s.planId).one()
+                        def amount = ((s.billingCycle == 'Yearly' ? plan?.yearlyPrice : plan?.monthlyPrice) ?: s.amount ?: 0) as java.math.BigDecimal
+                        if (amount.signum() <= 0) { ec.message.addError("The plan price is 0 — nothing to invoice."); return }
+                        def taxOut = ec.service.sync().name("zenith.subscriptions.SubscriptionServices.calculate#SubscriptionTax")
+                            .parameters([organizationPartyId:'ZETAERP', customerPartyId:tenant.organizationPartyId, taxableAmount:amount, gstRate:18]).disableAuthz().call()
+                        def _pf = s.renewalDate ?: java.sql.Date.valueOf(java.time.LocalDate.now())
+                        def _pfLd = new java.sql.Date(_pf.getTime()).toLocalDate()
+                        def _pt = java.sql.Date.valueOf(s.billingCycle == 'Yearly' ? _pfLd.plusYears(1) : _pfLd.plusMonths(1))
+                        def _prefix = 'SAAS-' + java.time.LocalDate.now().toString().substring(0,7).replace('-','') + '-'
+                        def _last = ec.entity.find("zenith.erp.saas.SaasInvoice").condition("invoiceNumber","like",_prefix+'%').orderBy("-invoiceNumber").disableAuthz().list()
+                        int _seq = 1
+                        if (_last) { try { _seq = (_last[0].invoiceNumber.toString().substring(_prefix.length()) as Integer) + 1 } catch (e) { _seq = _last.size() + 1 } }
+                        def _invNo = _prefix + String.format('%04d', _seq)
+                        ec.service.sync().name("create#zenith.erp.saas.SaasInvoice").parameters([
+                            tenantId:s.tenantId, subscriptionId:subscriptionId, invoiceNumber:_invNo, invoiceDate:ec.user.nowTimestamp,
+                            dueDate:java.sql.Date.valueOf(java.time.LocalDate.now().plusDays(7)), periodFrom:_pf, periodTo:_pt,
+                            subtotal:amount, taxAmount:(taxOut?.taxAmount ?: 0), cgstAmount:taxOut?.cgstAmount, sgstAmount:taxOut?.sgstAmount,
+                            igstAmount:taxOut?.igstAmount, placeOfSupply:taxOut?.placeOfSupply, totalAmount:(taxOut?.totalAmount ?: amount),
+                            currencyUomId:(s.currencyUomId ?: 'INR'), statusId:'SiSent']).disableAuthz().call()
+                        if (action == 'renew') {
+                            ec.service.sync().name("update#zenith.erp.saas.SaasSubscription").parameters([subscriptionId:subscriptionId, renewalDate:_pt]).call()
+                        }
+                        audit(action == 'renew' ? 'SUB_RENEW' : 'SUB_INVOICE', 'Invoice ' + _invNo + ' generated' + (action == 'renew' ? '; renewal advanced to ' + _pt : ''))
+                        ec.message.addMessage("Invoice ${_invNo} generated (${amount} + GST)" + (action == 'renew' ? "; renewal date advanced to ${_pt}." : "."))
+                        break
+                    default: ec.message.addError("Unknown action."); return
+                }
+            ]]></script>
+        </actions>
+        <default-response url="."/>
+    </transition>
+
+    <actions>
+        <entity-find-one entity-name="zenith.erp.saas.SaasSubscription" value-field="subscription"/>
+        <set field="notFound" from="subscription == null"/>
+        <if condition="subscription != null">
+            <entity-find-one entity-name="zenith.erp.saas.SaasTenant" value-field="tenant">
+                <field-map field-name="tenantId" from="subscription.tenantId"/>
+            </entity-find-one>
+            <script><![CDATA[
+                context.statusDesc = ec.entity.find("moqui.basic.StatusItem").condition("statusId", subscription.statusId).disableAuthz().one()?.description ?: subscription.statusId
+                context.tenantName = tenant?.tenantName ?: subscription.tenantId
+                def _cur = subscription.currencyUomId ?: 'INR'
+                def _sym = _cur == 'INR' ? '₹' : (_cur + ' ')
+                context.amountFmt = _sym + ec.l10n.format((subscription.amount ?: 0) as java.math.BigDecimal, '#,##0.00')
+                def _dt = { d -> d == null ? '—' : ec.l10n.format(d, 'dd-MMM-yyyy') }
+                context.startStr = _dt(subscription.startDate)
+                context.renewStr = _dt(subscription.renewalDate)
+                context.trialStr = _dt(subscription.trialEndDate)
+                context.cancelStr = _dt(subscription.cancelledDate)
+                context.terminal = subscription.statusId in ['SubCancelled','SubExpired']
+            ]]></script>
+        </if>
+    </actions>
+    <widgets>
+        <section name="NotFound" condition="notFound">
+            <widgets><label text="Subscription not found." type="h6" style="text-negative"/></widgets>
+        </section>
+        <section name="Detail" condition="!notFound">
+            <widgets>
+                <container style="row justify-between items-center q-mb-md">
+                    <label text="Subscription ${subscription.subscriptionId}" type="h5" style="text-weight-bold q-my-none"/>
+                    <label text="${statusDesc}" type="h6" style="text-weight-bold ${subscription.statusId == 'SubActive' ? 'text-positive' : subscription.statusId == 'SubTrial' ? 'text-warning' : subscription.statusId == 'SubPaused' ? 'text-info' : 'text-negative'}"/>
+                </container>
+
+                <!-- Details -->
+                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-lg">
+                    <container style="row q-col-gutter-md">
+                        <container style="col-6">
+                            <label text="Tenant" style="text-caption text-grey-7"/><label text="${tenantName}" type="p" style="text-weight-bold"/>
+                            <label text="Plan" style="text-caption text-grey-7 q-mt-sm"/><label text="${subscription.planId}" type="p"/>
+                            <label text="Billing Cycle" style="text-caption text-grey-7 q-mt-sm"/><label text="${subscription.billingCycle}" type="p"/>
+                            <label text="Amount" style="text-caption text-grey-7 q-mt-sm"/><label text="${amountFmt}" type="p"/>
+                            <label text="Auto-Renew" style="text-caption text-grey-7 q-mt-sm"/><label text="${subscription.autoRenew}" type="p"/>
+                        </container>
+                        <container style="col-6">
+                            <label text="Start Date" style="text-caption text-grey-7"/><label text="${startStr}" type="p"/>
+                            <label text="Renewal Date" style="text-caption text-grey-7 q-mt-sm"/><label text="${renewStr}" type="p"/>
+                            <label text="Trial Ends" style="text-caption text-grey-7 q-mt-sm"/><label text="${trialStr}" type="p"/>
+                            <label text="Cancelled" style="text-caption text-grey-7 q-mt-sm"/><label text="${cancelStr}" type="p"/>
+                        </container>
+                    </container>
+                </container>
+
+                <!-- Lifecycle actions (only the valid ones for the current status) -->
+                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg">
+                    <label text="Lifecycle Actions" type="h6" style="text-weight-bold q-mb-md"/>
+                    <container style="row q-gutter-sm">
+                        <link url="subAction" text="Activate" btn-type="success" icon="fa fa-play"
+                              parameter-map="[subscriptionId:subscription.subscriptionId, action:'activate']"
+                              condition="subscription.statusId == 'SubTrial'"/>
+                        <link url="subAction" text="Pause" btn-type="warning" icon="fa fa-pause"
+                              parameter-map="[subscriptionId:subscription.subscriptionId, action:'pause']"
+                              condition="subscription.statusId == 'SubActive'"
+                              confirmation="Pause this subscription?"/>
+                        <link url="subAction" text="Resume" btn-type="success" icon="fa fa-play"
+                              parameter-map="[subscriptionId:subscription.subscriptionId, action:'resume']"
+                              condition="subscription.statusId == 'SubPaused'"/>
+                        <link url="subAction" text="Reactivate" btn-type="success" icon="fa fa-redo"
+                              parameter-map="[subscriptionId:subscription.subscriptionId, action:'reactivate']"
+                              condition="subscription.statusId == 'SubPastDue'"/>
+                        <link url="subAction" text="Renew" btn-type="primary" icon="fa fa-sync"
+                              parameter-map="[subscriptionId:subscription.subscriptionId, action:'renew']"
+                              condition="subscription.statusId == 'SubActive'"
+                              confirmation="Generate a renewal invoice and advance the renewal date?"/>
+                        <link url="subAction" text="Generate Invoice" btn-type="info" icon="fa fa-file-invoice"
+                              parameter-map="[subscriptionId:subscription.subscriptionId, action:'generate']"
+                              condition="subscription.statusId == 'SubActive' || subscription.statusId == 'SubTrial' || subscription.statusId == 'SubPastDue'"/>
+                        <link url="subAction" text="Cancel" btn-type="danger" icon="fa fa-ban"
+                              parameter-map="[subscriptionId:subscription.subscriptionId, action:'cancel']"
+                              condition="subscription.statusId == 'SubTrial' || subscription.statusId == 'SubActive' || subscription.statusId == 'SubPaused' || subscription.statusId == 'SubPastDue'"
+                              confirmation="Cancel this subscription? This cannot be undone."/>
+                    </container>
+                    <section name="Terminal" condition="terminal"><widgets>
+                        <label text="No lifecycle actions are available for a ${statusDesc} subscription." type="p" style="text-grey-6 q-mt-sm"/>
+                    </widgets></section>
+                </container>
+            </widgets>
+        </section>
+    </widgets>
+</screen>
