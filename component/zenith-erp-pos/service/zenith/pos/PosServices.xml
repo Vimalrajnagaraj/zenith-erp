@@ -416,12 +416,20 @@
                              manualPrice:_manualPrice]"/>
             </else></if>
 
-            <!-- Store per-line tax breakdown -->
-            <if condition="taxedItem?.taxBreakdowns &amp;&amp; taxedItem.taxBreakdowns.size() &gt; 0">
+            <!-- Store per-line tax breakdown. ZE-TAX-PHANTOM: only when tax is ON. Storing the breakdown while the
+                 cashier bills tax-OFF (taxOn='N') is what left phantom TaxLineDetail rows that never matched the
+                 tax-free charge. Charge-neutral: this touches ONLY TaxLineDetail, never the item/txn charge fields. -->
+            <if condition="taxOn != 'N' &amp;&amp; taxedItem?.taxBreakdowns &amp;&amp; taxedItem.taxBreakdowns.size() &gt; 0">
                 <service-call name="zenith.tax.TaxServices.store#TaxLineDetails"
                               in-map="[referenceType:'PosTransactionItem', referenceId:transactionId,
                                        referenceSeqId:itemSeqId, taxBreakdowns:taxedItem.taxBreakdowns]"/>
-            </if>
+            <else>
+                <entity-delete-by-condition entity-name="zenith.erp.tax.TaxLineDetail">
+                    <econdition field-name="referenceType" value="PosTransactionItem"/>
+                    <econdition field-name="referenceId" from="transactionId"/>
+                    <econdition field-name="referenceSeqId" from="itemSeqId"/>
+                </entity-delete-by-condition>
+            </else></if>
 
             <!-- Recalculate transaction totals -->
             <service-call name="zenith.pos.PosServices.recalculate#TransactionTotals"
@@ -445,10 +453,14 @@
             <if condition="txn.statusId != 'PtCreated'">
                 <return error="true" message="Transaction is already completed or voided"/></if>
 
-            <!-- Remove tax line details for this item -->
-            <service-call name="zenith.tax.TaxServices.store#TaxLineDetails"
-                          in-map="[referenceType:'PosTransactionItem', referenceId:transactionId,
-                                   referenceSeqId:itemSeqId, taxBreakdowns:[]]" ignore-error="true"/>
+            <!-- Remove tax line details for this item. ZE-TAX-PHANTOM: store#TaxLineDetails requires a non-empty
+                 taxBreakdowns list, so the old []-store silently failed validation and left orphan detail rows;
+                 delete directly instead. -->
+            <entity-delete-by-condition entity-name="zenith.erp.tax.TaxLineDetail">
+                <econdition field-name="referenceType" value="PosTransactionItem"/>
+                <econdition field-name="referenceId" from="transactionId"/>
+                <econdition field-name="referenceSeqId" from="itemSeqId"/>
+            </entity-delete-by-condition>
 
             <service-call name="delete#zenith.erp.pos.PosTransactionItem"
                 in-map="[transactionId:transactionId, itemSeqId:itemSeqId]"/>
@@ -1532,6 +1544,13 @@
                 <if condition="taxOn == 'N'">
                     <set field="totalTaxAmount" from="BigDecimal.ZERO" type="BigDecimal"/>
                     <set field="lineTotal" from="taxableAmount" type="BigDecimal"/>
+                    <!-- ZE-TAX-PHANTOM: tax toggled OFF -> clear the per-line GST breakdown add stored, so the
+                         recorded detail matches the tax-free charge. Charge-neutral (only touches TaxLineDetail). -->
+                    <entity-delete-by-condition entity-name="zenith.erp.tax.TaxLineDetail">
+                        <econdition field-name="referenceType" value="PosTransactionItem"/>
+                        <econdition field-name="referenceId" from="transactionId"/>
+                        <econdition field-name="referenceSeqId" from="it.itemSeqId"/>
+                    </entity-delete-by-condition>
                 </if>
                 <service-call name="update#zenith.erp.pos.PosTransactionItem"
                     in-map="[transactionId:transactionId, itemSeqId:it.itemSeqId, unitPrice:newUnit,
@@ -1593,7 +1612,14 @@
             <set field="taxable" from="taxedI?.taxableAmount ?: (lineSub - dAmt)" type="BigDecimal"/>
             <set field="ttax" from="taxedI?.totalTaxAmount ?: BigDecimal.ZERO" type="BigDecimal"/>
             <!-- Honor the tax toggle: a per-line mode change must not re-apply GST when tax is OFF. -->
-            <if condition="taxOn == 'N'"><set field="ttax" from="BigDecimal.ZERO" type="BigDecimal"/></if>
+            <if condition="taxOn == 'N'"><set field="ttax" from="BigDecimal.ZERO" type="BigDecimal"/>
+                <!-- ZE-TAX-PHANTOM: clear the stale GST breakdown so recorded detail matches the tax-free charge. -->
+                <entity-delete-by-condition entity-name="zenith.erp.tax.TaxLineDetail">
+                    <econdition field-name="referenceType" value="PosTransactionItem"/>
+                    <econdition field-name="referenceId" from="transactionId"/>
+                    <econdition field-name="referenceSeqId" from="itemSeqId"/>
+                </entity-delete-by-condition>
+            </if>
             <service-call name="update#zenith.erp.pos.PosTransactionItem"
                 in-map="[transactionId:transactionId, itemSeqId:itemSeqId, unitPrice:newUnit,
                          mrp:(prod?.mrpAmount ?: newUnit),
