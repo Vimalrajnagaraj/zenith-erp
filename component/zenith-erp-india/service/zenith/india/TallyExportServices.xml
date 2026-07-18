@@ -2,10 +2,13 @@
 <services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
           xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
 
-    <!-- Export Journal Entries to Tally XML format -->
+    <!-- Export Journal Entries to Tally XML format.
+         ZE-ACCT-TALLY: rebound from the never-existent zenith.erp.accounting.JournalEntry/JournalEntryLine/GlAccount
+         to the REAL Mantle ledger the accounting module actually writes (ManualJournalEntry + post#AcctgTrans):
+         mantle.ledger.transaction.AcctgTrans (header) + AcctgTransEntry (lines, amount + debitCreditFlag) +
+         mantle.ledger.account.GlAccount. -->
     <service verb="export" noun="JournalsToTally">
-        <description>Export accounting journal entries in Tally-compatible XML format.
-            Generates Tally Day Book XML that can be imported via Tally Gateway.</description>
+        <description>Export posted ledger transactions in Tally-compatible XML (Day Book vouchers).</description>
         <in-parameters>
             <parameter name="organizationPartyId" required="true"/>
             <parameter name="fromDate" type="Date" required="true"/>
@@ -17,16 +20,21 @@
             <parameter name="voucherCount" type="Integer"/>
         </out-parameters>
         <actions>
-            <entity-find entity-name="zenith.erp.accounting.JournalEntry" list="journals">
+            <!-- transactionDate is a Timestamp; make toDate inclusive of the whole day. -->
+            <set field="toDateEnd" from="new java.sql.Timestamp(toDate.getTime() + 86400000L)"/>
+            <entity-find entity-name="mantle.ledger.transaction.AcctgTrans" list="journals">
                 <econdition field-name="organizationPartyId"/>
                 <econdition field-name="transactionDate" operator="greater-equals" from="fromDate"/>
-                <econdition field-name="transactionDate" operator="less-equals" from="toDate"/>
-                <econdition field-name="statusId" value="JePosted"/>
+                <econdition field-name="transactionDate" operator="less" from="toDateEnd"/>
+                <econdition field-name="isPosted" value="Y"/>
                 <order-by field-name="transactionDate"/>
             </entity-find>
 
             <set field="voucherCount" from="journals?.size() ?: 0"/>
             <script><![CDATA[
+                def vtMap = ['AttJournal':'Journal', 'AttSalesInvoice':'Sales', 'AttPurchaseInvoice':'Purchase',
+                             'AttIncomingPayment':'Receipt', 'AttOutgoingPayment':'Payment', 'AttContra':'Contra']
+                def esc = { s -> (s ?: '').toString().replace('&','&amp;').replace('<','&lt;').replace('>','&gt;') }
                 def sb = new StringBuilder()
                 sb.append('<?xml version="1.0" encoding="UTF-8"?>\n')
                 sb.append('<ENVELOPE>\n')
@@ -38,49 +46,47 @@
                 sb.append('      <REQUESTDESC>\n')
                 sb.append('        <REPORTNAME>Vouchers</REPORTNAME>\n')
                 sb.append('        <STATICVARIABLES>\n')
-                sb.append('          <SVCURRENTCOMPANY>' + (companyName ?: 'Company') + '</SVCURRENTCOMPANY>\n')
+                sb.append('          <SVCURRENTCOMPANY>' + esc(companyName ?: 'Company') + '</SVCURRENTCOMPANY>\n')
                 sb.append('        </STATICVARIABLES>\n')
                 sb.append('      </REQUESTDESC>\n')
                 sb.append('      <REQUESTDATA>\n')
 
+                def acctNameCache = [:]
                 journals?.each { journal ->
                     def txnDate = ec.l10n.format(journal.transactionDate, 'yyyyMMdd')
-                    def voucherType = 'Journal'
-                    if (journal.voucherType == 'Sales') voucherType = 'Sales'
-                    else if (journal.voucherType == 'Purchase') voucherType = 'Purchase'
-                    else if (journal.voucherType == 'Payment') voucherType = 'Payment'
-                    else if (journal.voucherType == 'Receipt') voucherType = 'Receipt'
-                    else if (journal.voucherType == 'Contra') voucherType = 'Contra'
+                    def voucherType = vtMap[journal.acctgTransTypeEnumId] ?: 'Journal'
 
                     sb.append('        <TALLYMESSAGE xmlns:UDF="TallyUDF">\n')
                     sb.append('          <VOUCHER VCHTYPE="' + voucherType + '" ACTION="Create">\n')
                     sb.append('            <DATE>' + txnDate + '</DATE>\n')
                     sb.append('            <VOUCHERTYPENAME>' + voucherType + '</VOUCHERTYPENAME>\n')
-                    sb.append('            <VOUCHERNUMBER>' + (journal.voucherNumber ?: journal.journalEntryId) + '</VOUCHERNUMBER>\n')
-                    sb.append('            <NARRATION>' + (journal.description ?: '') + '</NARRATION>\n')
+                    sb.append('            <VOUCHERNUMBER>' + esc(journal.voucherRef ?: journal.acctgTransId) + '</VOUCHERNUMBER>\n')
+                    sb.append('            <NARRATION>' + esc(journal.description) + '</NARRATION>\n')
 
-                    // Get line items
-                    def lines = ec.entity.find('zenith.erp.accounting.JournalEntryLine')
-                        .condition('journalEntryId', journal.journalEntryId).list()
+                    def lines = ec.entity.find('mantle.ledger.transaction.AcctgTransEntry')
+                        .condition('acctgTransId', journal.acctgTransId).orderBy('acctgTransEntrySeqId').list()
 
                     lines?.each { line ->
-                        def acctName = ''
-                        def acct = ec.entity.find('zenith.erp.accounting.GlAccount')
-                            .condition('glAccountId', line.glAccountId).one()
-                        if (acct) acctName = acct.accountName ?: acct.glAccountId
-
-                        if (line.debitAmount && line.debitAmount > 0) {
-                            sb.append('            <ALLLEDGERENTRIES.LIST>\n')
-                            sb.append('              <LEDGERNAME>' + acctName + '</LEDGERNAME>\n')
-                            sb.append('              <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>\n')
-                            sb.append('              <AMOUNT>-' + line.debitAmount + '</AMOUNT>\n')
-                            sb.append('            </ALLLEDGERENTRIES.LIST>\n')
+                        def acctName = acctNameCache[line.glAccountId]
+                        if (acctName == null) {
+                            def acct = ec.entity.find('mantle.ledger.account.GlAccount')
+                                .condition('glAccountId', line.glAccountId).one()
+                            acctName = acct ? (acct.accountName ?: acct.glAccountId) : line.glAccountId
+                            acctNameCache[line.glAccountId] = acctName
                         }
-                        if (line.creditAmount && line.creditAmount > 0) {
+                        def amt = line.amount ?: 0
+                        // Tally: debit => ISDEEMEDPOSITIVE Yes with a negative AMOUNT; credit => No with positive.
+                        if (line.debitCreditFlag == 'D') {
                             sb.append('            <ALLLEDGERENTRIES.LIST>\n')
-                            sb.append('              <LEDGERNAME>' + acctName + '</LEDGERNAME>\n')
+                            sb.append('              <LEDGERNAME>' + esc(acctName) + '</LEDGERNAME>\n')
+                            sb.append('              <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>\n')
+                            sb.append('              <AMOUNT>-' + amt + '</AMOUNT>\n')
+                            sb.append('            </ALLLEDGERENTRIES.LIST>\n')
+                        } else if (line.debitCreditFlag == 'C') {
+                            sb.append('            <ALLLEDGERENTRIES.LIST>\n')
+                            sb.append('              <LEDGERNAME>' + esc(acctName) + '</LEDGERNAME>\n')
                             sb.append('              <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>\n')
-                            sb.append('              <AMOUNT>' + line.creditAmount + '</AMOUNT>\n')
+                            sb.append('              <AMOUNT>' + amt + '</AMOUNT>\n')
                             sb.append('            </ALLLEDGERENTRIES.LIST>\n')
                         }
                     }
@@ -99,7 +105,8 @@
         </actions>
     </service>
 
-    <!-- Export Chart of Accounts to Tally -->
+    <!-- Export Chart of Accounts to Tally as Ledger masters. GL accounts are a GLOBAL chart in Mantle
+         (mantle.ledger.account.GlAccount has NO organizationPartyId) so no org filter is applied. -->
     <service verb="export" noun="LedgersToTally">
         <description>Export GL accounts as Tally Ledger masters</description>
         <in-parameters>
@@ -111,12 +118,12 @@
             <parameter name="ledgerCount" type="Integer"/>
         </out-parameters>
         <actions>
-            <entity-find entity-name="zenith.erp.accounting.GlAccount" list="accounts">
-                <econdition field-name="organizationPartyId"/>
+            <entity-find entity-name="mantle.ledger.account.GlAccount" list="accounts">
                 <order-by field-name="accountCode"/>
             </entity-find>
             <set field="ledgerCount" from="accounts?.size() ?: 0"/>
             <script><![CDATA[
+                def esc = { s -> (s ?: '').toString().replace('&','&amp;').replace('<','&lt;').replace('>','&gt;') }
                 def sb = new StringBuilder()
                 sb.append('<?xml version="1.0" encoding="UTF-8"?>\n')
                 sb.append('<ENVELOPE>\n')
@@ -128,7 +135,7 @@
                 sb.append('      <REQUESTDESC>\n')
                 sb.append('        <REPORTNAME>All Masters</REPORTNAME>\n')
                 sb.append('        <STATICVARIABLES>\n')
-                sb.append('          <SVCURRENTCOMPANY>' + (companyName ?: 'Company') + '</SVCURRENTCOMPANY>\n')
+                sb.append('          <SVCURRENTCOMPANY>' + esc(companyName ?: 'Company') + '</SVCURRENTCOMPANY>\n')
                 sb.append('        </STATICVARIABLES>\n')
                 sb.append('      </REQUESTDESC>\n')
                 sb.append('      <REQUESTDATA>\n')
@@ -146,7 +153,7 @@
                 accounts?.each { acct ->
                     def tallyGroup = tallyGroupMap[acct.accountClassification] ?: 'Sundry Debtors'
                     sb.append('        <TALLYMESSAGE xmlns:UDF="TallyUDF">\n')
-                    sb.append('          <LEDGER NAME="' + (acct.accountName ?: acct.glAccountId) + '" ACTION="Create">\n')
+                    sb.append('          <LEDGER NAME="' + esc(acct.accountName ?: acct.glAccountId) + '" ACTION="Create">\n')
                     sb.append('            <PARENT>' + tallyGroup + '</PARENT>\n')
                     sb.append('            <OPENINGBALANCE>0</OPENINGBALANCE>\n')
                     sb.append('          </LEDGER>\n')
