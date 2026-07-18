@@ -97,7 +97,9 @@
         <in-parameters>
             <parameter name="priceListId" required="true"/>
             <parameter name="productId" required="true"/>
-            <parameter name="unitPrice" type="BigDecimal" required="true"/>
+            <!-- ZE-PRC-014: not service-level required — a Discount-type item has no unit price (it derives from
+                 the product MRP in calculate#Price). The body requires a Unit Price for Fixed items instead. -->
+            <parameter name="unitPrice" type="BigDecimal"/>
             <parameter name="minQuantity" type="BigDecimal" default="1"/>
             <parameter name="maxQuantity" type="BigDecimal"/>
             <parameter name="priceTypeEnumId" default-value="PtpFixed"/>
@@ -111,10 +113,20 @@
             <parameter name="priceListItemId"/>
         </out-parameters>
         <actions>
-            <!-- ZE-CONTACTS-022 f/u: a discount is a percentage — reject out-of-range (0-100). Blank allowed. -->
+            <!-- ZE-CONTACTS-022 f/u: a discount is a percentage — reject out-of-range (0-100). Blank allowed.
+                 ZE-PRC-014: a Discount-type item needs a Discount % (not a Unit Price); a Fixed item needs a Unit
+                 Price. A discount item's stored unitPrice is unused by calculate#Price, so default it to 0. -->
             <script><![CDATA[
-                if (discountPercent != null && discountPercent.toString().trim() && ((discountPercent as BigDecimal) < 0 || (discountPercent as BigDecimal) > 100))
+                def _isDiscount = priceTypeEnumId == 'PtpDiscount'
+                def _dpBlank = (discountPercent == null || !discountPercent.toString().trim())
+                if (!_dpBlank && ((discountPercent as BigDecimal) < 0 || (discountPercent as BigDecimal) > 100))
                     ec.message.addError("Discount % must be between 0 and 100.")
+                if (_isDiscount) {
+                    if (_dpBlank) ec.message.addError("Enter a Discount % for a Discount-type price item.")
+                    if (unitPrice == null) unitPrice = BigDecimal.ZERO
+                } else if (unitPrice == null) {
+                    ec.message.addError("Enter a Unit Price for a Fixed-type price item.")
+                }
             ]]></script>
             <if condition="ec.message.hasError()"><return/></if>
             <entity-find-one entity-name="zenith.erp.pricing.PriceList" value-field="_pl"><field-map field-name="priceListId"/></entity-find-one>
@@ -129,7 +141,8 @@
                 <then>
                     <set field="prev" from="existing[0]"/>
                     <set field="priceListItemId" from="prev.priceListItemId"/>
-                    <if condition="prev.unitPrice != unitPrice">
+                    <!-- ZE-PRC-014: only log unit-price changes for Fixed items; a discount item's unitPrice is 0/unused. -->
+                    <if condition="priceTypeEnumId != 'PtpDiscount' &amp;&amp; prev.unitPrice != unitPrice">
                         <service-call name="create#zenith.erp.pricing.PriceChangeLog"
                                       in-map="[priceListId:priceListId, productId:productId,
                                                organizationPartyId:organizationPartyId, previousPrice:prev.unitPrice, newPrice:unitPrice,
@@ -149,12 +162,15 @@
                                            priceTypeEnumId:priceTypeEnumId, discountPercent:discountPercent,
                                            marginPercent:marginPercent, validFromDate:validFromDate,
                                            validThruDate:validThruDate]"/>
-                    <service-call name="create#zenith.erp.pricing.PriceChangeLog"
-                                  in-map="[priceListId:priceListId, productId:productId,
-                                           organizationPartyId:organizationPartyId, previousPrice:0, newPrice:unitPrice,
-                                           changeReason:changeReason ?: 'Initial price set',
-                                           changedByUserId:ec.user.userId,
-                                           changeDate:ec.user.nowTimestamp]"/>
+                    <!-- ZE-PRC-014: skip the ₹0 log entry for a discount item (its unitPrice is 0/unused). -->
+                    <if condition="priceTypeEnumId != 'PtpDiscount'">
+                        <service-call name="create#zenith.erp.pricing.PriceChangeLog"
+                                      in-map="[priceListId:priceListId, productId:productId,
+                                               organizationPartyId:organizationPartyId, previousPrice:0, newPrice:unitPrice,
+                                               changeReason:changeReason ?: 'Initial price set',
+                                               changedByUserId:ec.user.userId,
+                                               changeDate:ec.user.nowTimestamp]"/>
+                    </if>
                 </else>
             </if>
         </actions>
