@@ -21,8 +21,41 @@
         <default-response url="."/>
     </transition>
 
+    <!-- ZE-SUB-008 (MS-048): a manual invoice must be GST-correct + auditable. Old version entity-auto-created
+         with a flat, hand-typed taxAmount and NO invoice number and NO CGST/SGST/IGST split. Now: number it in
+         the shared SAAS-yyyyMM-NNNN series, and route the tax through the SAME India GST engine the renewal cron
+         uses (calculate#SubscriptionTax, ZETAERP supplier) so the head-split is computed. The split is populated
+         once ZETAERP's GSTIN/state + the tenant's state are configured; until then the engine returns a correct
+         flat 18% total. Admin enters the taxable Subtotal + GST% only. -->
     <transition name="createInvoice">
-        <service-call name="create#zenith.erp.saas.SaasInvoice"/>
+        <actions>
+            <script><![CDATA[
+                import java.time.LocalDate
+                import java.math.BigDecimal
+                def _tenant = ec.entity.find("zenith.erp.saas.SaasTenant").condition("tenantId", tenantId).disableAuthz().one()
+                if (_tenant == null) { ec.message.addError("Select a tenant."); return }
+                def _sub = (subtotal ?: 0) as BigDecimal
+                if (_sub.signum() <= 0) { ec.message.addError("Enter a Subtotal greater than 0."); return }
+                def _rate = (gstRate != null && gstRate.toString().trim()) ? (gstRate as BigDecimal) : new BigDecimal(18)
+                def taxOut = ec.service.sync().name("zenith.subscriptions.SubscriptionServices.calculate#SubscriptionTax")
+                    .parameters([organizationPartyId:'ZETAERP', customerPartyId:_tenant.organizationPartyId,
+                                 taxableAmount:_sub, gstRate:_rate]).disableAuthz().call()
+                def _prefix = 'SAAS-' + LocalDate.now().toString().substring(0,7).replace('-','') + '-'
+                def _last = ec.entity.find("zenith.erp.saas.SaasInvoice").condition("invoiceNumber","like",_prefix+'%')
+                    .orderBy("-invoiceNumber").disableAuthz().list()
+                int _seq = 1
+                if (_last) { try { _seq = (_last[0].invoiceNumber.toString().substring(_prefix.length()) as Integer) + 1 } catch (Exception e) { _seq = _last.size() + 1 } }
+                def _invNo = _prefix + String.format('%04d', _seq)
+                ec.service.sync().name("create#zenith.erp.saas.SaasInvoice").parameters([
+                    tenantId:tenantId, invoiceNumber:_invNo, invoiceDate:invoiceDate, dueDate:dueDate,
+                    periodFrom:periodFrom, periodTo:periodTo, subtotal:_sub, taxAmount:(taxOut?.taxAmount ?: 0),
+                    cgstAmount:taxOut?.cgstAmount, sgstAmount:taxOut?.sgstAmount, igstAmount:taxOut?.igstAmount,
+                    placeOfSupply:taxOut?.placeOfSupply, totalAmount:(taxOut?.totalAmount ?: _sub),
+                    currencyUomId:(currencyUomId ?: 'INR'), statusId:(statusId ?: 'SiSent'), notes:notes
+                ]).disableAuthz().call()
+                ec.message.addMessage("Invoice ${_invNo} created for ${_tenant.tenantName} — subtotal ${_sub} + GST ${(taxOut?.taxAmount ?: 0)} = ${(taxOut?.totalAmount ?: _sub)}.")
+            ]]></script>
+        </actions>
         <default-response url="."/>
     </transition>
 
@@ -57,14 +90,12 @@
                     <field name="periodTo"><default-field title="Period To">
                         <date-time type="date"/>
                     </default-field></field>
-                    <field name="subtotal"><default-field title="Subtotal">
+                    <field name="subtotal"><default-field title="Subtotal (taxable, ex-GST)">
                         <text-line size="10" input-type="number"/>
                     </default-field></field>
-                    <field name="taxAmount"><default-field title="Tax Amount">
-                        <text-line size="10" input-type="number" default-value="0"/>
-                    </default-field></field>
-                    <field name="totalAmount"><default-field title="Total Amount">
-                        <text-line size="10" input-type="number"/>
+                    <field name="gstRate"><default-field title="GST %">
+                        <text-line size="5" input-type="number" default-value="18"/>
+                        <label text="Tax, CGST/SGST or IGST split, and Total are computed automatically." style="text-grey-6 text-caption" type="p"/>
                     </default-field></field>
                     <field name="currencyUomId"><default-field title="Currency">
                         <text-line size="5" default-value="INR"/>
@@ -101,6 +132,8 @@
                     <default-field title="Status"><display-entity entity-name="moqui.basic.StatusItem"/></default-field></field>
                 <field name="paidDate"><default-field title="Paid"><display format="dd-MMM-yyyy"/></default-field></field>
                 <field name="actions"><default-field title="">
+                    <link url="InvoiceDetail" text="View" btn-type="info" icon="fa fa-eye"
+                          parameter-map="[saasInvoiceId:saasInvoiceId]"/>
                     <link url="markPaid" text="Mark Paid" btn-type="success" icon="fa fa-check"
                           parameter-map="[saasInvoiceId:saasInvoiceId]"
                           condition="statusId == 'SiSent' || statusId == 'SiOverdue'"

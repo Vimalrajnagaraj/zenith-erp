@@ -1,0 +1,139 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- ZE-SUB-008 (MS-048): view/print a SaaS invoice with its full GST breakdown so an admin can verify the
+     tax calculation. Super-admin only (gated by the SaasAdmin parent pre-actions; this is a render, no
+     transition). Mounted under SaasAdmin (menu-include=false); reached from the Invoices list "View" link.
+     All display strings are computed in the <script> (Groovy) so the labels use plain ${...} (no Groovy in
+     the FreeMarker label expressions). -->
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
+        default-menu-title="Invoice" require-authentication="true">
+    <parameter name="saasInvoiceId" required="true"/>
+    <actions>
+        <entity-find-one entity-name="zenith.erp.saas.SaasInvoice" value-field="inv"/>
+        <set field="notFound" from="inv == null"/>
+        <if condition="inv != null">
+            <entity-find-one entity-name="zenith.erp.saas.SaasTenant" value-field="tenant">
+                <field-map field-name="tenantId" from="inv.tenantId"/>
+            </entity-find-one>
+            <script><![CDATA[
+                // NB: no `import` here — this <script> sits after <entity-find-one> in one compiled actions
+                // block, so imports would land mid-script (parse error). Fully-qualify java.math.* instead.
+                def bd = { v -> (v == null) ? null : (v as java.math.BigDecimal) }
+                def nz = { v -> ((v ?: 0) as java.math.BigDecimal) }
+                def _sub = nz(inv.subtotal), _tax = nz(inv.taxAmount)
+                def _cgst = bd(inv.cgstAmount), _sgst = bd(inv.sgstAmount), _igst = bd(inv.igstAmount)
+                context.hasSplit = (_cgst != null && _cgst.signum() != 0) || (_sgst != null && _sgst.signum() != 0) || (_igst != null && _igst.signum() != 0)
+                context.isInterState = (_igst != null && _igst.signum() != 0)
+
+                def gstPct = _sub.signum() > 0 ? _tax.multiply(new java.math.BigDecimal(100)).divide(_sub, 2, java.math.RoundingMode.HALF_UP) : java.math.BigDecimal.ZERO
+                def halfPct = gstPct.divide(new java.math.BigDecimal(2), 2, java.math.RoundingMode.HALF_UP)
+                context.gstPctStr = gstPct.stripTrailingZeros().toPlainString()
+                context.halfPctStr = halfPct.stripTrailingZeros().toPlainString()
+
+                def cur = inv.currencyUomId ?: 'INR'
+                def sym = cur == 'INR' ? '₹' : (cur + ' ')
+                def money = { v -> sym + ec.l10n.format(nz(v), '#,##0.00') }
+                context.subtotalFmt = money(inv.subtotal)
+                context.taxFmt   = money(inv.taxAmount)
+                context.cgstFmt  = money(inv.cgstAmount)
+                context.sgstFmt  = money(inv.sgstAmount)
+                context.igstFmt  = money(inv.igstAmount)
+                context.totalFmt = money(inv.totalAmount)
+
+                def dt = { d -> d == null ? '' : ec.l10n.format(d, 'dd-MMM-yyyy') }
+                context.invNo = inv.invoiceNumber ?: inv.saasInvoiceId
+                context.invDateStr = dt(inv.invoiceDate)
+                context.dueDateStr = dt(inv.dueDate)
+                context.periodStr = dt(inv.periodFrom) + ' to ' + dt(inv.periodTo)
+                context.statusDesc = ec.entity.find("moqui.basic.StatusItem").condition("statusId", inv.statusId).disableAuthz().one()?.description ?: inv.statusId
+
+                def gstinOf = { pid -> pid ? ec.entity.find("mantle.party.PartyIdentification")
+                    .condition("partyId", pid).condition("partyIdTypeEnumId", "PtidGstin").disableAuthz().one()?.idValue : null }
+                context.supplierName = ec.entity.find("mantle.party.Organization").condition("partyId", "ZETAERP").disableAuthz().one()?.organizationName ?: "ZetaERP Platform"
+                context.supplierGstin = gstinOf("ZETAERP") ?: '— not configured —'
+                context.buyerName = tenant?.tenantName ?: inv.tenantId
+                context.buyerSub = tenant?.subdomain ?: ''
+                context.buyerGstin = gstinOf(tenant?.organizationPartyId) ?: '—'
+                context.posStr = inv.placeOfSupply ?: '—'
+                context.gstLineLabel = 'GST @ ' + context.gstPctStr + '%' + (inv.placeOfSupply ? ' (POS ' + inv.placeOfSupply + ')' : '')
+                context.splitNote = context.hasSplit ? '' :
+                    "GST head-split (CGST/SGST vs IGST) appears once ZETAERP's GSTIN + state and the tenant's state are configured; the total tax is correct either way."
+            ]]></script>
+        </if>
+    </actions>
+    <widgets>
+        <section name="NotFound" condition="notFound">
+            <widgets><label text="Invoice not found." type="h6" style="text-negative"/></widgets>
+        </section>
+        <section name="Detail" condition="!notFound">
+            <widgets>
+                <render-mode><text type="html,vuet,qvt"><![CDATA[
+                    <img src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" alt="" style="display:none"
+                         onload="if(!window.__saasInvPrint){window.__saasInvPrint=1;var st=document.createElement('style');st.textContent='@media print{.q-header,.q-drawer,.q-page-sticky,header,nav,.saas-noprint{display:none !important}.saas-inv-doc{box-shadow:none !important;border:1px solid #ccc}}';document.head.appendChild(st);document.addEventListener('click',function(e){var b=e.target&&e.target.closest?e.target.closest('.saas-print-btn'):null;if(b){e.preventDefault();window.print();}});}"/>
+                ]]></text></render-mode>
+
+                <container style="row justify-between items-center q-mb-md saas-noprint">
+                    <label text="Invoice ${invNo}" type="h5" style="text-weight-bold q-my-none"/>
+                    <render-mode><text type="html"><![CDATA[
+                        <button class="btn btn-primary saas-print-btn"><i class="fa fa-print"></i> Print</button>
+                    ]]></text><text type="vuet,qvt"><![CDATA[
+                        <q-btn color="primary" size="sm" label="Print" icon="print" class="saas-print-btn"/>
+                    ]]></text></render-mode>
+                </container>
+
+                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg saas-inv-doc">
+                    <container style="row justify-between q-mb-lg">
+                        <container style="col">
+                            <label text="${supplierName}" type="h6" style="text-weight-bold"/>
+                            <label text="Platform subscription (SAC 998314)" type="p" style="text-grey-7 text-caption"/>
+                            <label text="GSTIN: ${supplierGstin}" type="p" style="text-caption"/>
+                        </container>
+                        <container style="col text-right">
+                            <label text="TAX INVOICE" type="h6" style="text-weight-bold text-primary"/>
+                            <label text="No: ${invNo}" type="p" style="text-caption"/>
+                            <label text="Date: ${invDateStr}" type="p" style="text-caption"/>
+                            <label text="Due: ${dueDateStr}" type="p" style="text-caption"/>
+                            <label text="Status: ${statusDesc}" type="p" style="text-caption text-weight-bold"/>
+                        </container>
+                    </container>
+
+                    <container style="q-mb-md q-pa-sm bg-grey-2 border-radius-md">
+                        <label text="Bill To" style="text-caption text-grey-7 text-weight-bold"/>
+                        <label text="${buyerName}" type="p" style="text-weight-bold"/>
+                        <label text="Subdomain: ${buyerSub}" type="p" style="text-caption"/>
+                        <label text="GSTIN: ${buyerGstin}" type="p" style="text-caption"/>
+                        <label text="Billing period: ${periodStr}" type="p" style="text-caption"/>
+                    </container>
+
+                    <container style="q-mt-md">
+                        <container style="row justify-between q-py-xs">
+                            <label text="Taxable Amount"/><label text="${subtotalFmt}" style="text-weight-medium"/>
+                        </container>
+                        <section name="Intra" condition="hasSplit &amp;&amp; !isInterState"><widgets>
+                            <container style="row justify-between q-py-xs"><label text="CGST @ ${halfPctStr}%"/><label text="${cgstFmt}"/></container>
+                            <container style="row justify-between q-py-xs"><label text="SGST @ ${halfPctStr}%"/><label text="${sgstFmt}"/></container>
+                        </widgets></section>
+                        <section name="Inter" condition="hasSplit &amp;&amp; isInterState"><widgets>
+                            <container style="row justify-between q-py-xs"><label text="IGST @ ${gstPctStr}%"/><label text="${igstFmt}"/></container>
+                        </widgets></section>
+                        <section name="Flat" condition="!hasSplit"><widgets>
+                            <container style="row justify-between q-py-xs"><label text="${gstLineLabel}"/><label text="${taxFmt}"/></container>
+                        </widgets></section>
+                        <container style="row justify-between q-py-sm q-mt-xs">
+                            <label text="Total Amount" type="h6" style="text-weight-bold"/>
+                            <label text="${totalFmt}" type="h6" style="text-weight-bold text-primary"/>
+                        </container>
+                    </container>
+
+                    <label text="Place of supply: ${posStr}" type="p" style="text-grey-6 text-caption q-mt-md"/>
+                    <section name="SplitNote" condition="splitNote"><widgets>
+                        <label text="${splitNote}" type="p" style="text-grey-6 text-caption"/>
+                    </widgets></section>
+                    <section name="Notes" condition="inv.notes"><widgets>
+                        <label text="Notes: ${inv.notes}" type="p" style="text-grey-7 text-caption q-mt-sm"/>
+                    </widgets></section>
+                </container>
+            </widgets>
+        </section>
+    </widgets>
+</screen>
