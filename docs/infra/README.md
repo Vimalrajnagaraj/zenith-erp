@@ -18,6 +18,18 @@ container) and terminates TLS, with Cloudflare in front — so host config is NO
   pattern from `~/CLAUDE.md`); reports `file:line:col`. Also flags an unterminated `/*`. Run before
   a CSS deploy: `sh docs/infra/lint-css-comments.sh` (requires `node`). Logic in `lint-css-comments.js`.
 
+### Run the guards automatically (pre-commit hook)
+`git-hooks/pre-commit` runs the three **static** guards above at commit time, each gated on the
+file type it cares about (css-comments on staged `.css`/`.xml`; party-picker + cross-module on
+staged `.xml`) so unrelated commits aren't slowed. `lint-purge-vocabulary.sh` is deliberately NOT
+wired — it needs the Docker API (a runtime check), so it would block commits when Docker is down.
+**Activate once per clone** (`core.hooksPath` is local, not committed — a fresh clone must opt in):
+```
+sh docs/infra/install-git-hooks.sh      # sets core.hooksPath -> docs/infra/git-hooks
+```
+Emergency bypass: `git commit --no-verify`. The guards scan the whole tree (fast), so they also
+stop a pre-existing violation from riding in alongside your change; all three pass on the tree today.
+
 ## One-command sync (no more manual scp)
 - **Push repo → server** (rebuild recovery, or to ship a repo-side change):
   `bash docs/infra/apply-host-config.sh [user@host]`
