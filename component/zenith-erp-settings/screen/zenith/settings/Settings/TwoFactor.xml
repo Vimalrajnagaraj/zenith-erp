@@ -1,0 +1,205 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
+        default-menu-title="Two-Factor Login" default-menu-index="96">
+
+    <!-- ZE-AUTH-022: self-service Two-Factor Authentication (authenticator-app TOTP + single-use backup codes).
+         The login ALREADY enforces a 2nd factor when a user has an active UserAuthcFactor (proven) — this screen
+         is the missing ENROLLMENT surface so a user can turn 2FA on for their OWN account. SECURITY: every
+         transition forces userId = ec.user.userId (never a submitted value), so no one can manage another
+         account's 2FA; turning 2FA off or regenerating backup codes requires a current code (proves possession).
+         Uses only the framework's own, already-working services (create/setup/validate#UserAuthcFactor*). -->
+
+    <!-- Step 1: create a pending TOTP factor for the current user (one at a time). -->
+    <transition name="enableTotp">
+        <actions>
+            <script><![CDATA[
+                def _uid = ec.user.userId
+                boolean _d = ec.artifactExecution.disableAuthz()
+                try {
+                    // reuse any existing pending setup; only create when there is no TOTP factor yet
+                    def existing = ec.entity.find("moqui.security.UserAuthcFactor")
+                            .condition("userId", _uid).condition("factorTypeEnumId", "UafTotp").list()
+                    if (!existing) {
+                        ec.service.sync().name("org.moqui.impl.UserServices.create#UserAuthcFactorTotp")
+                                .parameters([userId: _uid]).call()
+                    }
+                } finally { if (!_d) ec.artifactExecution.enableAuthz() }
+            ]]></script>
+        </actions>
+        <default-response url="."/>
+    </transition>
+
+    <!-- Step 2: verify the first 6-digit code -> activates the factor, then issue backup codes. -->
+    <transition name="verifyTotp">
+        <actions>
+            <set field="_uid" from="ec.user.userId"/>
+            <service-call name="org.moqui.impl.UserServices.validate#UserAuthcFactorCode"
+                          in-map="[userId:_uid, code:code]" out-map="_v"/>
+            <if condition="_v.verified"><then>
+                <service-call name="org.moqui.impl.UserServices.create#SingleUseAuthcCodes"
+                              in-map="[userId:_uid, numberOfCodes:10]" out-map="_rc"/>
+                <script>ec.web.sessionAttributes.put("zTwoFaCodes", _rc.singleUseCodes)</script>
+                <message>Two-factor login is now on. Save your backup codes shown below — each works once if you lose your phone.</message>
+            </then><else>
+                <message error="true" public="true">That code didn't match. Open your authenticator app and enter the current 6-digit code.</message>
+            </else></if>
+        </actions>
+        <default-response url="."/>
+    </transition>
+
+    <!-- Cancel an unverified setup (never touches an active factor). -->
+    <transition name="cancelSetup">
+        <actions>
+            <script><![CDATA[
+                def _uid = ec.user.userId
+                boolean _d = ec.artifactExecution.disableAuthz()
+                try {
+                    ec.entity.find("moqui.security.UserAuthcFactor").condition("userId", _uid)
+                            .condition("needsValidation", "Y").deleteAll()
+                } finally { if (!_d) ec.artifactExecution.enableAuthz() }
+            ]]></script>
+        </actions>
+        <default-response url="."/>
+    </transition>
+
+    <!-- Regenerate backup codes — requires a current code (TOTP or an existing backup code). -->
+    <transition name="regenCodes">
+        <actions>
+            <set field="_uid" from="ec.user.userId"/>
+            <service-call name="org.moqui.impl.UserServices.validate#UserAuthcFactorCode"
+                          in-map="[userId:_uid, code:code]" out-map="_v"/>
+            <if condition="_v.verified"><then>
+                <service-call name="org.moqui.impl.UserServices.create#SingleUseAuthcCodes"
+                              in-map="[userId:_uid, numberOfCodes:10]" out-map="_rc"/>
+                <script>ec.web.sessionAttributes.put("zTwoFaCodes", _rc.singleUseCodes)</script>
+                <message>New backup codes generated. Your previous codes no longer work.</message>
+            </then><else>
+                <message error="true" public="true">Enter a current code from your authenticator (or a backup code) to generate new codes.</message>
+            </else></if>
+        </actions>
+        <default-response url="."/>
+    </transition>
+
+    <!-- Turn 2FA off — requires a current code so a hijacked open session can't silently disable it. -->
+    <transition name="disableTotp">
+        <actions>
+            <set field="_uid" from="ec.user.userId"/>
+            <service-call name="org.moqui.impl.UserServices.validate#UserAuthcFactorCode"
+                          in-map="[userId:_uid, code:code]" out-map="_v"/>
+            <if condition="_v.verified"><then>
+                <script><![CDATA[
+                    boolean _d = ec.artifactExecution.disableAuthz()
+                    try {
+                        // remove ALL of this user's factors (TOTP + backup codes) so 2FA is fully off
+                        ec.entity.find("moqui.security.UserAuthcFactor").condition("userId", _uid).deleteAll()
+                    } finally { if (!_d) ec.artifactExecution.enableAuthz() }
+                ]]></script>
+                <message>Two-factor login is now off.</message>
+            </then><else>
+                <message error="true" public="true">Enter a current code from your authenticator (or a backup code) to turn off two-factor login.</message>
+            </else></if>
+        </actions>
+        <default-response url="."/>
+    </transition>
+
+    <actions>
+        <set field="_uid" from="ec.user.userId"/>
+        <set field="_recoveryCodes" from="ec.web.sessionAttributes.remove('zTwoFaCodes')"/>
+        <script><![CDATA[
+            boolean _d = ec.artifactExecution.disableAuthz()
+            try {
+                def now = ec.user.nowTimestamp
+                def factors = ec.entity.find("moqui.security.UserAuthcFactor").condition("userId", _uid).list()
+                def totp = factors.find { it.factorTypeEnumId == 'UafTotp' }
+                context.totpPending = totp != null && totp.needsValidation == 'Y'
+                context.totpActive  = totp != null && totp.needsValidation == 'N'
+                context.pendingFactorId = totp?.factorId
+                context.backupCodesLeft = factors.count { it.factorTypeEnumId == 'UafSingleUse' }
+            } finally { if (!_d) ec.artifactExecution.enableAuthz() }
+        ]]></script>
+        <if condition="totpPending">
+            <service-call name="org.moqui.impl.UserServices.setup#UserAuthcFactorTotp"
+                          in-map="[userId:_uid, factorId:pendingFactorId]" out-map="context"/>
+        </if>
+    </actions>
+
+    <widgets>
+        <container style="zenith-body">
+        <container style="glass-panel q-pa-lg" name="TwoFaCard">
+            <label text="Two-Factor Login" type="h5" style="text-weight-bold q-mb-xs"/>
+            <label type="p" style="text-grey-8 q-mb-md"
+                   text="Add a second step to sign-in. After your password, you'll enter a 6-digit code from an authenticator app on your phone — so your account is safe even if your password is stolen."/>
+
+            <!-- ============ STATE: ON ============ -->
+            <section name="StateOn"><condition><expression>totpActive</expression></condition><widgets>
+                <container style="q-pa-md bg-green-1 border-radius-md q-mb-md">
+                    <label text="✓ Two-factor login is ON for your account." type="strong" style="text-positive"/>
+                    <label type="p" style="text-grey-8 q-mb-none q-mt-xs"
+                           text="You have ${backupCodesLeft ?: 0} backup code(s) left. Each backup code works once if you can't reach your authenticator app."/>
+                </container>
+                <container style="row q-gutter-md items-start">
+                    <container-dialog id="RegenDialog" button-text="Generate new backup codes" type="info">
+                        <form-single name="RegenForm" transition="regenCodes">
+                            <field name="code"><default-field title="Current authenticator code"
+                                    tooltip="A 6-digit code from your app, or one of your backup codes."><text-line size="14"/></default-field></field>
+                            <field name="submitButton"><default-field title="Generate new codes"><submit/></default-field></field>
+                        </form-single>
+                    </container-dialog>
+                    <container-dialog id="DisableDialog" button-text="Turn off two-factor login" type="danger">
+                        <form-single name="DisableForm" transition="disableTotp">
+                            <label type="p" style="text-grey-8 q-mb-sm"
+                                   text="Enter a current code to confirm. Turning this off removes the second step and your backup codes."/>
+                            <field name="code"><default-field title="Current authenticator code"><text-line size="14"/></default-field></field>
+                            <field name="submitButton"><default-field title="Turn off"><submit/></default-field></field>
+                        </form-single>
+                    </container-dialog>
+                </container>
+            </widgets></section>
+
+            <!-- ============ STATE: SETUP (pending verification) ============ -->
+            <section name="StatePending"><condition><expression>totpPending</expression></condition><widgets>
+                <label text="Step 1 — Scan this code in your authenticator app" type="h6" style="text-weight-bold q-mb-sm"/>
+                <label type="p" style="text-grey-8 q-mb-sm"
+                       text="Open an authenticator app (Google Authenticator, Microsoft Authenticator, Authy…) and scan the code below, or add it manually."/>
+                <render-mode><text type="html" template="true"><![CDATA[<div style="text-align:center;margin:8px 0 14px"><img src="${dataUri!''}" alt="Two-factor QR code" style="width:200px;height:200px;border:1px solid #ddd;border-radius:8px;background:#fff;padding:6px"/></div>]]></text></render-mode>
+                <container style="q-pa-md bg-grey-2 border-radius-md q-mb-md">
+                    <label type="p" style="text-grey-8 q-mb-none" text="Can't scan? Enter this key manually:"/>
+                    <label text="${qrSecret ?: ''}" type="strong" style="text-weight-bold" />
+                </container>
+                <label text="Step 2 — Enter the 6-digit code from the app" type="h6" style="text-weight-bold q-mb-sm"/>
+                <form-single name="VerifyForm" transition="verifyTotp" focus-field="code">
+                    <field name="code"><default-field title="6-digit code"
+                            tooltip="The current code shown in your authenticator app."><text-line size="14"/></default-field></field>
+                    <field name="submitButton"><default-field title="Turn on two-factor login"><submit/></default-field></field>
+                </form-single>
+                <form-single name="CancelForm" transition="cancelSetup">
+                    <field name="submitButton"><default-field title="Cancel setup"><submit/></default-field></field>
+                </form-single>
+            </widgets></section>
+
+            <!-- ============ STATE: OFF ============ -->
+            <section name="StateOff"><condition><expression>!totpActive &amp;&amp; !totpPending</expression></condition><widgets>
+                <container style="q-pa-md bg-grey-2 border-radius-md q-mb-md">
+                    <label text="Two-factor login is off." type="strong" style="text-grey-8"/>
+                </container>
+                <form-single name="EnableForm" transition="enableTotp">
+                    <field name="submitButton"><default-field title="Turn on two-factor login"><submit/></default-field></field>
+                </form-single>
+            </widgets></section>
+
+            <!-- ============ Backup codes (shown once, right after verify / regenerate) ============ -->
+            <section name="BackupCodes"><condition><expression>_recoveryCodes</expression></condition><widgets>
+                <container style="q-pa-md q-mt-lg bg-orange-1 border-radius-md">
+                    <label text="Your backup codes — save them now" type="h6" style="text-weight-bold text-negative q-mb-xs"/>
+                    <label type="p" style="text-grey-9 q-mb-sm"
+                           text="Each code works once. Keep them somewhere safe — they're the only way in if you lose your authenticator app. They won't be shown again."/>
+                    <render-mode><text type="html" template="true"><![CDATA[
+                        <div style="display:flex;flex-wrap:wrap;gap:8px 20px;font-family:monospace;font-size:15px;font-weight:700;margin-top:6px">
+                        <#list _recoveryCodes as rc><span style="background:#fff;border:1px solid #f0c98a;border-radius:5px;padding:3px 9px">${rc}</span></#list>
+                        </div>]]></text></render-mode>
+                </container>
+            </widgets></section>
+        </container>
+        </container>
+    </widgets>
+</screen>

@@ -53,17 +53,43 @@ along with this software (see the LICENSE.md file). If not, see
             </else></if>
 
             <if condition="ec.web.sessionAttributes.moquiAuthcFactorRequired">
-                <if condition="code"><then>
-                    <service-call name="org.moqui.impl.UserServices.validate#ExternalUserAuthcCode"
-                            in-map="[code:code]" out-map="validateOut"/>
-                    <if condition="validateOut.verified"><then>
-                        <script>ec.user.internalLoginUser(validateOut.username)</script>
-                        <return/>
-                    </then><else>
-                        <message error="true" public="true">Authentication code is not valid</message>
-                    </else></if>
+                <!-- ZE-AUTH-022: only a COMPLETED (needs_validation='N') factor enforces 2FA. Moqui's loginUser sets
+                     moquiAuthcFactorRequired for ANY factor row, including a pending/unverified enrollment — which
+                     would lock out a user who started but never finished 2FA setup (and, for a solo-admin shop, with
+                     no one to reset them). So if the pre-auth user has NO validated factor, log them in with the
+                     password alone. A user with a validated factor still gets the full code prompt below.
+                     MARUTHI-safe: this branch only runs when the user HAS a factor; no MARUTHI user does. -->
+                <set field="_preU" from="ec.web.sessionAttributes.moquiPreAuthcUsername ?: username"/>
+                <script><![CDATA[
+                    boolean _dz = ec.artifactExecution.disableAuthz()
+                    context._twoFaActive = false
+                    try {
+                        def _ua = _preU ? ec.entity.find("moqui.security.UserAccount").condition("username", _preU).one() : null
+                        if (_ua?.userId) context._twoFaActive = ec.entity.find("moqui.security.UserAuthcFactor")
+                                .condition("userId", _ua.userId).condition("needsValidation", "N")
+                                .conditionDate("fromDate", "thruDate", ec.user.nowTimestamp).count() > 0
+                    } finally { if (!_dz) ec.artifactExecution.enableAuthz() }
+                ]]></script>
+                <if condition="!_twoFaActive"><then>
+                    <!-- incomplete/abandoned enrollment: complete login with the password only, and clear the
+                         pre-auth so the request proceeds to normal org validation below. -->
+                    <script>ec.user.internalLoginUser(_preU)
+                        ec.web.sessionAttributes.remove("moquiAuthcFactorRequired")
+                        ec.web.sessionAttributes.remove("moquiPreAuthcUsername")</script>
                 </then><else>
-                    <message error="true" public="true">Authentication code required for user ${username}</message>
+                    <!-- validated 2FA — require and verify the code -->
+                    <if condition="code"><then>
+                        <service-call name="org.moqui.impl.UserServices.validate#ExternalUserAuthcCode"
+                                in-map="[code:code]" out-map="validateOut"/>
+                        <if condition="validateOut.verified"><then>
+                            <script>ec.user.internalLoginUser(validateOut.username)</script>
+                            <return/>
+                        </then><else>
+                            <message error="true" public="true">Authentication code is not valid</message>
+                        </else></if>
+                    </then><else>
+                        <message error="true" public="true">Authentication code required for user ${username}</message>
+                    </else></if>
                 </else></if>
             </if>
 
