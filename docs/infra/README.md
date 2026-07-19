@@ -30,6 +30,18 @@ sh docs/infra/install-git-hooks.sh      # sets core.hooksPath -> docs/infra/git-
 Emergency bypass: `git commit --no-verify`. The guards scan the whole tree (fast), so they also
 stop a pre-existing violation from riding in alongside your change; all three pass on the tree today.
 
+### CI (clone-proof layer) — `.github/workflows/repo-guards.yml`
+The pre-commit hook is per-clone (must be armed, and is `--no-verify`-bypassable). The workflow runs
+the **same three static guards** on `ubuntu-latest` for every `push` and `pull_request` — server-side,
+so it can't be skipped at setup or bypassed. **It is DORMANT until this repo has a GitHub remote**
+(there is none today — local-only `master` + `feature/*`); GitHub Actions only run on github.com, so
+the file just sits there until the first push to a GitHub repo, then activates automatically with no
+setup. Verified against a `git archive HEAD` checkout (committed files only, exactly what a runner
+sees): all three guards pass, 56 modules / 887 files. `.gitattributes` pins the guard scripts + hook
+to LF so a Windows CRLF commit can't break `/bin/sh` on the Linux runner. Pushing this live commercial
+ERP's source to any remote is a deliberate, security-sensitive decision — not done here; wire the
+remote when you're ready and the guards start enforcing on the server.
+
 ## One-command sync (no more manual scp)
 - **Push repo → server** (rebuild recovery, or to ship a repo-side change):
   `bash docs/infra/apply-host-config.sh [user@host]`
