@@ -11,6 +11,12 @@ container) and terminates TLS, with Cloudflare in front — so host config is NO
   `component://zenith-erp-base/screen/include/PartyPicker.xml`, or uses the picker without a
   local PartyPicker include. Run before a deploy: `sh docs/infra/lint-party-picker.sh`.
   See [[project_pos-barcode-screens]] (ZE-SEC-JSON).
+- `lint-css-comments.sh` — fails on the recurring **`*/`-inside-a-`/* … */`-comment** footgun,
+  where the inner `*/` closes the comment early and the CSS rule that follows is silently dropped
+  (bit the /apps light-mode theme fix and ZE-CONTACTS-028; each cost a redeploy to spot). Scans
+  authored `.css` files **and** CSS inside XML `<style>…</style>` blocks (the per-screen injection
+  pattern from `~/CLAUDE.md`); reports `file:line:col`. Also flags an unterminated `/*`. Run before
+  a CSS deploy: `sh docs/infra/lint-css-comments.sh` (requires `node`). Logic in `lint-css-comments.js`.
 
 ## One-command sync (no more manual scp)
 - **Push repo → server** (rebuild recovery, or to ship a repo-side change):
