@@ -16,6 +16,46 @@
         <default-response url="../EditContact"/>
     </transition>
 
+    <!-- ZE-CONTACTS-027 / CT-166: real XLSX export (Moqui 4.0 has no xlsx render mode — see
+         build#ListXlsx). Exports the full org-scoped, non-disabled contact directory. GSTIN/PAN/CIN are
+         enriched per row from IndiaGstin + Party (ContactListView does not alias them), so the sheet
+         carries the compliance columns. Org isolation via the ownerPartyId econdition. Read-only. -->
+    <transition name="exportExcel" read-only="true">
+        <actions>
+            <entity-find entity-name="zenith.erp.contacts.ContactListView" list="contactList">
+                <econdition field-name="disabled" operator="not-equals" value="Y" or-null="true"/>
+                <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+                <order-by field-name="organizationName"/>
+                <order-by field-name="firstName"/>
+            </entity-find>
+            <script><![CDATA[
+                def rows = []
+                for (r in contactList) {
+                    def party = ec.entity.find("mantle.party.Party").condition("partyId", r.partyId).one()
+                    def gstList = ec.entity.find("zenith.erp.india.IndiaGstin").condition("partyId", r.partyId).list()
+                    def gstin = gstList ? gstList[0].gstin : ''
+                    def gstReg = gstList ? (gstList[0].gstRegistrationType ?: '') : ''
+                    def nm = r.organizationName ?: (((r.firstName ?: '') + ' ' + (r.lastName ?: '')).trim())
+                    def typ = (r.partyTypeEnumId == 'PtyOrganization') ? 'Organization' : 'Person'
+                    rows.add([ (r.partyId ?: ''), (nm ?: 'Unknown'), typ, (r.emailAddress ?: ''), (r.phoneNumber ?: ''),
+                               gstin, gstReg, (party?.panNumber ?: ''), (party?.cinNumber ?: '') ])
+                }
+                context.expHeaders = ['ID', 'Name', 'Type', 'Email', 'Phone', 'GSTIN', 'GST Registration', 'PAN', 'CIN']
+                context.expRows = rows
+            ]]></script>
+            <service-call name="zenith.contacts.ContactServices.build#ListXlsx"
+                          in-map="[sheetName:'All Contacts', headers:expHeaders, rows:expRows]" out-map="context"/>
+            <script><![CDATA[
+                ec.web.response.setContentType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                ec.web.response.setHeader("Content-Disposition", "attachment; filename=\"All_Contacts.xlsx\"")
+                def os = ec.web.response.outputStream
+                os.write(xlsxBase64.decodeBase64())
+                os.flush()
+            ]]></script>
+        </actions>
+        <default-response type="none"/>
+    </transition>
+
     <actions>
         <!-- ZE-CONTACTS-016: disabled contacts are hidden by default (so Customers/Vendors stay clean),
              but "Show Disabled = Yes" drops the filter so a disabled contact can be found and re-enabled
@@ -162,9 +202,12 @@
             </container-dialog>
               </widgets>
             </section>
+            <!-- ZE-CONTACTS-027 / CT-166: export the full contact directory to Excel (real .xlsx). -->
+            <link url="exportExcel" text="Export to Excel" icon="file_download" btn-type="success" class="text-white"
+                  link-type="anchor" target-window="_blank"/>
         </box-toolbar><box-body>
             <form-list name="ContactListForm" list="contactList" skip-form="true" header-dialog="true"
-                       show-csv-button="true" show-xlsx-button="true" show-page-size="true">
+                       show-csv-button="true" show-page-size="true">
                 
                                 <row-actions>
                     <set field="contactName" from="organizationName ?: ((firstName ?: '') + ' ' + (lastName ?: '')).trim()"/>

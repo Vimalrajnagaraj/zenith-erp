@@ -14,6 +14,45 @@
         <default-response url="../EditContact"/>
     </transition>
 
+    <!-- ZE-CONTACTS-027 / CT-166: real XLSX export (Moqui 4.0 has no xlsx render mode — see
+         build#ListXlsx). Exports the full org-scoped, non-disabled supplier list; org isolation via the
+         ownerPartyId econdition (transitions run outside the active-org filter). Read-only. -->
+    <transition name="exportExcel" read-only="true">
+        <actions>
+            <entity-find entity-name="mantle.party.PartyDetailAndRole" list="vendorList">
+                <econdition field-name="roleTypeId" operator="in" value="Supplier,Vendor"/>
+                <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+                <econdition field-name="disabled" operator="not-equals" value="Y" or-null="true"/>
+                <order-by field-name="organizationName"/>
+                <order-by field-name="firstName"/>
+            </entity-find>
+            <script><![CDATA[
+                def rows = []
+                def seen = new HashSet()
+                for (r in vendorList) {
+                    if (!seen.add(r.partyId)) continue   // PartyDetailAndRole repeats a party across roles
+                    def party = ec.entity.find("mantle.party.Party").condition("partyId", r.partyId).one()
+                    def gstList = ec.entity.find("zenith.erp.india.IndiaGstin").condition("partyId", r.partyId).list()
+                    def nm = r.organizationName ?: (((r.firstName ?: '') + ' ' + (r.lastName ?: '')).trim())
+                    def typ = (r.partyTypeEnumId == 'PtyOrganization') ? 'Business' : 'Individual'
+                    rows.add([ (r.partyId ?: ''), (nm ?: 'Unknown'), typ, (gstList ? gstList[0].gstin : ''), (party?.panNumber ?: '') ])
+                }
+                context.expHeaders = ['ID', 'Vendor Name', 'Type', 'GSTIN', 'PAN']
+                context.expRows = rows
+            ]]></script>
+            <service-call name="zenith.contacts.ContactServices.build#ListXlsx"
+                          in-map="[sheetName:'Suppliers', headers:expHeaders, rows:expRows]" out-map="context"/>
+            <script><![CDATA[
+                ec.web.response.setContentType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                ec.web.response.setHeader("Content-Disposition", "attachment; filename=\"Suppliers.xlsx\"")
+                def os = ec.web.response.outputStream
+                os.write(xlsxBase64.decodeBase64())
+                os.flush()
+            ]]></script>
+        </actions>
+        <default-response type="none"/>
+    </transition>
+
     <actions>
         <set field="planGate" from="isSaasTenant &amp;&amp; !saasHasAllAccess &amp;&amp; saasAllowedModules != null"/>
         <set field="showPurchaseBtn" from="!planGate || saasAllowedModules.contains('purchase')"/>
@@ -103,8 +142,13 @@
             </section>
         </container>
 
+        <!-- ZE-CONTACTS-027 / CT-166: export the supplier list to Excel (real .xlsx). -->
+        <container style="row justify-end q-mb-sm">
+            <link url="exportExcel" text="Export to Excel" icon="file_download" btn-type="success" class="text-white"
+                  link-type="anchor" target-window="_blank"/>
+        </container>
         <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md">
-            <form-list name="FindVendorList" list="vendorList" skip-form="true" header-dialog="true" show-csv-button="true" show-xlsx-button="true" show-page-size="true">
+            <form-list name="FindVendorList" list="vendorList" skip-form="true" header-dialog="true" show-csv-button="true" show-page-size="true">
                 <entity-find entity-name="mantle.party.PartyDetailAndRole" list="vendorList">
                     <search-form-inputs default-order-by="organizationName,firstName"/>
                     <econdition field-name="roleTypeId" operator="in" value="Supplier,Vendor"/>

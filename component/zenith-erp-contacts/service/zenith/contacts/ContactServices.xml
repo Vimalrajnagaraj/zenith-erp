@@ -761,4 +761,149 @@
         </actions>
     </service>
 
+    <!-- ZE-CONTACTS-027 / CT-166: shared XLSX builder for the Contacts list exports (All Contacts,
+         Customers, Suppliers, Customer Groups).
+         WHY a hand-rolled builder: Moqui 4.0.0 ships NO xlsx render mode at all — there is no
+         widget-render-class for it (forcing renderMode=xlsx returns 500 "Could not find
+         widget-render-class ... xlsx"), and the framework's own show-xlsx-button is guarded behind
+         isRenderModeValid('xlsx'), which is false here, so that attribute renders nothing. So we build a
+         real .xlsx ourselves as an OOXML (SpreadsheetML) zip using only the JDK — the same proven,
+         already-deployed pattern as Accounting/JournalHistory + TdsRegister (no Apache POI dependency).
+         Every cell is emitted as text (inlineStr) on purpose: contact IDs, phone numbers and GSTINs must
+         keep leading characters and never be coerced by Excel into numbers / scientific notation.
+         Input: sheetName, headers (List<String>), rows (List<List<Object>>). Returns xlsxBase64 (the
+         workbook bytes, base64-encoded — a String crosses the service boundary with no type coercion
+         risk; each screen's read-only exportExcel transition decodes it and streams the bytes). -->
+    <service verb="build" noun="ListXlsx">
+        <in-parameters>
+            <parameter name="sheetName" default-value="Sheet1"/>
+            <parameter name="headers" type="java.util.List" required="true"/>
+            <parameter name="rows" type="java.util.List" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="xlsxBase64"/>
+        </out-parameters>
+        <actions>
+            <script><![CDATA[
+                import java.util.zip.ZipOutputStream
+                import java.util.zip.ZipEntry
+
+                def esc = { v -> v == null ? '' : v.toString().replace('&','&amp;').replace('<','&lt;').replace('>','&gt;').replace('"','&quot;').replace("'","&apos;") }
+
+                int nCols = headers.size()
+
+                // 0-based column index -> Excel column letters (A, B, ... Z, AA, ...)
+                def colLetter = { int idx ->
+                    StringBuilder sb = new StringBuilder()
+                    int n = idx
+                    while (n >= 0) { sb.insert(0, (char)(('A'.charAt(0)) + (n % 26))); n = ((int)(n / 26)) - 1 }
+                    return sb.toString()
+                }
+
+                // Column widths from content (chars + padding), clamped 10..60.
+                int[] widths = new int[nCols]
+                for (int c = 0; c < nCols; c++) widths[c] = Math.max(10, ((headers[c] == null ? '' : headers[c].toString()).length() + 2))
+                for (row in rows) {
+                    for (int c = 0; c < nCols; c++) {
+                        def cell = (c < row.size()) ? row[c] : ''
+                        int len = ((cell == null ? '' : cell.toString()).length()) + 2
+                        if (len > widths[c]) widths[c] = len
+                    }
+                }
+                for (int c = 0; c < nCols; c++) if (widths[c] > 60) widths[c] = 60
+
+                def baos = new ByteArrayOutputStream()
+                def zos = new ZipOutputStream(baos)
+                def addEntry = { name, content ->
+                    zos.putNextEntry(new ZipEntry(name)); zos.write(content.getBytes("UTF-8")); zos.closeEntry()
+                }
+
+                addEntry("[Content_Types].xml", """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+  <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+</Types>""")
+
+                addEntry("_rels/.rels", """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>""")
+
+                // Excel sheet names: <=31 chars, none of : \ / ? * [ ]
+                def safeSheet = (sheetName ?: 'Sheet1').toString().replaceAll('[\\\\/\\?\\*\\[\\]:]', ' ')
+                if (safeSheet.length() > 31) safeSheet = safeSheet.substring(0, 31)
+
+                addEntry("xl/workbook.xml", """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets>
+    <sheet name="${esc(safeSheet)}" sheetId="1" r:id="rId1"/>
+  </sheets>
+</workbook>""")
+
+                addEntry("xl/_rels/workbook.xml.rels", """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+</Relationships>""")
+
+                // Style 1 = header (bold white on indigo fill), matching the app's list header look.
+                addEntry("xl/styles.xml", """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <fonts count="2">
+    <font><name val="Calibri"/><sz val="11"/></font>
+    <font><b/><color rgb="FFFFFFFF"/><name val="Calibri"/><sz val="11"/></font>
+  </fonts>
+  <fills count="2">
+    <fill><patternFill patternType="none"/></fill>
+    <fill><patternFill patternType="solid"><fgColor rgb="FF1A237E"/><bgColor indexed="64"/></patternFill></fill>
+  </fills>
+  <borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>
+  <cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+  <cellXfs count="2">
+    <xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>
+    <xf numFmtId="0" fontId="1" fillId="1" borderId="0" xfId="0" applyFont="1" applyFill="1"/>
+  </cellXfs>
+  <cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>
+</styleSheet>""")
+
+                def sx = new StringBuilder()
+                sx.append("""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <cols>
+""")
+                for (int c = 0; c < nCols; c++) sx.append("""    <col min="${c+1}" max="${c+1}" width="${widths[c]}" customWidth="1"/>\n""")
+                sx.append("""  </cols>
+  <sheetData>
+    <row r="1">
+""")
+                for (int c = 0; c < nCols; c++) {
+                    sx.append("""      <c r="${colLetter(c)}1" s="1" t="inlineStr"><is><t xml:space="preserve">${esc(headers[c])}</t></is></c>\n""")
+                }
+                sx.append("    </row>\n")
+
+                int rowIndex = 2
+                for (row in rows) {
+                    sx.append("""    <row r="${rowIndex}">\n""")
+                    for (int c = 0; c < nCols; c++) {
+                        def cell = (c < row.size()) ? row[c] : ''
+                        sx.append("""      <c r="${colLetter(c)}${rowIndex}" t="inlineStr"><is><t xml:space="preserve">${esc(cell)}</t></is></c>\n""")
+                    }
+                    sx.append("    </row>\n")
+                    rowIndex++
+                }
+
+                sx.append("""  </sheetData>
+</worksheet>""")
+
+                addEntry("xl/worksheets/sheet1.xml", sx.toString())
+                zos.close()
+
+                xlsxBase64 = baos.toByteArray().encodeBase64().toString()
+            ]]></script>
+        </actions>
+    </service>
+
 </services>
