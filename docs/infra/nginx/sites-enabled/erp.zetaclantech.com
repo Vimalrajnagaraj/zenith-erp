@@ -192,6 +192,34 @@ server {
         add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
     }
 
+    # Legacy root-scoped service worker retirement (ZE-CONTACTS-025 f/u).
+    # /sw.js and /static/sw.js used to serve a ROOT-scoped SW ("zetaerp-v6", scope /) that still
+    # controls old browsers app-wide (intercepting the shell + org-context: userOrgInfo /
+    # ActiveOrgNav.qvue / saasConfig). No current code registers it, but a SW runs until unregistered.
+    # These blocks serve a tiny self-unregistering TOMBSTONE instead: a browser doing its SW update
+    # check fetches this, installs it, and on activate it clears caches + unregisters itself + reloads
+    # its clients -> the stale SW is gone. Served no-store so Cloudflare/browsers never pin it (WITHOUT
+    # an exact-match block these fall into `~* \.(js|...)$` -> `immutable, max-age=1y`, the exact trap
+    # that pinned this SW for a year). The exact (`=`) match also short-circuits before the orphan
+    # framework file at base-component/webroot/.../static/sw.js is ever reached. Page-side belt-and-
+    # suspenders: /zenithstatic/js/sw-reaper.js (unregisters any non-POS SW on every page load).
+    location = /sw.js {
+        default_type application/javascript;
+        add_header Cache-Control "no-cache, no-store, must-revalidate" always;
+        add_header Service-Worker-Allowed "/" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+        return 200 "self.addEventListener('install',function(){self.skipWaiting()});self.addEventListener('activate',function(e){e.waitUntil(caches.keys().then(function(k){return Promise.all(k.filter(function(c){return c.indexOf('zetaerp')===0}).map(function(c){return caches.delete(c)}))}).then(function(){return self.registration.unregister()}).then(function(){return self.clients.matchAll()}).then(function(cs){cs.forEach(function(c){c.navigate&&c.navigate(c.url)})}).catch(function(){}))});";
+    }
+    location = /static/sw.js {
+        default_type application/javascript;
+        add_header Cache-Control "no-cache, no-store, must-revalidate" always;
+        add_header Service-Worker-Allowed "/" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+        return 200 "self.addEventListener('install',function(){self.skipWaiting()});self.addEventListener('activate',function(e){e.waitUntil(caches.keys().then(function(k){return Promise.all(k.filter(function(c){return c.indexOf('zetaerp')===0}).map(function(c){return caches.delete(c)}))}).then(function(){return self.registration.unregister()}).then(function(){return self.clients.matchAll()}).then(function(cs){cs.forEach(function(c){c.navigate&&c.navigate(c.url)})}).catch(function(){}))});";
+    }
+
     # Main application
     location / {
         limit_req zone=general burst=50 nodelay;
