@@ -17,6 +17,13 @@ container) and terminates TLS, with Cloudflare in front — so host config is NO
   authored `.css` files **and** CSS inside XML `<style>…</style>` blocks (the per-screen injection
   pattern from `~/CLAUDE.md`); reports `file:line:col`. Also flags an unterminated `/*`. Run before
   a CSS deploy: `sh docs/infra/lint-css-comments.sh` (requires `node`). Logic in `lint-css-comments.js`.
+- `lint-form-dom-collisions.sh` — fails on a Moqui **form control named after a DOM property Vue reads**
+  during render (`tagName`/`nodeName`/`nodeType`). `HTMLFormElement` is `[LegacyOverrideBuiltins]`, so such
+  a control shadows `form.<name>` and Vue's patch does `form.tagName.indexOf(…)` on the `<input>` element →
+  `TypeError` → the /qapps page renders **blank** (bit ZE-CONTACTS-018: `PartyTag`'s PK is `tagName`,
+  auto-emitted by the Tags form-list). Catches `parameter-map` keys, form input fields, and form-lists over
+  an entity with such a PK. Run: `sh docs/infra/lint-form-dom-collisions.sh` (requires `node`). Logic in
+  `lint-form-dom-collisions.js`.
 
 ### Run the guards automatically (pre-commit hook)
 `git-hooks/pre-commit` runs the three **static** guards above at commit time, each gated on the
