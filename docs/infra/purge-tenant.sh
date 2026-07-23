@@ -44,7 +44,7 @@ if [ "${ISSUED:-0}" -gt 0 ] && [ "$MODE" = "--commit" ]; then
   exit 1
 fi
 
-DROPFNS="DROP FUNCTION IF EXISTS ztest_purge_tenant(text,boolean); DROP FUNCTION IF EXISTS ztest_tenant_residue(text);"
+DROPFNS="DROP FUNCTION IF EXISTS ztest_purge_tenant(text,boolean); DROP FUNCTION IF EXISTS ztest_tenant_residue(text); DROP FUNCTION IF EXISTS ztest_sweep_orphan_contact_mechs(boolean);"
 
 if [ "$MODE" = "--commit" ]; then
   echo "=== COMMIT purge of org $ORG (atomic; self-verifies completeness before COMMIT) ==="
@@ -52,9 +52,15 @@ if [ "$MODE" = "--commit" ]; then
   # missed table aborts the COMMIT (nothing deleted) and names table.column. On success, confirm externally
   # with the catalog-wide residue sweep too.
   { cat "$HERE/purge-tenant.sql"
-    printf "BEGIN;\nSELECT * FROM ztest_purge_tenant('%s', true) ORDER BY del_order, tbl_name;\nCOMMIT;\n" "$ORG"
+    printf "BEGIN;\nSELECT * FROM ztest_purge_tenant('%s', true) ORDER BY del_order, tbl_name;\n" "$ORG"
+    # ContactMech hangs off PartyContactMech (no party_id col), so the party-scoped purge above orphans it.
+    # Sweep those orphans in the SAME transaction so a completed purge never leaves dangling contact data.
+    printf "\\\\echo '=== sweep ContactMechs orphaned by the purge (referenced by nothing) ==='\n"
+    printf "SELECT * FROM ztest_sweep_orphan_contact_mechs(true);\nCOMMIT;\n"
     printf "\\\\echo '=== residue sweep — EVERY %%party_id column in the schema (must be empty) ==='\n"
     printf "SELECT * FROM ztest_tenant_residue('%s');\n" "$ORG"
+    printf "\\\\echo '=== contact_mech orphans remaining (must be 0) ==='\n"
+    printf "SELECT * FROM ztest_sweep_orphan_contact_mechs(false);\n"
     printf "\\\\echo '=== billing baselines (plans 4 / plan_modules 76 must be intact) ==='\n"
     printf "SELECT (SELECT count(*) FROM saas_plan) plans, (SELECT count(*) FROM saas_plan_module) plan_mods;\n"
     printf "%s\n" "$DROPFNS"
@@ -67,7 +73,10 @@ elif [ "$MODE" = "--audit" ]; then
 else
   echo "=== DRY RUN — rows that WOULD be deleted (no changes made) ==="
   { cat "$HERE/purge-tenant.sql"
-    printf "SELECT * FROM ztest_purge_tenant('%s', false) ORDER BY tbl_name;\n%s\n" "$ORG" "$DROPFNS"
+    printf "SELECT * FROM ztest_purge_tenant('%s', false) ORDER BY tbl_name;\n" "$ORG"
+    printf "\\\\echo '=== + ContactMech orphans the post-purge sweep would clear (global; referenced by nothing) ==='\n"
+    printf "SELECT * FROM ztest_sweep_orphan_contact_mechs(false);\n"
+    printf "%s\n" "$DROPFNS"
   } | $PSQL
   echo "(re-run with --commit to delete, or --audit to sweep an org for residue)"
 fi

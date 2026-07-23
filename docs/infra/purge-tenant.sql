@@ -271,3 +271,57 @@ BEGIN
   END LOOP;
 END;
 $fn$;
+
+-- ZE-SETTINGS-005 follow-up (2026-07-23): sweep ContactMechs orphaned by a tenant purge.
+-- WHY: a ContactMech is reached from a party ONLY through PartyContactMech / FacilityContactMech / etc. — none
+-- of which carry a party_id column — so ztest_purge_tenant deletes the tenant's PartyContactMech rows but the
+-- ContactMech behind them (and its 1:1 TelecomNumber / PostalAddress detail) is left dangling: a PARENT of the
+-- deleted link, invisible to the party-scoped FK closure AND to ztest_tenant_residue (which only scans
+-- %party_id columns). That debris accumulates every purge and once tempted a hand-written "delete the orphans"
+-- that was scoped by class instead of id and nipped a pre-existing orphan too. This does it correctly instead:
+-- delete every ContactMech referenced by NOTHING external — derived from the catalog (all %contact_mech_id
+-- columns + real FKs to contact_mech), MINUS the PK self-column and the mech's OWN detail children
+-- (telecom_number/postal_address.contact_mech_id, which are deleted together with it, not a reason to keep it).
+-- "Referenced by nothing" == provably dead, so it is safe globally (not just for one org) and also clears the
+-- debris earlier purges already left. Single pass; re-run to collect any second-order orphans (a deleted
+-- mech's postal_address that pointed at another mech). p_commit=false counts only. Companion to purge-tenant.sh.
+CREATE OR REPLACE FUNCTION ztest_sweep_orphan_contact_mechs(p_commit boolean DEFAULT false)
+RETURNS TABLE(action text, tbl_name text, rows_n bigint) LANGUAGE plpgsql AS $fn$
+DECLARE r record;
+BEGIN
+  -- external reference columns to contact_mech; exclude the PK self-column and the mech's own 1:1 detail rows
+  CREATE TEMP TABLE _cmref ON COMMIT DROP AS
+    SELECT DISTINCT c.table_name AS tbl, c.column_name AS col
+    FROM information_schema.columns c
+    JOIN pg_class rc ON rc.relname=c.table_name AND rc.relkind='r' AND rc.relnamespace='public'::regnamespace
+    WHERE c.table_schema='public'
+      AND (c.column_name ~ 'contact_mech_id$'
+        OR c.column_name IN (SELECT ca.attname FROM pg_constraint fc
+            JOIN pg_class pt ON pt.oid=fc.confrelid
+            JOIN pg_attribute ca ON ca.attrelid=fc.conrelid AND ca.attnum=fc.conkey[1]
+            WHERE fc.contype='f' AND pt.relname='contact_mech'))
+      AND NOT (c.table_name='contact_mech'   AND c.column_name='contact_mech_id')
+      AND NOT (c.table_name='telecom_number' AND c.column_name='contact_mech_id')
+      AND NOT (c.table_name='postal_address' AND c.column_name='contact_mech_id');
+  CREATE TEMP TABLE _referenced(id text PRIMARY KEY) ON COMMIT DROP;
+  FOR r IN SELECT tbl, col FROM _cmref LOOP
+    EXECUTE format('INSERT INTO _referenced SELECT DISTINCT %I::text FROM %I WHERE %I IS NOT NULL ON CONFLICT DO NOTHING',
+                   r.col, r.tbl, r.col);
+  END LOOP;
+  CREATE TEMP TABLE _orphan(id text PRIMARY KEY) ON COMMIT DROP;
+  INSERT INTO _orphan SELECT cm.contact_mech_id FROM contact_mech cm
+    WHERE NOT EXISTS (SELECT 1 FROM _referenced rf WHERE rf.id=cm.contact_mech_id);
+
+  IF NOT p_commit THEN
+    action:='DRY-RUN would delete'; tbl_name:='contact_mech (+ detail)'; rows_n:=(SELECT count(*) FROM _orphan); RETURN NEXT;
+    RETURN;
+  END IF;
+  -- detail children first (they FK to the mech), then the mech itself
+  DELETE FROM telecom_number WHERE contact_mech_id IN (SELECT id FROM _orphan);
+  GET DIAGNOSTICS rows_n = ROW_COUNT; action:='deleted'; tbl_name:='telecom_number'; RETURN NEXT;
+  DELETE FROM postal_address WHERE contact_mech_id IN (SELECT id FROM _orphan);
+  GET DIAGNOSTICS rows_n = ROW_COUNT; action:='deleted'; tbl_name:='postal_address'; RETURN NEXT;
+  DELETE FROM contact_mech WHERE contact_mech_id IN (SELECT id FROM _orphan);
+  GET DIAGNOSTICS rows_n = ROW_COUNT; action:='deleted'; tbl_name:='contact_mech'; RETURN NEXT;
+END;
+$fn$;
