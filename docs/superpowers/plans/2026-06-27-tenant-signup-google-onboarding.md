@@ -28,7 +28,7 @@ tar czf - -T /tmp/ch.txt | ssh -o StrictHostKeyChecking=no root@167.233.117.229 
   'docker exec -i deploy-moqui-1 sh -c "tar xzf - -C /opt/moqui/runtime"'
 ssh root@167.233.117.229 'docker commit deploy-moqui-1 zetaerp-moqui:latest >/dev/null && cd /opt/deploy/deploy && docker compose restart moqui'
 # poll
-for i in $(seq 1 40); do c=$(curl -s -k -o /dev/null -w "%{http_code}" -u john.doe:moqui https://erp.zetaclantech.com/apps/zenith); [ "$c" = 200 ] && break; sleep 4; done
+for i in $(seq 1 40); do c=$(curl -s -k -o /dev/null -w "%{http_code}" -u "john.doe:$MOQUI_ADMIN_PASS" https://erp.zetaclantech.com/apps/zenith); [ "$c" = 200 ] && break; sleep 4; done
 ```
 SQL helper: `ssh root@167.233.117.229 'docker exec -i deploy-db-1 psql -U moqui -d moqui -c "<SQL>"'`.
 
@@ -80,7 +80,7 @@ def settingKeys = [
 
 - [ ] **Step 4: Verify render + save.** Render the super-admin settings screen and confirm 200 + the new field:
 ```bash
-curl -s -k -u john.doe:moqui "https://erp.zetaclantech.com/apps/zenith/saas-admin/Settings" | grep -ci "Google OAuth Client ID"   # expect >=1
+curl -s -k -u "john.doe:$MOQUI_ADMIN_PASS" "https://erp.zetaclantech.com/apps/zenith/saas-admin/Settings" | grep -ci "Google OAuth Client ID"   # expect >=1
 ```
 Then save a placeholder value through the form (or directly, to test the read path) and confirm the row:
 ```bash
