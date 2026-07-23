@@ -505,6 +505,56 @@
 
     <!-- ========== Payment Processing ========== -->
 
+    <!-- ZE-POS-MODERULES: evaluate a tenant's OPT-IN per-mode order rules (PosSalesModeOrgConfig).
+         No config row for (org, mode) => blocked=false, so MARUTHI and any not-opted-in tenant are
+         unaffected. This is a PURE CHECK: it returns a flag and NEVER returns error="true" itself —
+         a nested service-call that errors THROWS inside the caller and aborts the whole payment
+         transition before it can build its JSON/receipt response (the caller would then only be able
+         to show a generic "Payment failed"). Instead the caller raises the error from its OWN body
+         (like the terminal's native errors) so the specific reason reaches the cashier. -->
+    <service verb="check" noun="PosSalesModeOrgRules">
+        <in-parameters>
+            <parameter name="transactionId" required="true"/>
+            <parameter name="assumeCustomerAttached" type="Boolean" default="false">
+                <description>Credit sales always capture a customer (name+phone) before this runs, so the
+                    caller sets this to skip the customer check and enforce only the minimum-order rule.</description>
+            </parameter>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="blocked" type="Boolean"/>
+            <parameter name="reason"/>
+        </out-parameters>
+        <actions>
+            <set field="blocked" from="false"/>
+            <entity-find-one entity-name="zenith.erp.pos.PosTransaction" value-field="txn"/>
+            <if condition="txn == null || !txn.salesModeId"><return/></if>
+            <entity-find-one entity-name="zenith.erp.pos.PosSalesModeOrgConfig" value-field="cfg">
+                <field-map field-name="organizationPartyId" from="txn.organizationPartyId"/>
+                <field-map field-name="salesModeId" from="txn.salesModeId"/>
+            </entity-find-one>
+            <!-- Not opted in for this shop+mode -> no enforcement at all. -->
+            <if condition="cfg == null"><return/></if>
+            <entity-find-one entity-name="zenith.erp.pos.PosSalesMode" value-field="_mode">
+                <field-map field-name="salesModeId" from="txn.salesModeId"/></entity-find-one>
+            <set field="_modeName" from="_mode?.modeName ?: 'This sales'"/>
+            <!-- Rule 1: require a customer on the bill -->
+            <if condition="cfg.requireCustomer == 'Y' &amp;&amp; !assumeCustomerAttached &amp;&amp; !txn.customerPartyId">
+                <set field="blocked" from="true"/>
+                <set field="reason" from="_modeName + ' mode needs a customer on the bill. Attach a customer (CUSTOMER button), then take payment.'"/>
+                <return/>
+            </if>
+            <!-- Rule 2: minimum order value -->
+            <set field="_total" from="(txn.grandTotal ?: txn.payableAmount ?: 0) as BigDecimal"/>
+            <if condition="cfg.minOrderAmount != null &amp;&amp; (cfg.minOrderAmount as BigDecimal) &gt; 0 &amp;&amp; _total &lt; (cfg.minOrderAmount as BigDecimal)">
+                <set field="_minDisp" from="(cfg.minOrderAmount as BigDecimal).stripTrailingZeros().toPlainString()"/>
+                <set field="_totDisp" from="_total.stripTrailingZeros().toPlainString()"/>
+                <set field="blocked" from="true"/>
+                <set field="reason" from="_modeName + ' orders must be at least ₹' + _minDisp + '. This bill is only ₹' + _totDisp + ' — add more items to continue.'"/>
+                <return/>
+            </if>
+        </actions>
+    </service>
+
     <service verb="process" noun="PosPayment">
         <in-parameters>
             <parameter name="transactionId" required="true"/>
@@ -513,9 +563,23 @@
             <parameter name="digitalTransactionId"/>
             <parameter name="cardLastFour"/>
             <parameter name="referenceNumber"/>
+            <parameter name="bypassModeRules" type="Boolean" default="false">
+                <description>Set by internal callers replaying/settling an ALREADY-committed sale (offline
+                    sync, credit settlement) so the opt-in sales-mode order rules are not re-applied to a
+                    sale that already happened. The interactive terminal never sets it -> rules apply.</description>
+            </parameter>
         </in-parameters>
         <out-parameters><parameter name="paymentId"/></out-parameters>
         <actions>
+            <!-- ZE-POS-MODERULES: opt-in per-mode order rules gate, BEFORE any payment row is created, so the
+                 cashier is stopped up-front rather than after cash is recorded. No-op unless the tenant opted
+                 in. The error is raised HERE (this service's own return) rather than by check#… so it does not
+                 throw/abort the caller before it can send its JSON response — see check#PosSalesModeOrgRules. -->
+            <if condition="!bypassModeRules">
+                <service-call name="zenith.pos.PosServices.check#PosSalesModeOrgRules" out-map="_mr"
+                    in-map="[transactionId:transactionId]"/>
+                <if condition="_mr.blocked"><return error="true" message="${_mr.reason}"/></if>
+            </if>
             <!-- IDEMPOTENCY: lock the txn and reject any payment once it has left PtCreated. Without this a
                  double-clicked / retried Pay (plausible on a slow link) created a SECOND PosPayment row and
                  inflated paidAmount/changeAmount, corrupting the bill and the session cash reconciliation.
@@ -633,6 +697,12 @@
             <if condition="!customerName?.trim() || !customerPhone?.trim()">
                 <return error="true" message="Customer name and phone are required for a credit sale"/></if>
 
+            <!-- ZE-POS-MODERULES: apply the opt-in min-order rule to credit sales too (the customer rule is
+                 already satisfied — a credit sale forces name+phone above). No-op unless the tenant opted in. -->
+            <service-call name="zenith.pos.PosServices.check#PosSalesModeOrgRules" out-map="_mr"
+                in-map="[transactionId:transactionId, assumeCustomerAttached:true]"/>
+            <if condition="_mr.blocked"><return error="true" message="${_mr.reason}"/></if>
+
             <!-- Book the receivable against a real per-customer party (not the generic Walk-in),
                  keyed deterministically by phone so repeat credit customers reuse one ledger. -->
             <set field="custDigits" from="customerPhone.replaceAll('[^0-9]', '')"/>
@@ -688,9 +758,11 @@
             <if condition="(amount as BigDecimal) &lt;= 0">
                 <return error="true" message="Amount must be greater than zero"/></if>
 
+            <!-- Settling an existing credit bill is money against an ALREADY-completed sale -> bypass the
+                 sales-mode order rules (they applied when the sale was first made, not at settlement). -->
             <service-call name="zenith.pos.PosServices.process#PosPayment"
                 in-map="[transactionId:transactionId, paymentMethod:paymentMethod,
-                         amount:amount, referenceNumber:referenceNumber]"/>
+                         amount:amount, referenceNumber:referenceNumber, bypassModeRules:true]"/>
 
             <entity-find-one entity-name="zenith.erp.pos.PosTransaction" value-field="txn2"/>
             <set field="paidAmount" from="(txn2.paidAmount ?: 0) as BigDecimal"/>
@@ -1451,10 +1523,12 @@
                             // Pay the recomputed payable so completion succeeds even if tax shifted the total
                             def txn = ec.entity.find("zenith.erp.pos.PosTransaction").condition("transactionId", createdTxnId).one()
                             def payable = (txn?.payableAmount ?: sale.total ?: 0) as BigDecimal
+                            // bypassModeRules: this offline sale already happened at the counter; replaying it
+                            // into the books must never be blocked by the opt-in sales-mode order rules.
                             ec.service.sync().name("zenith.pos.PosServices.process#PosPayment")
                                 .parameters([transactionId: createdTxnId,
                                              paymentMethod: (sale.paymentMethod ?: 'Cash'),
-                                             amount: payable,
+                                             amount: payable, bypassModeRules: true,
                                              referenceNumber: ('OFFLINE:' + (sale.offlineId ?: ''))]).call()
                             ec.service.sync().name("zenith.pos.PosServices.complete#PosTransaction")
                                 .parameters([transactionId: createdTxnId]).call()
