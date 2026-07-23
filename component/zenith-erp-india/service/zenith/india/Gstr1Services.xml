@@ -37,7 +37,7 @@
                 // --- Seller GST config ---
                 def cfg = ec.entity.find("zenith.erp.india.IndiaGstConfig")
                     .condition("organizationPartyId", organizationPartyId).one()
-                def orgGstin = cfg?.gstin ?: ""
+                def orgGstin = (cfg?.gstin ?: "").toString().trim()
                 def orgState = cfg?.stateCode ?: ""
 
                 // --- Fresh filing (clear any prior DRAFT for this org+period, incl. child records) ---
@@ -67,6 +67,9 @@
                     .condition("invoiceDate", ">=", periodStart)
                     .condition("invoiceDate", "<", periodEnd)
                     .condition("statusId", "!=", "InvoiceCancelled")
+                    // GSTR-1 reports ISSUED outward supplies only — an InProcess draft is not a supply yet
+                    // and must never appear in a return (a test/draft invoice was leaking into the B2B section).
+                    .condition("statusId", "!=", "InvoiceInProcess")
                     .disableAuthz().list()
 
                 def hsnMap = [:]   // "hsn|rate" -> accumulator
@@ -78,7 +81,7 @@
                 for (def inv : invoices) {
                     invCount++
                     def isCdn = (inv.invoiceTypeEnumId == "InvoiceCreditMemo") || (inv.creditDebitNoteType != null)
-                    def buyerGstin = inv.buyerGstin
+                    def buyerGstin = (inv.buyerGstin ?: "").toString().trim()
                     def pos = inv.placeOfSupplyStateCode ?: (buyerGstin ? buyerGstin.substring(0,2) : null) ?: orgState
                     def invNo = inv.gstInvoiceNumber ?: inv.customInvoiceNumber ?: inv.invoiceId
                     def isExport = inv.isExport == "Y"
@@ -117,7 +120,9 @@
                             r.invoiceNumber = invNo; r.invoiceDate = inv.invoiceDate; r.invoiceValue = round2(invValue)
                             r.portCode = inv.portCode; r.shippingBillNumber = inv.shippingBillNumber; r.shippingBillDate = inv.shippingBillDate
                             r.rate = rate; r.taxableValue = round2(a.taxable); r.igstAmount = round2(a.igst); r.create()
-                        } else if (buyerGstin) {
+                        } else if (buyerGstin && buyerGstin.length() == 15 && buyerGstin != orgGstin) {
+                            // B2B requires a VALID customer GSTIN (15 chars) that isn't the seller's OWN — a
+                            // blank / malformed / self GSTIN is a B2C (unregistered) sale, not B2B.
                             def r = ec.entity.makeValue("zenith.erp.india.gstr1.Gstr1B2bRecord"); r.setSequencedIdPrimary()
                             r.filingId = filingId; r.invoiceId = inv.invoiceId; r.buyerGstin = buyerGstin
                             r.invoiceNumber = invNo; r.invoiceDate = inv.invoiceDate; r.invoiceValue = round2(invValue)
