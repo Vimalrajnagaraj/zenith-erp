@@ -47,6 +47,39 @@
         </actions>
         <default-response url="."><parameter name="stockTransferId"/></default-response>
     </transition>
+    <!-- ZE-INV-IV-080/081: record an ACTUAL received quantity that differs from what was sent (partial receipt /
+         transit loss). Sets the line's quantityReceived BEFORE the Receive step; receive#StockTransfer then moves
+         that quantity (not the sent qty) to the destination and leaves quantityReceived as set. Capped at the sent
+         quantity — you can't receive more than was shipped on an internal transfer (an overage is a Stock
+         Adjustment, not a transfer). Only while In Transit. -->
+    <transition name="setReceivedQty">
+        <actions>
+            <service-call name="zenith.inventory.InventoryServices.assert#StockTransferAccess" in-map="[stockTransferId:stockTransferId]" out-map="_acc"/>
+            <if condition="!_acc.allowed"><return error="true" message="You do not have access to this stock transfer."/></if>
+            <entity-find-one entity-name="zenith.erp.inventory.StockTransfer" value-field="_stx"><field-map field-name="stockTransferId"/></entity-find-one>
+            <if condition="_stx?.statusId != 'StxInTransit'"><return error="true" message="You can only set received quantities while the transfer is in transit (before receiving)."/></if>
+            <entity-find-one entity-name="zenith.erp.inventory.StockTransferItem" value-field="_line">
+                <field-map field-name="stockTransferId"/><field-map field-name="transferItemSeqId"/>
+            </entity-find-one>
+            <if condition="_line == null"><return error="true" message="Transfer line not found."/></if>
+            <script><![CDATA[
+                def _s = (quantityReceived == null) ? '' : quantityReceived.toString().trim()
+                if (!(_s ==~ /\d*\.?\d+/)) { ec.message.addError("Received quantity must be a number."); return }
+                def _rq = new BigDecimal(_s)
+                def _sent = (_line.quantity ?: 0) as BigDecimal
+                if (_rq.signum() <= 0) { ec.message.addError("Received quantity must be greater than zero."); return }
+                if (_rq.compareTo(_sent) > 0) {
+                    ec.message.addError("Received (" + _rq + ") can't be more than the sent quantity (" + _sent + "). You can't receive more than was shipped on a transfer — record any overage with a Stock Adjustment instead.")
+                    return
+                }
+            ]]></script>
+            <service-call name="update#zenith.erp.inventory.StockTransferItem"
+                          in-map="[stockTransferId:stockTransferId, transferItemSeqId:transferItemSeqId, quantityReceived:quantityReceived]"/>
+            <script>ec.message.addMessage("Received quantity set to " + quantityReceived + " (sent " + _line.quantity + "). Click “Receive” below to add it to the destination.")</script>
+        </actions>
+        <error-response url="."><parameter name="stockTransferId"/></error-response>
+        <default-response url="."><parameter name="stockTransferId"/></default-response>
+    </transition>
     <transition name="back"><default-response url="../StockTransfers"/></transition>
 
     <!-- XF-004: edit the draft header / delete the draft. Both guard write-access (defense-in-depth)
@@ -269,7 +302,29 @@
                 <field name="batchNumber"><default-field title="Lot"><display text="${batchNumber ?: '—'}"/></default-field></field>
                 <field name="serialNames"><default-field title="Serials"><display text="${serialNames ?: '—'}"/></default-field></field>
                 <field name="quantity"><default-field title="Sent"><display text="${ec.l10n.format(quantity ?: 0,'#,##0')}"/></default-field></field>
-                <field name="quantityReceived"><default-field title="Received"><display text="${quantityReceived != null ? ec.l10n.format(quantityReceived,'#,##0') : '—'}"/></default-field></field>
+                <field name="quantityReceived"><default-field title="Received">
+                    <display text="${quantityReceived != null ? ec.l10n.format(quantityReceived,'#,##0') : (isTransit ? ('full ' + ec.l10n.format(quantity ?: 0,'#,##0')) : '—')}"/>
+                </default-field></field>
+                <!-- ZE-INV-IV-080/081: while In Transit, set the ACTUAL received qty per line (partial receipt).
+                     Capped at Sent (setReceivedQty); leaving it unset receives the full sent qty. -->
+                <field name="receiveSet"><header-field title=""/>
+                  <conditional-field name="recvSetAvail" condition="isTransit &amp;&amp; invCanWrite">
+                    <container-dialog id="SetRecv_${transferItemSeqId}" button-text="Set received" button-icon="fa fa-pencil"
+                                      button-class="q-btn--flat text-primary text-caption q-px-sm">
+                        <label text="Enter how many actually arrived for this line. Leave it at the sent quantity if nothing was short; enter less to record a partial receipt — the shortfall is treated as a transit loss. You can't enter more than was sent." type="p" style="text-grey-7 q-mb-sm"/>
+                        <form-single name="SetReceivedForm" transition="setReceivedQty">
+                            <field name="stockTransferId"><default-field><hidden default-value="${stockTransferId}"/></default-field></field>
+                            <field name="transferItemSeqId"><default-field><hidden default-value="${transferItemSeqId}"/></default-field></field>
+                            <field name="sentDisp"><default-field title="Sent"><display text="${ec.l10n.format(quantity ?: 0,'#,##0')}"/></default-field></field>
+                            <field name="quantityReceived"><default-field title="Actually received (max ${ec.l10n.format(quantity ?: 0,'#,##0')})">
+                                <text-line size="10" default-value="${quantityReceived != null ? quantityReceived : quantity}"/>
+                            </default-field></field>
+                            <field name="submitButton"><default-field title=""><submit text="Save"/></default-field></field>
+                        </form-single>
+                    </container-dialog>
+                  </conditional-field>
+                  <default-field title=""><label text="" type="span"/></default-field>
+                </field>
                 <field name="del">
                   <!-- ZE-INV-010: Remove line is a write action — hidden for view-only users -->
                   <conditional-field name="delWrite" condition="invCanWrite" title="">
@@ -301,7 +356,7 @@
             <condition><expression>isTransit &amp;&amp; invCanWrite</expression></condition>
             <widgets>
                 <container style="row items-center justify-between bg-green-1 q-pa-md border-radius-md">
-                    <label text="Goods arrived? Receiving will add this stock to ${toFac?.facilityName ?: 'the receiver'}." type="p" style="text-grey-8 q-mb-none"/>
+                    <label text="Goods arrived? If any line came up short, use “Set received” above first; then Receive. The actual received quantities are added to ${toFac?.facilityName ?: 'the receiver'} — any shortfall stays behind as a transit loss." type="p" style="text-grey-8 q-mb-none"/>
                     <link url="receiveTransfer" text="Receive" parameter-map="[stockTransferId:stockTransferId]"
                           confirmation="Receive this transfer? Stock will be added to the receiver."
                           style="q-btn bg-positive text-white text-weight-bold q-px-lg border-radius-sm"/>
