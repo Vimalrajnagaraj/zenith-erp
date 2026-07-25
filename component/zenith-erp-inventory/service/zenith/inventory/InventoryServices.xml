@@ -146,20 +146,9 @@
                 String toGstin = toFac?.facilityGstin
                 String igstInvoiceIdOut = null
                 boolean interState = (fromGstin && toGstin && fromGstin != toGstin)
-
-                // Different GSTINs => inter-state branch transfer, a deemed supply requiring an IGST invoice.
-                if (interState) {
-                    def invoiceOut = ec.service.sync().name("create#mantle.account.invoice.Invoice")
-                        .parameters([
-                            invoiceTypeEnumId: 'InvoiceSales',
-                            statusId: 'InvoiceInProcess',
-                            fromPartyId: organizationPartyId,
-                            toPartyId: organizationPartyId,
-                            invoiceDate: ec.user.nowTimestamp,
-                            description: 'IGST branch-transfer invoice (' + (fromFac?.facilityName ?: fromFacilityId) + ' ' + fromGstin + ' -> ' + (toFac?.facilityName ?: toFacilityId) + ' ' + toGstin + ')'
-                        ]).call()
-                    igstInvoiceIdOut = invoiceOut.invoiceId
-                }
+                // The IGST branch-transfer invoice — with line items + per-item IGST tax — is generated at SHIP
+                // time (build#StockTransferIgstInvoice), when the goods actually move and line quantities are
+                // final. Nothing to create at draft; igstInvoiceIdOut stays null (the list shows "IGST pending").
 
                 // ZE-INV-IV-075 + IV-077: E-Way Bill required when consignment value > ₹50,000 OR the move is
                 // inter-state. Value is 0 here (no lines yet) — recalc#StockTransferTotals keeps it current as
@@ -369,6 +358,72 @@
                                          quantityDiff:(-qty), reason:("Transfer out " + stockTransferId)]).call()
                     }
                 }
+                // ZE-INV-IV-075: goods have moved and line quantities are final — generate the IGST
+                // branch-transfer invoice (line items + per-item IGST tax). No-op for an intra-state move.
+                ec.service.sync().name("zenith.inventory.InventoryServices.build#StockTransferIgstInvoice")
+                    .parameters([stockTransferId: stockTransferId]).call()
+            ]]></script>
+        </actions>
+    </service>
+
+    <!-- ZE-INV-IV-075 f/u: generate the FULL IGST branch-transfer invoice (one line item per transfer line +
+         per-item IGST computed by the shared india GST engine + invoice totals) for an inter-state move (source
+         & destination facilities under DIFFERENT GSTINs). Called at ship, and by the one-off backfill for
+         pre-fix transfers. Idempotent — re-links & rebuilds the lines cleanly. Intra-state => no-op. -->
+    <service verb="build" noun="StockTransferIgstInvoice">
+        <in-parameters><parameter name="stockTransferId" required="true"/></in-parameters>
+        <out-parameters><parameter name="igstInvoiceId"/></out-parameters>
+        <actions>
+            <entity-find-one entity-name="zenith.erp.inventory.StockTransfer" value-field="stx"/>
+            <if condition="stx == null"><return/></if>
+            <entity-find-one entity-name="mantle.facility.Facility" value-field="fromFac"><field-map field-name="facilityId" from="stx.fromFacilityId"/></entity-find-one>
+            <entity-find-one entity-name="mantle.facility.Facility" value-field="toFac"><field-map field-name="facilityId" from="stx.toFacilityId"/></entity-find-one>
+            <script><![CDATA[
+                def fromGstin = fromFac?.facilityGstin
+                def toGstin = toFac?.facilityGstin
+                igstInvoiceId = stx.igstInvoiceId
+                // Only an inter-state move (different GSTINs) is a deemed supply requiring an IGST invoice.
+                if (!(fromGstin && toGstin && fromGstin != toGstin)) return
+                def items = ec.entity.find("zenith.erp.inventory.StockTransferItem").condition("stockTransferId", stockTransferId).list()
+                if (!items) return
+                def org = stx.organizationPartyId
+                def supState = fromFac?.gstStateCode
+                def buyState = toFac?.gstStateCode
+                def invId = stx.igstInvoiceId
+                if (invId) {
+                    for (ex in ec.entity.find("mantle.account.invoice.InvoiceItem").condition("invoiceId", invId).list()) ex.delete()
+                } else {
+                    def invOut = ec.service.sync().name("create#mantle.account.invoice.Invoice").parameters([
+                        invoiceTypeEnumId:'InvoiceSales', statusId:'InvoiceInProcess', fromPartyId:org, toPartyId:org,
+                        invoiceDate: ec.user.nowTimestamp,
+                        description:'IGST branch-transfer invoice (' + (fromFac?.facilityName ?: stx.fromFacilityId) + ' ' + fromGstin + ' -> ' + (toFac?.facilityName ?: stx.toFacilityId) + ' ' + toGstin + ')']).call()
+                    invId = invOut.invoiceId
+                    ec.service.sync().name("update#zenith.erp.inventory.StockTransfer").parameters([stockTransferId:stockTransferId, igstInvoiceId:invId, ewayBillRequired:'Y']).call()
+                }
+                def totIgst = 0G; def totTaxable = 0G
+                for (li in items) {
+                    def prod = ec.entity.find("mantle.product.Product").condition("productId", li.productId).one()
+                    def qty = (li.quantity ?: 0) as BigDecimal
+                    def unit = (li.unitAmount ?: prod?.mrpAmount ?: 0) as BigDecimal
+                    def taxable = qty.multiply(unit)
+                    def g = ec.service.sync().name("zenith.india.GstServices.calculate#Gst").parameters([
+                        supplierStateCode: supState, buyerStateCode: buyState,
+                        gstSlabId: (prod?.gstSlabId ?: 'GST_EXEMPT'), taxableAmount: taxable]).call()
+                    def itemOut = ec.service.sync().name("mantle.account.InvoiceServices.create#InvoiceItem").parameters([
+                        invoiceId: invId, itemTypeEnumId:'ItemProduct', productId: li.productId,
+                        description: (prod?.productName ?: li.productId), quantity: qty, amount: unit]).call()
+                    ec.service.sync().name("update#mantle.account.invoice.InvoiceItem").parameters([
+                        invoiceId: invId, invoiceItemSeqId: itemOut.invoiceItemSeqId,
+                        hsnSacCode: prod?.hsnCode, gstSlabId: prod?.gstSlabId,
+                        igstRate: g.igstRate, igstAmount: g.igstAmount, taxableAmount: taxable]).call()
+                    totIgst += (g.igstAmount ?: 0G)
+                    totTaxable += taxable
+                }
+                ec.service.sync().name("update#mantle.account.invoice.Invoice").parameters([
+                    invoiceId: invId, supplierStateCode: supState, buyerStateCode: buyState,
+                    supplierGstin: fromGstin, buyerGstin: toGstin,
+                    totalIgst: totIgst, totalTaxableAmount: totTaxable]).call()
+                igstInvoiceId = invId
             ]]></script>
         </actions>
     </service>
