@@ -138,13 +138,17 @@
             </entity-find-one>
             
             <script><![CDATA[
-                String fromGstin = fromFac?.taxRegistrationNumber
-                String toGstin = toFac?.taxRegistrationNumber
+                // ZE-INV-IV-075: the facility GSTIN is stored on facilityGstin (what EditFacility saves) — NOT
+                // taxRegistrationNumber, which the UI never populates. Reading the wrong (always-empty) field made
+                // EVERY transfer look intra-state, so the IGST branch-transfer invoice never generated and
+                // inter-state was never flagged for E-Way. Read facilityGstin.
+                String fromGstin = fromFac?.facilityGstin
+                String toGstin = toFac?.facilityGstin
                 String igstInvoiceIdOut = null
-                
-                // If they have different GSTINs, it's an inter-state transfer, treated as a sale requiring IGST
-                if (fromGstin && toGstin && fromGstin != toGstin) {
-                    // Create IGST Invoice
+                boolean interState = (fromGstin && toGstin && fromGstin != toGstin)
+
+                // Different GSTINs => inter-state branch transfer, a deemed supply requiring an IGST invoice.
+                if (interState) {
                     def invoiceOut = ec.service.sync().name("create#mantle.account.invoice.Invoice")
                         .parameters([
                             invoiceTypeEnumId: 'InvoiceSales',
@@ -152,14 +156,16 @@
                             fromPartyId: organizationPartyId,
                             toPartyId: organizationPartyId,
                             invoiceDate: ec.user.nowTimestamp,
-                            description: 'IGST Invoice for Branch Transfer'
+                            description: 'IGST branch-transfer invoice (' + (fromFac?.facilityName ?: fromFacilityId) + ' ' + fromGstin + ' -> ' + (toFac?.facilityName ?: toFacilityId) + ' ' + toGstin + ')'
                         ]).call()
                     igstInvoiceIdOut = invoiceOut.invoiceId
                 }
-                
-                // Determine totalValue placeholder logic
+
+                // ZE-INV-IV-075 + IV-077: E-Way Bill required when consignment value > ₹50,000 OR the move is
+                // inter-state. Value is 0 here (no lines yet) — recalc#StockTransferTotals keeps it current as
+                // lines are added.
                 BigDecimal val = totalValue ?: BigDecimal.ZERO
-                String ewayRequired = (val > new BigDecimal("50000")) ? "Y" : "N"
+                String ewayRequired = ((val.compareTo(new BigDecimal("50000")) > 0) || interState) ? "Y" : "N"
                 
                 // Create the StockTransfer
                 def result = ec.service.sync().name("create#zenith.erp.inventory.StockTransfer")
@@ -260,8 +266,17 @@
                     def u = (it.unitAmount ?: 0) as java.math.BigDecimal
                     _tot = _tot.add(q.multiply(u))
                 }
+                // ZE-INV-IV-075: E-Way is also required for an inter-state move (source & destination facilities
+                // under DIFFERENT GSTINs), not only for value > ₹50,000.
+                boolean _inter = false
+                def _stx = ec.entity.find("zenith.erp.inventory.StockTransfer").condition("stockTransferId", stockTransferId).one()
+                if (_stx?.fromFacilityId && _stx?.toFacilityId) {
+                    def _ff = ec.entity.find("mantle.facility.Facility").condition("facilityId", _stx.fromFacilityId).one()
+                    def _tf = ec.entity.find("mantle.facility.Facility").condition("facilityId", _stx.toFacilityId).one()
+                    _inter = (_ff?.facilityGstin && _tf?.facilityGstin && _ff.facilityGstin != _tf.facilityGstin)
+                }
                 totalValue = _tot
-                ewayBillRequired = (_tot.compareTo(new java.math.BigDecimal("50000")) > 0) ? "Y" : "N"
+                ewayBillRequired = ((_tot.compareTo(new java.math.BigDecimal("50000")) > 0) || _inter) ? "Y" : "N"
             ]]></script>
             <service-call name="update#zenith.erp.inventory.StockTransfer"
                 in-map="[stockTransferId:stockTransferId, totalValue:totalValue, ewayBillRequired:ewayBillRequired]"/>
