@@ -40,7 +40,22 @@ path is a custom-service call (guard the service) or an entity-auto call (guard 
   (customer+product). Product.ownerPartyId==active-org guard. Verified: EditInvoice addItem blocks a foreign
   product (0 rows), adds own (1 row). **Remaining Tier 2** (parent doc ALSO unguarded → need parent+product):
   purchase PurchaseReturnDetail.addItem, JobWorkChallanDetail.addItem, add#PurchaseInvoiceItem.
+- **TIER-2 tail + TIER 3 — FIXED + verified live [d5d7d97]:** purchase PurchaseReturnDetail/JobWorkChallanDetail
+  addItem + add#PurchaseInvoiceItem (parent+product); workshop create#ServiceJob/add#ServiceJobPart/create#AmcContract;
+  rental create#RentalAgreement + EditAgreement.addItem (rentalAsset); returns create#ReturnRequest + EditReturn.addItem;
+  crm log#Activity + createOpportunity + EditSegment.addMember; helpdesk create#Ticket. Verified: workshop createJob
+  blocks a foreign customer (0 rows), creates own (1 row).
 - **Junk data removed:** cross-tenant subscription 100257 (DOODLE billing org 101074's customer).
+
+## ONLY REMAINING: Tier 4 (schema) + Tier 5 (employee membership)
+Everything in the party/product ID-injection class is now closed across ALL commercial + peripheral modules.
+What's left needs design/schema work, not the one-line guard:
+- **TIER 4** — modules with NO org column on any entity (stores, quality, maintenance, attendance, timeoff,
+  documents) + SmsGateway secret + create#Campaign org-stamp. Each is a per-module isolation project: add
+  organizationPartyId, scope the lists, stamp on create, then guard. Do SmsGateway before SMS sending goes live.
+- **TIER 5** — employee-internal party IDs (hr/payroll/attendance/timeoff assignee/employee fields). These need a
+  new org-membership helper (a party is a member of org X via PartyRelationship, not ownerPartyId==X) — build
+  `assert#PartyOrgMembership` once, then apply.
 - **Deferred (need a schema change; both latent/empty today):** SmsGateway secret isolation (no org column; the
   3 gateway rows hold no secrets; `build#SmsPayload` has no live caller) and `create#Campaign` org-stamp
   (MarketingCampaign has no org column) — do with the TIER 4 no-org-model work, and **before SMS sending goes live**.
