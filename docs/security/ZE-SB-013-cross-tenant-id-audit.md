@@ -28,6 +28,12 @@ path is a custom-service call (guard the service) or an entity-auto call (guard 
   (customerPartyId) + custom-service DiD [ea1f55d]; marketing `addMember#ContactList` (partyId) [ea1f55d];
   promotions `create#Promotion` org-stamp (forged/null org overridden — verified) [a6d5945]; sales
   `create#PaymentLink` invoice-org guard (latent, DiD) [a6d5945].
+- **TIER 1 core commercial customer/vendor — FIXED + verified live [84c8720]:** sales CreateOrder/CreateQuotation/
+  CreateDeliveryChallan; purchase createPo/FindPurchaseOrder.createOrder/createDebitNote/VendorEvaluation/
+  JobWorkChallan/EditRfq.createVendorResponse + `create#PurchaseInvoice` (service); contacts assign/remove
+  CustomerGroupMember. Guarded only when the id is supplied → MARUTHI own-customer/vendor = no-op (verified:
+  foreign party 0 rows, own party 1 row, on both sales and purchase). **Remaining in Tier 1:** sales
+  `WarrantyPolicies.registerWarranty` (customerPartyId+productId).
 - **Junk data removed:** cross-tenant subscription 100257 (DOODLE billing org 101074's customer).
 - **Deferred (need a schema change; both latent/empty today):** SmsGateway secret isolation (no org column; the
   3 gateway rows hold no secrets; `build#SmsPayload` has no live caller) and `create#Campaign` org-stamp
