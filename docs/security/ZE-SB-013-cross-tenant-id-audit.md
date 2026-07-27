@@ -25,8 +25,13 @@ path is a custom-service call (guard the service) or an entity-auto call (guard 
 ## Status
 - **FIXED + verified live:** subscriptions `create#Subscription` (customerPartyId + planId) [520eca1]; subscription
   UI switched to org-scoped PartyPicker [8108213]; fieldservice `createTask`/`createEquipment` transitions
-  (customerPartyId) + custom-service DiD [ea1f55d]; marketing `addMember#ContactList` (partyId) [ea1f55d].
+  (customerPartyId) + custom-service DiD [ea1f55d]; marketing `addMember#ContactList` (partyId) [ea1f55d];
+  promotions `create#Promotion` org-stamp (forged/null org overridden — verified) [a6d5945]; sales
+  `create#PaymentLink` invoice-org guard (latent, DiD) [a6d5945].
 - **Junk data removed:** cross-tenant subscription 100257 (DOODLE billing org 101074's customer).
+- **Deferred (need a schema change; both latent/empty today):** SmsGateway secret isolation (no org column; the
+  3 gateway rows hold no secrets; `build#SmsPayload` has no live caller) and `create#Campaign` org-stamp
+  (MarketingCampaign has no org column) — do with the TIER 4 no-org-model work, and **before SMS sending goes live**.
 
 ---
 
