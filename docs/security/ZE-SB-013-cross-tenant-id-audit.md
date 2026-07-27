@@ -34,6 +34,12 @@ path is a custom-service call (guard the service) or an entity-auto call (guard 
   CustomerGroupMember. Guarded only when the id is supplied → MARUTHI own-customer/vendor = no-op (verified:
   foreign party 0 rows, own party 1 row, on both sales and purchase). **Remaining in Tier 1:** sales
   `WarrantyPolicies.registerWarranty` (customerPartyId+productId).
+- **TIER 2 product line items — FIXED + verified live [df0c9e6]:** sales EditInvoice/EditOrder/EditQuotation/
+  EditCreditNote/EditDeliveryChallan addItem; purchase EditPurchaseOrder/EditPurchaseInvoice addItem, EditRfq
+  createRfqItem/updateRfqItem; pricing set#PriceListItem/set#VolumePricing; + Tier-1 tail sales register#Warranty
+  (customer+product). Product.ownerPartyId==active-org guard. Verified: EditInvoice addItem blocks a foreign
+  product (0 rows), adds own (1 row). **Remaining Tier 2** (parent doc ALSO unguarded → need parent+product):
+  purchase PurchaseReturnDetail.addItem, JobWorkChallanDetail.addItem, add#PurchaseInvoiceItem.
 - **Junk data removed:** cross-tenant subscription 100257 (DOODLE billing org 101074's customer).
 - **Deferred (need a schema change; both latent/empty today):** SmsGateway secret isolation (no org column; the
   3 gateway rows hold no secrets; `build#SmsPayload` has no live caller) and `create#Campaign` org-stamp
