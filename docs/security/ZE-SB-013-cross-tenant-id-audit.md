@@ -179,3 +179,28 @@ DIFFERENT org) blocked / 0 rows.
 select by a record PK on entities with no org column, so they need org columns first.
 **Next: batch 2b** — helpdesk/approvals/expenses assignee/approver/delegate party injections (assign#Ticket,
 delegate#Approval, addStep, create#Ticket assignedToPartyId, etc.); several of those entities also lack an org column.
+
+## Progress log — 2026-07-28: Tier 5 batch 2b — helpdesk / approvals / expenses party guards
+**8 files, deployed + verified on throwaway tenant (org 113617), 0 residue, MARUTHI no-op.**
+Guarded every write that injects an assignee/approver/delegate/requester/employee party id
+(assert#PartyOrgMembership, "only when supplied"):
+- **helpdesk** create#Ticket (assignedToPartyId) + assign#Ticket (assignedToPartyId **and** assert#RecordOrgAccess on
+  ticketId — Ticket HAS an org column); transitions EditTicket.updateTicket (ticketId org + assignee),
+  Departments.createDept/updateDept (managerPartyId).
+- **approvals** delegate#Approval (fromPartyId **and** toPartyId — blocks impersonation, the strongest finding);
+  transitions Delegations.updateDelegation, EditRequest.updateRequest, EditWorkflow.addStep/updateStep.
+- **expenses** transition Advances.updateAdvance (employeePartyId).
+Verified own-vs-foreign on DB ground truth: delegate#Approval (own→own created; foreign delegate blocked) and
+create#Ticket (own assignee ticket created + org-stamped; foreign assignee blocked).
+
+### ⚠ Remaining after Tier 5 (party-injection class is now CLOSED app-wide; two structural items remain)
+1. **Tier-4 org columns** — the **approvals module** (ApprovalWorkflow/Step/Request/Delegation/Decision/Notification),
+   helpdesk **HelpDepartment**, and expenses **ExpenseAdvance** carry NO organizationPartyId. The party-injection guards
+   above block foreign-party injection, but the RECORDS themselves are still cross-tenant (a forged record PK can
+   read/update another tenant's row). Closing that needs a per-module isolation pass (add org column + list scope +
+   assert#RecordOrgAccess on the PK). Same for the other no-org Tier-4 modules: stores, quality, maintenance, documents
+   (+ marketing create#Campaign org-stamp).
+2. **Record-PK IDOR sweep** (a distinct class, deliberately not in these batches): approve/reject/cancel/regularize
+   -by-id transitions and update-by-record-PK on no-org entities (updateOvertime/updateCompOff/updateBalance/
+   updateDeclaration/updateStep/updateDelegation/updateRequest/updateAdvance). These select by a record id, not a
+   party id; they need the parent record's org checked — folds into item 1 once those entities have an org column.
