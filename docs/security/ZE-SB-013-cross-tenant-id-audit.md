@@ -154,3 +154,28 @@ Tier-5 helper built + first applications:
 
 **Remaining Tier 4:** stores, quality, maintenance, documents + `create#Campaign` org-stamp (per-module schema projects).
 **Remaining Tier 5:** ~35 more hr/payroll/attendance/timeoff/quality/maintenance/helpdesk/approvals employee-party writes.
+
+## Progress log — 2026-07-28: Tier 5 batch 2a — HR / attendance / timeoff / payroll employee guards
+**13 files, deployed + verified on throwaway tenant (org 113617), 0 residue, MARUTHI no-op.**
+Added a second helper `zenith.base.SecurityServices.assert#EmployeeOrgAccess(employeeId)` (loads zenith.erp.hr.Employee
+by its PK, compares organizationPartyId to the active org; ADMIN-exempt) for the many hr/payroll writes keyed on the
+Employee PK rather than a party id. Guarded (all "only when the id is supplied" → own/null flows are a MARUTHI no-op):
+- **hr** HrServices: create#Employee (reportingToEmployeeId), confirm#Employee, resign#Employee, approve#Leave
+  (approvedByEmployeeId), calculate#FullAndFinal; LmsServices assign#MandatoryTraining; PerformanceServices
+  start#AppraisalCycle (subject + manager + every peer); **transitions** MyLeaves.applyLeave (entity-auto create,
+  bypasses the guarded apply#Leave service) + MyProfile.updateProfile (entity-auto update#Employee — a forged
+  employeeId could overwrite another org's CTC/bank/statutory IDs).
+- **attendance** clockIn/clockOut#Attendance (employeePartyId + clockOut's recordId path), transitions
+  Shifts.assignShift / Overtime.createOvertime / MyAttendance.requestRegularize.
+- **timeoff** initialize#LeaveBalance, transition CompOff.createCompOff.
+- **payroll** transition TaxDeclarations.createDeclaration (india entity has no org column). SKIPPED calculate#Payslip:
+  not web-reachable, sole caller process#PayrollRun pre-scopes to org employees, and a guard would fail-closed for a
+  future anonymous/cron run — flagged latent, guard only if ever exposed.
+Verified own-vs-foreign on DB ground truth across the full guard matrix (transition+employeeId createDeclaration,
+transition+partyId createCompOff, service+employeeId resignEmployee): own succeeds, foreign (a valid employee of a
+DIFFERENT org) blocked / 0 rows.
+**Deferred to a follow-up record-IDOR + Tier-4 sweep** (a distinct class): update-by-record-PK transitions
+(updateOvertime/updateCompOff/updateBalance/updateDeclaration) and approve/reject/cancel-by-applicationId — these
+select by a record PK on entities with no org column, so they need org columns first.
+**Next: batch 2b** — helpdesk/approvals/expenses assignee/approver/delegate party injections (assign#Ticket,
+delegate#Approval, addStep, create#Ticket assignedToPartyId, etc.); several of those entities also lack an org column.
