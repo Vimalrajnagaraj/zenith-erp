@@ -124,3 +124,33 @@ is adding org columns + list scoping + guards (a per-module isolation pass).*
 4. TIER 3 (peripheral customer modules).
 5. TIER 4 (no-org-model modules) — schedule as per-module isolation projects (schema + scope + guard).
 6. TIER 5 (employee-internal) — needs an org-membership helper service.
+
+## Progress log — 2026-07-28: SmsGateway module isolation (Tier 4 start) + Tier-5 membership helper
+**Deployed + verified on throwaway PROFESSIONAL tenant (org 113566), 0 residue, MARUTHI untouched.**
+
+Secondary-HIGH #1 (SMS secret) fully closed as a *module* isolation, not just a service band-aid:
+- Added `SmsGateway.organizationPartyId` (auto-DDL). `createGateway` stamps it from the session; `updateGateway`
+  guards via `assert#RecordOrgAccess`; the gateway list is org-scoped. **Verified (DB ground truth):** own create
+  stamped 113566; foreign `updateGateway` blocked (name unchanged); foreign gateway invisible in the list render.
+- `build#SmsPayload` guards the gateway before the decrypted `apiKey`/`apiSecret` enter the payload (defense-in-depth;
+  no reachable caller — verified by inspection). Returns the same "not found" message as the not-exists case.
+- **`SmsLog` + `SmsDltTemplate` have no org column** — they belong to a gateway, so both lists (and the DLT
+  gateway drop-down + `create/updateDltTemplate`) are scoped/guarded to the org's own gateway ids. This closed a
+  **cross-tenant PII leak**: `SmsLog` (phone numbers + message bodies) was visible to every tenant. **Verified:**
+  own log/template shown, foreign hidden; foreign DLT create/update blocked.
+- Fixed a **pre-existing render bug** (unrelated to the security change) that made the whole screen unusable for any
+  tenant with an empty SMS log: `<limit-range>` (the codebase's only use) generates a `getPartialList`→`absolute(1)`
+  scrollable-cursor call that throws "Error going to absolute row number 1". Replaced with `offset`/`limit` attrs.
+- No-op-safe note: the 3 pre-existing gateways (`SMS_KALEYRA`/`SMS_MSG91`/`SMS_TEXTLOCAL`) are inactive platform
+  **seeds** (org NULL, sender ZENITH, `is_active=N`); scoping keeps them out of tenant views (super-admin still sees
+  them). MARUTHI configured none and has no gateway of its own → send capability unaffected.
+
+Tier-5 helper built + first applications:
+- New `zenith.base.SecurityServices.assert#PartyOrgMembership(partyId)` — a party is a member of the active org if it
+  is an Employee of it (`zenith.erp.hr.Employee`), owned by it, or is the org. ADMIN-exempt pure predicate.
+- Applied to attendance `mark#Attendance` (**verified**: own employee of 113566 → row created; employee of a
+  *different* org → blocked, proving org-scoping not just "is any employee"), timeoff `encash#Leave` (money path),
+  and payroll `create#SalaryAdvance` (inline Employee-PK org check — that service keys on `employeeId`, not partyId).
+
+**Remaining Tier 4:** stores, quality, maintenance, documents + `create#Campaign` org-stamp (per-module schema projects).
+**Remaining Tier 5:** ~35 more hr/payroll/attendance/timeoff/quality/maintenance/helpdesk/approvals employee-party writes.

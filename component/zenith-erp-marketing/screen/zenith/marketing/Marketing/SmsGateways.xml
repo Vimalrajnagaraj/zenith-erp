@@ -4,32 +4,70 @@
         default-menu-title="SMS Gateways" default-menu-index="5">
 
     <transition name="createGateway" begin-transaction="true">
-        <service-call name="create#zenith.erp.marketing.SmsGateway"/>
+        <actions>
+            <!-- ZE-SB-013 (Tier 4): stamp the owning org from the session so a gateway (with encrypted secrets)
+                 is private to this tenant. -->
+            <service-call name="create#zenith.erp.marketing.SmsGateway"
+                          in-map="context + [organizationPartyId:ec.user.getPreference('ACTIVE_ORGANIZATION')]"/>
+        </actions>
         <default-response url="."/>
     </transition>
     <transition name="updateGateway" begin-transaction="true">
-        <service-call name="update#zenith.erp.marketing.SmsGateway"/>
+        <actions>
+            <!-- ZE-SB-013 (Tier 4): only edit a gateway owned by this org (list is scoped, so this blocks a forged POST). -->
+            <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" out-map="_ga"
+                          in-map="[entityName:'zenith.erp.marketing.SmsGateway', idField:'gatewayId', idValue:gatewayId, orgField:'organizationPartyId']"/>
+            <if condition="!_ga.allowed"><return error="true" message="You do not have access to this SMS gateway."/></if>
+            <service-call name="update#zenith.erp.marketing.SmsGateway" in-map="context"/>
+        </actions>
         <default-response url="."/>
     </transition>
     <transition name="createDltTemplate" begin-transaction="true">
-        <service-call name="create#zenith.erp.marketing.SmsDltTemplate"/>
+        <actions>
+            <!-- ZE-SB-013 (Tier 4 f/u): a template may only be attached to a gateway THIS org owns (guard only when
+                 a gateway is chosen, so a gateway-less template is unchanged and MARUTHI's own flow is a no-op). -->
+            <if condition="gatewayId">
+                <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" out-map="_dc"
+                              in-map="[entityName:'zenith.erp.marketing.SmsGateway', idField:'gatewayId', idValue:gatewayId, orgField:'organizationPartyId']"/>
+                <if condition="!_dc.allowed"><return error="true" message="You do not have access to that SMS gateway."/></if>
+            </if>
+            <service-call name="create#zenith.erp.marketing.SmsDltTemplate" in-map="context"/>
+        </actions>
         <default-response url="."/>
     </transition>
     <transition name="updateDltTemplate" begin-transaction="true">
-        <service-call name="update#zenith.erp.marketing.SmsDltTemplate"/>
+        <actions>
+            <!-- ZE-SB-013 (Tier 4 f/u): only edit a template whose gateway this org owns (blocks a forged dltTemplateId). -->
+            <entity-find-one entity-name="zenith.erp.marketing.SmsDltTemplate" value-field="_dlt"/>
+            <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" out-map="_du"
+                          in-map="[entityName:'zenith.erp.marketing.SmsGateway', idField:'gatewayId', idValue:_dlt?.gatewayId, orgField:'organizationPartyId']"/>
+            <if condition="!_du.allowed"><return error="true" message="You do not have access to that DLT template."/></if>
+            <service-call name="update#zenith.erp.marketing.SmsDltTemplate" in-map="context"/>
+        </actions>
         <default-response url="."/>
     </transition>
 
     <actions>
         <entity-find entity-name="zenith.erp.marketing.SmsGateway" list="gatewayList">
+            <!-- ZE-SB-013 (Tier 4): show only this org's gateways (super-admin with no active org sees all). -->
+            <econdition field-name="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
             <order-by field-name="gatewayName"/>
         </entity-find>
+        <!-- ZE-SB-013 (Tier 4 f/u): SmsDltTemplate and SmsLog carry no org field of their own; each belongs to a
+             gateway, so scope both to THIS org's gateway ids (phone numbers + message bodies in SmsLog were
+             cross-tenant visible). Empty set -> '__none__' => nothing (a tenant with no gateways sees no
+             logs/templates). Super-admin (no active org) => gatewayList is every gateway => sees all, as before. -->
+        <set field="myGatewayIds" from="(gatewayList ?: []).collect{ it.gatewayId } ?: ['__none__']"/>
         <entity-find entity-name="zenith.erp.marketing.SmsDltTemplate" list="dltList">
+            <econdition field-name="gatewayId" operator="in" from="myGatewayIds"/>
             <order-by field-name="gatewayId,templateName"/>
         </entity-find>
-        <entity-find entity-name="zenith.erp.marketing.SmsLog" list="logList">
+        <!-- ZE-SB-013 f/u: use offset/limit (plain SQL LIMIT) not <limit-range>, whose getPartialList/absolute()
+             scrollable-cursor path throws "absolute row number 1" on an empty/forward-only result and broke the
+             whole screen for any tenant with no SMS log rows (the only <limit-range> use in the codebase). -->
+        <entity-find entity-name="zenith.erp.marketing.SmsLog" list="logList" offset="0" limit="50">
+            <econdition field-name="gatewayId" operator="in" from="myGatewayIds"/>
             <order-by field-name="-sentDate"/>
-            <limit-range start="0" size="50"/>
         </entity-find>
     </actions>
 
@@ -88,7 +126,10 @@
                         <field name="dltTemplateId"><default-field title="DLT Template ID"><text-line size="20"/></default-field></field>
                         <field name="gatewayId"><default-field title="Gateway">
                             <drop-down><entity-options key="${gatewayId}" text="${gatewayName}">
-                                <entity-find entity-name="zenith.erp.marketing.SmsGateway"/>
+                                <entity-find entity-name="zenith.erp.marketing.SmsGateway">
+                                    <!-- ZE-SB-013 (Tier 4 f/u): only offer this org's own gateways. -->
+                                    <econdition field-name="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+                                </entity-find>
                             </entity-options></drop-down></default-field></field>
                         <field name="templateName"><default-field title="Name"><text-line size="30"/></default-field></field>
                         <field name="templateContent"><default-field title="Content"><text-area rows="4" cols="50"/></default-field></field>
