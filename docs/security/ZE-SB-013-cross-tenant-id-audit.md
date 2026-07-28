@@ -330,3 +330,20 @@ share OWN doc with a FOREIGN party blocked (party-injection); foreign doc detail
   QualityParameter global+private).
 - **maintenance** (Equipment/MaintWorkOrder/MaintenancePlan roots + WorkOrderTask/Part/MeterLog children + dashboard
   count scoping). Full inventories captured.
+
+## Progress log — 2026-07-28: Tier 4 batch 3f — maintenance module
+**8 files, deployed + verified on throwaway tenant (org 113923), 0 residue, MARUTHI no-op.**
+Equipment / MaintWorkOrder / MaintenancePlan = canonical private roots (no seeds); WorkOrderTask/Part (via WO),
+EquipmentMeterLog (via Equipment) children guarded through the parent (no own column). WorkOrderView alias-alls WO.
+- create#Equipment / create#WorkOrder stamp org + scope their number sequences; create#WorkOrder also asserts the
+  referenced equipment is owned. start#/complete#WorkOrder, add#WorkOrderPart, log#MeterReading guard the parent's org;
+  check#MaintenanceDue scopes to the caller (all for a cron).
+- Screens: EquipmentList/WorkOrders/MaintenancePlans lists + equipment pickers scoped; EditEquipment updateEquipment/
+  createPlan/updatePlan + detail render guarded; EditWorkOrder updateWo/addTask/updateTask + detail render guarded;
+  MaintenanceDashboard's 4 counts + duePlans + recentWorkOrders scoped.
+**Verified (DB ground truth):** create stamps org; update on foreign equipment blocked; create work order against a
+foreign equipment blocked; start on a foreign work order blocked; foreign equipment detail not rendered.
+
+### Still to do (Tier 4) — 1 module left
+- **quality** (QualityInspection/NonConformance/QualityCertificate/InspectionTemplate roots + InspectionReading/
+  CorrectiveAction/TemplateParam children + QualityParameter global+private). Full inventory captured.

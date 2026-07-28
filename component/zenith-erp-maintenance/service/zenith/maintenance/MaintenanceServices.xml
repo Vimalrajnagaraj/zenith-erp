@@ -22,8 +22,9 @@
             int fyStart = now.monthValue >= fyStartMonth ? now.year : now.year - 1
             String fySuffix = String.format("%02d-%02d", fyStart % 100, (fyStart + 1) % 100)
 
+            def _ao = ec.user.getPreference("ACTIVE_ORGANIZATION"); if (_ao == '_NA_') _ao = null   // ZE-SB-013 (Tier 4)
             def last = ec.entity.find("zenith.erp.maintenance.Equipment")
-                .condition("equipmentNumber", "like", "EQ/${fySuffix}/%").orderBy("-equipmentNumber").limit(1).list()
+                .condition("equipmentNumber", "like", "EQ/${fySuffix}/%").condition("organizationPartyId", _ao).orderBy("-equipmentNumber").limit(1).list()
             int nextSeq = 1
             if (last) {
                 def parts = last[0].equipmentNumber.split("/")
@@ -40,7 +41,8 @@
                 purchaseDate: purchaseDate, purchaseAmount: purchaseAmount,
                 warrantyExpiryDate: warrantyExpiryDate, statusId: "EqActive",
                 currentMeterReading: 0, meterUnit: meterUnit ?: "Hours",
-                criticality: criticality ?: "Medium", description: description
+                criticality: criticality ?: "Medium", description: description,
+                organizationPartyId: _ao
             ]).create()
         ]]></script></actions>
     </service>
@@ -63,8 +65,12 @@
             int fyStart = now.monthValue >= fyStartMonth ? now.year : now.year - 1
             String fySuffix = String.format("%02d-%02d", fyStart % 100, (fyStart + 1) % 100)
 
+            // ZE-SB-013 (Tier 4): the equipment this work order is for must belong to your org.
+            def _ao = ec.user.getPreference("ACTIVE_ORGANIZATION"); if (_ao == '_NA_') _ao = null
+            def _eq = ec.entity.find("zenith.erp.maintenance.Equipment").condition("equipmentId", equipmentId).one()
+            if (!_eq || (!ec.user.isInGroup("ADMIN") && _eq.organizationPartyId != _ao)) { ec.message.addError("Equipment not found for your account"); return }
             def last = ec.entity.find("zenith.erp.maintenance.MaintWorkOrder")
-                .condition("workOrderNumber", "like", "WO/${fySuffix}/%").orderBy("-workOrderNumber").limit(1).list()
+                .condition("workOrderNumber", "like", "WO/${fySuffix}/%").condition("organizationPartyId", _ao).orderBy("-workOrderNumber").limit(1).list()
             int nextSeq = 1
             if (last) {
                 def parts = last[0].workOrderNumber.split("/")
@@ -79,7 +85,8 @@
                 workOrderType: workOrderType, priority: priority,
                 description: description, requestedDate: ec.user.nowTimestamp,
                 scheduledDate: scheduledDate, assignedToPartyId: assignedToPartyId,
-                statusId: "WoDraft", estimatedHours: estimatedHours
+                statusId: "WoDraft", estimatedHours: estimatedHours,
+                organizationPartyId: _ao
             ]).create()
         ]]></script></actions>
     </service>
@@ -88,7 +95,8 @@
         <in-parameters><parameter name="workOrderId" required="true"/></in-parameters>
         <actions><script><![CDATA[
             def wo = ec.entity.find("zenith.erp.maintenance.MaintWorkOrder").condition("workOrderId", workOrderId).one()
-            if (!wo) { ec.message.addError("Work order not found"); return }
+            // ZE-SB-013 (Tier 4): only act on a work order your org owns.
+            if (!wo || (!ec.user.isInGroup("ADMIN") && wo.organizationPartyId != ec.user.getPreference("ACTIVE_ORGANIZATION"))) { ec.message.addError("Work order not found"); return }
             if (wo.statusId != "WoDraft" && wo.statusId != "WoScheduled") {
                 ec.message.addError("Work order must be Draft or Scheduled"); return
             }
@@ -113,7 +121,8 @@
         </in-parameters>
         <actions><script><![CDATA[
             def wo = ec.entity.find("zenith.erp.maintenance.MaintWorkOrder").condition("workOrderId", workOrderId).one()
-            if (!wo) { ec.message.addError("Work order not found"); return }
+            // ZE-SB-013 (Tier 4): only act on a work order your org owns.
+            if (!wo || (!ec.user.isInGroup("ADMIN") && wo.organizationPartyId != ec.user.getPreference("ACTIVE_ORGANIZATION"))) { ec.message.addError("Work order not found"); return }
             if (wo.statusId != "WoInProgress") { ec.message.addError("Work order must be In Progress"); return }
 
             wo.set("statusId", "WoCompleted")
@@ -162,6 +171,9 @@
             <parameter name="unitCost" type="BigDecimal"/>
         </in-parameters>
         <actions><script><![CDATA[
+            // ZE-SB-013 (Tier 4): only add parts to a work order your org owns.
+            def _wo = ec.entity.find("zenith.erp.maintenance.MaintWorkOrder").condition("workOrderId", workOrderId).one()
+            if (!_wo || (!ec.user.isInGroup("ADMIN") && _wo.organizationPartyId != ec.user.getPreference("ACTIVE_ORGANIZATION"))) { ec.message.addError("Work order not found"); return }
             def existing = ec.entity.find("zenith.erp.maintenance.WorkOrderPart")
                 .condition("workOrderId", workOrderId).orderBy("-partSeqId").limit(1).list()
             int nextSeq = 1
@@ -185,6 +197,9 @@
         </in-parameters>
         <out-parameters><parameter name="logId"/></out-parameters>
         <actions><script><![CDATA[
+            // ZE-SB-013 (Tier 4): only log a reading for equipment your org owns.
+            def _eq = ec.entity.find("zenith.erp.maintenance.Equipment").condition("equipmentId", equipmentId).one()
+            if (!_eq || (!ec.user.isInGroup("ADMIN") && _eq.organizationPartyId != ec.user.getPreference("ACTIVE_ORGANIZATION"))) { ec.message.addError("Equipment not found for your account"); return }
             context.logId = ec.entity.sequencedIdPrimary("zenith.erp.maintenance.EquipmentMeterLog", null, null)
             ec.entity.makeValue("zenith.erp.maintenance.EquipmentMeterLog").setAll([
                 logId: context.logId, equipmentId: equipmentId,
@@ -205,9 +220,13 @@
         <out-parameters><parameter name="dueCount" type="Integer"/></out-parameters>
         <actions><script><![CDATA[
             def cutoff = java.sql.Date.valueOf(java.time.LocalDate.now().plusDays(daysAhead ?: 7))
-            def plans = ec.entity.find("zenith.erp.maintenance.MaintenancePlan")
+            def _pf = ec.entity.find("zenith.erp.maintenance.MaintenancePlan")
                 .condition("isActive", "Y")
-                .condition("nextMaintenanceDate", "<=", cutoff).list()
+                .condition("nextMaintenanceDate", "<=", cutoff)
+            // ZE-SB-013 (Tier 4): scope to the caller's org; count all for a super-admin / no-user cron.
+            def _ao = ec.user.getPreference("ACTIVE_ORGANIZATION")
+            if (_ao && _ao != '_NA_') _pf.condition("organizationPartyId", _ao)
+            def plans = _pf.list()
             context.dueCount = plans.size()
             ec.message.addMessage("Found ${context.dueCount} maintenance plans due within ${daysAhead} days")
         ]]></script></actions>
