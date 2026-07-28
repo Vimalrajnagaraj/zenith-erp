@@ -204,3 +204,40 @@ create#Ticket (own assignee ticket created + org-stamped; foreign assignee block
    -by-id transitions and update-by-record-PK on no-org entities (updateOvertime/updateCompOff/updateBalance/
    updateDeclaration/updateStep/updateDelegation/updateRequest/updateAdvance). These select by a record id, not a
    party id; they need the parent record's org checked — folds into item 1 once those entities have an org column.
+
+## Progress log — 2026-07-28: Tier 4 batch 3a — stores / expenses(ExpenseAdvance) / helpdesk(ticket gaps)
+**7 files, deployed + verified on throwaway tenant (org 113668), 0 residue, MARUTHI no-op. All Tier-4 tables were
+EMPTY (0 rows across stores/expenses/helpdesk/approvals/quality/maintenance/documents) → adding columns + scoping is
+trivially no-op-safe (nothing to hide/backfill); isolation is forward-looking.**
+
+Scope = the UNAMBIGUOUS, seed-free, tenant-transactional entities (no product decision needed):
+- **stores** — `Store` already had organizationPartyId; the gap was enforcement. FORCE org from session on create#Store
+  (it used to TRUST a submitted organizationPartyId = cross-tenant stamp), guard update#Store + the 4 child writes
+  (set#OperatingHours/StoreTarget/StoreConfig via parent Store's org), guard the `addHoliday` entity-auto transition,
+  add a render guard on EditStore (was a cross-tenant detail read), guard get#StoreDashboard. Children (hours/target/
+  config/holiday) keyed by storeId → guarded via the PARENT (no new columns). **Verified:** submitted-foreign-org
+  create → forced to caller org; foreign update/detail blocked.
+- **expenses** — added `ExpenseAdvance.organizationPartyId` (auto-DDL); stamp on create#ExpenseAdvance, scope the
+  Advances list + the advanceNumber sequence, add assert#RecordOrgAccess on advanceId in updateAdvance. **Verified:**
+  foreign advance update blocked.
+- **helpdesk** — `Ticket` already had org; closed the residual gaps: guarded the unprotected updateStatus/addComment/
+  rateTicket transitions (assert on ticketId), added a render guard on EditTicket (cross-tenant ticket+comments read),
+  scoped the SlaConfig breached-ticket list. TicketComment (child) guarded via parent Ticket. **Verified:** foreign
+  ticket status update blocked; foreign ticket detail not rendered.
+
+### ⚠ DECISION NEEDED before isolating the rest (seeded global config vs per-tenant)
+Several entities are SEEDED with global (NULL-org) rows; isolating them would HIDE the seeds from every tenant:
+- **approvals** `ApprovalWorkflow` — 4 seeded starter templates (PO / expense-claim / sales-discount / leave-request)
+  + their steps. (ApprovalRequest + ApprovalDelegation are transactional/unseeded → isolatable now; ApprovalWorkflow
+  is the seeded-config question.)
+- **expenses** `ExpenseCategory`, `PerDiemRule`; **helpdesk** `HelpDepartment`, `TicketCategory`, `SlaPolicy`,
+  `CannedResponse` — category/policy masters, seeded globally.
+Question for the user: are these meant to be (a) GLOBAL shared config (keep NULL-org, special-case them as visible-to-
+all — needs an "org == active OR org IS NULL" scope, and they stay read-only shared), (b) PER-TENANT (add column +
+stamp + scope, and BACKFILL the seed rows to a specific org or drop them), or (c) leave as-is for now? Not guessing —
+touches seed/business data. Until decided, these are NOT isolated.
+
+### Still to do (Tier 4)
+- approvals ApprovalRequest + ApprovalDelegation isolation (transactional, no seed conflict) — ready to do.
+- quality / maintenance / documents — inventory agent failed mid-stream (API error); needs a re-run before executing.
+- marketing create#Campaign org-stamp.
