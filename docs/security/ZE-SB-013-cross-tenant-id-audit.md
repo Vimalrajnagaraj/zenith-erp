@@ -241,3 +241,35 @@ touches seed/business data. Until decided, these are NOT isolated.
 - approvals ApprovalRequest + ApprovalDelegation isolation (transactional, no seed conflict) — ready to do.
 - quality / maintenance / documents — inventory agent failed mid-stream (API error); needs a re-run before executing.
 - marketing create#Campaign org-stamp.
+
+## Progress log — 2026-07-28: Tier 4 batch 3b — approvals module (global+private model)
+**8 files, deployed + verified on throwaway tenant (org 113719), 0 residue, seeds intact, MARUTHI no-op.**
+User decision (global-config): "Global defaults + private additions" — seeded rows stay visible to all as read-only
+shared starters; tenant-created rows are stamped private; tenants can edit only their own.
+
+Added organizationPartyId to ApprovalWorkflow, ApprovalRequest, ApprovalDelegation (view auto-exposes via alias-all).
+- **ApprovalWorkflow = GLOBAL+PRIVATE** (the 4 seeded templates are NULL-org shared starters): createWorkflow stamps
+  the tenant's org (a no-org admin authors a NULL global template); lists/drop-downs scope `org == active OR org IS
+  NULL` (own + global seeds); EditWorkflow detail allows viewing own-or-global; updateWorkflow/addStep/updateStep
+  assert#RecordOrgAccess on workflowId (denies editing a NULL seed → seeds are read-only to tenants). ApprovalStep
+  (child) guarded via the parent workflow.
+- **ApprovalRequest / ApprovalDelegation = CANONICAL PRIVATE** (transactional, unseeded): stamp org on create; scope
+  MyApprovals pendingList (was leaking ALL tenants' pending requests) + AllRequests + Delegations list; guard the 5
+  by-id request writes (approve/reject/return/escalate/cancel) + updateRequest + EditRequest render + updateDelegation
+  + EditRequest/updateDelegation with assert#RecordOrgAccess. create#ApprovalRequest validates that the chosen
+  workflow is own-or-global (not another tenant's). check#OverdueApprovals left unscoped (background job, all tenants).
+- Pattern for global+private: stamp normalizes a no-org admin's '_NA_' to NULL so they author true global seeds;
+  scope uses `<econditions combine="or">` (org ignore-if-empty + is-null); the guard (assert#RecordOrgAccess) already
+  denies NULL to non-admins, giving read-only seeds for free.
+**Verified (DB ground truth):** create against the global seed workflow → request created + stamped tenant org;
+create against a foreign workflow → 0 rows; approve a foreign request → blocked; update a global seed workflow (as
+tenant) → blocked (name unchanged); MyApprovals pending list shows own, hides foreign; the 4 seed workflows remain
+NULL-org/global.
+
+### Still to do (Tier 4)
+- config masters (global+private, same pattern): expenses ExpenseCategory/PerDiemRule; helpdesk HelpDepartment/
+  TicketCategory/SlaPolicy/CannedResponse.
+- quality (QualityInspection/NonConformance/QualityCertificate/InspectionTemplate roots + QualityParameter global+
+  private), maintenance (Equipment/MaintWorkOrder/MaintenancePlan + children), documents (Document root + DocumentShare
+  party-injection + DocumentCategory/DocumentTag global+private) — full inventories captured (agent re-run).
+- marketing create#Campaign org-stamp.
