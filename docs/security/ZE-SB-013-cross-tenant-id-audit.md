@@ -273,3 +273,22 @@ NULL-org/global.
   private), maintenance (Equipment/MaintWorkOrder/MaintenancePlan + children), documents (Document root + DocumentShare
   party-injection + DocumentCategory/DocumentTag global+private) — full inventories captured (agent re-run).
 - marketing create#Campaign org-stamp.
+
+## Progress log — 2026-07-28: Tier 4 batch 3c — config masters (global+private)
+**10 files, deployed + verified on throwaway tenant (org 113770), 0 residue, MARUTHI no-op.**
+Applied the user's "global defaults + private additions" model to the seeded config-master entities:
+- expenses: ExpenseCategory, PerDiemRule; helpdesk: HelpDepartment, TicketCategory, SlaPolicy, CannedResponse.
+Each got: organizationPartyId column; create stamps the tenant org (no-org admin '_NA_'→NULL authors a global seed);
+update/delete guarded by assert#RecordOrgAccess (a NULL seed / another org's row is read-only to tenants); list finds
++ every picker drop-down scoped `org == active OR org IS NULL` (own + global). (Note: these config tables were empty
+in this DB — the data-file seeds were never loaded — so the change is doubly no-op-safe; the model is correct for when
+seeds/data exist.) Display-entity label lookups left unscoped (they resolve names for already-visible rows).
+**Verified (DB ground truth):** tenant createCategory → stamped org; updateCategory on a NULL global seed → blocked
+(read-only); updateCategory on another org's category → blocked; helpdesk updatePolicy on a global seed → blocked;
+Categories list render shows own + global seed, hides the foreign category.
+
+### Still to do (Tier 4)
+- quality (QualityInspection/NonConformance/QualityCertificate/InspectionTemplate roots + children + QualityParameter
+  global+private), maintenance (Equipment/MaintWorkOrder/MaintenancePlan + children), documents (Document root +
+  DocumentShare party-injection + DocumentCategory/DocumentTag global+private). Full inventories captured.
+- marketing create#Campaign org-stamp.
