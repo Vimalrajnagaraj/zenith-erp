@@ -292,3 +292,22 @@ Categories list render shows own + global seed, hides the foreign category.
   global+private), maintenance (Equipment/MaintWorkOrder/MaintenancePlan + children), documents (Document root +
   DocumentShare party-injection + DocumentCategory/DocumentTag global+private). Full inventories captured.
 - marketing create#Campaign org-stamp.
+
+## Progress log — 2026-07-28: Tier 4 batch 3d — marketing MarketingCampaign isolation
+**4 files, deployed + verified on throwaway tenant (org 113821), 0 residue, MARUTHI no-op.**
+The audit item was "create#Campaign org-stamp" but proper isolation needed the full root treatment (a null-org campaign
+would act cross-tenant). Added MarketingCampaign.organizationPartyId (CampaignView alias-alls it); create#Campaign
+stamps the session org; Campaigns list scoped; the lifecycle services schedule/send/cancel/complete#Campaign +
+EditCampaign updateCampaign transition + EditCampaign detail render all guard campaignId via assert#RecordOrgAccess.
+CampaignRecipient (child) isolated transitively via the campaign guard. **Verified (DB ground truth):** create stamps
+org; schedule + update on another org's campaign blocked (status/name unchanged).
+
+### Still to do (Tier 4) — the three large modules
+- **quality** (QualityInspection/NonConformance/QualityCertificate/InspectionTemplate roots + InspectionReading/
+  CorrectiveAction/TemplateParam children + QualityParameter global+private).
+- **maintenance** (Equipment/MaintWorkOrder/MaintenancePlan roots + WorkOrderTask/Part/MeterLog children + dashboard
+  count scoping).
+- **documents** (Document root + DocumentVersion/AccessLog/TagMap children + DocumentShare child with a sharedWithPartyId
+  party-injection + DocumentCategory/DocumentTag global+private).
+Full inventories captured (2026-07-28 agent re-run). Each is a focused per-module batch (root column + stamp + scope +
+guard every entity-auto by-PK transition + child guards via parent).
