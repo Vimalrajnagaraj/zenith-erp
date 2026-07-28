@@ -347,3 +347,27 @@ foreign equipment blocked; start on a foreign work order blocked; foreign equipm
 ### Still to do (Tier 4) — 1 module left
 - **quality** (QualityInspection/NonConformance/QualityCertificate/InspectionTemplate roots + InspectionReading/
   CorrectiveAction/TemplateParam children + QualityParameter global+private). Full inventory captured.
+
+## Progress log — 2026-07-28: Tier 4 batch 3g — quality module (COMPLETES TIER 4)
+**9 files, deployed + verified on throwaway tenant (org 113974), 0 residue, MARUTHI no-op.**
+QualityInspection / NonConformance / QualityCertificate / InspectionTemplate = canonical private roots;
+QualityParameter = global+private (seeded master); InspectionReading/CorrectiveAction/InspectionTemplateParam children
+guarded via parent. InspectionView alias-alls QI.
+- create#Inspection / create#NonConformance stamp org + scope their sequences; create#Inspection also asserts its
+  templateId is owned. record#/complete#Inspection, resolve#NonConformance, add#TemplateParameter guard the parent org.
+- Screens: Inspections/NonConformances/Certificates/Templates lists + template picker scoped; EditInspection
+  (updateInspection/addReading/detail), EditNcr (updateNcr/createCapa/updateCapa/detail — updateCapa resolves the
+  CAPA's own NCR to guard), Templates (create/update/deleteParam + selected-template render sentinel) guarded;
+  QualityParameter lists+pickers global+private (OR-null); create/update global+private.
+**Verified (DB ground truth):** create stamps org; update on a foreign inspection blocked; resolve on a foreign NCR
+blocked; update on a NULL global parameter (seed) blocked; foreign inspection detail not rendered.
+
+## ✅ TIER 4 COMPLETE (2026-07-28)
+Every previously-un-isolated module now enforces org isolation:
+SmsGateway, stores, expenses(ExpenseAdvance), helpdesk(ticket gaps), approvals, config-masters(expenses+helpdesk),
+marketing(MarketingCampaign), documents, maintenance, quality — plus the config masters + QualityParameter/
+DocumentCategory as global+private per the user's decision. **The entire cross-tenant ID-injection class (Tiers 1-3),
+the employee-membership class (Tier 5), and the no-org-model modules (Tier 4) are all closed and verified live.**
+Residual, lower-severity items intentionally out of scope of this program (documented for a future pass): the pure
+record-PK IDOR sweep on the FEW remaining no-org child tables that have neither their own org column nor a guardable
+parent (none known after this program) and any approve/reject/cancel-by-id paths already covered per-module above.
