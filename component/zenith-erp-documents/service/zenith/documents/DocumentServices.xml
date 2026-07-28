@@ -18,13 +18,14 @@
             import java.time.LocalDate
 
             def now = LocalDate.now()
+            def _ao = ec.user.getPreference("ACTIVE_ORGANIZATION"); if (_ao == '_NA_') _ao = null   // ZE-SB-013 (Tier 4)
             def fysSetting = ec.entity.find("zenith.erp.base.CompanySettings").condition("organizationPartyId", ec.user.getPreference("ACTIVE_ORGANIZATION")).condition("settingKey", "FY_START_MONTH").one()
             int fyStartMonth = fysSetting ? (fysSetting.settingValue as int) : 4
             int fyStart = now.monthValue >= fyStartMonth ? now.year : now.year - 1
             String fySuffix = String.format("%02d-%02d", fyStart % 100, (fyStart + 1) % 100)
 
             def last = ec.entity.find("zenith.erp.documents.Document")
-                .condition("documentNumber", "like", "DOC/${fySuffix}/%").orderBy("-documentNumber").limit(1).list()
+                .condition("documentNumber", "like", "DOC/${fySuffix}/%").condition("organizationPartyId", _ao).orderBy("-documentNumber").limit(1).list()
             int nextSeq = 1
             if (last) {
                 def parts = last[0].documentNumber.split("/")
@@ -53,7 +54,7 @@
                 uploadedDate: ec.user.nowTimestamp,
                 currentVersion: 1, statusId: "DocActive",
                 expiryDate: expiryDate, retentionUntilDate: retentionDate,
-                isConfidential: isConfidential
+                isConfidential: isConfidential, organizationPartyId: _ao
             ]).create()
 
             // Create version 1
@@ -76,7 +77,8 @@
         </in-parameters>
         <actions><script><![CDATA[
             def doc = ec.entity.find("zenith.erp.documents.Document").condition("documentId", documentId).one()
-            if (!doc) { ec.message.addError("Document not found"); return }
+            // ZE-SB-013 (Tier 4): only version a document your org owns.
+            if (!doc || (!ec.user.isInGroup("ADMIN") && doc.organizationPartyId != ec.user.getPreference("ACTIVE_ORGANIZATION"))) { ec.message.addError("Document not found"); return }
 
             int newVersion = (doc.currentVersion ?: 1) + 1
             ec.entity.makeValue("zenith.erp.documents.DocumentVersion").setAll([
@@ -104,6 +106,14 @@
         </in-parameters>
         <out-parameters><parameter name="shareId"/></out-parameters>
         <actions><script><![CDATA[
+            // ZE-SB-013 (Tier 4): only share a document your org owns, and only WITH a party in your org (sharedWithPartyId injection).
+            def _ao = ec.user.getPreference("ACTIVE_ORGANIZATION")
+            def _doc = ec.entity.find("zenith.erp.documents.Document").condition("documentId", documentId).one()
+            if (!_doc || (!ec.user.isInGroup("ADMIN") && _doc.organizationPartyId != _ao)) { ec.message.addError("Document not found"); return }
+            if (!ec.user.isInGroup("ADMIN")) {
+                def _m = ec.service.sync().name("zenith.base.SecurityServices.assert#PartyOrgMembership").parameters([partyId: sharedWithPartyId]).call()
+                if (!_m?.allowed) { ec.message.addError("That party isn't part of your organization."); return }
+            }
             context.shareId = ec.entity.sequencedIdPrimary("zenith.erp.documents.DocumentShare", null, null)
             ec.entity.makeValue("zenith.erp.documents.DocumentShare").setAll([
                 shareId: context.shareId, documentId: documentId,
@@ -121,6 +131,9 @@
             <parameter name="accessType" required="true"/>
         </in-parameters>
         <actions><script><![CDATA[
+            // ZE-SB-013 (Tier 4): only log access to a document your org owns (silently skip a foreign id).
+            def _doc = ec.entity.find("zenith.erp.documents.Document").condition("documentId", documentId).one()
+            if (!_doc || (!ec.user.isInGroup("ADMIN") && _doc.organizationPartyId != ec.user.getPreference("ACTIVE_ORGANIZATION"))) { return }
             ec.entity.makeValue("zenith.erp.documents.DocumentAccessLog").setAll([
                 accessId: ec.entity.sequencedIdPrimary("zenith.erp.documents.DocumentAccessLog", null, null),
                 documentId: documentId, accessType: accessType,
@@ -135,10 +148,14 @@
         <out-parameters><parameter name="expiringCount" type="Integer"/></out-parameters>
         <actions><script><![CDATA[
             def cutoff = java.sql.Date.valueOf(java.time.LocalDate.now().plusDays(daysAhead ?: 30))
-            def docs = ec.entity.find("zenith.erp.documents.Document")
+            def _rf = ec.entity.find("zenith.erp.documents.Document")
                 .condition("statusId", "DocActive")
                 .condition("retentionUntilDate", "<=", cutoff)
-                .condition("retentionUntilDate", "is-not-null", null).list()
+                .condition("retentionUntilDate", "is-not-null", null)
+            // ZE-SB-013 (Tier 4): scope to the caller's org; count all orgs for a super-admin / no-user cron.
+            def _ao = ec.user.getPreference("ACTIVE_ORGANIZATION")
+            if (_ao && _ao != '_NA_') _rf.condition("organizationPartyId", _ao)
+            def docs = _rf.list()
             context.expiringCount = docs.size()
             ec.message.addMessage("Found ${context.expiringCount} documents with retention period expiring within ${daysAhead} days")
         ]]></script></actions>

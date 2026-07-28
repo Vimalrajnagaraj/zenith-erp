@@ -311,3 +311,22 @@ org; schedule + update on another org's campaign blocked (status/name unchanged)
   party-injection + DocumentCategory/DocumentTag global+private).
 Full inventories captured (2026-07-28 agent re-run). Each is a focused per-module batch (root column + stamp + scope +
 guard every entity-auto by-PK transition + child guards via parent).
+
+## Progress log — 2026-07-28: Tier 4 batch 3e — documents module
+**5 files, deployed + verified on throwaway tenant (org 113872), 0 residue, MARUTHI no-op.**
+Document = canonical private (root); DocumentCategory = global+private; DocumentTag stays GLOBAL (seeded, no
+tenant-create path); Version/AccessLog/Share/TagMap children guarded via the parent Document (no own column).
+- create#Document stamps org + scopes the doc-number sequence; upload#NewVersion/log#DocumentAccess guard the
+  document's org; check#RetentionExpiry scopes to the caller's org (counts all for a no-user cron).
+- **share#Document (the headline gap)**: guards the document is owned AND that sharedWithPartyId is a member of the
+  caller's org (assert#PartyOrgMembership) — closes both a doc IDOR and a cross-tenant party-attach.
+- DocumentList scoped; EditDocument updateDocument/updateShare/addTag/removeTag transitions guarded (via parent doc);
+  EditDocument detail render guarded (confidential/foreign read IDOR); category pickers scoped global+private.
+**Verified (DB ground truth):** create stamps org; update on a foreign doc blocked; share on a foreign doc blocked;
+share OWN doc with a FOREIGN party blocked (party-injection); foreign doc detail not rendered.
+
+### Still to do (Tier 4) — 2 modules left
+- **quality** (QualityInspection/NonConformance/QualityCertificate/InspectionTemplate roots + children +
+  QualityParameter global+private).
+- **maintenance** (Equipment/MaintWorkOrder/MaintenancePlan roots + WorkOrderTask/Part/MeterLog children + dashboard
+  count scoping). Full inventories captured.
