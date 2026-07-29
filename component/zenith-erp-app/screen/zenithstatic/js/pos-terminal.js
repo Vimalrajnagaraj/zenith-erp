@@ -383,6 +383,20 @@ window._posOffline = (function() {
         function closeHistory() {
             if (historyOverlay) { historyOverlay.remove(); historyOverlay = null; }
         }
+        // Absolute URL to the Terminal/ajaxCart endpoint, tolerant of a TRAILING SLASH on the current page
+        // URL. The credit-bills / history / settle fetches used a RELATIVE 'Terminal/ajaxCart', which the
+        // browser resolves against the page's base dir — so on /apps/zenith/pos/CreditBills/ (a trailing
+        // slash, e.g. carried in from the /qapps->/apps bounce or a bookmark) it resolved to
+        // .../CreditBills/Terminal/ajaxCart -> 404 -> r.json() throws -> the page showed "Could not load
+        // credit bills — please refresh the page" and refreshing never helped (the trailing slash persisted).
+        // ZE-POS-0211. Every POS screen using this lives at /<shell>/zenith/pos/<Screen>, so the endpoint is
+        // always <shell>/zenith/pos/Terminal/ajaxCart in the SAME shell as the current page.
+        function ajaxCartUrl() {
+            var path = (location.pathname || '').replace(/\/+$/, '');   // drop trailing slash(es)
+            var i = path.indexOf('/zenith/pos/');
+            if (i >= 0) return path.slice(0, i) + '/zenith/pos/Terminal/ajaxCart';
+            return path.slice(0, path.lastIndexOf('/')) + '/Terminal/ajaxCart';  // fallback: sibling of current screen
+        }
         function historyPost(params) {
             if (CTX.sessionId) params.sessionId = CTX.sessionId;
             if (CTX.terminalId) params.terminalId = CTX.terminalId;
@@ -394,7 +408,7 @@ window._posOffline = (function() {
                 if (_tsel && _tsel.value) params.terminalId = _tsel.value;
             }
             params.moquiSessionToken = histToken();
-            return fetch('Terminal/ajaxCart', {
+            return fetch(ajaxCartUrl(), {   // ZE-POS-0211: absolute (was relative 'Terminal/ajaxCart' -> broke on a trailing-slash page URL)
                 method: 'POST', headers: {'Content-Type': 'application/x-www-form-urlencoded'},
                 body: new URLSearchParams(params), credentials: 'same-origin'
             }).then(function(r) { return r.json(); });
