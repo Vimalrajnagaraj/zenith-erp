@@ -14,14 +14,27 @@
                               in-map="[entityName:'mantle.party.Party', idField:'partyId', idValue:ec.web.parameters.customerPartyId, orgField:'ownerPartyId']"/>
                 <if condition="!_ca.allowed"><return error="true" message="Please select a valid customer from your account."/></if>
             </if>
+            <!-- ZE-PRC-018 f/u: resolve the order's SELLING org. Prefer the user's active org; if none (e.g. a
+                 super-admin with no active org) fall back to the selected customer's owner org. A sales order MUST
+                 carry a vendor org — without it pricing can't resolve a price list (falls to MRP, so volume/list
+                 pricing is ignored, cf. EditOrder/addItem) and org isolation breaks. Reject rather than persist a
+                 null-vendor order. -->
+            <script><![CDATA[
+                _sellOrg = ec.user.getPreference('ACTIVE_ORGANIZATION')
+                if ((!_sellOrg || _sellOrg == '_NA_') && customerPartyId)
+                    _sellOrg = ec.entity.find("mantle.party.Party").condition("partyId", customerPartyId).disableAuthz().one()?.ownerPartyId
+            ]]></script>
+            <if condition="!_sellOrg || _sellOrg == '_NA_'">
+                <return error="true" message="Select an active organization (or a customer) before creating an order."/>
+            </if>
             <!-- ZE-SALES: set currencyUomId explicitly (mantle's create#Order otherwise defaults to USD; India-only
                  ERP → INR, matching the quotation and invoice flows). -->
-            <service-call name="mantle.order.OrderServices.create#Order" in-map="[orderName:'New Sales Order', entryDate:orderDate, statusId:'OrderPlaced', currencyUomId:'INR', vendorPartyId:ec.user.getPreference('ACTIVE_ORGANIZATION'), customerPartyId:customerPartyId]" out-map="createOut"/>
+            <service-call name="mantle.order.OrderServices.create#Order" in-map="[orderName:'New Sales Order', entryDate:orderDate, statusId:'OrderPlaced', currencyUomId:'INR', vendorPartyId:_sellOrg, customerPartyId:customerPartyId]" out-map="createOut"/>
             <!-- ZE-SALES: assign a formatted per-org, financial-year sales-order number (SO/26-27/00001). Fail-open
                  to the order id if the org has no SALES_ORDER sequence, so order creation never breaks. -->
             <script><![CDATA[
                 try {
-                    def _org = ec.user.getPreference('ACTIVE_ORGANIZATION')
+                    def _org = _sellOrg   // the resolved selling org (active org, else the customer's owner org)
                     // Only call get#NextSequence when the org has this sequence configured: for a missing sequence
                     // it RETURNS AN ERROR (not an exception) that would roll back the whole order. Best-effort number.
                     def _hasSeq = _org && ec.entity.find("zenith.erp.base.SystemSequence").condition("organizationPartyId", _org).condition("sequenceType", "SALES_ORDER").disableAuthz().count() > 0
