@@ -282,6 +282,33 @@
                         def msgs = [[role: "system", content: system], [role: "user", content: llmQuery]]
                         def msg1 = callGroq(msgs)
                         def toolCalls = msg1?.tool_calls
+                        // ZE-CP-H-09: models sometimes emit the tool call as INLINE TEXT in the content
+                        // (e.g. <queryErpData>{...}</queryErpData>, or a mismatched </function> close) instead
+                        // of a structured tool_call. That (a) LEAKED the internal tool schema (entity names +
+                        // filter structure) to the user [SEC] and (b) meant the tool never ran. Strip the raw
+                        // syntax before display, and recover the answer by parsing the inline call so the tool
+                        // still executes.
+                        def _knownTools = ["queryErpData","getDemandAlerts","forecastCategoryDemand","forecastSales","explainForecastVariance","forecastProductDemand"]
+                        def stripToolCalls = { String s ->
+                            if (s == null) return s
+                            def o = s
+                            o = o.replaceAll(/(?is)<\s*(function|queryErpData|getDemandAlerts|forecast\w*|explain\w*)\b[^>]*>.*?<\s*\/\s*\w+\s*>/, '')
+                            o = o.replaceAll(/(?is)<\s*\/?\s*(function|queryErpData|getDemandAlerts|forecast\w*|explain\w*)\b[^>]*>/, '')
+                            return o.trim()
+                        }
+                        if (!toolCalls && msg1?.content) {
+                            def _im = (msg1.content =~ /(?is)<\s*([A-Za-z]\w*)\b[^>]*>\s*(\{.*?\})\s*<\s*\/\s*\w+\s*>/)
+                            if (_im.find()) {
+                                def _open = _im.group(1); def _json = _im.group(2); def _fn = _open
+                                if (_open.equalsIgnoreCase("function")) {
+                                    def _nm = (msg1.content =~ /name\s*=\s*["']([^"']+)["']/); _fn = _nm.find() ? _nm.group(1) : "queryErpData"
+                                }
+                                if (_knownTools.contains(_fn)) {
+                                    toolCalls = [[id: "inline1", type: "function", function: [name: _fn, arguments: _json]]]
+                                    msg1.content = ""  // don't carry the leaked tool-call text into the follow-up prompt
+                                }
+                            }
+                        }
                         if (toolCalls) {
                             def tc = toolCalls[0]
                             def fname = tc.function?.name
@@ -337,6 +364,9 @@
                         } else {
                             resp = msg1?.content?.trim()
                         }
+                        // ZE-CP-H-09: final safety net — never render raw tool-call syntax to the user, even if
+                        // a follow-up (msg2) or a non-tool reply still contained inline <queryErpData>/</function>.
+                        resp = stripToolCalls(resp)
 
                         // Back-translate the English answer into the user's language (fail-open: keep English on miss).
                         if (userLang && resp) {
@@ -385,7 +415,7 @@
                 }
                 allowed.add("mantle.product.asset.Asset")
                 allowed.add("moqui.basic.Enumeration"); allowed.add("moqui.basic.Uom")
-                if (!allowed.contains(en)) { summary = "The data set '" + en + "' is not available to the assistant (only your business data is, never security data)."; result = [count: 0, rows: []]; return }
+                if (!allowed.contains(en)) { summary = "That information isn't available to the assistant (only your business data is, never security data)."; result = [count: 0, rows: []]; return }
 
                 import org.moqui.entity.EntityCondition
                 def orgId = ec.user.getPreference("ACTIVE_ORGANIZATION")
@@ -393,7 +423,7 @@
                 boolean _qd = ec.artifactExecution.disableAuthz()
                 try {
                     def ed = null; try { ed = ec.entity.getEntityDefinition(en) } catch (Exception ee) { }
-                    if (ed == null) { summary = "No such data set: " + en; result = [count: 0, rows: []]; return }
+                    if (ed == null) { summary = "That information isn't available."; result = [count: 0, rows: []]; return }
                     def fnames = ed.getAllFieldNames()
                     def cf = ec.entity.conditionFactory
                     // build the SAME org-scoping the row-level entity filters use, applied manually
@@ -408,7 +438,7 @@
                             if (ors) orgCond = cf.makeCondition(ors, EntityCondition.OR)
                             else if (fnames.contains("partyId")) orgCond = cf.makeCondition("partyId", EntityCondition.EQUALS, orgId)
                         }
-                        if (orgCond == null) { summary = "The data set '" + en + "' cannot be safely scoped to your business, so it is not available."; result = [count: 0, rows: []]; return }
+                        if (orgCond == null) { summary = "That information can't be safely scoped to your business, so it isn't available."; result = [count: 0, rows: []]; return }
                     }
                     def ef = ec.entity.find(en)
                     if (orgCond != null) ef.condition(orgCond)
@@ -419,10 +449,10 @@
                     def list = ef.limit(cap).list()
                     def rows = list.collect { new LinkedHashMap(it) }
                     result = [count: trueCount, returned: rows.size(), rows: rows]
-                    summary = "There are " + trueCount + " " + en + " record(s)" + (rows.size() < trueCount ? " (showing the first " + rows.size() + ")" : "") + "."
+                    summary = "There are " + trueCount + " matching record(s)" + (rows.size() < trueCount ? " (showing the first " + rows.size() + ")" : "") + "."
                 } catch (Exception qe) {
                     ec.logger.warn("query#ErpData failed for " + en + ": " + qe.message)
-                    summary = "Could not read " + en + "."; result = [count: 0, rows: []]
+                    summary = "Could not read that data."; result = [count: 0, rows: []]
                 } finally { if (!_qd) ec.artifactExecution.enableAuthz() }
             ]]></script>
         </actions>
