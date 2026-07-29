@@ -76,6 +76,7 @@
                     double mean = sum / n
                     double varSum = 0.0; for (v in series) varSum += (v - mean) * (v - mean)
                     double sd = Math.sqrt(varSum / Math.max(1, n - 1))
+                    double _phi = 0.85                      // trend damping factor, shared by forecast + its back-test
 
                     def fit = { int len ->
                         double sx=0, sy=0, sxx=0, sxy=0
@@ -88,25 +89,41 @@
                         for (int i = 0; i < len; i++) { int dw = c.getDayOfWeek().getValue() % 7; ds[dw] += series[i]; dc[dw]++; c = c.plusDays(1) }
                         double[] df = new double[7]
                         for (int k = 0; k < 7; k++) { double a = dc[k] > 0 ? ds[k]/dc[k] : mn; df[k] = mn > 0 ? Math.max(0.3, Math.min(2.5, a/mn)) : 1.0 }
-                        return [intercept, slope, df]
+                        return [intercept, slope, df, mn]
                     }
 
-                    // predictors: trained on [0,trainEnd), predict day index i
-                    def predA = { int trainEnd, int i -> def f = fit(trainEnd); int dw = minD.plusDays(i).getDayOfWeek().getValue()%7; return Math.max(0.0, (((double)f[0]) + ((double)f[1])*i) * ((double[])f[2])[dw]) }
-                    def predB = { int trainEnd, int i -> if (i >= 7) return series[i-7]; double s=0; for(int k=0;k<trainEnd;k++) s+=series[k]; return trainEnd>0 ? s/trainEnd : 0.0 }
+                    // predictors: trained on [0,trainEnd), predict day index i.
+                    // predA back-tests the SAME damped-trend-shrunk-to-mean model the forecast uses, so the
+                    // reported confidence describes the forecast actually shown (not a different raw-trend model). (ZE-CP-E-02c)
+                    def predA = { int trainEnd, int i ->
+                        def f = fit(trainEnd)
+                        double fi = (double)f[0]; double fs = (double)f[1]; double[] fdf = (double[])f[2]; double fmn = (double)f[3]
+                        double fL = fi + fs*(trainEnd - 1); int hstep = i - trainEnd + 1
+                        double dmp = _phi * (1.0 - Math.pow(_phi, hstep)) / (1.0 - _phi)
+                        double lvl = Math.max(0.0, fL + fs*dmp); double base = 0.5*lvl + 0.5*fmn
+                        int dw = minD.plusDays(i).getDayOfWeek().getValue()%7
+                        return Math.max(0.0, base * fdf[dw])
+                    }
+                    // seasonal-naive, ALSO shrunk toward the training mean so a single spike/trough week can't drag
+                    // the forecast to a wild value (mirrors the trend branch; keeps whichever method wins well-behaved). (ZE-CP-E-02b)
+                    def predB = { int trainEnd, int i -> double s=0; for(int k=0;k<trainEnd;k++) s+=series[k]; double tm = trainEnd>0 ? s/trainEnd : 0.0; double sn = (i >= 7) ? series[i-7] : tm; return 0.5*sn + 0.5*tm }
 
                     def cv = { Closure pred ->
                         int period = 7; int periods = (int)(n / period)
                         if (periods < 3) return null
-                        int testCount = Math.min(4, periods - 1); double apeSum = 0.0; int apeN = 0
+                        int testCount = Math.min(4, periods - 1)
+                        // WAPE (total error / total actual across the test weeks) rather than an average of per-week
+                        // APEs: a single low-volume week can't dominate via a tiny denominator, so the score reflects
+                        // real fit quality and varies instead of pinning at a floor. (ZE-CP-E-02c)
+                        double sumAbs = 0.0; double sumAct = 0.0
                         for (int p = periods - testCount; p < periods; p++) {
                             int trainEnd = p * period; if (trainEnd < period) continue
                             double predTot = 0.0, actTot = 0.0
                             for (int i = trainEnd; i < trainEnd + period && i < n; i++) { predTot += Math.max(0.0, pred(trainEnd, i)); actTot += series[i] }
-                            if (actTot > 0) { apeSum += Math.abs(actTot - predTot) / actTot; apeN++ }
+                            sumAbs += Math.abs(actTot - predTot); sumAct += actTot
                         }
-                        if (apeN == 0) return null
-                        double mape = apeSum / apeN; return Math.max(40, Math.min(96, (int)Math.round(100.0*(1.0 - mape))))
+                        if (sumAct <= 0) return null
+                        double wape = sumAbs / sumAct; return Math.max(1, Math.min(96, (int)Math.round(100.0*(1.0 - wape))))
                     }
 
                     Integer accA = cv(predA); Integer accB = cv(predB)
@@ -119,11 +136,21 @@
                     int peakDow = 0; for (int k = 1; k < 7; k++) if (dowF[k] > dowF[peakDow]) peakDow = k
 
                     // horizon forecast using the chosen method
+                    // Trend branch: DAMPED linear trend (Gardner) shrunk toward the historical mean, so a
+                    // declining series levels off near typical demand instead of collapsing to ~0, and a rising
+                    // one is pulled back toward its average instead of extrapolating without bound. (ZE-CP-E-02b)
+                    double _L = intercept + slope*(n - 1)   // fitted level at the last observed day (_phi defined above)
                     double fTotal = 0.0; def fcur = maxD.plusDays(1)
                     for (int h = 0; h < horizon; h++) {
                         double f
-                        if (useB) { f = (n >= 7) ? series[n - 7 + (h % 7)] : mean }
-                        else { int dw = fcur.getDayOfWeek().getValue() % 7; f = Math.max(0.0, (intercept + slope*(n + h)) * dowF[dw]) }
+                        if (useB) { double _sn = (n >= 7) ? series[n - 7 + (h % 7)] : mean; f = 0.5*_sn + 0.5*mean }
+                        else {
+                            int dw = fcur.getDayOfWeek().getValue() % 7
+                            double _damp = _phi * (1.0 - Math.pow(_phi, h + 1)) / (1.0 - _phi)
+                            double _lvl = Math.max(0.0, _L + slope*_damp)   // damped trend level
+                            double _base = 0.5*_lvl + 0.5*mean              // shrink toward historical mean
+                            f = Math.max(0.0, _base * dowF[dw])
+                        }
                         fTotal += Math.max(0.0, f); fcur = fcur.plusDays(1)
                     }
                     String methodLabel = useB ? "seasonal-naive (last week)" : "trend + weekly seasonality"
@@ -131,11 +158,13 @@
 
                     double z = sl >= 0.99 ? 2.33 : (sl >= 0.975 ? 1.96 : (sl >= 0.95 ? 1.645 : (sl >= 0.90 ? 1.28 : 1.04)))
                     double safety = z * sd * Math.sqrt((double) leadTime)
-                    double dailyDemand = useB ? (mean) : Math.max(0.0, intercept + slope*n)
+                    double dailyDemand = (fTotal / (double) horizon)   // representative daily rate, consistent with the shown forecast
                     double rop = dailyDemand * leadTime + safety
                     double suggestedOrder = fTotal + safety
 
                     def r2 = { double v -> (Math.round(v*100.0)/100.0) }
+                    // plain-language reliability band so a genuinely low back-tested % reads as "rough guide", not a broken default (ZE-CP-E-02c)
+                    def confBand = { Integer c -> c == null ? null : (c >= 75 ? "high" : (c >= 55 ? "good" : (c >= 40 ? "moderate" : (c >= 25 ? "low" : "very rough")))) }
                     def trendTxt = slope > 0.02 ? "rising" : (slope < -0.02 ? "declining" : "stable")
                     res = [
                         productName: pname, productId: pid,
@@ -150,7 +179,7 @@
                         " (around " + String.format("%.1f", fTotal / (double) horizon) + " a day, a " + trendTxt + " trend, busiest on " + dowNames[peakDow] + "). " +
                         "At " + ((int)Math.round(sl*100)) + "% service level with a " + leadTime + "-day lead time, reorder at about " + ((int)Math.round(rop)) +
                         " units (incl. ~" + ((int)Math.round(safety)) + " safety stock), and order about " + ((int)Math.round(suggestedOrder)) + " units. " +
-                        (confidence != null ? ("Confidence ~" + confidence + "% using the " + methodLabel + " method") : "Confidence limited by short history") +
+                        (confidence != null ? ("Confidence ~" + confidence + "% (" + confBand(confidence) + ") using the " + methodLabel + " method") : "Confidence limited by short history") +
                         ", based on " + n + " days of real sales."
                     result = res
                 } catch (Exception e) {
@@ -815,10 +844,14 @@
                     for (int i = 0; i < n; i++) { int dw = c2.getDayOfWeek().getValue()%7; ds[dw] += series[i]; dc[dw]++; c2 = c2.plusDays(1) }
                     double[] dowF = new double[7]; for (int k=0;k<7;k++){ double a = dc[k]>0?ds[k]/dc[k]:mean; dowF[k] = mean>0?Math.max(0.3,Math.min(2.5,a/mean)):1.0 }
                     def dowNames = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"]; int peakDow=0; for(int k=1;k<7;k++) if(dowF[k]>dowF[peakDow]) peakDow=k
+                    // DAMPED trend shrunk toward the historical mean (same model as forecast#ProductDemand): a declining
+                    // category levels off near typical demand instead of collapsing to ~0; a rising one is pulled back
+                    // toward its average instead of extrapolating without bound. (ZE-CP-E-02b)
+                    double _L = intercept + slope*(n - 1); double _phi = 0.85
                     double fTotal = 0.0; def fcur = maxD.plusDays(1)
-                    for (int h=0; h<horizon; h++){ int dw=fcur.getDayOfWeek().getValue()%7; fTotal += Math.max(0.0,(intercept+slope*(n+h))*dowF[dw]); fcur=fcur.plusDays(1) }
+                    for (int h=0; h<horizon; h++){ int dw=fcur.getDayOfWeek().getValue()%7; double _damp=_phi*(1.0-Math.pow(_phi,h+1))/(1.0-_phi); double _lvl=Math.max(0.0,_L+slope*_damp); double _base=0.5*_lvl+0.5*mean; fTotal += Math.max(0.0,_base*dowF[dw]); fcur=fcur.plusDays(1) }
                     double z = sl>=0.99?2.33:(sl>=0.975?1.96:(sl>=0.95?1.645:(sl>=0.90?1.28:1.04)))
-                    double safety = z*sd*Math.sqrt((double)leadTime); double dailyDemand = Math.max(0.0, intercept+slope*n)
+                    double safety = z*sd*Math.sqrt((double)leadTime); double dailyDemand = (fTotal / (double) horizon)
                     double rop = dailyDemand*leadTime + safety
                     // weekly cross-validation confidence (predict each recent week's TOTAL, same as products)
                     Integer confidence = null
@@ -829,23 +862,27 @@
                         double[] fds=new double[7]; int[] fdc=new int[7]; def fcc=minD
                         for (int i=0;i<len;i++){ int dw=fcc.getDayOfWeek().getValue()%7; fds[dw]+=series[i]; fdc[dw]++; fcc=fcc.plusDays(1) }
                         double[] fdf=new double[7]; for(int k=0;k<7;k++){ double a=fdc[k]>0?fds[k]/fdc[k]:fmn; fdf[k]= fmn>0?Math.max(0.3,Math.min(2.5,a/fmn)):1.0 }
-                        return [fin, fslp, fdf]
+                        return [fin, fslp, fdf, fmn]
                     }
                     int cvPeriods=(int)(n/7)
                     if (cvPeriods >= 3) {
-                        int tcnt=Math.min(4,cvPeriods-1); double apeSum=0.0; int apeN=0
+                        int tcnt=Math.min(4,cvPeriods-1); double sumAbs=0.0; double sumAct=0.0
                         for (int p=cvPeriods-tcnt; p<cvPeriods; p++){
                             int trainEnd=p*7; if(trainEnd<7) continue
-                            def ff=fitC(trainEnd); double fi=ff[0]; double fsl2=ff[1]; double[] fdf=ff[2]
+                            // back-test the SAME damped-trend-shrunk-to-mean model the forecast uses, scored by WAPE (ZE-CP-E-02c)
+                            def ff=fitC(trainEnd); double fi=(double)ff[0]; double fsl2=(double)ff[1]; double[] fdf=(double[])ff[2]; double fmn=(double)ff[3]
+                            double fL=fi+fsl2*(trainEnd-1)
                             double predTot=0.0, actTot=0.0; def pc=minD.plusDays(trainEnd)
-                            for (int i=trainEnd; i<trainEnd+7 && i<n; i++){ int dw=pc.getDayOfWeek().getValue()%7; predTot+=Math.max(0.0,(fi+fsl2*i)*fdf[dw]); actTot+=series[i]; pc=pc.plusDays(1) }
-                            if (actTot>0){ apeSum+=Math.abs(actTot-predTot)/actTot; apeN++ }
+                            for (int i=trainEnd; i<trainEnd+7 && i<n; i++){ int dw=pc.getDayOfWeek().getValue()%7; int hstep=i-trainEnd+1; double fdamp=_phi*(1.0-Math.pow(_phi,hstep))/(1.0-_phi); double flvl=Math.max(0.0,fL+fsl2*fdamp); double fbase=0.5*flvl+0.5*fmn; predTot+=Math.max(0.0,fbase*fdf[dw]); actTot+=series[i]; pc=pc.plusDays(1) }
+                            sumAbs+=Math.abs(actTot-predTot); sumAct+=actTot
                         }
-                        if (apeN>0){ double mape=apeSum/apeN; confidence=Math.max(40,Math.min(96,(int)Math.round(100.0*(1.0-mape)))) }
+                        if (sumAct>0){ double wape=sumAbs/sumAct; confidence=Math.max(1,Math.min(96,(int)Math.round(100.0*(1.0-wape)))) }
                     }
                     def trendTxt = slope>0.02?"rising":(slope<-0.02?"declining":"stable")
+                    // plain-language reliability band (ZE-CP-E-02c)
+                    def confBand = { Integer c -> c == null ? null : (c >= 75 ? "high" : (c >= 55 ? "good" : (c >= 40 ? "moderate" : (c >= 25 ? "low" : "very rough")))) }
                     res = [categoryName: catNm, products: ownedPids.size(), historyDays: n, avgDailyDemand: (Math.round(mean*100)/100.0), trendPerDay: (Math.round(slope*100)/100.0), peakWeekday: dowNames[peakDow], horizonDays: horizon, forecastDemand: (int)Math.round(fTotal), reorderPoint: (int)Math.round(rop), safetyStock: (int)Math.round(safety), confidencePct: confidence]
-                    summary = "Category '" + catNm + "' (" + ownedPids.size() + " products): expect about " + ((int)Math.round(fTotal)) + " units of total demand over the next " + horizon + " days (around " + String.format("%.1f", fTotal / (double) horizon) + "/day, " + trendTxt + " trend, busiest on " + dowNames[peakDow] + "). " + (confidence != null ? ("Back-tested confidence about " + confidence + "%. ") : "") + "Based on " + n + " days of sales."
+                    summary = "Category '" + catNm + "' (" + ownedPids.size() + " products): expect about " + ((int)Math.round(fTotal)) + " units of total demand over the next " + horizon + " days (around " + String.format("%.1f", fTotal / (double) horizon) + "/day, " + trendTxt + " trend, busiest on " + dowNames[peakDow] + "). " + (confidence != null ? ("Back-tested confidence about " + confidence + "% (" + confBand(confidence) + "). ") : "") + "Based on " + n + " days of sales."
                     result = res
                 } catch (Exception e) { ec.logger.error("forecast#CategoryDemand failed: " + e.message, e); summary = "The category forecast could not be completed."; result = res } finally { if (!_d) ec.artifactExecution.enableAuthz() }
             ]]></script>
