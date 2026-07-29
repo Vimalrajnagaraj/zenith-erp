@@ -279,6 +279,28 @@
                             if (_en && _en.toString().trim()) { llmQuery = _en.toString() } else { userLang = null }
                         }
 
+                        // ZE-CP-H-05: deterministically short-circuit obvious keyboard-mash / nonsense input BEFORE
+                        // the LLM, so clear gibberish always gets the SAME polite "please rephrase" reply and can
+                        // never surface the transient backend fallback. Deliberately conservative (keyboard walks,
+                        // or a single long token with a 6+ consonant run) so real questions, short words, product
+                        // codes and non-Latin/Indic input (handled upstream) are never misclassified.
+                        def looksLikeGibberish = { String s ->
+                            if (!s) return false
+                            def t = s.trim()
+                            if (t.length() < 8) return false
+                            for (int i = 0; i < t.length(); i++) { if (((int) t.charAt(i)) > 127) return false }
+                            def low = t.toLowerCase()
+                            def walks = ["qwertyuiop", "asdfghjkl", "zxcvbnm", "poiuytrewq", "lkjhgfdsa", "mnbvcxz"]
+                            boolean kbWalk = walks.any { low.contains(it) }
+                            boolean singleLongJunk = !(t =~ /\s/) && t.length() >= 15 &&
+                                (low.replaceAll(/[^a-z]/, "") =~ /[bcdfghjklmnpqrstvwxyz]{6,}/)
+                            return kbWalk || singleLongJunk
+                        }
+                        if (looksLikeGibberish(query)) {
+                            resp = "I'm sorry, I couldn't quite understand that. Could you please rephrase your question? I can help with your sales, stock, products, customers, or how to do things in ZetaERP."
+                        }
+
+                        if (resp == null) {
                         def msgs = [[role: "system", content: system], [role: "user", content: llmQuery]]
                         def msg1 = callGroq(msgs)
                         def toolCalls = msg1?.tool_calls
@@ -367,6 +389,7 @@
                         // ZE-CP-H-09: final safety net — never render raw tool-call syntax to the user, even if
                         // a follow-up (msg2) or a non-tool reply still contained inline <queryErpData>/</function>.
                         resp = stripToolCalls(resp)
+                        }
 
                         // Back-translate the English answer into the user's language (fail-open: keep English on miss).
                         if (userLang && resp) {
@@ -377,7 +400,7 @@
                 } catch (Exception e) {
                     ec.logger.warn("Copilot LLM call failed: " + e.message)
                 } finally { if (!_d) ec.artifactExecution.enableAuthz() }
-                response = resp ?: "Sorry, the assistant is busy right now. Please try again in a moment."
+                response = resp ?: "Sorry, I couldn't quite process that just now - could you please rephrase your question, or try again in a moment?"
             ]]></script>
         </actions>
     </service>
