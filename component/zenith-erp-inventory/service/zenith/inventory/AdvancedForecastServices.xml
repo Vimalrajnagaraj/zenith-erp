@@ -717,8 +717,30 @@
                     def ef = ec.entity.find("zenith.erp.inventory.DemandAlert").condition("organizationPartyId", orgId).condition("statusId", "AlertNew")
                     if (direction) ef.condition("direction", direction)
                     def list = ef.orderBy("alertType").orderBy("-alertDate").limit((maxAlerts ?: 20) as int).list()
-                    alertCount = list.size()
-                    def items = list.collect { [productName: it.productName, alertType: it.alertType, direction: it.direction, message: it.message] }
+                    def _fmt = { v -> ((v ?: 0G) as BigDecimal).stripTrailingZeros().toPlainString() }
+                    def items = []
+                    for (al in list) {
+                        def m = [productName: al.productName, alertType: al.alertType, direction: al.direction, message: al.message]
+                        // ZE-CP-E-08: for Reorder alerts, ALWAYS report LIVE stock + reorder point. The stored alert
+                        // snapshot goes stale when the product's reorder point or on-hand stock changes (that made the
+                        // Copilot quote wrong numbers: stale reorder point 14 vs live 10). Rebuild the message from live
+                        // data, and drop the alert entirely if the product has since recovered to/above its reorder point.
+                        if (al.alertType == "Reorder" && al.productId) {
+                            try {
+                                BigDecimal liveStock = 0.0G
+                                ec.entity.find("mantle.product.asset.Asset").condition("productId", al.productId).condition("assetTypeEnumId", "AstTpInventory").condition("ownerPartyId", orgId).selectField("quantityOnHandTotal").list().each { liveStock += (it.quantityOnHandTotal ?: 0G) as BigDecimal }
+                                def prod = ec.entity.find("mantle.product.Product").condition("productId", al.productId).one()
+                                BigDecimal rp = (prod?.reorderPoint ?: 0G) as BigDecimal
+                                if (rp > 0G && liveStock >= rp) continue
+                                BigDecimal rq = prod?.reorderQuantity ? (prod.reorderQuantity as BigDecimal) : 0G
+                                BigDecimal suggest = (rq > 0G) ? rq : rp
+                                m.stockOnHand = liveStock; m.reorderPoint = rp; m.suggestedOrder = suggest
+                                m.message = "Stock of '" + al.productName + "' is low: " + _fmt(liveStock) + " units on hand vs a reorder point of " + _fmt(rp) + " units. Suggested order about " + _fmt(suggest) + " units."
+                            } catch (Exception le) { ec.logger.warn("DemandAlert live-refresh failed for " + al.productId + ": " + le.message) }
+                        }
+                        items.add(m)
+                    }
+                    alertCount = items.size()
                     result = [alerts: items, count: alertCount]
                     int reorderN = items.count { it.alertType == "Reorder" }
                     int shiftN = alertCount - reorderN
