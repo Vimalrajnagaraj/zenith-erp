@@ -136,6 +136,49 @@
         </actions>
     </service>
 
+    <!-- ZE-PRC-025 (PRC-025): reject a self-referencing or cyclic Fallback (parent) price list at the
+         SERVICE layer, not just via the org-scoped UI dropdown. A direct/tampered updatePriceList could
+         otherwise persist parentPriceListId == priceListId (or a longer A->B->A loop), which would make
+         calculate#Price's parent fallback recurse forever. Belt-and-suspenders with the cycle-safe guard
+         in calculate#Price: this stops a bad chain from ever being STORED; that stops any stored bad chain
+         from hanging resolution. -->
+    <service verb="assert" noun="NoPriceListCycle">
+        <in-parameters>
+            <parameter name="priceListId" required="true"/>
+            <parameter name="parentPriceListId"/>
+        </in-parameters>
+        <out-parameters><parameter name="valid" type="Boolean"/></out-parameters>
+        <actions>
+            <set field="valid" from="true" type="Boolean"/>
+            <if condition="parentPriceListId != null &amp;&amp; parentPriceListId.toString().trim()">
+                <script><![CDATA[
+                    def self = priceListId?.toString()
+                    def parent = parentPriceListId.toString().trim()
+                    if (parent == self) {
+                        valid = false
+                        ec.message.addError("A price list cannot be its own fallback price list.")
+                    } else {
+                        // Walk the proposed parent's chain; if it comes back to this list, the assignment
+                        // forms a loop. The visited-set makes the walk terminate even if the stored data
+                        // already contains a cycle.
+                        def seen = new HashSet()
+                        def cur = parent
+                        while (cur && !seen.contains(cur)) {
+                            if (cur == self) {
+                                valid = false
+                                ec.message.addError("This fallback would create a loop in the price-list chain.")
+                                break
+                            }
+                            seen.add(cur)
+                            def p = ec.entity.find("zenith.erp.pricing.PriceList").condition("priceListId", cur).disableAuthz().one()
+                            cur = p?.parentPriceListId
+                        }
+                    }
+                ]]></script>
+            </if>
+        </actions>
+    </service>
+
     <!-- ========== Price List Item CRUD ========== -->
 
     <service verb="set" noun="PriceListItem">
@@ -445,6 +488,9 @@
             <parameter name="salesChannelEnumId"/>
             <parameter name="regionGeoId"/>
             <parameter name="orderDate" type="Timestamp" default="ec.user.nowTimestamp"/>
+            <!-- ZE-PRC-025: internal accumulator of price-list ids already visited in the parent-fallback
+                 recursion (callers never pass it). Makes the recursion cycle-safe. -->
+            <parameter name="_visitedPriceLists" type="List"/>
         </in-parameters>
         <out-parameters>
             <parameter name="unitPrice" type="BigDecimal"/>
@@ -570,10 +616,18 @@
                     <entity-find-one entity-name="zenith.erp.pricing.PriceList" value-field="pl">
                         <field-map field-name="priceListId" from="effectivePriceListId"/>
                     </entity-find-one>
-                    <if condition="pl?.parentPriceListId">
+                    <!-- ZE-PRC-025: CYCLE-SAFE fallback. Track the lists already visited in this recursion and
+                         only follow the parent when it is neither this list itself nor one already seen. Without
+                         this, a self-referencing or cyclic parentPriceListId (which a direct/tampered
+                         updatePriceList can persist past the org-scoped UI dropdown) makes calculate#Price
+                         recurse forever -> StackOverflowError / hung price resolution. Fails safe: on a cycle it
+                         simply stops following parents and uses the price resolved so far. -->
+                    <set field="_seenPls" from="(_visitedPriceLists ?: []) + [effectivePriceListId]"/>
+                    <if condition="pl?.parentPriceListId &amp;&amp; !_seenPls.contains(pl.parentPriceListId)">
                         <service-call name="zenith.pricing.PricingServices.calculate#Price"
                                       in-map="[productId:productId, quantity:quantity,
-                                               priceListId:pl.parentPriceListId, orderDate:orderDate]"
+                                               priceListId:pl.parentPriceListId, orderDate:orderDate,
+                                               _visitedPriceLists:_seenPls]"
                                       out-map="parentResult"/>
                         <if condition="parentResult.priceSource != 'ProductListPrice'">
                             <set field="unitPrice" from="parentResult.unitPrice"/>
