@@ -405,9 +405,9 @@
          carries BOTH bounds. Previously the Edit-Rule "Add Condition" transition called the raw entity
          create#PricingRuleCondition with no validation, so a half-formed range ("between | 500 | blank")
          saved silently. Both the Edit-Rule transition and the New-Rule create#PricingRule condition loop
-         go through this now, so the rule holds everywhere. NB: calculate#Price currently evaluates a
-         condition by its conditionTypeEnumId ONLY and does NOT read `operator`/`fieldValueTo` at all — so
-         this is data-integrity hardening (a blank "To" never persists), not a runtime price-scope fix. -->
+         go through this now, so the rule holds everywhere. (As of ZE-PRC-076 calculate#Price DOES honour
+         `operator`/`fieldValueTo`, so a complete 'between' now constrains the range at runtime; this
+         guard keeps a half-formed range from ever persisting to be evaluated.) -->
     <service verb="add" noun="PricingRuleCondition">
         <in-parameters>
             <parameter name="pricingRuleId" required="true"/>
@@ -629,59 +629,100 @@
 
                 <set field="allMatch" from="true" type="Boolean"/>
                 <iterate list="conditions" entry="cond">
-                    <if condition="cond.conditionTypeEnumId == 'PctProduct'">
-                        <if condition="cond.fieldValue != productId"><set field="allMatch" from="false"/></if>
-                    <else-if condition="cond.conditionTypeEnumId == 'PctProductCategory'">
-                        <entity-find entity-name="mantle.product.category.ProductCategoryMember" list="catMembers" limit="1">
-                            <econdition field-name="productId"/>
-                            <econdition field-name="productCategoryId" from="cond.fieldValue"/>
-                            <date-filter/>
-                        </entity-find>
-                        <if condition="!catMembers"><set field="allMatch" from="false"/></if>
-                    </else-if>
-                    <else-if condition="cond.conditionTypeEnumId == 'PctMinQuantity'">
-                        <if condition="quantity &lt; (cond.fieldValue as BigDecimal)"><set field="allMatch" from="false"/></if>
-                    </else-if>
-                    <else-if condition="cond.conditionTypeEnumId == 'PctMinAmount'">
-                        <if condition="(unitPrice * quantity) &lt; (cond.fieldValue as BigDecimal)"><set field="allMatch" from="false"/></if>
-                    </else-if>
-                    <else-if condition="cond.conditionTypeEnumId == 'PctChannel'">
-                        <if condition="cond.fieldValue != salesChannelEnumId"><set field="allMatch" from="false"/></if>
-                    </else-if>
-                    <else-if condition="cond.conditionTypeEnumId == 'PctCustomerGroup'">
-                        <if condition="cond.fieldValue != customerGroupId"><set field="allMatch" from="false"/></if>
-                    </else-if>
-                    <else-if condition="cond.conditionTypeEnumId == 'PctRegion'">
-                        <if condition="!regionGeoId || cond.fieldValue != regionGeoId"><set field="allMatch" from="false"/></if>
-                    </else-if>
-                    <else-if condition="cond.conditionTypeEnumId == 'PctDayOfWeek'">
-                        <script><![CDATA[
-                            def ldt = new java.sql.Timestamp(((java.util.Date)now).getTime()).toLocalDateTime()
-                            def fv = (cond.fieldValue ?: '').toUpperCase()
-                            def dn = ldt.getDayOfWeek().name().substring(0,3)
+                    <!-- ZE-PRC-076 (PRC-075 follow-up): operator-aware condition matching. Previously each type
+                         compared cond.fieldValue with a HARDCODED per-type semantic and IGNORED cond.operator +
+                         cond.fieldValueTo, so the operator dropdown (equals/not-equals/greater-than/less-than/
+                         in/between) was cosmetic in the engine. Now the operator controls the comparison.
+                         BACKWARD-COMPATIBLE: the default operator 'equals' (entity + UI default) keeps every
+                         type's original behaviour: Product/Category/Channel/CustomerGroup/Region = exact
+                         equals/membership; Minimum-Quantity/Amount = '>=' (the "Minimum ..." type meaning).
+                         Explicit operators refine: not-equals / in (value & id types); greater-than /
+                         less-than / between (the numeric Minimum types). An operator that doesn't apply to a
+                         type falls back to that type's default; malformed numeric input makes the condition
+                         FAIL (allMatch=false) so a bad rule never silently BROADENS its scope. Day-of-Week and
+                         Time-Range keep their own parsing (operators don't apply). -->
+                    <script><![CDATA[
+                        def op = (cond.operator ?: 'equals').toString().trim()
+                        if (!op) op = 'equals'
+                        def fv = cond.fieldValue
+                        def fvTo = cond.fieldValueTo
+                        def t = cond.conditionTypeEnumId
+
+                        def csvList = { s -> (s ?: '').toString().split(',').collect { it.trim() }.findAll { it } }
+                        // id / enum equality: equals (default), not-equals, in; any other op -> equals
+                        def catMatch = { actual ->
+                            def a = (actual == null) ? null : actual.toString()
+                            def f = (fv == null) ? null : fv.toString()
+                            if (op == 'not-equals') return a != f
+                            if (op == 'in') return csvList(fv).contains(a)
+                            return a == f
+                        }
+                        // numeric compare for the Minimum types: default/equals -> '>=' (preserves the type),
+                        // plus greater-than / less-than / not-equals / between / in
+                        def numMatch = { lv ->
+                            if (lv == null) return false
+                            try {
+                                def bd = (fv as BigDecimal)
+                                if (op == 'greater-than') return lv > bd
+                                if (op == 'less-than')    return lv < bd
+                                if (op == 'not-equals')   return lv != bd
+                                if (op == 'between')      return lv >= bd && lv <= (fvTo as BigDecimal)
+                                if (op == 'in')           return csvList(fv).any { lv == (it as BigDecimal) }
+                                return lv >= bd
+                            } catch (Exception e) { return false }
+                        }
+
+                        boolean match
+                        if (t == 'PctProduct') {
+                            match = catMatch(productId)
+                        } else if (t == 'PctChannel') {
+                            match = catMatch(salesChannelEnumId)
+                        } else if (t == 'PctCustomerGroup') {
+                            match = catMatch(customerGroupId)
+                        } else if (t == 'PctRegion') {
+                            def has = (regionGeoId != null && regionGeoId.toString().trim() != '')
+                            if (op == 'not-equals')  match = !(has && regionGeoId.toString() == (fv?.toString()))
+                            else if (op == 'in')     match = has && csvList(fv).contains(regionGeoId.toString())
+                            else                     match = has && regionGeoId.toString() == (fv?.toString())
+                        } else if (t == 'PctProductCategory') {
+                            def cats = (op == 'in') ? csvList(fv) : [ (fv == null ? null : fv.toString()) ]
+                            boolean isMember = false
+                            for (cat in cats) {
+                                if (!cat) continue
+                                def cm = ec.entity.find('mantle.product.category.ProductCategoryMember')
+                                           .condition('productId', productId).condition('productCategoryId', cat)
+                                           .conditionDate('fromDate', 'thruDate', now).list()
+                                if (cm) { isMember = true; break }
+                            }
+                            match = (op == 'not-equals') ? !isMember : isMember
+                        } else if (t == 'PctMinQuantity') {
+                            match = numMatch(quantity == null ? null : (quantity as BigDecimal))
+                        } else if (t == 'PctMinAmount') {
+                            match = (unitPrice == null || quantity == null) ? false : numMatch((unitPrice as BigDecimal) * (quantity as BigDecimal))
+                        } else if (t == 'PctDayOfWeek') {
+                            def ldt = new java.sql.Timestamp(((java.util.Date) now).getTime()).toLocalDateTime()
+                            def f = (fv ?: '').toString().toUpperCase()
+                            def dn = ldt.getDayOfWeek().name().substring(0, 3)
                             def di = '' + ldt.getDayOfWeek().getValue()
-                            def days = fv.replace(' ','').split(',')
-                            if (!(fv.contains(dn) || days.contains(di))) allMatch = false
-                        ]]></script>
-                    </else-if>
-                    <else-if condition="cond.conditionTypeEnumId == 'PctTimeRange'">
-                        <script><![CDATA[
-                            def fv = (cond.fieldValue ?: '').trim()
-                            if (fv.contains('-')) {
+                            def days = f.replace(' ', '').split(',')
+                            match = (f.contains(dn) || days.contains(di))
+                        } else if (t == 'PctTimeRange') {
+                            def f = (fv ?: '').toString().trim()
+                            match = false
+                            if (f.contains('-')) {
                                 try {
-                                    def parts = fv.split('-')
-                                    def lt = new java.sql.Timestamp(((java.util.Date)now).getTime()).toLocalDateTime().toLocalTime()
+                                    def parts = f.split('-')
+                                    def lt = new java.sql.Timestamp(((java.util.Date) now).getTime()).toLocalDateTime().toLocalTime()
                                     def st = java.time.LocalTime.parse(parts[0].trim())
                                     def en = java.time.LocalTime.parse(parts[1].trim())
-                                    if (lt.isBefore(st) || lt.isAfter(en)) allMatch = false
-                                } catch (Exception ex) { allMatch = false }
-                            } else { allMatch = false }
-                        ]]></script>
-                    </else-if>
-                    <else>
-                        <set field="allMatch" from="false"/>
-                    </else>
-                    </if>
+                                    match = !(lt.isBefore(st) || lt.isAfter(en))
+                                } catch (Exception ex) { match = false }
+                            }
+                        } else {
+                            match = false
+                        }
+                        if (!match) allMatch = false
+                    ]]></script>
                 </iterate>
 
                 <if condition="allMatch">
