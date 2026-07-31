@@ -26,6 +26,7 @@
                         ec.logger.warn("Copilot: GROQ_API_KEY not set for ZETAERP")
                     } else {
                         String ctx = ""
+                        def _pf = null   // ZE-CP-C-04c: period sales figures (this/last month, today) - set ONLY on a fully-successful ctx build, else stays null
                         try {
                             if (orgId) {
                                 def now = ec.user.nowTimestamp
@@ -74,12 +75,17 @@
                                 def _td = _invSales(tdTs, null); BigDecimal tAll = _td[0]; long tcAll = _td[1]
                                 def _lm = _invSales(lmStartTs, msTs); BigDecimal lmAll = _lm[0]; long lcAll = _lm[1]
                                 def lmName = lmStart.getMonth().getDisplayName(java.time.format.TextStyle.FULL, java.util.Locale.ENGLISH) + " " + lmStart.getYear()
+                                // ZE-CP-C-04c: capture the period figures now - reached only if the _invSales calls above all
+                                // succeeded (any throw would jump to the outer catch, leaving _pf null). Reports FIGURES, never
+                                // an absence claim, so a transient bad read is a bounded per-query error, never a false "no sales".
+                                _pf = [tm:[mAll, cAll], lm:[lmAll, lcAll], td:[tAll, tcAll], lmName:lmName]
                                 // all-time via the grouped summary view (efficient; SAME basis as _invSales and the dashboard tile)
                                 BigDecimal totalSalesAll = 0.0G; long totalSalesInv = 0
                                 try {
                                     ec.entity.find("zenith.erp.sales.InvoiceSalesSummaryView").condition("fromPartyId", orgId).condition("invoiceTypeEnumId", "InvoiceSales").list().each {
                                         if (_isSale(it.statusId)) { totalSalesAll += (((it.taxableSum ?: 0G) as BigDecimal) + ((it.taxSum ?: 0G) as BigDecimal) + ((it.roundSum ?: 0G) as BigDecimal)); totalSalesInv += ((it.cnt ?: 0) as long) }
                                     }
+                                    if (_pf != null) _pf.total = [totalSalesAll, totalSalesInv]   // ZE-CP-C-04c: only on all-time success (inside try)
                                 } catch (Exception tse) { ec.logger.warn("Copilot total-sales calc failed: " + tse.message) }
                                 def r0 = { BigDecimal v -> v.setScale(0, java.math.RoundingMode.HALF_UP).toString() }
                                 def productCount = ec.entity.find("mantle.product.Product").condition("productTypeEnumId","PtAsset").condition("ownerPartyId", orgId).count()
@@ -378,6 +384,35 @@
                             if (_wc >= 1 && _wc <= 6 && _period && !_metric && (_conn || _purePeriod)) {
                                 def _per = _fq.replaceAll(/^(and for|what about the|what about|how about|and in|what of|and)\s+/, "").trim()
                                 resp = "Just so I answer the right thing - each question I get is independent, so I don't have your previous one in view. For " + (_per ?: "that period") + ", would you like total sales, number of bills, or something else?"
+                            }
+                        }
+
+                        // ZE-CP-C-04c: an OVERALL sales-amount question for a specific past period ("what were my sales this
+                        // month?", "how much did I sell today?", "last month's sales?") - answer DETERMINISTICALLY from the
+                        // period figures already computed for the ctx, so it can't intermittently mis-route to a raw
+                        // transaction count (queryErpData) under load. Reports FIGURES only, never an absence claim (so a
+                        // transient bad read is a bounded per-query error, never a false "no sales" - the C-05b lesson);
+                        // fires only when the ctx built cleanly (_pf != null). Narrow: needs a sales-RESULT phrasing + an
+                        // explicit period, and skips how-to / forecast / advice / product-specific ('of') / comparison, so
+                        // product, forecast, and all-time / bare questions all still go to the LLM.
+                        if (resp == null && _pf != null) {
+                            def _sq = (llmQuery ?: query ?: "").toLowerCase()
+                            boolean _amt = (_sq =~ /\b(my|the|total|overall) sales\b|\bsales (this|last|today|so far|were|are)\b|\bhow much (did|have) i\b|\bdid i (sell|make)\b|\bhave i (sold|made)\b/) as boolean
+                            boolean _skip = (_sq =~ /\bhow (to|do|does)\b|\b(forecast|predict|expect|will|next|projected|upcoming|coming|future|should|recommend|suggest|vs|versus|compare|compared)\b|\bof\b/) as boolean
+                            if (_amt && !_skip) {
+                                def _fig = null; def _lbl = null
+                                if (_sq =~ /\b(this month|month to date|so far this month)\b/) { _fig = _pf.tm; _lbl = "so far this month" }
+                                else if (_sq =~ /\b(last month|previous month)\b/) { _fig = _pf.lm; _lbl = "last month (" + _pf.lmName + ")" }
+                                else if (_sq =~ /\btoday\b/) { _fig = _pf.td; _lbl = "today" }
+                                // all-time only when a 'total/overall/all-time' word is present AND the total is POSITIVE -
+                                // a zero total (fresh shop, or a transient bad read) defers to the LLM/prompt ("no sales yet"),
+                                // so this never reports a false zero for the whole-business figure (the C-05b lesson).
+                                else if (_pf.total != null && ((_pf.total[0] ?: 0G) as BigDecimal) > 0G && (_sq =~ /\b(total|overall|all[ -]?time|altogether|in all)\b/)) { _fig = _pf.total; _lbl = "in total (all-time)" }
+                                if (_fig != null) {
+                                    def _a = ((_fig[0] ?: 0G) as BigDecimal).setScale(0, java.math.RoundingMode.HALF_UP).toString()
+                                    long _c = (_fig[1] ?: 0L) as long
+                                    resp = "Your sales " + _lbl + " come to INR " + _a + (_c > 0 ? (" from " + _c + " sales " + (_c == 1 ? "invoice" : "invoices")) : "") + "."
+                                }
                             }
                         }
 
