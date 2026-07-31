@@ -52,31 +52,28 @@
                                     def exclNames = planAll ? [] : _common.findAll { !planMods.contains(it) }.collect { _mn[it] ?: it }
                                     planLine = "\n- PLAN & ACCESS: this shop is on the " + planId + " plan. Modules INCLUDED (the owner can use these): " + inclNames.join(", ") + "." + (exclNames ? (" Modules NOT in this plan (the owner does NOT have access and cannot use them unless they upgrade): " + exclNames.join(", ") + ".") : "")
                                 }
-                                def monthTx = ec.entity.find("zenith.erp.pos.PosTransaction")
-                                    .condition("organizationPartyId", orgId).condition("entryDate", ">=", msTs)
-                                    .selectField("grandTotal").selectField("entryDate").selectField("transactionId").list()
-                                BigDecimal mAll=0.0, mImp=0.0, mLive=0.0, tAll=0.0, tLive=0.0
-                                int cAll=0, cImp=0, cLive=0, tcAll=0, tcLive=0
-                                monthTx.each { t ->
-                                    def g = (t.grandTotal ?: 0.0) as BigDecimal
-                                    boolean imported = (t.transactionId ?: "").startsWith("MTCT")
-                                    boolean today = (t.entryDate != null && !t.entryDate.before(tdTs))
-                                    mAll += g; cAll++
-                                    if (imported) { mImp += g; cImp++ } else { mLive += g; cLive++ }
-                                    if (today) { tAll += g; tcAll++; if (!imported) { tLive += g; tcLive++ } }
+                                // ZE-CP-C-05b: ALL sales figures use the SAME invoice basis as the Sales dashboard - both its
+                                // Total Sales tile AND its Monthly Sales Trend chart sum non-cancelled InvoiceSales invoices'
+                                // (taxable + tax + round) by invoiceDate. Using this everywhere makes every Copilot sales
+                                // figure reconcile with the others AND match the dashboard exactly. (The old PosTransaction/
+                                // till basis diverged from the dashboard - e.g. big non-POS B2B sales invoices weren't counted.)
+                                def _invSales = { java.sql.Timestamp fromTs, java.sql.Timestamp toTs ->
+                                    def ef = ec.entity.find("mantle.account.invoice.Invoice").condition("fromPartyId", orgId).condition("invoiceTypeEnumId", "InvoiceSales")
+                                    if (fromTs != null) ef.condition("invoiceDate", ">=", fromTs)
+                                    if (toTs != null) ef.condition("invoiceDate", "<", toTs)
+                                    BigDecimal s = 0.0G; long n = 0
+                                    ef.selectField("totalTaxableAmount").selectField("totalTaxAmount").selectField("roundOffAmount").selectField("statusId").list().each {
+                                        if (it.statusId != "InvoiceCancelled") { s += (((it.totalTaxableAmount ?: 0G) as BigDecimal) + ((it.totalTaxAmount ?: 0G) as BigDecimal) + ((it.roundOffAmount ?: 0G) as BigDecimal)); n++ }
+                                    }
+                                    return [s, n]
                                 }
-                                // ZE-CP-C-07: last-month sales, so "what were my sales last month?" returns a real figure
-                                // (not a transaction count) and is deterministic across identical asks.
                                 def lmStart = ld.withDayOfMonth(1).minusMonths(1)
                                 def lmStartTs = new java.sql.Timestamp(lmStart.atStartOfDay(zone).toInstant().toEpochMilli())
-                                BigDecimal lmAll = 0.0; int lcAll = 0
-                                ec.entity.find("zenith.erp.pos.PosTransaction").condition("organizationPartyId", orgId)
-                                    .condition("entryDate", ">=", lmStartTs).condition("entryDate", "<", msTs)
-                                    .selectField("grandTotal").list().each { lmAll += ((it.grandTotal ?: 0.0) as BigDecimal); lcAll++ }
+                                def _tm = _invSales(msTs, null); BigDecimal mAll = _tm[0]; long cAll = _tm[1]
+                                def _td = _invSales(tdTs, null); BigDecimal tAll = _td[0]; long tcAll = _td[1]
+                                def _lm = _invSales(lmStartTs, msTs); BigDecimal lmAll = _lm[0]; long lcAll = _lm[1]
                                 def lmName = lmStart.getMonth().getDisplayName(java.time.format.TextStyle.FULL, java.util.Locale.ENGLISH) + " " + lmStart.getYear()
-                                // ZE-CP-C-05: all-time total sales, computed EXACTLY like the Sales dashboard's Total Sales
-                                // tile (sum of non-cancelled sales invoices' taxable+tax+round), so "what is my total sales?"
-                                // matches the dashboard - and a fresh shop with none reads a true zero, not a record count.
+                                // all-time via the grouped summary view (efficient; SAME basis as _invSales and the dashboard tile)
                                 BigDecimal totalSalesAll = 0.0G; long totalSalesInv = 0
                                 try {
                                     ec.entity.find("zenith.erp.sales.InvoiceSalesSummaryView").condition("fromPartyId", orgId).condition("invoiceTypeEnumId", "InvoiceSales").list().each {
@@ -118,12 +115,10 @@
                                 int alertCnt = 0
                                 try { alertCnt = ec.entity.find("zenith.erp.inventory.DemandAlert").condition("organizationPartyId", orgId).condition("statusId", "AlertNew").count() as int } catch (Exception ae) { }
                                 ctx = "\n\nLive business data for " + orgName + " (today is " + ld.toString() + "):\n" +
-                                      "- This month total sales: INR " + r0(mAll) + " from " + cAll + " bills.\n" +
-                                      "    * Imported from previous system (MarG POS): INR " + r0(mImp) + " from " + cImp + " bills.\n" +
-                                      "    * New sales billed live in ZetaERP: INR " + r0(mLive) + " from " + cLive + " bills.\n" +
-                                      "- Today's sales: INR " + r0(tAll) + " from " + tcAll + " bills (of which live in ZetaERP: INR " + r0(tLive) + " from " + tcLive + ").\n" +
-                                      "- Last month (" + lmName + ") total sales: INR " + r0(lmAll) + " from " + lcAll + " bills.\n" +
-                                      "- Total sales all-time (all sales invoices, same basis as the Sales dashboard's Total Sales tile): INR " + r0(totalSalesAll) + " from " + totalSalesInv + " invoices.\n" +
+                                      "- Sales so far THIS MONTH: INR " + r0(mAll) + " from " + cAll + " sales invoices.\n" +
+                                      "- Sales TODAY: INR " + r0(tAll) + " from " + tcAll + " sales invoices.\n" +
+                                      "- Sales LAST MONTH (" + lmName + "): INR " + r0(lmAll) + " from " + lcAll + " sales invoices.\n" +
+                                      "- TOTAL SALES all-time (every sales invoice ever, the shop's overall total - this is the 'total sales' figure and it matches the Sales dashboard's Total Sales): INR " + r0(totalSalesAll) + " from " + totalSalesInv + " sales invoices. All four of these sales figures use the SAME basis (sales invoices), so they match the dashboard and each other.\n" +
                                       "- Products in catalog: " + productCount + ". POS terminals: " + termCount + ".\n" +
                                       "- Total stock value (all inventory on hand, valued at cost or MRP): INR " + r0(stockValue) + ".\n" +
                                       (topDemand ? ("- Top-selling products by total units sold (highest first): " + topDemand + ". ") : "") +
