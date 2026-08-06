@@ -3599,7 +3599,7 @@ window.posToggleFullscreen = function() {
         dragging = true; startX = x;
         startLeftW = left.offsetWidth;
         totalW = layout.offsetWidth - splitter.offsetWidth;
-        splitter.style.background = '#7986cb';
+        splitter.style.background = '#4D9BF5';
         document.body.style.cursor = 'col-resize';
         document.body.style.userSelect = 'none';
     }
