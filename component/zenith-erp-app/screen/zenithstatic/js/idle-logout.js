@@ -98,7 +98,7 @@
     btn.textContent = 'Stay signed in';
     btn.style.cssText = [
       'flex:0 0 auto', 'cursor:pointer', 'border:0', 'border-radius:8px',
-      'background:#4F46E5', 'color:#fff', 'font-weight:600', 'font-size:14px',
+      'background:#0E63D6', 'color:#fff', 'font-weight:600', 'font-size:14px',
       'padding:8px 16px', 'white-space:nowrap'
     ].join(';');
     btn.onclick = function () { lastKeepAlive = 0; markActivity(); };

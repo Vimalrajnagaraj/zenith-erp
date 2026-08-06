@@ -11,18 +11,18 @@
 
     var CSS =
         '#ai-copilot-container{position:fixed;bottom:24px;right:24px;z-index:9999;font-family:inherit;}' +
-        '#ai-copilot-toggle{background:#1a237e;color:#fff;border:none;border-radius:24px;padding:10px 18px;cursor:pointer;box-shadow:0 3px 12px rgba(0,0,0,.3);font-size:14px;font-weight:600;display:inline-flex;align-items:center;gap:6px;}' +
-        '#ai-copilot-toggle:hover{background:#283593;}' +
+        '#ai-copilot-toggle{background:#0a2a7a;color:#fff;border:none;border-radius:24px;padding:10px 18px;cursor:pointer;box-shadow:0 3px 12px rgba(0,0,0,.3);font-size:14px;font-weight:600;display:inline-flex;align-items:center;gap:6px;}' +
+        '#ai-copilot-toggle:hover{background:#0a3f9e;}' +
         '#ai-copilot-window{position:absolute;bottom:56px;right:0;width:340px;max-width:90vw;height:460px;background:#fff;border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,.28);flex-direction:column;overflow:hidden;}' +
-        '#ai-copilot-window .chat-header{background:#1a237e;color:#fff;padding:12px 16px;font-weight:bold;flex:0 0 auto;}' +
+        '#ai-copilot-window .chat-header{background:#0a2a7a;color:#fff;padding:12px 16px;font-weight:bold;flex:0 0 auto;}' +
         '#ai-copilot-window .chat-history{flex:1 1 auto;overflow-y:auto;padding:12px;background:#f6f7fb;}' +
         '#ai-copilot-window .msg{margin-bottom:8px;padding:8px 11px;border-radius:9px;font-size:13px;line-height:1.45;max-width:85%;word-wrap:break-word;}' +
         '#ai-copilot-window .msg.ai{background:#eceffc;}' +
-        '#ai-copilot-window .msg.user{background:#1a237e;color:#fff;margin-left:auto;}' +
+        '#ai-copilot-window .msg.user{background:#0a2a7a;color:#fff;margin-left:auto;}' +
         '#ai-copilot-window .msg.error{background:#fdecea;color:#b71c1c;}' +
         '#ai-copilot-window .chat-input-area{display:flex;gap:6px;padding:8px;border-top:1px solid #eee;background:#fff;flex:0 0 auto;}' +
         '#ai-copilot-window #copilot-input{flex:1;border:1px solid #ccc;border-radius:6px;padding:9px;font-size:13px;}' +
-        '#ai-copilot-window #copilot-send{background:#1a237e;color:#fff;border:none;border-radius:6px;padding:9px 16px;cursor:pointer;font-weight:600;}' +
+        '#ai-copilot-window #copilot-send{background:#0a2a7a;color:#fff;border:none;border-radius:6px;padding:9px 16px;cursor:pointer;font-weight:600;}' +
         'body.body--dark #ai-copilot-window{background:#1e1e2a;}' +
         'body.body--dark #ai-copilot-window .chat-history{background:#161620;}' +
         'body.body--dark #ai-copilot-window .msg.ai{background:#2a2a3a;color:#eee;}' +

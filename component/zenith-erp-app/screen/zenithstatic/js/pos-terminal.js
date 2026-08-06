@@ -1004,12 +1004,12 @@ window._posOffline = (function() {
         var panel = document.createElement('div');
         panel.style.cssText = 'background:#fff;border-radius:16px;width:90vw;max-width:560px;max-height:84vh;display:flex;flex-direction:column;box-shadow:0 12px 48px rgba(0,0,0,0.3);overflow:hidden';
         panel.innerHTML =
-            '<div style="padding:14px 18px;background:#283593;color:#fff;display:flex;justify-content:space-between;align-items:center">'
+            '<div style="padding:14px 18px;background:#0a3f9e;color:#fff;display:flex;justify-content:space-between;align-items:center">'
           + '<span style="font-size:17px;font-weight:700">&#128100; Customer for this bill</span>'
           + '<button id="cust-close" style="background:none;border:none;color:#fff;font-size:24px;cursor:pointer;padding:0 4px">&times;</button></div>'
           + '<div style="padding:12px 18px;border-bottom:1px solid #e0e0e0;display:flex;gap:8px;align-items:center">'
           + '<input id="cust-search" type="text" placeholder="Search name or phone…" autocomplete="off" style="flex:1;padding:11px 14px;border:1px solid #ccc;border-radius:8px;font-size:15px;box-sizing:border-box;outline:none"/>'
-          + '<a href="/apps/zenith/Contacts/Customers" target="_blank" rel="noopener" style="white-space:nowrap;padding:11px 14px;border-radius:8px;background:#e8eaf6;color:#283593;border:1px solid #c5cae9;font-weight:700;font-size:13px;text-decoration:none" title="Add a new customer in Contacts (opens a new tab)">&#43; New</a></div>'
+          + '<a href="/apps/zenith/Contacts/Customers" target="_blank" rel="noopener" style="white-space:nowrap;padding:11px 14px;border-radius:8px;background:#E7F0FD;color:#0a3f9e;border:1px solid #c5d8f5;font-weight:700;font-size:13px;text-decoration:none" title="Add a new customer in Contacts (opens a new tab)">&#43; New</a></div>'
           + '<div style="padding:8px 18px 0"><button id="cust-walkin" type="button" style="width:100%;padding:11px;border:1px dashed #bbb;background:#fafafa;border-radius:8px;font-size:14px;font-weight:700;color:#555;cursor:pointer">&#128694; Walk-In (no customer)</button></div>'
           + '<div id="cust-list" style="flex:1;overflow-y:auto;padding:10px 14px 16px"><div style="text-align:center;padding:30px;color:#999">Type a name or phone number to search your customers…</div></div>';
         ov.appendChild(panel); document.body.appendChild(ov);
@@ -1036,7 +1036,7 @@ window._posOffline = (function() {
             var h = '';
             d.customers.forEach(function(c) {
                 h += '<div class="cust-row" data-pid="' + c.partyId + '" data-name="' + (c.name || '').replace(/"/g, '&quot;') + '" style="padding:12px 14px;border:1px solid #e8e8e8;border-radius:10px;margin-bottom:8px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;gap:10px" onmouseover="this.style.background=\'#e8eaf6\'" onmouseout="this.style.background=\'#fff\'">'
-                  + '<span style="font-weight:700;color:#283593">' + (c.name || c.partyId) + '</span>'
+                  + '<span style="font-weight:700;color:#0a3f9e">' + (c.name || c.partyId) + '</span>'
                   + (c.phone ? '<span style="font-size:13px;color:#777;white-space:nowrap">' + c.phone + '</span>' : '')
                   + '</div>';
             });
@@ -1047,7 +1047,7 @@ window._posOffline = (function() {
                     var pid = row.dataset.pid, nm = row.dataset.name;
                     if (!tx) { histToast('Add an item to the bill first, then set the customer', '#e65100'); return; }
                     custPost('setCustomer', {transactionId: tx, customerPartyId: pid}).then(function(d) {
-                        if (d && d.success) { setCustChip(d.customer || nm); histToast('Customer: ' + (d.customer || nm), '#283593'); closeCustomer(); }
+                        if (d && d.success) { setCustChip(d.customer || nm); histToast('Customer: ' + (d.customer || nm), '#0a3f9e'); closeCustomer(); }
                         else { histToast((d && d.error) || 'Could not set customer', '#c62828'); }
                     });
                 });
@@ -3087,7 +3087,7 @@ window.posToggleFullscreen = function() {
                             + '<span style="font-weight:700;font-size:15px;color:'+(color||'#333')+'">'+CS+fmt2(val)+'</span></div>';
                     };
                     var html = '<div style="background:#fff;border-radius:16px;padding:28px 32px;width:420px;max-width:90vw;box-shadow:0 12px 40px rgba(0,0,0,0.3)">'
-                        + '<div style="text-align:center;font-size:22px;font-weight:800;color:#1a237e;margin-bottom:4px">Close Session</div>'
+                        + '<div style="text-align:center;font-size:22px;font-weight:800;color:#0a2a7a;margin-bottom:4px">Close Session</div>'
                         + '<div style="text-align:center;font-size:13px;color:#888;margin-bottom:18px">Session #'+SI+'</div>'
                         + '<div style="background:#f5f5f5;border-radius:10px;padding:14px 16px;margin-bottom:16px">'
                         + '<div style="font-size:13px;font-weight:700;color:#777;text-transform:uppercase;margin-bottom:8px">Session Summary</div>'
@@ -3101,9 +3101,9 @@ window.posToggleFullscreen = function() {
                         + row('Opening Cash', d.openingCash)
                         + row('Cash Received', d.cashReceived, '#2e7d32')
                         + row('Change Given', d.changeGiven, '#e65100')
-                        + '<div style="display:flex;justify-content:space-between;padding:10px 0 4px;border-top:2px solid #1a237e;margin-top:6px">'
-                        + '<span style="font-weight:800;font-size:17px;color:#1a237e">Expected Cash</span>'
-                        + '<span style="font-weight:800;font-size:17px;color:#1a237e">'+CS+fmt2(d.expectedCash)+'</span></div>'
+                        + '<div style="display:flex;justify-content:space-between;padding:10px 0 4px;border-top:2px solid #0a2a7a;margin-top:6px">'
+                        + '<span style="font-weight:800;font-size:17px;color:#0a2a7a">Expected Cash</span>'
+                        + '<span style="font-weight:800;font-size:17px;color:#0a2a7a">'+CS+fmt2(d.expectedCash)+'</span></div>'
                         + '</div>'
                         + (d.cardReceived > 0 || d.upiReceived > 0 ? '<div style="background:#f5f5f5;border-radius:10px;padding:14px 16px;margin-bottom:16px">'
                             + '<div style="font-size:13px;font-weight:700;color:#777;text-transform:uppercase;margin-bottom:8px">Other Payments</div>'
@@ -3112,7 +3112,7 @@ window.posToggleFullscreen = function() {
                             + '</div>' : '')
                         + '<div style="margin-bottom:16px">'
                         + '<label style="font-size:14px;font-weight:700;color:#333;display:block;margin-bottom:6px">Enter Closing Cash Amount</label>'
-                        + '<input type="number" class="pos-close-cash" step="any" min="0" value="'+Math.round(d.expectedCash)+'" style="width:100%;padding:14px 16px;border:2px solid #1a237e;border-radius:10px;font-size:22px;font-weight:700;text-align:right;box-sizing:border-box;outline:none;color:#1a237e" onfocus="this.select()"/>'
+                        + '<input type="number" class="pos-close-cash" step="any" min="0" value="'+Math.round(d.expectedCash)+'" style="width:100%;padding:14px 16px;border:2px solid #0a2a7a;border-radius:10px;font-size:22px;font-weight:700;text-align:right;box-sizing:border-box;outline:none;color:#0a2a7a" onfocus="this.select()"/>'
                         + '<div class="pos-close-diff" style="text-align:right;margin-top:6px;font-size:14px;font-weight:600"></div>'
                         + '</div>'
                         + '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">'
