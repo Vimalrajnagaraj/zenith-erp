@@ -3,6 +3,10 @@
         xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
         default-menu-title="Dashboard" default-menu-index="1">
 
+    <parameter name="showSettings"/>
+    <parameter name="dashDate"/>
+    <parameter name="dashDateTo"/>
+
     <transition name="createPerson">
         <service-call name="zenith.contacts.ContactServices.create#Contact"
                       in-map="context + [partyTypeEnumId:'PtyPerson']"/>
@@ -14,20 +18,171 @@
         <default-response url="../EditContact"/>
     </transition>
 
+    <!-- ZE-DASH: switchable widgets + drag-reorder + a date-range filter that drives the Customer Activity + Top Customers widgets -->
+    <transition name="saveDashLayout">
+        <actions><script><![CDATA[
+            def _wk = ['metrics','activity','topcust']
+            ec.user.setPreference('CONTACT_DASH_HIDDEN', _wk.findAll { !context.get('w_' + it) }.join(','))
+        ]]></script></actions>
+        <default-response url="." parameter-map="[dashDate:dashDate, dashDateTo:dashDateTo]"/>
+    </transition>
+    <transition name="resetDashLayout">
+        <actions><script>ec.user.setPreference('CONTACT_DASH_HIDDEN', null); ec.user.setPreference('CONTACT_DASH_ORDER', null)</script></actions>
+        <default-response url="." parameter-map="[dashDate:dashDate, dashDateTo:dashDateTo]"/>
+    </transition>
+    <transition name="changeDashDate"><default-response url="." parameter-map="[dashDate:dashDate, dashDateTo:dashDateTo]"/></transition>
+    <transition name="saveDashOrder" require-session-token="false">
+        <actions><script><![CDATA[
+            def _valid = ['metrics','activity','topcust']
+            def _clean = ((context.order ?: '').toString().split(',') as List).findAll { _valid.contains(it) }
+            ec.user.setPreference('CONTACT_DASH_ORDER', _clean.join(','))
+            ec.web.sendJsonResponse([saved:true, order:_clean.join(',')])
+        ]]></script></actions>
+        <default-response type="none"/>
+    </transition>
+
     <actions>
-        <!-- Aggregate Customers -->
+        <set field="orgId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+        <set field="currSymbol" value="₹"/>
+
+        <!-- Aggregate Customers (current directory count — snapshot) -->
         <entity-find entity-name="mantle.party.PartyDetailAndRole" list="customerList">
             <econdition field-name="roleTypeId" operator="in" value="Customer,CustomerBillTo"/>
-            <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+            <econdition field-name="ownerPartyId" from="orgId" ignore-if-empty="true"/>
         </entity-find>
         <set field="totalCustomers" from="customerList?.size() ?: 0"/>
-        
-        <!-- Aggregate Vendors -->
+
+        <!-- Aggregate Vendors (current directory count — snapshot) -->
         <entity-find entity-name="mantle.party.PartyDetailAndRole" list="vendorList">
             <econdition field-name="roleTypeId" operator="in" value="Supplier,Vendor"/>
-            <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+            <econdition field-name="ownerPartyId" from="orgId" ignore-if-empty="true"/>
         </entity-find>
         <set field="totalVendors" from="vendorList?.size() ?: 0"/>
+
+        <script><![CDATA[
+            import org.moqui.entity.EntityCondition
+            def ef = ec.entity
+
+            // ===== ZE-DASH date-range filter =====
+            // NOTE: contacts have no reliable "created/became-a-customer" date in the data (party/party_role
+            // carry only last_updated_stamp), so a date filter over the directory counts would be a no-op OR a
+            // fabrication. The honest time dimension for a Contacts view is customer *transaction activity*:
+            // finalised sales invoices (invoiceDate, org-scoped) — same "finalised sale" basis as SalesDashboard.
+            // The range drives ONLY the Customer Activity chart, Top Customers, and the "active in range" stat.
+            // The Customers/Suppliers directory totals above stay "current" (MARUTHI-safe).
+            def _sdf = new java.text.SimpleDateFormat("yyyy-MM-dd")
+            def _now = ec.user.nowTimestamp
+            def _todayStr = _sdf.format(_now)
+            if (!dashDate) dashDate = ''
+            if (!dashDateTo) dashDateTo = ''
+            dayStart = null; dayEndExcl = null
+            if (dashDate) {
+                if (!dashDateTo) dashDateTo = dashDate
+                if (dashDateTo < dashDate) { def _s = dashDate; dashDate = dashDateTo; dashDateTo = _s }
+                dayStart = java.sql.Timestamp.valueOf(dashDate + " 00:00:00")
+                def _ce = java.util.Calendar.getInstance(); _ce.setTime(java.sql.Timestamp.valueOf(dashDateTo + " 00:00:00")); _ce.add(java.util.Calendar.DAY_OF_MONTH, 1)
+                dayEndExcl = new java.sql.Timestamp(_ce.getTimeInMillis())
+            }
+            def _cw = java.util.Calendar.getInstance(); _cw.setTime(_now); _cw.set(java.util.Calendar.DAY_OF_WEEK, _cw.getFirstDayOfWeek()); def _weekStartStr = _sdf.format(_cw.getTime())
+            def _cm = java.util.Calendar.getInstance(); _cm.setTime(_now); _cm.set(java.util.Calendar.DAY_OF_MONTH,1); def _monthStartStr = _sdf.format(_cm.getTime())
+            def _c30 = java.util.Calendar.getInstance(); _c30.setTime(_now); _c30.add(java.util.Calendar.DAY_OF_MONTH,-29); def _last30Str = _sdf.format(_c30.getTime())
+            urlAll = "?"; urlToday = "?dashDate="+_todayStr+"&dashDateTo="+_todayStr
+            urlWeek = "?dashDate="+_weekStartStr+"&dashDateTo="+_todayStr
+            urlMonth = "?dashDate="+_monthStartStr+"&dashDateTo="+_todayStr
+            url30 = "?dashDate="+_last30Str+"&dashDateTo="+_todayStr
+            presetActive = 'all'
+            if (dashDate) {
+                presetActive = 'custom'
+                if (dashDateTo == _todayStr) {
+                    if (dashDate == _todayStr) presetActive='today'
+                    else if (dashDate == _weekStartStr) presetActive='week'
+                    else if (dashDate == _monthStartStr) presetActive='month'
+                    else if (dashDate == _last30Str) presetActive='last30'
+                }
+            }
+            // window = selected range, else last 6 months
+            def _acStart; def _acEnd
+            if (dayStart) { _acStart = dayStart; _acEnd = dayEndExcl }
+            else {
+                def _c6 = java.util.Calendar.getInstance(); _c6.setTime(_now); _c6.set(java.util.Calendar.DAY_OF_MONTH,1); _c6.add(java.util.Calendar.MONTH,-5); _acStart = new java.sql.Timestamp(_c6.getTimeInMillis())
+                def _ce2 = java.util.Calendar.getInstance(); _ce2.setTime(_now); _ce2.add(java.util.Calendar.DAY_OF_MONTH,1); _acEnd = new java.sql.Timestamp(_ce2.getTimeInMillis())
+            }
+            def _daily = ((_acEnd.getTime() - _acStart.getTime()) / (1000L*60*60*24)) <= 62
+            def _bfmt = _daily ? new java.text.SimpleDateFormat("yyyy-MM-dd") : new java.text.SimpleDateFormat("yyyy-MM")
+            def _lfmt = _daily ? new java.text.SimpleDateFormat("dd MMM") : new java.text.SimpleDateFormat("MMM yy")
+
+            // one finalised-sales-invoice pass drives all range widgets
+            def _invs = orgId ? ef.find("mantle.account.invoice.Invoice")
+                                  .condition("fromPartyId", orgId)
+                                  .condition("invoiceTypeEnumId", "InvoiceSales")
+                                  .condition("statusId", EntityCondition.IN, ["InvoiceFinalized","InvoicePmtRecvd"])
+                                  .condition("invoiceDate", EntityCondition.GREATER_THAN_EQUAL_TO, _acStart)
+                                  .condition("invoiceDate", EntityCondition.LESS_THAN, _acEnd)
+                                  .selectField("toPartyId").selectField("invoiceDate")
+                                  .selectField("totalTaxableAmount").selectField("totalTaxAmount").selectField("roundOffAmount")
+                                  .list() : []
+
+            // build empty daily/monthly buckets across the window
+            def _keys = []; def _labelByKey = [:]; def _setBy = [:]
+            def _bc = java.util.Calendar.getInstance(); _bc.setTime(_acStart); def _bendMs = _acEnd.getTime(); int _guard = 0
+            while (_bc.getTimeInMillis() < _bendMs && _guard < 400) {
+                def _k = _bfmt.format(_bc.getTime())
+                if (!_labelByKey.containsKey(_k)) { _keys.add(_k); _labelByKey[_k] = _lfmt.format(_bc.getTime()); _setBy[_k] = new HashSet() }
+                _bc.add(_daily ? java.util.Calendar.DAY_OF_MONTH : java.util.Calendar.MONTH, 1); _guard++
+            }
+            def _custTotal = [:]; def _allCust = new HashSet()
+            _invs.each {
+                if (!it.toPartyId) return
+                def _k = _bfmt.format(it.invoiceDate)
+                if (_setBy.containsKey(_k)) _setBy[_k].add(it.toPartyId)
+                _allCust.add(it.toPartyId)
+                def _amt = ((it.totalTaxableAmount ?: 0G) + (it.totalTaxAmount ?: 0G) + (it.roundOffAmount ?: 0G))
+                _custTotal[it.toPartyId] = (_custTotal[it.toPartyId] ?: 0G) + _amt
+            }
+            def _aclbls=[]; def _acvals=[]
+            _keys.each { _k -> _aclbls.add("'"+_labelByKey[_k]+"'"); _acvals.add(_setBy[_k].size()) }
+            acLabelsJson = "["+_aclbls.join(",")+"]"
+            acValsJson   = "["+_acvals.join(",")+"]"
+            acActiveInRange = _allCust.size()
+            acInvCount = _invs.size()
+            acHasData = _invs.size() > 0
+            acRangeLabel = dashDate ? (dashDate == dashDateTo ? dashDate : (dashDate + " to " + dashDateTo)) : "last 6 months"
+
+            // top customers by finalised sales value in the window
+            def _ct = _custTotal.entrySet().toList()
+            _ct.sort { a, b -> (b.value <=> a.value) }
+            def _topc = _ct.size() > 8 ? _ct.subList(0, 8) : _ct
+            def _tclbls=[]; def _tcvals=[]
+            for (e in _topc) {
+                def _nm = null
+                def _org = ef.find("mantle.party.Organization").condition("partyId", e.key).one()
+                if (_org) _nm = _org.organizationName
+                if (!_nm) { def _per = ef.find("mantle.party.Person").condition("partyId", e.key).one(); if (_per) _nm = ((_per.firstName ?: '') + ' ' + (_per.lastName ?: '')).trim() }
+                if (!_nm) _nm = e.key
+                _nm = _nm.toString().replace("'", " ").replace("\"", " ")
+                if (_nm.length() > 26) _nm = _nm.substring(0, 26)
+                _tclbls.add("'" + _nm + "'")
+                _tcvals.add(((e.value ?: 0G) as java.math.BigDecimal).setScale(0, java.math.RoundingMode.HALF_UP).toPlainString())
+            }
+            tcLabelsJson = "[" + _tclbls.join(",") + "]"
+            tcValsJson   = "[" + _tcvals.join(",") + "]"
+            tcHasData    = (_tcvals.size() > 0)
+
+            // ZE-DASH layout: switchable widgets (+ cashier role default) + saved drag order
+            def _roleHidden = ''
+            try {
+                if (!ec.user.isInGroup("ADMIN")) {
+                    def _zrp = (ec.user.userGroupIdSet ?: []).findAll { it?.startsWith("ZENITH_") && it != "ZENITH_ALL" }
+                    if (_zrp.size() == 1 && _zrp.contains("ZENITH_CASHIER")) _roleHidden = 'activity,topcust'
+                }
+            } catch (Exception e) {}
+            def _pref = ec.user.getPreference('CONTACT_DASH_HIDDEN')
+            def _hiddenSet = ((_pref != null) ? _pref : _roleHidden).split(',').findAll { it }.toSet()
+            showMetrics = !_hiddenSet.contains('metrics'); showActivity = !_hiddenSet.contains('activity'); showTopcust = !_hiddenSet.contains('topcust')
+            w_metrics = showMetrics ? 'Y' : ''; w_activity = showActivity ? 'Y' : ''; w_topcust = showTopcust ? 'Y' : ''
+            dashOrderCsv = (ec.user.getPreference('CONTACT_DASH_ORDER') ?: '')
+            urlSettings = dashDate ? ("?dashDate="+dashDate+"&dashDateTo="+dashDateTo+"&showSettings=1") : "?showSettings=1"
+        ]]></script>
     </actions>
 
     <widgets>
@@ -49,12 +204,12 @@
                         <field name="emailAddress"><default-field title="Email"><text-line size="40"/></default-field></field>
                         <field name="countryCode"><default-field title="Country Code"><text-line size="4" default-value="91"/></default-field></field>
                         <field name="contactNumber"><default-field title="Phone"><text-line size="12"/></default-field></field>
-                        
+
                         <field name="panNumber"><default-field title="PAN"><text-line size="10" maxlength="10"/></default-field></field>
                         <field name="tdsApplicable"><default-field title="TDS Applicable">
                             <drop-down no-current-selected-key="N"><option key="Y" text="Yes"/><option key="N" text="No"/></drop-down>
                         </default-field></field>
-                        
+
                         <field name="roleTypeId"><default-field title="Role">
                             <drop-down no-current-selected-key="Customer">
                                 <option key="Customer" text="Customer"/>
@@ -77,7 +232,7 @@
                         <field name="emailAddress"><default-field title="Email"><text-line size="40"/></default-field></field>
                         <field name="countryCode"><default-field title="Country Code"><text-line size="4" default-value="91"/></default-field></field>
                         <field name="contactNumber"><default-field title="Phone"><text-line size="12"/></default-field></field>
-                        
+
                         <field name="gstin"><default-field title="GSTIN"><text-line size="15" maxlength="15"/></default-field></field>
                         <field name="gstRegistrationType"><default-field title="GST Registration">
                             <drop-down no-current-selected-key="Regular">
@@ -85,7 +240,7 @@
                                 <option key="Unregistered"/><option key="SEZ"/><option key="Overseas"/>
                             </drop-down>
                         </default-field></field>
-                        
+
                         <field name="panNumber"><default-field title="PAN"><text-line size="10" maxlength="10"/></default-field></field>
                         <field name="tdsApplicable"><default-field title="TDS Applicable">
                             <drop-down no-current-selected-key="N"><option key="Y" text="Yes"/><option key="N" text="No"/></drop-down>
@@ -105,9 +260,39 @@
             </section>
         </container>
 
+        <!-- ZE-DASH: date-range filter (drives Customer Activity + Top Customers) + customize gear -->
+        <container style="q-px-lg q-py-md q-mb-md zenith-card bg-white shadow-1 border-radius-lg">
+            <render-mode><text type="html" template="true"><![CDATA[<div style="display:flex;flex-wrap:wrap;align-items:center;gap:8px;font-family:Segoe UI,Arial,sans-serif;margin-bottom:8px"><span style="font-size:11.5px;font-weight:800;color:#5C6B85;letter-spacing:.06em;margin-right:4px">ACTIVITY RANGE</span><a href="${urlAll}" class="zdash-chip${(presetActive=='all')?string(' on','')}">All time</a><a href="${urlToday}" class="zdash-chip${(presetActive=='today')?string(' on','')}">Today</a><a href="${urlWeek}" class="zdash-chip${(presetActive=='week')?string(' on','')}">This Week</a><a href="${urlMonth}" class="zdash-chip${(presetActive=='month')?string(' on','')}">This Month</a><a href="${url30}" class="zdash-chip${(presetActive=='last30')?string(' on','')}">Last 30 Days</a><a href="${urlSettings}" class="zdash-chip" style="margin-left:auto">&#9881; Customize</a></div><div style="font-size:11px;color:#8A96AB">This range drives the <b>Customer Activity</b> chart and <b>Top Customers</b> (from your finalised sales). Your <b>Customers</b> / <b>Suppliers</b> totals always show the current directory.</div>]]></text></render-mode>
+            <form-single name="DateForm" transition="changeDashDate">
+                <field name="dashDate"><default-field title="From"><date-time type="date" default-value="${dashDate}"/></default-field></field>
+                <field name="dashDateTo"><default-field title="To"><date-time type="date" default-value="${dashDateTo}"/></default-field></field>
+                <field name="goBtn"><default-field title=""><submit text="Apply" icon="fa fa-check"/></default-field></field>
+            </form-single>
+        </container>
+        <section name="DashSettings" condition="showSettings == '1'">
+            <widgets>
+                <container style="q-px-lg q-py-md q-mb-md zenith-card bg-white shadow-1 border-radius-lg">
+                    <render-mode><text type="html"><![CDATA[<div style="font-size:12.5px;font-weight:800;color:#0A2A7A;letter-spacing:.04em;margin-bottom:2px">&#9881; CUSTOMIZE DASHBOARD</div><div style="font-size:12px;color:#5C6B85;margin-bottom:8px">Tick the sections you want to see &mdash; saved to your account. Drag the handle on any card to reorder.</div>]]></text></render-mode>
+                    <form-single name="DashLayoutForm" transition="saveDashLayout">
+                        <field name="w_metrics"><default-field title="Directory totals (customers, suppliers, active in range)"><check><option key="Y" text=" "/></check></default-field></field>
+                        <field name="w_activity"><default-field title="Customer Activity chart (over the selected range)"><check><option key="Y" text=" "/></check></default-field></field>
+                        <field name="w_topcust"><default-field title="Top Customers by sales (over the selected range)"><check><option key="Y" text=" "/></check></default-field></field>
+                        <field name="saveBtn"><default-field title=""><submit text="Save Layout" icon="fa fa-check"/></default-field></field>
+                    </form-single>
+                    <container style="row q-gutter-sm q-mt-sm">
+                        <link url="resetDashLayout" text="Reset to Default" icon="fa fa-undo" btn-type="warning"/>
+                        <link url="." text="Close" btn-type="flat"/>
+                    </container>
+                </container>
+            </widgets>
+        </section>
+
+        <!-- Metrics row -->
+        <section name="wMetrics" condition="showMetrics"><widgets>
+        <render-mode><text type="html"><![CDATA[<div class="dash-widget" data-wkey="metrics"><div class="dash-handle" title="Drag to reorder">&#8942;&#8942;</div>]]></text></render-mode>
         <container-row>
-            <row-col lg="6">
-                <!-- Total Customers -->
+            <row-col lg="4" md="6" sm="12">
+                <!-- Total Customers (current) -->
                 <container style="zenith-card q-pa-lg bg-white shadow-1 border-radius-lg border-left border-info q-mb-md">
                     <container style="row items-center justify-between">
                         <container>
@@ -123,9 +308,9 @@
                     </container>
                 </container>
             </row-col>
-            
-            <row-col lg="6">
-                <!-- Total Vendors -->
+
+            <row-col lg="4" md="6" sm="12">
+                <!-- Total Vendors (current) -->
                 <container style="zenith-card q-pa-lg bg-white shadow-1 border-radius-lg border-left border-warning q-mb-md">
                     <container style="row items-center justify-between">
                         <container>
@@ -141,8 +326,112 @@
                     </container>
                 </container>
             </row-col>
-        </container-row>
 
+            <row-col lg="4" md="12" sm="12">
+                <!-- Active customers in the selected range (from finalised sales) -->
+                <container style="zenith-card q-pa-lg bg-white shadow-1 border-radius-lg border-left border-primary q-mb-md">
+                    <container style="row items-center justify-between">
+                        <container>
+                            <label text="Active Customers" type="h6" style="text-grey-7 q-my-none"/>
+                            <label text="${acActiveInRange}" type="h3" style="text-primary text-weight-bold q-my-none q-mt-sm"/>
+                            <label text="bought from you · ${acRangeLabel}" type="p" style="text-grey-6 text-caption q-mb-none q-mt-xs"/>
+                        </container>
+                        <container style="zenith-avatar text-primary bg-indigo-1" type="div">
+                            <render-mode><text type="html"><![CDATA[<q-icon name="shopping_bag" class="text-h3"/>]]></text></render-mode>
+                        </container>
+                    </container>
+                </container>
+            </row-col>
+        </container-row>
+        <render-mode><text type="html"><![CDATA[</div>]]></text></render-mode>
+        </widgets></section>
+
+        <!-- Customer Activity time series (driven by the date range) -->
+        <section name="wActivity" condition="showActivity"><widgets>
+        <render-mode><text type="html"><![CDATA[<div class="dash-widget" data-wkey="activity"><div class="dash-handle" title="Drag to reorder">&#8942;&#8942;</div>]]></text></render-mode>
+        <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md q-mb-md">
+            <container style="row items-center justify-between q-mb-sm">
+                <label text="Customer Activity — ${acRangeLabel}" type="h6" style="text-primary text-weight-bold q-my-none"/>
+                <label text="${acActiveInRange} active customers · ${acInvCount} bills" type="p" style="text-grey-6 text-caption q-mb-none"/>
+            </container>
+            <section name="AcHasData">
+                <condition><expression>acHasData</expression></condition>
+                <widgets>
+                    <render-mode><text type="html,vuet,qvt" template="true"><![CDATA[
+                        <div id="contactsActivityChart"></div>
+                        <script src="https://cdn.jsdelivr.net/npm/apexcharts@3.44.0/dist/apexcharts.min.js"></script>
+                        <script>
+                        (function(){
+                            new ApexCharts(document.querySelector("#contactsActivityChart"), {
+                                chart: { type:'area', height: 300, toolbar:{show:false}, fontFamily:'Roboto, sans-serif' },
+                                series: [ { name:'Active customers', data: ${acValsJson} } ],
+                                xaxis: { categories: ${acLabelsJson} },
+                                colors: ['#0E63D6'],
+                                stroke: { curve:'smooth', width:2 },
+                                fill: { type:'gradient', gradient:{ shadeIntensity:0.4, opacityFrom:0.4, opacityTo:0.05 } },
+                                dataLabels: { enabled:false },
+                                yaxis: { title:{ text:'Customers who bought' }, labels:{ formatter:function(v){ return Math.round(v); } } }
+                            }).render();
+                        })();
+                        </script>
+                    ]]></text></render-mode>
+                </widgets>
+            </section>
+            <section name="AcNoData">
+                <condition><expression>!acHasData</expression></condition>
+                <widgets>
+                    <container style="bg-blue-1 q-pa-md border-radius-md text-center">
+                        <label text="No finalised sales in this period, so there's no customer activity to show. Pick a wider range, or record some sales." type="p" style="text-blue-9 q-mb-none"/>
+                    </container>
+                </widgets>
+            </section>
+        </container>
+        <render-mode><text type="html"><![CDATA[</div>]]></text></render-mode>
+        </widgets></section>
+
+        <!-- Top Customers by sales (driven by the date range) -->
+        <section name="wTopcust" condition="showTopcust"><widgets>
+        <render-mode><text type="html"><![CDATA[<div class="dash-widget" data-wkey="topcust"><div class="dash-handle" title="Drag to reorder">&#8942;&#8942;</div>]]></text></render-mode>
+        <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md q-mb-md">
+            <label text="Top Customers — ${acRangeLabel}" type="h6" style="text-primary text-weight-bold q-mb-md"/>
+            <section name="TcHasData">
+                <condition><expression>tcHasData</expression></condition>
+                <widgets>
+                    <render-mode><text type="html,vuet,qvt" template="true"><![CDATA[
+                        <div id="contactsTopCustChart"></div>
+                        <script src="https://cdn.jsdelivr.net/npm/apexcharts@3.44.0/dist/apexcharts.min.js"></script>
+                        <script>
+                        (function(){
+                            var labels = ${tcLabelsJson};
+                            var data = ${tcValsJson}.map(Number);
+                            new ApexCharts(document.querySelector("#contactsTopCustChart"), {
+                                chart: { type:'bar', height: 360, toolbar:{show:false}, fontFamily:'Roboto, sans-serif' },
+                                series: [{ name:'Sales (₹)', data: data }],
+                                plotOptions: { bar: { horizontal:true, borderRadius:4, distributed:true, barHeight:'70%' } },
+                                xaxis: { categories: labels },
+                                legend: { show:false },
+                                colors: ['#0E63D6','#18B4F0','#4D9BF5','#26A69A','#66BB6A','#FFA726','#FF7043','#EF5350'],
+                                dataLabels: { enabled:true, formatter:function(v){ return '₹' + Number(v).toLocaleString('en-IN'); } },
+                                tooltip: { y: { formatter:function(v){ return '₹' + Number(v).toLocaleString('en-IN'); } } }
+                            }).render();
+                        })();
+                        </script>
+                    ]]></text></render-mode>
+                </widgets>
+            </section>
+            <section name="TcNoData">
+                <condition><expression>!tcHasData</expression></condition>
+                <widgets>
+                    <container style="bg-blue-1 q-pa-md border-radius-md text-center">
+                        <label text="No finalised sales in this period yet. Once you bill some customers they'll appear here, ranked by value." type="p" style="text-blue-9 q-mb-none"/>
+                    </container>
+                </widgets>
+            </section>
+        </container>
+        <render-mode><text type="html"><![CDATA[</div>]]></text></render-mode>
+        </widgets></section>
+
+        <render-mode><text type="html"><![CDATA[<div id="dashExtras">]]></text></render-mode>
         <container-row>
             <row-col lg="12">
                 <container style="zenith-card bg-indigo-9 text-white shadow-2 border-radius-lg q-pa-xl q-mt-lg text-center">
@@ -152,5 +441,8 @@
                 </container>
             </row-col>
         </container-row>
+        <render-mode><text type="html"><![CDATA[</div>]]></text></render-mode>
+
+        <render-mode><text type="html" template="true"><![CDATA[<script>window.__dashLayout={saveUrl:(("${ec.web.request.requestURI}").replace(/\/+$/,''))+'/saveDashOrder',order:"${dashOrderCsv}"};</script><script src="/zenithstatic/js/dash-layout.js?v=2"></script>]]></text></render-mode>
     </widgets>
 </screen>
