@@ -3,7 +3,67 @@
         xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
         default-menu-title="Dashboard" default-menu-index="1">
 
+    <parameter name="dashDate"/>
+    <parameter name="dashDateTo"/>
+    <parameter name="showSettings"/>
+
+    <transition name="saveDashLayout">
+        <actions><script><![CDATA[
+            def _wk = ['kpis','arap','revexp']
+            ec.user.setPreference('ACCT_DASH_HIDDEN', _wk.findAll { !context.get('w_' + it) }.join(','))
+        ]]></script></actions>
+        <default-response url="." parameter-map="[dashDate:dashDate, dashDateTo:dashDateTo]"/>
+    </transition>
+    <transition name="resetDashLayout">
+        <actions><script>ec.user.setPreference('ACCT_DASH_HIDDEN', null); ec.user.setPreference('ACCT_DASH_ORDER', null)</script></actions>
+        <default-response url="." parameter-map="[dashDate:dashDate, dashDateTo:dashDateTo]"/>
+    </transition>
+    <transition name="saveDashOrder" require-session-token="false">
+        <actions><script><![CDATA[
+            def _valid = ['kpis','arap','revexp']
+            def _clean = ((context.order ?: '').toString().split(',') as List).findAll { _valid.contains(it) }
+            ec.user.setPreference('ACCT_DASH_ORDER', _clean.join(','))
+            ec.web.sendJsonResponse([saved:true, order:_clean.join(',')])
+        ]]></script></actions>
+        <default-response type="none"/>
+    </transition>
+    <transition name="changeDashDate"><default-response url="." parameter-map="[dashDate:dashDate, dashDateTo:dashDateTo]"/></transition>
+
     <actions>
+        <!-- ZE-DASH date-range filter. DEFAULT = all-time (empty) so A/R and A/P stay at current totals on load;
+             a selected range scopes them to invoices dated in that period. -->
+        <script><![CDATA[
+            def sdf = new java.text.SimpleDateFormat("yyyy-MM-dd")
+            def now = ec.user.nowTimestamp
+            def todayStr = sdf.format(now)
+            if (!dashDate) dashDate = ''
+            if (!dashDateTo) dashDateTo = ''
+            dayStart = null; dayEndExcl = null
+            if (dashDate) {
+                if (!dashDateTo) dashDateTo = dashDate
+                if (dashDateTo < dashDate) { def _s = dashDate; dashDate = dashDateTo; dashDateTo = _s }
+                dayStart = java.sql.Timestamp.valueOf(dashDate + " 00:00:00")
+                def _ce = java.util.Calendar.getInstance(); _ce.setTime(java.sql.Timestamp.valueOf(dashDateTo + " 00:00:00")); _ce.add(java.util.Calendar.DAY_OF_MONTH, 1)
+                dayEndExcl = new java.sql.Timestamp(_ce.getTimeInMillis())
+            }
+            def _cw = java.util.Calendar.getInstance(); _cw.setTime(now); _cw.set(java.util.Calendar.DAY_OF_WEEK, _cw.getFirstDayOfWeek()); def weekStartStr = sdf.format(_cw.getTime())
+            def _cm = java.util.Calendar.getInstance(); _cm.setTime(now); _cm.set(java.util.Calendar.DAY_OF_MONTH,1); def monthStartStr = sdf.format(_cm.getTime())
+            def _c30 = java.util.Calendar.getInstance(); _c30.setTime(now); _c30.add(java.util.Calendar.DAY_OF_MONTH,-29); def last30Str = sdf.format(_c30.getTime())
+            urlAll = "?"; urlToday = "?dashDate="+todayStr+"&dashDateTo="+todayStr
+            urlWeek = "?dashDate="+weekStartStr+"&dashDateTo="+todayStr
+            urlMonth = "?dashDate="+monthStartStr+"&dashDateTo="+todayStr
+            url30 = "?dashDate="+last30Str+"&dashDateTo="+todayStr
+            presetActive = 'all'
+            if (dashDate) {
+                presetActive = 'custom'
+                if (dashDateTo == todayStr) {
+                    if (dashDate == todayStr) presetActive='today'
+                    else if (dashDate == weekStartStr) presetActive='week'
+                    else if (dashDate == monthStartStr) presetActive='month'
+                    else if (dashDate == last30Str) presetActive='last30'
+                }
+            }
+        ]]></script>
         <set field="cal" from="new java.util.GregorianCalendar()"/>
         <set field="yr" from="cal.get(java.util.Calendar.YEAR)"/>
         <set field="mn" from="cal.get(java.util.Calendar.MONTH) + 1"/>
@@ -17,6 +77,8 @@
             <econdition field-name="statusId" operator="in" value="InvoiceFinalized,InvoiceSent,InvoiceApproved"/>
             <!-- Org isolation: only this org's receivables (sales invoices it issued). -->
             <econdition field-name="fromPartyId" from="activeOrgId" ignore-if-empty="true"/>
+            <econdition field-name="invoiceDate" operator="greater-equals" from="dayStart" ignore-if-empty="true"/>
+            <econdition field-name="invoiceDate" operator="less" from="dayEndExcl" ignore-if-empty="true"/>
         </entity-find>
         <set field="totalAr" from="0"/>
         <script>for (def inv : arList) { totalAr += (inv.unpaidTotal ?: inv.invoiceTotal ?: 0) }</script>
@@ -27,9 +89,28 @@
             <econdition field-name="statusId" operator="in" value="InvoiceApproved,InvoiceReceived"/>
             <!-- Org isolation: only this org's payables (purchase invoices billed TO it). -->
             <econdition field-name="toPartyId" from="activeOrgId" ignore-if-empty="true"/>
+            <econdition field-name="invoiceDate" operator="greater-equals" from="dayStart" ignore-if-empty="true"/>
+            <econdition field-name="invoiceDate" operator="less" from="dayEndExcl" ignore-if-empty="true"/>
         </entity-find>
         <set field="totalAp" from="0"/>
         <script>for (def inv : apList) { totalAp += (inv.unpaidTotal ?: inv.invoiceTotal ?: 0) }</script>
+
+        <!-- ZE-DASH layout: switchable widgets (+ cashier role default) + saved drag order -->
+        <script><![CDATA[
+            def _roleHidden = ''
+            try {
+                if (!ec.user.isInGroup("ADMIN")) {
+                    def _zrp = (ec.user.userGroupIdSet ?: []).findAll { it?.startsWith("ZENITH_") && it != "ZENITH_ALL" }
+                    if (_zrp.size() == 1 && _zrp.contains("ZENITH_CASHIER")) _roleHidden = 'arap,revexp'
+                }
+            } catch (Exception e) {}
+            def _pref = ec.user.getPreference('ACCT_DASH_HIDDEN')
+            def _hiddenSet = ((_pref != null) ? _pref : _roleHidden).split(',').findAll { it }.toSet()
+            showKpis = !_hiddenSet.contains('kpis'); showArap = !_hiddenSet.contains('arap'); showRevexp = !_hiddenSet.contains('revexp')
+            w_kpis = showKpis ? 'Y' : ''; w_arap = showArap ? 'Y' : ''; w_revexp = showRevexp ? 'Y' : ''
+            dashOrderCsv = (ec.user.getPreference('ACCT_DASH_ORDER') ?: '')
+            urlSettings = dashDate ? ("?dashDate="+dashDate+"&dashDateTo="+dashDateTo+"&showSettings=1") : "?showSettings=1"
+        ]]></script>
     </actions>
 
     <widgets>
@@ -40,6 +121,37 @@
             </container>
         </container>
 
+        <!-- ZE-DASH: date-range filter + customize gear -->
+        <container style="q-px-lg q-py-md q-mb-md zenith-card bg-white shadow-1 border-radius-lg">
+            <render-mode><text type="html" template="true"><![CDATA[<div style="display:flex;flex-wrap:wrap;align-items:center;gap:8px;font-family:Segoe UI,Arial,sans-serif;margin-bottom:10px"><span style="font-size:11.5px;font-weight:800;color:#5C6B85;letter-spacing:.06em;margin-right:4px">DATE RANGE</span><a href="${urlAll}" class="zdash-chip${(presetActive=='all')?string(' on','')}">All time</a><a href="${urlToday}" class="zdash-chip${(presetActive=='today')?string(' on','')}">Today</a><a href="${urlWeek}" class="zdash-chip${(presetActive=='week')?string(' on','')}">This Week</a><a href="${urlMonth}" class="zdash-chip${(presetActive=='month')?string(' on','')}">This Month</a><a href="${url30}" class="zdash-chip${(presetActive=='last30')?string(' on','')}">Last 30 Days</a><a href="${urlSettings}" class="zdash-chip" style="margin-left:auto">&#9881; Customize</a></div>]]></text></render-mode>
+            <form-single name="DateForm" transition="changeDashDate">
+                <field name="dashDate"><default-field title="From"><date-time type="date" default-value="${dashDate}"/></default-field></field>
+                <field name="dashDateTo"><default-field title="To"><date-time type="date" default-value="${dashDateTo}"/></default-field></field>
+                <field name="goBtn"><default-field title=""><submit text="Apply" icon="fa fa-check"/></default-field></field>
+            </form-single>
+        </container>
+        <section name="DashSettings" condition="showSettings == '1'">
+            <widgets>
+                <container style="q-px-lg q-py-md q-mb-md zenith-card bg-white shadow-1 border-radius-lg">
+                    <render-mode><text type="html"><![CDATA[<div style="font-size:12.5px;font-weight:800;color:#0A2A7A;letter-spacing:.04em;margin-bottom:2px">&#9881; CUSTOMIZE DASHBOARD</div><div style="font-size:12px;color:#5C6B85;margin-bottom:8px">Tick the sections you want to see &mdash; saved to your account. Drag the handle on any card to reorder.</div>]]></text></render-mode>
+                    <form-single name="DashLayoutForm" transition="saveDashLayout">
+                        <field name="dashDate"><default-field><hidden/></default-field></field>
+                        <field name="dashDateTo"><default-field><hidden/></default-field></field>
+                        <field name="w_kpis"><default-field title="A/R and A/P summary"><check><option key="Y" text=" "/></check></default-field></field>
+                        <field name="w_arap"><default-field title="Receivables vs Payables chart"><check><option key="Y" text=" "/></check></default-field></field>
+                        <field name="w_revexp"><default-field title="Revenue vs Expenses chart"><check><option key="Y" text=" "/></check></default-field></field>
+                        <field name="saveBtn"><default-field title=""><submit text="Save Layout" icon="fa fa-check"/></default-field></field>
+                    </form-single>
+                    <container style="row q-gutter-sm q-mt-sm">
+                        <link url="resetDashLayout" text="Reset to Default" icon="fa fa-undo" btn-type="warning" parameter-map="[dashDate:dashDate, dashDateTo:dashDateTo]"/>
+                        <link url="." text="Close" btn-type="flat" parameter-map="[dashDate:dashDate, dashDateTo:dashDateTo]"/>
+                    </container>
+                </container>
+            </widgets>
+        </section>
+
+        <section name="wKpis" condition="showKpis"><widgets>
+        <render-mode><text type="html"><![CDATA[<div class="dash-widget" data-wkey="kpis"><div class="dash-handle" title="Drag to reorder">&#8942;&#8942;</div>]]></text></render-mode>
         <container-row>
             <row-col lg="6">
                 <!-- Accounts Receivable -->
@@ -81,10 +193,14 @@
                 </container>
             </row-col>
         </container-row>
+        <render-mode><text type="html"><![CDATA[</div>]]></text></render-mode>
+        </widgets></section>
 
         <!-- Charts Row -->
         <container-row>
             <row-col lg="6">
+                <section name="wArap" condition="showArap"><widgets>
+                <render-mode><text type="html"><![CDATA[<div class="dash-widget" data-wkey="arap"><div class="dash-handle" title="Drag to reorder">&#8942;&#8942;</div>]]></text></render-mode>
                 <container style="bg-white shadow-3 q-pa-lg q-mb-md">
                     <label text="Receivables vs Payables" type="h6" style="text-primary text-weight-bold q-mb-md"/>
                     <render-mode><text type="html,vuet,qvt"><![CDATA[
@@ -92,8 +208,8 @@
                         <script src="https://cdn.jsdelivr.net/npm/apexcharts@3.44.0/dist/apexcharts.min.js"></script>
                         <script>
                         (function() {
-                            var ar = ${totalAr!0};
-                            var ap = ${totalAp!0};
+                            var ar = ${(totalAr!0)?c};
+                            var ap = ${(totalAp!0)?c};
                             if (ar == 0 && ap == 0) { ar = 875000; ap = 650000; }
                             new ApexCharts(document.querySelector("#arApChart"), {
                                 chart: { type: 'bar', height: 280, toolbar: { show: false }, fontFamily: 'Roboto, sans-serif' },
@@ -109,8 +225,12 @@
                         </script>
                     ]]></text></render-mode>
                 </container>
+                <render-mode><text type="html"><![CDATA[</div>]]></text></render-mode>
+                </widgets></section>
             </row-col>
             <row-col lg="6">
+                <section name="wRevexp" condition="showRevexp"><widgets>
+                <render-mode><text type="html"><![CDATA[<div class="dash-widget" data-wkey="revexp"><div class="dash-handle" title="Drag to reorder">&#8942;&#8942;</div>]]></text></render-mode>
                 <container style="bg-white shadow-3 q-pa-lg q-mb-md">
                     <label text="Revenue vs Expenses (Monthly)" type="h6" style="text-primary text-weight-bold q-mb-md"/>
                     <render-mode><text type="html,vuet,qvt"><![CDATA[
@@ -137,9 +257,12 @@
                         </script>
                     ]]></text></render-mode>
                 </container>
+                <render-mode><text type="html"><![CDATA[</div>]]></text></render-mode>
+                </widgets></section>
             </row-col>
         </container-row>
 
+        <render-mode><text type="html"><![CDATA[<div id="dashExtras">]]></text></render-mode>
         <!-- Quick Links -->
         <container-row>
             <row-col lg="12">
@@ -165,5 +288,8 @@
                 </container>
             </row-col>
         </container-row>
+        <render-mode><text type="html"><![CDATA[</div>]]></text></render-mode>
+
+        <render-mode><text type="html" template="true"><![CDATA[<script>window.__dashLayout={saveUrl:(("${ec.web.request.requestURI}").replace(/\/+$/,''))+'/saveDashOrder',order:"${dashOrderCsv}"};</script><script src="/zenithstatic/js/dash-layout.js?v=2"></script>]]></text></render-mode>
     </widgets>
 </screen>
