@@ -3,6 +3,10 @@
         xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
         default-menu-title="Dashboard" default-menu-index="1">
 
+    <parameter name="dashDate"/>
+    <parameter name="dashDateTo"/>
+    <parameter name="showSettings"/>
+
     <transition name="viewOrder"><default-response url="../FindOrder"/></transition>
     <transition name="viewCustomer"><default-response url="../FindCustomer"/></transition>
     <transition name="goContacts"><default-response url="../Contacts/FindContact"/></transition>
@@ -13,9 +17,67 @@
     <transition name="goPos"><default-response url="../pos/Terminal"/></transition>
     <transition name="goEcommerce"><default-response url="../ecommerce/EcomOrders"/></transition>
 
+    <!-- ZE-DASH: switchable widgets + drag-reorder (per-user, saved to UserPreference) -->
+    <transition name="saveDashLayout">
+        <actions><script><![CDATA[
+            def _wk = ['metrics','trend','payments','forecast','recent']
+            ec.user.setPreference('SALES_DASH_HIDDEN', _wk.findAll { !context.get('w_' + it) }.join(','))
+        ]]></script></actions>
+        <default-response url="." parameter-map="[dashDate:dashDate, dashDateTo:dashDateTo]"/>
+    </transition>
+    <transition name="resetDashLayout">
+        <actions><script>ec.user.setPreference('SALES_DASH_HIDDEN', null); ec.user.setPreference('SALES_DASH_ORDER', null)</script></actions>
+        <default-response url="." parameter-map="[dashDate:dashDate, dashDateTo:dashDateTo]"/>
+    </transition>
+    <transition name="saveDashOrder" require-session-token="false">
+        <actions><script><![CDATA[
+            def _valid = ['metrics','trend','payments','forecast','recent']
+            def _clean = ((context.order ?: '').toString().split(',') as List).findAll { _valid.contains(it) }
+            ec.user.setPreference('SALES_DASH_ORDER', _clean.join(','))
+            ec.web.sendJsonResponse([saved:true, order:_clean.join(',')])
+        ]]></script></actions>
+        <default-response type="none"/>
+    </transition>
+    <transition name="changeDashDate"><default-response url="." parameter-map="[dashDate:dashDate, dashDateTo:dashDateTo]"/></transition>
+
     <actions>
         <set field="orgId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
         <set field="currSymbol" value="₹"/>
+        <!-- ZE-DASH date-range filter. DEFAULT = all-time (empty) so displayed figures don't change on load;
+             a selected range narrows the KPI tiles. dayStart/dayEndExcl are null in all-time mode. -->
+        <script><![CDATA[
+            def sdf = new java.text.SimpleDateFormat("yyyy-MM-dd")
+            def now = ec.user.nowTimestamp
+            def todayStr = sdf.format(now)
+            if (!dashDate) dashDate = ''
+            if (!dashDateTo) dashDateTo = ''
+            dayStart = null; dayEndExcl = null
+            if (dashDate) {
+                if (!dashDateTo) dashDateTo = dashDate
+                if (dashDateTo < dashDate) { def _s = dashDate; dashDate = dashDateTo; dashDateTo = _s }
+                dayStart = java.sql.Timestamp.valueOf(dashDate + " 00:00:00")
+                def _ce = java.util.Calendar.getInstance(); _ce.setTime(java.sql.Timestamp.valueOf(dashDateTo + " 00:00:00")); _ce.add(java.util.Calendar.DAY_OF_MONTH, 1)
+                dayEndExcl = new java.sql.Timestamp(_ce.getTimeInMillis())
+            }
+            def _cw = java.util.Calendar.getInstance(); _cw.setTime(now); _cw.set(java.util.Calendar.DAY_OF_WEEK, _cw.getFirstDayOfWeek()); def weekStartStr = sdf.format(_cw.getTime())
+            def _cm = java.util.Calendar.getInstance(); _cm.setTime(now); _cm.set(java.util.Calendar.DAY_OF_MONTH,1); def monthStartStr = sdf.format(_cm.getTime())
+            def _c30 = java.util.Calendar.getInstance(); _c30.setTime(now); _c30.add(java.util.Calendar.DAY_OF_MONTH,-29); def last30Str = sdf.format(_c30.getTime())
+            urlAll = "?"; urlToday = "?dashDate="+todayStr+"&dashDateTo="+todayStr
+            urlWeek = "?dashDate="+weekStartStr+"&dashDateTo="+todayStr
+            urlMonth = "?dashDate="+monthStartStr+"&dashDateTo="+todayStr
+            url30 = "?dashDate="+last30Str+"&dashDateTo="+todayStr
+            presetActive = 'all'
+            if (dashDate) {
+                presetActive = 'custom'
+                if (dashDateTo == todayStr) {
+                    if (dashDate == todayStr) presetActive='today'
+                    else if (dashDate == weekStartStr) presetActive='week'
+                    else if (dashDate == monthStartStr) presetActive='month'
+                    else if (dashDate == last30Str) presetActive='last30'
+                }
+            }
+            rangeLabel = dashDate ? (dashDate == dashDateTo ? dashDate : (dashDate + " – " + dashDateTo)) : "All time"
+        ]]></script>
         <!-- ZE-CP-C-04b: Total sales = sum of FINALISED sales invoices only (issued + paid). Excludes in-process
              DRAFTS (InvoiceInProcess) and cancelled - a draft is not a completed sale, and counting drafts inflated
              the figure (e.g. a large B2B draft). Keeps this tile consistent with the Copilot's sales figures. -->
@@ -26,6 +88,14 @@
         </entity-find>
         <set field="totalSalesAmount" from="0.0" type="BigDecimal"/>
         <script>salesSums.each { totalSalesAmount += ((it.taxableSum ?: 0G) + (it.taxSum ?: 0G) + (it.roundSum ?: 0G)) }</script>
+        <!-- when a date range is chosen, recompute Total Sales for that period (finalised invoices) -->
+        <script><![CDATA[
+            import org.moqui.entity.EntityCondition
+            if (dayStart) {
+                def _inv = ec.entity.find("mantle.account.invoice.Invoice").condition("fromPartyId", orgId).condition("invoiceTypeEnumId","InvoiceSales").condition("statusId", EntityCondition.IN, ["InvoiceFinalized","InvoicePmtRecvd"]).condition("invoiceDate", EntityCondition.GREATER_THAN_EQUAL_TO, dayStart).condition("invoiceDate", EntityCondition.LESS_THAN, dayEndExcl).selectField("totalTaxableAmount").selectField("totalTaxAmount").selectField("roundOffAmount").list()
+                totalSalesAmount = 0.0G; _inv.each { totalSalesAmount += ((it.totalTaxableAmount ?: 0G) + (it.totalTaxAmount ?: 0G) + (it.roundOffAmount ?: 0G)) }
+            }
+        ]]></script>
 
         <!-- Sales forecast (from the nightly stored forecast) for the dashboard infographic -->
         <set field="fcToday" from="new java.sql.Date(System.currentTimeMillis())"/>
@@ -72,18 +142,24 @@
         <entity-find-count entity-name="mantle.order.OrderHeaderAndPart" count-field="totalOrders">
             <econdition field-name="statusId" operator="in" value="OrderPlaced,OrderApproved,OrderCompleted"/>
             <econdition field-name="vendorPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+            <econdition field-name="entryDate" operator="greater-equals" from="dayStart" ignore-if-empty="true"/>
+            <econdition field-name="entryDate" operator="less" from="dayEndExcl" ignore-if-empty="true"/>
         </entity-find-count>
 
         <!-- Get Active Quotes (Proposed) -->
         <entity-find-count entity-name="mantle.order.OrderHeaderAndPart" count-field="activeQuotes">
             <econdition field-name="statusId" value="OrderProposed"/>
             <econdition field-name="vendorPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+            <econdition field-name="entryDate" operator="greater-equals" from="dayStart" ignore-if-empty="true"/>
+            <econdition field-name="entryDate" operator="less" from="dayEndExcl" ignore-if-empty="true"/>
         </entity-find-count>
 
         <!-- Get Total Invoices -->
         <entity-find-count entity-name="mantle.account.invoice.Invoice" count-field="totalInvoices">
             <econdition field-name="statusId" operator="not-equals" value="InvoiceCancelled"/>
             <econdition field-name="fromPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+            <econdition field-name="invoiceDate" operator="greater-equals" from="dayStart" ignore-if-empty="true"/>
+            <econdition field-name="invoiceDate" operator="less" from="dayEndExcl" ignore-if-empty="true"/>
         </entity-find-count>
 
         <!-- Get Recent Orders for Table -->
@@ -124,6 +200,23 @@
             def allow = { k -> !planGate || (allowed != null && allowed.contains(k)) }
             showContacts = allow('contacts'); showInventory = allow('inventory'); showPurchase = allow('purchase')
             showAccounting = allow('accounting'); showCrm = allow('crm'); showPos = allow('pos'); showEcom = allow('ecommerce')
+
+            // ZE-DASH layout: switchable widgets (+ cashier role default) + saved drag order
+            def _roleHidden = ''
+            try {
+                if (!ec.user.isInGroup("ADMIN")) {
+                    def _zrp = (ec.user.userGroupIdSet ?: []).findAll { it?.startsWith("ZENITH_") && it != "ZENITH_ALL" }
+                    if (_zrp.size() == 1 && _zrp.contains("ZENITH_CASHIER")) _roleHidden = 'forecast,payments'
+                }
+            } catch (Exception e) {}
+            def _pref = ec.user.getPreference('SALES_DASH_HIDDEN')
+            def _hiddenSet = ((_pref != null) ? _pref : _roleHidden).split(',').findAll { it }.toSet()
+            showMetrics = !_hiddenSet.contains('metrics'); showTrend = !_hiddenSet.contains('trend'); showPayments = !_hiddenSet.contains('payments')
+            showForecast = !_hiddenSet.contains('forecast'); showRecent = !_hiddenSet.contains('recent')
+            w_metrics = showMetrics ? 'Y' : ''; w_trend = showTrend ? 'Y' : ''; w_payments = showPayments ? 'Y' : ''
+            w_forecast = showForecast ? 'Y' : ''; w_recent = showRecent ? 'Y' : ''
+            dashOrderCsv = (ec.user.getPreference('SALES_DASH_ORDER') ?: '')
+            urlSettings = dashDate ? ("?dashDate="+dashDate+"&dashDateTo="+dashDateTo+"&showSettings=1") : "?showSettings=1"
         ]]></script>
     </actions>
 
@@ -133,7 +226,42 @@
             <label text="A quick look at how your sales are doing — orders, quotes, customers and revenue at a glance." type="p" style="text-grey-7 q-mt-sm q-mb-none"/>
         </container>
 
+        <!-- ZE-DASH: date-range filter + customize gear -->
+        <container style="q-px-lg q-py-md q-mb-md zenith-card bg-white shadow-1 border-radius-lg">
+            <render-mode><text type="html" template="true"><![CDATA[<div style="display:flex;flex-wrap:wrap;align-items:center;gap:8px;font-family:Segoe UI,Arial,sans-serif;margin-bottom:10px"><span style="font-size:11.5px;font-weight:800;color:#5C6B85;letter-spacing:.06em;margin-right:4px">DATE RANGE</span><a href="${urlAll}" class="zdash-chip${(presetActive=='all')?string(' on','')}">All time</a><a href="${urlToday}" class="zdash-chip${(presetActive=='today')?string(' on','')}">Today</a><a href="${urlWeek}" class="zdash-chip${(presetActive=='week')?string(' on','')}">This Week</a><a href="${urlMonth}" class="zdash-chip${(presetActive=='month')?string(' on','')}">This Month</a><a href="${url30}" class="zdash-chip${(presetActive=='last30')?string(' on','')}">Last 30 Days</a><a href="${urlSettings}" class="zdash-chip" style="margin-left:auto">&#9881; Customize</a></div>]]></text></render-mode>
+            <form-single name="DateForm" transition="changeDashDate">
+                <field name="dashDate"><default-field title="From"><date-time type="date" default-value="${dashDate}"/></default-field></field>
+                <field name="dashDateTo"><default-field title="To"><date-time type="date" default-value="${dashDateTo}"/></default-field></field>
+                <field name="goBtn"><default-field title=""><submit text="Apply" icon="fa fa-check"/></default-field></field>
+            </form-single>
+        </container>
+
+        <!-- ZE-DASH: customize (switchable widgets) panel -->
+        <section name="DashSettings" condition="showSettings == '1'">
+            <widgets>
+                <container style="q-px-lg q-py-md q-mb-md zenith-card bg-white shadow-1 border-radius-lg">
+                    <render-mode><text type="html"><![CDATA[<div style="font-size:12.5px;font-weight:800;color:#0A2A7A;letter-spacing:.04em;margin-bottom:2px">&#9881; CUSTOMIZE DASHBOARD</div><div style="font-size:12px;color:#5C6B85;margin-bottom:8px">Tick the sections you want to see &mdash; saved to your account. Drag the handle on any card to reorder.</div>]]></text></render-mode>
+                    <form-single name="DashLayoutForm" transition="saveDashLayout">
+                        <field name="dashDate"><default-field><hidden/></default-field></field>
+                        <field name="dashDateTo"><default-field><hidden/></default-field></field>
+                        <field name="w_metrics"><default-field title="Metrics (Total Sales, Quotes, Customers, Invoices)"><check><option key="Y" text=" "/></check></default-field></field>
+                        <field name="w_trend"><default-field title="Monthly Sales Trend"><check><option key="Y" text=" "/></check></default-field></field>
+                        <field name="w_payments"><default-field title="Payment Status"><check><option key="Y" text=" "/></check></default-field></field>
+                        <field name="w_forecast"><default-field title="Sales Forecast"><check><option key="Y" text=" "/></check></default-field></field>
+                        <field name="w_recent"><default-field title="Recent Orders"><check><option key="Y" text=" "/></check></default-field></field>
+                        <field name="saveBtn"><default-field title=""><submit text="Save Layout" icon="fa fa-check"/></default-field></field>
+                    </form-single>
+                    <container style="row q-gutter-sm q-mt-sm">
+                        <link url="resetDashLayout" text="Reset to Default" icon="fa fa-undo" btn-type="warning" parameter-map="[dashDate:dashDate, dashDateTo:dashDateTo]"/>
+                        <link url="." text="Close" btn-type="flat" parameter-map="[dashDate:dashDate, dashDateTo:dashDateTo]"/>
+                    </container>
+                </container>
+            </widgets>
+        </section>
+
         <!-- Metrics Row -->
+        <section name="wMetrics" condition="showMetrics"><widgets>
+        <render-mode><text type="html"><![CDATA[<div class="dash-widget" data-wkey="metrics"><div class="dash-handle" title="Drag to reorder">&#8942;&#8942;</div>]]></text></render-mode>
         <container-row>
             <!-- Total Orders -->
             <row-col lg="3" md="6" sm="12">
@@ -195,10 +323,14 @@
                 </container>
             </row-col>
         </container-row>
+        <render-mode><text type="html"><![CDATA[</div>]]></text></render-mode>
+        </widgets></section>
 
         <!-- Charts Row -->
         <container-row>
             <row-col lg="8">
+                <section name="wTrend" condition="showTrend"><widgets>
+                <render-mode><text type="html"><![CDATA[<div class="dash-widget" data-wkey="trend"><div class="dash-handle" title="Drag to reorder">&#8942;&#8942;</div>]]></text></render-mode>
                 <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md q-mb-md">
                     <label text="Monthly Sales Trend" type="h6" style="text-primary text-weight-bold q-mb-md"/>
                     <render-mode><text type="html,vuet,qvt"><![CDATA[
@@ -237,8 +369,12 @@
                         </script>
                     ]]></text></render-mode>
                 </container>
+                <render-mode><text type="html"><![CDATA[</div>]]></text></render-mode>
+                </widgets></section>
             </row-col>
             <row-col lg="4">
+                <section name="wPayments" condition="showPayments"><widgets>
+                <render-mode><text type="html"><![CDATA[<div class="dash-widget" data-wkey="payments"><div class="dash-handle" title="Drag to reorder">&#8942;&#8942;</div>]]></text></render-mode>
                 <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md q-mb-md">
                     <label text="Payment Status" type="h6" style="text-primary text-weight-bold q-mb-md"/>
                     <render-mode><text type="html,vuet,qvt"><![CDATA[
@@ -258,10 +394,14 @@
                         </script>
                     ]]></text></render-mode>
                 </container>
+                <render-mode><text type="html"><![CDATA[</div>]]></text></render-mode>
+                </widgets></section>
             </row-col>
         </container-row>
 
         <!-- Sales Forecast Infographic -->
+        <section name="wForecast" condition="showForecast"><widgets>
+        <render-mode><text type="html"><![CDATA[<div class="dash-widget" data-wkey="forecast"><div class="dash-handle" title="Drag to reorder">&#8942;&#8942;</div>]]></text></render-mode>
         <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md q-mb-md">
             <container style="row items-center justify-between q-mb-sm">
                 <container style="column">
@@ -334,8 +474,12 @@
                 </fail-widgets>
             </section>
         </container>
+        <render-mode><text type="html"><![CDATA[</div>]]></text></render-mode>
+        </widgets></section>
 
         <!-- Recent Activity & Quick Actions -->
+        <section name="wRecent" condition="showRecent"><widgets>
+        <render-mode><text type="html"><![CDATA[<div class="dash-widget" data-wkey="recent"><div class="dash-handle" title="Drag to reorder">&#8942;&#8942;</div>]]></text></render-mode>
         <container-row>
             <row-col lg="8">
                 <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-none q-mb-md">
@@ -393,7 +537,10 @@
                 </container>
             </row-col>
         </container-row>
+        <render-mode><text type="html"><![CDATA[</div>]]></text></render-mode>
+        </widgets></section>
 
+        <render-mode><text type="html"><![CDATA[<div id="dashExtras">]]></text></render-mode>
         <!-- Related Modules -->
         <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-md">
             <label text="Related Modules" type="h6" style="text-weight-bold q-my-none q-mb-md"/>
@@ -407,6 +554,9 @@
                 <section name="relEcom"><condition><expression>showEcom</expression></condition><widgets><link url="goEcommerce" text="eCommerce" icon="fa fa-globe" btn-type="primary" style="q-btn--dense"/></widgets></section>
             </container>
         </container>
+        <render-mode><text type="html"><![CDATA[</div>]]></text></render-mode>
+
+        <render-mode><text type="html" template="true"><![CDATA[<script>window.__dashLayout={saveUrl:(("${ec.web.request.requestURI}").replace(/\/+$/,''))+'/saveDashOrder',order:"${dashOrderCsv}"};</script><script src="/zenithstatic/js/dash-layout.js?v=2"></script>]]></text></render-mode>
 
     </widgets>
 </screen>

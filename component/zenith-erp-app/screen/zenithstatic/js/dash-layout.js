@@ -10,12 +10,15 @@
     var first = document.querySelector('.dash-widget');
     if (!first) return;
     var extras = document.getElementById('dashExtras');
-    var oldRow = extras ? extras.parentNode.parentNode : (first.parentNode && first.parentNode.parentNode);
+    var all = [].slice.call(document.querySelectorAll('.dash-widget'));
+    // record each widget's grandparent (its layout row) BEFORE moving, so any row that ends up
+    // empty (e.g. a 2-col charts row whose cards we hoisted out) can be cleaned up afterwards.
+    var sources = [];
+    all.forEach(function (w) { var p = w.parentNode && w.parentNode.parentNode; if (p && sources.indexOf(p) < 0) sources.push(p); });
     var wrap = document.createElement('div');
     wrap.id = 'dashWidgets';
     wrap.className = 'dash-widgets-wrap';
     first.parentNode.insertBefore(wrap, first);
-    var all = [].slice.call(document.querySelectorAll('.dash-widget'));
     var byKey = {};
     all.forEach(function (w) { byKey[w.getAttribute('data-wkey')] = w; });
     var seq = [];
@@ -23,9 +26,13 @@
     all.forEach(function (w) { var k = w.getAttribute('data-wkey'); if (seq.indexOf(k) < 0) seq.push(k); });
     seq.forEach(function (k) { if (byKey[k]) wrap.appendChild(byKey[k]); });
     if (extras) wrap.parentNode.insertBefore(extras, wrap.nextSibling);
-    if (oldRow && oldRow.parentNode && oldRow !== wrap && !oldRow.contains(wrap) && oldRow.querySelectorAll('.dash-widget').length === 0) {
-      oldRow.parentNode.removeChild(oldRow);
-    }
+    // drop any now-empty layout rows left behind (no widget, no real content)
+    sources.forEach(function (row) {
+      if (!row || !row.parentNode || row === wrap || row.contains(wrap) || row.querySelector('.dash-widget')) return;
+      if ((row.textContent || '').replace(/\s/g, '') === '' && !row.querySelector('img,canvas,svg,input,button,a,iframe')) {
+        row.parentNode.removeChild(row);
+      }
+    });
     if (!cfg.saveUrl) return;
     var dragEl = null;
     all.forEach(function (w) {
