@@ -39,8 +39,73 @@
                     storeCode = "STR" + String.format("%04d", existing + 1)
                 ]]></script>
             </if>
+            <!-- ZE-SHOP: a shop IS a FcTpRetailStore facility (the POS/dashboards filter on it). Auto-create one when
+                 none is linked; if a facility was chosen it MUST belong to this org (defense in depth). Keeps 1:1. -->
+            <script><![CDATA[
+                if (facilityId) {
+                    boolean _dz = ec.artifactExecution.disableAuthz()
+                    try {
+                        def _pf = ec.entity.find("mantle.facility.Facility").condition("facilityId", facilityId).one()
+                        if (_pf == null || _pf.ownerPartyId != organizationPartyId) { ec.message.addError("That facility isn't part of your organization."); return }
+                    } finally { if (!_dz) ec.artifactExecution.enableAuthz() }
+                } else {
+                    def _fac = ec.service.sync().name("create#mantle.facility.Facility")
+                        .parameters([facilityTypeEnumId:'FcTpRetailStore', facilityName:storeName, ownerPartyId:organizationPartyId]).call()
+                    facilityId = _fac.facilityId
+                }
+            ]]></script>
             <service-call name="create#zenith.erp.stores.Store" out-map="context"
                           in-map="context + [organizationPartyId:organizationPartyId, statusId:'StActive']"/>
+        </actions>
+    </service>
+
+    <!-- ZE-SHOP: adopt every FcTpRetailStore facility the org owns (e.g. the onboarding "Main Store") that has no
+         Store row yet, so the Stores list == the shops the switcher/filters see. Idempotent, keyed on facilityId
+         (1:1 Store<->Facility). Safe to call on every Stores list render. -->
+    <service verb="reconcile" noun="OrgShops" authenticate="true">
+        <actions>
+            <script><![CDATA[
+                def org = ec.user.getPreference("ACTIVE_ORGANIZATION")
+                if (!org || org == '_NA_') return
+                boolean _dz = ec.artifactExecution.disableAuthz()
+                try {
+                    def facs = ec.entity.find("mantle.facility.Facility")
+                        .condition("ownerPartyId", org).condition("facilityTypeEnumId", "FcTpRetailStore").list()
+                    def existing = ec.entity.find("zenith.erp.stores.Store").condition("organizationPartyId", org).list()
+                    def haveFac = existing.collect { it.facilityId }.findAll { it } as Set
+                    int _seq = existing.size()
+                    facs.each { f ->
+                        if (!haveFac.contains(f.facilityId)) {
+                            _seq++
+                            ec.service.sync().name("create#zenith.erp.stores.Store").parameters([
+                                storeName: (f.facilityName ?: f.facilityId), storeCode: "STR" + String.format("%04d", _seq),
+                                storeTypeEnumId: "StOwned", facilityId: f.facilityId, organizationPartyId: org, statusId: "StActive"
+                            ]).call()
+                            haveFac.add(f.facilityId)
+                        }
+                    }
+                } finally { if (!_dz) ec.artifactExecution.enableAuthz() }
+            ]]></script>
+        </actions>
+    </service>
+
+    <!-- ZE-SHOP: bind a POS counter (terminal) to this shop's facility so the shop's POS sales attribute to it.
+         Both the store and the terminal must belong to the active org. -->
+    <service verb="assign" noun="ShopCounter">
+        <in-parameters>
+            <parameter name="storeId" required="true"/>
+            <parameter name="terminalId" required="true"/>
+        </in-parameters>
+        <actions>
+            <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" out-map="_sa"
+                          in-map="[entityName:'zenith.erp.stores.Store', idField:'storeId', idValue:storeId, orgField:'organizationPartyId']"/>
+            <if condition="!_sa.allowed"><return error="true" message="Store not found for your account."/></if>
+            <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" out-map="_ta"
+                          in-map="[entityName:'zenith.erp.pos.PosTerminal', idField:'terminalId', idValue:terminalId, orgField:'organizationPartyId']"/>
+            <if condition="!_ta.allowed"><return error="true" message="Counter not found for your account."/></if>
+            <entity-find-one entity-name="zenith.erp.stores.Store" value-field="_st"/>
+            <if condition="!_st?.facilityId"><return error="true" message="This shop has no linked facility."/></if>
+            <service-call name="update#zenith.erp.pos.PosTerminal" in-map="[terminalId:terminalId, facilityId:_st.facilityId]"/>
         </actions>
     </service>
 
