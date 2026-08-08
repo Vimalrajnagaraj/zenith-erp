@@ -36,7 +36,7 @@
     <!-- ZE-DASH-02: switchable dashboard widgets (per-user show/hide, saved to UserPreference) -->
     <transition name="saveDashLayout">
         <actions><script><![CDATA[
-            def _wk = ['salesKpi','opsKpi','hourly','payments','products']
+            def _wk = ['salesKpi','opsKpi','health','hourly','payments','products']
             def _hidden = _wk.findAll { !context.get('w_' + it) }
             ec.user.setPreference('POS_DASH_HIDDEN', _hidden.join(','))
         ]]></script></actions>
@@ -49,7 +49,7 @@
     </transition>
     <transition name="saveDashOrder" require-session-token="false">
         <actions><script><![CDATA[
-            def _valid = ['salesKpi','opsKpi','hourly','payments','products']
+            def _valid = ['salesKpi','opsKpi','health','hourly','payments','products']
             def _clean = ((context.order ?: '').toString().split(',') as List).findAll { _valid.contains(it) }
             ec.user.setPreference('POS_DASH_ORDER', _clean.join(','))
             ec.web.sendJsonResponse([saved:true, order:_clean.join(',')])
@@ -287,6 +287,116 @@
                     .condition("statusId", "PsOpen").count() as int
             } catch (Exception e) {}
 
+            // ===== Business Health scorecard (ZcERP report v2.1.0) — a COMPOSITE 0-100 score computed from
+            // REAL live data (never a fabricated number). Each of 5 metrics scores 0-100; a metric with no data
+            // for the current context is marked "No data" and EXCLUDED from the average, so a zero-sales day
+            // never fakes a low score. Sales & Cash Flow follow the selected date range; Receivables, Inventory
+            // and GST are current snapshots. =====
+            healthMetrics = []; healthScore = 0; healthLabel = '—'; healthHasData = false; healthColor = '#9e9e9e'
+            try {
+                def _orgH = ec.user.getPreference("ACTIVE_ORGANIZATION")
+                def _nowH = ec.user.nowTimestamp
+                def _pill = [good:['#DCFCE7','#166534'], warn:['#FEF3C7','#92400E'], bad:['#FEE2E2','#991B1B'], na:['#EEF0F5','#64748B']]
+                def _col = { s -> s >= 80 ? 'good' : (s >= 55 ? 'warn' : 'bad') }
+                def _add = { name, avail, score, status, ck -> def p = _pill[ck] ?: _pill.na; healthMetrics.add([name:name, avail:avail, score:score, status:status, pillBg:p[0], pillFg:p[1]]) }
+
+                // prior equal-length period (for the Sales trend)
+                def _pDays = (long)(((dayEnd.getTime() - dayStart.getTime()) / (1000L*60*60*24)) + 1)
+                def _priorStart = new java.sql.Timestamp(dayStart.getTime() - _pDays*24L*60*60*1000)
+                def _priorSales = BigDecimal.ZERO
+                if (_orgH) {
+                    def _pq = ec.entity.find("zenith.erp.pos.PosTransaction").condition("organizationPartyId", _orgH)
+                        .condition("statusId","PtCompleted").condition("entryDate", org.moqui.entity.EntityCondition.GREATER_THAN_EQUAL_TO, _priorStart)
+                        .condition("entryDate", org.moqui.entity.EntityCondition.LESS_THAN, dayStart)
+                    if (_locSessionIds) _pq.condition("sessionId","in",_locSessionIds)  // only scope to a location when one is picked
+                    _priorSales = _pq.list().sum { (it.payableAmount ?: 0) as BigDecimal } ?: BigDecimal.ZERO
+                }
+
+                // 1) SALES — this period vs the prior equal-length period
+                if (totalSales <= 0 && _priorSales <= 0) { _add('Sales', false, 0, 'No sales in range', 'na') }
+                else {
+                    double _g = _priorSales > 0 ? ((totalSales.doubleValue() - _priorSales.doubleValue()) * 100.0 / _priorSales.doubleValue()) : (totalSales > 0 ? 100.0 : -100.0)
+                    def _s = _g >= 10 ? 95 : (_g >= 0 ? 80 : (_g >= -15 ? 60 : 35))
+                    def _st = _g >= 10 ? 'Strong' : (_g >= 0 ? 'Good' : (_g >= -15 ? 'Fair' : 'Weak'))
+                    def _gp = Math.round(_g)
+                    _add('Sales', true, _s, _st + ' (' + (_gp >= 0 ? '+' : '') + _gp + '% vs prior)', _col(_s))
+                }
+
+                // 2) CASH FLOW — how much of sales is eaten by expenses + wastage (period)
+                if (totalSales <= 0) { _add('Cash Flow', false, 0, 'No sales in range', 'na') }
+                else {
+                    def _out = ((todayExpenses ?: 0) as BigDecimal) + ((todayWastage ?: 0) as BigDecimal)
+                    double _r = (_out.doubleValue() * 100.0 / totalSales.doubleValue())
+                    def _s = _r < 5 ? 95 : (_r < 15 ? 80 : (_r < 30 ? 60 : 35))
+                    def _st = _r < 5 ? 'Strong' : (_r < 15 ? 'Healthy' : (_r < 30 ? 'Watch' : 'Tight'))
+                    _add('Cash Flow', true, _s, _st, _col(_s))
+                }
+
+                // reference: 90-day sales (denominator for the receivables ratio)
+                def _c90 = java.util.Calendar.getInstance(); _c90.setTime(_nowH); _c90.add(java.util.Calendar.DAY_OF_MONTH, -90)
+                def _ref90 = BigDecimal.ZERO
+                if (_orgH) {
+                    def _rq = ec.entity.find("zenith.erp.pos.PosTransaction").condition("organizationPartyId", _orgH)
+                        .condition("statusId","PtCompleted").condition("entryDate", org.moqui.entity.EntityCondition.GREATER_THAN_EQUAL_TO, new java.sql.Timestamp(_c90.getTimeInMillis()))
+                    if (_locSessionIds) _rq.condition("sessionId","in",_locSessionIds)
+                    _ref90 = _rq.list().sum { (it.payableAmount ?: 0) as BigDecimal } ?: BigDecimal.ZERO
+                }
+
+                // 3) RECEIVABLES — outstanding on credit bills (payable - paid), current
+                def _creditOut = BigDecimal.ZERO
+                if (_orgH) {
+                    ec.entity.find("zenith.erp.pos.PosTransaction").condition("organizationPartyId", _orgH)
+                        .condition("isCredit","Y").condition("statusId","PtCompleted").list().each {
+                            def _py = (it.payableAmount ?: 0) as BigDecimal; def _pd = (it.paidAmount ?: 0) as BigDecimal
+                            if (_py > _pd) _creditOut += (_py - _pd)
+                        }
+                }
+                if (_creditOut <= 0) { _add('Receivables', true, 100, 'Nothing outstanding', 'good') }
+                else {
+                    double _r = _ref90 > 0 ? (_creditOut.doubleValue() / _ref90.doubleValue()) : 1.0
+                    def _s = _r < 0.02 ? 95 : (_r < 0.10 ? 80 : (_r < 0.25 ? 55 : 30))
+                    def _st = _r < 0.02 ? 'Healthy' : (_r < 0.10 ? 'OK' : (_r < 0.25 ? 'Needs Attention' : 'High'))
+                    _add('Receivables', true, _s, _st + ' (' + ec.l10n.format(_creditOut, '#,##0') + ' owed)', _col(_s))
+                }
+
+                // product-based snapshots (Inventory + GST)
+                def _prodTot = _orgH ? ec.entity.find("mantle.product.Product").condition("ownerPartyId", _orgH).count() : 0
+                if (_prodTot > 0) {
+                    def _tracked = ec.entity.find("mantle.product.Product").condition("ownerPartyId", _orgH).condition("inventoryTracked","Y").count()
+                    // 4) INVENTORY — stock health when tracked, else catalog readiness (priced items ready to sell)
+                    if (_tracked >= 5) {
+                        def _r = ((zeroStockCount + lowStockCount) * 1.0 / _tracked)
+                        def _s = _r < 0.05 ? 95 : (_r < 0.15 ? 80 : (_r < 0.30 ? 55 : 30))
+                        def _st = _r < 0.05 ? 'Healthy' : (_r < 0.15 ? 'Good' : (_r < 0.30 ? 'Needs Attention' : 'Low'))
+                        _add('Inventory', true, _s, _st, _col(_s))
+                    } else {
+                        def _wp = ec.entity.find("mantle.product.Product").condition("ownerPartyId", _orgH).condition("mrpAmount", org.moqui.entity.EntityCondition.GREATER_THAN, 0G).count()
+                        def _r = (_wp * 1.0 / _prodTot)
+                        def _s = _r >= 0.95 ? 90 : (_r >= 0.80 ? 75 : (_r >= 0.50 ? 55 : 35))
+                        def _st = _r >= 0.80 ? 'Catalog ready' : (_r >= 0.50 ? 'Some unpriced' : 'Many unpriced')
+                        _add('Inventory', true, _s, _st, _col(_s))
+                    }
+                    // 5) GST — % of products with a GST slab / HSN / exempt flag
+                    def _cf = ec.entity.conditionFactory
+                    def _gstCond = _cf.makeCondition([
+                        _cf.makeCondition("gstSlabId", org.moqui.entity.EntityCondition.IS_NOT_NULL, null),
+                        _cf.makeCondition("isGstExempt", org.moqui.entity.EntityCondition.EQUALS, "Y"),
+                        _cf.makeCondition("hsnCode", org.moqui.entity.EntityCondition.IS_NOT_NULL, null)
+                    ], org.moqui.entity.EntityCondition.OR)
+                    def _gstOk = ec.entity.find("mantle.product.Product").condition("ownerPartyId", _orgH).condition(_gstCond).count()
+                    def _r = (_gstOk * 1.0 / _prodTot)
+                    def _s = _r >= 0.95 ? 95 : (_r >= 0.80 ? 80 : (_r >= 0.50 ? 55 : 30))
+                    def _st = _r >= 0.95 ? 'Compliant' : (_r >= 0.80 ? 'Mostly set' : (_r >= 0.50 ? 'Partial' : 'Needs setup'))
+                    _add('GST', true, _s, _st, _col(_s))
+                }
+
+                def _avail = healthMetrics.findAll { it.avail }
+                healthHasData = (_avail.size() > 0)
+                healthScore = healthHasData ? (int) Math.round(_avail.sum { it.score } / _avail.size()) : 0
+                healthLabel = healthScore >= 85 ? 'Excellent' : (healthScore >= 70 ? 'Good' : (healthScore >= 55 ? 'Fair' : 'Needs Work'))
+                healthColor = healthScore >= 85 ? '#16A34A' : (healthScore >= 70 ? '#65A30D' : (healthScore >= 55 ? '#D97706' : '#DC2626'))
+            } catch (Exception e) { healthMetrics = []; healthScore = 0; healthLabel = '—'; healthHasData = false; healthColor = '#9e9e9e' }
+
             // SaaS module-access flags: hide ERP-module links not in the tenant's plan
             def _mods = context.saasAllowedModules
             boolean _allMod = (context.saasHasAllAccess == true) || (context.isSaasTenant != true)
@@ -304,7 +414,7 @@
             try {
                 if (!ec.user.isInGroup("ADMIN")) {
                     def _zrp = (ec.user.userGroupIdSet ?: []).findAll { it?.startsWith("ZENITH_") && it != "ZENITH_ALL" }
-                    if (_zrp.size() == 1 && _zrp.contains("ZENITH_CASHIER")) _roleHidden = 'opsKpi,hourly,products'
+                    if (_zrp.size() == 1 && _zrp.contains("ZENITH_CASHIER")) _roleHidden = 'opsKpi,hourly,products,health'
                 }
             } catch (Exception e) {}
             def _prefRaw = ec.user.getPreference('POS_DASH_HIDDEN')
@@ -312,11 +422,13 @@
             def _hiddenSet = _hiddenPref.split(',').findAll { it }.toSet()
             showSalesKpi = !_hiddenSet.contains('salesKpi')
             showOpsKpi   = !_hiddenSet.contains('opsKpi')
+            showHealth   = !_hiddenSet.contains('health')
             showHourly   = !_hiddenSet.contains('hourly')
             showPayments = !_hiddenSet.contains('payments')
             showProducts = !_hiddenSet.contains('products')
             w_salesKpi = showSalesKpi ? 'Y' : ''
             w_opsKpi   = showOpsKpi ? 'Y' : ''
+            w_health   = showHealth ? 'Y' : ''
             w_hourly   = showHourly ? 'Y' : ''
             w_payments = showPayments ? 'Y' : ''
             w_products = showProducts ? 'Y' : ''
@@ -371,6 +483,7 @@
                         <field name="dashDateTo"><default-field><hidden/></default-field></field>
                         <field name="w_salesKpi"><default-field title="Sales KPIs (sales, avg ticket, tax, discounts, cancelled, sessions)"><check><option key="Y" text=" "/></check></default-field></field>
                         <field name="w_opsKpi"><default-field title="Operations (cash in / out, expenses, wastage, stock, KOTs)"><check><option key="Y" text=" "/></check></default-field></field>
+                        <field name="w_health"><default-field title="Business Health scorecard (composite score across 5 metrics)"><check><option key="Y" text=" "/></check></default-field></field>
                         <field name="w_hourly"><default-field title="Time-Wise Sales chart"><check><option key="Y" text=" "/></check></default-field></field>
                         <field name="w_payments"><default-field title="Payment Breakdown"><check><option key="Y" text=" "/></check></default-field></field>
                         <field name="w_products"><default-field title="Top Selling Products"><check><option key="Y" text=" "/></check></default-field></field>
@@ -483,6 +596,55 @@
                 </container>
             </row-col>
         </container-row>
+        <render-mode><text type="html"><![CDATA[</div>]]></text></render-mode>
+        </widgets></section>
+
+        <!-- Business Health scorecard (ZcERP report v2.1.0) — real composite score from live data -->
+        <section name="wHealth" condition="showHealth"><widgets>
+        <render-mode><text type="html"><![CDATA[<div class="dash-widget" data-wkey="health"><div class="dash-handle" title="Drag to reorder">&#8942;&#8942;</div>]]></text></render-mode>
+        <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-md">
+            <container style="row items-center justify-between q-mb-md">
+                <label text="Business Health" type="h6" style="text-weight-bold q-my-none"/>
+                <label text="composite score · updates with the date range" style="text-caption text-grey-6"/>
+            </container>
+            <section name="HealthHasData" condition="healthHasData">
+                <widgets>
+                    <render-mode><text type="html,qvt" template="true"><![CDATA[
+<div style="display:flex;flex-wrap:wrap;gap:26px;align-items:center;font-family:Segoe UI,Arial,sans-serif">
+  <div style="display:flex;flex-direction:column;align-items:center;flex:0 0 auto">
+    <div style="position:relative;width:120px;height:120px">
+      <svg width="120" height="120" viewBox="0 0 120 120">
+        <circle cx="60" cy="60" r="52" fill="none" stroke="#EEF0F5" stroke-width="12"></circle>
+        <circle cx="60" cy="60" r="52" fill="none" stroke="${healthColor}" stroke-width="12" stroke-linecap="round" pathLength="100" stroke-dasharray="${healthScore} 100" transform="rotate(-90 60 60)"></circle>
+      </svg>
+      <div style="position:absolute;top:0;left:0;width:120px;height:120px;display:flex;flex-direction:column;align-items:center;justify-content:center">
+        <div style="font-size:31px;font-weight:800;color:${healthColor};line-height:1">${healthScore}</div>
+        <div style="font-size:10px;color:#94a3b8;font-weight:700;letter-spacing:.05em">OUT OF 100</div>
+      </div>
+    </div>
+    <div style="background:${healthColor};color:#fff;padding:3px 16px;border-radius:999px;font-size:12.5px;font-weight:800;margin-top:10px">${healthLabel}</div>
+  </div>
+  <div style="flex:1;min-width:250px">
+    <#list healthMetrics as m>
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 2px;border-bottom:1px solid #F1F5F9">
+      <span style="font-size:13.5px;color:#334155;font-weight:600">${m.name}</span>
+      <span style="background:${m.pillBg};color:${m.pillFg};padding:3px 12px;border-radius:999px;font-size:11.5px;font-weight:700;white-space:nowrap">${m.status}</span>
+    </div>
+    </#list>
+    <div style="font-size:11px;color:#94a3b8;margin-top:9px;line-height:1.5">Computed from your live sales trend, cash flow, credit outstanding, catalog &amp; GST setup. A metric with no data for the selected range is skipped, not counted against you.</div>
+  </div>
+</div>
+                    ]]></text></render-mode>
+                </widgets>
+            </section>
+            <section name="HealthNoData" condition="!healthHasData">
+                <widgets>
+                    <container style="bg-blue-1 q-pa-md border-radius-md text-center">
+                        <label text="Add products and record a few sales to see your business health score." type="p" style="text-blue-9 q-mb-none"/>
+                    </container>
+                </widgets>
+            </section>
+        </container>
         <render-mode><text type="html"><![CDATA[</div>]]></text></render-mode>
         </widgets></section>
 
@@ -700,7 +862,7 @@ var wrap=document.createElement('div');wrap.id='dashWidgets';wrap.className='das
 firstW.parentNode.insertBefore(wrap,firstW);
 var all=[].slice.call(document.querySelectorAll('.dash-widget'));
 var byKey={};all.forEach(function(w){byKey[w.getAttribute('data-wkey')]=w;});
-var def=['salesKpi','opsKpi','hourly','payments','products'];
+var def=['salesKpi','opsKpi','health','hourly','payments','products'];
 var saved=("${dashOrderCsv}").split(',').filter(Boolean);
 var seq=[];saved.forEach(function(k){if(byKey[k]&&seq.indexOf(k)<0)seq.push(k);});
 def.forEach(function(k){if(byKey[k]&&seq.indexOf(k)<0)seq.push(k);});
