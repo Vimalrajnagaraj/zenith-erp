@@ -57,7 +57,7 @@
           description: 'Subscription Payment',
           order_id: data.razorpayOrderId,
           prefill: { email: data.adminEmail || '', contact: '' },
-          theme: { color: '#8E28ED' },
+          theme: { color: '#6E56CF' },
           handler: function (response) {
             var f = document.createElement('form');
             f.method = 'POST';

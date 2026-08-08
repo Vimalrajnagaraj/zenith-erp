@@ -122,7 +122,7 @@
       function renderPinUI() {
         body.innerHTML = '';
         var dots = el('div', 'display:flex;gap:14px;justify-content:center;margin-bottom:18px');
-        for (var i = 0; i < 4; i++) dots.appendChild(el('div', 'width:16px;height:16px;border-radius:50%;border:2px solid #94a3b8;background:' + (i < pinBuf.length ? '#8E28ED' : 'transparent') + ';border-color:' + (i < pinBuf.length ? '#8E28ED' : '#94a3b8')));
+        for (var i = 0; i < 4; i++) dots.appendChild(el('div', 'width:16px;height:16px;border-radius:50%;border:2px solid #94a3b8;background:' + (i < pinBuf.length ? '#6E56CF' : 'transparent') + ';border-color:' + (i < pinBuf.length ? '#6E56CF' : '#94a3b8')));
         body.appendChild(dots);
         var pad = el('div', 'display:grid;grid-template-columns:repeat(3,1fr);gap:10px');
         var keys = ['1', '2', '3', '4', '5', '6', '7', '8', '9', 'back', '0', 'ok'];
@@ -139,7 +139,7 @@
         inp.type = 'password'; inp.autocomplete = 'off'; inp.placeholder = 'Your login password'; inp.id = '__zpw';
         inp.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); submitPassword(); } e.stopPropagation(); });
         body.appendChild(inp);
-        var go = el('button', 'width:100%;margin-top:12px;padding:12px;border:0;border-radius:10px;background:#8E28ED;color:#fff;font-weight:700;font-size:15px;cursor:pointer', 'Unlock');
+        var go = el('button', 'width:100%;margin-top:12px;padding:12px;border:0;border-radius:10px;background:#6E56CF;color:#fff;font-weight:700;font-size:15px;cursor:pointer', 'Unlock');
         go.type = 'button'; go.onclick = submitPassword; body.appendChild(go);
         setTimeout(function () { try { inp.focus(); } catch (e) {} }, 30);
       }
@@ -169,7 +169,7 @@
       card.appendChild(err);
 
       // toggle between PIN and password (password is always available as a fallback)
-      var toggle = el('button', 'margin-top:16px;background:none;border:0;color:#8E28ED;font-size:13px;font-weight:600;cursor:pointer;text-decoration:underline', hasPin ? 'Use password instead' : '');
+      var toggle = el('button', 'margin-top:16px;background:none;border:0;color:#6E56CF;font-size:13px;font-weight:600;cursor:pointer;text-decoration:underline', hasPin ? 'Use password instead' : '');
       toggle.type = 'button';
       toggle.onclick = function () { mode = (mode === 'pin') ? 'password' : 'pin'; pinBuf = ''; err.textContent = ''; toggle.textContent = (mode === 'pin') ? 'Use password instead' : 'Use PIN instead'; if (mode === 'pin') renderPinUI(); else renderPwUI(); };
       if (hasPin) card.appendChild(toggle);
