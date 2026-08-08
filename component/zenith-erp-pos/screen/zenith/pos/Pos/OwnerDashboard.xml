@@ -1,0 +1,358 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
+        default-menu-title="Overview" default-menu-index="1">
+
+    <!-- ZcERP Dashboard report v2.1.0 (Fig 2.1) — faithful business-owner overview.
+         Categorised sidebar (mobile icon-collapse) · greeting · Owner View · 4 owner KPIs ·
+         Weekly/Today/Hourly 3-tab Sales Analyst · 2x3 Quick Actions · Recent Transactions ·
+         Business Health · Top Selling Products · Pending Vendor Bills.
+         Every figure is computed from LIVE data — no fabricated mockup numbers (so Payables /
+         Vendor Bills legitimately read 0/empty for a POS-only tenant that records no purchases). -->
+
+    <parameter name="dashDate"/>
+    <parameter name="dashDateTo"/>
+
+    <transition name="changeDashDate"><default-response url="." parameter-map="[dashDate:dashDate, dashDateTo:dashDateTo]"/></transition>
+
+    <actions>
+        <script><![CDATA[
+            def sdf = new java.text.SimpleDateFormat("yyyy-MM-dd")
+            def now = ec.user.nowTimestamp
+            def todayStr = sdf.format(now)
+            def _cal = java.util.Calendar.getInstance(); _cal.setTime(now)
+            def _cm0 = java.util.Calendar.getInstance(); _cm0.setTime(now); _cm0.set(java.util.Calendar.DAY_OF_MONTH,1)
+            def monthStartStr = sdf.format(_cm0.getTime())
+            // default view = This Month
+            if (!dashDate) dashDate = monthStartStr
+            if (!dashDateTo) dashDateTo = todayStr
+            if (dashDateTo < dashDate) { def _s = dashDate; dashDate = dashDateTo; dashDateTo = _s }
+            def dayStart = java.sql.Timestamp.valueOf(dashDate + " 00:00:00")
+            def dayEnd = java.sql.Timestamp.valueOf(dashDateTo + " 23:59:59")
+
+            // preset anchors
+            def _cw = java.util.Calendar.getInstance(); _cw.setTime(now); _cw.set(java.util.Calendar.DAY_OF_WEEK, _cw.getFirstDayOfWeek()); def weekStartStr = sdf.format(_cw.getTime())
+            def _cy = java.util.Calendar.getInstance(); _cy.setTime(now); _cy.set(java.util.Calendar.DAY_OF_YEAR,1); def yearStartStr = sdf.format(_cy.getTime())
+            presetActive = 'custom'
+            if (dashDateTo == todayStr) {
+                if (dashDate == todayStr) presetActive='today'
+                else if (dashDate == weekStartStr) presetActive='week'
+                else if (dashDate == monthStartStr) presetActive='month'
+                else if (dashDate == yearStartStr) presetActive='year'
+            }
+            urlToday = "?dashDate="+todayStr+"&dashDateTo="+todayStr
+            urlWeek  = "?dashDate="+weekStartStr+"&dashDateTo="+todayStr
+            urlMonth = "?dashDate="+monthStartStr+"&dashDateTo="+todayStr
+            urlYear  = "?dashDate="+yearStartStr+"&dashDateTo="+todayStr
+            displayDate = dashDate == dashDateTo ? new java.text.SimpleDateFormat("dd MMM yyyy").format(java.sql.Date.valueOf(dashDate)) :
+                (new java.text.SimpleDateFormat("dd MMM").format(java.sql.Date.valueOf(dashDate)) + " – " + new java.text.SimpleDateFormat("dd MMM yyyy").format(java.sql.Date.valueOf(dashDateTo)))
+
+            // greeting
+            def _hr = _cal.get(java.util.Calendar.HOUR_OF_DAY)
+            greeting = _hr < 12 ? 'Good Morning' : (_hr < 17 ? 'Good Afternoon' : 'Good Evening')
+            _org = ec.user.getPreference("ACTIVE_ORGANIZATION")
+            orgName = 'there'
+            try { if (_org && _org != '_NA_') { def _o = ec.entity.find("mantle.party.Organization").condition("partyId", _org).one(); if (_o?.organizationName) orgName = _o.organizationName } } catch (Exception e) {}
+            if (orgName == 'there') { try { orgName = ec.user.userAccount?.userFullName ?: 'there' } catch (Exception e) {} }
+        ]]></script>
+
+        <entity-find entity-name="zenith.erp.pos.PosTransaction" list="completedTxns">
+            <econdition field-name="statusId" value="PtCompleted"/>
+            <econdition field-name="organizationPartyId" from="_org" ignore-if-empty="true"/>
+            <econdition field-name="entryDate" operator="greater-equals" from="dayStart"/>
+            <econdition field-name="entryDate" operator="less-equals" from="dayEnd"/>
+            <order-by field-name="-entryDate"/>
+        </entity-find>
+
+        <script><![CDATA[
+            def EC = org.moqui.entity.EntityCondition
+            def _bd = { v -> (v ?: 0) as BigDecimal }
+            totalSales = completedTxns.sum { _bd(it.payableAmount) } ?: BigDecimal.ZERO
+            invoiceCount = completedTxns.size()
+
+            // ---- prior equal-length period (WoW / vs-prior) ----
+            def _pDays = (long)(((dayEnd.getTime() - dayStart.getTime()) / (1000L*60*60*24)) + 1)
+            def _priorStart = new java.sql.Timestamp(dayStart.getTime() - _pDays*24L*60*60*1000)
+            def _priorSales = BigDecimal.ZERO
+            if (_org) { _priorSales = ec.entity.find("zenith.erp.pos.PosTransaction").condition("organizationPartyId", _org)
+                .condition("statusId","PtCompleted").condition("entryDate", EC.GREATER_THAN_EQUAL_TO, _priorStart).condition("entryDate", EC.LESS_THAN, dayStart)
+                .list().sum { _bd(it.payableAmount) } ?: BigDecimal.ZERO }
+            salesWoW = _priorSales > 0 ? Math.round((totalSales.doubleValue() - _priorSales.doubleValue()) * 100.0 / _priorSales.doubleValue()) : (totalSales > 0 ? 100 : 0)
+
+            // ---- Total Payables = unpaid purchase invoices (0 for a POS-only tenant) ----
+            totalPayables = BigDecimal.ZERO
+            try { if (_org) { ec.entity.find("mantle.account.invoice.Invoice").condition("toPartyId", _org).condition("invoiceTypeEnumId","InvoicePurchase")
+                .condition("statusId", EC.NOT_IN, ["InvoicePmtRecvd","InvoiceCancelled","InvoicePaid"]).list().each { totalPayables += (_bd(it.invoiceTotal ?: (_bd(it.totalTaxableAmount)+_bd(it.totalTaxAmount)))) } } } catch (Exception e) {}
+
+            // ---- Total Receivable = outstanding on credit bills (payable - paid) ----
+            totalReceivable = BigDecimal.ZERO; creditBillCount = 0
+            try { if (_org) { ec.entity.find("zenith.erp.pos.PosTransaction").condition("organizationPartyId", _org).condition("isCredit","Y").condition("statusId","PtCompleted").list().each {
+                def d = _bd(it.payableAmount) - _bd(it.paidAmount); if (d > 0) { totalReceivable += d; creditBillCount++ } } } } catch (Exception e) {}
+
+            // ---- Cash in Hand = cash-method payments in range + (cash-in - cash-out) entries ----
+            cashInHand = BigDecimal.ZERO
+            try {
+                def _tids = completedTxns.collect { it.transactionId }
+                if (_tids) ec.entity.find("zenith.erp.pos.PosPayment").condition("transactionId","in",_tids).condition("paymentMethod","Cash").list().each { cashInHand += _bd(it.amount) }
+                if (_org) ec.entity.find("zenith.erp.pos.PosCashEntry").condition("organizationPartyId", _org).condition("entryDate", EC.GREATER_THAN_EQUAL_TO, dayStart).condition("entryDate", EC.LESS_THAN_EQUAL_TO, dayEnd).list().each {
+                    if (it.entryType == 'CashIn') cashInHand += _bd(it.amount); else if (it.entryType == 'CashOut') cashInHand -= _bd(it.amount) }
+            } catch (Exception e) {}
+
+            // ---- Weekly series (last 7 days, oldest->newest) ----
+            def _wl=[]; def _wd=[]
+            def _wc = java.util.Calendar.getInstance(); _wc.setTime(dayEnd); _wc.add(java.util.Calendar.DAY_OF_MONTH,-6)  // last 7 days ending at the range end
+            def _dfmt = new java.text.SimpleDateFormat("EEE")
+            for (int i=0;i<7;i++) {
+                def _ds = new java.sql.Timestamp(_wc.getTimeInMillis()); _wc.set(java.util.Calendar.HOUR_OF_DAY,0); _wc.set(java.util.Calendar.MINUTE,0); _wc.set(java.util.Calendar.SECOND,0)
+                def _s0 = new java.sql.Timestamp(_wc.getTimeInMillis()); def _e0c = (java.util.Calendar) _wc.clone(); _e0c.add(java.util.Calendar.DAY_OF_MONTH,1); def _e0 = new java.sql.Timestamp(_e0c.getTimeInMillis())
+                def _sum = _org ? (ec.entity.find("zenith.erp.pos.PosTransaction").condition("organizationPartyId", _org).condition("statusId","PtCompleted").condition("entryDate", EC.GREATER_THAN_EQUAL_TO, _s0).condition("entryDate", EC.LESS_THAN, _e0).list().sum { _bd(it.payableAmount) } ?: BigDecimal.ZERO) : BigDecimal.ZERO
+                _wl.add("'"+_dfmt.format(_wc.getTime())+"'"); _wd.add(_sum.setScale(0, java.math.RoundingMode.HALF_UP).toPlainString())
+                _wc.add(java.util.Calendar.DAY_OF_MONTH,1)
+            }
+            weeklyLabelsJson = "["+_wl.join(",")+"]"; weeklyDataJson = "["+_wd.join(",")+"]"
+
+            // ---- Hourly series for the selected range (aggregate by hour) ----
+            def _hrs = new BigDecimal[24]; for (int i=0;i<24;i++) _hrs[i]=BigDecimal.ZERO
+            completedTxns.each { if (it.entryDate) { def c=java.util.Calendar.getInstance(); c.setTime(it.entryDate); _hrs[c.get(java.util.Calendar.HOUR_OF_DAY)] += _bd(it.payableAmount) } }
+            def _hl=[]; def _hd=[]
+            for (int h=8; h<=21; h++) { def _lab = (h%12==0?12:h%12) + (h<12?'AM':'PM'); _hl.add("'"+_lab+"'"); _hd.add(_hrs[h].setScale(0, java.math.RoundingMode.HALF_UP).toPlainString()) }
+            hourlyLabelsJson = "["+_hl.join(",")+"]"; hourlyDataJson = "["+_hd.join(",")+"]"
+
+            // ---- Today's hourly (for the "Today" tab) ----
+            def _tS = java.sql.Timestamp.valueOf(todayStr + " 00:00:00"); def _tE = java.sql.Timestamp.valueOf(todayStr + " 23:59:59")
+            def _th = new BigDecimal[24]; for (int i=0;i<24;i++) _th[i]=BigDecimal.ZERO
+            if (_org) ec.entity.find("zenith.erp.pos.PosTransaction").condition("organizationPartyId", _org).condition("statusId","PtCompleted").condition("entryDate", EC.GREATER_THAN_EQUAL_TO, _tS).condition("entryDate", EC.LESS_THAN_EQUAL_TO, _tE).list().each { if (it.entryDate) { def c=java.util.Calendar.getInstance(); c.setTime(it.entryDate); _th[c.get(java.util.Calendar.HOUR_OF_DAY)] += _bd(it.payableAmount) } }
+            def _td=[]; for (int h=8; h<=21; h++) _td.add(_th[h].setScale(0, java.math.RoundingMode.HALF_UP).toPlainString())
+            todayDataJson = "["+_td.join(",")+"]"
+
+            // ---- Top selling products (top 5 for the range) ----
+            topProducts = []
+            try {
+                def _tids = completedTxns.collect { it.transactionId }
+                if (_tids) {
+                    def _pm = [:]
+                    ec.entity.find("zenith.erp.pos.PosTransactionItem").condition("transactionId","in",_tids).list().each { def k = it.productName ?: it.productId; if (!_pm[k]) _pm[k]=[name:k,qty:BigDecimal.ZERO,total:BigDecimal.ZERO]; _pm[k].qty += _bd(it.quantity); _pm[k].total += _bd(it.lineTotal) }
+                    _pm.values().sort { -(it.total as BigDecimal) }.take(5).eachWithIndex { p, i -> topProducts.add([rank:(i+1), name:p.name.toString(), qty:ec.l10n.format(p.qty,'#,##0'), total:ec.l10n.format(p.total,'#,##0')]) }
+                }
+            } catch (Exception e) {}
+
+            // ---- Recent transactions (last 6) ----
+            recentTxns = []
+            completedTxns.take(6).each { recentTxns.add([no:(it.transactionNumber ?: it.transactionId), amt:ec.l10n.format(_bd(it.payableAmount),'#,##0'),
+                date: (it.entryDate ? new java.text.SimpleDateFormat("dd MMM").format(it.entryDate) : ''), credit:(it.isCredit == 'Y')]) }
+
+            // ---- Pending vendor bills (unpaid purchase invoices — empty for a POS-only tenant) ----
+            pendingBills = []
+            try { if (_org) { ec.entity.find("mantle.account.invoice.Invoice").condition("toPartyId", _org).condition("invoiceTypeEnumId","InvoicePurchase")
+                .condition("statusId", EC.NOT_IN, ["InvoicePmtRecvd","InvoiceCancelled","InvoicePaid"]).orderBy("dueDate").limit(5).list().each { inv ->
+                    def _due = inv.dueDate; def _days = _due ? (long)((_due.getTime() - now.getTime())/(1000L*60*60*24)) : 999
+                    def _pri = _days <= 7 ? 'High' : (_days <= 15 ? 'Medium' : 'Low')
+                    pendingBills.add([no:inv.invoiceId, amt:ec.l10n.format(_bd(inv.invoiceTotal ?: (_bd(inv.totalTaxableAmount)+_bd(inv.totalTaxAmount))),'#,##0'), due:(_days<0?'Overdue':('Due in '+_days+'d')), pri:_pri]) } } } catch (Exception e) {}
+
+            // ================= Business Health (same honest composite as the POS Dashboard) =================
+            healthMetrics = []; healthScore = 0; healthLabel = '—'; healthHasData = false; healthColor = '#9e9e9e'
+            try {
+                def _pill = [good:['#DCFCE7','#166534'], warn:['#FEF3C7','#92400E'], bad:['#FEE2E2','#991B1B'], na:['#EEF0F5','#64748B']]
+                def _colr = { s -> s >= 80 ? 'good' : (s >= 55 ? 'warn' : 'bad') }
+                def _addm = { name, avail, score, status, ck -> def p = _pill[ck] ?: _pill.na; healthMetrics.add([name:name, avail:avail, score:score, status:status, pillBg:p[0], pillFg:p[1]]) }
+                if (totalSales <= 0 && _priorSales <= 0) { _addm('Sales', false, 0, 'No sales in range', 'na') }
+                else { double _g = _priorSales > 0 ? ((totalSales.doubleValue()-_priorSales.doubleValue())*100.0/_priorSales.doubleValue()) : (totalSales>0?100.0:-100.0)
+                    def _s=_g>=10?95:(_g>=0?80:(_g>=-15?60:35)); def _st=_g>=10?'Strong':(_g>=0?'Good':(_g>=-15?'Fair':'Weak')); def _gp=Math.round(_g)
+                    _addm('Sales', true, _s, _st+' ('+(_gp>=0?'+':'')+_gp+'% vs prior)', _colr(_s)) }
+                if (totalSales <= 0) { _addm('Cash Flow', false, 0, 'No sales in range', 'na') }
+                else { def _out=BigDecimal.ZERO; try { ec.entity.find("zenith.erp.pos.PosExpense").condition("expenseDate",EC.GREATER_THAN_EQUAL_TO,dayStart).condition("expenseDate",EC.LESS_THAN_EQUAL_TO,dayEnd).list().each{_out+=_bd(it.amount)} } catch(Exception e){}
+                    double _r=(_out.doubleValue()*100.0/totalSales.doubleValue()); def _s=_r<5?95:(_r<15?80:(_r<30?60:35)); def _st=_r<5?'Strong':(_r<15?'Healthy':(_r<30?'Watch':'Tight')); _addm('Cash Flow', true, _s, _st, _colr(_s)) }
+                def _c90=java.util.Calendar.getInstance(); _c90.setTime(now); _c90.add(java.util.Calendar.DAY_OF_MONTH,-90)
+                def _ref90 = _org ? (ec.entity.find("zenith.erp.pos.PosTransaction").condition("organizationPartyId",_org).condition("statusId","PtCompleted").condition("entryDate",EC.GREATER_THAN_EQUAL_TO,new java.sql.Timestamp(_c90.getTimeInMillis())).list().sum{_bd(it.payableAmount)} ?: BigDecimal.ZERO) : BigDecimal.ZERO
+                if (totalReceivable <= 0) { _addm('Receivables', true, 100, 'Nothing outstanding', 'good') }
+                else { double _r=_ref90>0?(totalReceivable.doubleValue()/_ref90.doubleValue()):1.0; def _s=_r<0.02?95:(_r<0.10?80:(_r<0.25?55:30)); def _st=_r<0.02?'Healthy':(_r<0.10?'OK':(_r<0.25?'Needs Attention':'High')); _addm('Receivables', true, _s, _st+' ('+ec.l10n.format(totalReceivable,'#,##0')+' owed)', _colr(_s)) }
+                def _prodTot = _org ? ec.entity.find("mantle.product.Product").condition("ownerPartyId",_org).count() : 0
+                if (_prodTot > 0) {
+                    def _tracked = ec.entity.find("mantle.product.Product").condition("ownerPartyId",_org).condition("inventoryTracked","Y").count()
+                    if (_tracked >= 5) { def _low=0; try { ec.entity.find("zenith.erp.inventory.ProductStockView").condition("ownerPartyId",_org).list().each{ def q=_bd(it.totalQoh); def rp=_bd(it.reorderPoint); if (q<=0 || (rp>0&&q<=rp)) _low++ } } catch(Exception e){}
+                        double _r=(_low*1.0/_tracked); def _s=_r<0.05?95:(_r<0.15?80:(_r<0.30?55:30)); def _st=_r<0.05?'Healthy':(_r<0.15?'Good':(_r<0.30?'Needs Attention':'Low')); _addm('Inventory', true, _s, _st, _colr(_s)) }
+                    else { def _wp=ec.entity.find("mantle.product.Product").condition("ownerPartyId",_org).condition("mrpAmount",EC.GREATER_THAN,0G).count(); double _r=(_wp*1.0/_prodTot); def _s=_r>=0.95?90:(_r>=0.80?75:(_r>=0.50?55:35)); def _st=_r>=0.80?'Catalog ready':(_r>=0.50?'Some unpriced':'Many unpriced'); _addm('Inventory', true, _s, _st, _colr(_s)) }
+                    def _cf=ec.entity.conditionFactory
+                    def _gc=_cf.makeCondition([_cf.makeCondition("gstSlabId",EC.IS_NOT_NULL,null),_cf.makeCondition("isGstExempt",EC.EQUALS,"Y"),_cf.makeCondition("hsnCode",EC.IS_NOT_NULL,null)],EC.OR)
+                    def _go=ec.entity.find("mantle.product.Product").condition("ownerPartyId",_org).condition(_gc).count(); double _r=(_go*1.0/_prodTot); def _s=_r>=0.95?95:(_r>=0.80?80:(_r>=0.50?55:30)); def _st=_r>=0.95?'Compliant':(_r>=0.80?'Mostly set':(_r>=0.50?'Partial':'Needs setup')); _addm('GST', true, _s, _st, _colr(_s))
+                }
+                def _av = healthMetrics.findAll { it.avail }; healthHasData = (_av.size() > 0)
+                healthScore = healthHasData ? (int) Math.round(_av.sum { it.score } / _av.size()) : 0
+                healthLabel = healthScore>=85?'Excellent':(healthScore>=70?'Good':(healthScore>=55?'Fair':'Needs Work'))
+                healthColor = healthScore>=85?'#16A34A':(healthScore>=70?'#65A30D':(healthScore>=55?'#D97706':'#DC2626'))
+            } catch (Exception e) { healthMetrics=[]; healthScore=0; healthLabel='—'; healthHasData=false; healthColor='#9e9e9e' }
+
+            fmtSales = ec.l10n.format(totalSales, '#,##,##0')
+            fmtPayables = ec.l10n.format(totalPayables, '#,##,##0')
+            fmtReceivable = ec.l10n.format(totalReceivable, '#,##,##0')
+            fmtCash = ec.l10n.format(cashInHand, '#,##,##0')
+        ]]></script>
+    </actions>
+
+    <widgets>
+        <render-mode><text type="html,qvt" template="true"><![CDATA[
+<style>
+  .biz-wrap{--bz:#8E28ED;--bz2:#2A0E86;--bzsoft:#F3E9FE;font-family:'Segoe UI',Inter,Arial,sans-serif;color:#1A1530;display:flex;gap:0;background:#F6F4FB;border-radius:16px;overflow:hidden;box-shadow:0 1px 3px rgba(42,14,134,.08);min-height:640px}
+  .biz-side{flex:0 0 210px;background:#fff;border-right:1px solid #ECE7F6;padding:14px 10px;transition:flex-basis .2s}
+  .biz-brand{display:flex;align-items:center;gap:8px;padding:6px 8px 14px;font-weight:800;color:var(--bz2);font-size:16px}
+  .biz-brand .bzdot{width:26px;height:26px;border-radius:7px;background:linear-gradient(135deg,#B031E9,#8E28ED,#2A0E86);color:#fff;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:800}
+  .biz-cat{font-size:10.5px;font-weight:800;letter-spacing:.08em;color:#9C93B4;margin:14px 10px 4px}
+  .biz-nav{display:flex;align-items:center;gap:11px;padding:9px 11px;border-radius:9px;text-decoration:none;color:#4A4260;font-size:13.5px;font-weight:600;white-space:nowrap}
+  .biz-nav:hover{background:#F6F1FD}
+  .biz-nav.on{background:var(--bzsoft);color:var(--bz);font-weight:800}
+  .biz-nav .ic{width:20px;text-align:center;font-size:15px;flex:0 0 20px}
+  .biz-main{flex:1;min-width:0;padding:18px 22px}
+  .biz-top{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px;margin-bottom:14px}
+  .biz-owner{display:inline-flex;align-items:center;gap:7px;background:#fff;border:1px solid #E4DDF0;border-radius:10px;padding:8px 13px;font-size:13px;font-weight:700;color:var(--bz2)}
+  .biz-hi{font-size:21px;font-weight:800;margin:0}
+  .biz-sub{color:#6A6280;font-size:12.5px;margin-top:2px}
+  .biz-chip{padding:6px 14px;border-radius:999px;font-size:12.5px;font-weight:700;text-decoration:none;border:1px solid #E0CFF9;background:#fff;color:var(--bz2)}
+  .biz-chip.on{background:var(--bz);border-color:var(--bz);color:#fff}
+  .biz-cards{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:6px 0 16px}
+  .biz-card{background:#fff;border-radius:14px;padding:15px 16px;box-shadow:0 1px 3px rgba(42,14,134,.07)}
+  .biz-card .lab{font-size:10.5px;font-weight:800;letter-spacing:.05em;color:#9C93B4}
+  .biz-card .val{font-size:23px;font-weight:800;margin:5px 0 3px}
+  .biz-card .sub{font-size:11.5px;color:#8A82A0}
+  .biz-up{color:#16A34A;font-weight:700}.biz-dn{color:#DC2626;font-weight:700}
+  .biz-panel{background:#fff;border-radius:14px;padding:16px 18px;box-shadow:0 1px 3px rgba(42,14,134,.07)}
+  .biz-ph{font-size:14px;font-weight:800;margin:0 0 12px}
+  .biz-mid{display:grid;grid-template-columns:1.6fr 1fr;gap:14px;margin-bottom:16px}
+  .biz-tabs{display:inline-flex;background:#F1ECFA;border-radius:9px;padding:3px}
+  .biz-tab{border:none;background:transparent;padding:6px 15px;border-radius:7px;font-size:12.5px;font-weight:700;color:#6A6280;cursor:pointer}
+  .biz-tab.on{background:var(--bz);color:#fff}
+  .biz-qa{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .biz-qbtn{display:flex;flex-direction:column;align-items:center;gap:6px;padding:14px 6px;border:1px solid #EFEAF8;border-radius:11px;text-decoration:none;color:#4A4260;font-size:12px;font-weight:700;background:#FCFBFE}
+  .biz-qbtn:hover{border-color:var(--bz);color:var(--bz);background:var(--bzsoft)}
+  .biz-qbtn .qic{width:34px;height:34px;border-radius:9px;background:var(--bzsoft);color:var(--bz);display:flex;align-items:center;justify-content:center;font-size:17px;font-weight:800}
+  .biz-bot{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .biz-row{display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid #F3F0FA;font-size:12.5px}
+  .biz-pill{padding:2px 10px;border-radius:999px;font-size:10.5px;font-weight:800}
+  .biz-mrow{display:flex;align-items:center;justify-content:space-between;padding:7px 0;border-bottom:1px solid #F3F0FA}
+  .biz-menu-btn{display:none}
+  @media (max-width:1180px){ .biz-cards{grid-template-columns:repeat(2,1fr)} .biz-mid{grid-template-columns:1fr} .biz-bot{grid-template-columns:1fr} }
+  @media (max-width:768px){
+    .biz-side{flex-basis:56px;padding:14px 6px}
+    .biz-side .biz-cat,.biz-side .biz-nav span.lbl,.biz-side .biz-brand span.bt{display:none}
+    .biz-side.exp{flex-basis:210px;position:absolute;z-index:40;height:100%;box-shadow:6px 0 20px rgba(0,0,0,.12)}
+    .biz-side.exp .biz-cat,.biz-side.exp .biz-nav span.lbl,.biz-side.exp .biz-brand span.bt{display:inline}
+    .biz-nav{justify-content:center}.biz-side.exp .biz-nav{justify-content:flex-start}
+    .biz-wrap{position:relative}.biz-menu-btn{display:inline-flex}
+    .biz-cards{grid-template-columns:1fr}
+  }
+</style>
+<div class="biz-wrap">
+  <aside class="biz-side" id="bizSide">
+    <div class="biz-brand"><span class="bzdot">ZC</span><span class="bt">ZcERP</span></div>
+    <div class="biz-cat">OVERVIEW</div>
+    <a class="biz-nav on" href="/apps/zenith/pos/OwnerDashboard"><span class="ic">&#9632;</span><span class="lbl">Dashboard</span></a>
+    <a class="biz-nav" href="/apps/zenith/Contacts/Customers"><span class="ic">&#128101;</span><span class="lbl">Contacts</span></a>
+    <div class="biz-cat">SALES &amp; CRM</div>
+    <a class="biz-nav" href="/apps/zenith/sales/SalesDashboard"><span class="ic">&#128200;</span><span class="lbl">Sales</span></a>
+    <a class="biz-nav" href="/apps/zenith/Purchase/RfqList"><span class="ic">&#128722;</span><span class="lbl">Purchase</span></a>
+    <a class="biz-nav" href="/apps/zenith/Crm/Leads"><span class="ic">&#128227;</span><span class="lbl">CRM</span></a>
+    <a class="biz-nav" href="/apps/zenith/pos/Dashboard"><span class="ic">&#128179;</span><span class="lbl">POS</span></a>
+    <a class="biz-nav" href="/apps/zenith/pos/Terminal"><span class="ic">&#129534;</span><span class="lbl">POS Billing</span></a>
+    <div class="biz-cat">OPERATIONS</div>
+    <a class="biz-nav" href="/apps/zenith/Inventory/FindProduct"><span class="ic">&#128230;</span><span class="lbl">Inventory</span></a>
+    <a class="biz-nav" href="/apps/zenith/manufacturing/WorkOrders"><span class="ic">&#127981;</span><span class="lbl">Manufacturing</span></a>
+    <a class="biz-nav" href="/apps/zenith/project"><span class="ic">&#128193;</span><span class="lbl">Projects</span></a>
+    <div class="biz-cat">FINANCE</div>
+    <a class="biz-nav" href="/apps/zenith/Accounting/AcctgDashboard"><span class="ic">&#129518;</span><span class="lbl">Accounting</span></a>
+    <a class="biz-nav" href="/apps/zenith/payroll/PayrollRuns"><span class="ic">&#128181;</span><span class="lbl">Payroll</span></a>
+    <a class="biz-nav" href="/apps/zenith/pos/Expenses"><span class="ic">&#128176;</span><span class="lbl">Expenses</span></a>
+    <div class="biz-cat">OTHER</div>
+    <a class="biz-nav" href="/apps/zenith"><span class="ic">&#8943;</span><span class="lbl">More Modules</span></a>
+  </aside>
+  <main class="biz-main">
+    <div class="biz-top">
+      <div style="display:flex;align-items:center;gap:10px">
+        <button class="biz-tab biz-menu-btn" onclick="document.getElementById('bizSide').classList.toggle('exp')">&#9776;</button>
+        <span class="biz-owner">&#127970; Owner View (${orgName!'All Shops'})</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px">
+        <a class="biz-chip${(presetActive=='today')?string(' on','')}" href="${urlToday}">Today</a>
+        <a class="biz-chip${(presetActive=='week')?string(' on','')}" href="${urlWeek}">This Week</a>
+        <a class="biz-chip${(presetActive=='month')?string(' on','')}" href="${urlMonth}">This Month</a>
+        <a class="biz-chip${(presetActive=='year')?string(' on','')}" href="${urlYear}">This Year</a>
+      </div>
+    </div>
+    <div style="margin-bottom:14px"><h2 class="biz-hi">${greeting}, ${orgName} &#128075;</h2><div class="biz-sub">Aggregated view &middot; ${displayDate}</div></div>
+
+    <div class="biz-cards">
+      <div class="biz-card"><div class="lab">TOTAL SALES</div><div class="val" style="color:var(--bz2)">&#8377;${fmtSales!'0'}</div><div class="sub"><span class="${((salesWoW!0) gte 0)?string('biz-up','biz-dn')}">${((salesWoW!0) gte 0)?string('&#9650; +','&#9660; ')}${salesWoW!0}%</span> vs prior &middot; ${invoiceCount!0} bills</div></div>
+      <div class="biz-card"><div class="lab">TOTAL PAYABLES</div><div class="val" style="color:#DC2626">&#8377;${fmtPayables!'0'}</div><div class="sub">unpaid vendor bills</div></div>
+      <div class="biz-card"><div class="lab">TOTAL RECEIVABLE</div><div class="val" style="color:#D97706">&#8377;${fmtReceivable!'0'}</div><div class="sub">${creditBillCount!0} credit bill(s) outstanding</div></div>
+      <div class="biz-card"><div class="lab">CASH IN HAND</div><div class="val" style="color:#16A34A">&#8377;${fmtCash!'0'}</div><div class="sub">cash received this period</div></div>
+    </div>
+
+    <div class="biz-mid">
+      <div class="biz-panel">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+          <div class="biz-ph" style="margin:0">Sales Analyst &nbsp;<span style="color:var(--bz)">&#8377;${fmtSales!'0'}</span></div>
+          <div class="biz-tabs"><button class="biz-tab on" data-t="week" onclick="bizTab('week',this)">Weekly</button><button class="biz-tab" data-t="today" onclick="bizTab('today',this)">Today</button><button class="biz-tab" data-t="hour" onclick="bizTab('hour',this)">Hourly</button></div>
+        </div>
+        <div id="bizChart" style="min-height:300px"></div>
+      </div>
+      <div class="biz-panel">
+        <div class="biz-ph">Quick Actions</div>
+        <div class="biz-qa">
+          <a class="biz-qbtn" href="/apps/zenith/pos/Terminal"><span class="qic">+</span>New Sale</a>
+          <a class="biz-qbtn" href="/apps/zenith/Purchase/CreatePurchaseOrder"><span class="qic">&#128722;</span>New Purchase</a>
+          <a class="biz-qbtn" href="/apps/zenith/sales/CreateInvoice"><span class="qic">&#128196;</span>New Invoice</a>
+          <a class="biz-qbtn" href="/apps/zenith/Purchase/CreatePurchaseInvoice"><span class="qic">&#129534;</span>New Bill</a>
+          <a class="biz-qbtn" href="/apps/zenith/Accounting/AutoBrs"><span class="qic">&#8646;</span>Bank Recon</a>
+          <a class="biz-qbtn" href="/apps/zenith/Contacts/FindContact?newContact=1"><span class="qic">&#128100;</span>Add Contact</a>
+        </div>
+      </div>
+    </div>
+
+    <div class="biz-bot">
+      <div class="biz-panel">
+        <div class="biz-ph">Recent Transactions</div>
+        <#if recentTxns?has_content><#list recentTxns as t>
+        <div class="biz-row"><div><b>${t.no}</b><div style="color:#8A82A0;font-size:11px">${t.date}<#if t.credit> &middot; credit</#if></div></div><div style="font-weight:800">&#8377;${t.amt}<span class="biz-pill" style="background:${t.credit?string('#FEF3C7','#DCFCE7')};color:${t.credit?string('#92400E','#166534')};margin-left:8px">${t.credit?string('Credit','Paid')}</span></div></div>
+        </#list><#else><div style="color:#9C93B4;padding:14px 0;text-align:center">No transactions in this period.</div></#if>
+      </div>
+      <div class="biz-panel">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px"><div class="biz-ph" style="margin:0">Business Health</div><div style="font-size:22px;font-weight:800;color:${healthColor}">${healthScore}<span style="font-size:12px;color:#9C93B4">/100</span></div></div>
+        <#if healthHasData>
+          <div style="background:${healthColor};color:#fff;display:inline-block;padding:2px 12px;border-radius:999px;font-size:11.5px;font-weight:800;margin-bottom:8px">${healthLabel}</div>
+          <#list healthMetrics as m><div class="biz-mrow"><span style="font-size:12.5px;color:#4A4260;font-weight:600">${m.name}</span><span class="biz-pill" style="background:${m.pillBg};color:${m.pillFg}">${m.status}</span></div></#list>
+        <#else><div style="color:#9C93B4;padding:10px 0">Record some sales to see your health score.</div></#if>
+      </div>
+      <div class="biz-panel">
+        <div class="biz-ph">Top Selling Products</div>
+        <#if topProducts?has_content><#list topProducts as p>
+        <div class="biz-row"><span>#${p.rank} ${p.name} <span style="color:#9C93B4;font-size:11px">(x${p.qty})</span></span><b>&#8377;${p.total}</b></div>
+        </#list><#else><div style="color:#9C93B4;padding:14px 0;text-align:center">No sales in this period.</div></#if>
+      </div>
+      <div class="biz-panel">
+        <div class="biz-ph">Pending Vendor Bills</div>
+        <#if pendingBills?has_content><#list pendingBills as b>
+        <div class="biz-row"><div><span class="biz-pill" style="background:${(b.pri=='High')?string('#FEE2E2','#F1F5F9')};color:${(b.pri=='High')?string('#991B1B','#475569')}">${b.pri}</span> <b>${b.no}</b></div><div style="text-align:right">&#8377;${b.amt}<div style="color:#8A82A0;font-size:11px">${b.due}</div></div></div>
+        </#list><#else><div style="color:#9C93B4;padding:14px 0;text-align:center">&#127881; No pending vendor bills.<div style="font-size:11px;margin-top:3px">Purchase bills you log will appear here, tagged by due date.</div></div></#if>
+      </div>
+    </div>
+  </main>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/apexcharts@3.44.0/dist/apexcharts.min.js"></script>
+<script>
+(function(){
+  var data={week:{cats:${weeklyLabelsJson},series:${weeklyDataJson},type:'area',name:'Sales'},
+            today:{cats:${hourlyLabelsJson},series:${todayDataJson},type:'bar',name:'Today'},
+            hour:{cats:${hourlyLabelsJson},series:${hourlyDataJson},type:'bar',name:'Sales'}};
+  function opt(d){return {chart:{type:d.type,height:300,toolbar:{show:false},fontFamily:'Segoe UI,sans-serif'},
+    series:[{name:d.name,data:d.series.map(Number)}],xaxis:{categories:d.cats},colors:['#8E28ED'],
+    stroke:{curve:'smooth',width:3},fill:d.type=='area'?{type:'gradient',gradient:{shadeIntensity:.4,opacityFrom:.35,opacityTo:.05}}:{opacity:1},
+    plotOptions:{bar:{borderRadius:4,columnWidth:'55%'}},dataLabels:{enabled:false},grid:{borderColor:'#EFEAF8',strokeDashArray:4},
+    markers:{size:d.type=='area'?4:0,colors:['#fff'],strokeColors:'#8E28ED',strokeWidth:3},
+    yaxis:{labels:{formatter:function(v){return v>=1000?(v/1000).toFixed(0)+'K':v;}}}};}
+  var el=document.querySelector('#bizChart'); if(!el||typeof ApexCharts==='undefined')return;
+  var ch=new ApexCharts(el,opt(data.week)); ch.render();
+  window.bizTab=function(k,btn){[].forEach.call(document.querySelectorAll('.biz-tab[data-t]'),function(b){b.classList.remove('on');}); if(btn)btn.classList.add('on');
+    var d=data[k]; ch.updateOptions(opt(d),true);};
+})();
+</script>
+        ]]></text></render-mode>
+    </widgets>
+</screen>
