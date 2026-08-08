@@ -74,11 +74,15 @@
                 else { def _z = (ec.user.userGroupIdSet ?: []).findAll { it?.startsWith("ZENITH_") && it != "ZENITH_ALL" }; canSetTeam = !(_z.size()==1 && _z.contains("ZENITH_CASHIER")) }
                 if (_org && _org != '_NA_') { def _oc = ec.entity.find("zenith.erp.pos.OrgDashboardDefault").condition("organizationPartyId", _org).one(); isTeamDefault = (_oc?.dashboardKey == 'overview') }
             } catch (Exception e) {}
+            // ZE-SHOP: sessions of the globally-selected shop (null = All Shops); scopes every POS figure below
+            _shopSessions = null
+            try { def _sc = ec.service.sync().name("zenith.base.ShopServices.get#ActiveShopScope").parameter("includePosScope", true).call(); _shopSessions = _sc?.sessionIds } catch (Exception _se) {}
         ]]></script>
 
         <entity-find entity-name="zenith.erp.pos.PosTransaction" list="completedTxns">
             <econdition field-name="statusId" value="PtCompleted"/>
             <econdition field-name="organizationPartyId" from="_org" ignore-if-empty="true"/>
+            <econdition field-name="sessionId" operator="in" from="_shopSessions" ignore-if-empty="true"/><!-- ZE-SHOP -->
             <econdition field-name="entryDate" operator="greater-equals" from="dayStart"/>
             <econdition field-name="entryDate" operator="less-equals" from="dayEnd"/>
             <order-by field-name="-entryDate"/>
@@ -87,6 +91,8 @@
         <script><![CDATA[
             def EC = org.moqui.entity.EntityCondition
             def _bd = { v -> (v ?: 0) as BigDecimal }
+            // ZE-SHOP: append the selected-shop session filter to any PosTransaction/PosExpense/PosCashEntry find (no-op when All Shops)
+            def _shopCond = { q -> if (_shopSessions) q.condition("sessionId", "in", _shopSessions); return q }
             totalSales = completedTxns.sum { _bd(it.payableAmount) } ?: BigDecimal.ZERO
             invoiceCount = completedTxns.size()
 
@@ -94,8 +100,8 @@
             def _pDays = (long)(((dayEnd.getTime() - dayStart.getTime()) / (1000L*60*60*24)) + 1)
             def _priorStart = new java.sql.Timestamp(dayStart.getTime() - _pDays*24L*60*60*1000)
             def _priorSales = BigDecimal.ZERO
-            if (_org) { _priorSales = ec.entity.find("zenith.erp.pos.PosTransaction").condition("organizationPartyId", _org)
-                .condition("statusId","PtCompleted").condition("entryDate", EC.GREATER_THAN_EQUAL_TO, _priorStart).condition("entryDate", EC.LESS_THAN, dayStart)
+            if (_org) { _priorSales = _shopCond(ec.entity.find("zenith.erp.pos.PosTransaction").condition("organizationPartyId", _org)
+                .condition("statusId","PtCompleted").condition("entryDate", EC.GREATER_THAN_EQUAL_TO, _priorStart).condition("entryDate", EC.LESS_THAN, dayStart))
                 .list().sum { _bd(it.payableAmount) } ?: BigDecimal.ZERO }
             salesWoW = _priorSales > 0 ? Math.round((totalSales.doubleValue() - _priorSales.doubleValue()) * 100.0 / _priorSales.doubleValue()) : (totalSales > 0 ? 100 : 0)
 
@@ -106,7 +112,7 @@
 
             // ---- Total Receivable = outstanding on credit bills (payable - paid) ----
             totalReceivable = BigDecimal.ZERO; creditBillCount = 0
-            try { if (_org) { ec.entity.find("zenith.erp.pos.PosTransaction").condition("organizationPartyId", _org).condition("isCredit","Y").condition("statusId","PtCompleted").list().each {
+            try { if (_org) { _shopCond(ec.entity.find("zenith.erp.pos.PosTransaction").condition("organizationPartyId", _org).condition("isCredit","Y").condition("statusId","PtCompleted")).list().each {
                 def d = _bd(it.payableAmount) - _bd(it.paidAmount); if (d > 0) { totalReceivable += d; creditBillCount++ } } } } catch (Exception e) {}
 
             // ---- Cash in Hand = cash-method payments in range + (cash-in - cash-out) entries ----
@@ -114,7 +120,7 @@
             try {
                 def _tids = completedTxns.collect { it.transactionId }
                 if (_tids) ec.entity.find("zenith.erp.pos.PosPayment").condition("transactionId","in",_tids).condition("paymentMethod","Cash").list().each { cashInHand += _bd(it.amount) }
-                if (_org) ec.entity.find("zenith.erp.pos.PosCashEntry").condition("organizationPartyId", _org).condition("entryDate", EC.GREATER_THAN_EQUAL_TO, dayStart).condition("entryDate", EC.LESS_THAN_EQUAL_TO, dayEnd).list().each {
+                if (_org) _shopCond(ec.entity.find("zenith.erp.pos.PosCashEntry").condition("organizationPartyId", _org).condition("entryDate", EC.GREATER_THAN_EQUAL_TO, dayStart).condition("entryDate", EC.LESS_THAN_EQUAL_TO, dayEnd)).list().each {
                     if (it.entryType == 'CashIn') cashInHand += _bd(it.amount); else if (it.entryType == 'CashOut') cashInHand -= _bd(it.amount) }
             } catch (Exception e) {}
 
@@ -125,7 +131,7 @@
             for (int i=0;i<7;i++) {
                 def _ds = new java.sql.Timestamp(_wc.getTimeInMillis()); _wc.set(java.util.Calendar.HOUR_OF_DAY,0); _wc.set(java.util.Calendar.MINUTE,0); _wc.set(java.util.Calendar.SECOND,0)
                 def _s0 = new java.sql.Timestamp(_wc.getTimeInMillis()); def _e0c = (java.util.Calendar) _wc.clone(); _e0c.add(java.util.Calendar.DAY_OF_MONTH,1); def _e0 = new java.sql.Timestamp(_e0c.getTimeInMillis())
-                def _sum = _org ? (ec.entity.find("zenith.erp.pos.PosTransaction").condition("organizationPartyId", _org).condition("statusId","PtCompleted").condition("entryDate", EC.GREATER_THAN_EQUAL_TO, _s0).condition("entryDate", EC.LESS_THAN, _e0).list().sum { _bd(it.payableAmount) } ?: BigDecimal.ZERO) : BigDecimal.ZERO
+                def _sum = _org ? (_shopCond(ec.entity.find("zenith.erp.pos.PosTransaction").condition("organizationPartyId", _org).condition("statusId","PtCompleted").condition("entryDate", EC.GREATER_THAN_EQUAL_TO, _s0).condition("entryDate", EC.LESS_THAN, _e0)).list().sum { _bd(it.payableAmount) } ?: BigDecimal.ZERO) : BigDecimal.ZERO
                 _wl.add("'"+_dfmt.format(_wc.getTime())+"'"); _wd.add(_sum.setScale(0, java.math.RoundingMode.HALF_UP).toPlainString())
                 _wc.add(java.util.Calendar.DAY_OF_MONTH,1)
             }
@@ -141,7 +147,7 @@
             // ---- Today's hourly (for the "Today" tab) ----
             def _tS = java.sql.Timestamp.valueOf(todayStr + " 00:00:00"); def _tE = java.sql.Timestamp.valueOf(todayStr + " 23:59:59")
             def _th = new BigDecimal[24]; for (int i=0;i<24;i++) _th[i]=BigDecimal.ZERO
-            if (_org) ec.entity.find("zenith.erp.pos.PosTransaction").condition("organizationPartyId", _org).condition("statusId","PtCompleted").condition("entryDate", EC.GREATER_THAN_EQUAL_TO, _tS).condition("entryDate", EC.LESS_THAN_EQUAL_TO, _tE).list().each { if (it.entryDate) { def c=java.util.Calendar.getInstance(); c.setTime(it.entryDate); _th[c.get(java.util.Calendar.HOUR_OF_DAY)] += _bd(it.payableAmount) } }
+            if (_org) _shopCond(ec.entity.find("zenith.erp.pos.PosTransaction").condition("organizationPartyId", _org).condition("statusId","PtCompleted").condition("entryDate", EC.GREATER_THAN_EQUAL_TO, _tS).condition("entryDate", EC.LESS_THAN_EQUAL_TO, _tE)).list().each { if (it.entryDate) { def c=java.util.Calendar.getInstance(); c.setTime(it.entryDate); _th[c.get(java.util.Calendar.HOUR_OF_DAY)] += _bd(it.payableAmount) } }
             def _td=[]; for (int h=8; h<=21; h++) _td.add(_th[h].setScale(0, java.math.RoundingMode.HALF_UP).toPlainString())
             todayDataJson = "["+_td.join(",")+"]"
 
@@ -180,10 +186,10 @@
                     def _s=_g>=10?95:(_g>=0?80:(_g>=-15?60:35)); def _st=_g>=10?'Strong':(_g>=0?'Good':(_g>=-15?'Fair':'Weak')); def _gp=Math.round(_g)
                     _addm('Sales', true, _s, _st+' ('+(_gp>=0?'+':'')+_gp+'% vs prior)', _colr(_s)) }
                 if (totalSales <= 0) { _addm('Cash Flow', false, 0, 'No sales in range', 'na') }
-                else { def _out=BigDecimal.ZERO; try { ec.entity.find("zenith.erp.pos.PosExpense").condition("expenseDate",EC.GREATER_THAN_EQUAL_TO,dayStart).condition("expenseDate",EC.LESS_THAN_EQUAL_TO,dayEnd).list().each{_out+=_bd(it.amount)} } catch(Exception e){}
+                else { def _out=BigDecimal.ZERO; try { _shopCond(ec.entity.find("zenith.erp.pos.PosExpense").condition("expenseDate",EC.GREATER_THAN_EQUAL_TO,dayStart).condition("expenseDate",EC.LESS_THAN_EQUAL_TO,dayEnd)).list().each{_out+=_bd(it.amount)} } catch(Exception e){}
                     double _r=(_out.doubleValue()*100.0/totalSales.doubleValue()); def _s=_r<5?95:(_r<15?80:(_r<30?60:35)); def _st=_r<5?'Strong':(_r<15?'Healthy':(_r<30?'Watch':'Tight')); _addm('Cash Flow', true, _s, _st, _colr(_s)) }
                 def _c90=java.util.Calendar.getInstance(); _c90.setTime(now); _c90.add(java.util.Calendar.DAY_OF_MONTH,-90)
-                def _ref90 = _org ? (ec.entity.find("zenith.erp.pos.PosTransaction").condition("organizationPartyId",_org).condition("statusId","PtCompleted").condition("entryDate",EC.GREATER_THAN_EQUAL_TO,new java.sql.Timestamp(_c90.getTimeInMillis())).list().sum{_bd(it.payableAmount)} ?: BigDecimal.ZERO) : BigDecimal.ZERO
+                def _ref90 = _org ? (_shopCond(ec.entity.find("zenith.erp.pos.PosTransaction").condition("organizationPartyId",_org).condition("statusId","PtCompleted").condition("entryDate",EC.GREATER_THAN_EQUAL_TO,new java.sql.Timestamp(_c90.getTimeInMillis()))).list().sum{_bd(it.payableAmount)} ?: BigDecimal.ZERO) : BigDecimal.ZERO
                 if (totalReceivable <= 0) { _addm('Receivables', true, 100, 'Nothing outstanding', 'good') }
                 else { double _r=_ref90>0?(totalReceivable.doubleValue()/_ref90.doubleValue()):1.0; def _s=_r<0.02?95:(_r<0.10?80:(_r<0.25?55:30)); def _st=_r<0.02?'Healthy':(_r<0.10?'OK':(_r<0.25?'Needs Attention':'High')); _addm('Receivables', true, _s, _st+' ('+ec.l10n.format(totalReceivable,'#,##0')+' owed)', _colr(_s)) }
                 def _prodTot = _org ? ec.entity.find("mantle.product.Product").condition("ownerPartyId",_org).count() : 0
