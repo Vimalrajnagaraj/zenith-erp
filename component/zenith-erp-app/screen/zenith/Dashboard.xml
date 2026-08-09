@@ -11,7 +11,7 @@
     <!-- ZE-DASH: switchable widgets + drag-reorder + a date-range filter that scopes the Invoices KPI and drives the Business Activity time series -->
     <transition name="saveDashLayout">
         <actions><script><![CDATA[
-            def _wk = ['kpis','activity','quickactions','modules']
+            def _wk = ['insights','kpis','snapshot','activity','quickactions','modules']
             ec.user.setPreference('HOME_DASH_HIDDEN', _wk.findAll { !context.get('w_' + it) }.join(','))
         ]]></script></actions>
         <default-response url="." parameter-map="[dashDate:dashDate, dashDateTo:dashDateTo]"/>
@@ -23,7 +23,7 @@
     <transition name="changeDashDate"><default-response url="." parameter-map="[dashDate:dashDate, dashDateTo:dashDateTo, dateMode:'custom']"/></transition>
     <transition name="saveDashOrder" require-session-token="false">
         <actions><script><![CDATA[
-            def _valid = ['kpis','activity','quickactions','modules']
+            def _valid = ['insights','kpis','snapshot','activity','quickactions','modules']
             def _clean = ((context.order ?: '').toString().split(',') as List).findAll { _valid.contains(it) }
             ec.user.setPreference('HOME_DASH_ORDER', _clean.join(','))
             ec.web.sendJsonResponse([saved:true, order:_clean.join(',')])
@@ -246,12 +246,156 @@
             } catch (Exception e) {}
             def _pref = ec.user.getPreference('HOME_DASH_HIDDEN')
             def _hiddenSet = ((_pref != null) ? _pref : _roleHidden).split(',').findAll { it }.toSet()
+            showInsights = !_hiddenSet.contains('insights'); showSnapshot = !_hiddenSet.contains('snapshot')
             showKpis = !_hiddenSet.contains('kpis'); showActivity = !_hiddenSet.contains('activity')
             showQuickactions = !_hiddenSet.contains('quickactions'); showModules = !_hiddenSet.contains('modules')
+            w_insights = showInsights ? 'Y' : ''; w_snapshot = showSnapshot ? 'Y' : ''
             w_kpis = showKpis ? 'Y' : ''; w_activity = showActivity ? 'Y' : ''
             w_quickactions = showQuickactions ? 'Y' : ''; w_modules = showModules ? 'Y' : ''
             dashOrderCsv = (ec.user.getPreference('HOME_DASH_ORDER') ?: '')
             urlSettings = dashDate ? ("?dashDate="+dashDate+"&dashDateTo="+dashDateTo+"&showSettings=1") : "?showSettings=1"
+        ]]></script>
+
+        <!-- ZE-DASH DATA-RICH: compute the four data widgets (AI Insights, Recent Transactions, Business Health,
+             Top Selling Products) from REAL org-scoped data. Each widget is wrapped in its own try/catch so one
+             failing source never blanks the others. Receivables/overdue come from POS credit bills (invoice.unpaidTotal
+             is unreliable for POS cash sales, which finalise without an applied-payment record). Empty for no-org admin. -->
+        <script><![CDATA[
+            def _EC = org.moqui.entity.EntityCondition
+            def _bd = { v -> (v ?: 0) as BigDecimal }
+            def _org2 = activeOrgId
+            def _now2 = ec.user.nowTimestamp
+            def _fmt = { v -> '₹' + ec.l10n.format(_bd(v), '#,##,##0') }
+            def _finSale = ['InvoiceFinalized','InvoicePmtRecvd']
+
+            // date windows: the selected range if set, else last 30 days; prior = equal-length preceding window
+            def _wStart; def _wEnd
+            if (dayStart) { _wStart = dayStart; _wEnd = dayEndExcl }
+            else {
+                def _ce = java.util.Calendar.getInstance(); _ce.setTime(_now2); _ce.add(java.util.Calendar.DAY_OF_MONTH,1)
+                _ce.set(java.util.Calendar.HOUR_OF_DAY,0); _ce.set(java.util.Calendar.MINUTE,0); _ce.set(java.util.Calendar.SECOND,0); _ce.set(java.util.Calendar.MILLISECOND,0)
+                _wEnd = new java.sql.Timestamp(_ce.getTimeInMillis())
+                def _cs = java.util.Calendar.getInstance(); _cs.setTime(_now2); _cs.add(java.util.Calendar.DAY_OF_MONTH,-29)
+                _cs.set(java.util.Calendar.HOUR_OF_DAY,0); _cs.set(java.util.Calendar.MINUTE,0); _cs.set(java.util.Calendar.SECOND,0); _cs.set(java.util.Calendar.MILLISECOND,0)
+                _wStart = new java.sql.Timestamp(_cs.getTimeInMillis())
+            }
+            def _wMs = _wEnd.getTime() - _wStart.getTime()
+            def _pStart = new java.sql.Timestamp(_wStart.getTime() - _wMs)
+
+            // finalised sales total in [a,b)
+            def _salesIn = { a, b -> _org2 ? (ec.entity.find("mantle.account.invoice.Invoice")
+                .condition("fromPartyId",_org2).condition("invoiceTypeEnumId","InvoiceSales").condition("statusId","in",_finSale)
+                .condition("invoiceDate",_EC.GREATER_THAN_EQUAL_TO,a).condition("invoiceDate",_EC.LESS_THAN,b)
+                .list().sum { _bd(it.invoiceTotal ?: (_bd(it.totalTaxableAmount)+_bd(it.totalTaxAmount))) } ?: BigDecimal.ZERO) : BigDecimal.ZERO }
+            def _salesCur = _salesIn(_wStart, _wEnd)
+            def _salesPrior = _salesIn(_pStart, _wStart)
+            def _salesGrowth = _salesPrior > 0 ? ((_salesCur.doubleValue()-_salesPrior.doubleValue())*100.0/_salesPrior.doubleValue()) : (_salesCur>0?100.0:0.0)
+
+            // receivables + overdue from POS credit bills (honest source), + any real credit invoices past due date
+            def _recv = BigDecimal.ZERO; def _recvCount = 0; def _overdueAmt = BigDecimal.ZERO; def _overdueCount = 0
+            def _c15 = java.util.Calendar.getInstance(); _c15.setTime(_now2); _c15.add(java.util.Calendar.DAY_OF_MONTH,-15); def _ts15 = new java.sql.Timestamp(_c15.getTimeInMillis())
+            try { if (_org2) ec.entity.find("zenith.erp.pos.PosTransaction").condition("organizationPartyId",_org2).condition("isCredit","Y").condition("statusId","PtCompleted").list().each {
+                def d = _bd(it.payableAmount) - _bd(it.paidAmount); if (d > 0) { _recv += d; _recvCount++; if (it.entryDate != null && it.entryDate.before(_ts15)) { _overdueAmt += d; _overdueCount++ } } } } catch (Exception e) {}
+            try { if (_org2) ec.entity.find("mantle.account.invoice.Invoice").condition("fromPartyId",_org2).condition("invoiceTypeEnumId","InvoiceSales").condition("statusId","in",_finSale).condition("dueDate",_EC.LESS_THAN,_now2).list().each {
+                def u = _bd(it.unpaidTotal); if (u > 0) { _overdueAmt += u; _overdueCount++; _recv += u; _recvCount++ } } } catch (Exception e) {}
+
+            // low stock (products at/below reorder point) + GST setup completeness
+            // low stock: only among INVENTORY-TRACKED products, and only surfaced when the tenant tracks a
+            // meaningful catalog (>=5). A LEFT-joined ProductStockView flags every untracked/stockless product as
+            // qoh<=0, so without this gate a non-inventory tenant floods with false "low stock" (e.g. 1135 for MARUTHI).
+            def _lowStock = 0; def _trkN = 0
+            try { if (_org2) {
+                def _trkIds = ec.entity.find("mantle.product.Product").condition("ownerPartyId",_org2).condition("inventoryTracked","Y").selectField("productId").list()*.productId as Set
+                _trkN = _trkIds.size()
+                if (_trkN >= 5) ec.entity.find("zenith.erp.inventory.ProductStockView").condition("ownerPartyId",_org2).list().each { if (_trkIds.contains(it.productId)) { def q=_bd(it.totalQoh); def rp=_bd(it.reorderPoint); if (q<=0 || (rp>0 && q<=rp)) _lowStock++ } }
+            } } catch (Exception e) {}
+            def _prodTot2 = 0; def _gstSet = 0
+            try { if (_org2) { _prodTot2 = ec.entity.find("mantle.product.Product").condition("ownerPartyId",_org2).count()
+                def _cf = ec.entity.conditionFactory
+                def _gc = _cf.makeCondition([_cf.makeCondition("gstSlabId",_EC.IS_NOT_NULL,null),_cf.makeCondition("isGstExempt",_EC.EQUALS,"Y"),_cf.makeCondition("hsnCode",_EC.IS_NOT_NULL,null)],_EC.OR)
+                _gstSet = ec.entity.find("mantle.product.Product").condition("ownerPartyId",_org2).condition(_gc).count() } } catch (Exception e) {}
+
+            // ===== A. AI Insights (severity-ranked) =====
+            aiInsights = []
+            def _ins = { sev, icon, title, detail, url, act -> aiInsights.add([sev:sev, icon:icon, title:title, detail:detail, url:url, act:act]) }
+            if (_overdueCount > 0) _ins('danger','⚠', _overdueCount+(_overdueCount==1?' account':' accounts')+' overdue', _fmt(_overdueAmt)+' at risk - follow up on ageing balances', '/apps/zenith/Contacts/ContactsDashboard', 'View')
+            else if (_recvCount > 0) _ins('ok','✓', 'Receivables under control', _fmt(_recv)+' outstanding across '+_recvCount+(_recvCount==1?' credit bill':' credit bills')+', none overdue', '/apps/zenith/Contacts/ContactsDashboard', 'View')
+            if (_salesCur > 0 || _salesPrior > 0) { def _g = (int)Math.round(_salesGrowth)
+                if (_salesGrowth >= 0) _ins('ok','▲', 'Sales trending up '+_g+'%', _fmt(_salesCur)+' this period vs '+_fmt(_salesPrior)+' prior', '/apps/zenith/sales/SalesDashboard', 'Report')
+                else _ins((_salesGrowth < -20 ? 'warn':'info'),'▼', 'Sales down '+Math.abs(_g)+'%', _fmt(_salesCur)+' this period vs '+_fmt(_salesPrior)+' prior', '/apps/zenith/sales/SalesDashboard', 'Report') }
+            if (_lowStock > 0) _ins((_lowStock >= 10 ? 'danger':'warn'),'⚠', _lowStock+(_lowStock==1?' product':' products')+' low on stock', 'At or below reorder point - review purchasing', '/apps/zenith/Inventory/StockLevels', 'View')
+            if (_prodTot2 > 0) { def _pct = (int)Math.round(_gstSet*100.0/_prodTot2)
+                if (_gstSet < _prodTot2) _ins((_pct < 80 ? 'warn':'info'),'⚠', (_prodTot2-_gstSet)+(((_prodTot2-_gstSet)==1)?' product':' products')+' missing GST setup', _gstSet+' of '+_prodTot2+' products GST-ready', '/apps/zenith/Inventory/FindProduct', 'Fix')
+                else _ins('ok','✓', 'GST setup complete', 'All '+_prodTot2+' products have GST/HSN configured', '/apps/zenith/Inventory/FindProduct', 'View') }
+            def _sr = [danger:0, warn:1, info:2, ok:3]
+            aiInsights = aiInsights.sort { (_sr[it.sev] != null) ? _sr[it.sev] : 9 }
+            aiInsightsHas = !aiInsights.isEmpty()
+
+            // ===== B. Recent Transactions (latest sales invoices) =====
+            recentTx = []
+            try { if (_org2) {
+                def _sdfR = new java.text.SimpleDateFormat("dd MMM, HH:mm")
+                ec.entity.find("mantle.account.invoice.Invoice").condition("fromPartyId",_org2).condition("invoiceTypeEnumId","InvoiceSales")
+                    .condition("statusId",_EC.NOT_EQUAL,"InvoiceCancelled").orderBy("-invoiceDate").orderBy("-lastUpdatedStamp").limit(7).list().each { inv ->
+                    def _u = _bd(inv.unpaidTotal); def _ap = _bd(inv.appliedPaymentsTotal); def _dd = inv.dueDate
+                    def _st; def _cl
+                    if (_dd != null && _dd.before(_now2) && _u > 0) { _st='Overdue'; _cl='od' }
+                    else if (_u > 0 && _ap > 0) { _st='Partial'; _cl='pt' }
+                    else if (_dd != null && _u > 0) { _st='Pending'; _cl='pd' }
+                    else if (inv.statusId == 'InvoicePmtRecvd') { _st='Paid'; _cl='ok' }
+                    else if (inv.statusId == 'InvoiceInProcess') { _st='Draft'; _cl='dr' }
+                    else { _st='Completed'; _cl='ok' }
+                    recentTx.add([no:(inv.customInvoiceNumber ?: (inv.gstInvoiceNumber ?: inv.invoiceId)),
+                        amt:_fmt(inv.invoiceTotal ?: (_bd(inv.totalTaxableAmount)+_bd(inv.totalTaxAmount))), st:_st, cl:_cl,
+                        date:(inv.invoiceDate != null ? _sdfR.format(inv.invoiceDate) : ''), url:('/apps/zenith/sales/EditInvoice?invoiceId='+inv.invoiceId)])
+                }
+            } } catch (Exception e) { recentTx = [] }
+            recentTxHas = !recentTx.isEmpty()
+
+            // ===== C. Business Health (honest composite; average of AVAILABLE metrics) =====
+            bhMetrics = []; bhScore = 0; bhLabel = 'No data'; bhColor = '#9e9e9e'; bhHasData = false
+            try {
+                def _pill = [good:['#DCFCE7','#166534'], warn:['#FEF3C7','#92400E'], bad:['#FEE2E2','#991B1B'], na:['#EEF0F5','#64748B']]
+                def _clr = { s -> s >= 80 ? 'good' : (s >= 55 ? 'warn' : 'bad') }
+                def _addm = { nm, avail, sc, stt, ck -> def p = _pill[ck] ?: _pill.na; bhMetrics.add([name:nm, avail:avail, score:sc, status:stt, bg:p[0], fg:p[1]]) }
+                if (_salesCur <= 0 && _salesPrior <= 0) _addm('Sales', false, 0, 'No sales in range', 'na')
+                else { def _s=_salesGrowth>=10?95:(_salesGrowth>=0?80:(_salesGrowth>=-15?60:35)); def _stt=_salesGrowth>=10?'Strong':(_salesGrowth>=0?'Good':(_salesGrowth>=-15?'Fair':'Weak')); def _gp=(int)Math.round(_salesGrowth)
+                    _addm('Sales', true, _s, _stt+' ('+(_gp>=0?'+':'')+_gp+'% vs prior)', _clr(_s)) }
+                def _out = BigDecimal.ZERO; def _hasExp = false
+                try { if (_org2) { def _el = ec.entity.find("zenith.erp.pos.PosExpense").condition("organizationPartyId",_org2).condition("expenseDate",_EC.GREATER_THAN_EQUAL_TO,_wStart).condition("expenseDate",_EC.LESS_THAN,_wEnd).list(); if (!_el.isEmpty()) { _hasExp = true; _el.each { _out += _bd(it.amount) } } } } catch (Exception e) {}
+                if (_hasExp && _salesCur > 0) { double _r=(_out.doubleValue()*100.0/_salesCur.doubleValue()); def _s=_r<5?95:(_r<15?80:(_r<30?60:35)); def _stt=_r<5?'Strong':(_r<15?'Healthy':(_r<30?'Watch':'Tight')); _addm('Cash Flow', true, _s, _stt, _clr(_s)) }
+                def _c90 = java.util.Calendar.getInstance(); _c90.setTime(_now2); _c90.add(java.util.Calendar.DAY_OF_MONTH,-90); def _ts90 = new java.sql.Timestamp(_c90.getTimeInMillis())
+                def _ref90 = _salesIn(_ts90, _wEnd)
+                if (_recv <= 0 && _ref90 <= 0) _addm('Receivables', false, 0, 'No activity yet', 'na')
+                else if (_recv <= 0) _addm('Receivables', true, 100, 'Nothing outstanding', 'good')
+                else { double _r=_ref90>0?(_recv.doubleValue()/_ref90.doubleValue()):1.0; def _s=_r<0.02?95:(_r<0.10?80:(_r<0.25?55:30)); def _stt=_r<0.02?'Healthy':(_r<0.10?'OK':(_r<0.25?'Needs Attention':'High')); _addm('Receivables', true, _s, _stt+' ('+_fmt(_recv)+' owed)', _clr(_s)) }
+                if (_prodTot2 > 0) {
+                    if (_trkN >= 5) { double _r=(_lowStock*1.0/_trkN); def _s=_r<0.05?95:(_r<0.15?80:(_r<0.30?55:30)); def _stt=_r<0.05?'Healthy':(_r<0.15?'Good':(_r<0.30?'Needs Attention':'Low stock')); _addm('Inventory', true, _s, _stt, _clr(_s)) }
+                    else { def _wp=ec.entity.find("mantle.product.Product").condition("ownerPartyId",_org2).condition("mrpAmount",_EC.GREATER_THAN,0G).count(); double _r=(_wp*1.0/_prodTot2); def _s=_r>=0.95?90:(_r>=0.80?75:(_r>=0.50?55:35)); def _stt=_r>=0.80?'Catalog ready':(_r>=0.50?'Some unpriced':'Many unpriced'); _addm('Inventory', true, _s, _stt, _clr(_s)) }
+                    double _r=(_gstSet*1.0/_prodTot2); def _s=_r>=0.95?95:(_r>=0.80?80:(_r>=0.50?55:30)); def _stt=_r>=0.95?'Compliant':(_r>=0.80?'Mostly set':(_r>=0.50?'Partial':'Needs setup')); _addm('GST', true, _s, _stt, _clr(_s))
+                }
+                def _av = bhMetrics.findAll { it.avail }; bhHasData = (_av.size() > 0)
+                bhScore = bhHasData ? (int)Math.round(_av.sum { it.score } / _av.size()) : 0
+                bhLabel = bhScore>=85?'Excellent':(bhScore>=70?'Good':(bhScore>=55?'Fair':'Needs Work'))
+                bhColor = bhScore>=85?'#16A34A':(bhScore>=70?'#65A30D':(bhScore>=55?'#D97706':'#DC2626'))
+            } catch (Exception e) { bhMetrics=[]; bhScore=0; bhLabel='No data'; bhColor='#9e9e9e'; bhHasData=false }
+
+            // ===== D. Top Selling Products (from the aggregated view-entity) =====
+            topSell = []
+            try { if (_org2) {
+                def _pm = [:]
+                ec.entity.find("zenith.erp.sales.InvoiceSalesProductAgg").condition("fromPartyId",_org2).condition("invoiceTypeEnumId","InvoiceSales").condition("statusId","in",_finSale).disableAuthz().list().each {
+                    def k = it.productId; if (k == null) return
+                    if (!_pm.containsKey(k)) _pm[k] = [qty:BigDecimal.ZERO, val:BigDecimal.ZERO]
+                    _pm[k].qty += _bd(it.totalQuantity); _pm[k].val += _bd(it.totalValue) }
+                def _sorted = _pm.entrySet().sort { -(it.value.val.doubleValue()) }.take(5)
+                def _max = _sorted ? _sorted[0].value.val : BigDecimal.ZERO
+                _sorted.eachWithIndex { e, i ->
+                    def _p = ec.entity.find("mantle.product.Product").condition("productId", e.key).selectField("productName").disableAuthz().one()
+                    def _pct = (_max > 0) ? (int)Math.round(e.value.val.doubleValue()*100.0/_max.doubleValue()) : 0
+                    topSell.add([rank:(i+1), name:(_p?.productName ?: e.key.toString()), val:_fmt(e.value.val), units:ec.l10n.format(e.value.qty,'#,##0'), pct:_pct]) }
+            } } catch (Exception e) { topSell = [] }
+            topSellHas = !topSell.isEmpty()
         ]]></script>
 
         <!-- Role-Based Dashboard Routing -->
@@ -325,7 +469,9 @@
                 <container style="q-px-lg q-py-md q-mb-md zenith-card bg-white shadow-1 border-radius-lg">
                     <render-mode><text type="html"><![CDATA[<div style="font-size:12.5px;font-weight:800;color:#463D7A;letter-spacing:.04em;margin-bottom:2px">&#9881; CUSTOMIZE DASHBOARD</div><div style="font-size:12px;color:#5C6B85;margin-bottom:8px">Tick the sections you want to see &mdash; saved to your account. Drag the handle on any card to reorder.</div>]]></text></render-mode>
                     <form-single name="DashLayoutForm" transition="saveDashLayout">
+                        <field name="w_insights"><default-field title="AI Insights (overdue, sales trend, stock, GST)"><check><option key="Y" text=" "/></check></default-field></field>
                         <field name="w_kpis"><default-field title="KPI summary (customers, orders, invoices, products)"><check><option key="Y" text=" "/></check></default-field></field>
+                        <field name="w_snapshot"><default-field title="Recent Transactions, Business Health &amp; Top Selling Products"><check><option key="Y" text=" "/></check></default-field></field>
                         <field name="w_activity"><default-field title="Business Activity chart (over the selected range)"><check><option key="Y" text=" "/></check></default-field></field>
                         <field name="w_quickactions"><default-field title="Quick Actions"><check><option key="Y" text=" "/></check></default-field></field>
                         <field name="w_modules"><default-field title="All Modules grid"><check><option key="Y" text=" "/></check></default-field></field>
@@ -338,6 +484,33 @@
                 </container>
             </widgets>
         </section>
+
+        <!-- ZE-DASH: AI Insights — real-data alerts (overdue, sales trend, low stock, GST), ranked by severity -->
+        <section name="wInsights" condition="showInsights"><widgets>
+        <render-mode><text type="html"><![CDATA[<div class="dash-widget" data-wkey="insights"><div class="dash-handle" title="Drag to reorder">&#8942;&#8942;</div>]]></text></render-mode>
+        <render-mode><text type="html,vuet,qvt" template="true"><![CDATA[
+<div style="margin-bottom:22px">
+  <div style="display:flex;align-items:baseline;gap:9px;margin-bottom:11px;flex-wrap:wrap">
+    <span style="font-size:14px;font-weight:800;color:#2A2340;letter-spacing:.01em">AI Insights</span>
+    <span style="font-size:11px;color:#8A96AB">What needs your attention right now</span>
+  </div>
+  <#if aiInsightsHas>
+  <div class="zdh-ins-grid">
+    <#list aiInsights as ins>
+    <div class="zdh-ins sev-${ins.sev}">
+      <div class="zdh-ins-h"><span class="zdh-ico">${ins.icon}</span><span class="zdh-t">${ins.title}</span></div>
+      <div class="zdh-d">${ins.detail}</div>
+      <a class="zdh-a" href="${ins.url}">${ins.act} &#8594;</a>
+    </div>
+    </#list>
+  </div>
+  <#else>
+  <div style="background:#F3F7FF;border:1px solid #DCE6FA;border-radius:12px;padding:14px 16px;font-size:12.5px;color:#3A4A66">No insights yet — once you record sales, invoices and stock, smart alerts appear here.</div>
+  </#if>
+</div>
+]]></text></render-mode>
+        <render-mode><text type="html"><![CDATA[</div>]]></text></render-mode>
+        </widgets></section>
 
         <!-- KPI Summary Row -->
         <section name="wKpis" condition="showKpis"><widgets>
@@ -373,6 +546,54 @@
                 </container>
             </container>
         </container>
+        <render-mode><text type="html"><![CDATA[</div>]]></text></render-mode>
+        </widgets></section>
+
+        <!-- ZE-DASH: Recent Transactions + Business Health + Top Selling Products (responsive 3-column) -->
+        <section name="wSnapshot" condition="showSnapshot"><widgets>
+        <render-mode><text type="html"><![CDATA[<div class="dash-widget" data-wkey="snapshot"><div class="dash-handle" title="Drag to reorder">&#8942;&#8942;</div>]]></text></render-mode>
+        <render-mode><text type="html,vuet,qvt" template="true"><![CDATA[
+<div class="zdh-snap">
+  <div class="zdh-card">
+    <div class="zdh-card-h"><span class="zdh-ttl">Recent Transactions</span><a href="/apps/zenith/sales/FindInvoice">View all</a></div>
+    <#if recentTxHas>
+    <div class="zdh-tx">
+      <#list recentTx as tx>
+      <a class="zdh-row" href="${tx.url}">
+        <div style="flex:1;min-width:0"><div class="zdh-no">${tx.no}</div><div class="zdh-dt">${tx.date}</div></div>
+        <div class="zdh-amt">${tx.amt}</div>
+        <span class="zdh-pill ${tx.cl}">${tx.st}</span>
+      </a>
+      </#list>
+    </div>
+    <#else><div class="zdh-empty">No transactions yet.</div></#if>
+  </div>
+  <div class="zdh-card">
+    <div class="zdh-card-h"><span class="zdh-ttl">Business Health</span><a href="/apps/zenith/pos/OwnerDashboard">Full report</a></div>
+    <#if bhHasData>
+    <div class="zdh-ring" style="--zdh-rc:${bhColor};--zdh-rp:${bhScore}"><div><span class="zdh-score">${bhScore}</span><span class="zdh-of">/ 100</span></div></div>
+    <div class="zdh-hl" style="color:${bhColor}">${bhLabel}</div>
+    <#list bhMetrics as m>
+      <div class="zdh-mrow"><span class="zdh-mn">${m.name}</span><span class="zdh-mst" style="background:${m.bg};color:${m.fg}">${m.status}</span></div>
+    </#list>
+    <#else><div class="zdh-empty">Not enough data to score yet.</div></#if>
+  </div>
+  <div class="zdh-card">
+    <div class="zdh-card-h"><span class="zdh-ttl">Top Selling Products</span><a href="/apps/zenith/Inventory/FindProduct">All</a></div>
+    <#if topSellHas>
+    <div class="zdh-top">
+      <#list topSell as t>
+      <div class="zdh-trow">
+        <span class="zdh-rank">${t.rank}</span>
+        <div class="zdh-tmid"><div class="zdh-tn">${t.name}</div><div class="zdh-bar"><span style="width:${t.pct}%"></span></div></div>
+        <div class="zdh-tval"><div class="zdh-tv">${t.val}</div><div class="zdh-tu">${t.units} units</div></div>
+      </div>
+      </#list>
+    </div>
+    <#else><div class="zdh-empty">No sales recorded yet.</div></#if>
+  </div>
+</div>
+]]></text></render-mode>
         <render-mode><text type="html"><![CDATA[</div>]]></text></render-mode>
         </widgets></section>
 
