@@ -1,4 +1,4 @@
-const CACHE_NAME = 'zenith-pos-cache-v5';
+const CACHE_NAME = 'zenith-pos-cache-v6';
 
 // Minimal precache — only what's needed for an offline shell.
 // NOTE: the Terminal screen is mounted at /apps/zenith/pos/Terminal (NOT .../pos/Pos/...);
@@ -55,9 +55,15 @@ self.addEventListener('fetch', event => {
         return;
     }
 
-    // 2) App logic / dynamic screens (unversioned .js/.css, .qvt, Terminal screen):
-    //    network-FIRST so deployed updates are always picked up; cache is offline fallback only.
+    // 2) App logic / dynamic screens (unversioned .js/.css, .qvt, Terminal screen) AND every page
+    //    NAVIGATION: network-FIRST so deployed updates are always picked up; cache is offline fallback
+    //    only. ZE-SHOP fix: page navigations used to fall through to case 3 (cache-first), which froze
+    //    every /apps/zenith/pos/* screen (Dashboard, OwnerDashboard, …) — and its ZenithApp nav chrome —
+    //    at the first-cached version, so POS-using tenants never saw the new sidebar / top bar. Serving
+    //    document navigations network-first keeps the shell (and its authenticated, tenant-specific data)
+    //    always fresh; the offline fallback below still yields the cached page or the Terminal shell.
     const networkFirst =
+        event.request.mode === 'navigate' ||
         url.includes('Terminal') || url.includes('.qvt') ||
         url.endsWith('.js') || url.includes('.js?') ||
         url.endsWith('.css') || url.includes('.css?');
