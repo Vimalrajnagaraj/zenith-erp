@@ -25,7 +25,7 @@ if ! grep -q "$ANCHOR" "$F"; then
   echo "patch-macro-inr: anchor '$ANCHOR' not found (display macro changed?) — FAILING" >&2; exit 1
 fi
 
-INS='        <#-- ZE-INR: Indian lakh/crore regrouping for currency / #,##,##0 display fields (Java DecimalFormat cannot do 3-2-2 grouping) -->\n        <#if fieldValue?has_content && (.node["@currency-unit-field"]?has_content || (.node["@format"]!)?contains("#,##,##0"))><#assign fieldValue = Static["com.zenith.Fmt"].regroup(fieldValue)></#if>'
+INS='        <#-- ZE-INR: Indian lakh/crore regrouping for currency / grouped-number display fields (matches both the #,##0 and #,##,##0 format conventions; Java DecimalFormat cannot do 3-2-2 grouping) -->\n        <#if fieldValue?has_content && (.node["@currency-unit-field"]?has_content || (.node["@format"]!)?contains(",##0"))><#assign fieldValue = Static["com.zenith.Fmt"].regroup(fieldValue)></#if>'
 
 awk -v ins="$INS" 'index($0, "@widgetTextValue .node true") && index($0, "dispDynamic") { print; print ins; next } { print }' "$F" > "$F.zinr_tmp" && mv "$F.zinr_tmp" "$F"
 

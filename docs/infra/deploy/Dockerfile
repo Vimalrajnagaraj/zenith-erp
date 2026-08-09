@@ -44,11 +44,18 @@ RUN sh /tmp/patch-webroot-lazy-rules.sh /opt/moqui/runtime/base-component/webroo
 # Source: docs/infra/framework-patches/patch-log4j2-authzfilter.sh.
 COPY ./framework-patches/patch-log4j2-authzfilter.sh /tmp/patch-log4j2-authzfilter.sh
 RUN sh /tmp/patch-log4j2-authzfilter.sh && rm /tmp/patch-log4j2-authzfilter.sh
-# ZE-INR: Indian lakh/crore digit grouping. (1) com.zenith.Fmt on the runtime classpath regroups a
-# formatted number string to 3-2-2 (Java's DecimalFormat/locales cannot). Component XML wraps explicit
-# ec.l10n.format currency calls with zinr.inr(...) (a shared instance set in ZenithApp pre-actions).
-# (2) The macro patch covers form-single <display> currency fields. Source: docs/infra/zenith-classes/ +
-# docs/infra/framework-patches/patch-macro-inr.sh.
+# ZE-INR: Indian lakh/crore digit grouping (Java's DecimalFormat/locales can only do single 3-grouping).
+#  (1) com.zenith.Fmt on the runtime classpath regroups a formatted number string to 3-2-2. Component XML
+#      wraps explicit ec.l10n.format currency calls (both #,##0 and #,##,##0 conventions) with zinr.inr(...),
+#      a shared instance set in ZenithApp pre-actions (CSV exports deliberately left Western).
+#  (2) patch-macro-inr.sh regroups <display> currency/grouped-number fields in the render macros for EVERY
+#      surface: html (/apps), vuet, and qvt (/qapps). Self-verifying (fails the build if an anchor moved).
+#  (3) patch-webroot-inr-grid.sh wraps m-display's displayValue (client-rendered grid cells) as a backstop.
+# Source: docs/infra/zenith-classes/ + docs/infra/framework-patches/patch-macro-inr.sh + patch-webroot-inr-grid.sh
 COPY ./zenith-classes/ /opt/moqui/runtime/classes/
 COPY ./framework-patches/patch-macro-inr.sh /tmp/patch-macro-inr.sh
-RUN sh /tmp/patch-macro-inr.sh && rm /tmp/patch-macro-inr.sh
+RUN for m in html vuet qvt; do sh /tmp/patch-macro-inr.sh /opt/moqui/runtime/template/screen-macro/DefaultScreenMacros.$m.ftl; done && rm /tmp/patch-macro-inr.sh
+COPY ./framework-patches/patch-webroot-inr-grid.sh /tmp/patch-webroot-inr-grid.sh
+RUN sh /tmp/patch-webroot-inr-grid.sh /opt/moqui/runtime/base-component/webroot/screen/webroot/js/WebrootVue.qvt.min.js \
+ && sh /tmp/patch-webroot-inr-grid.sh /opt/moqui/runtime/base-component/webroot/screen/webroot/js/WebrootVue.qvt.js \
+ && rm /tmp/patch-webroot-inr-grid.sh
