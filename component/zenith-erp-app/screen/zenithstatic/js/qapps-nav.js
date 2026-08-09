@@ -30,17 +30,26 @@
         '/expenses': ['Expenses', 'MyExpenses:My Expenses', 'AllReports:All Reports', 'Categories:Categories', 'Advances:Advances', 'PerDiemRules:Per Diem Rules'],
         '/project': ['Projects', 'Projects:Projects', 'AllTasks:All Tasks']
     };
-    // the "Dashboards" hub shown on the Home/Dashboard landing — [label, href, matchPrefix] across the ERP
+    // the "Dashboards" hub shown on the Home/Dashboard landing — [label, href, matchPrefix, planModule] across
+    // the ERP. A tab is shown only if its planModule is in the tenant's plan (null = always shown).
     var DASHBOARDS = [
-        ['Overview', '/qapps/zenith', '/'],
-        ['Sales', '/qapps/zenith/sales/SalesDashboard', '/sales'],
-        ['POS', '/qapps/zenith/pos/Dashboard', '/pos/Dashboard'],
-        ['Owner Overview', '/qapps/zenith/pos/OwnerDashboard', '/pos/OwnerDashboard'],
-        ['Inventory', '/qapps/zenith/Inventory/InventoryDashboard', '/Inventory'],
-        ['Accounting', '/qapps/zenith/Accounting/AcctgDashboard', '/Accounting'],
-        ['Contacts', '/qapps/zenith/Contacts/ContactsDashboard', '/Contacts'],
-        ['HR', '/qapps/zenith/Hr/HrDashboard', '/Hr']
+        ['Overview', '/qapps/zenith', '/', null],
+        ['Sales', '/qapps/zenith/sales/SalesDashboard', '/sales', 'sales'],
+        ['POS', '/qapps/zenith/pos/Dashboard', '/pos/Dashboard', 'pos'],
+        ['Owner Overview', '/qapps/zenith/pos/OwnerDashboard', '/pos/OwnerDashboard', 'pos'],
+        ['Inventory', '/qapps/zenith/Inventory/InventoryDashboard', '/Inventory', 'inventory'],
+        ['Accounting', '/qapps/zenith/Accounting/AcctgDashboard', '/Accounting', 'accounting'],
+        ['Contacts', '/qapps/zenith/Contacts/ContactsDashboard', '/Contacts', 'contacts'],
+        ['HR', '/qapps/zenith/Hr/HrDashboard', '/Hr', 'hr']
     ];
+    // tenant's allowed plan modules (null = all-access / not a plan-gated tenant)
+    function tenantMods() {
+        try { var cfg = document.getElementById('zenith-saas-cfg');
+            if (cfg && cfg.getAttribute('data-tenant') === 'true' && cfg.getAttribute('data-all') !== 'true') {
+                var m = []; try { m = JSON.parse(cfg.getAttribute('data-modules') || '[]'); } catch (_e) {} return m.length ? m : null;
+            }
+        } catch (_e) {} return null;
+    }
 
     // module → sidebar entry. hrefs stay on /qapps (stay in the SPA); the billing Terminal is /apps-only.
     var CATS = [
@@ -204,7 +213,9 @@
         if (rel === '/' || rel === '/Dashboard') {
             subBar.innerHTML = '';
             subBar.appendChild(el('span', 'zqsub-title', 'Dashboards'));
+            var mods = tenantMods();
             DASHBOARDS.forEach(function (d) {
+                if (d[3] && mods && mods.indexOf(d[3]) < 0) return;   // module not in the tenant's plan → skip
                 var a = el('a', 'zqsub-tab', d[0]); a.href = d[1];
                 var on = (d[2] === '/') ? (rel === '/' || rel === '/Dashboard') : (rel.indexOf(d[2]) === 0);
                 if (on) a.classList.add('on');
