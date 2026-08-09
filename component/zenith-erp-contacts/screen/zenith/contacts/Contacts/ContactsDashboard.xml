@@ -168,6 +168,92 @@
             tcValsJson   = "[" + _tcvals.join(",") + "]"
             tcHasData    = (_tcvals.size() > 0)
 
+            // ===================== ZE-CONTACTS-DASH v2.1.0 (report-driven) — all REAL, org-scoped, MARUTHI-safe.
+            // Warehouses count, Total Contacts, all-time customer health, credit receivables + ageing + overdue
+            // bills, and the honest Business Health composite (never the mockup's fabricated numbers). =========
+            warehouseCount = orgId ? ef.find("mantle.facility.Facility").condition("ownerPartyId", orgId).condition("facilityTypeEnumId","FcTpWarehouse").count() : 0
+            def _allParties = new HashSet(); customerList.each { _allParties.add(it.partyId) }; vendorList.each { _allParties.add(it.partyId) }
+            totalContacts = _allParties.size()
+
+            // all-time finalised sales, per customer: last-purchase + lifetime value (drives active/at-risk/lost + high-value)
+            def _allInvs = orgId ? ef.find("mantle.account.invoice.Invoice").condition("fromPartyId", orgId).condition("invoiceTypeEnumId","InvoiceSales")
+                    .condition("statusId", EntityCondition.IN, ["InvoiceFinalized","InvoicePmtRecvd"])
+                    .selectField("toPartyId").selectField("invoiceDate").selectField("totalTaxableAmount").selectField("totalTaxAmount").selectField("roundOffAmount").list() : []
+            def _lastBy = [:]; def _totBy = [:]
+            def _nowMs = _now.getTime(); def _n90 = _nowMs - 90L*86400000L; def _n180 = _nowMs - 180L*86400000L; def _n30 = _nowMs - 30L*86400000L; def _n60 = _nowMs - 60L*86400000L
+            def _s30 = 0G; def _sp30 = 0G; def _s90 = 0G
+            _allInvs.each {
+                def _amt = ((it.totalTaxableAmount ?: 0G) + (it.totalTaxAmount ?: 0G) + (it.roundOffAmount ?: 0G))
+                def _d = it.invoiceDate ? it.invoiceDate.getTime() : 0L
+                if (_d >= _n90) _s90 += _amt
+                if (_d >= _n30) _s30 += _amt else if (_d >= _n60) _sp30 += _amt
+                if (it.toPartyId) { if (_d > (_lastBy[it.toPartyId] ?: 0L)) _lastBy[it.toPartyId] = _d; _totBy[it.toPartyId] = (_totBy[it.toPartyId] ?: 0G) + _amt }
+            }
+            activeCust = 0; atRiskCust = 0; inactiveCust = 0
+            _lastBy.each { k, v -> if (v >= _n90) activeCust++ else if (v >= _n180) atRiskCust++ else inactiveCust++ }
+            lostCust = inactiveCust; goodStandingCust = activeCust
+            def _avgVal = _totBy ? (_totBy.values().sum() / _totBy.size()) : 0G
+            highValueCust = _totBy.values().count { it > _avgVal }
+
+            // credit receivables + ageing + top overdue bills (POS credit sales still outstanding)
+            totalReceivable = 0G; def _ageAmt = [0G,0G,0G,0G]; def _overdue = 0G; def _bills = []
+            try { if (orgId) ef.find("zenith.erp.pos.PosTransaction").condition("organizationPartyId", orgId).condition("isCredit","Y").condition("statusId","PtCompleted").list().each {
+                def _out = ((it.payableAmount ?: 0G) as BigDecimal) - ((it.paidAmount ?: 0G) as BigDecimal)
+                if (_out <= 0) return
+                totalReceivable += _out
+                def _days = it.entryDate ? (long)((_nowMs - it.entryDate.getTime())/86400000L) : 0L
+                def _bi = _days<=30?0:(_days<=60?1:(_days<=90?2:3)); _ageAmt[_bi] += _out
+                if (_days > 30) _overdue += _out
+                _bills.add([out:_out, days:_days, cust:it.customerPartyId, no:it.transactionNumber])
+            } } catch (Exception e) {}
+            def _tt = totalReceivable > 0 ? totalReceivable.doubleValue() : 1.0
+            def _ageLbls = ['0 &ndash; 30 Days','31 &ndash; 60 Days','61 &ndash; 90 Days','90+ Days']; def _ageDot = ['#16A34A','#F59E0B','#F97316','#EF4444']
+            ageRows = []
+            _ageLbls.eachWithIndex { lbl, i -> ageRows.add([label:lbl, amt:ec.l10n.format(_ageAmt[i],'#,##,##0'), pct:(int)Math.round(_ageAmt[i].doubleValue()*100.0/_tt), dot:_ageDot[i]]) }
+            fmtReceivable = ec.l10n.format(totalReceivable,'#,##,##0'); fmtOverdue = ec.l10n.format(_overdue,'#,##,##0'); creditHasData = totalReceivable > 0
+            _bills.sort { a, b -> (b.out <=> a.out) }
+            overdueBills = []
+            _bills.take(5).each { bl ->
+                def _nm = null
+                if (bl.cust) { def _o=ef.find("mantle.party.Organization").condition("partyId",bl.cust).one(); if(_o)_nm=_o.organizationName
+                    if(!_nm){def _p=ef.find("mantle.party.Person").condition("partyId",bl.cust).one(); if(_p)_nm=((_p.firstName?:'')+' '+(_p.lastName?:'')).trim()} }
+                if (!_nm || _nm.toString().trim()=='') _nm = 'Walk-in / Cash'
+                def _pri = bl.out >= 50000 ? 'High' : (bl.out >= 20000 ? 'Medium' : 'Low')
+                def _pc = (_pri=='High') ? ['#FEE2E2','#991B1B'] : ((_pri=='Medium') ? ['#FEF3C7','#92400E'] : ['#DBEAFE','#1E40AF'])
+                overdueBills.add([name:_nm.toString(), no:(bl.no ?: ''), amt:ec.l10n.format(bl.out,'#,##,##0'), days:bl.days, pri:_pri, pillBg:_pc[0], pillFg:_pc[1]])
+            }
+
+            // Business Health composite (honest; same 5 metrics as the POS/Owner dashboards) + contact health metrics
+            healthMetrics = []; healthScore = 0; healthLabel = '—'; healthHasData = false; healthColor = '#9e9e9e'
+            try {
+                def _colr = { s -> s >= 80 ? 'good' : (s >= 55 ? 'warn' : 'bad') }
+                def _pill = [good:['#DCFCE7','#166534'], warn:['#FEF3C7','#92400E'], bad:['#FEE2E2','#991B1B'], na:['#EEF0F5','#64748B']]
+                def _addm = { name, avail, score, status, ck -> def p=_pill[ck]?:_pill.na; healthMetrics.add([name:name, avail:avail, score:score, status:status, pillBg:p[0], pillFg:p[1]]) }
+                if (_s30 <= 0 && _sp30 <= 0) { _addm('Sales', false, 0, 'No recent sales', 'na') }
+                else { double _g = _sp30>0 ? ((_s30.doubleValue()-_sp30.doubleValue())*100.0/_sp30.doubleValue()) : (_s30>0?100.0:-100.0)
+                    def _sc=_g>=10?95:(_g>=0?80:(_g>=-15?60:35)); def _st=_g>=10?'Strong':(_g>=0?'Good':(_g>=-15?'Fair':'Weak')); def _gp=Math.round(_g)
+                    _addm('Sales', true, _sc, _st+' ('+(_gp>=0?'+':'')+_gp+'% vs prior 30d)', _colr(_sc)) }
+                if (_s30 <= 0) { _addm('Cash Flow', false, 0, 'No recent sales', 'na') }
+                else { def _outv=0G; try { ef.find("zenith.erp.pos.PosExpense").condition("organizationPartyId",orgId).condition("expenseDate",EntityCondition.GREATER_THAN_EQUAL_TO,new java.sql.Timestamp(_n30)).list().each{_outv+=((it.amount?:0G) as BigDecimal)} } catch(Exception e){}
+                    double _r=_outv.doubleValue()*100.0/_s30.doubleValue(); def _sc=_r<5?95:(_r<15?80:(_r<30?60:35)); def _st=_r<5?'Strong':(_r<15?'Healthy':(_r<30?'Watch':'Tight')); _addm('Cash Flow', true, _sc, _st, _colr(_sc)) }
+                if (totalReceivable <= 0) { _addm('Receivables', true, 100, 'Nothing outstanding', 'good') }
+                else { double _r=_s90>0?(totalReceivable.doubleValue()/_s90.doubleValue()):1.0; def _sc=_r<0.02?95:(_r<0.10?80:(_r<0.25?55:30)); def _st=_r<0.02?'Healthy':(_r<0.10?'OK':(_r<0.25?'Needs Attention':'High')); _addm('Receivables', true, _sc, _st, _colr(_sc)) }
+                def _prodTot = orgId ? ef.find("mantle.product.Product").condition("ownerPartyId",orgId).count() : 0
+                if (_prodTot > 0) {
+                    def _tracked = ef.find("mantle.product.Product").condition("ownerPartyId",orgId).condition("inventoryTracked","Y").count()
+                    if (_tracked >= 5) { def _low=0; try { ef.find("zenith.erp.inventory.ProductStockView").condition("ownerPartyId",orgId).list().each{ def q=((it.totalQoh?:0G) as BigDecimal); def rp=((it.reorderPoint?:0G) as BigDecimal); if(q<=0||(rp>0&&q<=rp)) _low++ } } catch(Exception e){}
+                        double _r=_low*1.0/_tracked; def _sc=_r<0.05?95:(_r<0.15?80:(_r<0.30?55:30)); def _st=_r<0.05?'Healthy':(_r<0.15?'Good':(_r<0.30?'Needs Attention':'Low')); _addm('Inventory', true, _sc, _st, _colr(_sc)) }
+                    else { def _wp=ef.find("mantle.product.Product").condition("ownerPartyId",orgId).condition("mrpAmount",EntityCondition.GREATER_THAN,0G).count(); double _r=_wp*1.0/_prodTot; def _sc=_r>=0.95?90:(_r>=0.80?75:(_r>=0.50?55:35)); def _st=_r>=0.80?'Catalog ready':(_r>=0.50?'Some unpriced':'Many unpriced'); _addm('Inventory', true, _sc, _st, _colr(_sc)) }
+                    def _cf=ec.entity.conditionFactory; def _gc=_cf.makeCondition([_cf.makeCondition("gstSlabId",EntityCondition.IS_NOT_NULL,null),_cf.makeCondition("isGstExempt",EntityCondition.EQUALS,"Y"),_cf.makeCondition("hsnCode",EntityCondition.IS_NOT_NULL,null)],EntityCondition.OR)
+                    def _go=ef.find("mantle.product.Product").condition("ownerPartyId",orgId).condition(_gc).count(); double _r=_go*1.0/_prodTot; def _sc=_r>=0.95?95:(_r>=0.80?80:(_r>=0.50?55:30)); def _st=_r>=0.95?'Compliant':(_r>=0.80?'Mostly set':(_r>=0.50?'Partial':'Needs setup')); _addm('GST', true, _sc, _st, _colr(_sc))
+                }
+                def _av = healthMetrics.findAll { it.avail }; healthHasData = (_av.size() > 0)
+                healthScore = healthHasData ? (int) Math.round(_av.sum { it.score } / _av.size()) : 0
+                healthLabel = healthScore>=85?'Excellent':(healthScore>=70?'Good':(healthScore>=55?'Fair':'Needs Work'))
+                healthColor = healthScore>=85?'#16A34A':(healthScore>=70?'#65A30D':(healthScore>=55?'#D97706':'#DC2626'))
+            } catch (Exception e) { healthMetrics=[]; healthScore=0; healthLabel='—'; healthHasData=false; healthColor='#9e9e9e' }
+            healthDash = healthScore*3.6
+
             // ZE-DASH layout: switchable widgets (+ cashier role default) + saved drag order
             def _roleHidden = ''
             try {
@@ -291,16 +377,36 @@
         <section name="wMetrics" condition="showMetrics"><widgets>
         <render-mode><text type="html"><![CDATA[<div class="dash-widget" data-wkey="metrics"><div class="dash-handle" title="Drag to reorder">&#8942;&#8942;</div>]]></text></render-mode>
         <container-row>
-            <row-col lg="4" md="6" sm="12">
-                <!-- Total Customers (current) -->
+            <row-col lg="3" md="6" sm="12">
+                <!-- Total Contacts (distinct customers + suppliers, current directory) -->
+                <container style="zenith-card q-pa-lg bg-white shadow-1 border-radius-lg border-left border-primary q-mb-md">
+                    <container style="row items-center justify-between">
+                        <container>
+                            <label text="Total Contacts" type="h6" style="text-grey-7 q-my-none"/>
+                            <label text="${totalContacts}" type="h3" style="text-primary text-weight-bold q-my-none q-mt-sm"/>
+                            <label text="customers + suppliers" type="p" style="text-grey-6 text-caption q-mb-none q-mt-xs"/>
+                        </container>
+                        <container style="zenith-avatar text-primary bg-indigo-1" type="div">
+                            <render-mode><text type="html"><![CDATA[<q-icon name="groups" class="text-h3"/>]]></text></render-mode>
+                        </container>
+                    </container>
+                    <container style="q-mt-md">
+                        <link url="../FindContact" text="View All" style="q-btn q-btn--flat text-primary text-weight-bold"/>
+                    </container>
+                </container>
+            </row-col>
+
+            <row-col lg="3" md="6" sm="12">
+                <!-- Active Customers (bought in last 90 days) with Lost count -->
                 <container style="zenith-card q-pa-lg bg-white shadow-1 border-radius-lg border-left border-info q-mb-md">
                     <container style="row items-center justify-between">
                         <container>
-                            <label text="Total Customers" type="h6" style="text-grey-7 q-my-none"/>
-                            <label text="${totalCustomers}" type="h3" style="text-info text-weight-bold q-my-none q-mt-sm"/>
+                            <label text="Customers (Active)" type="h6" style="text-grey-7 q-my-none"/>
+                            <label text="${activeCust}" type="h3" style="text-info text-weight-bold q-my-none q-mt-sm"/>
+                            <label text="bought in last 90 days · Lost: ${lostCust}" type="p" style="text-grey-6 text-caption q-mb-none q-mt-xs"/>
                         </container>
                         <container style="zenith-avatar text-info bg-cyan-1" type="div">
-                            <render-mode><text type="html"><![CDATA[<q-icon name="groups" class="text-h3"/>]]></text></render-mode>
+                            <render-mode><text type="html"><![CDATA[<q-icon name="shopping_bag" class="text-h3"/>]]></text></render-mode>
                         </container>
                     </container>
                     <container style="q-mt-md">
@@ -309,13 +415,14 @@
                 </container>
             </row-col>
 
-            <row-col lg="4" md="6" sm="12">
-                <!-- Total Vendors (current) -->
+            <row-col lg="3" md="6" sm="12">
+                <!-- Suppliers (current directory) -->
                 <container style="zenith-card q-pa-lg bg-white shadow-1 border-radius-lg border-left border-warning q-mb-md">
                     <container style="row items-center justify-between">
                         <container>
-                            <label text="Total Suppliers" type="h6" style="text-grey-7 q-my-none"/>
+                            <label text="Suppliers (Active)" type="h6" style="text-grey-7 q-my-none"/>
                             <label text="${totalVendors}" type="h3" style="text-warning text-weight-bold q-my-none q-mt-sm"/>
+                            <label text="companies you buy from" type="p" style="text-grey-6 text-caption q-mb-none q-mt-xs"/>
                         </container>
                         <container style="zenith-avatar text-warning bg-orange-1" type="div">
                             <render-mode><text type="html"><![CDATA[<q-icon name="local_shipping" class="text-h3"/>]]></text></render-mode>
@@ -327,18 +434,21 @@
                 </container>
             </row-col>
 
-            <row-col lg="4" md="12" sm="12">
-                <!-- Active customers in the selected range (from finalised sales) -->
-                <container style="zenith-card q-pa-lg bg-white shadow-1 border-radius-lg border-left border-primary q-mb-md">
+            <row-col lg="3" md="6" sm="12">
+                <!-- Warehouses (real facility count) -->
+                <container style="zenith-card q-pa-lg bg-white shadow-1 border-radius-lg border-left border-positive q-mb-md">
                     <container style="row items-center justify-between">
                         <container>
-                            <label text="Active Customers" type="h6" style="text-grey-7 q-my-none"/>
-                            <label text="${acActiveInRange}" type="h3" style="text-primary text-weight-bold q-my-none q-mt-sm"/>
-                            <label text="bought from you · ${acRangeLabel}" type="p" style="text-grey-6 text-caption q-mb-none q-mt-xs"/>
+                            <label text="Warehouses" type="h6" style="text-grey-7 q-my-none"/>
+                            <label text="${warehouseCount}" type="h3" style="text-positive text-weight-bold q-my-none q-mt-sm"/>
+                            <label text="stock-holding facilities" type="p" style="text-grey-6 text-caption q-mb-none q-mt-xs"/>
                         </container>
-                        <container style="zenith-avatar text-primary bg-indigo-1" type="div">
-                            <render-mode><text type="html"><![CDATA[<q-icon name="shopping_bag" class="text-h3"/>]]></text></render-mode>
+                        <container style="zenith-avatar text-positive bg-green-1" type="div">
+                            <render-mode><text type="html"><![CDATA[<q-icon name="warehouse" class="text-h3"/>]]></text></render-mode>
                         </container>
+                    </container>
+                    <container style="q-mt-md">
+                        <link url="/apps/zenith/Inventory/FindFacility" text="Manage Facilities" style="q-btn q-btn--flat text-positive text-weight-bold"/>
                     </container>
                 </container>
             </row-col>
@@ -430,6 +540,84 @@
         </container>
         <render-mode><text type="html"><![CDATA[</div>]]></text></render-mode>
         </widgets></section>
+
+        <!-- ===== ZE-CONTACTS-DASH v2.1.0 (report Figs 3.5–3.7): Business Health + Overdue Credit Bills + Credit & Collection.
+             Static HTML (inline styles + FreeMarker) so it renders on both /apps and /qapps. All values are REAL. ===== -->
+        <render-mode><text type="html,vuet,qvt" template="true"><![CDATA[
+        <div style="background:#fff;border-radius:14px;box-shadow:0 1px 3px rgba(70,61,122,.08);padding:20px;margin-bottom:16px;font-family:Segoe UI,Arial,sans-serif">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
+            <span style="font-size:16px;font-weight:800;color:#6E56CF">Business Health</span>
+            <a href="/apps/zenith/pos/OwnerDashboard" style="font-size:12.5px;color:#6E56CF;text-decoration:none;font-weight:700">View Full Report &rarr;</a>
+          </div>
+          <#if healthHasData>
+          <div style="display:flex;gap:28px;flex-wrap:wrap;align-items:center">
+            <div style="flex:0 0 auto;position:relative;width:120px;height:120px;border-radius:50%;background:conic-gradient(${healthColor} ${healthDash}deg,#ECE8FB 0)">
+              <div style="position:absolute;top:10px;left:10px;right:10px;bottom:10px;background:#fff;border-radius:50%;display:flex;flex-direction:column;align-items:center;justify-content:center">
+                <span style="font-size:30px;font-weight:800;color:${healthColor};line-height:1">${healthScore}</span>
+                <span style="font-size:11px;color:#8983A0">/100</span>
+                <span style="font-size:11px;font-weight:800;color:${healthColor};margin-top:2px">${healthLabel}</span>
+              </div>
+            </div>
+            <div style="flex:1 1 240px;min-width:200px">
+              <#list healthMetrics as m>
+                <div style="display:flex;align-items:center;justify-content:space-between;padding:6px 0;border-bottom:1px solid #F1EEFA">
+                  <span style="font-size:13.5px;color:#3F3A57;font-weight:600">${m.name}</span>
+                  <span style="font-size:11.5px;font-weight:800;padding:3px 10px;border-radius:12px;background:${m.pillBg};color:${m.pillFg}">${m.status}</span>
+                </div>
+              </#list>
+            </div>
+            <div style="flex:1 1 200px;min-width:180px">
+              <div style="font-size:12px;font-weight:800;color:#463D7A;text-transform:uppercase;letter-spacing:.04em;margin-bottom:8px">Contact Health</div>
+              <div style="display:flex;justify-content:space-between;font-size:13px;padding:4px 0"><span style="color:#5C6B85">In Good Standing</span><b style="color:#16A34A">${goodStandingCust}</b></div>
+              <div style="display:flex;justify-content:space-between;font-size:13px;padding:4px 0"><span style="color:#5C6B85">At Risk</span><b style="color:#D97706">${atRiskCust}</b></div>
+              <div style="display:flex;justify-content:space-between;font-size:13px;padding:4px 0"><span style="color:#5C6B85">Inactive / Lost</span><b style="color:#DC2626">${inactiveCust}</b></div>
+              <div style="display:flex;justify-content:space-between;font-size:13px;padding:4px 0"><span style="color:#5C6B85">High Value</span><b style="color:#6E56CF">${highValueCust}</b></div>
+            </div>
+          </div>
+          <#else>
+          <div style="background:#EEF2FF;color:#3730A3;padding:14px;border-radius:8px;font-size:13px">Not enough recent sales or catalogue data yet to score business health &mdash; record some sales and set up your products to see it here.</div>
+          </#if>
+        </div>
+        ]]></text></render-mode>
+        <container-row>
+          <row-col lg="7" md="12" sm="12">
+            <render-mode><text type="html,vuet,qvt" template="true"><![CDATA[
+            <div style="background:#fff;border-radius:14px;box-shadow:0 1px 3px rgba(70,61,122,.08);padding:18px;margin-bottom:16px;font-family:Segoe UI,Arial,sans-serif;height:100%">
+              <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+                <span style="font-size:15px;font-weight:800;color:#6E56CF">Pending Follow-ups &mdash; Overdue Credit Bills</span>
+                <a href="/apps/zenith/pos/CreditBills" style="font-size:12px;color:#6E56CF;text-decoration:none;font-weight:700">View All &rarr;</a>
+              </div>
+              <#if (overdueBills?size > 0)>
+              <#list overdueBills as b>
+                <div style="display:flex;align-items:center;gap:12px;padding:9px 0;border-bottom:1px solid #F1EEFA">
+                  <span style="font-size:10.5px;font-weight:800;padding:3px 9px;border-radius:12px;background:${b.pillBg};color:${b.pillFg};flex:0 0 auto;width:52px;text-align:center">${b.pri}</span>
+                  <div style="flex:1 1 auto;min-width:0"><div style="font-size:13.5px;font-weight:700;color:#2C2A3F;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${b.name}</div><#if b.no?has_content><div style="font-size:11px;color:#8983A0">Bill ${b.no}</div></#if></div>
+                  <div style="flex:0 0 auto;text-align:right"><div style="font-size:13.5px;font-weight:800;color:#2C2A3F">&#8377;${b.amt}</div><div style="font-size:11px;color:#DC2626">Overdue by ${b.days} days</div></div>
+                </div>
+              </#list>
+              <#else>
+              <div style="background:#DCFCE7;color:#166534;padding:18px;border-radius:8px;font-size:13px;text-align:center">No overdue credit bills &mdash; every credit sale is settled. &#127881;</div>
+              </#if>
+            </div>
+            ]]></text></render-mode>
+          </row-col>
+          <row-col lg="5" md="12" sm="12">
+            <render-mode><text type="html,vuet,qvt" template="true"><![CDATA[
+            <div style="background:#fff;border-radius:14px;box-shadow:0 1px 3px rgba(70,61,122,.08);padding:18px;margin-bottom:16px;font-family:Segoe UI,Arial,sans-serif;height:100%">
+              <div style="font-size:15px;font-weight:800;color:#6E56CF;margin-bottom:12px">Credit &amp; Collection Summary</div>
+              <div style="display:flex;gap:12px;margin-bottom:14px">
+                <div style="flex:1;background:#F0FDF4;border:1px solid #BBF7D0;border-radius:10px;padding:12px"><div style="font-size:11px;color:#5C6B85">Total Receivables</div><div style="font-size:19px;font-weight:800;color:#16A34A">&#8377;${fmtReceivable}</div></div>
+                <div style="flex:1;background:#FEF2F2;border:1px solid #FECACA;border-radius:10px;padding:12px"><div style="font-size:11px;color:#5C6B85">Overdue (&gt;30d)</div><div style="font-size:19px;font-weight:800;color:#DC2626">&#8377;${fmtOverdue}</div></div>
+              </div>
+              <div style="font-size:12px;font-weight:800;color:#463D7A;margin-bottom:6px">Ageing Breakdown</div>
+              <#list ageRows as a>
+                <div style="display:flex;align-items:center;gap:8px;padding:5px 0"><span style="width:9px;height:9px;border-radius:50%;background:${a.dot};flex:0 0 auto"></span><span style="flex:1;font-size:12.5px;color:#3F3A57">${a.label}</span><span style="font-size:12.5px;font-weight:700;color:#2C2A3F">&#8377;${a.amt}</span><span style="font-size:12px;font-weight:800;color:${a.dot};width:38px;text-align:right">${a.pct}%</span></div>
+              </#list>
+              <#if !creditHasData><div style="font-size:12px;color:#8983A0;margin-top:6px">No outstanding credit bills right now.</div></#if>
+            </div>
+            ]]></text></render-mode>
+          </row-col>
+        </container-row>
 
         <render-mode><text type="html"><![CDATA[<div id="dashExtras">]]></text></render-mode>
         <container-row>
