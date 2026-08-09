@@ -27,6 +27,15 @@ RUN sh /tmp/patch-webroot-nav.sh && rm /tmp/patch-webroot-nav.sh
 # the framework breadcrumb template changed). Source: docs/infra/framework-patches/patch-webroot-breadcrumb.sh.
 COPY ./framework-patches/patch-webroot-breadcrumb.sh /tmp/patch-webroot-breadcrumb.sh
 RUN sh /tmp/patch-webroot-breadcrumb.sh && rm /tmp/patch-webroot-breadcrumb.sh
+# ZE-STORES-UI (defect_report_new_store_ui): make required/rule'd form fields validate ONLY on submit, not
+# eagerly on blur (so a required field can't flash its error the moment an autofocused dialog loses focus).
+# Adds lazy-rules="ondemand" to m-text-line + m-date-time q-inputs; m-form's submit still calls qForm.validate()
+# so submit-time validation is fully preserved. Idempotent + self-verifying (fails the build if the field
+# template changed). Source: docs/infra/framework-patches/patch-webroot-lazy-rules.sh.
+COPY ./framework-patches/patch-webroot-lazy-rules.sh /tmp/patch-webroot-lazy-rules.sh
+RUN sh /tmp/patch-webroot-lazy-rules.sh /opt/moqui/runtime/base-component/webroot/screen/webroot/js/WebrootVue.qvt.min.js \
+ && sh /tmp/patch-webroot-lazy-rules.sh /opt/moqui/runtime/base-component/webroot/screen/webroot/js/WebrootVue.qvt.js \
+ && rm /tmp/patch-webroot-lazy-rules.sh
 # ZE-INV-IV-033: suppress the benign ZTF_ASSET/ZTF_FACILITY "not included in view-entity" ERROR spam from
 # ArtifactExecutionFacadeImpl. StockByFacilityView/ProductStockView LEFT-joined Asset/Facility members can't
 # carry the filter's ownerPartyId alias without dropping facility-less/stock-less rows (ZE-INV-002 regression),
