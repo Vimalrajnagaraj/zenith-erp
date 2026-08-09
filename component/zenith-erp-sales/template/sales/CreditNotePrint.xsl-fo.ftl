@@ -1,7 +1,7 @@
 <#-- GST Credit/Debit Note Template for Moqui (CBIC Compliant) -->
 <#assign dateFormat = dateFormat!"dd-MMM-yyyy">
 <#macro encodeText textValue>${(Static["org.moqui.util.StringUtilities"].encodeForXmlAttribute(textValue!"", false))!""}</#macro>
-<#macro formatINR amount>${ec.l10n.format(amount!0, "#,##0.00")}</#macro>
+<#macro formatINR amount>${Static["com.zenith.Fmt"].regroup(ec.l10n.format(amount!0, "#,##0.00"))}</#macro>
 
 <#-- ZE-POS-009 sweep: words come from the screen (Indian numbering). The old ec.l10n.format(amt,
      "spellout") treated "spellout" as a literal decimal-format prefix -> printed "spellout118". -->

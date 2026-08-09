@@ -1,7 +1,7 @@
 <#-- Robu-Style Premium GST Tax Invoice Template for Moqui -->
 <#assign dateFormat = dateFormat!"dd/MM/yyyy">
 <#macro encodeText textValue>${(Static["org.moqui.util.StringUtilities"].encodeForXmlAttribute(textValue!"", false))!""}</#macro>
-<#macro formatINR amount>${ec.l10n.format(amount!0, "#,##0.00")}</#macro>
+<#macro formatINR amount>${Static["com.zenith.Fmt"].regroup(ec.l10n.format(amount!0, "#,##0.00"))}</#macro>
 
 <#assign amountWords = (amountInWords)!"">
 

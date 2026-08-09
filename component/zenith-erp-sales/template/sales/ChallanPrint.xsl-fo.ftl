@@ -1,7 +1,7 @@
 <#-- Delivery Challan Template for Moqui (GST Rule 55 Compliant) -->
 <#assign dateFormat = dateFormat!"dd-MMM-yyyy">
 <#macro encodeText textValue>${(Static["org.moqui.util.StringUtilities"].encodeForXmlAttribute(textValue!"", false))!""}</#macro>
-<#macro formatINR amount>Rs. ${ec.l10n.format(amount!0, "#,##0.00")}</#macro>
+<#macro formatINR amount>Rs. ${Static["com.zenith.Fmt"].regroup(ec.l10n.format(amount!0, "#,##0.00"))}</#macro>
 
 <fo:root xmlns:fo="http://www.w3.org/1999/XSL/Format" font-family="Helvetica, sans-serif" font-size="9pt">
     <fo:layout-master-set>

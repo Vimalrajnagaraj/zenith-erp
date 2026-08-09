@@ -2,7 +2,7 @@
 <#assign cellPadding = "3pt">
 <#assign dateFormat = dateFormat!"dd-MMM-yyyy">
 <#macro encodeText textValue>${(Static["org.moqui.util.StringUtilities"].encodeForXmlAttribute(textValue!"", false))!""}</#macro>
-<#macro formatINR amount>Rs. ${ec.l10n.format(amount!0, "#,##0.00")}</#macro>
+<#macro formatINR amount>Rs. ${Static["com.zenith.Fmt"].regroup(ec.l10n.format(amount!0, "#,##0.00"))}</#macro>
     <fo:layout-master-set>
         <fo:simple-page-master master-name="A4" page-width="210mm" page-height="297mm"
                                margin-top="10mm" margin-bottom="15mm" margin-left="10mm" margin-right="10mm">

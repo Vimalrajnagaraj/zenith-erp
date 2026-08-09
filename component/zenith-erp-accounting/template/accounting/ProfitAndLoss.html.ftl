@@ -12,7 +12,7 @@
         </td>
         <#list displayTimePeriodIdList as timePeriodId>
             <#assign classPerAmount = (classInfo.postedNoClosingByTimePeriod[timePeriodId]!0)*negMult>
-            <td class="text-right"><#if classPerAmount != 0>${ec.l10n.format(classPerAmount, currencyFormat)}<#if (classPerAmount >= 0)>&nbsp;</#if><#else>-</#if></td>
+            <td class="text-right"><#if classPerAmount != 0>${Static["com.zenith.Fmt"].regroup(ec.l10n.format(classPerAmount, currencyFormat))}<#if (classPerAmount >= 0)>&nbsp;</#if><#else>-</#if></td>
         </#list>
     </tr>
     <#list classInfo.glAccountInfoList! as glAccountInfo>
@@ -22,7 +22,7 @@
                 <td style="padding-left: ${(depth-1) * indentMult + (indentMult * 1.5) + 1}rem;">${glAccountInfo.accountCode}: ${glAccountInfo.accountName}</td>
                 <#list displayTimePeriodIdList as timePeriodId>
                     <#assign currentAmt = (glAccountInfo.postedNoClosingByTimePeriod[timePeriodId]!0)*negMult>
-                    <td class="text-right"><#if currentAmt != 0>${ec.l10n.format(currentAmt, currencyFormat)}<#if (currentAmt >= 0)>&nbsp;</#if><#else>-</#if></td>
+                    <td class="text-right"><#if currentAmt != 0>${Static["com.zenith.Fmt"].regroup(ec.l10n.format(currentAmt, currencyFormat))}<#if (currentAmt >= 0)>&nbsp;</#if><#else>-</#if></td>
                 </#list>
             </tr>
         </#if>
@@ -35,7 +35,7 @@
             <td style="padding-left: ${((depth-1) * indentMult) + 1}rem;">Total ${ec.l10n.localize(classInfo.className)}</td>
             <#list displayTimePeriodIdList as timePeriodId>
                 <#assign currentAmt = (classInfo.totalPostedNoClosingByTimePeriod[timePeriodId]!0)*negMult>
-                <td class="text-right">${ec.l10n.format(currentAmt, currencyFormat)}<#if (currentAmt >= 0)>&nbsp;</#if></td>
+                <td class="text-right">${Static["com.zenith.Fmt"].regroup(ec.l10n.format(currentAmt, currencyFormat))}<#if (currentAmt >= 0)>&nbsp;</#if></td>
             </#list>
         </tr>
     </#if>
@@ -62,7 +62,7 @@
                     <#assign revAmt = classInfoById.REVENUE.totalPostedNoClosingByTimePeriod[timePeriodId]!0>
                     <#assign incAmt = classInfoById.INCOME.totalPostedNoClosingByTimePeriod[timePeriodId]!0>
                     <#assign totalRev = revAmt + incAmt>
-                    <td class="text-right">${ec.l10n.format(totalRev, currencyFormat)}</td>
+                    <td class="text-right">${Static["com.zenith.Fmt"].regroup(ec.l10n.format(totalRev, currencyFormat))}</td>
                 </#list>
             </tr>
 
@@ -78,7 +78,7 @@
                     <#assign expAmt = (classInfoById.EXPENSE.totalPostedNoClosingByTimePeriod[timePeriodId]!0) * -1>
                     <#assign nonOpAmt = (classInfoById.NON_OP_EXPENSE.totalPostedNoClosingByTimePeriod[timePeriodId]!0) * -1>
                     <#assign totalExp = cogsAmt + expAmt + nonOpAmt>
-                    <td class="text-right">${ec.l10n.format(totalExp, currencyFormat)}</td>
+                    <td class="text-right">${Static["com.zenith.Fmt"].regroup(ec.l10n.format(totalExp, currencyFormat))}</td>
                 </#list>
             </tr>
 
@@ -86,7 +86,7 @@
                 <td style="padding-left: 1rem;">V. Profit before Tax (III - IV)</td>
                 <#list displayTimePeriodIdList as timePeriodId>
                     <#assign pbtAmt = netIncomeMap[timePeriodId]!0>
-                    <td class="text-right">${ec.l10n.format(pbtAmt, currencyFormat)}</td>
+                    <td class="text-right">${Static["com.zenith.Fmt"].regroup(ec.l10n.format(pbtAmt, currencyFormat))}</td>
                 </#list>
             </tr>
         </tbody>
