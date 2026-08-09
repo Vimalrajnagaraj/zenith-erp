@@ -67,7 +67,8 @@
         { head: 'OPERATIONS', items: [
             { mod: 'inventory', match: '/Inventory', icon: 'inventory_2', label: 'Inventory', href: '/qapps/zenith/Inventory/InventoryDashboard' },
             { mod: 'manufacturing', match: '/manufacturing', icon: 'precision_manufacturing', label: 'Manufacturing', href: '/qapps/zenith/manufacturing/WorkOrders' },
-            { mod: 'project', match: '/project', icon: 'folder_open', label: 'Projects', href: '/qapps/zenith/project' }
+            { mod: 'project', match: '/project', icon: 'folder_open', label: 'Projects', href: '/qapps/zenith/project' },
+            { match: '/Stores', icon: 'storefront', label: 'Shops', href: '/qapps/zenith/Stores/FindStore' }
         ] },
         { head: 'FINANCE', items: [
             { mod: 'accounting', match: '/Accounting', icon: 'account_balance', label: 'Accounting', href: '/qapps/zenith/Accounting/AcctgDashboard' },
@@ -173,6 +174,11 @@
                 a.addEventListener('click', function (e) { e.preventDefault(); e.stopPropagation(); submit(id); }); return a; };
             menu.appendChild(item('', 'All Shops (combined)', !activeShop));
             shops.forEach(function (s) { menu.appendChild(item(s.id, s.name, s.id === activeShop)); });
+            var msep = el('div'); msep.style.cssText = 'height:1px;background:#EEE9F7;margin:5px 6px'; menu.appendChild(msep);
+            var mmg = el('a', 'zqsm-item'); mmg.href = '/qapps/zenith/Stores/FindStore'; mmg.style.fontWeight = '700';
+            mmg.appendChild(mi('add')); mmg.appendChild(el('span', null, 'Add / manage shops'));
+            mmg.addEventListener('click', function (e) { e.stopPropagation(); });
+            menu.appendChild(mmg);
             ov.appendChild(menu);
             ov.addEventListener('click', function (e) { e.stopPropagation(); menu.classList.toggle('show'); });
             document.addEventListener('click', function () { menu.classList.remove('show'); });
@@ -274,10 +280,12 @@
         return true;
     }
 
-    // the Quasar shell renders asynchronously — wait for the layout to exist
+    // the Quasar shell renders asynchronously — wait for the layout AND the screen config (#z-shopdata, which
+    // drives the shop switcher) so canSwitch is read correctly; fall back after ~4s if the config never loads.
     var tries = 0;
     var iv = setInterval(function () {
         tries++;
+        if (!document.getElementById('z-shopdata') && tries <= 16) return;
         if (init() || tries > 60) clearInterval(iv);
     }, 250);
 })();
