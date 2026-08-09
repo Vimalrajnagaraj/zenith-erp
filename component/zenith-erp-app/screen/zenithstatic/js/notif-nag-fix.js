@@ -28,17 +28,24 @@
       };
     }
   } catch (e) {}
-  // (1) Root cause: make an auto (non-gesture) permission request report the current state without
-  // prompting, so neither the native prompt nor the "denied" callback (and its toast) fire on load.
+  // (1) Root cause: neutralise ONLY the auto (non-gesture) permission request the framework fires on
+  // mount — report the current state without prompting, so neither the native prompt nor the "denied"
+  // callback (and its toast) fire on load. A request made during a genuine user gesture (e.g. the
+  // "Enable notifications" button on the My Notifications screen) is passed straight through to the
+  // real API, so the standard Notification.requestPermission() still works when the user asks for it.
   try {
     if (window.Notification && typeof window.Notification.requestPermission === 'function') {
       var _orig = window.Notification.requestPermission.bind(window.Notification);
       window.Notification.requestPermission = function (cb) {
-        var perm = 'default';
+        var gesture = false;
+        try { gesture = !!(navigator.userActivation && navigator.userActivation.isActive); } catch (e) {}
+        if (gesture) return _orig(cb);                     // real user gesture -> real prompt
+        var perm = 'default';                               // auto on-mount call -> report state, no prompt
         try { perm = window.Notification.permission || 'default'; } catch (e) {}
         try { if (typeof cb === 'function') cb(perm); } catch (e) {}
         return (typeof Promise !== 'undefined') ? Promise.resolve(perm) : undefined;
       };
+      // guaranteed-real handle for the opt-in button (works even where navigator.userActivation is absent)
       try { window.moqui = window.moqui || {}; window.moqui._realNotifRequest = _orig; } catch (e) {}
     }
   } catch (e) {}
