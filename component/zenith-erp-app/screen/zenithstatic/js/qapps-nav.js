@@ -13,6 +13,23 @@
 (function () {
     if (location.pathname.indexOf('/qapps/') !== 0) return;   // Quasar shell only
     if (window.__zqNav) return; window.__zqNav = 1;
+    try { document.body.classList.add('zq-nav'); } catch (_e) {}   // apply the chrome CSS from first paint (no black header flash)
+
+    // per-module sub-nav tabs — [moduleTitle, 'segment:label', …]; href = /qapps/zenith/<mount>/<segment>
+    // (POS Terminal → /apps billing surface). Mirrors the /apps #z-subnav route map.
+    var SUBNAV = {
+        '/Contacts': ['Contacts', 'ContactsDashboard:Dashboard', 'FindContact:All Contacts', 'Customers:Customers', 'Vendors:Suppliers', 'CustomerGroups:Customer Groups', 'MergeContacts:Merge'],
+        '/sales': ['Sales', 'SalesDashboard:Dashboard', 'FindQuotation:Quotations', 'FindOrder:Orders', 'FindDeliveryChallan:Delivery Challans', 'FindInvoice:Invoices', 'FindCreditNote:Credit / Debit Notes', 'PosSalesRegister:POS Sales', 'WarrantyPolicies:Warranty', 'Commissions:Commissions', 'SalesForecast:Forecast'],
+        '/Purchase': ['Purchase', 'GoodsReceipt:Goods Receipt (GRN)', 'FindPurchaseOrder:Purchase Orders', 'FindPurchaseInvoice:Vendor Bills (ITC)', 'CreatePurchaseInvoice:Log Vendor Bill', 'PurchaseInvoices:Purchase Invoices', 'PurchaseReturns:Purchase Returns', 'JobWorkChallan:Job Work Challan', 'RfqList:RFQs', 'Gstr2bRecon:GSTR-2B Recon', 'VendorEvaluation:Vendor Evaluation'],
+        '/Crm': ['CRM', 'Leads:Leads', 'Pipeline:Pipeline', 'Activities:Activities', 'Segments:Segments'],
+        '/pos': ['POS', 'Dashboard:Dashboard', 'OwnerDashboard:Overview', 'Terminal:Billing Terminal', 'PosTransactions:Transactions', 'DailySummary:Daily Summary', 'PosSessions:Sessions', 'PosTerminals:Terminals', 'CreditBills:Credit Bills', 'CashEntry:Cash Entry', 'Expenses:Expenses', 'Wastage:Wastage', 'Stock:Stock', 'Reports:Reports', 'BillAuditReport:Audit Report', 'ProductPricing:Product Prices', 'PriceOverrides:Price Overrides', 'DiscountSettings:Discount', 'SalesMode:Sales Mode', 'Barcodes:Barcodes', 'BarcodeLabels:Barcode Labels', 'ProductImport:Import', 'ReceiptConfig:Receipts', 'PrinterConfig:Printers', 'Kitchen:Kitchen', 'BillNumberRegister:Bill Register', 'OfflineMode:Offline Mode'],
+        '/Inventory': ['Inventory', 'InventoryDashboard:Dashboard', 'FindProduct:Products', 'StockLevels:Stock Levels', 'FindReceipt:Receiving', 'StockTransfers:Stock Transfers', 'StockAdjustments:Stock Adjustments', 'GatePasses:Gate Passes', 'CreateCatalogue:Catalogues', 'ExpiryDashboard:Expiry Risk', 'SerialNumbers:Serial Numbers', 'DemandForecast:Demand Forecast'],
+        '/manufacturing': ['Manufacturing', 'WorkOrders:Work Orders', 'BillOfMaterials:Bill of Materials', 'WorkCenters:Work Centers', 'JobWork:Job Work', 'MrpPlanning:MRP Planning', 'ProductionSchedule:Production Schedule'],
+        '/Accounting': ['Accounting', 'AcctgDashboard:Dashboard', 'ChartOfAccounts:Chart of Accounts', 'ManualJournalEntry:Journal Entry', 'JournalHistory:Journal History', 'Invoices:Invoices (A/R & A/P)', 'Payments:Payments', 'TrialBalance:Trial Balance', 'ProfitAndLoss:Profit & Loss', 'CashFlowStatement:Cash Flow', 'AgingReport:AR/AP Aging', 'Budgets:Budgets', 'GstReports:GST Reports', 'Gstr3bReport:GSTR-3B', 'TdsRegister:TDS Register', 'MsmeAgingReport:MSME Aging', 'AutoBrs:Bank Feeds & BRS', 'Schedule3Statements:Schedule III', 'RecurringInvoices:Recurring Invoices', 'TallyExport:Tally Export', 'VoucherAudit:Voucher Audit', 'McaAuditLog:MCA Audit Log'],
+        '/payroll': ['Payroll', 'PayrollRuns:Payroll Runs', 'SalaryStructures:Salary Structures', 'TaxDeclarations:Tax Declarations', 'SalaryAdvances:Salary Advances', 'CtcCalculator:CTC Calculator', 'StatutoryCompliance:Statutory Compliance', 'EpfRegister:EPF Register', 'EsiRegister:ESI Register'],
+        '/expenses': ['Expenses', 'MyExpenses:My Expenses', 'AllReports:All Reports', 'Categories:Categories', 'Advances:Advances', 'PerDiemRules:Per Diem Rules'],
+        '/project': ['Projects', 'Projects:Projects', 'AllTasks:All Tasks']
+    };
 
     // module → sidebar entry. hrefs stay on /qapps (stay in the SPA); the billing Terminal is /apps-only.
     var CATS = [
@@ -167,6 +184,30 @@
         if (burger) toolbar.insertBefore(wrap, burger.nextSibling); else toolbar.insertBefore(wrap, toolbar.firstChild);
     }
 
+    // ---- per-module sub-nav bar (below the header): current module's sections as horizontal tabs ----
+    var subBar = null;
+    function updateSubnav() {
+        if (!subBar) return;
+        var rel = location.pathname.replace(/^\/qapps\/zenith/, '') || '/';
+        var key = null, klen = -1;
+        for (var k in SUBNAV) { if (rel.indexOf(k) === 0 && k.length > klen) { key = k; klen = k.length; } }
+        subBar.innerHTML = '';
+        if (!key) { subBar.classList.remove('show'); document.body.classList.remove('zq-has-subnav'); return; }
+        var arr = SUBNAV[key], mount = key.slice(1);
+        subBar.appendChild(el('span', 'zqsub-title', arr[0]));
+        var active = null, alen = -1;
+        for (var i = 1; i < arr.length; i++) {
+            var pair = arr[i], ci = pair.indexOf(':'), seg = pair.slice(0, ci), label = pair.slice(ci + 1);
+            var href = (mount === 'pos' && seg === 'Terminal') ? '/apps/zenith/pos/Terminal' : ('/qapps/zenith/' + mount + '/' + seg);
+            var a = el('a', 'zqsub-tab', label); a.href = href;
+            var m = key + '/' + seg; if (rel.indexOf(m) === 0 && m.length > alen) { active = a; alen = m.length; }
+            subBar.appendChild(a);
+        }
+        if (active) active.classList.add('on');
+        subBar.classList.add('show'); document.body.classList.add('zq-has-subnav');
+        if (active) { try { var r = active.getBoundingClientRect(), br = subBar.getBoundingClientRect(); subBar.scrollLeft += (r.left - br.left) - (subBar.clientWidth / 2) + (r.width / 2); } catch (_e) {} }
+    }
+
     function init() {
         var header = document.querySelector('.q-header');
         var layout = document.querySelector('.q-layout');
@@ -178,6 +219,10 @@
         applyRbac(side);
         applyActive();
         buildTopbar(header);
+        subBar = el('div'); subBar.id = 'zq-subnav';
+        subBar.style.top = (header.offsetHeight || 51) + 'px';
+        body.appendChild(subBar);
+        updateSubnav();
         // collapse (persisted)
         try { if (localStorage.getItem('zqSideCollapsed') === '1') body.classList.add('zq-side-collapsed'); } catch (_e) {}
         var tgl = document.getElementById('zq-side-toggle');
@@ -190,7 +235,7 @@
         side.addEventListener('click', function (e) { if (e.target.closest('.zqs-link')) body.classList.remove('zq-side-open'); });
         // re-apply active highlight on SPA route changes (URL is swapped without a full reload)
         var last = location.pathname;
-        setInterval(function () { if (location.pathname !== last) { last = location.pathname; applyActive(); } }, 400);
+        setInterval(function () { if (location.pathname !== last) { last = location.pathname; applyActive(); updateSubnav(); } }, 400);
         return true;
     }
 
