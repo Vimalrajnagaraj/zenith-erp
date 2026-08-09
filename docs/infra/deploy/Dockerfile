@@ -44,3 +44,11 @@ RUN sh /tmp/patch-webroot-lazy-rules.sh /opt/moqui/runtime/base-component/webroo
 # Source: docs/infra/framework-patches/patch-log4j2-authzfilter.sh.
 COPY ./framework-patches/patch-log4j2-authzfilter.sh /tmp/patch-log4j2-authzfilter.sh
 RUN sh /tmp/patch-log4j2-authzfilter.sh && rm /tmp/patch-log4j2-authzfilter.sh
+# ZE-INR: Indian lakh/crore digit grouping. (1) com.zenith.Fmt on the runtime classpath regroups a
+# formatted number string to 3-2-2 (Java's DecimalFormat/locales cannot). Component XML wraps explicit
+# ec.l10n.format currency calls with zinr.inr(...) (a shared instance set in ZenithApp pre-actions).
+# (2) The macro patch covers form-single <display> currency fields. Source: docs/infra/zenith-classes/ +
+# docs/infra/framework-patches/patch-macro-inr.sh.
+COPY ./zenith-classes/ /opt/moqui/runtime/classes/
+COPY ./framework-patches/patch-macro-inr.sh /tmp/patch-macro-inr.sh
+RUN sh /tmp/patch-macro-inr.sh && rm /tmp/patch-macro-inr.sh
