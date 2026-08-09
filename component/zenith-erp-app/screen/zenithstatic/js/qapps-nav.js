@@ -30,6 +30,17 @@
         '/expenses': ['Expenses', 'MyExpenses:My Expenses', 'AllReports:All Reports', 'Categories:Categories', 'Advances:Advances', 'PerDiemRules:Per Diem Rules'],
         '/project': ['Projects', 'Projects:Projects', 'AllTasks:All Tasks']
     };
+    // the "Dashboards" hub shown on the Home/Dashboard landing — [label, href, matchPrefix] across the ERP
+    var DASHBOARDS = [
+        ['Overview', '/qapps/zenith', '/'],
+        ['Sales', '/qapps/zenith/sales/SalesDashboard', '/sales'],
+        ['POS', '/qapps/zenith/pos/Dashboard', '/pos/Dashboard'],
+        ['Owner Overview', '/qapps/zenith/pos/OwnerDashboard', '/pos/OwnerDashboard'],
+        ['Inventory', '/qapps/zenith/Inventory/InventoryDashboard', '/Inventory'],
+        ['Accounting', '/qapps/zenith/Accounting/AcctgDashboard', '/Accounting'],
+        ['Contacts', '/qapps/zenith/Contacts/ContactsDashboard', '/Contacts'],
+        ['HR', '/qapps/zenith/Hr/HrDashboard', '/Hr']
+    ];
 
     // module → sidebar entry. hrefs stay on /qapps (stay in the SPA); the billing Terminal is /apps-only.
     var CATS = [
@@ -189,6 +200,19 @@
     function updateSubnav() {
         if (!subBar) return;
         var rel = location.pathname.replace(/^\/qapps\/zenith/, '') || '/';
+        // Home/Dashboard landing → the "Dashboards" hub (every ERP dashboard)
+        if (rel === '/' || rel === '/Dashboard') {
+            subBar.innerHTML = '';
+            subBar.appendChild(el('span', 'zqsub-title', 'Dashboards'));
+            DASHBOARDS.forEach(function (d) {
+                var a = el('a', 'zqsub-tab', d[0]); a.href = d[1];
+                var on = (d[2] === '/') ? (rel === '/' || rel === '/Dashboard') : (rel.indexOf(d[2]) === 0);
+                if (on) a.classList.add('on');
+                subBar.appendChild(a);
+            });
+            subBar.classList.add('show'); document.body.classList.add('zq-has-subnav');
+            return;
+        }
         var key = null, klen = -1;
         for (var k in SUBNAV) { if (rel.indexOf(k) === 0 && k.length > klen) { key = k; klen = k.length; } }
         subBar.innerHTML = '';
