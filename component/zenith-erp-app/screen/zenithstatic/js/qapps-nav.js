@@ -85,6 +85,22 @@
     function mi(name) { var s = el('span', 'material-icons', name); return s; }
     var allLinks = [];
 
+    // ZE-NAV: "More Modules" (OTHER category) discloses the dashboard's All Modules grid instead of being a
+    // dead same-page link. On the dashboard → smooth-scroll to it; elsewhere → flag + let the href navigate
+    // home, then the route-change watcher scrolls once the grid renders.
+    function scrollToModules() {
+        var tries = 0;
+        (function poll() {
+            var g = document.getElementById('dashAllModules');
+            if (g) { try { g.scrollIntoView({ behavior: 'smooth', block: 'start' }); } catch (_e) { g.scrollIntoView(); } return; }
+            if (++tries <= 24) setTimeout(poll, 300);
+        })();
+    }
+    function gotoModules(e) {
+        if (document.getElementById('dashAllModules')) { if (e) e.preventDefault(); scrollToModules(); }
+        else { try { sessionStorage.setItem('zqGotoModules', '1'); } catch (_e) {} }
+    }
+
     function buildSidebar() {
         var side = el('aside'); side.id = 'zq-sidebar';
         var brand = el('div', 'zqs-brand');
@@ -98,6 +114,7 @@
                 var a = el('a', 'zqs-link'); a.href = it.href;
                 if (it.mod) a.setAttribute('data-mod', it.mod);
                 a.setAttribute('data-match', it.match);
+                if (it.match === '/__more') a.addEventListener('click', gotoModules);
                 a.appendChild(mi(it.icon));
                 a.appendChild(el('span', 't', it.label));
                 scroll.appendChild(a);
@@ -277,7 +294,7 @@
         side.addEventListener('click', function (e) { if (e.target.closest('.zqs-link')) body.classList.remove('zq-side-open'); });
         // re-apply active highlight on SPA route changes (URL is swapped without a full reload)
         var last = location.pathname;
-        setInterval(function () { if (location.pathname !== last) { last = location.pathname; applyActive(); updateSubnav(); } }, 400);
+        setInterval(function () { if (location.pathname !== last) { last = location.pathname; applyActive(); updateSubnav(); try { if (sessionStorage.getItem('zqGotoModules')) { sessionStorage.removeItem('zqGotoModules'); scrollToModules(); } } catch (_e) {} } }, 400);
         return true;
     }
 
