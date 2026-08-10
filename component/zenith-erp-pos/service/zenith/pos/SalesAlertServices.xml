@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <!-- ZE-DASH-0402 follow-up: near-real-time NEW-SALE alerts.
+
+         OPT-IN per USER (moqui.security.UserPreference ZEN_ALERT_SALES='Y', default absent = OFF) => no-op for
+         every tenant, MARUTHI included, until a user turns it on in "My Notifications". Delivery is the native
+         Moqui NotificationMessage (topic "SalesAlert"): shows as a DESKTOP notification when the user granted
+         browser permission (MoquiLib.notifyNotification), else an in-app growl + the bell.
+
+         SAFETY: a SCHEDULED POLL that only READS completed POS sales — it never touches the sale/billing write
+         path. De-duped by a per-org watermark (last processed sale time) stored in CompanySettings; the first
+         run for an org sets the watermark to "now" so opting in never blasts historical sales. Runs under the
+         cron with no user => loginAnonymousIfNoUser first (mirrors send#ExpiryAlerts). -->
+    <service verb="send" noun="SalesAlerts" authenticate="anonymous-all">
+        <in-parameters>
+            <parameter name="organizationPartyId"><description>Optional: only this org; blank = all opted-in orgs</description></parameter>
+            <parameter name="dryRun" type="Boolean" default="false"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="notified" type="Integer"/>
+            <parameter name="report"/>
+        </out-parameters>
+        <actions>
+            <script><![CDATA[
+                ec.user.loginAnonymousIfNoUser()
+                def EC = org.moqui.entity.EntityCondition
+                def _grp = { v -> try { com.zenith.Fmt.INSTANCE.inr(ec.l10n.format((v ?: 0) as BigDecimal, '#,##,##0')) } catch (Throwable t) { ec.l10n.format((v ?: 0) as BigDecimal, '#,##,##0') } }
+
+                // 1) opted-in users, grouped by their active org
+                def _optRows = ec.entity.find("moqui.security.UserPreference").condition("preferenceKey", "ZEN_ALERT_SALES").condition("preferenceValue", "Y").disableAuthz().list()
+                def _byOrg = [:]
+                for (def _r : _optRows) {
+                    def _uid = _r.userId
+                    def _ao = ec.entity.find("moqui.security.UserPreference").condition("userId", _uid).condition("preferenceKey", "ACTIVE_ORGANIZATION").disableAuthz().one()
+                    def _org = _ao?.preferenceValue
+                    if (!_org || _org == '_NA_') continue
+                    if (organizationPartyId && _org != organizationPartyId) continue
+                    if (!_byOrg[_org]) _byOrg[_org] = []
+                    _byOrg[_org].add(_uid)
+                }
+
+                int _notified = 0; def _log = []
+                def _now = ec.user.nowTimestamp
+                for (def _e : _byOrg.entrySet()) {
+                    def _org = _e.key; def _uids = _e.value.unique()
+
+                    // 2) per-org watermark = last processed sale time, stored as a FULL-PRECISION timestamp string
+                    //    (NOT epoch-ms: a ms-truncated watermark re-alerts a sale whose entryDate carries sub-ms
+                    //    micros, e.g. DB now()). First run => set to now and skip (never blast historical sales).
+                    def _wmRow = ec.entity.find("zenith.erp.base.CompanySettings").condition("organizationPartyId", _org).condition("settingKey", "SALES_ALERT_WM").disableAuthz().one()
+                    if (!_wmRow?.settingValue) {
+                        if (!dryRun) ec.service.sync().name("create#zenith.erp.base.CompanySettings").parameters([organizationPartyId:_org, settingKey:"SALES_ALERT_WM", settingValue:_now.toString()]).disableAuthz().call()
+                        _log.add(_org + ':init'); continue
+                    }
+                    def _wm
+                    try {
+                        def _ws = _wmRow.settingValue.toString().trim()
+                        _wm = _ws.contains('-') ? java.sql.Timestamp.valueOf(_ws) : new java.sql.Timestamp(Long.parseLong(_ws))  // '-' => timestamp string; else legacy epoch-ms
+                    } catch (Exception _pe) { continue }
+
+                    // 3) completed sales since the watermark (READ ONLY)
+                    def _sales = ec.entity.find("zenith.erp.pos.PosTransaction").condition("organizationPartyId", _org).condition("statusId", "PtCompleted")
+                        .condition("entryDate", EC.GREATER_THAN, _wm).condition("entryDate", EC.LESS_THAN_EQUAL_TO, _now)
+                        .disableAuthz().orderBy("entryDate").list()
+                    if (_sales.isEmpty()) continue
+
+                    def _cnt = _sales.size()
+                    BigDecimal _tot = BigDecimal.ZERO
+                    java.sql.Timestamp _maxTs = _wm
+                    for (def s : _sales) { _tot += ((s.payableAmount ?: 0) as BigDecimal); if (s.entryDate != null && s.entryDate.after(_maxTs)) _maxTs = s.entryDate }
+
+                    // desktop notification shows the TITLE only -> put the summary there
+                    def _amt = '₹' + _grp(_tot)
+                    def _title
+                    if (_cnt == 1) { def one = _sales[0]; def bn = one.transactionNumber ?: one.transactionId; _title = 'New sale ' + _amt + ' · ' + bn }
+                    else { _title = _cnt + ' new sales · ' + _amt }
+
+                    _notified++; _log.add(_org + ':' + _cnt)
+                    if (!dryRun) {
+                        def _body = [count:_cnt, total:_tot, organizationPartyId:_org, link:'/apps/zenith/pos/OwnerDashboard', text:_title]
+                        for (def _uid : _uids) {
+                            try { def nm = ec.makeNotificationMessage().topic("SalesAlert").title(_title).message(_body); nm.userId(_uid); nm.send() }
+                            catch (Exception _ne) { ec.logger.warn("SalesAlert notify failed for " + _uid + ": " + _ne.message) }
+                        }
+                        // advance the watermark to the newest sale we just alerted on (full-precision string)
+                        ec.service.sync().name("update#zenith.erp.base.CompanySettings").parameters([organizationPartyId:_org, settingKey:"SALES_ALERT_WM", settingValue:_maxTs.toString()]).disableAuthz().call()
+                    }
+                }
+                notified = _notified
+                report = (dryRun ? '[DRY RUN] ' : '[SENT] ') + 'orgs alerted: ' + _notified + '. Detail: ' + _log
+            ]]></script>
+        </actions>
+    </service>
+
+</services>
