@@ -102,6 +102,16 @@
     }
 
     function buildSidebar() {
+        // ZE-NAV: super-admin-only entry to the platform SaaS Admin panel — mirror the /apps sidebar so it's
+        // reachable from /qapps too (SaasAdmin itself gates on the ADMIN group). Links to the /apps panel.
+        try {
+            var _cfg = document.getElementById('zenith-saas-cfg');
+            var _other = CATS[CATS.length - 1];
+            if (_cfg && _cfg.getAttribute('data-super') === 'true' && _other && _other.head === 'OTHER'
+                && !_other.items.some(function (x) { return x.match === '/saas-admin'; })) {
+                _other.items.push({ match: '/saas-admin', icon: 'admin_panel_settings', label: 'SaaS Admin', href: '/apps/zenith/saas-admin' });
+            }
+        } catch (_e) {}
         var side = el('aside'); side.id = 'zq-sidebar';
         var brand = el('div', 'zqs-brand');
         var img = el('img'); img.src = '/zenithstatic/img/zetaerp-icon-zc.svg'; img.alt = 'ZC'; brand.appendChild(img);
