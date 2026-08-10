@@ -2748,7 +2748,11 @@ window.posToggleFullscreen = function() {
             }
             function doQty(seq, newQty) {
                 newQty = Number(newQty);
-                var ln = bySeq(seq); if (!ln) return;
+                // ZETAERP-POS-CART-001: on session RE-ENTRY the optimistic model (lastCartData) is unseeded
+                // (null) while the server rendered the persisted rows, so bySeq can't find a line. THROW so the
+                // OPT.* wrapper's catch posts the edit straight to the server (TX is seeded from the cart form)
+                // and reseeds the model via renderCart — otherwise a silent return leaves the control "dead".
+                var ln = bySeq(seq); if (!ln) throw 'pos-reseed';
                 // A quantity edit must NEVER delete the line — a decimal/cleared/0 value that
                 // resolved while typing would silently drop the item. Revert to the authoritative
                 // cart instead; removal is only via the explicit × (remove) button.
@@ -2759,7 +2763,7 @@ window.posToggleFullscreen = function() {
             }
             function doPrice(seq, newPrice) {
                 newPrice = Number(newPrice);
-                var ln = bySeq(seq); if (!ln) return;
+                var ln = bySeq(seq); if (!ln) throw 'pos-reseed';   // ZETAERP-POS-CART-001: unseeded re-entry model → server fallback (see doQty)
                 var f = n(ln.price) > 0 ? newPrice / n(ln.price) : 0;
                 ln.price = newPrice;
                 if (f > 0) { ln.total = n(ln.total) * f; ln.tax = n(ln.tax) * f; } else { ln.total = newPrice * n(ln.qty); ln.tax = 0; }
@@ -2767,7 +2771,7 @@ window.posToggleFullscreen = function() {
                 enqueue({ action: 'updatePrice', seq: ln.seq, newPrice: newPrice, needSeq: true, lineKey: ln.pid + '|' + (ln.mode || '') });
             }
             function doRemove(seq) {
-                var L = lc(); if (!L) return;
+                var L = lc(); if (!L) throw 'pos-reseed';   // ZETAERP-POS-CART-001: unseeded re-entry model → server-side remove fallback (see doQty)
                 var ln = bySeq(seq); var key = ln ? (ln.pid + '|' + (ln.mode || '')) : ('rm#' + seq);
                 L.items = L.items.filter(function (it) { return String(it.seq) !== String(seq); });
                 recompute(); renderCart(L);
