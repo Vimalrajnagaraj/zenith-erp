@@ -1,9 +1,11 @@
-/* ZE-DASH: shared dashboard layout engine (switchable widgets + drag-to-reorder).
-   Each dashboard sets window.__dashLayout = { saveUrl: '<screen>/saveDashOrder', order: 'csv,of,wkeys' }
+/* ZE-DASH: shared dashboard layout engine (switchable widgets + drag-to-reorder + optional width presets).
+   Each dashboard sets window.__dashLayout = { saveUrl: '<screen>/saveDashOrder', order: 'csv,of,wkeys', sizes?: 'wkey:half,...' }
    and wraps each toggleable widget as <div class="dash-widget" data-wkey="X"><div class="dash-handle">..</div>..</div>,
    optionally wrapping fixed trailing cards in <div id="dashExtras">. This flattens the widgets into a single
    #dashWidgets column in the saved order, removes the now-empty original layout row, and enables HTML5 drag
-   (via the handle) that POSTs the new order back. Degrades gracefully (try/catch) to the default layout. */
+   (via the handle) that POSTs the new order back. Degrades gracefully (try/catch) to the default layout.
+   WIDTH PRESETS (opt-in): when `sizes` is present (even ''), each widget gets a full/half width toggle; the wrap
+   becomes a flex grid (scoped via .dash-resizable so other dashboards are unaffected) and sizes persist too. */
 (function () {
   try {
     var cfg = window.__dashLayout || {};
@@ -33,6 +35,34 @@
         row.parentNode.removeChild(row);
       }
     });
+
+    // ---- optional width presets (full/half), gated so other dashboards are untouched ----
+    var sizesOn = (cfg.sizes != null);
+    function applySize(w, sz) { w.classList.remove('dw-full', 'dw-half'); w.classList.add(sz === 'half' ? 'dw-half' : 'dw-full'); }
+    function currentSizes() {
+      return [].slice.call(wrap.querySelectorAll('.dash-widget')).map(function (w) {
+        return w.getAttribute('data-wkey') + ':' + (w.classList.contains('dw-half') ? 'half' : 'full');
+      }).filter(function (s) { return /:half$/.test(s); }).join(',');
+    }
+    if (sizesOn) {
+      wrap.classList.add('dash-resizable');
+      var sizeMap = {};
+      (cfg.sizes || '').split(',').forEach(function (pair) { var kv = pair.split(':'); if (kv.length === 2 && kv[0]) sizeMap[kv[0]] = (kv[1] === 'half' ? 'half' : 'full'); });
+      var ICON = '<svg width="13" height="13" viewBox="0 0 14 14" aria-hidden="true"><rect x="1.2" y="3" width="11.6" height="8" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.4"></rect><line x1="7" y1="3.4" x2="7" y2="10.6" stroke="currentColor" stroke-width="1.4"></line></svg>';
+      all.forEach(function (w) {
+        applySize(w, sizeMap[w.getAttribute('data-wkey')] || 'full');
+        var btn = document.createElement('button');
+        btn.type = 'button'; btn.className = 'dash-resize'; btn.innerHTML = ICON;
+        btn.title = 'Resize widget (full / half width)'; btn.setAttribute('aria-label', 'Resize widget between full and half width');
+        btn.addEventListener('click', function (e) {
+          e.preventDefault(); e.stopPropagation();
+          applySize(w, w.classList.contains('dw-half') ? 'full' : 'half');
+          saveLayout();
+        });
+        w.appendChild(btn);
+      });
+    }
+
     if (!cfg.saveUrl) return;
     var dragEl = null;
     all.forEach(function (w) {
@@ -40,7 +70,7 @@
       if (!h) return;
       h.addEventListener('mousedown', function () { w.setAttribute('draggable', 'true'); });
       w.addEventListener('dragstart', function (e) { dragEl = w; w.classList.add('dragging'); try { e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', 'x'); } catch (_e) {} });
-      w.addEventListener('dragend', function () { w.classList.remove('dragging'); w.removeAttribute('draggable'); saveOrder(); });
+      w.addEventListener('dragend', function () { w.classList.remove('dragging'); w.removeAttribute('draggable'); saveLayout(); });
     });
     wrap.addEventListener('dragover', function (e) { e.preventDefault(); if (!dragEl) return; var a = afterEl(e.clientY); if (a == null) wrap.appendChild(dragEl); else wrap.insertBefore(dragEl, a); });
     function afterEl(y) {
@@ -49,10 +79,17 @@
       els.forEach(function (ch) { var b = ch.getBoundingClientRect(); var o = y - b.top - b.height / 2; if (o < 0 && o > res.o) { res = { o: o, e: ch }; } });
       return res.e;
     }
-    function saveOrder() {
-      var keys = [].slice.call(wrap.querySelectorAll('.dash-widget')).map(function (w) { return w.getAttribute('data-wkey'); });
-      var body = 'order=' + encodeURIComponent(keys.join(','));
-      fetch(cfg.saveUrl, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: body, credentials: 'same-origin' }).catch(function () {});
+    var saveTimer = null;
+    function saveLayout() {
+      // debounce so rapid changes (e.g. resizing two widgets quickly) coalesce into ONE final POST —
+      // otherwise near-simultaneous requests race on the same preference and a stale write can win.
+      clearTimeout(saveTimer);
+      saveTimer = setTimeout(function () {
+        var keys = [].slice.call(wrap.querySelectorAll('.dash-widget')).map(function (w) { return w.getAttribute('data-wkey'); });
+        var body = 'order=' + encodeURIComponent(keys.join(','));
+        if (sizesOn) body += '&sizes=' + encodeURIComponent(currentSizes());
+        fetch(cfg.saveUrl, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: body, credentials: 'same-origin' }).catch(function () {});
+      }, 250);
     }
   } catch (_e) {}
 })();
