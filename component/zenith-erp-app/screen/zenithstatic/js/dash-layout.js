@@ -36,31 +36,39 @@
       }
     });
 
-    // ---- optional width presets (full/half), gated so other dashboards are untouched ----
+    // ---- optional width presets (full / half / third), gated so other dashboards are untouched ----
     var sizesOn = (cfg.sizes != null);
-    function applySize(w, sz) { w.classList.remove('dw-full', 'dw-half'); w.classList.add(sz === 'half' ? 'dw-half' : 'dw-full'); }
+    var SIZES = { full: 'dw-full', half: 'dw-half', third: 'dw-third' };
+    function sizeOf(w) { return w.classList.contains('dw-third') ? 'third' : (w.classList.contains('dw-half') ? 'half' : 'full'); }
+    function applySize(w, sz) { w.classList.remove('dw-full', 'dw-half', 'dw-third'); w.classList.add(SIZES[sz] || 'dw-full'); }
     function currentSizes() {
       return [].slice.call(wrap.querySelectorAll('.dash-widget')).map(function (w) {
-        return w.getAttribute('data-wkey') + ':' + (w.classList.contains('dw-half') ? 'half' : 'full');
-      }).filter(function (s) { return /:half$/.test(s); }).join(',');
+        return w.getAttribute('data-wkey') + ':' + sizeOf(w);
+      }).filter(function (s) { return /:(half|third)$/.test(s); }).join(',');
     }
+    // ApexCharts (and other responsive widgets) render at their initial width, so after we change a
+    // widget's column width we must nudge them to re-fit — a window 'resize' is what they listen for.
+    function reflow() { try { window.dispatchEvent(new Event('resize')); } catch (_e) {} }
     if (sizesOn) {
       wrap.classList.add('dash-resizable');
       var sizeMap = {};
-      (cfg.sizes || '').split(',').forEach(function (pair) { var kv = pair.split(':'); if (kv.length === 2 && kv[0]) sizeMap[kv[0]] = (kv[1] === 'half' ? 'half' : 'full'); });
+      (cfg.sizes || '').split(',').forEach(function (pair) { var kv = pair.split(':'); if (kv.length === 2 && kv[0]) { var s = kv[1]; sizeMap[kv[0]] = (s === 'half' || s === 'third') ? s : 'full'; } });
       var ICON = '<svg width="13" height="13" viewBox="0 0 14 14" aria-hidden="true"><rect x="1.2" y="3" width="11.6" height="8" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.4"></rect><line x1="7" y1="3.4" x2="7" y2="10.6" stroke="currentColor" stroke-width="1.4"></line></svg>';
+      var NEXT = { full: 'half', half: 'third', third: 'full' };
       all.forEach(function (w) {
         applySize(w, sizeMap[w.getAttribute('data-wkey')] || 'full');
         var btn = document.createElement('button');
         btn.type = 'button'; btn.className = 'dash-resize'; btn.innerHTML = ICON;
-        btn.title = 'Resize widget (full / half width)'; btn.setAttribute('aria-label', 'Resize widget between full and half width');
+        btn.title = 'Resize widget (full / half / third width)'; btn.setAttribute('aria-label', 'Cycle widget width: full, half, third');
         btn.addEventListener('click', function (e) {
           e.preventDefault(); e.stopPropagation();
-          applySize(w, w.classList.contains('dw-half') ? 'full' : 'half');
-          saveLayout();
+          applySize(w, NEXT[sizeOf(w)]);
+          saveLayout(); reflow();
         });
         w.appendChild(btn);
       });
+      // charts may finish rendering slightly after this runs — re-fit a couple of times as the layout settles
+      reflow(); setTimeout(reflow, 500); setTimeout(reflow, 1400);
     }
 
     if (!cfg.saveUrl) return;
