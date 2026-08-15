@@ -95,7 +95,9 @@
       saveTimer = setTimeout(function () {
         var keys = [].slice.call(wrap.querySelectorAll('.dash-widget')).map(function (w) { return w.getAttribute('data-wkey'); });
         var body = 'order=' + encodeURIComponent(keys.join(','));
-        if (sizesOn) body += '&sizes=' + encodeURIComponent(currentSizes());
+        // '__full__' sentinel = "every widget full" (a real saved state); empty would be ambiguous with
+        // "never customized" (which falls back to the dashboard's default sizes).
+        if (sizesOn) body += '&sizes=' + encodeURIComponent(currentSizes() || '__full__');
         fetch(cfg.saveUrl, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: body, credentials: 'same-origin' }).catch(function () {});
       }, 250);
     }
