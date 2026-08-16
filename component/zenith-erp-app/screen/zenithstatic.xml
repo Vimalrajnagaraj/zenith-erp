@@ -34,6 +34,61 @@
         <default-response type="none"/>
         <actions><script>ec.web.sendResourceResponse("component://zenith-erp-app/screen/zenithstatic/chart.html", true)</script></actions>
     </transition>
+    <!-- ZE-CONTACT-MAP: byte-range serving of the self-hosted India vector tiles (single-file .pmtiles,
+         z0-11) from INSIDE the container image. pmtiles.js requires HTTP 206; Moqui's sendResourceResponse
+         only does 200, so we hand-roll Range here (RandomAccessFile seek). This removes the host-level
+         deps (nginx block + /opt/deploy/maptiles) — the whole map now lives in the deploy artifact.
+         Whitelisted to the one file (no path traversal); public map data so require-authentication="false"
+         is inherited from the screen. See screen/zenithstatic/maptiles/README (git) for regen. -->
+    <transition name="maptiles" read-only="true">
+        <default-response type="none"/>
+        <actions><script><![CDATA[
+            import java.io.RandomAccessFile
+            def resp = ec.web.response
+            String name = sri.screenUrlInfo.extraPathNameList.join("/")
+            if (name != "india.pmtiles") { resp.setStatus(404); return }
+            def resRef = ec.resource.getLocationReference("component://zenith-erp-app/screen/zenithstatic/maptiles/india.pmtiles")
+            if (resRef == null || !resRef.supportsExists() || !resRef.exists) { resp.setStatus(404); return }
+            File f
+            try { f = new File(resRef.getUri()) } catch (Throwable t) { f = new File(System.getProperty("moqui.runtime") + "/component/zenith-erp-app/screen/zenithstatic/maptiles/india.pmtiles") }
+            long len = f.length()
+            resp.setHeader("Accept-Ranges", "bytes")
+            resp.setContentType("application/octet-stream")
+            resp.setHeader("Cache-Control", "public, max-age=2592000")
+            String range = ec.web.request.getHeader("Range")
+            long start = 0L, end = len - 1L
+            boolean partial = false
+            if (range != null && range.startsWith("bytes=")) {
+                String[] p = range.substring(6).split("-", 2)
+                try {
+                    if (p[0] != null && p[0].trim().length() > 0) start = Long.parseLong(p[0].trim())
+                    if (p.length > 1 && p[1] != null && p[1].trim().length() > 0) end = Long.parseLong(p[1].trim())
+                } catch (Exception e) { start = 0L; end = len - 1L }
+                if (end >= len) end = len - 1L
+                if (start < 0L) start = 0L
+                if (start > end) { resp.setHeader("Content-Range", "bytes */" + len); resp.setStatus(416); return }
+                partial = true
+            }
+            long clen = end - start + 1L
+            if (partial) { resp.setStatus(206); resp.setHeader("Content-Range", "bytes " + start + "-" + end + "/" + len) }
+            else { resp.setStatus(200) }
+            resp.setContentLengthLong(clen)
+            RandomAccessFile raf = new RandomAccessFile(f, "r")
+            def os = resp.outputStream
+            try {
+                raf.seek(start)
+                byte[] buf = new byte[65536]
+                long remaining = clen
+                while (remaining > 0L) {
+                    int toRead = (int) Math.min((long) buf.length, remaining)
+                    int n = raf.read(buf, 0, toRead)
+                    if (n < 0) break
+                    os.write(buf, 0, n)
+                    remaining -= n
+                }
+            } finally { raf.close(); os.flush() }
+        ]]></script></actions>
+    </transition>
     <widgets>
         <render-mode><text type="html"><![CDATA[
             <!-- Static resources for Zenith -->

@@ -34,7 +34,7 @@ const out =
 '  return {\n' +
 '    version: 8,\n' +
 '    glyphs: o + "/zenithstatic/fonts/{fontstack}/{range}.pbf",\n' +
-'    sources: { protomaps: { type: "vector", url: "pmtiles://" + o + "/maptiles/india.pmtiles",\n' +
+'    sources: { protomaps: { type: "vector", url: "pmtiles://" + o + "/zenithstatic/maptiles/india.pmtiles",\n' +
 '      attribution: "\u00A9 <a href=\\"https://openstreetmap.org/copyright\\">OpenStreetMap</a> \u00B7 <a href=\\"https://protomaps.com\\">Protomaps</a>" } },\n' +
 '    layers: ' + LAYERS_JSON + '\n' +
 '  };\n' +

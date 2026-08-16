@@ -3,17 +3,19 @@
      - MapLibre GL JS (BSD-3)              /zenithstatic/js/maplibre-gl.js
      - PMTiles protocol (BSD-3)            /zenithstatic/js/pmtiles.js
      - Protomaps basemap style + glyphs    /zenithstatic/js/india-style.js  +  /zenithstatic/fonts/...
-     - India vector tiles (OSM/Protomaps)  /maptiles/india.pmtiles   (single file, z0-11, served by
-                                           nginx from disk WITH HTTP byte-range — location ^~ /maptiles/)
+     - India vector tiles (OSM/Protomaps)  /zenithstatic/maptiles/india.pmtiles  (single file, z0-11,
+                                           range-served by a Moqui transition — zenithstatic.xml)
    The tiles were extracted once from the Protomaps v4 planet for the India bbox, so there is no reliance
-   on any tile service. Only this small helper is head-loaded app-wide; MapLibre (~900KB) + the protocol
-   + the style are LAZY-LOADED on first map render (pages without a map never pay for them). Head-loading
-   means window.zContactMap exists before the body (works on /apps AND the /qapps Quasar SPA, which strips
+   on any tile service. The .pmtiles is baked INTO the container image and range-served by Moqui (the
+   `maptiles` transition), so the whole map lives in the deploy artifact — no host-level nginx/file deps.
+   Only this small helper is head-loaded app-wide; MapLibre (~900KB) + the protocol + the style are
+   LAZY-LOADED on first map render (pages without a map never pay for them). Head-loading means
+   window.zContactMap exists before the body (works on /apps AND the /qapps Quasar SPA, which strips
    inline <script>); each map is driven by an <img onload> attribute (survives the strip). Markers + the
    home pin come from the map div's data-markers / data-home attributes. Degrades quietly.
-   [Alt serving: a static z/x/y pyramid (zenithstatic/maptiles/india, no byte-range) — see maptiles/README.] */
+   [Alt serving: a static z/x/y pyramid (no byte-range) — see maptiles/README.] */
 (function () {
-  var V = '?v=8';
+  var V = '?v=9';
   var CSS = '/zenithstatic/css/maplibre-gl.css' + V;
   var JS = [
     '/zenithstatic/js/maplibre-gl.js' + V,   // defines window.maplibregl
