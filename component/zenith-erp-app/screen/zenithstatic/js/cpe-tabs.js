@@ -14,6 +14,9 @@
     var tabs = document.querySelectorAll('.cpe-tab');
     for (var i = 0; i < tabs.length; i++) { tabs[i].classList.toggle('on', tabs[i].getAttribute('data-cpetab') === tab); }
     var panels = document.querySelectorAll('.cpe-panel');
-    for (var j = 0; j < panels.length; j++) { panels[j].style.display = panels[j].classList.contains('cpe-' + tab) ? 'block' : 'none'; }
+    for (var j = 0; j < panels.length; j++) {
+      var show = panels[j].classList.contains('cpe-' + tab);
+      panels[j].style.display = show ? (panels[j].classList.contains('cpe-grp') ? 'grid' : 'block') : 'none';
+    }
   });
 })();
