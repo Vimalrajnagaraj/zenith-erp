@@ -1,28 +1,46 @@
-/* ZE-CONTACT-MAP: a real interactive map for the Contacts dashboard, using ONLY free/open tools with NO API
-   key and NO usage limits: MapLibre GL JS (BSD-3) + OpenFreeMap vector tiles (free, commercial-OK, and
-   self-hostable at tiles.openfreemap.org). Only this small helper is head-loaded app-wide; MapLibre (~800KB)
-   + its CSS are LAZY-LOADED on first map render (pages without a map never pay for them). Head-loading means
-   window.zContactMap exists before the body (works on /apps AND the /qapps Quasar SPA, which strips inline
-   <script>); each map is driven by an <img onload> attribute (survives the strip). Markers + the home pin
-   come from the map div's data-markers / data-home attributes. Degrades quietly if the lib/tiles fail. */
+/* ZE-CONTACT-MAP: a FULLY SELF-HOSTED interactive map for the Contacts dashboard. No API key, no usage
+   limit, and NO external/runtime dependency at all — every byte is served from THIS server:
+     - MapLibre GL JS (BSD-3)              /zenithstatic/js/maplibre-gl.js
+     - Protomaps basemap style + glyphs    /zenithstatic/js/india-style.js  +  /zenithstatic/fonts/...
+     - India vector tiles (OSM/Protomaps)  /zenithstatic/maptiles/india/{z}/{x}/{y}.pbf  (z0-8, raw MVT)
+   The tiles were extracted once from the Protomaps v4 planet for the India bbox and stored as a plain
+   z/x/y pyramid of static .pbf files — so they load through Moqui's ordinary static serving (NO HTTP
+   byte-range needed) and there is no reliance on any tile service. Only this small helper is head-loaded
+   app-wide; MapLibre (~900KB) + the style are LAZY-LOADED on first map render (pages without a map never
+   pay for them). Head-loading means window.zContactMap exists before the body (works on /apps AND the
+   /qapps Quasar SPA, which strips inline <script>); each map is driven by an <img onload> attribute
+   (survives the strip). Markers + the home pin come from the map div's data-markers / data-home. Degrades
+   quietly. [Upgrade path: swapping the style source to pmtiles:// + an nginx byte-range rule serves the
+   full-zoom single-file tileset more efficiently — kept staged.] */
 (function () {
-  var V = '?v=2';
-  var JS = '/zenithstatic/js/maplibre-gl.js' + V;
+  var V = '?v=7';
   var CSS = '/zenithstatic/css/maplibre-gl.css' + V;
-  var STYLE = 'https://tiles.openfreemap.org/styles/positron';
+  var JS = [
+    '/zenithstatic/js/maplibre-gl.js' + V,   // defines window.maplibregl
+    '/zenithstatic/js/india-style.js' + V    // defines window.zBuildPmStyle(origin)
+  ];
+
+  function ready() { return window.maplibregl && window.zBuildPmStyle; }
 
   function loadLib(cb) {
-    if (window.maplibregl) { cb(); return; }
+    if (ready()) { cb(); return; }
     window.__zmCbs = window.__zmCbs || [];
     window.__zmCbs.push(cb);
     if (window.__zmLoading) return;
     window.__zmLoading = 1;
     try {
       var css = document.createElement('link'); css.rel = 'stylesheet'; css.href = CSS; document.head.appendChild(css);
-      var s = document.createElement('script'); s.src = JS;
-      s.onload = function () { var cbs = window.__zmCbs; window.__zmCbs = []; cbs.forEach(function (f) { try { f(); } catch (_e) {} }); };
-      s.onerror = function () { window.__zmLoading = 0; };
-      document.head.appendChild(s);
+      var pending = JS.length;
+      var done = function () {
+        if (--pending > 0) return;
+        var cbs = window.__zmCbs; window.__zmCbs = [];
+        cbs.forEach(function (f) { try { f(); } catch (_e) {} });
+      };
+      JS.forEach(function (src) {
+        var s = document.createElement('script'); s.src = src;
+        s.onload = done; s.onerror = function () { window.__zmLoading = 0; };
+        document.head.appendChild(s);
+      });
     } catch (_e) { window.__zmLoading = 0; }
   }
 
@@ -36,13 +54,14 @@
     el.__zmap = 1;
     loadLib(function () {
       try {
-        if (!window.maplibregl) { el.__zmap = 0; return; }
+        if (!ready()) { el.__zmap = 0; return; }
         var mk = [], hm = null;
         try { mk = JSON.parse(el.getAttribute('data-markers') || '[]'); } catch (_e) {}
         try { hm = JSON.parse(el.getAttribute('data-home') || 'null'); } catch (_e) {}
 
         // MapLibre uses [lng, lat] order (GeoJSON), not [lat, lng]
-        var map = new maplibregl.Map({ container: el, style: STYLE, center: [79, 22.5], zoom: 3.2, attributionControl: true });
+        var style = window.zBuildPmStyle(location.origin);
+        var map = new maplibregl.Map({ container: el, style: style, center: [79, 22.5], zoom: 3.2, attributionControl: true });
         map.addControl(new maplibregl.NavigationControl({ showCompass: false }), 'top-left');
         try { map.scrollZoom.disable(); } catch (_e) {}
 
@@ -75,7 +94,7 @@
           else if (pts.length > 1) {
             var b = new maplibregl.LngLatBounds();
             pts.forEach(function (c) { b.extend(c); });
-            map.fitBounds(b, { padding: 40, maxZoom: 10, duration: 0 });
+            map.fitBounds(b, { padding: 40, maxZoom: 9, duration: 0 });
           }
           setTimeout(function () { try { map.resize(); } catch (_e) {} }, 200);
         }
