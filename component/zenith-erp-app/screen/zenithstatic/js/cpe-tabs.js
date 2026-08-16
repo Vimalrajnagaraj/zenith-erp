@@ -6,7 +6,12 @@
 (function () {
   if (window.__cpeTabs) return; window.__cpeTabs = 1;
   document.addEventListener('click', function (e) {
-    var btn = e.target && e.target.closest ? e.target.closest('.cpe-tab') : null;
+    var tgt = e.target;
+    // Persistent action-bar Save: proxy the click to the real (hidden) submit inside ContactDetailForm,
+    // so the profile form submits from any tab — including the read-only Orders / Contact-Info tabs.
+    var sv = tgt && tgt.closest ? tgt.closest('[data-cpesave]') : null;
+    if (sv) { e.preventDefault(); var real = document.getElementById('ContactDetailForm_submitButton'); if (real) real.click(); return; }
+    var btn = tgt && tgt.closest ? tgt.closest('.cpe-tab') : null;
     if (!btn) return;
     var tab = btn.getAttribute('data-cpetab');
     if (!tab) return;
