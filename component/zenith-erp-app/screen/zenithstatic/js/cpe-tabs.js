@@ -11,6 +11,29 @@
     // so the profile form submits from any tab — including the read-only Orders / Contact-Info tabs.
     var sv = tgt && tgt.closest ? tgt.closest('[data-cpesave]') : null;
     if (sv) { e.preventDefault(); var real = document.getElementById('ContactDetailForm_submitButton'); if (real) real.click(); return; }
+    // ZE-CUST-FINAL: "+ New Customer" dropdown (Customers list) — toggle the menu; a menu item proxies its click to
+    // the real (hidden) create-dialog trigger, which opens the Bootstrap modal (/apps) or the q-dialog (/qapps).
+    var ncTrig = tgt && tgt.closest ? tgt.closest('.cust-nc-trigger') : null;
+    if (ncTrig) { e.preventDefault(); var ncw = ncTrig.closest('.cust-newcust'); if (ncw) ncw.classList.toggle('open'); return; }
+    var ncItem = tgt && tgt.closest ? tgt.closest('.cust-nc-item') : null;
+    if (ncItem) {
+      e.preventDefault();
+      var ncw2 = ncItem.closest('.cust-newcust'); if (ncw2) ncw2.classList.remove('open');
+      var ncIsOrg = ncItem.classList.contains('cust-nc-org');
+      // container-dialog IGNORES button-class on BOTH surfaces, so match the real trigger (/apps <button data-target>,
+      // /qapps .q-btn) by its button text within the hidden .cust-nc-src wrapper, then click it to open the dialog.
+      var ncLbl = ncIsOrg ? 'Add Company' : 'Add Person', ncReal = null;
+      var ncCand = document.querySelectorAll('.cust-nc-src button, .cust-nc-src .q-btn');
+      for (var nci = 0; nci < ncCand.length; nci++) {
+        if ((ncCand[nci].innerText || '').replace(/\s+/g, ' ').indexOf(ncLbl) !== -1) { ncReal = ncCand[nci]; break; }
+      }
+      if (ncReal) ncReal.click();
+      return;
+    }
+    if (!(tgt && tgt.closest && tgt.closest('.cust-newcust'))) {
+      var ncOpen = document.querySelectorAll('.cust-newcust.open');
+      for (var nk = 0; nk < ncOpen.length; nk++) ncOpen[nk].classList.remove('open');
+    }
     var btn = tgt && tgt.closest ? tgt.closest('.cpe-tab') : null;
     if (!btn) return;
     var tab = btn.getAttribute('data-cpetab');
