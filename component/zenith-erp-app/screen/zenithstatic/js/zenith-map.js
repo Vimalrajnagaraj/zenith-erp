@@ -1,26 +1,27 @@
 /* ZE-CONTACT-MAP: a FULLY SELF-HOSTED interactive map for the Contacts dashboard. No API key, no usage
    limit, and NO external/runtime dependency at all — every byte is served from THIS server:
      - MapLibre GL JS (BSD-3)              /zenithstatic/js/maplibre-gl.js
+     - PMTiles protocol (BSD-3)            /zenithstatic/js/pmtiles.js
      - Protomaps basemap style + glyphs    /zenithstatic/js/india-style.js  +  /zenithstatic/fonts/...
-     - India vector tiles (OSM/Protomaps)  /zenithstatic/maptiles/india/{z}/{x}/{y}.pbf  (z0-8, raw MVT)
-   The tiles were extracted once from the Protomaps v4 planet for the India bbox and stored as a plain
-   z/x/y pyramid of static .pbf files — so they load through Moqui's ordinary static serving (NO HTTP
-   byte-range needed) and there is no reliance on any tile service. Only this small helper is head-loaded
-   app-wide; MapLibre (~900KB) + the style are LAZY-LOADED on first map render (pages without a map never
-   pay for them). Head-loading means window.zContactMap exists before the body (works on /apps AND the
-   /qapps Quasar SPA, which strips inline <script>); each map is driven by an <img onload> attribute
-   (survives the strip). Markers + the home pin come from the map div's data-markers / data-home. Degrades
-   quietly. [Upgrade path: swapping the style source to pmtiles:// + an nginx byte-range rule serves the
-   full-zoom single-file tileset more efficiently — kept staged.] */
+     - India vector tiles (OSM/Protomaps)  /maptiles/india.pmtiles   (single file, z0-11, served by
+                                           nginx from disk WITH HTTP byte-range — location ^~ /maptiles/)
+   The tiles were extracted once from the Protomaps v4 planet for the India bbox, so there is no reliance
+   on any tile service. Only this small helper is head-loaded app-wide; MapLibre (~900KB) + the protocol
+   + the style are LAZY-LOADED on first map render (pages without a map never pay for them). Head-loading
+   means window.zContactMap exists before the body (works on /apps AND the /qapps Quasar SPA, which strips
+   inline <script>); each map is driven by an <img onload> attribute (survives the strip). Markers + the
+   home pin come from the map div's data-markers / data-home attributes. Degrades quietly.
+   [Alt serving: a static z/x/y pyramid (zenithstatic/maptiles/india, no byte-range) — see maptiles/README.] */
 (function () {
-  var V = '?v=7';
+  var V = '?v=8';
   var CSS = '/zenithstatic/css/maplibre-gl.css' + V;
   var JS = [
     '/zenithstatic/js/maplibre-gl.js' + V,   // defines window.maplibregl
+    '/zenithstatic/js/pmtiles.js' + V,       // defines window.pmtiles
     '/zenithstatic/js/india-style.js' + V    // defines window.zBuildPmStyle(origin)
   ];
 
-  function ready() { return window.maplibregl && window.zBuildPmStyle; }
+  function ready() { return window.maplibregl && window.pmtiles && window.zBuildPmStyle; }
 
   function loadLib(cb) {
     if (ready()) { cb(); return; }
@@ -46,6 +47,12 @@
 
   function node(html) { var d = document.createElement('div'); d.innerHTML = html; return d.firstChild; }
 
+  var protoRegistered = false;
+  function registerProto() {
+    if (protoRegistered) return; protoRegistered = true;
+    try { var p = new pmtiles.Protocol(); maplibregl.addProtocol('pmtiles', p.tile); } catch (_e) {}
+  }
+
   window.zContactMap = function (img) {
     if (!img) return;
     var box = img.closest ? img.closest('[data-cmap]') : null;
@@ -55,6 +62,7 @@
     loadLib(function () {
       try {
         if (!ready()) { el.__zmap = 0; return; }
+        registerProto();
         var mk = [], hm = null;
         try { mk = JSON.parse(el.getAttribute('data-markers') || '[]'); } catch (_e) {}
         try { hm = JSON.parse(el.getAttribute('data-home') || 'null'); } catch (_e) {}
@@ -94,7 +102,7 @@
           else if (pts.length > 1) {
             var b = new maplibregl.LngLatBounds();
             pts.forEach(function (c) { b.extend(c); });
-            map.fitBounds(b, { padding: 40, maxZoom: 9, duration: 0 });
+            map.fitBounds(b, { padding: 40, maxZoom: 10, duration: 0 });
           }
           setTimeout(function () { try { map.resize(); } catch (_e) {} }, 200);
         }

@@ -1,41 +1,52 @@
 # Self-hosted map tiles (Contacts dashboard Contact Map)
 
-`india/{z}/{x}/{y}.pbf` is a static z/x/y **vector tile pyramid** (Protomaps v4 schema, raw MVT,
-z0–8, ~779 files / ~31 MB) covering India. It powers the Contacts dashboard **Contact Map**
-(`zenith-map.js` → `india-style.js` → this pyramid), giving a real interactive map with **zero
-external/runtime dependency** — MapLibre, the style, the glyphs, and these tiles are all served from
-this server. Moqui's ordinary static serving is enough (no HTTP byte-range needed, unlike a `.pmtiles`).
+The Contacts dashboard **Contact Map** (`../js/zenith-map.js` → `../js/india-style.js` → these tiles)
+is a real interactive map with **zero external/runtime dependency** — MapLibre, the PMTiles protocol,
+the style, the glyphs, and the tiles are all served from this server. Tiles are OSM data via the
+Protomaps v4 planet, extracted once for the India bbox.
 
-The `.pbf` tiles themselves are **git-ignored** (build artifact, regenerable — see `.gitignore`); the
-build scripts below are committed so the pyramid is reproducible.
+## ACTIVE serving: single-file PMTiles + nginx byte-range
 
-## Regenerate the tiles
+`india-style.js` points at `pmtiles://<origin>/maptiles/india.pmtiles` (full zoom **z0–11**).
+pmtiles.js reads the single file via **HTTP byte-range (206)**, which **only nginx can serve** (Moqui
+static returns 200). Two things live **on the host** (NOT in git or the container image — restore them
+on a host rebuild):
 
-Prereqs: the `pmtiles` CLI (github.com/protomaps/go-pmtiles) and Node with
-`npm i pmtiles @protomaps/basemaps`.
+- **The tile file:** `/opt/deploy/maptiles/india.pmtiles` (277 MB, z0–11). Regenerate:
+  ```sh
+  pmtiles extract https://demo-bucket.protomaps.com/v4.pmtiles india.pmtiles --bbox=68,6,98,38 --maxzoom=11
+  # (range-based: downloads ~India only, not the 137 GB planet)
+  ```
+- **The nginx block** (`sites-enabled/erp.zetaclantech.com`, before the `location /`):
+  ```nginx
+  location ^~ /maptiles/ { alias /opt/deploy/maptiles/; default_type application/octet-stream;
+      add_header Access-Control-Allow-Origin "*" always;
+      add_header Cache-Control "public, max-age=2592000" always;
+      add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always; access_log off; }
+  ```
+  Then `nginx -t && systemctl reload nginx`. Verify: `curl -r 0-99 .../maptiles/india.pmtiles` → `206`.
+
+## FALLBACK / alternative: static z/x/y pyramid (no byte-range, no nginx)
+
+If byte-range serving isn't available, serve a plain **z/x/y `.pbf` pyramid** through Moqui's ordinary
+static (`india/{z}/{x}/{y}.pbf`, raw MVT). Fully self-contained in the container image (survives a host
+rebuild), at the cost of ~779 files and lower max zoom. To switch back: regenerate the pyramid (below),
+set the `india-style.js` source to `tiles: ["<origin>/zenithstatic/maptiles/india/{z}/{x}/{y}.pbf"]`
+(maxzoom 8), and drop pmtiles.js from `zenith-map.js`.
+
+## Regenerate (either form)
+
+Prereqs: the `pmtiles` CLI (github.com/protomaps/go-pmtiles) + Node with `npm i pmtiles @protomaps/basemaps`.
 
 ```sh
-# 1. Extract just India from the public Protomaps planet PMTiles (range-based; downloads ~India only,
-#    NOT the 137 GB planet). --maxzoom governs size: z8≈31MB(pyramid), z11≈278MB, z13≈1.4GB.
-pmtiles extract https://demo-bucket.protomaps.com/v4.pmtiles india.pmtiles \
-  --bbox=68,6,98,38 --maxzoom=8
-
-# 2. Dump it to a raw-MVT z/x/y pyramid under ./pyramid/india/  (getZxy auto-gunzips the gzip tiles).
-node build/extract-pyramid.js          # writes pyramid/india/{z}/{x}/{y}.pbf
-#    then move/copy pyramid/india -> ./india
-
-# 3. Regenerate the MapLibre style (../js/india-style.js): Protomaps LIGHT flavor with every label
-#    collapsed to name:en + one self-hosted Latin font, sprite-icon layers stripped.
-node build/gen-style2.js               # writes india-style.js (place it at ../js/india-style.js)
+pmtiles extract https://demo-bucket.protomaps.com/v4.pmtiles india.pmtiles --bbox=68,6,98,38 --maxzoom=11
+node build/extract-pyramid.js     # OPTIONAL: dump india.pmtiles -> pyramid/india/{z}/{x}/{y}.pbf (raw MVT)
+node build/gen-style2.js          # regenerate ../js/india-style.js (Protomaps LIGHT flavor, labels ->
+                                  #   name:en + one self-hosted Latin font, sprite-icon layers stripped)
 ```
-
 Glyphs (`../fonts/NotoSans-Regular/{range}.pbf`) come from
-`https://protomaps.github.io/basemaps-assets/fonts/Noto%20Sans%20Regular/{range}.pbf`
-(ranges 0-255, 256-511, 512-767 cover Latin / all major Indian cities via name:en).
+`https://protomaps.github.io/basemaps-assets/fonts/Noto%20Sans%20Regular/{range}.pbf` (ranges 0-255,
+256-511, 512-767 — Latin covers all major Indian cities via name:en). `build/gen-style2.js` toggles the
+source between the `pmtiles://` single file (active) and the `tiles:[...]` pyramid on one line.
 
-## Optional upgrade: single-file `.pmtiles` + nginx byte-range
-
-A full-zoom single file is more efficient than 779 static tiles, but pmtiles.js **requires HTTP 206
-range**, which Moqui can't serve — only nginx can. Serve `india.pmtiles` from disk via an nginx
-`location ^~ /maptiles/ { alias /opt/deploy/maptiles/; }` block, then point the `india-style.js`
-source at `pmtiles://<origin>/maptiles/india.pmtiles` (and re-add `pmtiles.js` to `zenith-map.js`).
+The `india/` pyramid `.pbf` output is **git-ignored** (see `.gitignore`); the build scripts are committed.
