@@ -74,6 +74,23 @@
         </actions>
         <default-response url="."/>
     </transition>
+    <!-- ZE-CONTACTS-EDIT-REDESIGN: remove a business role (chip ×). Org-guarded (assert#ContactAccess) and
+         restricted to the roles the Add-Role picker manages (Customer/Supplier) so internal/owner roles can
+         never be stripped from here. Deleting a PartyRole is safe: a contact with no role simply drops out
+         of the Customer/Vendor lists (it is not deleted). -->
+    <transition name="removeContactRole">
+        <actions>
+            <service-call name="zenith.contacts.ContactServices.assert#ContactAccess" in-map="[partyId:partyId]" out-map="_acc"/>
+            <if condition="_acc.allowed &amp;&amp; ['Customer','Supplier'].contains(roleTypeId)">
+                <entity-find-one entity-name="mantle.party.PartyRole" value-field="_prRemove">
+                    <field-map field-name="partyId"/>
+                    <field-map field-name="roleTypeId"/>
+                </entity-find-one>
+                <if condition="_prRemove != null"><entity-delete value-field="_prRemove"/></if>
+            </if>
+        </actions>
+        <default-response url="."/>
+    </transition>
     <transition name="createPostalAddress">
         <actions>
             <service-call name="zenith.contacts.ContactServices.assert#ContactAccess" in-map="[partyId:partyId]" out-map="_acc"/>
@@ -297,11 +314,18 @@
             poCount = poList ? poList.size() : 0
             billCount = payableInvoiceList ? payableInvoiceList.size() : 0
             rolesDisplay = []
+            roleChipList = []
             def _seenR = [] as Set
+            // only the roles the Add-Role picker manages are removable from here; internal/owner roles show but can't be stripped
+            def _removable = ['Customer', 'Supplier'] as Set
             partyRoles.each { r ->
                 def rt = ec.entity.find("mantle.party.RoleType").condition("roleTypeId", r.roleTypeId).useCache(true).one()
                 def nm = rt?.description ?: r.roleTypeId
-                if (!_seenR.contains(nm)) { _seenR.add(nm); rolesDisplay << nm }
+                if (!_seenR.contains(nm)) {
+                    _seenR.add(nm)
+                    rolesDisplay << nm
+                    roleChipList << [roleTypeId: r.roleTypeId, name: nm, removable: _removable.contains(r.roleTypeId)]
+                }
             }
             priceListName = party?.priceListId
             try {
@@ -348,6 +372,16 @@
                 <link url="/apps/zenith/sales/CreateQuotation" text="New Quote" parameter-map="[customerPartyId:partyId]" link-type="anchor" style="cp-btn cp-btn-outline"/>
                 <link url="/apps/zenith/sales/CreateOrder" text="New Order" parameter-map="[customerPartyId:partyId]" link-type="anchor" style="cp-btn cp-btn-outline"/>
                 <link url="/apps/zenith/Purchase/CreatePurchaseOrder" text="New PO" parameter-map="[vendorPartyId:partyId]" link-type="anchor" style="cp-btn cp-btn-outline"/>
+                <!-- ZE-CONTACTS-EDIT-REDESIGN: overflow menu (real secondary actions, native <details>, no JS). -->
+                <render-mode><text type="html,qvt,vuet"><![CDATA[
+                  <details class="cpe-of">
+                    <summary class="cpe-of-btn" title="More actions">&#8942;</summary>
+                    <div class="cpe-of-menu">
+                      <a class="cpe-of-item" href="/apps/zenith/Contacts/ContactProfile?partyId=${partyId}">View read-only profile</a>
+                      <a class="cpe-of-item" href="/apps/zenith/sales/CreateInvoice?partyId=${partyId}">New Invoice</a>
+                    </div>
+                  </details>
+                ]]></text></render-mode>
             </container>
         </container>
 
@@ -581,11 +615,18 @@
             <!-- ===== Profile tab extras: Roles (wrapper carries the toggleable cpe-panel class) ===== -->
             <container style="cpe-panel cpe-profile">
             <container-box class="zenith-card"><box-header title="Roles"/><box-body>
-                <!-- ZE-CONTACTS-EDIT-REDESIGN: roles shown as chips (spec). Remove-role has no existing
-                     service, so chips are display-only; roles are ADDED below. -->
-                <container style="cp-tags q-mb-md">
-                    <section-iterate name="roleChips" list="rolesDisplay" entry="rn"><widgets>
-                        <label text="${rn}" type="span" style="cp-badge cp-b-purple"/>
+                <!-- ZE-CONTACTS-EDIT-REDESIGN: roles as removable chips. Customer/Supplier chips carry a × that
+                     hits removeContactRole (org-guarded, restricted to those two role types); other roles show
+                     but have no ×. Roles are ADDED below. -->
+                <container style="cpe-rolechips q-mb-md">
+                    <section-iterate name="roleChips" list="roleChipList" entry="rc"><widgets>
+                        <container style="cpe-rolechip ${rc.removable ? '' : 'cpe-rolechip-fixed'}">
+                            <label text="${rc.name}" type="span" style="cpe-rolechip-t"/>
+                            <link url="removeContactRole" text="&#215;" title="Remove this role"
+                                  parameter-map="[partyId:partyId, roleTypeId:rc.roleTypeId]"
+                                  confirmation="Remove the ${rc.name} role from this contact?"
+                                  class="cpe-rolechip-x" condition="rc.removable &amp;&amp; modCanWrite"/>
+                        </container>
                     </widgets></section-iterate>
                     <label text="No roles assigned yet." type="span" style="cp-field-value cp-empty" condition="!rolesDisplay"/>
                 </container>
@@ -701,8 +742,9 @@
             </box-body></container-box>
 
             </container>
-            <!-- ===== Contact Info tab: Email / Phone / Address ===== -->
+            <!-- ===== Contact Info tab: Email / Phone / Address (3 equal-width cards) ===== -->
             <container style="cpe-panel cpe-contactinfo">
+            <container style="cpe-cards3">
             <container-box class="zenith-card"><box-header title="Email Addresses"/><box-toolbar>
                 <section name="EditContact_addemail_write">
                   <condition><expression>modCanWrite</expression></condition>
@@ -888,6 +930,7 @@
             </box-body></container-box>
 
             </container>
+            </container>
             <!-- ===== Orders &amp; Bills tab: history (read-only) ===== -->
             <container style="cpe-panel cpe-orders">
             <container-box class="zenith-card"><box-header title="Recent Invoices"/><box-body>
@@ -902,7 +945,7 @@
                         </field>
                         <field name="invoiceDate"><header-field title="Date"/><default-field><display format="yyyy-MM-dd"/></default-field></field>
                         <field name="invoiceTotal"><header-field title="Total"/><default-field><display currency-unit-field="currencyUomId"/></default-field></field>
-                        <field name="statusId"><header-field title="Status"/><default-field><display text="${statusItem?.description}"/></default-field></field>
+                        <field name="statusId"><header-field title="Status"/><default-field><label type="span" text="${statusItem?.description}" style="cpe-pill ${(statusItem?.description ==~ /(?i).*(complet|paid|approv|finaliz|receiv|active).*/) ? 'cpe-pill-green' : ((statusItem?.description ==~ /(?i).*(open|propos|tentat|process|draft|pending|hold).*/) ? 'cpe-pill-orange' : 'cpe-pill-grey')}"/></default-field></field>
                         <field name="findButton"><header-field title="Find"><submit/></header-field></field>
                     </form-list>
                 </widgets><fail-widgets>
@@ -922,7 +965,7 @@
                         </field>
                         <field name="entryDate"><header-field title="Date"/><default-field><display format="yyyy-MM-dd"/></default-field></field>
                         <field name="grandTotal"><header-field title="Total"/><default-field><display currency-unit-field="currencyUomId"/></default-field></field>
-                        <field name="statusId"><header-field title="Status"/><default-field><display text="${statusItem?.description}"/></default-field></field>
+                        <field name="statusId"><header-field title="Status"/><default-field><label type="span" text="${statusItem?.description}" style="cpe-pill ${(statusItem?.description ==~ /(?i).*(complet|paid|approv|finaliz|receiv|active).*/) ? 'cpe-pill-green' : ((statusItem?.description ==~ /(?i).*(open|propos|tentat|process|draft|pending|hold).*/) ? 'cpe-pill-orange' : 'cpe-pill-grey')}"/></default-field></field>
                         <field name="findButton"><header-field title="Find"><submit/></header-field></field>
                     </form-list>
                 </widgets><fail-widgets>
@@ -942,7 +985,7 @@
                         </field>
                         <field name="entryDate"><header-field title="Date"/><default-field><display format="yyyy-MM-dd"/></default-field></field>
                         <field name="grandTotal"><header-field title="Total"/><default-field><display currency-unit-field="currencyUomId"/></default-field></field>
-                        <field name="statusId"><header-field title="Status"/><default-field><display text="${statusItem?.description}"/></default-field></field>
+                        <field name="statusId"><header-field title="Status"/><default-field><label type="span" text="${statusItem?.description}" style="cpe-pill ${(statusItem?.description ==~ /(?i).*(complet|paid|approv|finaliz|receiv|active).*/) ? 'cpe-pill-green' : ((statusItem?.description ==~ /(?i).*(open|propos|tentat|process|draft|pending|hold).*/) ? 'cpe-pill-orange' : 'cpe-pill-grey')}"/></default-field></field>
                         <field name="findButton"><header-field title="Find"><submit/></header-field></field>
                     </form-list>
                 </widgets><fail-widgets>
@@ -962,7 +1005,7 @@
                         </field>
                         <field name="entryDate"><header-field title="Date"/><default-field><display format="yyyy-MM-dd"/></default-field></field>
                         <field name="grandTotal"><header-field title="Total"/><default-field><display currency-unit-field="currencyUomId"/></default-field></field>
-                        <field name="statusId"><header-field title="Status"/><default-field><display text="${statusItem?.description}"/></default-field></field>
+                        <field name="statusId"><header-field title="Status"/><default-field><label type="span" text="${statusItem?.description}" style="cpe-pill ${(statusItem?.description ==~ /(?i).*(complet|paid|approv|finaliz|receiv|active).*/) ? 'cpe-pill-green' : ((statusItem?.description ==~ /(?i).*(open|propos|tentat|process|draft|pending|hold).*/) ? 'cpe-pill-orange' : 'cpe-pill-grey')}"/></default-field></field>
                         <field name="findButton"><header-field title="Find"><submit/></header-field></field>
                     </form-list>
                 </widgets><fail-widgets>
@@ -982,7 +1025,7 @@
                         </field>
                         <field name="invoiceDate"><header-field title="Date"/><default-field><display format="yyyy-MM-dd"/></default-field></field>
                         <field name="invoiceTotal"><header-field title="Total"/><default-field><display currency-unit-field="currencyUomId"/></default-field></field>
-                        <field name="statusId"><header-field title="Status"/><default-field><display text="${statusItem?.description}"/></default-field></field>
+                        <field name="statusId"><header-field title="Status"/><default-field><label type="span" text="${statusItem?.description}" style="cpe-pill ${(statusItem?.description ==~ /(?i).*(complet|paid|approv|finaliz|receiv|active).*/) ? 'cpe-pill-green' : ((statusItem?.description ==~ /(?i).*(open|propos|tentat|process|draft|pending|hold).*/) ? 'cpe-pill-orange' : 'cpe-pill-grey')}"/></default-field></field>
                         <field name="findButton"><header-field title="Find"><submit/></header-field></field>
                     </form-list>
                 </widgets><fail-widgets>
