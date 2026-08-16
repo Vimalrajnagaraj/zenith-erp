@@ -1,0 +1,258 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- ZE-CONTACTS-PROFILE: redesigned tabbed Contact Profile (read-oriented). A PARALLEL screen to
+     EditContact — EditContact stays the working edit form; this presents the same contact in the new
+     progressive-disclosure layout (header card, quick stats, tabs). Reuses EditContact's data queries +
+     the assert#ContactAccess IDOR guard + the no-partyId redirect (security inherited, not reinvented).
+     Full editing is via the "Edit" action -> EditContact. Hidden from nav; reached via a link. -->
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
+        default-menu-title="Contact Profile" default-menu-include="false">
+
+    <parameter name="partyId"/>
+
+    <always-actions>
+        <if condition="!partyId">
+            <script>def _uri = ec.web.getRequest()?.getRequestURI() ?: '/apps'
+                    def _sh = _uri.startsWith('/qapps/') ? '/qapps' : (_uri.startsWith('/vapps/') ? '/vapps' : '/apps')
+                    sri.sendRedirectAndStopRender(_sh + "/zenith/Contacts/FindContact")</script>
+            <return/>
+        </if>
+    </always-actions>
+
+    <actions>
+        <entity-find-one entity-name="mantle.party.Party" value-field="party"/>
+        <!-- Org-isolation guard: a tenant user may only open contacts owned by their active organization. -->
+        <service-call name="zenith.contacts.ContactServices.assert#ContactAccess" in-map="[partyId:partyId]" out-map="_acc"/>
+        <if condition="!_acc.allowed">
+            <script>ec.message.clearErrors()
+                    def _sh = (ec.web.getRequest()?.getRequestURI() ?: '').startsWith('/qapps/') ? '/qapps' : ((ec.web.getRequest()?.getRequestURI() ?: '').startsWith('/vapps/') ? '/vapps' : '/apps')
+                    sri.sendRedirectAndStopRender(_sh + "/zenith/Contacts/FindContact")</script>
+            <return/>
+        </if>
+        <entity-find-one entity-name="mantle.party.Person" value-field="person"/>
+        <entity-find-one entity-name="mantle.party.Organization" value-field="organization"/>
+
+        <entity-find entity-name="mantle.party.PartyRole" list="partyRoles"><econdition field-name="partyId"/></entity-find>
+        <entity-find entity-name="zenith.erp.india.IndiaGstin" list="gstinList"><econdition field-name="partyId"/></entity-find>
+        <entity-find entity-name="mantle.party.contact.PartyContactMechInfo" list="emailList">
+            <econdition field-name="partyId"/><econdition field-name="contactMechTypeEnumId" value="CmtEmailAddress"/>
+            <date-filter/><order-by field-name="contactMechPurposeId"/></entity-find>
+        <entity-find entity-name="mantle.party.contact.PartyContactMechTelecomNumber" list="phoneList">
+            <econdition field-name="partyId"/><date-filter/></entity-find>
+        <entity-find entity-name="mantle.party.contact.PartyContactMechPostalAddress" list="addressList">
+            <econdition field-name="partyId"/><date-filter/></entity-find>
+        <entity-find entity-name="mantle.order.OrderHeaderAndPart" list="poList" limit="10">
+            <econdition field-name="vendorPartyId" from="partyId"/>
+            <econdition field-name="statusId" operator="not-in" value="OrderProposed,OrderRejected"/>
+            <order-by field-name="-entryDate"/></entity-find>
+        <entity-find entity-name="mantle.account.invoice.Invoice" list="payableInvoiceList" limit="10">
+            <econdition field-name="fromPartyId" from="partyId"/><order-by field-name="-invoiceDate"/></entity-find>
+
+        <set field="contactName" from="organization?.organizationName ?: ((person?.firstName ?: '') + ' ' + (person?.lastName ?: '')).trim()"/>
+        <set field="contactName" from="contactName ?: partyId"/>
+
+        <!-- ===== derived display values (no fabrication: only fields the app actually stores) ===== -->
+        <script><![CDATA[
+            avatarInitial = (contactName ?: '?').trim().take(1).toUpperCase()
+            isDisabled = (party?.disabled == 'Y')
+            isOrg = (organization != null)
+            poCount = poList ? poList.size() : 0
+            billCount = payableInvoiceList ? payableInvoiceList.size() : 0
+            // friendly role names (skip internal owner/rollup roles)
+            rolesDisplay = []
+            def _seen = [] as Set
+            partyRoles.each { r ->
+                def rt = ec.entity.find("mantle.party.RoleType").condition("roleTypeId", r.roleTypeId).useCache(true).one()
+                def nm = rt?.description ?: r.roleTypeId
+                if (!_seen.contains(nm)) { _seen.add(nm); rolesDisplay << nm }
+            }
+            // price list name (fail-safe: fall back to the id if the lookup can't resolve)
+            priceListName = party?.priceListId
+            try {
+                if (party?.priceListId) {
+                    def pl = ec.entity.find("zenith.erp.pricing.PriceList").condition("priceListId", party.priceListId).useCache(true).one()
+                    if (pl != null) priceListName = pl.name ?: pl.priceListName ?: pl.description ?: party.priceListId
+                }
+            } catch (Throwable _t) { }
+        ]]></script>
+        <set field="zinr" from="new com.zenith.Fmt()" ignore-error="true"/>
+    </actions>
+
+    <widgets>
+        <!-- Breadcrumb -->
+        <container style="cp-crumb">
+            <link url="FindContact" text="Contacts" link-type="anchor" style="cp-crumb-link"/>
+            <label text="/" type="span" style="cp-sep"/>
+            <link url="FindContact" text="All Contacts" link-type="anchor" style="cp-crumb-link"/>
+            <label text="/" type="span" style="cp-sep"/>
+            <label text="${contactName}" type="span" style="cp-current"/>
+        </container>
+
+        <!-- ===== Header card ===== -->
+        <container style="cp-card cp-header">
+            <container style="cp-avatar"><label text="${avatarInitial}" type="span"/></container>
+            <container style="cp-identity">
+                <label text="${contactName}" type="h1" style="cp-name"/>
+                <container style="cp-meta-row">
+                    <label text="ID: ${partyId}" type="span" style="cp-meta"/>
+                    <label text="|" type="span" style="cp-pipe"/>
+                    <label text="${isOrg ? 'Organization' : 'Person'}" type="span" style="cp-meta"/>
+                    <label text="${isDisabled ? 'Disabled' : 'Active'}" type="span" style="cp-badge ${isDisabled ? 'cp-b-muted' : 'cp-b-green'}"/>
+                    <section-iterate name="hdrRoles" list="rolesDisplay" entry="rn">
+                        <widgets><label text="${rn}" type="span" style="cp-badge cp-b-purple"/></widgets>
+                    </section-iterate>
+                </container>
+            </container>
+            <container style="cp-actions">
+                <link url="/apps/zenith/sales/CreateQuotation" text="New Quote" parameter-map="[customerPartyId:partyId]" link-type="anchor" style="cp-btn cp-btn-outline"/>
+                <link url="/apps/zenith/sales/CreateOrder" text="New Order" parameter-map="[customerPartyId:partyId]" link-type="anchor" style="cp-btn cp-btn-outline"/>
+                <link url="EditContact" text="Edit" parameter-map="[partyId:partyId]" link-type="anchor" style="cp-btn cp-btn-primary"/>
+            </container>
+        </container>
+
+        <!-- ===== Quick stats ===== -->
+        <container style="cp-stats">
+            <container style="cp-card cp-stat">
+                <label text="Credit Limit" type="span" style="cp-stat-label"/>
+                <label text="${party?.creditLimit != null ? zinr.inr(party.creditLimit) : '—'}" type="span" style="cp-stat-value cp-accent"/>
+                <label text="${party?.creditDays ? (party.creditDays + ' days credit period') : 'No credit period set'}" type="span" style="cp-stat-sub"/>
+            </container>
+            <container style="cp-card cp-stat">
+                <label text="Opening Balance" type="span" style="cp-stat-label"/>
+                <label text="${party?.openingBalance != null ? zinr.inr(party.openingBalance) : '—'}" type="span" style="cp-stat-value"/>
+                <label text="${priceListName ? (priceListName + ' price list') : 'No price list'}" type="span" style="cp-stat-sub"/>
+            </container>
+            <container style="cp-card cp-stat">
+                <label text="Purchase Orders" type="span" style="cp-stat-label"/>
+                <label text="${poCount}" type="span" style="cp-stat-value ${poCount == 0 ? 'cp-muted' : ''}"/>
+                <label text="${poCount == 0 ? 'No purchase orders' : 'Recent orders'}" type="span" style="cp-stat-sub"/>
+            </container>
+            <container style="cp-card cp-stat">
+                <label text="Vendor Bills" type="span" style="cp-stat-label"/>
+                <label text="${billCount}" type="span" style="cp-stat-value ${billCount == 0 ? 'cp-muted' : ''}"/>
+                <label text="${billCount == 0 ? 'No bills found' : 'Recent bills'}" type="span" style="cp-stat-sub"/>
+            </container>
+        </container>
+
+        <!-- ===== Tabs nav ===== -->
+        <render-mode><text type="html,qvt,vuet"><![CDATA[
+          <div class="cp-tabs-container"><div class="cp-tabs-nav" role="tablist">
+            <button class="cp-tab active" data-idx="0" type="button">Profile</button>
+            <button class="cp-tab" data-idx="1" type="button">Tax &amp; Compliance</button>
+            <button class="cp-tab" data-idx="2" type="button">Banking</button>
+            <button class="cp-tab" data-idx="3" type="button">Contact Info</button>
+            <button class="cp-tab" data-idx="4" type="button">Orders &amp; Bills</button>
+          </div></div>
+        ]]></text></render-mode>
+
+        <container style="cp-tab-body">
+          <container style="cp-tab-inner">
+
+            <!-- ===== Panel 0: Profile ===== -->
+            <container style="cp-panel active">
+                <container style="cp-sec">
+                    <label text="Basic Details" type="span" style="cp-sec-title"/>
+                    <container style="cp-grid">
+                        <container style="cp-field"><label text="Organization Name" type="span" style="cp-field-label"/><label text="${(organization?.organizationName ?: contactName)}" type="span" style="cp-field-value"/></container>
+                        <container style="cp-field"><label text="Type" type="span" style="cp-field-label"/><label text="${isOrg ? 'Organization' : 'Individual'}" type="span" style="cp-field-value"/></container>
+                        <container style="cp-field"><label text="Status" type="span" style="cp-field-label"/><label text="${isDisabled ? 'Disabled' : 'Active'}" type="span" style="cp-field-value"/></container>
+                    </container>
+                </container>
+                <container style="cp-sec">
+                    <label text="Roles" type="span" style="cp-sec-title"/>
+                    <container style="cp-tags">
+                        <section-iterate name="rolePills" list="rolesDisplay" entry="rn"><widgets><label text="${rn}" type="span" style="cp-tag"/></widgets></section-iterate>
+                        <label text="No roles" type="span" style="cp-field-value cp-empty" condition="!rolesDisplay"/>
+                    </container>
+                </container>
+                <container style="cp-sec">
+                    <label text="Credit &amp; Pricing" type="span" style="cp-sec-title"/>
+                    <container style="cp-grid">
+                        <container style="cp-field"><label text="Credit Limit (₹)" type="span" style="cp-field-label"/><label text="${party?.creditLimit != null ? zinr.inr(party.creditLimit) : 'Not set'}" type="span" style="cp-field-value ${party?.creditLimit == null ? 'cp-empty' : ''}"/></container>
+                        <container style="cp-field"><label text="Credit Days" type="span" style="cp-field-label"/><label text="${party?.creditDays ?: 'Not set'}" type="span" style="cp-field-value ${!party?.creditDays ? 'cp-empty' : ''}"/></container>
+                        <container style="cp-field"><label text="Opening Balance (₹)" type="span" style="cp-field-label"/><label text="${party?.openingBalance != null ? zinr.inr(party.openingBalance) : 'Not set'}" type="span" style="cp-field-value ${party?.openingBalance == null ? 'cp-empty' : ''}"/></container>
+                        <container style="cp-field"><label text="Price List" type="span" style="cp-field-label"/><label text="${priceListName ?: 'Not set'}" type="span" style="cp-field-value ${!priceListName ? 'cp-empty' : ''}"/></container>
+                        <container style="cp-field"><label text="Mandatory Payment Days" type="span" style="cp-field-label"/><label text="${party?.paymentTermLockDays ?: 'Not set'}" type="span" style="cp-field-value ${!party?.paymentTermLockDays ? 'cp-empty' : ''}"/></container>
+                    </container>
+                </container>
+            </container>
+
+            <!-- ===== Panel 1: Tax & Compliance ===== -->
+            <container style="cp-panel">
+                <container style="cp-sec">
+                    <label text="GST Registrations" type="span" style="cp-sec-title"/>
+                    <container style="cp-grid">
+                        <section-iterate name="gstins" list="gstinList" entry="g">
+                            <widgets><container style="cp-field"><label text="GSTIN" type="span" style="cp-field-label"/><label text="${g.gstin}" type="span" style="cp-field-value cp-mono"/></container></widgets>
+                        </section-iterate>
+                    </container>
+                    <label text="No GST registration on file." type="span" style="cp-field-value cp-empty" condition="!gstinList"/>
+                </container>
+            </container>
+
+            <!-- ===== Panel 2: Banking ===== -->
+            <container style="cp-panel">
+                <container style="cp-sec">
+                    <label text="Bank Account" type="span" style="cp-sec-title"/>
+                    <container style="cp-grid">
+                        <container style="cp-field"><label text="Account Name" type="span" style="cp-field-label"/><label text="${party?.bankAccountName ?: 'Not set'}" type="span" style="cp-field-value ${!party?.bankAccountName ? 'cp-empty' : ''}"/></container>
+                        <container style="cp-field"><label text="Account Number" type="span" style="cp-field-label"/><label text="${party?.bankAccountNumber ?: 'Not set'}" type="span" style="cp-field-value cp-mono ${!party?.bankAccountNumber ? 'cp-empty' : ''}"/></container>
+                        <container style="cp-field"><label text="${(party?.bankRoutingCodeType ?: 'IFSC')} Code" type="span" style="cp-field-label"/><label text="${party?.bankRoutingCode ?: 'Not set'}" type="span" style="cp-field-value cp-mono ${!party?.bankRoutingCode ? 'cp-empty' : ''}"/></container>
+                    </container>
+                </container>
+            </container>
+
+            <!-- ===== Panel 3: Contact Info ===== -->
+            <container style="cp-panel">
+                <container style="cp-info-cards">
+                    <container style="cp-info-card">
+                        <label text="Email Addresses" type="span" style="cp-info-head"/>
+                        <section-iterate name="emails" list="emailList" entry="em">
+                            <widgets><container style="cp-info-item"><label text="${em.infoString}" type="span" style="cp-info-v"/></container></widgets>
+                        </section-iterate>
+                        <label text="No email on file" type="span" style="cp-empty" condition="!emailList"/>
+                    </container>
+                    <container style="cp-info-card">
+                        <label text="Phone Numbers" type="span" style="cp-info-head"/>
+                        <section-iterate name="phones" list="phoneList" entry="ph">
+                            <widgets><container style="cp-info-item"><label text="${(ph.countryCode ? ('+' + ph.countryCode + ' ') : '') + (ph.contactNumber ?: '')}" type="span" style="cp-info-v"/></container></widgets>
+                        </section-iterate>
+                        <label text="No phone on file" type="span" style="cp-empty" condition="!phoneList"/>
+                    </container>
+                    <container style="cp-info-card">
+                        <label text="Addresses" type="span" style="cp-info-head"/>
+                        <section-iterate name="addrs" list="addressList" entry="ad">
+                            <widgets><container style="cp-info-item"><label text="${[ad.address1, ad.city, ad.postalCode].findAll{it}.join(', ')}" type="span" style="cp-info-v"/></container></widgets>
+                        </section-iterate>
+                        <label text="No address added yet" type="span" style="cp-empty" condition="!addressList"/>
+                    </container>
+                </container>
+            </container>
+
+            <!-- ===== Panel 4: Orders & Bills ===== -->
+            <container style="cp-panel">
+                <container style="cp-sec">
+                    <label text="Recent Purchase Orders" type="span" style="cp-sec-title"/>
+                    <form-list name="cpPoList" list="poList" skip-form="true">
+                        <field name="displayId"><default-field title="PO No."><link url="/apps/zenith/Purchase/EditPurchaseOrder" text="${displayId ?: orderId}" parameter-map="[orderId:orderId]" link-type="anchor" style="cp-link"/></default-field></field>
+                        <field name="entryDate"><default-field title="Date"><display format="dd MMM yyyy"/></default-field></field>
+                        <field name="grandTotal"><default-field title="Total (₹)"><display/></default-field></field>
+                        <field name="statusId"><default-field title="Status"><display-entity entity-name="moqui.basic.StatusItem" text="${description}"/></default-field></field>
+                    </form-list>
+                    <label text="No purchase orders found." type="span" style="cp-empty" condition="!poList"/>
+                </container>
+                <container style="cp-sec">
+                    <label text="Recent Vendor Bills" type="span" style="cp-sec-title"/>
+                    <form-list name="cpBillList" list="payableInvoiceList" skip-form="true">
+                        <field name="invoiceId"><default-field title="Bill No."><link url="/apps/zenith/Purchase/EditPurchaseInvoice" text="${invoiceId}" parameter-map="[invoiceId:invoiceId]" link-type="anchor" style="cp-link"/></default-field></field>
+                        <field name="invoiceDate"><default-field title="Date"><display format="dd MMM yyyy"/></default-field></field>
+                        <field name="invoiceTotal"><default-field title="Total (₹)"><display/></default-field></field>
+                    </form-list>
+                    <label text="No vendor bills found." type="span" style="cp-empty" condition="!payableInvoiceList"/>
+                </container>
+            </container>
+
+          </container>
+        </container>
+    </widgets>
+</screen>
