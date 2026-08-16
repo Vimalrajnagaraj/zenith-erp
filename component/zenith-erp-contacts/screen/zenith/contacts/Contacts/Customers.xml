@@ -3,6 +3,9 @@
         xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
         default-menu-title="Customers" default-menu-index="2">
 
+    <!-- ZE-CUST-LIST: inline filter params (Customer Type + Show Disabled), read from the GET URL. -->
+    <parameter name="showDisabled"/>
+
     <transition name="createPerson">
         <service-call name="zenith.contacts.ContactServices.create#Contact"
                       in-map="context + [partyTypeEnumId:'PtyPerson', roleTypeId:'Customer']"/>
@@ -73,6 +76,9 @@
         <set field="planGate" from="isSaasTenant &amp;&amp; !saasHasAllAccess &amp;&amp; saasAllowedModules != null"/>
         <set field="showSalesBtn" from="!planGate || saasAllowedModules.contains('sales')"/>
         <set field="showAccountingBtn" from="!planGate || saasAllowedModules.contains('accounting')"/>
+        <!-- ZE-CUST-LIST: Show Disabled — default hides disabled (disabledFilter='Y' excludes them); the toggle
+             sets showDisabled='Y' -> disabledFilter=null -> ignore-if-empty drops the filter. -->
+        <set field="disabledFilter" from="(showDisabled == 'Y') ? null : 'Y'"/>
         <!-- ZE-CONTACTS-010: let the Find Options dialog search by GSTIN / PAN / CIN / email / phone.
              These live on IndiaGstin / Party / ContactMech, not the PartyDetailAndRole search view, so
              resolve each provided term to matching partyIds; the list then filters on `searchPartyIds`.
@@ -172,15 +178,36 @@
         </container>
 
         <label text="Tip: use Find Options (top-right) to search by name, company, or ID — then click a customer's name or ID to open their full profile." type="p" style="text-grey-6 text-caption q-mb-md"/>
-        <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md">
+
+        <!-- ZE-CUST-LIST: inline filter bar — Customer Type dropdown (native <details>, no JS) + a Show Disabled
+             toggle-switch (GET-param filters; each preserves the other param). Reuses the shared list-filter/table
+             styling (sup-*) so the Customers + Suppliers lists look identical. Default = active-only = MARUTHI no-op. -->
+        <render-mode><text type="html,qvt,vuet"><![CDATA[
+            <#assign _t = (partyTypeEnumId)!''><#assign _sd = (showDisabled)!''>
+            <#assign _tName><#if _t == 'PtyOrganization'>Business<#elseif _t == 'PtyPerson'>Individual<#else>All</#if></#assign>
+            <div class="sup-filterbar2">
+              <span class="sup-flabel">Customer Type:</span>
+              <details class="sup-dd">
+                <summary class="sup-dd-btn"><span>${_tName}</span><span class="sup-dd-caret">&#9660;</span></summary>
+                <div class="sup-dd-menu">
+                  <a href="?partyTypeEnumId=&amp;showDisabled=${_sd}" class="sup-dd-item<#if _t == ''> on</#if>">All</a>
+                  <a href="?partyTypeEnumId=PtyOrganization&amp;showDisabled=${_sd}" class="sup-dd-item<#if _t == 'PtyOrganization'> on</#if>">Business</a>
+                  <a href="?partyTypeEnumId=PtyPerson&amp;showDisabled=${_sd}" class="sup-dd-item<#if _t == 'PtyPerson'> on</#if>">Individual</a>
+                </div>
+              </details>
+              <span class="sup-fspacer"></span>
+              <a href="?showDisabled=<#if _sd == 'Y'>N<#else>Y</#if>&amp;partyTypeEnumId=${_t}" class="sup-switch-link<#if _sd == 'Y'> sup-switch-on</#if>">Show Disabled</a>
+            </div>
+        ]]></text></render-mode>
+        <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md sup-compact">
             <form-list name="FindCustomerList" list="customerList" skip-form="true" header-dialog="true" show-page-size="true">
                 <entity-find entity-name="mantle.party.PartyDetailAndRole" list="customerList">
                     <search-form-inputs default-order-by="organizationName,firstName"/>
                     <econdition field-name="roleTypeId" operator="in" value="Customer,CustomerBillTo"/>
                     <!-- Org isolation: only the active organization's customers (admin with no active org sees all). -->
                     <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
-                    <!-- Hide disabled contacts (consistent with the All-Contacts directory). -->
-                    <econdition field-name="disabled" operator="not-equals" value="Y" or-null="true"/>
+                    <!-- Hide disabled by default; the Show Disabled toggle drops this filter (disabledFilter=null). -->
+                    <econdition field-name="disabled" operator="not-equals" from="disabledFilter" or-null="true" ignore-if-empty="true"/>
                     <!-- ZE-CONTACTS-010: GSTIN/PAN/CIN/email/phone search resolves to partyIds in screen actions. -->
                     <econdition field-name="partyId" operator="in" from="searchPartyIds" ignore-if-empty="true"/>
                     <!-- We want a unique list of parties, but PartyDetailAndRole can have multiple roles.
@@ -194,12 +221,31 @@
                     <entity-find-one entity-name="zenith.erp.india.IndiaGstin" value-field="gstinRec">
                         <field-map field-name="partyId" from="partyId"/>
                     </entity-find-one>
+                    <!-- ZE-CUST-LIST: per-row display — name, avatar initial+colour, type, primary email/phone. -->
+                    <script><![CDATA[
+                        dispName = organizationName ?: (((firstName ?: '') + ' ' + (lastName ?: '')).trim()) ?: 'Unknown'
+                        avatarInitial = dispName.trim().take(1).toUpperCase()
+                        isBiz = (partyTypeEnumId == 'PtyOrganization')
+                        def _pal = ['a','b','c','d','e','f']
+                        avatarColor = _pal[(((partyId ?: '').hashCode() % _pal.size()) + _pal.size()) % _pal.size()]
+                        rowEmail = null; rowPhone = null
+                        try {
+                            def _em = ec.entity.find("mantle.party.contact.PartyContactMechInfo")
+                                        .condition("partyId", partyId).condition("contactMechTypeEnumId", "CmtEmailAddress")
+                                        .conditionDate("fromDate", "thruDate", ec.user.nowTimestamp)
+                                        .orderBy("-contactMechPurposeId").list()
+                            if (_em) rowEmail = _em[0].infoString
+                            def _ph = ec.entity.find("mantle.party.contact.PartyContactMechTelecomNumber")
+                                        .condition("partyId", partyId)
+                                        .conditionDate("fromDate", "thruDate", ec.user.nowTimestamp)
+                                        .orderBy("-contactMechPurposeId").list()
+                            if (_ph) rowPhone = _ph[0].contactNumber
+                        } catch (Throwable _t) { }
+                    ]]></script>
                 </row-actions>
 
-                <field name="partyId">
-                    <header-field title="ID" show-order-by="true"><text-find/></header-field>
-                    <default-field><link url="../ContactProfile" text="${partyId}" parameter-map="[partyId:partyId]" style="text-indigo-8 text-weight-bold"/></default-field>
-                </field>
+                <!-- ZE-CUST-LIST: Party ID column removed (ID now shown under the name); kept as a Find-Options search. -->
+                <field name="partyId"><header-field title="ID Search"><text-find/></header-field><default-field><hidden/></default-field></field>
 
                 <field name="organizationName"><header-field title="Company Search"><text-find/></header-field><default-field><hidden/></default-field></field>
                 <field name="firstName"><header-field title="First Name Search"><text-find/></header-field><default-field><hidden/></default-field></field>
@@ -211,51 +257,84 @@
                 <field name="cinSearch"><header-field title="CIN Search"><text-line size="22"/></header-field><default-field><hidden/></default-field></field>
                 <field name="emailSearch"><header-field title="Email Search"><text-line size="30"/></header-field><default-field><hidden/></default-field></field>
                 <field name="phoneSearch"><header-field title="Phone Search"><text-line size="15"/></header-field><default-field><hidden/></default-field></field>
+                <!-- ZE-CUST-LIST: Show Disabled also in Find Options so the inline toggle's param round-trips. -->
+                <field name="showDisabled"><header-field title="Show Disabled"><drop-down no-current-selected-key="N"><option key="N" text="No"/><option key="Y" text="Yes (include disabled)"/></drop-down></header-field><default-field><hidden/></default-field></field>
 
                 <field name="name">
                     <header-field title="Customer Name" show-order-by="true"/>
                     <default-field>
-                        <!-- CT-041 / ZE-CONTACTS-007: the Customer Name must open the profile too (not just the ID chip).
-                             Render it as a link to EditContact so it's clickable with a pointer cursor. -->
-                        <link url="../ContactProfile" text="${organizationName ?: (((firstName ?: '') + ' ' + (lastName ?: '')).trim()) ?: 'Unknown'}" parameter-map="[partyId:partyId]" style="text-indigo-8 text-weight-medium zenith-contact-name"/>
+                        <!-- ZE-CUST-LIST: avatar + bold name + ID underneath (name opens the profile; ID column removed). -->
+                        <container style="sup-namecell">
+                            <label text="${avatarInitial}" type="span" style="sup-avatar sup-av-${avatarColor}"/>
+                            <container style="sup-nametext">
+                                <link url="../ContactProfile" text="${dispName}" parameter-map="[partyId:partyId]" link-type="anchor" style="sup-name zenith-contact-name"/>
+                                <label text="ID: ${partyId}" type="span" style="sup-id"/>
+                            </container>
+                        </container>
+                    </default-field>
+                </field>
+
+                <!-- ZE-CUST-LIST: Contact Information — the customer's primary email + phone (real data). -->
+                <field name="contactInfo">
+                    <header-field title="Contact Information"/>
+                    <default-field>
+                        <container style="sup-stack">
+                            <container style="sup-cline"><label text="mail" type="span" style="material-icons sup-cicon" condition="rowEmail"/><label text="${rowEmail}" type="span" style="sup-cval" condition="rowEmail"/></container>
+                            <container style="sup-cline"><label text="call" type="span" style="material-icons sup-cicon" condition="rowPhone"/><label text="${rowPhone}" type="span" style="sup-cval" condition="rowPhone"/></container>
+                            <label text="No contact info" type="span" style="sup-cval sup-cempty" condition="!rowEmail &amp;&amp; !rowPhone"/>
+                        </container>
                     </default-field>
                 </field>
 
                 <field name="partyTypeEnumId">
-                    <header-field title="Type">
+                    <header-field title="Customer Type">
                         <drop-down allow-empty="true">
                             <option key="PtyOrganization" text="Organization"/>
                             <option key="PtyPerson" text="Person"/>
                         </drop-down>
                     </header-field>
                     <default-field>
-                        <label text="${partyTypeEnumId == 'PtyOrganization' ? 'Business' : 'Individual'}" type="span" style="zenith-badge info"/>
+                        <label text="${isBiz ? 'Business' : 'Individual'}" type="span" style="sup-badge ${isBiz ? 'sup-b-green' : 'sup-b-purple'}"/>
                     </default-field>
                 </field>
 
                 <field name="gstin">
-                    <header-field title="GST Number"/>
+                    <header-field title="GSTIN (For ITC)"/>
                     <default-field>
-                        <label text="${gstinRec?.gstin ?: 'Not Provided'}" type="span" style="${gstinRec?.gstin ? 'text-dark' : 'text-grey-5'}"/>
-                        <label text="Valid" type="span" style="zenith-badge success q-ml-sm" condition="gstinRec?.gstin"/>
-                    </default-field>
-                </field>
-                
-                <field name="pan">
-                    <header-field title="PAN (tax ID)"/>
-                    <default-field>
-                        <label text="${partyDetail?.panNumber ?: '-'}" type="span"/>
+                        <container style="sup-stack">
+                            <label text="${gstinRec?.gstin}" type="span" style="sup-gstin" condition="gstinRec?.gstin"/>
+                            <label text="GST registered" type="span" style="sup-badge sup-b-green" condition="gstinRec?.gstin"/>
+                            <label text="Not Provided" type="span" style="sup-gstin sup-none" condition="!gstinRec?.gstin"/>
+                            <label text="No ITC" type="span" style="sup-noitc" condition="!gstinRec?.gstin"/>
+                        </container>
                     </default-field>
                 </field>
 
+                <field name="pan">
+                    <header-field title="PAN (Tax ID)"/>
+                    <default-field>
+                        <label text="${partyDetail?.panNumber ?: '-'}" type="span" style="sup-gstin"/>
+                    </default-field>
+                </field>
+
+                <!-- ZE-CUST-LIST: Status badge from the real `disabled` field (shown customers read Active; the
+                     Show Disabled toggle reveals Disabled ones). -->
+                <field name="status">
+                    <header-field title="Status"/>
+                    <default-field>
+                        <label text="${partyDetail?.disabled == 'Y' ? 'Disabled' : 'Active'}" type="span" style="sup-badge ${partyDetail?.disabled == 'Y' ? 'sup-b-grey' : 'sup-b-green'}"/>
+                    </default-field>
+                </field>
+
+                <!-- ZE-CUST-LIST: customer-appropriate row actions. The report's "POs / Bills" are VENDOR actions
+                     (purchase orders / vendor bills) — WRONG for a customer, who has sales Orders + Invoices + an
+                     accounting Ledger. Edit dropped as a text link: the name opens the profile, which has Edit. -->
                 <field name="actions">
                     <header-field title="Actions"/>
                     <default-field>
-                        <!-- ZE-POS-012: explicit Edit action (the ID/name links to EditContact were being missed) -->
-                        <!-- feature-access: hide the write Edit affordance from view-only users; the ID/Name open links remain -->
-                        <link url="../EditContact" text="Edit" icon="edit" class="q-btn q-btn--outline q-btn--rectangle q-btn--sm text-indigo-8 q-mr-sm bg-white" parameter-map="[partyId:partyId]" link-type="anchor" condition="modCanWrite"/>
                         <link url="/apps/zenith/sales/FindOrder" text="Orders" icon="shopping_cart" class="q-btn q-btn--outline q-btn--rectangle q-btn--sm text-primary q-mr-sm bg-white" parameter-map="[customerPartyId:partyId]" link-type="anchor" condition="showSalesBtn"/>
-                        <link url="/apps/zenith/Accounting/Invoices" text="Invoices" icon="receipt_long" class="q-btn q-btn--outline q-btn--rectangle q-btn--sm text-secondary bg-white" parameter-map="[toPartyId:partyId]" link-type="anchor" condition="showAccountingBtn"/>
+                        <link url="/apps/zenith/sales/FindInvoice" text="Invoices" icon="receipt_long" class="q-btn q-btn--outline q-btn--rectangle q-btn--sm text-warning q-mr-sm bg-white" parameter-map="[toPartyId:partyId]" link-type="anchor" condition="showSalesBtn"/>
+                        <link url="/apps/zenith/Accounting/Invoices" text="Ledger" icon="account_balance_wallet" class="q-btn q-btn--outline q-btn--rectangle q-btn--sm text-secondary bg-white" parameter-map="[toPartyId:partyId]" link-type="anchor" condition="showAccountingBtn"/>
                     </default-field>
                 </field>
 
