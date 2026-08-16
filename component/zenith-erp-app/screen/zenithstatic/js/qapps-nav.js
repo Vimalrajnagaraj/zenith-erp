@@ -219,6 +219,7 @@
         var sc = el('div'); sc.id = 'zq-search';
         var box = el('div', 'zqsr-box'); box.appendChild(mi('search'));
         var inp = el('input'); inp.type = 'text'; inp.id = 'zq-search-input'; inp.placeholder = 'Search modules…'; inp.setAttribute('autocomplete', 'off'); box.appendChild(inp);
+        var kb = el('span', 'z-kbd'); var isMac = /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAgent || ''); kb.textContent = isMac ? '⌘K' : 'Ctrl K'; kb.setAttribute('aria-hidden', 'true'); kb.title = 'Focus search'; kb.addEventListener('click', function () { inp.focus(); }); box.appendChild(kb);
         sc.appendChild(box);
         var res = el('div'); res.id = 'zq-search-results'; sc.appendChild(res);
         wrap.appendChild(sc);
@@ -232,6 +233,8 @@
         inp.addEventListener('input', function () { draw(inp.value); });
         inp.addEventListener('keydown', function (e) { if (e.key === 'Enter') { var f = res.querySelector('a'); if (f) { e.preventDefault(); location.href = f.getAttribute('href'); } } else if (e.key === 'Escape') { inp.value = ''; res.classList.remove('show'); } });
         document.addEventListener('click', function (e) { if (!sc.contains(e.target)) res.classList.remove('show'); });
+        // ⌘K / Ctrl-K focuses the quick-search from anywhere (bound once; input is looked up live)
+        if (!window.__zqSearchKbd) { window.__zqSearchKbd = 1; document.addEventListener('keydown', function (e) { if ((e.metaKey || e.ctrlKey) && !e.altKey && (e.key === 'k' || e.key === 'K')) { var si = document.getElementById('zq-search-input'); if (si) { e.preventDefault(); si.focus(); try { si.select(); } catch (_e) {} } } }); }
         // insert INTO the toolbar row, right after the menu burger, so it stays a single row
         var toolbar = header.querySelector('.q-toolbar') || header;
         var burger = toolbar.querySelector('button');
