@@ -28,6 +28,7 @@
         if ((ncCand[nci].innerText || '').replace(/\s+/g, ' ').indexOf(ncLbl) !== -1) { ncReal = ncCand[nci]; break; }
       }
       if (ncReal) ncReal.click();
+      setTimeout(cgPlaceholders, 450);  // the create dialog just opened — seed field placeholders (attr is a no-op here)
       return;
     }
     if (!(tgt && tgt.closest && tgt.closest('.cust-newcust'))) {
@@ -71,4 +72,15 @@
   document.addEventListener('change', function (e) {
     if (e.target && e.target.matches && e.target.matches('select[name="bankBeneficiaryStatus"]')) cpeColorBen();
   });
+
+  // ZE-CG-ADD: seed placeholders on the "Add Customer Group" form (Moqui <text-line placeholder> is a no-op in this
+  // build). Runs on load (/apps: inputs pre-exist in the hidden modal) + after the dialog opens (/qapps: portaled).
+  function cgPlaceholders() {
+    var m = { groupName: 'Enter group name', defaultDiscountPercent: 'Enter percentage', creditTermDays: 'Enter credit term in days', creditLimitDefault: 'Enter credit limit', paymentTerms: 'e.g. Net 30, Immediate', description: 'Enter description' };
+    var forms = document.querySelectorAll('form[name="CreateGroupForm"]');
+    for (var f = 0; f < forms.length; f++) {
+      for (var k in m) { var el = forms[f].querySelector('[name="' + k + '"]'); if (el && !el.getAttribute('placeholder')) el.setAttribute('placeholder', m[k]); }
+    }
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', cgPlaceholders); else cgPlaceholders();
 })();
