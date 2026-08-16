@@ -15,15 +15,15 @@
     // the real (hidden) create-dialog trigger, which opens the Bootstrap modal (/apps) or the q-dialog (/qapps).
     var ncTrig = tgt && tgt.closest ? tgt.closest('.cust-nc-trigger') : null;
     if (ncTrig) { e.preventDefault(); var ncw = ncTrig.closest('.cust-newcust'); if (ncw) ncw.classList.toggle('open'); return; }
-    var ncItem = tgt && tgt.closest ? tgt.closest('.cust-nc-item') : null;
+    var ncItem = tgt && tgt.closest ? tgt.closest('.cust-nc-item, .cust-nc-solo') : null;
     if (ncItem) {
       e.preventDefault();
       var ncw2 = ncItem.closest('.cust-newcust'); if (ncw2) ncw2.classList.remove('open');
-      var ncIsOrg = ncItem.classList.contains('cust-nc-org');
       // container-dialog IGNORES button-class on BOTH surfaces, so match the real trigger (/apps <button data-target>,
       // /qapps .q-btn) by its button text within the hidden .cust-nc-src wrapper, then click it to open the dialog.
-      var ncLbl = ncIsOrg ? 'Add Company' : 'Add Person', ncReal = null;
-      var ncCand = document.querySelectorAll('.cust-nc-src button, .cust-nc-src .q-btn');
+      // data-nctext lets a single-action CTA (e.g. Add Group) name its trigger; dropdown items fall back to the class.
+      var ncLbl = ncItem.getAttribute('data-nctext') || (ncItem.classList.contains('cust-nc-org') ? 'Add Company' : 'Add Person');
+      var ncReal = null, ncCand = document.querySelectorAll('.cust-nc-src button, .cust-nc-src .q-btn');
       for (var nci = 0; nci < ncCand.length; nci++) {
         if ((ncCand[nci].innerText || '').replace(/\s+/g, ' ').indexOf(ncLbl) !== -1) { ncReal = ncCand[nci]; break; }
       }
