@@ -27,6 +27,12 @@ RUN sh /tmp/patch-webroot-nav.sh && rm /tmp/patch-webroot-nav.sh
 # the framework breadcrumb template changed). Source: docs/infra/framework-patches/patch-webroot-breadcrumb.sh.
 COPY ./framework-patches/patch-webroot-breadcrumb.sh /tmp/patch-webroot-breadcrumb.sh
 RUN sh /tmp/patch-webroot-breadcrumb.sh && rm /tmp/patch-webroot-breadcrumb.sh
+# ZE-QAVATAR: /qapps header account button shows the user's INITIALS in a purple avatar instead of the
+# generic Quasar account_circle icon (matches the /apps header avatar in ZenithApp.xml). Patches the same
+# WebrootVue.qvt.ftl; idempotent + self-verifying (fails the build if the account button template changed).
+# Source: docs/infra/framework-patches/patch-webroot-qavatar.sh.
+COPY ./framework-patches/patch-webroot-qavatar.sh /tmp/patch-webroot-qavatar.sh
+RUN sh /tmp/patch-webroot-qavatar.sh && rm /tmp/patch-webroot-qavatar.sh
 # ZE-STORES-UI (defect_report_new_store_ui): make required/rule'd form fields validate ONLY on submit, not
 # eagerly on blur (so a required field can't flash its error the moment an autofocused dialog loses focus).
 # Adds lazy-rules="ondemand" to m-text-line + m-date-time q-inputs; m-form's submit still calls qForm.validate()
