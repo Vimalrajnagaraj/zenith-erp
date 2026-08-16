@@ -23,5 +23,29 @@
       var show = panels[j].classList.contains('cpe-' + tab);
       panels[j].style.display = show ? (panels[j].classList.contains('cpe-grp') ? 'grid' : 'block') : 'none';
     }
+    cpeColorBen();  /* re-colour after a tab switch — on /qapps the Banking q-select only exists post-transclude */
+  });
+
+  /* Beneficiary Status pill: colour the editable status control by its current value (Pending=amber,
+     Verified=green, Rejected=muted) so it reads as a compact status pill while staying fully functional.
+     The value-class is stamped on the native <select> AND its visible framework widget: /apps = the adjacent
+     Select2 container (styled via CSS sibling selector); /qapps = the enclosing Quasar q-field. */
+  function cpeColorBen() {
+    var sels = document.querySelectorAll('select[name="bankBeneficiaryStatus"]');
+    for (var i = 0; i < sels.length; i++) {
+      var s = sels[i], v = (s.value || '').toLowerCase(), cls = v ? 'cpe-bs-' + v : 'cpe-bs-none';
+      var targets = [s];
+      var qf = s.closest ? s.closest('.q-field') : null; if (qf) targets.push(qf);
+      for (var t = 0; t < targets.length; t++) {
+        var el = targets[t];
+        el.classList.add('cpe-bs');
+        el.classList.remove('cpe-bs-pending', 'cpe-bs-verified', 'cpe-bs-rejected', 'cpe-bs-none');
+        el.classList.add(cls);
+      }
+    }
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', cpeColorBen); else cpeColorBen();
+  document.addEventListener('change', function (e) {
+    if (e.target && e.target.matches && e.target.matches('select[name="bankBeneficiaryStatus"]')) cpeColorBen();
   });
 })();
