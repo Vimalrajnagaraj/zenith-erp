@@ -11,6 +11,16 @@
     // so the profile form submits from any tab — including the read-only Orders / Contact-Info tabs.
     var sv = tgt && tgt.closest ? tgt.closest('[data-cpesave]') : null;
     if (sv) { e.preventDefault(); var real = document.getElementById('ContactDetailForm_submitButton'); if (real) real.click(); return; }
+    // ZE-CG-EDIT: Active toggle — flip the visual switch AND sync the hidden isActive field so the form always submits Y/N.
+    var cgTog = tgt && tgt.closest ? tgt.closest('.cg-toggle') : null;
+    if (cgTog) {
+      var cgSw = cgTog.querySelector('.cg-toggle-sw'), cgLbl = cgTog.querySelector('.cg-toggle-lbl');
+      var cgOn = cgSw ? cgSw.classList.toggle('on') : false;
+      if (cgLbl) cgLbl.textContent = cgOn ? 'Yes' : 'No';
+      var cgFrm = cgTog.closest('form'), cgHid = cgFrm ? cgFrm.querySelector('[name="isActive"]') : null;
+      if (cgHid) { cgHid.value = cgOn ? 'Y' : 'N'; try { cgHid.dispatchEvent(new Event('change', { bubbles: true })); } catch (er) {} }
+      return;
+    }
     // ZE-CUST-FINAL: "+ New Customer" dropdown (Customers list) — toggle the menu; a menu item proxies its click to
     // the real (hidden) create-dialog trigger, which opens the Bootstrap modal (/apps) or the q-dialog (/qapps).
     var ncTrig = tgt && tgt.closest ? tgt.closest('.cust-nc-trigger') : null;
@@ -82,8 +92,28 @@
       for (var k in m) { var el = forms[f].querySelector('[name="' + k + '"]'); if (el && !el.getAttribute('placeholder')) el.setAttribute('placeholder', m[k]); }
     }
   }
-  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', cgPlaceholders); else cgPlaceholders();
-  // /qapps renders screens AFTER DOMContentLoaded (async SPA transclude), so a load-time call is too early —
-  // re-seed placeholders when the DOM settles (idempotent; only fills inputs that don't already have one).
-  if (window.MutationObserver) { var _cgT; new MutationObserver(function () { clearTimeout(_cgT); _cgT = setTimeout(cgPlaceholders, 200); }).observe(document.documentElement, { childList: true, subtree: true }); }
+  // ZE-CG-EDIT: on /apps, replace the isActive Y/N <drop-down> with a purple toggle switch synced to the select (the
+  // select stays the REAL submitting control, so Active saves correctly). /qapps keeps the dropdown (safe q-select).
+  function cgActiveToggle() {
+    if (!document.getElementById('content')) return;  // /apps only (Bootstrap page)
+    var sels = document.querySelectorAll('form[name="GroupForm"] select[name="isActive"]');
+    for (var i = 0; i < sels.length; i++) {
+      var sel = sels[i];
+      if (sel.getAttribute('data-cgtog')) continue;
+      sel.setAttribute('data-cgtog', '1');
+      var on = sel.value !== 'N';
+      var tog = document.createElement('span');
+      tog.className = 'cg-toggle';
+      tog.innerHTML = '<span class="cg-toggle-sw' + (on ? ' on' : '') + '"></span><span class="cg-toggle-lbl">' + (on ? 'Yes' : 'No') + '</span>';
+      sel.style.display = 'none';
+      var s2 = sel.parentNode.querySelector('.select2-container'); if (s2) s2.style.display = 'none';
+      var fg = sel.closest('.form-group'), lb = fg ? fg.querySelector('label') : null; if (lb) lb.style.display = 'none';
+      sel.parentNode.appendChild(tog);
+    }
+  }
+  function cgInit() { cgPlaceholders(); cgActiveToggle(); }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', cgInit); else cgInit();
+  // /qapps renders screens AFTER DOMContentLoaded (async SPA transclude), so a load-time call is too early — re-run
+  // when the DOM settles (idempotent; guarded by data-cgtog and the existing-placeholder check).
+  if (window.MutationObserver) { var _cgT; new MutationObserver(function () { clearTimeout(_cgT); _cgT = setTimeout(cgInit, 200); }).observe(document.documentElement, { childList: true, subtree: true }); }
 })();
