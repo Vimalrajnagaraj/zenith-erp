@@ -266,10 +266,16 @@
         subBar.innerHTML = '';
         if (!key) { subBar.classList.remove('show'); document.body.classList.remove('zq-has-subnav'); return; }
         var arr = SUBNAV[key], mount = key.slice(1);
+        // ZE-POS-NAV-ROLE: a POS-only cashier (posOnlyUser -> data-pos-only) sees only till-operational POS submodules;
+        // hide the rest (visibility-only). Same cashier set as the /apps #z-subnav filter (ZenithApp.xml). Admin / Store
+        // Manager are never posOnly, so they keep every tab.
+        var posCash = null;
+        if (mount === 'pos') { try { var _pc = document.getElementById('zenith-saas-cfg'); if (_pc && _pc.getAttribute('data-pos-only') === 'true') posCash = { Dashboard: 1, Terminal: 1, PosTransactions: 1, DailySummary: 1, PosSessions: 1, CreditBills: 1, CashEntry: 1 }; } catch (_e) {} }
         subBar.appendChild(el('span', 'zqsub-title', arr[0]));
         var active = null, alen = -1;
         for (var i = 1; i < arr.length; i++) {
             var pair = arr[i], ci = pair.indexOf(':'), seg = pair.slice(0, ci), label = pair.slice(ci + 1);
+            if (posCash && !posCash[seg]) continue;
             var href = (mount === 'pos' && seg === 'Terminal') ? '/apps/zenith/pos/Terminal' : ('/qapps/zenith/' + mount + '/' + seg);
             var a = el('a', 'zqsub-tab', label); a.href = href;
             var m = key + '/' + seg; if (rel.indexOf(m) === 0 && m.length > alen) { active = a; alen = m.length; }
