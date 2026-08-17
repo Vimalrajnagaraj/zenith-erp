@@ -76,11 +76,14 @@
   // ZE-CG-ADD: seed placeholders on the "Add Customer Group" form (Moqui <text-line placeholder> is a no-op in this
   // build). Runs on load (/apps: inputs pre-exist in the hidden modal) + after the dialog opens (/qapps: portaled).
   function cgPlaceholders() {
-    var m = { groupName: 'Enter group name', defaultDiscountPercent: 'Enter percentage', creditTermDays: 'Enter credit term in days', creditLimitDefault: 'Enter credit limit', paymentTerms: 'e.g. Net 30, Immediate', description: 'Enter description' };
-    var forms = document.querySelectorAll('form[name="CreateGroupForm"]');
+    var m = { groupName: 'Enter group name', defaultDiscountPercent: 'Enter percentage', creditTermDays: 'Enter credit term in days', creditLimitDefault: 'Enter credit limit', paymentTerms: 'e.g. Net 30, Immediate', description: 'Enter description (optional)' };
+    var forms = document.querySelectorAll('form[name="CreateGroupForm"], form[name="GroupForm"]');
     for (var f = 0; f < forms.length; f++) {
       for (var k in m) { var el = forms[f].querySelector('[name="' + k + '"]'); if (el && !el.getAttribute('placeholder')) el.setAttribute('placeholder', m[k]); }
     }
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', cgPlaceholders); else cgPlaceholders();
+  // /qapps renders screens AFTER DOMContentLoaded (async SPA transclude), so a load-time call is too early —
+  // re-seed placeholders when the DOM settles (idempotent; only fills inputs that don't already have one).
+  if (window.MutationObserver) { var _cgT; new MutationObserver(function () { clearTimeout(_cgT); _cgT = setTimeout(cgPlaceholders, 200); }).observe(document.documentElement, { childList: true, subtree: true }); }
 })();
