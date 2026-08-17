@@ -11,6 +11,20 @@
     // so the profile form submits from any tab — including the read-only Orders / Contact-Info tabs.
     var sv = tgt && tgt.closest ? tgt.closest('[data-cpesave]') : null;
     if (sv) { e.preventDefault(); var real = document.getElementById('ContactDetailForm_submitButton'); if (real) real.click(); return; }
+    // ZE-CONTACTS-SEARCH: the custom "Filters" button (All Contacts) proxy-opens the framework Find Options dialog.
+    // Prefer the element we've already marked+hidden (.sup-fo-native); fall back to a text match. .click() fires even
+    // on a display:none element, so the hidden native trigger still toggles the Bootstrap modal / Quasar q-dialog.
+    var fBtn = tgt && tgt.closest ? tgt.closest('.sup-filters-btn') : null;
+    if (fBtn) {
+      e.preventDefault();
+      var fo = document.querySelector('.sup-fo-native');
+      if (!fo) {
+        var fc = document.querySelectorAll('button, a, .q-btn');
+        for (var fi = 0; fi < fc.length; fi++) { var ft = (fc[fi].textContent || '').replace(/\s+/g, ' ').trim(); if (ft.indexOf('Find Options') !== -1 && ft.length < 40) { fo = fc[fi]; break; } }
+      }
+      if (fo) fo.click();
+      return;
+    }
     // ZE-CG-EDIT: Active toggle — flip the visual switch AND sync the hidden isActive field so the form always submits Y/N.
     var cgTog = tgt && tgt.closest ? tgt.closest('.cg-toggle') : null;
     if (cgTog) {
@@ -111,7 +125,20 @@
       sel.parentNode.appendChild(tog);
     }
   }
-  function cgInit() { cgPlaceholders(); cgActiveToggle(); }
+  // ZE-CONTACTS-SEARCH: on any list that ships the custom "Filters" button (currently All Contacts), hide the
+  // framework's own "Find Options" trigger so there's a single filters entry point. Scoped by .sup-filters-btn so it
+  // never touches Find Options on other list screens. Marked (not removed) so the Filters proxy can still click it.
+  function hideNativeFindOpts() {
+    if (!document.querySelector('.sup-filters-btn')) return;
+    var cand = document.querySelectorAll('button, a, .q-btn');
+    for (var i = 0; i < cand.length; i++) {
+      var c = cand[i];
+      if (c.classList.contains('sup-filters-btn') || c.classList.contains('sup-fo-native')) continue;
+      var t = (c.textContent || '').replace(/\s+/g, ' ').trim();
+      if (t.indexOf('Find Options') !== -1 && t.length < 40) c.classList.add('sup-fo-native');
+    }
+  }
+  function cgInit() { cgPlaceholders(); cgActiveToggle(); hideNativeFindOpts(); }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', cgInit); else cgInit();
   // /qapps renders screens AFTER DOMContentLoaded (async SPA transclude), so a load-time call is too early — re-run
   // when the DOM settles (idempotent; guarded by data-cgtog and the existing-placeholder check).
