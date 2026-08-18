@@ -266,6 +266,11 @@
         subBar.innerHTML = '';
         if (!key) { subBar.classList.remove('show'); document.body.classList.remove('zq-has-subnav'); return; }
         var arr = SUBNAV[key], mount = key.slice(1);
+        // ZE-NAV-ALIAS: a detail/edit screen (menu-include=false, e.g. EditStockTransfer) shares no URL prefix with its
+        // list tab, so no tab would highlight. Map it to the parent list route for active-state matching only (the group
+        // still resolves via the /<module> prefix above, so this doesn't change which subnav renders).
+        var relA = rel, _NAV_ALIAS = { '/Inventory/EditStockTransfer': '/Inventory/StockTransfers', '/Inventory/EditStockAdjustment': '/Inventory/StockAdjustments' };
+        for (var _ak in _NAV_ALIAS) { if (rel.indexOf(_ak) === 0) { relA = _NAV_ALIAS[_ak] + rel.slice(_ak.length); break; } }
         // ZE-POS-NAV-ROLE: a POS-only cashier (posOnlyUser -> data-pos-only) sees only till-operational POS submodules;
         // hide the rest (visibility-only). Same cashier set as the /apps #z-subnav filter (ZenithApp.xml). Admin / Store
         // Manager are never posOnly, so they keep every tab.
@@ -278,7 +283,7 @@
             if (posCash && !posCash[seg]) continue;
             var href = (mount === 'pos' && seg === 'Terminal') ? '/apps/zenith/pos/Terminal' : ('/qapps/zenith/' + mount + '/' + seg);
             var a = el('a', 'zqsub-tab', label); a.href = href;
-            var m = key + '/' + seg; if (rel.indexOf(m) === 0 && m.length > alen) { active = a; alen = m.length; }
+            var m = key + '/' + seg; if (relA.indexOf(m) === 0 && m.length > alen) { active = a; alen = m.length; }
             subBar.appendChild(a);
         }
         if (active) active.classList.add('on');
