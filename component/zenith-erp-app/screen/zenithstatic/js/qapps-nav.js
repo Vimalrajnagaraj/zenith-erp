@@ -249,6 +249,7 @@
         // Home/Dashboard landing → the "Dashboards" hub (every ERP dashboard)
         if (rel === '/' || rel === '/Dashboard') {
             subBar.innerHTML = '';
+            subBar.removeAttribute('data-mod');
             subBar.appendChild(el('span', 'zqsub-title', 'Dashboards'));
             var mods = tenantMods();
             DASHBOARDS.forEach(function (d) {
@@ -266,6 +267,7 @@
         subBar.innerHTML = '';
         if (!key) { subBar.classList.remove('show'); document.body.classList.remove('zq-has-subnav'); return; }
         var arr = SUBNAV[key], mount = key.slice(1);
+        subBar.setAttribute('data-mod', mount);  // ZE-CONTACTS-DS: lets CSS scope the active-tab pill to Contacts only
         // ZE-NAV-ALIAS: a detail/edit screen (menu-include=false, e.g. EditStockTransfer) shares no URL prefix with its
         // list tab, so no tab would highlight. Map it to the parent list route for active-state matching only (the group
         // still resolves via the /<module> prefix above, so this doesn't change which subnav renders).
