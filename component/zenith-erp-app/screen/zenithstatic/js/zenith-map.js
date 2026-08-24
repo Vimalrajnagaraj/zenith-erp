@@ -80,7 +80,7 @@
         mk.forEach(function (p) {
           var dm = 20 + Math.round(20 * Math.sqrt(p.n / maxN));
           var fs = dm > 36 ? 13 : (dm > 28 ? 11 : 10);
-          var elm = node('<div style="width:' + dm + 'px;height:' + dm + 'px;border-radius:50%;background:rgba(110,86,207,.85);'
+          var elm = node('<div style="width:' + dm + 'px;height:' + dm + 'px;border-radius:50%;background:rgba(124,58,237,.85);'
             + 'border:2px solid #fff;box-shadow:0 1px 5px rgba(70,61,122,.45);display:flex;align-items:center;justify-content:center;'
             + 'color:#fff;font-weight:800;font-size:' + fs + 'px;font-family:Segoe UI,Arial;cursor:pointer">' + p.n + '</div>');
           new maplibregl.Marker({ element: elm, anchor: 'center' }).setLngLat([p.lng, p.lat])
