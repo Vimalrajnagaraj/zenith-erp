@@ -102,16 +102,38 @@
                     return [dir: (p >= 0 ? 'up' : 'down'), pct: Math.abs(p)]
                 } catch (Exception _e) { return null }
             }
-            // Customers: no "customer since" date exists in the schema (party has no createdDate; party_role has
-            // no fromDate; no dated customer party_relationship) -> no WoW chip, like Products. Orders/Invoices do.
-            def _custTrend = null
-            def _ordTrend  = _wow("mantle.order.OrderHeaderAndPart",  "entryDate",  { q -> q.condition("statusId", EC.IN, ["OrderPlaced","OrderApproved","OrderCompleted"]); if (activeOrgId) q.condition("vendorPartyId", activeOrgId); q })
-            def _invTrend  = _wow("mantle.account.invoice.Invoice",   "invoiceDate",{ q -> q.condition("statusId", EC.NOT_EQUAL, "InvoiceCancelled"); if (activeOrgId) q.condition("fromPartyId", activeOrgId); q })
+            // ZE-DASH FINANCIAL (2026-08): the 4 KPI tiles now carry the dashboard-mockup's FINANCIAL set — Total
+            // Sales / Total Payables / Total Receivable / Cash in Hand — from REAL org data (mirrors the Owner
+            // Overview; NEVER the mockup's fabricated figures). Sales & Cash honour the ACTIVITY RANGE when one is
+            // picked (else all-time); Payables/Receivable are outstanding balances. All org-scoped + defensive.
+            def _zbd = { v -> (v ?: 0) as BigDecimal }
+            def _zfs = ['InvoiceFinalized','InvoicePmtRecvd']
+            def _finFmt = { v -> try { zinr.inr(ec.l10n.format(_zbd(v), '#,##,##0')) } catch (Exception _fe) { ec.l10n.format(_zbd(v), '#,##0') } }
+            def _salesBetween = { a, b -> try { activeOrgId ? (ec.entity.find("mantle.account.invoice.Invoice")
+                .condition("fromPartyId",activeOrgId).condition("invoiceTypeEnumId","InvoiceSales").condition("statusId","in",_zfs)
+                .condition("invoiceDate", EC.GREATER_THAN_EQUAL_TO, a).condition("invoiceDate", EC.LESS_THAN, b).disableAuthz()
+                .list().sum { _zbd(it.invoiceTotal) } ?: BigDecimal.ZERO) : BigDecimal.ZERO } catch (Exception _e) { BigDecimal.ZERO } }
+            def _nPlus = new java.sql.Timestamp(_n.getTime() + 86400000L)
+            def _finSales = (dayStart != null) ? _salesBetween(dayStart, dayEndExcl) : _salesBetween(new java.sql.Timestamp(0L), _nPlus)
+            def _sCur = _salesBetween(_w1, _nPlus); def _sPrev = _salesBetween(_w2, _w1)
+            def _salesTrend = (_sCur == 0 && _sPrev == 0) ? null : [dir:((_sCur >= _sPrev)?'up':'down'), pct:(_sPrev > 0 ? (int)Math.round(Math.abs((_sCur.doubleValue()-_sPrev.doubleValue())*100.0/_sPrev.doubleValue())) : 100)]
+            def _finPay = BigDecimal.ZERO
+            try { if (activeOrgId) ec.entity.find("mantle.account.invoice.Invoice").condition("toPartyId",activeOrgId).condition("invoiceTypeEnumId","InvoicePurchase")
+                .condition("statusId", EC.NOT_IN, ["InvoicePmtRecvd","InvoiceCancelled","InvoicePaid"]).disableAuthz().list().each { _finPay += _zbd(it.invoiceTotal ?: (_zbd(it.totalTaxableAmount)+_zbd(it.totalTaxAmount))) } } catch (Exception _e) {}
+            def _finRecv = BigDecimal.ZERO
+            try { if (activeOrgId) ec.entity.find("zenith.erp.pos.PosTransaction").condition("organizationPartyId",activeOrgId).condition("isCredit","Y").condition("statusId","PtCompleted").disableAuthz().list().each { def _d = _zbd(it.payableAmount) - _zbd(it.paidAmount); if (_d > 0) _finRecv += _d } } catch (Exception _e) {}
+            def _finCash = BigDecimal.ZERO
+            try { if (activeOrgId) {
+                def _cq = ec.entity.find("zenith.erp.pos.PosTransaction").condition("organizationPartyId",activeOrgId).condition("statusId","PtCompleted")
+                if (dayStart != null) _cq.condition("entryDate", EC.GREATER_THAN_EQUAL_TO, dayStart).condition("entryDate", EC.LESS_THAN, dayEndExcl)
+                def _tids = _cq.disableAuthz().list().collect { it.transactionId }
+                if (_tids) ec.entity.find("zenith.erp.pos.PosPayment").condition("transactionId","in",_tids).condition("paymentMethod","Cash").disableAuthz().list().each { _finCash += _zbd(it.amount) }
+            } } catch (Exception _e) {}
             kpiCards = [
-                [lab:'Customers',    num: totalCustomers, icon:'groups',        tintBg:'#F3E9FE', tintFg:'#7C3AED', url:'/apps/zenith/Contacts/Customers',      trend:_custTrend],
-                [lab:'Sales Orders', num: totalOrders,    icon:'shopping_cart', tintBg:'#E6FBF7', tintFg:'#0D9488', url:'/apps/zenith/sales/FindOrder',         trend:_ordTrend],
-                [lab:'Invoices',     num: totalInvoices,  icon:'description',   tintBg:'#FEF3E2', tintFg:'#D97706', url:'/apps/zenith/sales/FindInvoice',       trend:_invTrend],
-                [lab:'Products',     num: totalProducts,  icon:'inventory_2',   tintBg:'#E7F8EF', tintFg:'#10B981', url:'/apps/zenith/Inventory/FindProduct',   trend:null]
+                [lab:'Total Sales',      disp:_finFmt(_finSales), icon:'trending_up',            tintBg:'#FEF3C7', tintFg:'#D97706', url:'/apps/zenith/sales/SalesDashboard',      trend:_salesTrend],
+                [lab:'Total Payables',   disp:_finFmt(_finPay),   icon:'receipt_long',           tintBg:'#FEE2E2', tintFg:'#DC2626', url:'/apps/zenith/Purchase/PurchaseInvoices', trend:null],
+                [lab:'Total Receivable', disp:_finFmt(_finRecv),  icon:'account_balance_wallet', tintBg:'#DBEAFE', tintFg:'#3B82F6', url:'/apps/zenith/pos/CreditBills',           trend:null],
+                [lab:'Cash in Hand',     disp:_finFmt(_finCash),  icon:'payments',               tintBg:'#D1FAE5', tintFg:'#059669', url:'/apps/zenith/pos/CashEntry',            trend:null]
             ]
         ]]></script>
 
@@ -569,7 +591,7 @@
       <span class="zsc-lab">${c.lab}</span>
       <span class="material-icons zsc-ic" style="background:${c.tintBg};color:${c.tintFg}">${c.icon}</span>
     </div>
-    <div class="zsc-num">${(c.num!0)?c}</div>
+    <div class="zsc-num">&#8377;${c.disp!((c.num!0)?c)}</div>
     <div class="zsc-sub"><#if c.trend??><span class="zsc-chip ${(c.trend.dir=='up')?string('zsc-up','zsc-dn')}">${(c.trend.dir=='up')?string('&#9650; +','&#9660; ')}${c.trend.pct}%</span><span style="color:#9CA3AF">vs last week</span><#else><span class="zsc-more">View all &#8594;</span></#if></div>
   </a>
   </#list>
