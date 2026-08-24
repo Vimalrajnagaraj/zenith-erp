@@ -12,7 +12,7 @@
     var CSS =
         '#ai-copilot-container{position:fixed;bottom:24px;right:24px;z-index:9999;font-family:inherit;}' +
         '#ai-copilot-toggle{background:#463D7A;color:#fff;border:none;border-radius:24px;padding:10px 18px;cursor:pointer;box-shadow:0 3px 12px rgba(0,0,0,.3);font-size:14px;font-weight:600;display:inline-flex;align-items:center;gap:6px;}' +
-        '#ai-copilot-toggle:hover{background:#6E56CF;}' +
+        '#ai-copilot-toggle:hover{background:#7C3AED;}' +
         '#ai-copilot-window{position:absolute;bottom:56px;right:0;width:340px;max-width:90vw;height:460px;background:#fff;border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,.28);flex-direction:column;overflow:hidden;}' +
         '#ai-copilot-window .chat-header{background:#463D7A;color:#fff;padding:12px 16px;font-weight:bold;flex:0 0 auto;}' +
         '#ai-copilot-window .chat-history{flex:1 1 auto;overflow-y:auto;padding:12px;background:#f6f7fb;}' +

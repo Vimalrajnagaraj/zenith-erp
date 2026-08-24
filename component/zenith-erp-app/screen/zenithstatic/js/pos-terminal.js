@@ -360,7 +360,7 @@ window._posOffline = (function() {
             ov.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;z-index:2147483647;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center';
             var panel = document.createElement('div');
             panel.style.cssText = 'background:#fff;border-radius:16px;width:90vw;max-width:800px;max-height:85vh;display:flex;flex-direction:column;box-shadow:0 12px 48px rgba(0,0,0,0.3);overflow:hidden';
-            panel.innerHTML = '<div style="padding:16px 20px;background:#6E56CF;color:#fff;display:flex;justify-content:space-between;align-items:center">'
+            panel.innerHTML = '<div style="padding:16px 20px;background:#7C3AED;color:#fff;display:flex;justify-content:space-between;align-items:center">'
                 + '<span style="font-size:18px;font-weight:700">&#128196; Bill History</span>'
                 + '<button id="hist-close" style="background:none;border:none;color:#fff;font-size:24px;cursor:pointer;padding:0 4px">&times;</button></div>'
                 + '<div style="padding:12px 20px;border-bottom:1px solid #e0e0e0">'
@@ -492,7 +492,7 @@ window._posOffline = (function() {
                     var edited = bill.amendCount > 0 ? '<span style="background:#ff9800;color:#fff;padding:1px 6px;border-radius:4px;font-size:10px;margin-left:6px">EDITED ('+bill.amendCount+')</span>' : '';
                     h += '<div class="hist-bill-row" data-tx-id="'+bill.txId+'" style="padding:12px 14px;border:1px solid #e8e8e8;border-radius:10px;margin-bottom:8px;cursor:pointer;transition:all 0.15s;background:#fafafa" onmouseover="this.style.background=\'#ECE8FB\';this.style.borderColor=\'#CBB8F0\'" onmouseout="this.style.background=\'#fafafa\';this.style.borderColor=\'#e8e8e8\'">'
                         + '<div style="display:flex;justify-content:space-between;align-items:center">'
-                        + '<div><span style="font-weight:700;font-size:15px;color:#6E56CF">#'+bill.billNo+'</span>'+edited+'</div>'
+                        + '<div><span style="font-weight:700;font-size:15px;color:#7C3AED">#'+bill.billNo+'</span>'+edited+'</div>'
                         + '<span style="font-weight:800;font-size:16px;color:#2e7d32">₹'+Number(bill.grand||0).toFixed(2)+'</span></div>'
                         + '<div style="display:flex;justify-content:space-between;margin-top:4px;font-size:12px;color:#777">'
                         + '<span>'+bill.date+'</span>'
@@ -546,10 +546,10 @@ window._posOffline = (function() {
             var listEl = document.getElementById('hist-list');
             if (!listEl) return;
             var h = '<div style="padding:8px">';
-            h += '<button id="hist-back" style="background:none;border:none;color:#6E56CF;font-size:14px;cursor:pointer;padding:4px 0;font-weight:600">&larr; Back to list</button>';
+            h += '<button id="hist-back" style="background:none;border:none;color:#7C3AED;font-size:14px;cursor:pointer;padding:4px 0;font-weight:600">&larr; Back to list</button>';
             h += '<div style="background:#f5f5f5;border-radius:10px;padding:14px;margin-top:8px">';
             h += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">'
-                + '<span style="font-size:18px;font-weight:700;color:#6E56CF">Bill #'+bill.billNo+'</span>'
+                + '<span style="font-size:18px;font-weight:700;color:#7C3AED">Bill #'+bill.billNo+'</span>'
                 + '<span style="font-size:11px;color:#999">'+bill.date+'</span></div>';
             h += '<table style="width:100%;border-collapse:collapse;font-size:13px">';
             h += '<thead><tr style="border-bottom:2px solid #ddd"><th style="text-align:left;padding:6px 4px">#</th><th style="text-align:left;padding:6px 4px">Item</th><th style="text-align:right;padding:6px 4px">Rate</th><th style="text-align:center;padding:6px 4px">Qty</th><th style="text-align:right;padding:6px 4px">Total</th><th style="padding:6px 4px"></th></tr></thead><tbody>';
@@ -586,7 +586,7 @@ window._posOffline = (function() {
                 h += '</div>';
             }
             h += '<div style="margin-top:12px;background:#ECE8FB;border-radius:10px;padding:12px">';
-            h += '<div style="font-weight:600;font-size:13px;color:#6E56CF;margin-bottom:6px">&#43; Add Item to Bill</div>';
+            h += '<div style="font-weight:600;font-size:13px;color:#7C3AED;margin-bottom:6px">&#43; Add Item to Bill</div>';
             h += '<div style="display:flex;gap:6px;align-items:center">';
             h += '<div style="flex:1;position:relative"><input id="hist-add-search" type="text" placeholder="Search product by name or code..." style="width:100%;padding:10px;border:1px solid #CBB8F0;border-radius:6px;font-size:13px;box-sizing:border-box;outline:none"/>';
             h += '<div id="hist-add-results" style="display:none;position:absolute;top:100%;left:0;right:0;z-index:10;background:#fff;border:1px solid #ccc;border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,0.15);max-height:200px;overflow-y:auto;margin-top:2px"></div></div>';
@@ -732,16 +732,16 @@ window._posOffline = (function() {
                 st.textContent =
                     '#pos-cart-editor table tbody td{color:#222 !important}'
                   + '#pos-cart-editor table tbody td>div{color:#999 !important}'
-                  + '#pos-cart-editor table thead th{color:#6E56CF !important;background:#eaf2fb !important}'
+                  + '#pos-cart-editor table thead th{color:#7C3AED !important;background:#eaf2fb !important}'
                   + '#pos-cart-editor input{background:#fff !important;color:#222 !important}'
                   + '#pos-cart-editor input::placeholder{color:#9aa0a6 !important}'
                   + '#pos-cart-editor .ced-inc,#pos-cart-editor .ced-dec{background:#f5f5f5 !important;color:#222 !important}'
                   + '#pos-cart-editor #ced-add-res{background:#fff !important}'
                   + '#pos-cart-editor .ced-pi div{color:#222 !important}'
                   // Outlined table: blue outer border (matches the editor header) + soft-blue gridlines.
-                  + '#pos-cart-editor table{border:1px solid #6E56CF !important}'
+                  + '#pos-cart-editor table{border:1px solid #7C3AED !important}'
                   + '#pos-cart-editor table th,#pos-cart-editor table td{border:1px solid #DCD3F2 !important}'
-                  + '#pos-cart-editor table thead th{border-bottom:2px solid #6E56CF !important}';
+                  + '#pos-cart-editor table thead th{border-bottom:2px solid #7C3AED !important}';
                 document.head.appendChild(st);
             }
             function f2(n) { return Number(n||0).toFixed(2); }
@@ -760,11 +760,11 @@ window._posOffline = (function() {
             var ed = document.createElement('div');
             cartEditorEl = ed;
             ed.id = 'pos-cart-editor';
-            ed.style.cssText = 'position:absolute;top:0;left:0;right:0;bottom:0;z-index:900;background:#fff;display:flex;flex-direction:column;box-shadow:-2px 0 0 #6E56CF inset';
+            ed.style.cssText = 'position:absolute;top:0;left:0;right:0;bottom:0;z-index:900;background:#fff;display:flex;flex-direction:column;box-shadow:-2px 0 0 #7C3AED inset';
             // Block the global terminal keyboard shortcuts while typing in the editor.
             ed.addEventListener('keydown', function(e) { e.stopPropagation(); });
             ed.innerHTML =
-                '<div style="background:#6E56CF;color:#fff;padding:10px 14px;display:flex;justify-content:space-between;align-items:center;flex-shrink:0">'
+                '<div style="background:#7C3AED;color:#fff;padding:10px 14px;display:flex;justify-content:space-between;align-items:center;flex-shrink:0">'
               + '<div><span style="font-size:16px;font-weight:800">&#9998; Editing Bill #'+bill.billNo+'</span>'
               + '<div style="font-size:11px;opacity:0.9;margin-top:2px">Change qty / price, remove items, or <b>tap a product on the left</b> to add it, then Save. This updates the same bill &mdash; not a new sale.</div></div>'
               + '<button id="ced-cancel-x" title="Cancel" style="background:rgba(255,255,255,0.18);border:none;color:#fff;font-size:22px;line-height:1;cursor:pointer;border-radius:6px;width:34px;height:34px">&times;</button></div>'
@@ -849,7 +849,7 @@ window._posOffline = (function() {
                 var orig = Number(bill.grand)||0;
                 var diff = est - orig;
                 var diffStr = diff > 0.005 ? ('<span style="color:#c62828;font-weight:700"> &nbsp;collect ~&#8377;'+f2(diff)+' more</span>')
-                            : diff < -0.005 ? ('<span style="color:#6E56CF;font-weight:700"> &nbsp;refund ~&#8377;'+f2(-diff)+'</span>')
+                            : diff < -0.005 ? ('<span style="color:#7C3AED;font-weight:700"> &nbsp;refund ~&#8377;'+f2(-diff)+'</span>')
                             : '';
                 totalsEl.innerHTML = 'Est. subtotal &#8377;'+f2(sub)+' &middot; GST ~&#8377;'+f2(tax)
                   + ' &middot; <b>Est. total ~&#8377;'+f2(est)+'</b>'+diffStr
@@ -927,7 +927,7 @@ window._posOffline = (function() {
                     histToast('✔ Bill #'+(lastBill?lastBill.billNo:bill.billNo)+' updated — printing revised bill', '#2e7d32');
                     if (lastBill) {
                         var rd=Number(lastBill.refundDue)||0, bd=Number(lastBill.balanceDue)||0;
-                        if (rd>0.005) setTimeout(function(){ histToast('↩ REFUND ₹'+f2(rd)+' to the customer', '#6E56CF'); }, 1200);
+                        if (rd>0.005) setTimeout(function(){ histToast('↩ REFUND ₹'+f2(rd)+' to the customer', '#7C3AED'); }, 1200);
                         else if (bd>0.005) setTimeout(function(){ histToast('➕ COLLECT ₹'+f2(bd)+' more from the customer', '#e65100'); }, 1200);
                         printEditedReceipt(lastBill.txId, lastBill.billNo, (Number(lastBill.tax)>0?'Y':'N'));
                     }
@@ -1004,12 +1004,12 @@ window._posOffline = (function() {
         var panel = document.createElement('div');
         panel.style.cssText = 'background:#fff;border-radius:16px;width:90vw;max-width:560px;max-height:84vh;display:flex;flex-direction:column;box-shadow:0 12px 48px rgba(0,0,0,0.3);overflow:hidden';
         panel.innerHTML =
-            '<div style="padding:14px 18px;background:#6E56CF;color:#fff;display:flex;justify-content:space-between;align-items:center">'
+            '<div style="padding:14px 18px;background:#7C3AED;color:#fff;display:flex;justify-content:space-between;align-items:center">'
           + '<span style="font-size:17px;font-weight:700">&#128100; Customer for this bill</span>'
           + '<button id="cust-close" style="background:none;border:none;color:#fff;font-size:24px;cursor:pointer;padding:0 4px">&times;</button></div>'
           + '<div style="padding:12px 18px;border-bottom:1px solid #e0e0e0;display:flex;gap:8px;align-items:center">'
           + '<input id="cust-search" type="text" placeholder="Search name or phone…" autocomplete="off" style="flex:1;padding:11px 14px;border:1px solid #ccc;border-radius:8px;font-size:15px;box-sizing:border-box;outline:none"/>'
-          + '<a href="/apps/zenith/Contacts/Customers" target="_blank" rel="noopener" style="white-space:nowrap;padding:11px 14px;border-radius:8px;background:#ECE8FB;color:#6E56CF;border:1px solid #DCD3F2;font-weight:700;font-size:13px;text-decoration:none" title="Add a new customer in Contacts (opens a new tab)">&#43; New</a></div>'
+          + '<a href="/apps/zenith/Contacts/Customers" target="_blank" rel="noopener" style="white-space:nowrap;padding:11px 14px;border-radius:8px;background:#ECE8FB;color:#7C3AED;border:1px solid #DCD3F2;font-weight:700;font-size:13px;text-decoration:none" title="Add a new customer in Contacts (opens a new tab)">&#43; New</a></div>'
           + '<div style="padding:8px 18px 0"><button id="cust-walkin" type="button" style="width:100%;padding:11px;border:1px dashed #bbb;background:#fafafa;border-radius:8px;font-size:14px;font-weight:700;color:#555;cursor:pointer">&#128694; Walk-In (no customer)</button></div>'
           + '<div id="cust-list" style="flex:1;overflow-y:auto;padding:10px 14px 16px"><div style="text-align:center;padding:30px;color:#999">Type a name or phone number to search your customers…</div></div>';
         ov.appendChild(panel); document.body.appendChild(ov);
@@ -1036,7 +1036,7 @@ window._posOffline = (function() {
             var h = '';
             d.customers.forEach(function(c) {
                 h += '<div class="cust-row" data-pid="' + c.partyId + '" data-name="' + (c.name || '').replace(/"/g, '&quot;') + '" style="padding:12px 14px;border:1px solid #e8e8e8;border-radius:10px;margin-bottom:8px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;gap:10px" onmouseover="this.style.background=\'#e8eaf6\'" onmouseout="this.style.background=\'#fff\'">'
-                  + '<span style="font-weight:700;color:#6E56CF">' + (c.name || c.partyId) + '</span>'
+                  + '<span style="font-weight:700;color:#7C3AED">' + (c.name || c.partyId) + '</span>'
                   + (c.phone ? '<span style="font-size:13px;color:#777;white-space:nowrap">' + c.phone + '</span>' : '')
                   + '</div>';
             });
@@ -1047,7 +1047,7 @@ window._posOffline = (function() {
                     var pid = row.dataset.pid, nm = row.dataset.name;
                     if (!tx) { histToast('Add an item to the bill first, then set the customer', '#e65100'); return; }
                     custPost('setCustomer', {transactionId: tx, customerPartyId: pid}).then(function(d) {
-                        if (d && d.success) { setCustChip(d.customer || nm); histToast('Customer: ' + (d.customer || nm), '#6E56CF'); closeCustomer(); }
+                        if (d && d.success) { setCustChip(d.customer || nm); histToast('Customer: ' + (d.customer || nm), '#7C3AED'); closeCustomer(); }
                         else { histToast((d && d.error) || 'Could not set customer', '#c62828'); }
                     });
                 });
@@ -1080,7 +1080,7 @@ window._posOffline = (function() {
                 d.bills.forEach(function(b) {
                     h += '<div style="border:1px solid #ffe0b2;background:#fff8f0;border-radius:10px;padding:14px;margin-bottom:10px">'
                         + '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px">'
-                        + '<div><span style="font-weight:700;font-size:15px;color:#6E56CF">#'+b.billNo+'</span>'
+                        + '<div><span style="font-weight:700;font-size:15px;color:#7C3AED">#'+b.billNo+'</span>'
                         + '<span style="font-size:12px;color:#777;margin-left:8px">'+b.date+'</span></div>'
                         + '<span style="font-weight:800;font-size:16px;color:#c62828">Due ₹'+creditFmt(b.outstanding)+'</span></div>'
                         + '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;margin-top:6px">'
@@ -1253,7 +1253,7 @@ window.posPayCash = function(form) {
             + '<div style="display:flex;align-items:center;gap:8px;margin-bottom:12px"><span style="color:#666;font-size:15px;min-width:62px">Received</span>'
             + '<input id="posCashRecv" type="number" step="any" min="0" value="' + due.toFixed(2) + '" style="flex:1;padding:12px;font-size:22px;font-weight:800;text-align:right;border:2px solid #4caf50;border-radius:10px;outline:none"/></div>'
             + '<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin-bottom:10px">' + denomBtns
-            + '<button type="button" id="posCashExact" style="padding:14px 4px;font-size:13px;font-weight:700;border:2px solid #6E56CF;background:#ECE8FB;color:#6E56CF;border-radius:10px;cursor:pointer">Exact</button>'
+            + '<button type="button" id="posCashExact" style="padding:14px 4px;font-size:13px;font-weight:700;border:2px solid #7C3AED;background:#ECE8FB;color:#7C3AED;border-radius:10px;cursor:pointer">Exact</button>'
             + '<button type="button" id="posCashClear" style="padding:14px 4px;font-size:13px;font-weight:700;border:2px solid #c62828;background:#ffebee;color:#c62828;border-radius:10px;cursor:pointer">Clear</button></div>'
             + '<div id="posCashChange" style="text-align:center;font-size:18px;font-weight:800;padding:11px;border-radius:10px;margin-bottom:14px"></div>'
             + '<div style="display:flex;gap:10px"><button type="button" id="posCashCancel" style="flex:1;padding:14px;font-size:15px;font-weight:700;border:1px solid #bbb;background:#f5f5f5;color:#444;border-radius:10px;cursor:pointer">Cancel</button>'
@@ -1395,7 +1395,7 @@ window.posPayDigital = function(form) {
     if (window.__posArrowNav) { return; }
     window.__posArrowNav = true;
 
-    var BLUE = '#6E56CF', YELLOW = '#ffeb3b';
+    var BLUE = '#7C3AED', YELLOW = '#ffeb3b';
     var cur = null;       // { el, type, seq }
     var qtyBuf = '';
     var hintT = null;
@@ -1915,20 +1915,20 @@ window.posToggleFullscreen = function() {
                     var card = ov.firstElementChild;
                     var body = '<div style="padding:20px 24px">'
                         + '<div style="text-align:center;margin-bottom:16px;padding-bottom:12px;border-bottom:2px solid #e0e0e0">'
-                        + '<div style="font-size:36px;font-weight:800;color:#6E56CF">'+d.billCount+'</div>'
+                        + '<div style="font-size:36px;font-weight:800;color:#7C3AED">'+d.billCount+'</div>'
                         + '<div style="font-size:13px;color:#777">Bills Completed</div></div>'
                         + row('Total Sales', d.totalSales, true, '#2e7d32')
                         + '<div style="height:8px"></div>'
                         + row('Opening Cash', d.openingCash, false)
                         + row('Cash Received', d.cashReceived, false, '#2e7d32')
-                        + row('Card Received', d.cardReceived, false, '#6E56CF')
+                        + row('Card Received', d.cardReceived, false, '#7C3AED')
                         + row('UPI Received', d.upiReceived, false, '#7b1fa2')
                         + row('Change Given', d.changeGiven, false, '#e65100')
                         + '<div style="height:4px"></div>'
-                        + row('Expected Cash in Drawer', d.expectedCash, true, '#6E56CF')
+                        + row('Expected Cash in Drawer', d.expectedCash, true, '#7C3AED')
                         + '<div style="margin-top:20px">'
                         + '<label style="font-size:13px;font-weight:600;color:#555;display:block;margin-bottom:6px">Actual Cash in Drawer</label>'
-                        + '<input id="close-cash-input" type="number" step="0.01" value="'+fmt(d.expectedCash)+'" style="width:100%;padding:12px 14px;border:2px solid #6E56CF;border-radius:8px;font-size:18px;font-weight:700;text-align:center;box-sizing:border-box;outline:none"/>'
+                        + '<input id="close-cash-input" type="number" step="0.01" value="'+fmt(d.expectedCash)+'" style="width:100%;padding:12px 14px;border:2px solid #7C3AED;border-radius:8px;font-size:18px;font-weight:700;text-align:center;box-sizing:border-box;outline:none"/>'
                         + '<div id="close-cash-diff" style="text-align:center;font-size:13px;margin-top:6px;color:#999">Difference: ₹0.00</div></div>'
                         + '<div style="display:flex;gap:12px;margin-top:20px">'
                         + '<button id="close-cancel-btn" style="flex:1;padding:14px;border:2px solid #ccc;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;background:#fff;color:#555">Cancel</button>'
@@ -2170,7 +2170,7 @@ window.posToggleFullscreen = function() {
                     ov.className = 'pos-printer-overlay';
                     ov.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.6);z-index:999999;display:flex;align-items:center;justify-content:center';
                     var card = '<div style="background:#fff;border-radius:16px;padding:28px;width:420px;max-height:80vh;overflow-y:auto;box-shadow:0 20px 60px rgba(0,0,0,0.4)">'
-                        + '<div style="font-size:20px;font-weight:700;color:#6E56CF;margin-bottom:6px">&#128424; Printer Setup</div>'
+                        + '<div style="font-size:20px;font-weight:700;color:#7C3AED;margin-bottom:6px">&#128424; Printer Setup</div>'
                         + '<div style="font-size:13px;color:#666;margin-bottom:16px">Select your thermal receipt printer for silent printing via QZ Tray</div>';
                     if (printers.length === 0) {
                         card += '<div style="padding:20px;text-align:center;color:#e53935;font-size:15px">No printers found. Make sure your thermal printer is connected and drivers are installed.</div>';
@@ -2183,7 +2183,7 @@ window.posToggleFullscreen = function() {
                     }
                     card += '<div style="display:flex;gap:10px;margin-top:16px">'
                         + '<button class="qz-cancel" style="flex:1;padding:12px;border:2px solid #ccc;border-radius:10px;background:#f5f5f5;font-size:14px;font-weight:600;cursor:pointer;color:#666">Cancel</button>'
-                        + '<button class="qz-save" style="flex:1;padding:12px;border:none;border-radius:10px;background:#6E56CF;color:#fff;font-size:14px;font-weight:700;cursor:pointer;opacity:' + (qzPrinter ? '1' : '0.5') + '"' + (qzPrinter ? '' : ' disabled') + '>Save & Print</button>'
+                        + '<button class="qz-save" style="flex:1;padding:12px;border:none;border-radius:10px;background:#7C3AED;color:#fff;font-size:14px;font-weight:700;cursor:pointer;opacity:' + (qzPrinter ? '1' : '0.5') + '"' + (qzPrinter ? '' : ' disabled') + '>Save & Print</button>'
                         + '</div></div>';
                     ov.innerHTML = card;
                     document.body.appendChild(ov);
@@ -2233,7 +2233,7 @@ window.posToggleFullscreen = function() {
         setTimeout(function() {
             qzConnect().then(function() {
                 console.log('QZ Tray connected — silent printing enabled');
-                showToast('Printer connected — silent printing active', '#6E56CF');
+                showToast('Printer connected — silent printing active', '#7C3AED');
             }).catch(function() {});
         }, 400);
 
@@ -2421,7 +2421,7 @@ window.posToggleFullscreen = function() {
                 + '<span style="color:#555">Tax: <b id="posSumTax">'+fmt(d.tax)+'</b></span>'
                 + '<span style="color:#555">Disc: <b id="posSumDisc">'+fmt(d.disc)+'</b></span>'
                 + '</div></div>'
-                + '<div style="background:#6E56CF;color:#fff;padding:clamp(5px,1vh,12px) 20px;border-radius:10px;display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">'
+                + '<div style="background:#7C3AED;color:#fff;padding:clamp(5px,1vh,12px) 20px;border-radius:10px;display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">'
                 + '<span style="font-size:16px;font-weight:600">'+modeLabel+' TOTAL</span>'
                 + '<span id="posSumTotal" style="font-size:28px;font-weight:800;letter-spacing:1px">'+CS+fmt(d.pay)+'</span></div>';
             if (d.items.length > 0) {
@@ -2430,7 +2430,7 @@ window.posToggleFullscreen = function() {
                     + '<button type="button" class="pos-cash-btn" style="width:100%;padding:clamp(8px,1.4vh,15px) 8px;border:none;border-radius:10px;font-size:16px;font-weight:700;cursor:pointer;background:#4caf50;color:#fff">&#128176; CASH</button>'
                     + payBtn('Card','&#128179; CARD','#2196f3')
                     + payBtn('UPI','&#128241; UPI','#9c27b0') + '</div>'
-                    + '<button type="button" class="pos-split-btn" style="display:block;width:100%;padding:clamp(7px,1.2vh,13px) 8px;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;background:#6E56CF;color:#fff;border:none;text-align:center;margin-bottom:8px;box-sizing:border-box">&#8596; SPLIT PAYMENT</button>'
+                    + '<button type="button" class="pos-split-btn" style="display:block;width:100%;padding:clamp(7px,1.2vh,13px) 8px;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;background:#7C3AED;color:#fff;border:none;text-align:center;margin-bottom:8px;box-sizing:border-box">&#8596; SPLIT PAYMENT</button>'
                     + '<div style="display:grid;grid-template-columns:1fr 1fr 1fr'+(heldCount > 0 ? ' 1fr' : '')+';gap:8px">'
                     + '<button type="button" onclick="posCreditSale()" style="width:100%;padding:clamp(7px,1.2vh,13px) 4px;border-radius:10px;font-size:14px;font-weight:700;cursor:pointer;background:#e65100;color:#fff;border:none;text-align:center;box-sizing:border-box">&#128196; CREDIT</button>'
                     + actionBtn('holdSale','HOLD','#ff9800')
@@ -2453,11 +2453,11 @@ window.posToggleFullscreen = function() {
                 + '<span style="color:#555">Tax: <b>'+(lastCartData ? fmt(lastCartData.tax) : '0')+'</b></span>'
                 + '<span style="color:#555">Disc: <b>'+(lastCartData ? fmt(lastCartData.disc) : '0')+'</b></span>'
                 + '</div></div>'
-                + '<div style="background:#6E56CF;color:#fff;padding:clamp(5px,1vh,12px) 20px;border-radius:10px;display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">'
+                + '<div style="background:#7C3AED;color:#fff;padding:clamp(5px,1vh,12px) 20px;border-radius:10px;display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">'
                 + '<span style="font-size:16px;font-weight:600">'+modeLabel+' TOTAL</span>'
                 + '<span style="font-size:28px;font-weight:800;letter-spacing:1px">'+CS+fmt(lastPay)+'</span></div>'
-                + '<div class="pos-split-panel" style="border:2px solid #6E56CF;border-radius:10px;padding:14px;background:#ECE8FB">'
-                + '<div style="text-align:center;font-size:17px;font-weight:700;color:#6E56CF;margin-bottom:6px">SPLIT PAYMENT</div>'
+                + '<div class="pos-split-panel" style="border:2px solid #7C3AED;border-radius:10px;padding:14px;background:#ECE8FB">'
+                + '<div style="text-align:center;font-size:17px;font-weight:700;color:#7C3AED;margin-bottom:6px">SPLIT PAYMENT</div>'
                 + '<div style="text-align:center;font-size:24px;font-weight:800;color:#333;margin-bottom:14px">Total: '+CS+fmt(lastPay)+'</div>'
                 + '<form method="post" action="Terminal/splitPayAndComplete" class="pos-split-form" style="margin:0">'
                 + '<input type="hidden" name="transactionId" value="'+TX+'"/>'
@@ -2471,7 +2471,7 @@ window.posToggleFullscreen = function() {
                 + '<input type="number" name="cashAmount" value="0" step="any" min="0" onfocus="this.select()" style="flex:1;padding:12px 10px;border:2px solid #4caf50;border-radius:8px;font-size:18px;text-align:right;box-sizing:border-box;outline:none"/>'
                 + '</div>'
                 + '<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">'
-                + '<span style="min-width:55px;font-size:14px;font-weight:700;color:#6E56CF;text-align:right">&#128179; Card</span>'
+                + '<span style="min-width:55px;font-size:14px;font-weight:700;color:#7C3AED;text-align:right">&#128179; Card</span>'
                 + '<input type="number" name="cardAmount" value="0" step="any" min="0" onfocus="this.select()" style="flex:1;padding:12px 10px;border:2px solid #2196f3;border-radius:8px;font-size:18px;text-align:right;box-sizing:border-box;outline:none"/>'
                 + '</div>'
                 + '<div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;padding-left:65px">'
@@ -2484,7 +2484,7 @@ window.posToggleFullscreen = function() {
                 + '<div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;padding-left:65px">'
                 + '<input type="text" name="upiRef" placeholder="UPI reference #" style="flex:1;padding:8px 10px;border:1px solid #ccc;border-radius:6px;font-size:13px;box-sizing:border-box;outline:none"/>'
                 + '</div>'
-                + '<button type="submit" style="width:100%;padding:16px;background:#6E56CF;color:#fff;border:none;border-radius:10px;font-size:17px;font-weight:700;cursor:pointer;margin-bottom:8px">&#10003; CONFIRM SPLIT</button>'
+                + '<button type="submit" style="width:100%;padding:16px;background:#7C3AED;color:#fff;border:none;border-radius:10px;font-size:17px;font-weight:700;cursor:pointer;margin-bottom:8px">&#10003; CONFIRM SPLIT</button>'
                 + '</form>'
                 + '<button type="button" class="pos-split-cancel" style="display:block;width:100%;text-align:center;padding:12px;background:#f5f5f5;border:none;border-radius:8px;color:#666;font-size:14px;font-weight:600;cursor:pointer">&#10006; CANCEL</button>'
                 + '</div>';
@@ -2515,7 +2515,7 @@ window.posToggleFullscreen = function() {
                 + '<span style="color:#555">Tax: <b>'+(lastCartData ? fmt(lastCartData.tax) : '0')+'</b></span>'
                 + '<span style="color:#555">Disc: <b>'+(lastCartData ? fmt(lastCartData.disc) : '0')+'</b></span>'
                 + '</div></div>'
-                + '<div style="background:#6E56CF;color:#fff;padding:clamp(5px,1vh,12px) 20px;border-radius:10px;display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">'
+                + '<div style="background:#7C3AED;color:#fff;padding:clamp(5px,1vh,12px) 20px;border-radius:10px;display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">'
                 + '<span style="font-size:16px;font-weight:600">'+modeLabel+' TOTAL</span>'
                 + '<span style="font-size:28px;font-weight:800;letter-spacing:1px">'+CS+fmt(lastPay)+'</span></div>'
                 + '<div class="pos-cash-panel" style="border:2px solid #4caf50;border-radius:10px;padding:14px;background:#e8f5e9">'
@@ -2550,12 +2550,12 @@ window.posToggleFullscreen = function() {
                 if (d.modes && d.modes.length > 1) {
                     var mo = '';
                     d.modes.forEach(function(m){ mo += '<option value="'+m.id+'"'+(it.mode===m.id?' selected':'')+'>'+m.name+(Number(m.disc)>0?(' −'+Number(m.disc)+'%'):'')+'</option>'; });
-                    modeSel = '<select class="aj-mode" data-seq="'+it.seq+'" title="Sale mode for this item" style="flex-shrink:0;font-size:11px;padding:3px 4px;border:1px solid #CBB8F0;border-radius:4px;color:#6E56CF;font-weight:700;max-width:120px;background:#f5f8ff;cursor:pointer">'+mo+'</select>';
+                    modeSel = '<select class="aj-mode" data-seq="'+it.seq+'" title="Sale mode for this item" style="flex-shrink:0;font-size:11px;padding:3px 4px;border:1px solid #CBB8F0;border-radius:4px;color:#7C3AED;font-weight:700;max-width:120px;background:#f5f8ff;cursor:pointer">'+mo+'</select>';
                 }
                 h += '<td style="padding:3px 10px"><div style="display:flex;align-items:center;gap:8px"><div style="font-size:14px;font-weight:600;color:#000;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+it.name+'</div>'+modeSel+'</div><div style="font-size:11px;color:#555">'+it.pid+'</div></td>';
                 h += '<td style="padding:4px 4px;text-align:right;vertical-align:middle"><div style="display:flex;align-items:center;gap:3px;justify-content:flex-end">';
                 h += '<input type="text" inputmode="decimal" value="'+Number(it.price)+'" data-seq="'+it.seq+'" class="aj-p" style="width:65px;padding:8px 6px;border:1px solid #ccc;border-radius:6px;font-size:14px;text-align:right;background:#fff;color:#000;box-sizing:border-box"/>';
-                h += '<button data-seq="'+it.seq+'" class="aj-pb" style="width:32px;height:32px;border:none;background:#6E56CF;color:#fff;border-radius:6px;cursor:pointer;font-size:14px;display:flex;align-items:center;justify-content:center;padding:0;flex-shrink:0">&#10003;</button>';
+                h += '<button data-seq="'+it.seq+'" class="aj-pb" style="width:32px;height:32px;border:none;background:#7C3AED;color:#fff;border-radius:6px;cursor:pointer;font-size:14px;display:flex;align-items:center;justify-content:center;padding:0;flex-shrink:0">&#10003;</button>';
                 h += '</div></td>';
                 h += '<td style="padding:4px;text-align:center;vertical-align:middle"><div style="display:flex;align-items:center;justify-content:center;gap:0">';
                 h += '<button data-seq="'+it.seq+'" data-q="'+(Number(it.qty)-1)+'" class="aj-q" style="width:34px;height:34px;border:2px solid #e53935;background:#fff;font-size:19px;font-weight:bold;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0;border-radius:8px 0 0 8px;color:#e53935">-</button>';
@@ -2908,7 +2908,7 @@ window.posToggleFullscreen = function() {
                 window.__posCartEditorAddProduct(fd.get('productId'), fd.get('unitPrice'),
                     (function(){ var b = form.querySelector('button div'); return b ? b.textContent : ''; })());
                 var ebtn = form.querySelector('button');
-                if (ebtn) { ebtn.style.transform = 'scale(0.92)'; ebtn.style.boxShadow = '0 0 0 3px #6E56CF';
+                if (ebtn) { ebtn.style.transform = 'scale(0.92)'; ebtn.style.boxShadow = '0 0 0 3px #7C3AED';
                     setTimeout(function() { ebtn.style.transform = ''; ebtn.style.boxShadow = ''; }, 250); }
                 return;
             }
@@ -2975,7 +2975,7 @@ window.posToggleFullscreen = function() {
                 var newCatId = linkUrl.searchParams.get('catId') || '';
                 CATID = newCatId;
                 document.querySelectorAll('.pos-cat-strip a').forEach(function(a) { a.style.background = '#455a64'; });
-                this.style.background = '#6E56CF';
+                this.style.background = '#7C3AED';
                 var grid = document.querySelector('.pos-product-grid');
                 var searchInput = document.querySelector('.pos-search-bar input[name="searchTerm"]');
                 if (searchInput) searchInput.value = '';
@@ -3097,7 +3097,7 @@ window.posToggleFullscreen = function() {
                         + '<div style="font-size:13px;font-weight:700;color:#777;text-transform:uppercase;margin-bottom:8px">Session Summary</div>'
                         + '<div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #eee">'
                         + '<span style="color:#555;font-size:15px">Bills Completed</span>'
-                        + '<span style="font-weight:700;font-size:15px;color:#6E56CF">'+d.billCount+'</span></div>'
+                        + '<span style="font-weight:700;font-size:15px;color:#7C3AED">'+d.billCount+'</span></div>'
                         + row('Total Sales', d.totalSales, '#2e7d32')
                         + '</div>'
                         + '<div style="background:#f5f5f5;border-radius:10px;padding:14px 16px;margin-bottom:16px">'
@@ -3111,7 +3111,7 @@ window.posToggleFullscreen = function() {
                         + '</div>'
                         + (d.cardReceived > 0 || d.upiReceived > 0 ? '<div style="background:#f5f5f5;border-radius:10px;padding:14px 16px;margin-bottom:16px">'
                             + '<div style="font-size:13px;font-weight:700;color:#777;text-transform:uppercase;margin-bottom:8px">Other Payments</div>'
-                            + (d.cardReceived > 0 ? row('Card', d.cardReceived, '#6E56CF') : '')
+                            + (d.cardReceived > 0 ? row('Card', d.cardReceived, '#7C3AED') : '')
                             + (d.upiReceived > 0 ? row('UPI', d.upiReceived, '#7b1fa2') : '')
                             + '</div>' : '')
                         + '<div style="margin-bottom:16px">'
@@ -3477,7 +3477,7 @@ window.posToggleFullscreen = function() {
                 changeDiv.innerHTML = '<span style="color:#2e7d32;font-size:22px">✔ Exact Amount</span>';
                 confirmBtn.disabled = false; confirmBtn.style.opacity = '1';
             } else {
-                changeDiv.innerHTML = '<span style="color:#6E56CF;font-size:26px;letter-spacing:0.5px">Change: ' + CS + fmt(diff) + '</span>';
+                changeDiv.innerHTML = '<span style="color:#7C3AED;font-size:26px;letter-spacing:0.5px">Change: ' + CS + fmt(diff) + '</span>';
                 confirmBtn.disabled = false; confirmBtn.style.opacity = '1';
             }
         });
@@ -3603,7 +3603,7 @@ window.posToggleFullscreen = function() {
         dragging = true; startX = x;
         startLeftW = left.offsetWidth;
         totalW = layout.offsetWidth - splitter.offsetWidth;
-        splitter.style.background = '#A793F0';
+        splitter.style.background = '#A78BFA';
         document.body.style.cursor = 'col-resize';
         document.body.style.userSelect = 'none';
     }

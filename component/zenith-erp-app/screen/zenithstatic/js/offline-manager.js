@@ -32,7 +32,7 @@
             "@keyframes zeta-pulse{0%,100%{opacity:1}50%{opacity:.4}}" +
             "#zeta-sync-badge{" +
                 "position:fixed;bottom:80px;right:20px;z-index:99998;" +
-                "background:#6E56CF;color:#fff;border-radius:12px;" +
+                "background:#7C3AED;color:#fff;border-radius:12px;" +
                 "padding:10px 16px;font-family:Inter,sans-serif;font-size:13px;" +
                 "font-weight:500;cursor:pointer;box-shadow:0 4px 12px rgba(110, 86, 207,.3);" +
                 "display:none;align-items:center;gap:8px;" +
@@ -41,7 +41,7 @@
             "}" +
             "#zeta-sync-badge:hover{transform:translateY(-2px);box-shadow:0 6px 16px rgba(110, 86, 207,.4)}" +
             "#zeta-sync-badge .count{" +
-                "background:#fff;color:#6E56CF;border-radius:50%;min-width:22px;height:22px;" +
+                "background:#fff;color:#7C3AED;border-radius:50%;min-width:22px;height:22px;" +
                 "display:inline-flex;align-items:center;justify-content:center;font-weight:700;font-size:12px;" +
             "}" +
             "#zeta-sync-badge.syncing{background:#B98BE0;pointer-events:none}" +

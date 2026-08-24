@@ -12,7 +12,7 @@ function svg(N) {
     <svg xmlns="http://www.w3.org/2000/svg" width="${N}" height="${N}" viewBox="0 0 ${N} ${N}">
       <defs><linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%">
         <stop offset="0%" stop-color="#C4A5EC"/>
-        <stop offset="52%" stop-color="#6E56CF"/>
+        <stop offset="52%" stop-color="#7C3AED"/>
         <stop offset="100%" stop-color="#463D7A"/>
       </linearGradient></defs>
       <rect x="0" y="0" width="${N}" height="${N}" rx="${r}" ry="${r}" fill="url(#g)"/>
