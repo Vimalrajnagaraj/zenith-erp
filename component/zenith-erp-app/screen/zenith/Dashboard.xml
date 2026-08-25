@@ -307,34 +307,37 @@
             dwLabel = (showCustom && dashDate) ? acRangeLabel : "Date-wise"
             invKpiScoped = (dashDate != null && dashDate != '')
 
-            // ZE-DASH SWITCH: two client-switchable views for the Business Activity chart — Weekly (invoices raised
-            // per day, current week Sun..Sat) and Today Hourly (per hour today). SAME metric (invoices raised),
-            // org-scoped. Empty for a tenant with no current-week/today activity -> renders a flat zero line + a
-            // "0 invoices" subtitle (never a broken/blank chart). Not driven by the ACTIVITY RANGE chips.
-            def _baInvCount = { a, b -> activeOrgId ? ef.find("mantle.account.invoice.Invoice").condition("fromPartyId", activeOrgId)
-                .condition("invoiceTypeEnumId","InvoiceSales").condition("statusId", EntityCondition.NOT_EQUAL, "InvoiceCancelled")
-                .condition("invoiceDate", EntityCondition.GREATER_THAN_EQUAL_TO, a).condition("invoiceDate", EntityCondition.LESS_THAN, b).count() : 0 }
+            // ZE-DASH SALES ANALYST (2026-08): two client-switchable views — Weekly (sales ₹ per day, current week)
+            // and Today Hourly (sales ₹ per hour today). Metric = finalised InvoiceSales invoiceTotal (SAME basis as
+            // the Total Sales KPI above), org-scoped. Empty -> flat zero line + a "No sales" subtitle (never blank).
+            def _saFin = ['InvoiceFinalized','InvoicePmtRecvd']
+            def _saSum = { a, b -> try { activeOrgId ? (ef.find("mantle.account.invoice.Invoice").condition("fromPartyId", activeOrgId)
+                .condition("invoiceTypeEnumId","InvoiceSales").condition("statusId","in",_saFin)
+                .condition("invoiceDate", EntityCondition.GREATER_THAN_EQUAL_TO, a).condition("invoiceDate", EntityCondition.LESS_THAN, b)
+                .disableAuthz().list().sum { (it.invoiceTotal ?: 0) as BigDecimal } ?: BigDecimal.ZERO) : BigDecimal.ZERO } catch (Exception _e) { BigDecimal.ZERO } }
+            def _saRnd = { v -> (long) Math.round(((v ?: 0) as BigDecimal).doubleValue()) }
+            def _saFmt = { v -> try { zinr.inr(ec.l10n.format(((v ?: 0) as BigDecimal), '#,##,##0')) } catch (Exception _fe) { ec.l10n.format(((v ?: 0) as BigDecimal), '#,##0') } }
             // Weekly (current week, first-day-of-week .. +7 days)
             def _wkCal = java.util.Calendar.getInstance(); _wkCal.setTime(_now); _wkCal.set(java.util.Calendar.DAY_OF_WEEK, _wkCal.getFirstDayOfWeek())
             _wkCal.set(java.util.Calendar.HOUR_OF_DAY,0); _wkCal.set(java.util.Calendar.MINUTE,0); _wkCal.set(java.util.Calendar.SECOND,0); _wkCal.set(java.util.Calendar.MILLISECOND,0)
-            def _dayFmt = new java.text.SimpleDateFormat("EEE"); def _baWkL=[]; def _baWkD=[]; def _baWkTot=0
+            def _dayFmt = new java.text.SimpleDateFormat("EEE"); def _baWkL=[]; def _baWkD=[]; def _baWkTot=0L
             for (int i=0;i<7;i++) {
                 def _ds = new java.sql.Timestamp(_wkCal.getTimeInMillis()); def _dc = (java.util.Calendar) _wkCal.clone(); _dc.add(java.util.Calendar.DAY_OF_MONTH,1)
-                def _c = (int) _baInvCount(_ds, new java.sql.Timestamp(_dc.getTimeInMillis()))
-                _baWkL.add("'"+_dayFmt.format(_wkCal.getTime())+"'"); _baWkD.add(_c); _baWkTot += _c; _wkCal.add(java.util.Calendar.DAY_OF_MONTH,1)
+                def _v = _saRnd(_saSum(_ds, new java.sql.Timestamp(_dc.getTimeInMillis())))
+                _baWkL.add("'"+_dayFmt.format(_wkCal.getTime())+"'"); _baWkD.add(_v); _baWkTot += _v; _wkCal.add(java.util.Calendar.DAY_OF_MONTH,1)
             }
-            baWeekLabelsJson = "["+_baWkL.join(",")+"]"; baWeekDataJson = "["+_baWkD.join(",")+"]"; baWeekTotal = _baWkTot
-            // Today Hourly (per hour today, 8AM..9PM business window)
+            baWeekLabelsJson = "["+_baWkL.join(",")+"]"; baWeekDataJson = "["+_baWkD.join(",")+"]"; baWeekTotal = _baWkTot; baWeekTotalFmt = _saFmt(_baWkTot)
+            // Today Hourly (per hour today, 8AM..9PM business window) — sum ₹ per hour
             def _tStr = _sdf.format(_now)
             def _tS = java.sql.Timestamp.valueOf(_tStr + " 00:00:00"); def _tE = java.sql.Timestamp.valueOf(_tStr + " 23:59:59")
-            def _hrC = new int[24]
+            def _hrV = new java.math.BigDecimal[24]; for (int _i=0;_i<24;_i++) _hrV[_i]=BigDecimal.ZERO
             if (activeOrgId) ef.find("mantle.account.invoice.Invoice").condition("fromPartyId", activeOrgId).condition("invoiceTypeEnumId","InvoiceSales")
-                .condition("statusId", EntityCondition.NOT_EQUAL, "InvoiceCancelled").condition("invoiceDate", EntityCondition.GREATER_THAN_EQUAL_TO, _tS)
-                .condition("invoiceDate", EntityCondition.LESS_THAN_EQUAL_TO, _tE).selectField("invoiceDate").list().each {
-                    if (it.invoiceDate) { def c = java.util.Calendar.getInstance(); c.setTime(it.invoiceDate); _hrC[c.get(java.util.Calendar.HOUR_OF_DAY)]++ } }
-            def _baHrL=[]; def _baHrD=[]; def _baHrTot=0
-            for (int h=8; h<=21; h++) { def _lab=(h%12==0?12:h%12)+(h<12?'AM':'PM'); _baHrL.add("'"+_lab+"'"); _baHrD.add(_hrC[h]); _baHrTot += _hrC[h] }
-            baHourLabelsJson = "["+_baHrL.join(",")+"]"; baHourDataJson = "["+_baHrD.join(",")+"]"; baHourTotal = _baHrTot
+                .condition("statusId","in",_saFin).condition("invoiceDate", EntityCondition.GREATER_THAN_EQUAL_TO, _tS)
+                .condition("invoiceDate", EntityCondition.LESS_THAN_EQUAL_TO, _tE).selectField("invoiceDate").selectField("invoiceTotal").disableAuthz().list().each {
+                    if (it.invoiceDate) { def c = java.util.Calendar.getInstance(); c.setTime(it.invoiceDate); _hrV[c.get(java.util.Calendar.HOUR_OF_DAY)] += ((it.invoiceTotal ?: 0) as BigDecimal) } }
+            def _baHrL=[]; def _baHrD=[]; def _baHrTot=0L
+            for (int h=8; h<=21; h++) { def _lab=(h%12==0?12:h%12)+(h<12?'AM':'PM'); def _hv=_saRnd(_hrV[h]); _baHrL.add("'"+_lab+"'"); _baHrD.add(_hv); _baHrTot += _hv }
+            baHourLabelsJson = "["+_baHrL.join(",")+"]"; baHourDataJson = "["+_baHrD.join(",")+"]"; baHourTotal = _baHrTot; baHourTotalFmt = _saFmt(_baHrTot)
 
             // ZE-DASH layout: switchable widgets (+ cashier role default) + saved drag order
             def _roleHidden = ''
@@ -683,8 +686,8 @@
   <div class="zdh-ocard">
     <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:4px">
       <div style="min-width:0;display:flex;align-items:baseline;gap:9px">
-        <span style="font-size:15px;font-weight:800;color:#2A2340;letter-spacing:.01em">Business Activity</span>
-        <span id="baHead" style="font-size:20px;font-weight:800;color:#7C3AED;line-height:1">0</span>
+        <span style="font-size:15px;font-weight:800;color:#2A2340;letter-spacing:.01em">Sales Analyst</span>
+        <span id="baHead" style="font-size:20px;font-weight:800;color:#2563EB;line-height:1">&#8377;0</span>
       </div>
       <div class="ba-seg" role="group" aria-label="Business activity view">
         <button type="button" class="ba-seg-btn on" aria-pressed="true" data-t="weekly" onclick="try{baSwitch('weekly',this)}catch(_e){}">Weekly</button>
@@ -694,18 +697,20 @@
     <div id="baSub" style="font-size:11.5px;color:#8A96AB;margin-bottom:6px">This week</div>
     <div id="homeActivityChart" style="min-height:210px"></div>
   <img alt="" style="display:none" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" onload="zChart(this,function(){(function(){
-    var data={weekly:{cats:${baWeekLabelsJson},series:${baWeekDataJson},total:${baWeekTotal?c},sub:'This week',empty:'No invoices raised this week'},
-              hourly:{cats:${baHourLabelsJson},series:${baHourDataJson},total:${baHourTotal?c},sub:'Today',empty:'No invoices raised today'}};
+    var data={weekly:{cats:${baWeekLabelsJson},series:${baWeekDataJson},total:${baWeekTotal?c},fmt:'${baWeekTotalFmt}',sub:'This week',empty:'No sales this week'},
+              hourly:{cats:${baHourLabelsJson},series:${baHourDataJson},total:${baHourTotal?c},fmt:'${baHourTotalFmt}',sub:'Today',empty:'No sales today'}};
     var el=document.querySelector('#homeActivityChart'); if(!el||typeof ApexCharts==='undefined')return;
+    function inr(v){try{return Number(v).toLocaleString('en-IN');}catch(e){return Math.round(v);}}
+    function kc(v){v=Number(v);if(v>=10000000)return '₹'+(v/10000000).toFixed(1)+'Cr';if(v>=100000)return '₹'+(v/100000).toFixed(1)+'L';if(v>=1000)return '₹'+Math.round(v/1000)+'K';return '₹'+Math.round(v);}
     function opt(d){return {chart:{type:'area',height:210,toolbar:{show:false},fontFamily:'Roboto, sans-serif',animations:{enabled:true}},
-      series:[{name:'Invoices raised',data:d.total>0?d.series.map(Number):[]}],xaxis:{categories:d.cats},colors:['#7C3AED'],
-      stroke:{curve:'smooth',width:2},fill:{type:'gradient',gradient:{shadeIntensity:0.4,opacityFrom:0.4,opacityTo:0.05}},
-      dataLabels:{enabled:false},grid:{borderColor:'#EFEAF8',strokeDashArray:4},
-      markers:{size:4,colors:['#fff'],strokeColors:'#7C3AED',strokeWidth:2},
-      yaxis:{title:{text:'Invoices'},labels:{formatter:function(v){return Math.round(v);}}},
+      series:[{name:'Sales',data:d.total>0?d.series.map(Number):[]}],xaxis:{categories:d.cats},colors:['#2563EB'],
+      stroke:{curve:'smooth',width:3,lineCap:'round'},fill:{type:'gradient',gradient:{shadeIntensity:0.4,opacityFrom:0.12,opacityTo:0.01}},
+      dataLabels:{enabled:false},grid:{borderColor:'#E5E7EB',strokeDashArray:4},
+      markers:{size:4,colors:['#fff'],strokeColors:'#2563EB',strokeWidth:2},
+      yaxis:{labels:{formatter:function(v){return kc(v);}}},
       noData:{text:d.empty,style:{color:'#8A96AB',fontSize:'13px'}},
-      tooltip:{y:{formatter:function(v){return Math.round(v)+' invoices';}}}};}
-    function sub(d){var h=document.getElementById('baHead'); if(h)h.textContent=d.total; var s=document.getElementById('baSub'); if(s)s.textContent=d.sub+' · '+d.total+' invoice'+(d.total==1?'':'s')+' raised';}
+      tooltip:{y:{formatter:function(v){return '₹'+inr(Math.round(v));}}}};}
+    function sub(d){var h=document.getElementById('baHead'); if(h)h.innerHTML='₹'+d.fmt; var s=document.getElementById('baSub'); if(s)s.textContent=d.sub+' · ₹'+d.fmt+' in sales';}
     var ch=new ApexCharts(el,opt(data.weekly)); ch.render(); sub(data.weekly);
     window.baSwitch=function(k,btn){var d=data[k]; if(!d)return;
       try{localStorage.setItem('zdhBaPeriod',k);}catch(e){}
