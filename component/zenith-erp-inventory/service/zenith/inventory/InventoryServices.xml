@@ -8,11 +8,17 @@
             <parameter name="organizationPartyId"/>  <!-- org isolation; blank/_NA_ = all (super-admin) -->
             <parameter name="searchText"/>            <!-- product / stock id / batch / supplier contains -->
             <parameter name="withinDays"/>            <!-- '7'/'30'/'60' = within N days; 'expired' = past; '' = all 90d -->
+            <parameter name="categoryFilter"/>        <!-- expiry-risk §6: exact category name -->
+            <parameter name="supplierFilter"/>        <!-- expiry-risk §6: exact supplier name -->
+            <parameter name="daysBucket"/>            <!-- expiry-risk §7 chips: 'expired'/'0-30'/'31-60'/'61-90'/'90+' range tier -->
             <parameter name="orderByField" default-value="expiryDate"/>
         </in-parameters>
         <out-parameters>
             <parameter name="totalExpiryValue" type="BigDecimal"/>
             <parameter name="expiringAssets" type="List"/>
+            <parameter name="categoryOptions" type="List"/>  <!-- distinct categories in the org's expiry list -->
+            <parameter name="supplierOptions" type="List"/>  <!-- distinct suppliers in the org's expiry list -->
+            <parameter name="tierCounts" type="Map"/>        <!-- §7 chip counts: all/expired/d30/d3160/d6190/after90 -->
         </out-parameters>
         <actions>
             <script><![CDATA[
@@ -86,13 +92,47 @@
                     ])
                 }
 
-                // search + within-days filter
+                // expiry-risk §6: distinct category + supplier options from the FULL org list (stable regardless
+                // of the current filter selection, so the dropdowns don't lose options when a filter is applied).
+                categoryOptions = expList.collect { it.category }.findAll { it }.unique().sort().collect { [v: it] }
+                supplierOptions = expList.collect { it.supplierName }.findAll { it }.unique().sort().collect { [v: it] }
+
+                // search + category + supplier filters
                 def _search = (searchText ?: '').toString().trim().toLowerCase()
-                def _within = (withinDays ?: '').toString().trim()
                 if (_search) expList = expList.findAll { r ->
-                    (((r.productName ?: '') + ' ' + (r.assetId ?: '') + ' ' + (r.batchNumber ?: '') + ' ' + (r.supplierName ?: '')).toLowerCase().contains(_search) )
+                    (((r.productName ?: '') + ' ' + (r.assetId ?: '') + ' ' + (r.batchNumber ?: '') + ' ' + (r.supplierName ?: '') + ' ' + (r.pseudoId ?: '')).toLowerCase().contains(_search) )
                 }
-                if (_within) expList = expList.findAll { r -> (_within == 'expired') ? (r.daysToExpiry <= 0) : (r.daysToExpiry <= (_within as Integer)) }
+                def _catF = (categoryFilter ?: '').toString().trim()
+                if (_catF) expList = expList.findAll { r -> (r.category ?: '') == _catF }
+                def _supF = (supplierFilter ?: '').toString().trim()
+                if (_supF) expList = expList.findAll { r -> (r.supplierName ?: '') == _supF }
+
+                // expiry-risk §7: tier counts over the search/category/supplier scope (BEFORE the tier/within filter)
+                // so every chip shows a stable count within the active scope.
+                def _deT = { r -> (r.daysToExpiry != null) ? (r.daysToExpiry as Integer) : 999 }
+                tierCounts = [
+                    all:     expList.size(),
+                    expired: expList.count { _deT(it) <= 0 },
+                    d30:     expList.count { def d = _deT(it); d > 0 && d <= 30 },
+                    d3160:   expList.count { def d = _deT(it); d > 30 && d <= 60 },
+                    d6190:   expList.count { def d = _deT(it); d > 60 && d <= 90 },
+                    after90: expList.count { _deT(it) > 90 }
+                ]
+
+                // §7 tier (range) filter from the chips, OR the cumulative 'within N days' dropdown (§6)
+                def _bucket = (daysBucket ?: '').toString().trim()
+                def _within = (withinDays ?: '').toString().trim()
+                if (_bucket) {
+                    expList = expList.findAll { r -> def d = _deT(r)
+                        (_bucket == 'expired') ? (d <= 0) :
+                        ((_bucket == '0-30') ? (d > 0 && d <= 30) :
+                        ((_bucket == '31-60') ? (d > 30 && d <= 60) :
+                        ((_bucket == '61-90') ? (d > 60 && d <= 90) :
+                        ((_bucket == '90+') ? (d > 90) : true))))
+                    }
+                } else if (_within) {
+                    expList = expList.findAll { r -> (_within == 'expired') ? (r.daysToExpiry <= 0) : (r.daysToExpiry <= (_within as Integer)) }
+                }
 
                 BigDecimal totalVal = BigDecimal.ZERO
                 for (def r : expList) { totalVal = totalVal.add(r.value ?: BigDecimal.ZERO) }
