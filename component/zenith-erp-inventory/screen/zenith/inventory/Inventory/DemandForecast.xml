@@ -166,6 +166,41 @@
             context.fcHorizonDisp = _fcPe ? ('through ' + ec.l10n.format(_fcPe, 'dd MMM yyyy')) : '—'
             context.fcModelActive = (forecastProductCount > 0)
 
+            // ZE-INV demand-forecast §7 + §8.2: top-5 products by forecast demand + demand-tier distribution,
+            // from the FRESHEST forecast per product (real data). Tiers = tertiles of the actual quantity
+            // distribution (data-driven, not invented thresholds); No-demand = zero forecast.
+            def _dfAll = ec.entity.find("zenith.erp.inventory.DemandForecast").condition("productId", "in", myProductIds).selectField("productId").selectField("forecastQuantity").selectField("periodStart").list()
+            def _dfByProd = [:]
+            for (def f : _dfAll) {
+                def ex = _dfByProd[f.productId]
+                if (ex == null || (f.periodStart != null && (ex.periodStart == null || f.periodStart > ex.periodStart))) _dfByProd[f.productId] = f
+            }
+            def _dfQs = _dfByProd.values().collect { (it.forecastQuantity ?: 0G) as BigDecimal }
+            def _dfPos = _dfQs.findAll { it > 0G }.sort()
+            distNone = _dfQs.count { it <= 0G }
+            int _dfHi = 0, _dfMd = 0, _dfLo = 0
+            if (_dfPos) {
+                def _t1 = _dfPos[(int)(_dfPos.size() / 3)]; def _t2 = _dfPos[(int)(_dfPos.size() * 2 / 3)]
+                for (def q : _dfPos) { if (q >= _t2) _dfHi++ else if (q >= _t1) _dfMd++ else _dfLo++ }
+            }
+            distHi = _dfHi; distMd = _dfMd; distLo = _dfLo; distTotal = _dfQs.size()
+            distPctHi = distTotal > 0 ? (int)(distHi * 100 / distTotal) : 0
+            distPctMd = distTotal > 0 ? (int)(distMd * 100 / distTotal) : 0
+            distPctLo = distTotal > 0 ? (int)(distLo * 100 / distTotal) : 0
+            distPctNone = distTotal > 0 ? (100 - distPctHi - distPctMd - distPctLo) : 0
+            def _dfTop = new ArrayList(_dfByProd.values()).sort { a, b -> ((b.forecastQuantity ?: 0G) <=> (a.forecastQuantity ?: 0G)) }
+            if (_dfTop.size() > 5) _dfTop = new ArrayList(_dfTop.subList(0, 5))
+            def _dfMax = _dfTop ? ((_dfTop[0].forecastQuantity ?: 0G) as BigDecimal) : 0G
+            def _dfNames = [:]
+            if (_dfTop) ec.entity.find("mantle.product.Product").condition("productId", "in", _dfTop.collect { it.productId }).selectField("productId").selectField("productName").list().each { _dfNames[it.productId] = it.productName }
+            def _dfBars = []
+            for (def r : _dfTop) {
+                def q = (r.forecastQuantity ?: 0G) as BigDecimal
+                def pct = (_dfMax > 0G) ? q.multiply(100G).divide(_dfMax, 0, java.math.RoundingMode.HALF_UP).intValue() : 0
+                _dfBars.add([name: (_dfNames[r.productId] ?: r.productId), qty: ec.l10n.format(q, '#,##0.##'), pct: pct])
+            }
+            topDemandBars = _dfBars
+
             def confWord = { p -> p == null ? "Still learning" : (p >= 75 ? "Strong" : (p >= 60 ? "Good" : (p >= 45 ? "Fair" : "Still learning"))) }
             context.accWord = hasAcc ? confWord(avgAccuracy) : "Building up"
             context.accColor = !hasAcc ? "grey" : (avgAccuracy >= 60 ? "success" : (avgAccuracy >= 45 ? "warning" : "grey"))
@@ -318,6 +353,10 @@
         <!-- ZE-INV demand-forecast §8.1: Forecast health mini-grid — real derived values (last compute time,
              SKUs tracked, furthest horizon, model status), inline flex so it renders on /apps AND /qapps. -->
         <render-mode><text type="html,qvt,vuet"><![CDATA[<div style="background:#fff;border:1px solid #E5E7EB;border-radius:10px;padding:14px 16px;margin-bottom:16px"><div style="font-size:13px;font-weight:700;color:#374151;margin-bottom:10px">Forecast health</div><div style="display:flex;flex-wrap:wrap;gap:28px"><div><div style="font-size:11px;color:#6B7280;margin-bottom:2px">Data updated</div><div style="font-size:14px;font-weight:700;color:#111827">${fcUpdatedDisp}</div></div><div><div style="font-size:11px;color:#6B7280;margin-bottom:2px">Total SKUs</div><div style="font-size:14px;font-weight:700;color:#111827">${forecastProductCount}</div></div><div><div style="font-size:11px;color:#6B7280;margin-bottom:2px">Forecast horizon</div><div style="font-size:14px;font-weight:700;color:#111827">${fcHorizonDisp}</div></div><div><div style="font-size:11px;color:#6B7280;margin-bottom:2px">Model status</div><div><span style="display:inline-block;padding:2px 10px;border-radius:12px;font-size:12px;font-weight:700;background:${fcModelActive?string('#D1FAE5','#F1F1F2')};color:${fcModelActive?string('#059669','#6B7280')}">${fcModelActive?string('Active','Idle')}</span></div></div></div></div>]]></text></render-mode>
+
+        <!-- ZE-INV demand-forecast §7 + §8.2: Top-products forecast-demand bars + demand-tier distribution
+             (real data; distribution tiers = tertiles of the actual forecast quantities). Pure CSS, both surfaces. -->
+        <render-mode><text type="html,vuet,qvt"><![CDATA[<div style="display:flex;flex-wrap:wrap;gap:16px;margin-bottom:16px"><div style="flex:1 1 300px;background:#fff;border:1px solid #E5E7EB;border-radius:12px;padding:16px 18px"><div style="font-size:15px;font-weight:700;color:#111827;margin-bottom:12px">Top products by forecast demand</div><#if topDemandBars?has_content><#list topDemandBars as b><div style="margin-bottom:10px"><div style="display:flex;justify-content:space-between;font-size:12.5px;margin-bottom:3px"><span style="color:#111827;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:72%">${b.name}</span><span style="color:#6B7280;font-weight:700">${b.qty}</span></div><div style="background:#F3F4F6;border-radius:6px;height:8px;overflow:hidden"><div style="background:#7C3AED;height:8px;width:${b.pct}%"></div></div></div></#list><#else><div style="color:#6B7280;font-size:13px">No forecast data yet.</div></#if></div><div style="flex:1 1 300px;background:#fff;border:1px solid #E5E7EB;border-radius:12px;padding:16px 18px"><div style="font-size:15px;font-weight:700;color:#111827;margin-bottom:12px">Demand distribution</div><#if (distTotal gt 0)><div style="display:flex;height:14px;border-radius:7px;overflow:hidden;margin-bottom:12px"><div style="width:${distPctHi}%;background:#059669"></div><div style="width:${distPctMd}%;background:#D97706"></div><div style="width:${distPctLo}%;background:#DC2626"></div><div style="width:${distPctNone}%;background:#E5E7EB"></div></div><div style="display:flex;flex-wrap:wrap;gap:14px;font-size:12px;color:#6B7280"><span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#059669;margin-right:5px"></span>High ${distHi}</span><span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#D97706;margin-right:5px"></span>Medium ${distMd}</span><span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#DC2626;margin-right:5px"></span>Low ${distLo}</span><span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#E5E7EB;margin-right:5px"></span>No demand ${distNone}</span></div><#else><div style="color:#6B7280;font-size:13px">No forecast data yet.</div></#if></div></div>]]></text></render-mode>
 
         <!-- IV-113 (ZE-DF-009): check any single product's forecast + sales history, incl. a brand-new no-sales product -->
         <container style="zenith-card bg-white shadow-2 border-radius-md q-pa-md q-mb-md">
