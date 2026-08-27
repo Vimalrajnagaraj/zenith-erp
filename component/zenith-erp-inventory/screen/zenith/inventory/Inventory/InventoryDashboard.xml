@@ -330,14 +330,90 @@
             dashOrderCsv = (ec.user.getPreference('INV_DASH_ORDER') ?: '')
             dashSizeCsv = (ec.user.getPreference('INV_DASH_SIZE') ?: '')
             urlSettings = dashDate ? ("?dashDate="+dashDate+"&dashDateTo="+dashDateTo+"&showSettings=1") : "?showSettings=1"
+
+            // ========================================================================================
+            // inventory-dashboard mockup restructure (real data only — NO fabricated deltas)
+            // ========================================================================================
+            // §5 Stock In / Stock Out over the last 7 days + the prior 7 days (for a REAL % delta), from the
+            // AssetDetail ledger scoped to this org's assets (positive diff = in, negative = out).
+            def _wc7 = java.util.Calendar.getInstance(); _wc7.setTime(_now); _wc7.add(java.util.Calendar.DAY_OF_MONTH,-7); def _wk7Ts = new java.sql.Timestamp(_wc7.getTimeInMillis())
+            def _wc14 = java.util.Calendar.getInstance(); _wc14.setTime(_now); _wc14.add(java.util.Calendar.DAY_OF_MONTH,-14); def _wk14Ts = new java.sql.Timestamp(_wc14.getTimeInMillis())
+            def _wkIn=0G; def _wkOut=0G; def _pwIn=0G; def _pwOut=0G
+            ef.find("mantle.product.asset.AssetDetail").condition("effectiveDate", EntityCondition.GREATER_THAN_EQUAL_TO, _wk14Ts).selectField("assetId").selectField("effectiveDate").selectField("quantityOnHandDiff").list().each {
+                if (!_ioAssetIds.contains(it.assetId)) return
+                def _d = (it.quantityOnHandDiff ?: 0G) as BigDecimal
+                def _cur = (it.effectiveDate != null && it.effectiveDate.time >= _wk7Ts.time)
+                if (_d > 0G) { if (_cur) _wkIn += _d else _pwIn += _d }
+                else if (_d < 0G) { if (_cur) _wkOut += _d.abs() else _pwOut += _d.abs() }
+            }
+            weekInDisp = ec.l10n.format(_wkIn, '#,##0.##'); weekOutDisp = ec.l10n.format(_wkOut, '#,##0.##')
+            def _pct = { cur, prev -> (prev == null || prev == 0G) ? null : (((cur - prev) / prev) * 100G).setScale(1, java.math.RoundingMode.HALF_UP) }
+            def _inDelta = _pct(_wkIn, _pwIn); def _outDelta = _pct(_wkOut, _pwOut)
+            def _inUp = (_inDelta != null && _inDelta >= 0G); def _outUp = (_outDelta != null && _outDelta >= 0G)
+            kpiInSub  = (_inDelta  == null) ? 'units received (7d)' : ((_inUp?'▲ ':'▼ ') + (_inDelta>=0G?'+':'') + _inDelta + '% vs last week')
+            kpiOutSub = (_outDelta == null) ? 'units issued (7d)'   : ((_outUp?'▲ ':'▼ ') + (_outDelta>=0G?'+':'') + _outDelta + '% vs last week')
+            kpiInColor  = (_inDelta  == null) ? '#9CA3AF' : (_inUp  ? '#059669' : '#DC2626')
+            kpiOutColor = (_outDelta == null) ? '#9CA3AF' : (_outUp ? '#059669' : '#DC2626')
+
+            // §5 preformatted KPI display strings
+            totalItemsDisp = ec.l10n.format(totalProducts ?: 0, '#,##0')
+            stockValueDispK = zinr.inr(ec.l10n.format(stockValue ?: 0, '#,##,##0'))
+            lowStockCountDisp = ec.l10n.format(lowStockCount ?: 0, '#,##0')
+            def _tuDisp = ec.l10n.format(totalUnits ?: 0, '#,##0')
+            kpiValSub = unitsDeltaZero ? (_tuDisp + ' units in stock') : (_tuDisp + ' units · ' + unitsDeltaDisp + ' this week')
+            kpiValColor = unitsDeltaZero ? '#9CA3AF' : (unitsDeltaUp ? '#059669' : '#DC2626')
+
+            // §9 Recent Transactions as ITEM-LEVEL movements from the ledger (newest first) — real.
+            def _rMoves = []; def _pNameCache = [:]
+            def _rlRows = ef.find("mantle.product.asset.AssetDetail").orderBy("-effectiveDate").limit(50).list()
+            for (r in _rlRows) {
+                if (!_ioAssetIds.contains(r.assetId)) continue
+                def _d = (r.quantityOnHandDiff ?: 0G) as BigDecimal
+                if (_d == 0G) continue
+                def _asset = ef.find("mantle.product.asset.Asset").condition("assetId", r.assetId).useCache(true).one()
+                def _pid = _asset?.productId
+                def _pn = _pNameCache.containsKey(_pid) ? _pNameCache[_pid] : null
+                if (_pn == null) { def _p = _pid ? ef.find("mantle.product.Product").condition("productId", _pid).useCache(true).one() : null; _pn = (_p?.productName ?: _pid ?: '—'); _pNameCache[_pid] = _pn }
+                def _rate = (_asset?.valuationRate ?: _asset?.acquireCost ?: 0G) as BigDecimal
+                def _amt = _d.abs() * (_rate ?: 0G)
+                _rMoves.add([name:_pn,
+                             dateDisp:(r.effectiveDate ? ec.l10n.format(r.effectiveDate, 'dd MMM yyyy, HH:mm') : '—'),
+                             isIn:(_d > 0G),
+                             qtyDisp:((_d>0G?'+':'−') + ec.l10n.format(_d.abs(), '#,##0.##')),
+                             amtDisp:('₹' + ec.l10n.format(_amt, '#,##,##0.00'))])
+                if (_rMoves.size() >= 8) break
+            }
+            recentMoves = _rMoves; recentMovesHas = (_rMoves.size() > 0)
+
+            // §11 Data-completeness breakdown — REAL fields only (the mockup's "purchase price"/"other" have no
+            // backing field here, so use the fields that exist: price / tax code / barcode / category / description).
+            def _allProds = ef.find("mantle.product.Product").condition("ownerPartyId", orgId).selectField("productId").selectField("mrpAmount").selectField("hsnCode").selectField("description").list()
+            def _noPrice=[] as HashSet; def _noHsn=[] as HashSet; def _noDesc=[] as HashSet
+            for (p in _allProds) {
+                def _mv = p.mrpAmount; if (_mv == null || (_mv as BigDecimal) <= 0G) _noPrice.add(p.productId)
+                if (!p.hsnCode) _noHsn.add(p.productId)
+                if (!p.description) _noDesc.add(p.productId)
+            }
+            def _barPids = ef.find("mantle.product.ProductIdentification").condition("productId", EntityCondition.IN, myPids).selectField("productId").list()*.productId as HashSet
+            def _catPids = ef.find("mantle.product.category.ProductCategoryMember").condition("productId", EntityCondition.IN, myPids).selectField("productId").list()*.productId as HashSet
+            def _noBar = new HashSet(myPids); _noBar.removeAll(_barPids); if (_noBar.contains('__none__')) _noBar.remove('__none__')
+            def _noCat = new HashSet(myPids); _noCat.removeAll(_catPids); if (_noCat.contains('__none__')) _noCat.remove('__none__')
+            compRows = [ [label:'Selling price not set', n:_noPrice.size()],
+                         [label:'Tax code (HSN/SAC) not set', n:_noHsn.size()],
+                         [label:'Barcode not set', n:_noBar.size()],
+                         [label:'Category not set', n:_noCat.size()],
+                         [label:'Description not set', n:_noDesc.size()] ]
+            def _anyMiss = new HashSet(); _anyMiss.addAll(_noPrice); _anyMiss.addAll(_noHsn); _anyMiss.addAll(_noDesc); _anyMiss.addAll(_noBar); _anyMiss.addAll(_noCat)
+            compTotal = _anyMiss.size(); compTotalDisp = ec.l10n.format(compTotal, '#,##0')
+            compHas = (compTotal > 0)
         ]]></script>
     </actions>
 
     <widgets>
         <!-- Header -->
         <container style="q-mb-md">
-            <label text="Inventory Overview" type="h3" style="text-primary text-weight-bold q-my-none"/>
-            <label text="A quick look at your products, stock and stores — everything you need to keep your shelves in order, at a glance." type="p" style="text-grey-7 q-mt-sm q-mb-none"/>
+            <label text="Inventory Dashboard" type="h3" style="text-primary text-weight-bold q-my-none"/>
+            <label text="Real-time overview of your inventory operations" type="p" style="text-grey-7 q-mt-sm q-mb-none"/>
         </container>
 
         <!-- ZE-DASH: date-range filter (drives the Stock Movements chart) + customize gear -->
@@ -394,63 +470,18 @@
         <!-- KPI row -->
         <section name="wKpis" condition="showKpis"><widgets>
         <render-mode><text type="html"><![CDATA[<div class="dash-widget" data-wkey="kpis"><div class="dash-handle" title="Drag to reorder">&#8942;&#8942;</div>]]></text></render-mode>
-        <container-row>
-            <row-col lg="3" md="6" sm="12">
-                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-md">
-                    <container style="row items-center justify-between">
-                        <container>
-                            <label text="Total Products" type="p" style="text-grey-7 text-uppercase text-weight-bold q-mb-xs"/>
-                            <label text="${zinr.inr(ec.l10n.format(totalProducts ?: 0, '#,##0'))}" type="h4" style="text-dark text-weight-bold q-my-none"/>
-                        </container>
-                        <container style="q-pa-sm bg-indigo-1 border-radius-md text-indigo-8">
-                            <render-mode><text type="html"><![CDATA[<q-icon name="inventory_2" class="text-h4"/>]]></text></render-mode>
-                        </container>
-                    </container>
-                </container>
-            </row-col>
-            <row-col lg="3" md="6" sm="12">
-                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-md">
-                    <container style="row items-center justify-between">
-                        <container>
-                            <label text="Categories" type="p" style="text-grey-7 text-uppercase text-weight-bold q-mb-xs"/>
-                            <label text="${zinr.inr(ec.l10n.format(categoriesCount ?: 0, '#,##0'))}" type="h4" style="text-dark text-weight-bold q-my-none"/>
-                        </container>
-                        <container style="q-pa-sm bg-teal-1 border-radius-md text-teal-8">
-                            <render-mode><text type="html"><![CDATA[<q-icon name="category" class="text-h4"/>]]></text></render-mode>
-                        </container>
-                    </container>
-                </container>
-            </row-col>
-            <row-col lg="3" md="6" sm="12">
-                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-md">
-                    <container style="row items-center justify-between">
-                        <container>
-                            <label text="Stores / Warehouses" type="p" style="text-grey-7 text-uppercase text-weight-bold q-mb-xs"/>
-                            <label text="${zinr.inr(ec.l10n.format(facilitiesCount ?: 0, '#,##0'))}" type="h4" style="text-dark text-weight-bold q-my-none"/>
-                        </container>
-                        <container style="q-pa-sm bg-orange-1 border-radius-md text-orange-8">
-                            <render-mode><text type="html"><![CDATA[<q-icon name="store" class="text-h4"/>]]></text></render-mode>
-                        </container>
-                    </container>
-                </container>
-            </row-col>
-            <row-col lg="3" md="6" sm="12">
-                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-md">
-                    <container style="row items-center justify-between">
-                        <container>
-                            <label text="Stock Value" type="p" style="text-grey-7 text-uppercase text-weight-bold q-mb-xs"/>
-                            <label text="${currSymbol}${zinr.inr(ec.l10n.format(stockValue ?: 0, '#,##,##0'))}" type="h4" style="text-dark text-weight-bold q-my-none"/>
-                            <label text="${zinr.inr(ec.l10n.format(totalUnits ?: 0, '#,##0'))} units in stock" type="p" style="text-grey-6 text-caption q-mb-none"/>
-                            <!-- ZE-INV §5: real week-over-week delta from the AssetDetail ledger (net units moved in the last 7 days). -->
-                            <label text="${unitsDeltaZero ? 'No change this week' : (unitsDeltaDisp + ' units this week')}" type="p" style="text-caption q-mb-none q-mt-xs ${unitsDeltaZero ? 'text-grey-6' : (unitsDeltaUp ? 'text-positive' : 'text-danger')}"/>
-                        </container>
-                        <container style="q-pa-sm bg-green-1 border-radius-md text-green-8">
-                            <render-mode><text type="html"><![CDATA[<q-icon name="account_balance_wallet" class="text-h4"/>]]></text></render-mode>
-                        </container>
-                    </container>
-                </container>
-            </row-col>
-        </container-row>
+        <!-- inventory-dashboard §5: five stat cards (Total Items · Stock Value · Stock In · Stock Out · Low Stock)
+             reusing the shared .stk-* card family. REAL data only — Stock In/Out show a true % delta vs the prior
+             week when a baseline exists, else a plain caption (never a fabricated %). -->
+        <render-mode><text type="html,vuet,qvt" template="true"><![CDATA[
+            <div class="stk-row">
+              <div class="stk-card stk-violet"><span class="stk-ic"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M20 2H4c-1.1 0-2 .9-2 2v3.01c0 .72.43 1.34 1 1.69V20c0 1.1 1.1 2 2 2h14c.9 0 2-.9 2-2V8.7c.57-.35 1-.97 1-1.69V4c0-1.1-1-2-2-2zm-5 12H9v-2h6v2zm5-7H4V4h16v3z"/></svg></span><div class="stk-txt"><span class="stk-lab">Total Items</span><span class="stk-val">${totalItemsDisp}</span><span style="font-size:11px;color:#9CA3AF;margin-top:2px">in your catalog</span></div></div>
+              <div class="stk-card stk-blue"><span class="stk-ic"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M21 18v1c0 1.1-.9 2-2 2H5c-1.11 0-2-.9-2-2V5c0-1.1.89-2 2-2h14c1.1 0 2 .9 2 2v1h-9c-1.11 0-2 .9-2 2v8c0 1.1.89 2 2 2h9zm-9-2h10V8H12v8zm4-2.5c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5z"/></svg></span><div class="stk-txt"><span class="stk-lab">Total Stock Value</span><span class="stk-val">&#8377;${stockValueDispK}</span><span style="font-size:11px;color:${kpiValColor};margin-top:2px">${kpiValSub}</span></div></div>
+              <div class="stk-card stk-green"><span class="stk-ic"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg></span><div class="stk-txt"><span class="stk-lab">Stock In (7 days)</span><span class="stk-val">${weekInDisp}</span><span style="font-size:11px;font-weight:600;color:${kpiInColor};margin-top:2px">${kpiInSub}</span></div></div>
+              <div class="stk-card stk-amber"><span class="stk-ic"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M5 20h14v-2H5v2zM5 9h4v6h6V9h4l-7-7-7 7z"/></svg></span><div class="stk-txt"><span class="stk-lab">Stock Out (7 days)</span><span class="stk-val">${weekOutDisp}</span><span style="font-size:11px;font-weight:600;color:${kpiOutColor};margin-top:2px">${kpiOutSub}</span></div></div>
+              <div class="stk-card stk-red"><span class="stk-ic"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M1 21h22L12 2 1 21zm12-3h-2v-2h2v2zm0-4h-2v-4h2v4z"/></svg></span><div class="stk-txt"><span class="stk-lab">Low Stock Items</span><span class="stk-val">${lowStockCountDisp}</span><span style="font-size:11px;color:#9CA3AF;margin-top:2px">below reorder point</span></div></div>
+            </div>
+        ]]></text></render-mode>
         <render-mode><text type="html"><![CDATA[</div>]]></text></render-mode>
         </widgets></section>
 
@@ -470,8 +501,8 @@
                  "have a selling price" card showed). Unwrapped to plain cards (matching that card) so they render. -->
             <row-col lg="3" md="6" sm="12">
                 <container style="zenith-card bg-white shadow-1 border-radius-md q-pa-md q-mb-md row items-center">
-                    <render-mode><text type="html"><![CDATA[<q-icon name="error_outline" class="text-h5 text-orange-8 q-mr-sm"/>]]></text></render-mode>
-                    <container><label text="${zinr.inr(ec.l10n.format(missingPrice ?: 0, '#,##0'))}" type="h6" style="q-my-none text-weight-bold text-orange-9"/><label text="missing a price" type="p" style="text-grey-7 text-caption q-mb-none"/></container>
+                    <render-mode><text type="html"><![CDATA[<q-icon name="category" class="text-h5 text-teal-7 q-mr-sm"/>]]></text></render-mode>
+                    <container><label text="${zinr.inr(ec.l10n.format(categoriesCount ?: 0, '#,##0'))}" type="h6" style="q-my-none text-weight-bold"/><label text="product categories" type="p" style="text-grey-7 text-caption q-mb-none"/></container>
                 </container>
             </row-col>
             <row-col lg="3" md="6" sm="12">
@@ -482,8 +513,8 @@
             </row-col>
             <row-col lg="3" md="6" sm="12">
                 <container style="zenith-card bg-white shadow-1 border-radius-md q-pa-md q-mb-md row items-center">
-                    <render-mode><text type="html"><![CDATA[<q-icon name="trending_down" class="text-h5 text-indigo-7 q-mr-sm"/>]]></text></render-mode>
-                    <container><label text="${zinr.inr(ec.l10n.format(lowStockCount ?: 0, '#,##0'))}" type="h6" style="q-my-none text-weight-bold"/><label text="low on stock" type="p" style="text-grey-7 text-caption q-mb-none"/></container>
+                    <render-mode><text type="html"><![CDATA[<q-icon name="store" class="text-h5 text-orange-8 q-mr-sm"/>]]></text></render-mode>
+                    <container><label text="${zinr.inr(ec.l10n.format(facilitiesCount ?: 0, '#,##0'))}" type="h6" style="q-my-none text-weight-bold"/><label text="stores / warehouses" type="p" style="text-grey-7 text-caption q-mb-none"/></container>
                 </container>
             </row-col>
         </container-row>
@@ -507,7 +538,9 @@
         <!-- Recent Transactions (adjustments + transfers, newest first — real data) -->
         <section name="wRecent" condition="showRecent"><widgets>
         <render-mode><text type="html"><![CDATA[<div class="dash-widget" data-wkey="recent"><div class="dash-handle" title="Drag to reorder">&#8942;&#8942;</div>]]></text></render-mode>
-        <render-mode><text type="html,vuet,qvt"><![CDATA[<div style="background:#fff;border:1px solid #E5E7EB;border-radius:12px;padding:16px 18px;margin-bottom:16px"><div style="font-size:15px;font-weight:700;color:#111827;margin-bottom:10px">Recent Transactions</div><#if recentTxns?has_content><div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:13px"><tr style="border-bottom:1px solid #E5E7EB"><th style="text-align:left;padding:6px 0;font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase">When</th><th style="text-align:left;padding:6px 10px;font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase">Type</th><th style="text-align:left;padding:6px 0;font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase">Reference</th></tr><#list recentTxns as x><tr style="border-bottom:1px solid #F3F4F6"><td style="padding:8px 0;color:#6B7280;white-space:nowrap">${x.dateDisp}</td><td style="padding:8px 10px"><span style="display:inline-block;padding:2px 9px;border-radius:12px;font-size:11px;font-weight:700;background:${(x.kind=='Transfer')?string('#F0EEFF','#e8f1fd')};color:${(x.kind=='Transfer')?string('#7C3AED','#1a6fd4')}">${x.kind}</span></td><td style="padding:8px 0;color:#111827">${x.ref}<#if x.detail?has_content> <span style="color:#9CA3AF">&#183; ${x.detail}</span></#if></td></tr></#list></table></div><#else><div style="color:#6B7280;font-size:13px;padding:8px 0">No inventory transactions yet.</div></#if></div>]]></text></render-mode>
+        <!-- inventory-dashboard §9: item-level Recent Transactions from the AssetDetail ledger — Date/Item/Type/Qty/
+             Amount. Type = Stock In (positive diff, green) / Stock Out (negative diff, orange); negative qty/amount red. -->
+        <render-mode><text type="html,vuet,qvt"><![CDATA[<div style="background:#fff;border:1px solid #E5E7EB;border-radius:12px;padding:16px 18px;margin-bottom:16px"><div style="font-size:15px;font-weight:700;color:#111827;margin-bottom:10px">Recent Transactions</div><#if recentMovesHas><div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:13px"><tr style="border-bottom:1px solid #E5E7EB"><th style="text-align:left;padding:6px 0;font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase">Date &amp; Time</th><th style="text-align:left;padding:6px 10px;font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase">Item</th><th style="text-align:left;padding:6px 10px;font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase">Type</th><th style="text-align:right;padding:6px 10px;font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase">Qty</th><th style="text-align:right;padding:6px 0;font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase">Amount</th></tr><#list recentMoves as x><tr style="border-bottom:1px solid #F3F4F6"><td style="padding:8px 0;color:#6B7280;white-space:nowrap">${x.dateDisp}</td><td style="padding:8px 10px;color:#111827">${x.name}</td><td style="padding:8px 10px"><span style="display:inline-block;padding:2px 9px;border-radius:12px;font-size:11px;font-weight:700;background:${x.isIn?string('#D1FAE5','#FFEDD5')};color:${x.isIn?string('#059669','#C2410C')}">${x.isIn?string('Stock In','Stock Out')}</span></td><td style="padding:8px 10px;text-align:right;font-weight:600;white-space:nowrap;color:${x.isIn?string('#059669','#DC2626')}">${x.qtyDisp}</td><td style="padding:8px 0;text-align:right;white-space:nowrap;color:${x.isIn?string('#111827','#DC2626')}">${x.amtDisp}</td></tr></#list></table></div><#else><div style="color:#6B7280;font-size:13px;padding:8px 0">No stock movements recorded yet.</div></#if></div>]]></text></render-mode>
         <render-mode><text type="html"><![CDATA[</div>]]></text></render-mode>
         </widgets></section>
 
@@ -706,6 +739,10 @@
                 <link url="../DemandForecast"   text="Demand forecast"      icon="insights"    style="q-btn--dense"/>
             </container>
         </container>
+
+        <!-- inventory-dashboard §11: "Products needing details" — a by-detail completeness breakdown + total,
+             using REAL fields only (the mockup's purchase-price/other categories have no backing field here). -->
+        <render-mode><text type="html,vuet,qvt"><![CDATA[<div style="background:#fff;border:1px solid #E5E7EB;border-radius:12px;padding:16px 18px;margin-bottom:16px"><div style="font-size:15px;font-weight:700;color:#111827;margin-bottom:4px">Products needing details</div><div style="font-size:12px;color:#6B7280;margin-bottom:10px">Fields still missing across your catalog &mdash; fill them in for cleaner billing &amp; reports.</div><#if compHas><table style="width:100%;border-collapse:collapse;font-size:13px"><tr style="border-bottom:1px solid #E5E7EB"><th style="text-align:left;padding:6px 0;font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase">By detail</th><th style="text-align:right;padding:6px 0;font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase">Count</th></tr><#list compRows as c><tr style="border-bottom:1px solid #F3F4F6"><td style="padding:8px 0;color:#6B7280">${c.label}</td><td style="padding:8px 0;text-align:right;font-weight:600;color:#111827">${c.n}</td></tr></#list><tr style="border-top:2px solid #E5E7EB"><td style="padding:9px 0;font-weight:800;color:#7C3AED">Total products needing attention</td><td style="padding:9px 0;text-align:right;font-weight:800;color:#7C3AED">${compTotalDisp}</td></tr></table><#else><div style="color:#059669;font-size:13px;padding:8px 0">&#10003; Every product has its key details filled in.</div></#if></div>]]></text></render-mode>
 
         <!-- Needs attention: products missing a price -->
         <section name="MissingPricePanel">
