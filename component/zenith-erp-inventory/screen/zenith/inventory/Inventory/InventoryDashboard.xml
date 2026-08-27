@@ -11,7 +11,7 @@
     <!-- ZE-DASH: switchable widgets + drag-reorder + a date-range filter that drives the Stock Movements time series -->
     <transition name="saveDashLayout">
         <actions><script><![CDATA[
-            def _wk = ['kpis','health','movements','category','pricecov','forecast']
+            def _wk = ['kpis','health','lowstock','warehouse','movements','category','pricecov','forecast']
             ec.user.setPreference('INV_DASH_HIDDEN', _wk.findAll { !context.get('w_' + it) }.join(','))
         ]]></script></actions>
         <default-response url="." parameter-map="[dashDate:dashDate, dashDateTo:dashDateTo]"/>
@@ -23,7 +23,7 @@
     <transition name="changeDashDate"><default-response url="." parameter-map="[dashDate:dashDate, dashDateTo:dashDateTo, dateMode:'custom']"/></transition>
     <transition name="saveDashOrder" require-session-token="false">
         <actions><script><![CDATA[
-            def _valid = ['kpis','health','movements','category','pricecov','forecast']
+            def _valid = ['kpis','health','lowstock','warehouse','movements','category','pricecov','forecast']
             def _clean = ((context.order ?: '').toString().split(',') as List).findAll { _valid.contains(it) }
             ec.user.setPreference('INV_DASH_ORDER', _clean.join(','))
             if (context.sizes != null) {
@@ -69,6 +69,7 @@
             stockValue = 0G
             totalUnits = 0G
             def _mrpCache = [:]
+            def _facVal = [:]; def _facUnits = [:]   // ZE-INV dashboard: per-facility value/units for Stock-by-Warehouse
             def _saq = ef.find("mantle.product.asset.Asset").condition("ownerPartyId", orgId)
                                 .condition("assetTypeEnumId", "AstTpInventory")
                                 .condition("quantityOnHandTotal", EntityCondition.GREATER_THAN, 0G)
@@ -90,18 +91,41 @@
                     rate = mrp
                 }
                 stockValue += qoh * (rate ?: 0G)
+                def _fid = a.facilityId ?: '__none__'
+                _facVal[_fid] = ((_facVal[_fid] ?: 0G) as java.math.BigDecimal) + qoh * (rate ?: 0G)
+                _facUnits[_fid] = ((_facUnits[_fid] ?: 0G) as java.math.BigDecimal) + qoh
             }
+            // ----- Stock by Warehouse: aggregate the SAME per-asset value/units by facility (real data) -----
+            def _wh = []
+            for (def _e : _facVal.entrySet()) {
+                def _fid2 = _e.key
+                def _nm = '— No store —'
+                if (_fid2 != '__none__') { def _f = ef.find("mantle.facility.Facility").condition("facilityId", _fid2).useCache(true).one(); _nm = _f?.facilityName ?: _fid2 }
+                _wh.add([name: _nm, value: (_e.value ?: 0G),
+                         valueDisp: zinr.inr(ec.l10n.format((_e.value ?: 0G), '#,##,##0.00')),
+                         unitsDisp: ec.l10n.format((_facUnits[_fid2] ?: 0G), '#,##0.##')])
+            }
+            _wh.sort { x, y -> (y.value <=> x.value) }
+            warehouseList = _wh
+            warehouseTotalDisp = zinr.inr(ec.l10n.format((stockValue ?: 0G), '#,##,##0.00'))
 
             // ----- Low stock (only for items that actually track quantity) -----
             int lowStockCnt = 0
+            def _lowAll = []
             if (trackedCount > 0) {
                 def psv = ef.find("zenith.erp.inventory.ProductStockView").condition("ownerPartyId", orgId).list()
                 for (r in psv) {
                     def q = (r.totalQoh ?: 0G); def rp = (r.reorderPoint ?: 0G)
-                    if (rp > 0G && q <= rp) lowStockCnt++
+                    if (rp > 0G && q <= rp) {
+                        lowStockCnt++
+                        _lowAll.add([name: (r.productName ?: r.productId), sku: (r.pseudoId ?: ''), q: q,
+                                     qohDisp: ec.l10n.format(q, '#,##0.##'), rpDisp: ec.l10n.format(rp, '#,##0.##')])
+                    }
                 }
             }
             lowStockCount = lowStockCnt
+            _lowAll.sort { x, y -> (x.q <=> y.q) }
+            lowStockList = _lowAll.size() > 8 ? new ArrayList(_lowAll.subList(0, 8)) : _lowAll
 
             // ----- Expiring within 90 days -----
             def cal = java.util.Calendar.getInstance(); cal.add(java.util.Calendar.DAY_OF_YEAR, 90)
@@ -271,6 +295,8 @@
             showCategory = !_hiddenSet.contains('category'); showPricecov = !_hiddenSet.contains('pricecov'); showForecast = !_hiddenSet.contains('forecast')
             w_kpis = showKpis ? 'Y' : ''; w_health = showHealth ? 'Y' : ''; w_movements = showMovements ? 'Y' : ''
             w_category = showCategory ? 'Y' : ''; w_pricecov = showPricecov ? 'Y' : ''; w_forecast = showForecast ? 'Y' : ''
+            showLowstock = !_hiddenSet.contains('lowstock'); showWarehouse = !_hiddenSet.contains('warehouse')
+            w_lowstock = showLowstock ? 'Y' : ''; w_warehouse = showWarehouse ? 'Y' : ''
             dashOrderCsv = (ec.user.getPreference('INV_DASH_ORDER') ?: '')
             dashSizeCsv = (ec.user.getPreference('INV_DASH_SIZE') ?: '')
             urlSettings = dashDate ? ("?dashDate="+dashDate+"&dashDateTo="+dashDateTo+"&showSettings=1") : "?showSettings=1"
@@ -311,6 +337,8 @@
                         <field name="w_category"><default-field title="Products by category chart"><check><option key="Y" text=" "/></check></default-field></field>
                         <field name="w_pricecov"><default-field title="Price coverage chart"><check><option key="Y" text=" "/></check></default-field></field>
                         <field name="w_forecast"><default-field title="Demand Forecast"><check><option key="Y" text=" "/></check></default-field></field>
+                        <field name="w_lowstock"><default-field title="Low Stock Alerts (below reorder point)"><check><option key="Y" text=" "/></check></default-field></field>
+                        <field name="w_warehouse"><default-field title="Stock by Warehouse"><check><option key="Y" text=" "/></check></default-field></field>
                         <field name="saveBtn"><default-field title=""><submit text="Save Layout" icon="fa fa-check"/></default-field></field>
                     </form-single>
                     <container style="row q-gutter-sm q-mt-sm">
@@ -426,6 +454,20 @@
                 </container>
             </row-col>
         </container-row>
+        <render-mode><text type="html"><![CDATA[</div>]]></text></render-mode>
+        </widgets></section>
+
+        <!-- Low Stock Alerts (items at/below their reorder point — real derived list) -->
+        <section name="wLowstock" condition="showLowstock"><widgets>
+        <render-mode><text type="html"><![CDATA[<div class="dash-widget" data-wkey="lowstock"><div class="dash-handle" title="Drag to reorder">&#8942;&#8942;</div>]]></text></render-mode>
+        <render-mode><text type="html,vuet,qvt"><![CDATA[<div style="background:#fff;border:1px solid #E5E7EB;border-radius:12px;padding:16px 18px;margin-bottom:16px"><div style="font-size:15px;font-weight:700;color:#111827;margin-bottom:10px">Low Stock Alerts <span style="display:inline-block;padding:1px 9px;border-radius:12px;font-size:12px;font-weight:800;background:${(lowStockCount gt 0)?string('#FEE2E2','#D1FAE5')};color:${(lowStockCount gt 0)?string('#DC2626','#059669')}">${lowStockCount}</span></div><#if lowStockList?has_content><div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:13px"><#list lowStockList as l><tr style="border-bottom:1px solid #F3F4F6"><td style="padding:8px 0"><div style="color:#111827;font-weight:600">${l.name}</div><#if l.sku?has_content><div style="color:#9CA3AF;font-size:11px">${l.sku}</div></#if></td><td style="padding:8px 12px;text-align:right;white-space:nowrap"><span style="display:inline-block;padding:2px 9px;border-radius:12px;font-size:12px;font-weight:700;background:#FEE2E2;color:#DC2626">${l.qohDisp} left</span></td><td style="padding:8px 0;text-align:right;color:#6B7280;white-space:nowrap">reorder at ${l.rpDisp}</td></tr></#list></table></div><#if (lowStockCount gt 8)><div style="color:#9CA3AF;font-size:11px;margin-top:8px">+${(lowStockCount-8)?c} more below reorder point</div></#if><#else><div style="color:#059669;font-size:13px;padding:8px 0">&#10003; All tracked items are above their reorder point.</div></#if></div>]]></text></render-mode>
+        <render-mode><text type="html"><![CDATA[</div>]]></text></render-mode>
+        </widgets></section>
+
+        <!-- Stock by Warehouse (real per-facility value/units aggregation) -->
+        <section name="wWarehouse" condition="showWarehouse"><widgets>
+        <render-mode><text type="html"><![CDATA[<div class="dash-widget" data-wkey="warehouse"><div class="dash-handle" title="Drag to reorder">&#8942;&#8942;</div>]]></text></render-mode>
+        <render-mode><text type="html,vuet,qvt"><![CDATA[<div style="background:#fff;border:1px solid #E5E7EB;border-radius:12px;padding:16px 18px;margin-bottom:16px"><div style="font-size:15px;font-weight:700;color:#111827;margin-bottom:10px">Stock by Warehouse</div><#if warehouseList?has_content><div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:13px"><#list warehouseList as w><tr style="border-bottom:1px solid #F3F4F6"><td style="padding:8px 0;color:#111827">${w.name}</td><td style="padding:8px 12px;text-align:right;color:#6B7280;white-space:nowrap">${w.unitsDisp} units</td><td style="padding:8px 0;text-align:right;font-weight:700;color:#111827;white-space:nowrap">&#8377;${w.valueDisp}</td></tr></#list><tr style="border-top:2px solid #E5E7EB"><td style="padding:9px 0;font-weight:800;color:#7C3AED">Total</td><td></td><td style="padding:9px 0;text-align:right;font-weight:800;color:#7C3AED;white-space:nowrap">&#8377;${warehouseTotalDisp}</td></tr></table></div><#else><div style="color:#6B7280;font-size:13px;padding:8px 0">No stock on hand yet.</div></#if></div>]]></text></render-mode>
         <render-mode><text type="html"><![CDATA[</div>]]></text></render-mode>
         </widgets></section>
 
