@@ -201,6 +201,51 @@
             }
             topDemandBars = _dfBars
 
+            // ===== demand-forecast §7: grouped "This vs Next period" comparison — REAL on-demand forecasts
+            // (forecast#ProductDemand / forecast#CategoryDemand: avgDailyDemand = recent actual rate, forecastDemand
+            // = model prediction). Toggles: dfMode product|group, dfSpan week|month. Bounded to top 5 (<=5 calls). =====
+            def _dfMode = (ec.context.dfMode ?: 'product').toString()
+            def _dfSpan = (ec.context.dfSpan ?: 'week').toString()
+            int _spanDays = (_dfSpan == 'month') ? 30 : 7
+            context.dfMode = _dfMode; context.dfSpan = _dfSpan
+            context.dfSpanCap = (_dfSpan == 'month') ? 'Month' : 'Week'
+            context.dfSpanLower = (_dfSpan == 'month') ? 'month' : 'week'
+            context.dfModeNoun = (_dfMode == 'group') ? 'groups' : 'products'
+            def _cmpLbls = []; def _cmpThis = []; def _cmpNext = []
+            if (orgId && orgId != '_NA_' && _dfByProd) {
+                if (_dfMode == 'group') {
+                    def _allPidCat = [:]; def _allPids = new ArrayList(_dfByProd.keySet())
+                    ec.entity.find("mantle.product.category.ProductCategoryMember").condition("productId", "in", _allPids).disableAuthz().list().each { if (!_allPidCat.containsKey(it.productId)) _allPidCat[it.productId] = it.productCategoryId }
+                    def _catSum = [:]
+                    for (def e : _dfByProd.entrySet()) { def cid = _allPidCat[e.key]; if (cid) _catSum[cid] = ((_catSum[cid] ?: 0G) as BigDecimal) + ((e.value.forecastQuantity ?: 0G) as BigDecimal) }
+                    def _topCats = new ArrayList(_catSum.entrySet()).sort { a, b -> (b.value <=> a.value) }
+                    if (_topCats.size() > 5) _topCats = new ArrayList(_topCats.subList(0, 5))
+                    for (def c : _topCats) {
+                        def _cf = null
+                        try { _cf = ec.service.sync().name("zenith.inventory.AdvancedForecastServices.forecast#CategoryDemand").parameters([categoryId: c.key, organizationPartyId: orgId, horizonDays: _spanDays]).call() } catch (Exception _ce) {}
+                        def _r = _cf?.result
+                        def _tv = (((_r?.avgDailyDemand ?: 0) as BigDecimal).multiply(_spanDays as BigDecimal)).setScale(0, java.math.RoundingMode.HALF_UP)
+                        def _nv = ((_r?.forecastDemand ?: 0) as BigDecimal).setScale(0, java.math.RoundingMode.HALF_UP)
+                        _cmpLbls.add("'" + (_r?.categoryName ?: c.key).toString().replace("'", " ").replace("\"", " ") + "'"); _cmpThis.add(_tv); _cmpNext.add(_nv)
+                    }
+                } else {
+                    def _cmpP = new ArrayList(_dfByProd.values()).sort { a, b -> ((b.forecastQuantity ?: 0G) <=> (a.forecastQuantity ?: 0G)) }
+                    if (_cmpP.size() > 5) _cmpP = new ArrayList(_cmpP.subList(0, 5))
+                    for (def r : _cmpP) {
+                        def _pf = null
+                        try { _pf = ec.service.sync().name("zenith.inventory.AdvancedForecastServices.forecast#ProductDemand").parameters([productId: r.productId, organizationPartyId: orgId, horizonDays: _spanDays]).call() } catch (Exception _pe) {}
+                        def _r = _pf?.result
+                        def _tv = (((_r?.avgDailyDemand ?: 0) as BigDecimal).multiply(_spanDays as BigDecimal)).setScale(0, java.math.RoundingMode.HALF_UP)
+                        def _nv = ((_r?.forecastDemand ?: 0) as BigDecimal).setScale(0, java.math.RoundingMode.HALF_UP)
+                        _cmpLbls.add("'" + (_dfNames[r.productId] ?: r.productId).toString().replace("'", " ").replace("\"", " ") + "'"); _cmpThis.add(_tv); _cmpNext.add(_nv)
+                    }
+                }
+            }
+            context.dfCmpLabels = "[" + _cmpLbls.join(",") + "]"
+            context.dfCmpThis = "[" + _cmpThis.join(",") + "]"
+            context.dfCmpNext = "[" + _cmpNext.join(",") + "]"
+            context.dfCmpHas = (_cmpLbls.size() > 0)
+
             def confWord = { p -> p == null ? "Still learning" : (p >= 75 ? "Strong" : (p >= 60 ? "Good" : (p >= 45 ? "Fair" : "Still learning"))) }
             context.accWord = hasAcc ? confWord(avgAccuracy) : "Building up"
             context.accColor = !hasAcc ? "grey" : (avgAccuracy >= 60 ? "success" : (avgAccuracy >= 45 ? "warning" : "grey"))
@@ -356,9 +401,13 @@
              SKUs tracked, furthest horizon, model status), inline flex so it renders on /apps AND /qapps. -->
         <render-mode><text type="html,qvt,vuet"><![CDATA[<div style="background:#fff;border:1px solid #E5E7EB;border-radius:10px;padding:14px 16px;margin-bottom:16px"><div style="font-size:13px;font-weight:700;color:#374151;margin-bottom:10px">Forecast health</div><div style="display:flex;flex-wrap:wrap;gap:28px"><div><div style="font-size:11px;color:#6B7280;margin-bottom:2px">Data updated</div><div style="font-size:14px;font-weight:700;color:#111827">${fcUpdatedDisp}</div></div><div><div style="font-size:11px;color:#6B7280;margin-bottom:2px">Total SKUs</div><div style="font-size:14px;font-weight:700;color:#111827">${forecastProductCount}</div></div><div><div style="font-size:11px;color:#6B7280;margin-bottom:2px">Forecast horizon</div><div style="font-size:14px;font-weight:700;color:#111827">${fcHorizonDisp}</div></div><div><div style="font-size:11px;color:#6B7280;margin-bottom:2px">Model status</div><div><span style="display:inline-block;padding:2px 10px;border-radius:12px;font-size:12px;font-weight:700;background:${fcModelActive?string('#D1FAE5','#F1F1F2')};color:${fcModelActive?string('#059669','#6B7280')}">${fcModelActive?string('Active','Idle')}</span></div></div></div></div>]]></text></render-mode>
 
-        <!-- ZE-INV demand-forecast §7 + §8.2: Top-products forecast-demand bars + demand-tier distribution
-             (real data; distribution tiers = tertiles of the actual forecast quantities). Pure CSS, both surfaces. -->
-        <render-mode><text type="html,vuet,qvt"><![CDATA[<div style="display:flex;flex-wrap:wrap;gap:16px;margin-bottom:16px"><div style="flex:1 1 300px;background:#fff;border:1px solid #E5E7EB;border-radius:12px;padding:16px 18px"><div style="font-size:15px;font-weight:700;color:#111827;margin-bottom:12px">Top products by forecast demand</div><#if topDemandBars?has_content><#list topDemandBars as b><div style="margin-bottom:10px"><div style="display:flex;justify-content:space-between;font-size:12.5px;margin-bottom:3px"><span style="color:#111827;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:72%">${b.name}</span><span style="color:#6B7280;font-weight:700">${b.qty}</span></div><div style="background:#F3F4F6;border-radius:6px;height:8px;overflow:hidden"><div style="background:#7C3AED;height:8px;width:${b.pct}%"></div></div></div></#list><#else><div style="color:#6B7280;font-size:13px">No forecast data yet.</div></#if></div><div style="flex:1 1 300px;background:#fff;border:1px solid #E5E7EB;border-radius:12px;padding:16px 18px"><div style="font-size:15px;font-weight:700;color:#111827;margin-bottom:12px">Demand distribution</div><#if (distTotal gt 0)><div style="display:flex;height:14px;border-radius:7px;overflow:hidden;margin-bottom:12px"><div style="width:${distPctHi}%;background:#059669"></div><div style="width:${distPctMd}%;background:#D97706"></div><div style="width:${distPctLo}%;background:#DC2626"></div><div style="width:${distPctNone}%;background:#E5E7EB"></div></div><div style="display:flex;flex-wrap:wrap;gap:14px;font-size:12px;color:#6B7280"><span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#059669;margin-right:5px"></span>High ${distHi}</span><span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#D97706;margin-right:5px"></span>Medium ${distMd}</span><span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#DC2626;margin-right:5px"></span>Low ${distLo}</span><span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#E5E7EB;margin-right:5px"></span>No demand ${distNone}</span></div><#else><div style="color:#6B7280;font-size:13px">No forecast data yet.</div></#if></div></div>]]></text></render-mode>
+        <!-- demand-forecast §7: grouped "This vs Next period" comparison chart. Segmented toggles (Product/Group,
+             Week/Month) re-render with dfMode/dfSpan. Bars use REAL on-demand forecasts. ApexCharts via zChart
+             (renders /apps + /qapps). Teal = this period (actual rate), lavender = next period (predicted). -->
+        <render-mode><text type="html,vuet,qvt"><![CDATA[<div style="background:#fff;border:1px solid #E5E7EB;border-radius:12px;padding:16px 18px;margin-bottom:16px"><div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:8px"><div style="display:flex;align-items:center;gap:8px;font-size:15px;font-weight:700;color:#111827"><svg viewBox="0 0 24 24" width="18" height="18" style="color:#7C3AED" aria-hidden="true"><path fill="currentColor" d="M5 9.2h3V19H5zM10.6 5h2.8v14h-2.8zm5.6 8H19v6h-2.8z"/></svg>Demand comparison: Top 5 ${dfModeNoun} (This ${dfSpanLower} vs Next ${dfSpanLower})</div><div style="display:flex;gap:8px;flex-wrap:wrap"><div style="display:inline-flex;border:1px solid #E5E7EB;border-radius:8px;overflow:hidden"><a href="?dfMode=product&amp;dfSpan=${dfSpan}" style="padding:5px 12px;font-size:12.5px;text-decoration:none;${(dfMode=='product')?string('background:#7C3AED;color:#fff;font-weight:600','background:#fff;color:#6B7280')}">Product Demand</a><a href="?dfMode=group&amp;dfSpan=${dfSpan}" style="padding:5px 12px;font-size:12.5px;text-decoration:none;${(dfMode=='group')?string('background:#7C3AED;color:#fff;font-weight:600','background:#fff;color:#6B7280')}">Group Demand</a></div><div style="display:inline-flex;border:1px solid #E5E7EB;border-radius:8px;overflow:hidden"><a href="?dfMode=${dfMode}&amp;dfSpan=week" style="padding:5px 12px;font-size:12.5px;text-decoration:none;${(dfSpan=='week')?string('background:#7C3AED;color:#fff;font-weight:600','background:#fff;color:#6B7280')}">Week</a><a href="?dfMode=${dfMode}&amp;dfSpan=month" style="padding:5px 12px;font-size:12.5px;text-decoration:none;${(dfSpan=='month')?string('background:#7C3AED;color:#fff;font-weight:600','background:#fff;color:#6B7280')}">Month</a></div></div></div><#if dfCmpHas><div id="dfCmpChart"></div><img alt="" style="display:none" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" onload="zChart(this,function(){(function(){new ApexCharts(document.querySelector(&quot;#dfCmpChart&quot;),{chart:{type:'bar',height:340,toolbar:{show:false},fontFamily:'Roboto, sans-serif'},series:[{name:'This ${dfSpanCap}',data:${dfCmpThis}},{name:'Next ${dfSpanCap}',data:${dfCmpNext}}],xaxis:{categories:${dfCmpLabels}},colors:['#14B8A6','#A78BFA'],plotOptions:{bar:{borderRadius:4,columnWidth:'55%'}},dataLabels:{enabled:true},stroke:{show:true,width:2,colors:['transparent']},legend:{position:'top'},yaxis:{title:{text:'Demand (Units)'}}}).render();})();})"/><#else><div style="color:#6B7280;font-size:13px;padding:10px 0">No forecast data yet — use &ldquo;Update Now&rdquo; above to generate predictions, then this compares recent demand with what&rsquo;s expected next.</div></#if></div>]]></text></render-mode>
+
+        <!-- demand-forecast §8.2: demand-tier distribution (tertiles of the freshest forecast quantities). -->
+        <render-mode><text type="html,vuet,qvt"><![CDATA[<div style="background:#fff;border:1px solid #E5E7EB;border-radius:12px;padding:16px 18px;margin-bottom:16px"><div style="font-size:15px;font-weight:700;color:#111827;margin-bottom:12px">Demand distribution</div><#if (distTotal gt 0)><div style="display:flex;height:14px;border-radius:7px;overflow:hidden;margin-bottom:12px"><div style="width:${distPctHi}%;background:#059669"></div><div style="width:${distPctMd}%;background:#D97706"></div><div style="width:${distPctLo}%;background:#DC2626"></div><div style="width:${distPctNone}%;background:#E5E7EB"></div></div><div style="display:flex;flex-wrap:wrap;gap:16px;font-size:12px;color:#6B7280"><span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#059669;margin-right:5px"></span>High demand ${distHi} (${distPctHi}%)</span><span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#D97706;margin-right:5px"></span>Medium demand ${distMd} (${distPctMd}%)</span><span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#DC2626;margin-right:5px"></span>Low demand ${distLo} (${distPctLo}%)</span><span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#E5E7EB;margin-right:5px"></span>No demand ${distNone} (${distPctNone}%)</span></div><#else><div style="color:#6B7280;font-size:13px">No forecast data yet.</div></#if></div>]]></text></render-mode>
 
         <!-- IV-113 (ZE-DF-009): check any single product's forecast + sales history, incl. a brand-new no-sales product -->
         <container style="zenith-card bg-white shadow-2 border-radius-md q-pa-md q-mb-md">
