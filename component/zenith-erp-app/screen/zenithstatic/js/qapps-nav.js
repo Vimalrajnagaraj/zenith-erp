@@ -183,7 +183,7 @@
         var wrap = el('div'); wrap.id = 'zq-topextra';
         // Owner View pill / switcher
         var ov = el('div'); ov.id = 'zq-ownerview';
-        ov.appendChild(mi('verified_user'));
+        ov.appendChild(mi('grid_view'));   // ZE-QAPPS-TOPBAR-PARITY: match the /apps Owner-View icon (was verified_user)
         ov.appendChild(el('span', null, 'Owner View'));
         if (canSwitch) {
             ov.classList.add('zqov-switch');
@@ -239,6 +239,49 @@
         var toolbar = header.querySelector('.q-toolbar') || header;
         var burger = toolbar.querySelector('button');
         if (burger) toolbar.insertBefore(wrap, burger.nextSibling); else toolbar.insertBefore(wrap, toolbar.firstChild);
+        buildToolButtons(toolbar);
+    }
+
+    // ---- right-side control cluster mirroring the /apps top bar ----
+    // /apps shows: avatar, logout, theme toggle, notifications, messages, calendar, tasks, password. The Quasar
+    // header's own right buttons (facility switcher `edit_location`, notifications dropdown, history, account avatar)
+    // are none of them present on /apps, so we hide them and render one cohesive, /apps-identical cluster instead.
+    function zInitials(n) { n = (n || '').trim(); if (!n) return '?'; var w = n.split(/\s+/); var a = w[0].charAt(0); var b = w.length > 1 ? w[w.length - 1].charAt(0) : (w[0].charAt(1) || ''); return (a + b).toUpperCase(); }
+    function buildToolButtons(toolbar) {
+        try {
+            if (!toolbar || document.getElementById('zq-toolbtns')) return;
+            var cfg = document.getElementById('zenith-saas-cfg');
+            var uname = (cfg && cfg.getAttribute('data-user-name')) || '';
+            // hide the framework's mismatched right buttons (none exist on /apps)
+            [].slice.call(toolbar.querySelectorAll('button.q-btn')).forEach(function (btn) {
+                var ic = btn.querySelector('.q-icon, .material-icons'); var t = ic ? ic.textContent.trim() : '';
+                if (t === 'help_outline' || t === 'edit_location' || t === 'notifications' || t === 'history') btn.style.display = 'none';
+                if (btn.querySelector('.q-avatar')) btn.style.display = 'none';   // framework account avatar
+            });
+            var cluster = el('div'); cluster.id = 'zq-toolbtns';
+            function tb(icon, href, title, cls) { var a = el('a', 'zqtb' + (cls ? ' ' + cls : '')); a.href = href; a.title = title; a.setAttribute('aria-label', title); a.appendChild(mi(icon)); return a; }
+            var lock = tb('lock', '/apps/zenith/MyPassword', 'My Password');
+            var bell = tb('notifications', '/apps/my/User/Notifications', 'Notifications'); bell.appendChild(el('span', 'zqtb-badge zq-empty'));
+            var mail = tb('mail', '/apps/my/User/Messages/FindMessage?statusId=CeReceived', 'Messages', 'zqtb-quad');
+            var cal = tb('event', '/apps/my/User/Calendar/MyCalendar', 'Events This Week', 'zqtb-quad');
+            var task = tb('task_alt', '/apps/my/User/Task/MyTasks', 'Open Tasks', 'zqtb-quad');
+            var theme = tb('contrast', '#', 'Switch Dark / Light');
+            theme.addEventListener('click', function (e) {
+                e.preventDefault();
+                try {
+                    var on = document.body.classList.toggle('body--dark');
+                    try { localStorage.setItem('zqDark', on ? '1' : '0'); } catch (_e) {}
+                    try { var app = document.getElementById('apps-root'); if (app && app.__vue__ && app.__vue__.$q && app.__vue__.$q.dark) app.__vue__.$q.dark.set(on); } catch (_e) {}
+                } catch (_e) {}
+            });
+            var logout = tb('power_settings_new', '/Login/logout', 'Logout' + (uname ? ' ' + uname : ''), 'zqtb-danger');
+            // avatar (initials) → My Account — rightmost, mirroring /apps
+            var av = el('a', 'zqtb zqtb-avatar'); av.href = '/apps/my'; av.title = uname || 'My account'; av.setAttribute('aria-label', (uname ? uname + ' — ' : '') + 'My account'); av.textContent = zInitials(uname);
+            // order matches the /apps toolbar (L→R): password, notifications, messages, calendar, tasks, theme, logout, avatar
+            [lock, bell, mail, cal, task, theme, logout, av].forEach(function (b2) { cluster.appendChild(b2); });
+            toolbar.appendChild(cluster);
+            try { if (localStorage.getItem('zqDark') === '1') document.body.classList.add('body--dark'); } catch (_e) {}
+        } catch (_e) {}
     }
 
     // ---- per-module sub-nav bar (below the header): current module's sections as horizontal tabs ----
