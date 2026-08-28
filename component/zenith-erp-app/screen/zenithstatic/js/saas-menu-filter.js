@@ -45,9 +45,34 @@
     // the menu can never stay hidden.
     if (location.pathname.indexOf('/qapps/') === 0) { injectHide(); setTimeout(reveal, 3000); }
 
+    // ZE-NAV-SSR (/qapps): persistent CSS ALLOW-LIST. The Vue navMenuList filter below removes disallowed
+    // modules, but if it is delayed/bypassed the fail-safe reveal would expose them. This injects a persistent
+    // style that hides EVERY /qapps module item and reveals ONLY the allowed ones (server-known from data-modules),
+    // so an out-of-plan module can never appear in the /qapps nav even if the JS filter never runs. Only applied
+    // to users who are actually filtered (a limited-plan tenant); non-tenant / all-access see everything.
+    function applyAllowlist(cfg) {
+        if (!cfg || !cfg.isSaasTenant || cfg.hasAllAccess) return;
+        var show;
+        if (cfg.posOnly) {
+            show = ["pos", "inventory", "mypassword"];
+        } else {
+            show = (cfg.modules || []).map(function(m) { return String(m).toLowerCase(); });
+            // saas-admin is the PLATFORM super-admin console — hidden for tenants (this branch only runs for
+            // a tenant), so it is deliberately NOT revealed. my-subscription IS a tenant's own page → shown.
+            show = show.concat(["dashboard", "my-subscription", "mypassword"]);
+            if (cfg.isAdmin !== false) show.push("settings");
+        }
+        var css = '.q-drawer a.q-item[href^="/qapps/zenith/"]{display:none !important}';
+        show.forEach(function(m) { if (m) css += '.q-drawer a.q-item[href^="/qapps/zenith/' + m + '" i]{display:flex !important}'; });
+        var st = document.getElementById("zmf-allowlist");
+        if (!st) { st = document.createElement("style"); st.id = "zmf-allowlist"; (document.head || document.documentElement).appendChild(st); }
+        st.textContent = css;
+    }
+
     function startFilter(cfg) {
         var app = document.getElementById("apps-root");
         if (!app || !app.__vue__) { reveal(); return; }
+        applyAllowlist(cfg);
         var vm = app.__vue__;
         var isTenant = !!cfg.isSaasTenant;
         var hasAll = !!cfg.hasAllAccess;
