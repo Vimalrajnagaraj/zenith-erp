@@ -44,7 +44,10 @@
         ['Inventory', '/qapps/zenith/Inventory/InventoryDashboard', '/Inventory', 'inventory'],
         ['Accounting', '/qapps/zenith/Accounting/AcctgDashboard', '/Accounting', 'accounting'],
         ['Contacts', '/qapps/zenith/Contacts/ContactsDashboard', '/Contacts', 'contacts'],
-        ['HR', '/qapps/zenith/Hr/HrDashboard', '/Hr', 'hr']
+        ['HR', '/qapps/zenith/Hr/HrDashboard', '/Hr', 'hr'],
+        ['Tax', '/qapps/zenith/tax/TaxDashboard', '/tax', 'tax'],
+        ['Pricing', '/qapps/zenith/pricing/PricingDashboard', '/pricing', 'pricing'],
+        ['Barcode', '/qapps/zenith/barcode/BarcodeDashboard', '/barcode', 'barcode']
     ];
     // tenant's allowed plan modules (null = all-access / not a plan-gated tenant)
     function tenantMods() {
