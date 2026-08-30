@@ -29,7 +29,10 @@
         '/payroll': ['Payroll', 'PayrollRuns:Payroll Runs', 'SalaryStructures:Salary Structures', 'TaxDeclarations:Tax Declarations', 'SalaryAdvances:Salary Advances', 'CtcCalculator:CTC Calculator', 'StatutoryCompliance:Statutory Compliance', 'EpfRegister:EPF Register', 'EsiRegister:ESI Register'],
         '/expenses': ['Expenses', 'MyExpenses:My Expenses', 'AllReports:All Reports', 'Categories:Categories', 'Advances:Advances', 'PerDiemRules:Per Diem Rules'],
         '/project': ['Projects', 'Projects:Projects', 'AllTasks:All Tasks'],
-        '/Stores': ['Shops', 'FindStore:All Shops']
+        '/Stores': ['Shops', 'FindStore:All Shops'],
+        '/tax': ['Tax', 'TaxDashboard:Dashboard', 'FindTaxRate:Tax Rates', 'FindTaxAuthority:Tax Authorities', 'FindTaxExemption:Tax Exemptions', 'FindTaxRegistration:Tax Registrations', 'Gstr1Returns:GST Returns'],
+        '/pricing': ['Pricing', 'PricingDashboard:Dashboard', 'FindPriceList:Price Lists', 'FindPricingRule:Pricing Rules', 'PriceChangeHistory:Price History'],
+        '/barcode': ['Barcode', 'BarcodeDashboard:Dashboard', 'FindBarcode:Product Barcodes', 'LabelTemplates:Label Templates', 'PrintJobs:Print Jobs']
     };
     // the "Dashboards" hub shown on the Home/Dashboard landing — [label, href, matchPrefix, planModule] across
     // the ERP. A tab is shown only if its planModule is in the tenant's plan (null = always shown).
