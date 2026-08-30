@@ -66,16 +66,19 @@
             { mod: 'purchase', match: '/Purchase', icon: 'shopping_cart', label: 'Purchase', href: '/qapps/zenith/Purchase/RfqList' },
             { mod: 'crm', match: '/Crm', icon: 'campaign', label: 'CRM', href: '/qapps/zenith/Crm/Leads' },
             { mod: 'pos', match: '/pos', icon: 'point_of_sale', label: 'POS', href: '/qapps/zenith/pos/Dashboard' },
-            { mod: 'pos', match: '/pos/Terminal', icon: 'receipt_long', label: 'POS Billing', href: '/apps/zenith/pos/Terminal' }
+            { mod: 'pos', match: '/pos/Terminal', icon: 'receipt_long', label: 'POS Billing', href: '/apps/zenith/pos/Terminal' },
+            { mod: 'pricing', match: '/pricing', icon: 'sell', label: 'Pricing', href: '/qapps/zenith/pricing/PricingDashboard' }
         ] },
         { head: 'OPERATIONS', items: [
             { mod: 'inventory', match: '/Inventory', icon: 'inventory_2', label: 'Inventory', href: '/qapps/zenith/Inventory/InventoryDashboard' },
             { mod: 'manufacturing', match: '/manufacturing', icon: 'precision_manufacturing', label: 'Manufacturing', href: '/qapps/zenith/manufacturing/WorkOrders' },
             { mod: 'project', match: '/project', icon: 'folder_open', label: 'Projects', href: '/qapps/zenith/project' },
-            { match: '/Stores', icon: 'storefront', label: 'Shops', href: '/qapps/zenith/Stores/FindStore' }
+            { match: '/Stores', icon: 'storefront', label: 'Shops', href: '/qapps/zenith/Stores/FindStore' },
+            { mod: 'barcode', match: '/barcode', icon: 'qr_code_scanner', label: 'Barcode', href: '/qapps/zenith/barcode/BarcodeDashboard' }
         ] },
         { head: 'FINANCE', items: [
             { mod: 'accounting', match: '/Accounting', icon: 'account_balance', label: 'Accounting', href: '/qapps/zenith/Accounting/AcctgDashboard' },
+            { mod: 'tax', match: '/tax', icon: 'percent', label: 'Tax', href: '/qapps/zenith/tax/TaxDashboard' },
             { mod: 'payroll', match: '/payroll', icon: 'payments', label: 'Payroll', href: '/qapps/zenith/payroll/PayrollRuns' },
             { mod: 'expenses', match: '/expenses', icon: 'savings', label: 'Expenses', href: '/qapps/zenith/expenses/MyExpenses' }
         ] },
