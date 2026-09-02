@@ -23,12 +23,13 @@
             <entity-find entity-name="zenith.erp.sales.SalesRevenueForecast" list="histList">
                 <econdition field-name="organizationPartyId" from="org"/>
                 <econdition field-name="dimension" value="Overall"/>
-                <order-by field-name="periodDate"/>
+                <order-by field-name="-periodDate"/>
             </entity-find>
         </if>
         <set field="weeklyList" from="fc?.weeklyPoints ?: []"/>
         <set field="catList" from="catFc?.categories ?: []"/>
-        <set field="histList" from="histList ?: []"/>
+        <!-- track record: most recent ~14 days that actually have a result (newest first) so it stays compact -->
+        <set field="histList" from="(histList ?: []).findAll{ it.actualAmount != null }.take(14)"/>
         <set field="sym" value="₹"/>
         <script><![CDATA[
             def fmt = { v -> ec.l10n.format((v ?: 0) as BigDecimal, "#,##,##0") }
@@ -41,14 +42,17 @@
                 return up ? "Customers spending more each visit" : "Customers spending a little less"
             }
             // ZE-SALES-026 f/u (SL-089): safe defaults so the widgets never NPE when there's no org / no forecast.
-            trendNice = "—"; driverNice = "—"; perDay = 0; hasData = false; catChartHtml = ""
+            trendNice = "—"; driverNice = "—"; perDay = 0; hasData = false; catChartHtml = ""; heroChartHtml = ""
             confNice = confWord(null); confColor = "grey"
+            trendIco = "trending_flat"; trendBadgeColor = "grey"
             if (fc == null) {
                 plain = noOrg ? "Choose your business from the organization picker at the top of the page to see its sales forecast."
                               : "We need a couple of weeks of sales before we can predict reliably. Keep billing through the POS and check back soon."
                 leadLine = plain
             } else {
                 trendNice = trendWord(fc.trendLabel)
+                trendIco = (fc.trendLabel == 'growing') ? 'trending_up' : (fc.trendLabel == 'softening' ? 'trending_down' : 'trending_flat')
+                trendBadgeColor = (fc.trendLabel == 'growing') ? 'green' : (fc.trendLabel == 'softening' ? 'red' : 'grey')
                 driverNice = driverWord(fc.primaryDriver)
                 confNice = confWord(fc.confidencePct)
                 hasData = (fc.confidencePct != null)
@@ -78,72 +82,113 @@
                 // Build the horizontal bar chart as raw HTML — Moqui containers put `style` into `class`, so a
                 // proportional-width bar needs real inline styles, which only render-mode HTML provides.
                 def _esc = { s -> (s ?: '').toString().replace('&','&amp;').replace('<','&lt;').replace('>','&gt;') }
-                def _barColor = { t -> (t == 'growing') ? '#2e9e6a' : (t == 'softening' ? '#d9534f' : '#7C3AED') }
+                // categorical palette by group (mockup): primary, blue, red, green, orange, primary-dark
+                def _palette = ['#7C3AED','#3B82F6','#EF4444','#10B981','#F59E0B','#6D28D9']
+                def _dir = { t -> (t == 'growing') ? ['#0E9F6E','&#8599; Going up'] : (t == 'softening' ? ['#DC2626','&#8600; Slowing down'] : ['#6B7280','&#8212; Holding steady']) }
                 def _b = new StringBuilder()
                 _b.append('<div style="font-size:0.9rem;">')
                 _b.append('<div style="display:flex;align-items:center;gap:12px;padding-bottom:6px;font-size:0.68rem;text-transform:uppercase;letter-spacing:.04em;color:#9a9aa8;font-weight:700;">')
-                _b.append('<div style="width:24%;">Group</div><div style="flex:1;">Share of next 7 days</div><div style="width:96px;text-align:right;">Next 7 days</div><div style="width:64px;text-align:right;">Per day</div><div style="width:118px;text-align:center;">Direction</div></div>')
-                catList.each { c ->
+                _b.append('<div style="width:24%;">Group</div><div style="flex:1;">Share of next 7 days</div><div style="width:96px;text-align:right;">Next 7 days</div><div style="width:64px;text-align:right;">Per day</div><div style="width:132px;text-align:center;">Direction</div></div>')
+                catList.eachWithIndex { c, i ->
+                    def col = _palette[i % _palette.size()]
+                    def dd = _dir(c.trend)
                     _b.append('<div style="display:flex;align-items:center;gap:12px;padding:9px 0;border-bottom:1px solid rgba(128,128,128,0.14);">')
                     _b.append('<div style="width:24%;font-weight:600;">' + _esc(c.category) + '</div>')
-                    _b.append('<div style="flex:1;background:rgba(128,128,140,0.16);border-radius:8px;height:15px;overflow:hidden;"><div style="width:' + (c.barPct ?: 0) + '%;min-width:2px;background:' + _barColor(c.trend) + ';height:15px;border-radius:8px;"></div></div>')
+                    _b.append('<div style="flex:1;background:rgba(128,128,140,0.16);border-radius:9999px;height:9px;overflow:hidden;"><div style="width:' + (c.barPct ?: 0) + '%;min-width:2px;background:' + col + ';height:9px;border-radius:9999px;"></div></div>')
                     _b.append('<div style="width:96px;text-align:right;font-weight:700;">' + sym + fmt(c.projectedNext7) + '</div>')
                     _b.append('<div style="width:64px;text-align:right;color:#9a9aa8;">' + sym + fmt(c.perDay) + '</div>')
-                    _b.append('<div style="width:118px;text-align:center;color:#7a7a88;font-size:0.82rem;">' + _esc(c.dirNice) + '</div>')
+                    _b.append('<div style="width:132px;text-align:center;font-size:0.82rem;font-weight:600;color:' + dd[0] + ';">' + dd[1] + '</div>')
                     _b.append('</div>')
                 }
                 _b.append('</div>')
                 catChartHtml = _b.toString()
+                // hero mini 7-day trend chart: last up-to-7 daily actuals as ascending --primary bars
+                def _hist7 = histList.findAll { it.actualAmount != null }.take(7).reverse()
+                if (_hist7.size() >= 2) {
+                    def _hmax = _hist7.collect { (it.actualAmount ?: 0) as BigDecimal }.max()
+                    def _hb = new StringBuilder()
+                    _hb.append('<div style="display:flex;align-items:flex-end;gap:5px;height:60px;padding-top:4px;">')
+                    _hist7.each { h ->
+                        def v = (h.actualAmount ?: 0) as BigDecimal
+                        def pct = (_hmax != null && _hmax > 0) ? (v * 100 / _hmax).setScale(0, java.math.RoundingMode.HALF_UP) : (0 as BigDecimal)
+                        _hb.append('<div style="flex:1;height:' + pct + '%;min-height:3px;background:#7C3AED;border-radius:3px 3px 0 0;opacity:.85;"></div>')
+                    }
+                    _hb.append('</div><div style="font-size:0.62rem;color:#9a9aa8;text-transform:uppercase;letter-spacing:.03em;margin-top:4px;">Last 7 days</div>')
+                    heroChartHtml = _hb.toString()
+                }
             }
         ]]></script>
     </actions>
 
     <widgets>
-        <container style="row items-center justify-between q-mb-md">
+        <container style="zsec-hdr row items-start justify-between q-mb-md">
             <container style="column">
                 <label text="Sales Forecast" type="h4" style="text-primary text-weight-bold q-my-none"/>
                 <label text="What you're likely to sell in the coming days — updated automatically each night." type="p" style="text-grey-7 q-mb-none text-caption"/>
+                <container style="row items-center q-gutter-xs q-mt-sm">
+                    <label text="How sure:" type="span" style="text-grey-7 text-caption"/>
+                    <label text="${confNice}${hasData ? ' (' + fc.confidencePct + '%)' : ''}" type="span" style="zenith-badge nd ${confColor}"/>
+                </container>
             </container>
             <container style="row q-gutter-sm items-center">
-                <label text="How sure: ${confNice}${hasData ? ' (' + fc.confidencePct + '%)' : ''}" type="span" style="zenith-badge ${confColor}"/>
                 <form-single name="RunForm" transition="runForecast"><field name="go">
-                    <conditional-field name="runForecast_write" condition="modCanWrite" title=""><submit text="Update Now" icon="refresh" style="bg-indigo-7 text-white text-weight-bold border-radius-sm"/></conditional-field>
+                    <conditional-field name="runForecast_write" condition="modCanWrite" title=""><submit text="Update Now" icon="refresh" style="z-solid bg-primary text-white text-weight-bold border-radius-sm q-px-md"/></conditional-field>
                     <default-field title=""><label text="You have view-only access — changes are disabled." type="span" style="text-grey-7"/></default-field></field></form-single>
             </container>
         </container>
 
         <section name="ForecastReady" condition="hasData"><widgets>
 
-            <!-- HERO: the one answer, at a glance -->
+            <!-- HERO: the one answer, at a glance — 3 zones: KPI · narrative+mini-chart · status badge -->
             <container style="zenith-card q-pa-lg bg-indigo-1 border-radius-lg shadow-1 q-mb-md">
-                <container style="row items-center justify-between no-wrap">
+                <container style="row items-center justify-between no-wrap q-gutter-lg">
                     <container style="column">
-                        <label text="Expected sales · next 7 days" type="p" style="text-indigo-9 text-uppercase text-weight-bold text-caption q-mb-xs"/>
+                        <label text="Expected sales · next 7 days" type="p" style="text-primary text-uppercase text-weight-bold text-caption q-mb-xs"/>
                         <label text="${sym}${zinr.inr(ec.l10n.format(fc.projectedNext7 ?: 0,'#,##,##0'))}" type="h2" style="text-primary text-weight-bolder q-my-none"/>
                         <label text="≈ ${sym}${zinr.inr(ec.l10n.format(perDay,'#,##,##0'))} on a normal day  ·  busiest ${fc.peakDay ?: 'day varies'}" type="p" style="text-grey-8 q-mb-none q-mt-xs"/>
                     </container>
-                    <container style="column items-end text-right">
-                        <label text="${trendNice}" type="h5" style="text-weight-bolder q-my-none ${fc.trendLabel == 'growing' ? 'text-success' : (fc.trendLabel == 'softening' ? 'text-danger' : 'text-grey-8')}"/>
+                    <container style="column col q-px-md">
+                        <label text="${leadLine}" type="p" style="text-grey-9 text-subtitle1 q-mt-none q-mb-sm"/>
+                        <render-mode><text type="html,qvt,vuet">${heroChartHtml}</text></render-mode>
+                    </container>
+                    <container style="column items-center text-center">
+                        <label text="${trendIco}" type="span" style="material-icons z-icobadge lg ${trendBadgeColor} q-mb-xs"/>
+                        <label text="${trendNice}" type="p" style="text-weight-bolder text-dark q-my-none"/>
                         <label text="which way sales are heading" type="p" style="text-grey-6 text-caption q-mb-none"/>
                     </container>
                 </container>
-                <label text="${leadLine}" type="p" style="text-grey-9 text-subtitle1 q-mt-md q-mb-none"/>
             </container>
 
-            <!-- Supporting stats -->
+            <!-- Supporting stats: 3 insight cards with icon badges -->
             <container-row>
-                <row-col lg="6" md="6">
-                    <container style="zenith-card q-pa-md bg-white shadow-1 border-radius-md q-mb-md">
-                        <label text="Customers · next 7 days" type="p" style="text-grey-7 text-weight-bold text-caption q-mb-xs"/>
-                        <label text="${zinr.inr(ec.l10n.format(fc.next7Traffic ?: 0,'#,##0'))}" type="h4" style="text-primary text-weight-bold q-my-none"/>
-                        <label text="spending about ${sym}${zinr.inr(ec.l10n.format(fc.next7Aov ?: 0,'#,##0'))} each visit" type="p" style="text-grey-6 text-caption q-mb-none"/>
+                <row-col lg="4" md="4">
+                    <container style="zenith-card q-pa-md bg-white shadow-1 border-radius-md q-mb-md row items-center no-wrap q-gutter-md">
+                        <label text="groups" type="span" style="material-icons z-icobadge primary"/>
+                        <container style="column">
+                            <label text="Customers · next 7 days" type="p" style="text-grey-7 text-weight-bold text-caption q-mb-none"/>
+                            <label text="${zinr.inr(ec.l10n.format(fc.next7Traffic ?: 0,'#,##0'))}" type="h4" style="text-primary text-weight-bold q-my-none"/>
+                            <label text="spending about ${sym}${zinr.inr(ec.l10n.format(fc.next7Aov ?: 0,'#,##0'))} each visit" type="p" style="text-grey-6 text-caption q-mb-none"/>
+                        </container>
                     </container>
                 </row-col>
-                <row-col lg="6" md="6">
-                    <container style="zenith-card q-pa-md bg-white shadow-1 border-radius-md q-mb-md">
-                        <label text="What's changing" type="p" style="text-grey-7 text-weight-bold text-caption q-mb-xs"/>
-                        <label text="${driverNice}" type="h5" style="text-weight-bold text-indigo-8 q-my-none"/>
-                        <label text="the main reason sales are moving right now" type="p" style="text-grey-6 text-caption q-mb-none"/>
+                <row-col lg="4" md="4">
+                    <container style="zenith-card q-pa-md bg-white shadow-1 border-radius-md q-mb-md row items-center no-wrap q-gutter-md">
+                        <label text="trending_up" type="span" style="material-icons z-icobadge green"/>
+                        <container style="column">
+                            <label text="What's changing" type="p" style="text-grey-7 text-weight-bold text-caption q-mb-none"/>
+                            <label text="${driverNice}" type="p" style="text-weight-bold text-dark q-my-none"/>
+                            <label text="the main reason sales are moving right now" type="p" style="text-grey-6 text-caption q-mb-none"/>
+                        </container>
+                    </container>
+                </row-col>
+                <row-col lg="4" md="4">
+                    <container style="zenith-card q-pa-md bg-white shadow-1 border-radius-md q-mb-md row items-center no-wrap q-gutter-md">
+                        <label text="star" type="span" style="material-icons z-icobadge orange"/>
+                        <container style="column">
+                            <label text="What's driving sales" type="p" style="text-grey-7 text-weight-bold text-caption q-mb-none"/>
+                            <label text="Your biggest groups" type="p" style="text-weight-bold text-dark q-my-none"/>
+                            <label text="expected over the next 7 days" type="p" style="text-grey-6 text-caption q-mb-none"/>
+                        </container>
                     </container>
                 </row-col>
             </container-row>
@@ -153,7 +198,7 @@
             <container style="zenith-card q-pa-md bg-white shadow-1 border-radius-md q-mb-md">
                 <label text="What's driving sales" type="h6" style="text-primary text-weight-bold q-my-none"/>
                 <label text="Your biggest groups, expected over the next 7 days." type="p" style="text-grey-6 text-caption q-mb-md"/>
-                <render-mode><text type="html">${catChartHtml}</text></render-mode>
+                <render-mode><text type="html,qvt,vuet">${catChartHtml}</text></render-mode>
             </container>
 
             <!-- Details, de-emphasized -->
@@ -161,7 +206,7 @@
             <container-row>
                 <row-col lg="5" md="12">
                     <container style="zenith-card q-pa-md bg-white shadow-1 border-radius-md q-mb-md">
-                        <label text="Two-week outlook" type="span" style="text-weight-bold text-dark"/>
+                        <label text="Two-week outlook" type="span" style="text-primary text-weight-bold"/>
                         <form-list name="WeeklyList" list="weeklyList" skip-form="true">
                             <field name="weekStart"><default-field title="Week starting"><display/></default-field></field>
                             <field name="predicted"><default-field title="Expected"><display text="${sym}${zinr.inr(ec.l10n.format(predicted ?: 0,'#,##,##0'))}"/></default-field></field>
@@ -171,12 +216,12 @@
                 </row-col>
                 <row-col lg="7" md="12">
                     <container style="zenith-card q-pa-md bg-white shadow-1 border-radius-md q-mb-md">
-                        <label text="Track record — forecast vs actual" type="span" style="text-weight-bold text-dark"/>
+                        <label text="Track record — forecast vs actual" type="span" style="text-primary text-weight-bold"/>
                         <form-list name="ForecastList" list="histList" skip-form="true" show-page-size="true">
                             <field name="periodDate"><default-field title="Date"><display/></default-field></field>
                             <field name="predictedAmount"><default-field title="We expected"><display text="${sym}${zinr.inr(ec.l10n.format(predictedAmount ?: 0,'#,##,##0'))}"/></default-field></field>
                             <field name="actualAmount"><default-field title="Actually sold"><display text="${actualAmount != null ? (sym + zinr.inr(ec.l10n.format(actualAmount,'#,##,##0'))) : 'not yet'}"/></default-field></field>
-                            <field name="accuracyPct"><default-field title="How close"><display text="${accuracyPct != null ? (accuracyPct + '% on target') : '—'}"/></default-field></field>
+                            <field name="accuracyPct"><default-field title="How close"><label text="${accuracyPct != null ? (accuracyPct + '% on target') : '—'}" type="span" style="${accuracyPct != null ? ('zenith-badge nd ' + (accuracyPct &gt;= 80 ? 'success' : (accuracyPct &gt;= 40 ? 'warning' : 'danger'))) : 'text-grey-6'}"/></default-field></field>
                         </form-list>
                     </container>
                 </row-col>
