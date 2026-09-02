@@ -196,6 +196,8 @@
             import java.util.Calendar
             def nowTs = ec.user.nowTimestamp
             def revArr = []; def ordArr = []
+            // ZE-DASH: per-metric 6-month sparklines (mockup stat-card mini-bars), computed in the same loop
+            def _spQ = []; def _spC = []; def _spI = []
             for (int i = 5; i >= 0; i--) {
                 def c = Calendar.getInstance(); c.setTimeInMillis(nowTs.getTime()); c.add(Calendar.MONTH, -i)
                 c.set(Calendar.DAY_OF_MONTH,1); c.set(Calendar.HOUR_OF_DAY,0); c.set(Calendar.MINUTE,0); c.set(Calendar.SECOND,0); c.set(Calendar.MILLISECOND,0)
@@ -208,9 +210,16 @@
                 def rev = 0.0G; invs.each { rev += ((it.totalTaxableAmount ?: 0G) + (it.totalTaxAmount ?: 0G) + (it.roundOffAmount ?: 0G)) }
                 revArr.add(rev.setScale(0, java.math.RoundingMode.HALF_UP).toPlainString())
                 ordArr.add(invs.size())
+                _spQ.add(ec.entity.find("mantle.order.OrderHeaderAndPart").condition("statusId","OrderProposed").condition("vendorPartyId",orgId).condition("entryDate",EntityCondition.GREATER_THAN_EQUAL_TO,start).condition("entryDate",EntityCondition.LESS_THAN,end).count())
+                _spI.add(ec.entity.find("mantle.account.invoice.Invoice").condition("fromPartyId",orgId).condition("statusId",EntityCondition.NOT_EQUAL,"InvoiceCancelled").condition("invoiceDate",EntityCondition.GREATER_THAN_EQUAL_TO,start).condition("invoiceDate",EntityCondition.LESS_THAN,end).count())
+                try { _spC.add(ec.entity.find("mantle.party.PartyDetailAndRole").condition("roleTypeId","Customer").condition("ownerPartyId",orgId).condition("createdDate",EntityCondition.GREATER_THAN_EQUAL_TO,start).condition("createdDate",EntityCondition.LESS_THAN,end).count()) } catch (Exception _e) { _spC.add(0) }
             }
             salesRevJson = "[" + revArr.join(",") + "]"
             salesOrdJson = "[" + ordArr.join(",") + "]"
+            salesSpark = salesRevJson
+            quotesSpark = "[" + _spQ.join(",") + "]"
+            custSpark = "[" + _spC.join(",") + "]"
+            invSpark = "[" + _spI.join(",") + "]"
             long onCredit = ec.entity.find("zenith.erp.pos.PosTransaction").condition("organizationPartyId", orgId).condition("statusId","PtCompleted").condition("isCredit","Y").count()
             long totalSalesCnt = 0
             for (r in salesSums) { totalSalesCnt += ((r.cnt ?: 0) as long) }
@@ -242,6 +251,66 @@
             dashOrderCsv = (ec.user.getPreference('SALES_DASH_ORDER') ?: '')
             dashSizeCsv = (ec.user.getPreference('SALES_DASH_SIZE') ?: '')
             urlSettings = dashDate ? ("?dashDate="+dashDate+"&dashDateTo="+dashDateTo+"&showSettings=1") : "?showSettings=1"
+        ]]></script>
+
+        <!-- ZE-DASH: stat-card deltas (last 30 vs prior 30 days) + Sales-by-Category (actual, bounded) -->
+        <script><![CDATA[
+            import org.moqui.entity.EntityCondition
+            import java.util.Calendar
+            salesDelta = null; quotesDelta = null; invoicesDelta = null; customersDelta = null
+            catNamesJson = "[]"; catValsJson = "[]"; catHasData = false
+            if (orgId) {
+                def _now2 = ec.user.nowTimestamp
+                def _tsShift = { days -> def c = Calendar.getInstance(); c.setTimeInMillis(_now2.getTime()); c.set(Calendar.HOUR_OF_DAY,0); c.set(Calendar.MINUTE,0); c.set(Calendar.SECOND,0); c.set(Calendar.MILLISECOND,0); c.add(Calendar.DAY_OF_MONTH, days); return new java.sql.Timestamp(c.getTimeInMillis()) }
+                def _d0 = _tsShift(1); def _d30 = _tsShift(-30); def _d60 = _tsShift(-60)
+                def _pct = { cur, prev -> (prev == null || (prev as BigDecimal) == 0G) ? null : ((((cur as BigDecimal) - (prev as BigDecimal)) * 100G) / (prev as BigDecimal)).setScale(1, java.math.RoundingMode.HALF_UP) }
+                def _salesSum = { from, to -> def s = 0.0G; ec.entity.find("mantle.account.invoice.Invoice").condition("fromPartyId", orgId).condition("invoiceTypeEnumId","InvoiceSales").condition("statusId", EntityCondition.IN, ["InvoiceFinalized","InvoicePmtRecvd"]).condition("invoiceDate", EntityCondition.GREATER_THAN_EQUAL_TO, from).condition("invoiceDate", EntityCondition.LESS_THAN, to).selectField("totalTaxableAmount").selectField("totalTaxAmount").selectField("roundOffAmount").list().each { s += ((it.totalTaxableAmount?:0G)+(it.totalTaxAmount?:0G)+(it.roundOffAmount?:0G)) }; return s }
+                def _qCnt = { from, to -> ec.entity.find("mantle.order.OrderHeaderAndPart").condition("statusId","OrderProposed").condition("vendorPartyId",orgId).condition("entryDate",EntityCondition.GREATER_THAN_EQUAL_TO,from).condition("entryDate",EntityCondition.LESS_THAN,to).count() }
+                def _iCnt = { from, to -> ec.entity.find("mantle.account.invoice.Invoice").condition("fromPartyId",orgId).condition("statusId",EntityCondition.NOT_EQUAL,"InvoiceCancelled").condition("invoiceDate",EntityCondition.GREATER_THAN_EQUAL_TO,from).condition("invoiceDate",EntityCondition.LESS_THAN,to).count() }
+                def _cCnt = { from, to -> try { return ec.entity.find("mantle.party.PartyDetailAndRole").condition("roleTypeId","Customer").condition("ownerPartyId",orgId).condition("createdDate",EntityCondition.GREATER_THAN_EQUAL_TO,from).condition("createdDate",EntityCondition.LESS_THAN,to).count() } catch (Exception _e) { return null } }
+                salesDelta = _pct(_salesSum(_d30,_d0), _salesSum(_d60,_d30))
+                quotesDelta = _pct(_qCnt(_d30,_d0), _qCnt(_d60,_d30))
+                invoicesDelta = _pct(_iCnt(_d30,_d0), _iCnt(_d60,_d30))
+                def _cc30 = _cCnt(_d30,_d0); def _cc60 = _cCnt(_d60,_d30)
+                customersDelta = (_cc30 == null || _cc60 == null) ? null : _pct(_cc30, _cc60)
+
+                def _catFrom = dayStart ?: _tsShift(-90)
+                def _catTo = dayEndExcl ?: _d0
+                def _catMap = [:]
+                ec.entity.find("zenith.erp.sales.InvoiceCategorySalesView").condition("fromPartyId",orgId).condition("invoiceTypeEnumId","InvoiceSales").condition("statusId",EntityCondition.NOT_EQUAL,"InvoiceCancelled").condition("invoiceDate",EntityCondition.GREATER_THAN_EQUAL_TO,_catFrom).condition("invoiceDate",EntityCondition.LESS_THAN,_catTo).selectField("productCategoryId").selectField("taxableAmount").selectField("totalTaxAmount").list().each { r ->
+                    def cid = r.productCategoryId
+                    if (cid) _catMap[cid] = ((_catMap[cid] ?: 0.0G)) + ((r.taxableAmount ?: 0G) + (r.totalTaxAmount ?: 0G))
+                }
+                def _catTop = _catMap.entrySet().toList().sort { -it.value }.take(6)
+                def _cn = []; def _cv = []
+                _catTop.each { e ->
+                    def pc = ec.entity.find("mantle.product.category.ProductCategory").condition("productCategoryId", e.key).selectField("categoryName").one()
+                    _cn.add("'" + ((pc?.categoryName ?: e.key).toString().replace("\\","").replace("'","")) + "'")
+                    _cv.add((e.value as BigDecimal).setScale(0, java.math.RoundingMode.HALF_UP).toPlainString())
+                }
+                catNamesJson = "[" + _cn.join(",") + "]"
+                catValsJson = "[" + _cv.join(",") + "]"
+                catHasData = (_cv.size() > 0)
+            }
+            // stat-card delta chip + sparkline (inline HTML, no chart lib) for each metric
+            def _deltaHtml = { d ->
+                if (d == null) return '<div style="margin-top:8px;font-size:11px;color:#9a9aa8;">&mdash; no prior data</div>'
+                def up = ((d as BigDecimal) >= 0G)
+                return '<div style="margin-top:8px;font-size:11.5px;font-weight:700;color:' + (up ? '#0E9F6E' : '#DC2626') + ';">' + (up ? '&#8593;' : '&#8595;') + ' ' + (d.abs().toPlainString()) + '% <span style="color:#9a9aa8;font-weight:500;">vs last 30 days</span></div>'
+            }
+            def _sparkHtml = { arrStr, col ->
+                def vals = []
+                try { (arrStr ?: '').replaceAll('[\\[\\]]','').split(',').each { if (it?.trim()) vals.add(new BigDecimal(it.trim())) } } catch (Exception _e) {}
+                if (vals.size() < 2) return ''
+                def mx = vals.max(); if (mx == null || mx == 0G) return ''
+                def b = new StringBuilder('<div style="display:flex;align-items:flex-end;gap:2px;height:26px;">')
+                vals.each { v -> def h = ((v * 100G) / mx).setScale(0, java.math.RoundingMode.HALF_UP); b.append('<div style="width:5px;height:' + h + '%;min-height:2px;background:' + col + ';border-radius:2px 2px 0 0;opacity:.85;"></div>') }
+                b.append('</div>'); return b.toString()
+            }
+            salesDeltaHtml = _deltaHtml(salesDelta); salesSparkHtml = _sparkHtml(salesSpark ?: '', '#0E9F6E')
+            quotesDeltaHtml = _deltaHtml(quotesDelta); quotesSparkHtml = _sparkHtml(quotesSpark ?: '', '#D97706')
+            custDeltaHtml = _deltaHtml(customersDelta); custSparkHtml = _sparkHtml(custSpark ?: '', '#2563EB')
+            invDeltaHtml = _deltaHtml(invoicesDelta); invSparkHtml = _sparkHtml(invSpark ?: '', '#DC2626')
         ]]></script>
     </actions>
 
@@ -298,60 +367,76 @@
             <!-- Total Orders -->
             <row-col lg="3" md="6" sm="12">
                 <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-md">
-                    <container style="row items-center justify-between">
+                    <container style="row items-start justify-between">
                         <container>
                             <label text="Total Sales" type="p" style="text-grey-7 text-uppercase text-weight-bold q-mb-xs"/>
                             <label text="${currSymbol}${zinr.inr(ec.l10n.format(totalSalesAmount ?: 0, '#,##,##0'))}" type="h4" style="text-dark text-weight-bold q-my-none"/>
                         </container>
-                        <container style="q-pa-sm bg-green-1 border-radius-md text-green-9">
-                            <render-mode><text type="html"><![CDATA[<q-icon name="trending_up" class="text-h4"/>]]></text></render-mode>
+                        <container style="column items-end q-gutter-xs">
+                            <container style="q-pa-sm bg-green-1 border-radius-md text-green-9">
+                                <render-mode><text type="html"><![CDATA[<q-icon name="trending_up" class="text-h4"/>]]></text></render-mode>
+                            </container>
+                            <render-mode><text type="html,qvt,vuet">${salesSparkHtml}</text></render-mode>
                         </container>
                     </container>
+                    <render-mode><text type="html,qvt,vuet">${salesDeltaHtml}</text></render-mode>
                 </container>
             </row-col>
 
             <!-- Active Quotes -->
             <row-col lg="3" md="6" sm="12">
                 <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-md">
-                    <container style="row items-center justify-between">
+                    <container style="row items-start justify-between">
                         <container>
                             <label text="Active Quotes" type="p" style="text-grey-7 text-uppercase text-weight-bold q-mb-xs"/>
                             <label text="${activeQuotes}" type="h4" style="text-dark text-weight-bold q-my-none"/>
                         </container>
-                        <container style="q-pa-sm bg-orange-1 border-radius-md text-orange-8">
-                            <render-mode><text type="html"><![CDATA[<q-icon name="request_quote" class="text-h4"/>]]></text></render-mode>
+                        <container style="column items-end q-gutter-xs">
+                            <container style="q-pa-sm bg-orange-1 border-radius-md text-orange-8">
+                                <render-mode><text type="html"><![CDATA[<q-icon name="request_quote" class="text-h4"/>]]></text></render-mode>
+                            </container>
+                            <render-mode><text type="html,qvt,vuet">${quotesSparkHtml}</text></render-mode>
                         </container>
                     </container>
+                    <render-mode><text type="html,qvt,vuet">${quotesDeltaHtml}</text></render-mode>
                 </container>
             </row-col>
 
             <!-- Total Customers -->
             <row-col lg="3" md="6" sm="12">
                 <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-md">
-                    <container style="row items-center justify-between">
+                    <container style="row items-start justify-between">
                         <container>
                             <label text="Total Customers" type="p" style="text-grey-7 text-uppercase text-weight-bold q-mb-xs"/>
                             <label text="${totalCustomers}" type="h4" style="text-dark text-weight-bold q-my-none"/>
                         </container>
-                        <container style="q-pa-sm bg-blue-1 border-radius-md text-blue-9">
-                            <render-mode><text type="html"><![CDATA[<q-icon name="people" class="text-h4"/>]]></text></render-mode>
+                        <container style="column items-end q-gutter-xs">
+                            <container style="q-pa-sm bg-blue-1 border-radius-md text-blue-9">
+                                <render-mode><text type="html"><![CDATA[<q-icon name="people" class="text-h4"/>]]></text></render-mode>
+                            </container>
+                            <render-mode><text type="html,qvt,vuet">${custSparkHtml}</text></render-mode>
                         </container>
                     </container>
+                    <render-mode><text type="html,qvt,vuet">${custDeltaHtml}</text></render-mode>
                 </container>
             </row-col>
 
             <!-- Total Invoices -->
             <row-col lg="3" md="6" sm="12">
                 <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-md">
-                    <container style="row items-center justify-between">
+                    <container style="row items-start justify-between">
                         <container>
                             <label text="Generated Invoices" type="p" style="text-grey-7 text-uppercase text-weight-bold q-mb-xs"/>
                             <label text="${totalInvoices}" type="h4" style="text-dark text-weight-bold q-my-none"/>
                         </container>
-                        <container style="q-pa-sm bg-red-1 border-radius-md text-red-9">
-                            <render-mode><text type="html"><![CDATA[<q-icon name="receipt_long" class="text-h4"/>]]></text></render-mode>
+                        <container style="column items-end q-gutter-xs">
+                            <container style="q-pa-sm bg-red-1 border-radius-md text-red-9">
+                                <render-mode><text type="html"><![CDATA[<q-icon name="receipt_long" class="text-h4"/>]]></text></render-mode>
+                            </container>
+                            <render-mode><text type="html,qvt,vuet">${invSparkHtml}</text></render-mode>
                         </container>
                     </container>
+                    <render-mode><text type="html,qvt,vuet">${invDeltaHtml}</text></render-mode>
                 </container>
             </row-col>
         </container-row>
@@ -379,20 +464,22 @@
                             var ordersData = ${salesOrdJson};
 
                             new ApexCharts(document.querySelector(&quot;#salesTrendChart&quot;), {
-                                chart: { type: 'area', height: 280, toolbar: { show: true }, fontFamily: 'Roboto, sans-serif' },
+                                chart: { type: 'bar', height: 280, toolbar: { show: true }, fontFamily: 'Roboto, sans-serif' },
                                 series: [
-                                    { name: 'Revenue', type: 'area', data: salesData },
-                                    { name: 'Orders', type: 'line', data: ordersData }
+                                    { name: 'Revenue', data: salesData },
+                                    { name: 'Orders', data: ordersData }
                                 ],
                                 xaxis: { categories: labels },
                                 yaxis: [
-                                    { title: { text: 'Revenue' }, labels: { formatter: function(v) { return '${currSymbol!"$"}' + (v/1000).toFixed(0) + 'K'; } } },
-                                    { opposite: true, title: { text: 'Orders' } }
+                                    { seriesName: 'Revenue', title: { text: 'Revenue' }, labels: { formatter: function(v) { return '${currSymbol!"$"}' + (v/1000).toFixed(0) + 'K'; } } },
+                                    { seriesName: 'Orders', opposite: true, title: { text: 'Orders' }, labels: { formatter: function(v){ return Math.round(v); } } }
                                 ],
                                 colors: ['#2563EB', '#F59E0B'],
-                                fill: { type: ['gradient', 'solid'], gradient: { shadeIntensity: 1, opacityFrom: 0.4, opacityTo: 0.1 } },
-                                stroke: { width: [2, 3], curve: 'smooth' },
-                                tooltip: { shared: true },
+                                plotOptions: { bar: { columnWidth: '62%', borderRadius: 3, borderRadiusApplication: 'end' } },
+                                grid: { borderColor: '#E5E7EB' },
+                                stroke: { show: true, width: 2, colors: ['transparent'] },
+                                tooltip: { shared: true, intersect: false },
+                                legend: { position: 'bottom' },
                                 dataLabels: { enabled: false }
                             }).render();
                         })();})"/>
@@ -425,6 +512,34 @@
                 </widgets></section>
             </row-col>
         </container-row>
+
+        <!-- Sales by Category (actual, top groups) -->
+        <section name="wCategory" condition="catHasData"><widgets>
+        <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md q-mb-md">
+            <label text="Sales by Category" type="h6" style="text-primary text-weight-bold q-mb-md"/>
+            <render-mode><text type="html,vuet,qvt"><![CDATA[
+                <div id="salesCatChart"></div>
+                <img alt="" style="display:none" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" onload="zChart(this,function(){(function() {
+                    var cats = ${catNamesJson};
+                    var vals = ${catValsJson};
+                    var palette = ['#3B82F6','#10B981','#14B8A6','#F59E0B','#EF4444','#7C3AED'];
+                    var fmtL = function(v){ return '${currSymbol!"$"}' + (v/100000).toFixed(1) + 'L'; };
+                    new ApexCharts(document.querySelector(&quot;#salesCatChart&quot;), {
+                        chart: { type: 'bar', height: 300, toolbar: { show: false }, fontFamily: 'Roboto, sans-serif' },
+                        series: [{ name: 'Sales', data: vals }],
+                        xaxis: { categories: cats },
+                        yaxis: { labels: { formatter: fmtL } },
+                        plotOptions: { bar: { distributed: true, columnWidth: '55%', borderRadius: 3, borderRadiusApplication: 'end' } },
+                        colors: palette,
+                        dataLabels: { enabled: true, offsetY: -18, style: { colors: ['#374151'], fontWeight: 700 }, formatter: fmtL },
+                        grid: { borderColor: '#E5E7EB' },
+                        legend: { show: false },
+                        tooltip: { y: { formatter: fmtL } }
+                    }).render();
+                })();})"/>
+            ]]></text></render-mode>
+        </container>
+        </widgets></section>
 
         <!-- Sales Forecast Infographic -->
         <section name="wForecast" condition="showForecast"><widgets>
