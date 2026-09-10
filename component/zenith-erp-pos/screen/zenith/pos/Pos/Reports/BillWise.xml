@@ -3,118 +3,238 @@
         xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
         default-menu-title="Bill Wise" default-menu-index="1">
 
-    <transition name="viewTransaction">
-        <default-response url="../../EditTransaction"/>
+    <transition name="viewTransaction"><default-response url="../../EditTransaction"/></transition>
+
+    <transition name="exportCsv" read-only="true">
+        <actions>
+            <script><![CDATA[
+                import org.moqui.context.ExecutionContext
+                ExecutionContext ec = context.ec
+                def fromD = (fromDate ?: ec.l10n.format(ec.user.nowTimestamp, 'yyyy-MM-dd'))
+                def thruD = (thruDate ?: fromD)
+                def ds = java.sql.Timestamp.valueOf(fromD + ' 00:00:00')
+                def de = java.sql.Timestamp.valueOf(thruD + ' 23:59:59')
+                def _org = ec.user.getPreference("ACTIVE_ORGANIZATION")
+                def ef = ec.entity.find("zenith.erp.pos.PosTransactionView")
+                    .condition("entryDate","greater-equals",ds).condition("entryDate","less-equals",de).orderBy("-entryDate")
+                if (statusId) ef.condition("statusId", statusId)
+                if (_org) ef.condition("organizationPartyId", _org)
+                def bills = ef.list()
+                def stx = (searchText ?: '').trim().toLowerCase()
+                if (stx) bills = bills.findAll { ((it.transactionNumber ?: '').toString().toLowerCase().contains(stx) || (it.customerName ?: '').toLowerCase().contains(stx)) }
+                def canon = { m -> def k=(m ?: '').toString().trim(); def lk=k.toLowerCase();
+                    if(lk=='cash')return 'Cash'; if(lk=='upi')return 'UPI'; if(lk=='card')return 'Card';
+                    if(lk=='netbanking'||lk=='net banking')return 'Net Banking'; if(lk=='wallet')return 'Wallet'; if(lk=='credit')return 'Credit'; return k }
+                def billIds = bills.collect { it.transactionId }
+                def payAgg = [:]
+                if (billIds) ec.entity.find("zenith.erp.pos.PosPayment").condition("transactionId","in",billIds).list().each { p ->
+                    def mm = payAgg.get(p.transactionId, [:]); def k = canon(p.paymentMethod); mm[k] = (mm[k] ?: 0.0G) + ((p.amount ?: 0) as BigDecimal) }
+                def payType = { b -> (b.isCredit == 'Y') ? 'Credit' : (payAgg[b.transactionId] ? payAgg[b.transactionId].entrySet().max{ it.value }.key : '') }
+                def slMap = [PtCompleted:'Completed', PtVoided:'Cancelled', PtHeld:'Pending', PtCreated:'Pending']
+                def statusOf = { b -> (b.isCredit == 'Y') ? 'Credit' : (slMap[b.statusId] ?: b.statusId) }
+                def esc = { v -> if (v == null) return ""; String s = v.toString().trim(); (s.contains(",")||s.contains("\"")||s.contains("\n")) ? "\"" + s.replace("\"","\"\"") + "\"" : s }
+                def num = { v -> String.format("%.2f", (v ?: 0.0) as double) }
+                def dt = { v -> v == null ? "" : ec.l10n.format(v, 'dd-MM-yyyy HH:mm') }
+                StringBuilder csv = new StringBuilder()
+                csv.append("ZetaERP - Bill Wise Report\n")
+                csv.append("Period: ${fromD} to ${thruD}  |  Generated: ${ec.l10n.format(ec.user.nowTimestamp, 'dd MMM yyyy HH:mm')}\n\n")
+                csv.append("Bill No,Date,Terminal,Customer,Subtotal,Discount,Tax,Net Amount,Payment Type,Status\n")
+                bills.each { b ->
+                    csv.append("${esc(b.transactionNumber ?: b.transactionId)},${dt(b.entryDate)},${esc(b.terminalName)},${esc(b.customerName ?: 'Walk-in Customer')},${num(b.subtotal)},${num(b.discountTotal)},${num(b.totalTaxAmount)},${num(b.payableAmount)},${esc(payType(b))},${esc(statusOf(b))}\n")
+                }
+                ec.web.sendTextResponse(csv.toString(), "text/csv", "Bill_Wise_${ec.l10n.format(ec.user.nowTimestamp, 'yyyyMMdd_HHmm')}.csv")
+            ]]></script>
+        </actions>
+        <default-response type="none"/>
     </transition>
-    <transition name="goDailySummary"><default-response url="../../DailySummary"/></transition>
-    <transition name="goTransactions"><default-response url="../../PosTransactions"/></transition>
-    <transition name="goDashboard"><default-response url="../../Dashboard"/></transition>
-    <transition name="goTerminal"><default-response url="../../Terminal"/></transition>
-    <transition name="goPriceOverrides"><default-response url="../../PriceOverrides"/></transition>
+
+    <transition name="downloadPdf" read-only="true">
+        <default-response url="${ec.web.getWebappRootUrl(false, null) + '/fop/apps/zenith/pos/Reports/BillWisePdf?fromDate=' + (fromDate ?: '') + '&amp;thruDate=' + (thruDate ?: '') + '&amp;statusId=' + (statusId ?: '') + '&amp;searchText=' + java.net.URLEncoder.encode(searchText ?: '', 'UTF-8')}" url-type="plain"/>
+    </transition>
 
     <actions>
         <set field="fromDate" from="fromDate ?: ec.l10n.format(ec.user.nowTimestamp, 'yyyy-MM-dd')"/>
         <set field="thruDate" from="thruDate ?: fromDate"/>
+        <set field="statusId" from="statusId ?: ''"/>
+        <set field="searchText" from="searchText ?: ''"/>
         <set field="dayStart" from="java.sql.Timestamp.valueOf(fromDate + ' 00:00:00')"/>
         <set field="dayEnd" from="java.sql.Timestamp.valueOf(thruDate + ' 23:59:59')"/>
+        <set field="searchLike" from="searchText ? ('%' + searchText + '%') : null"/>
+        <script>context.zinr = com.zenith.Fmt.INSTANCE</script>
 
         <entity-find entity-name="zenith.erp.pos.PosTransactionView" list="billList">
             <econdition field-name="entryDate" operator="greater-equals" from="dayStart"/>
             <econdition field-name="entryDate" operator="less-equals" from="dayEnd"/>
             <econdition field-name="statusId" from="statusId" ignore-if-empty="true"/>
+            <econdition field-name="transactionNumber" operator="like" from="searchLike" ignore-if-empty="true"/>
             <order-by field-name="-entryDate"/>
-            <!-- ZE-SALES-014 f/u: org-isolate CSV/XLSX export (standalone render bypasses the MANTLE_ACTIVE_ORG authz filter) -->
+            <!-- ZE-SALES-014 f/u: org-isolate CSV/PDF export (standalone render bypasses the MANTLE_ACTIVE_ORG authz filter) -->
             <econdition field-name="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
         </entity-find>
 
         <script><![CDATA[
-            reportTotalSales = billList.findAll { it.statusId == 'PtCompleted' }.sum { (it.payableAmount ?: 0) as BigDecimal } ?: BigDecimal.ZERO
-            reportTotalBills = billList.findAll { it.statusId == 'PtCompleted' }.size()
-            reportTotalDiscount = billList.findAll { it.statusId == 'PtCompleted' }.sum { (it.discountTotal ?: 0) as BigDecimal } ?: BigDecimal.ZERO
+            def zinr = context.zinr
+            // Payment type per bill: dominant PosPayment method (batch, one query), or "Credit" for pay-later bills
+            def canon = { m -> def k=(m ?: '').toString().trim(); def lk=k.toLowerCase();
+                if(lk=='cash')return 'Cash'; if(lk=='upi')return 'UPI'; if(lk=='card')return 'Card';
+                if(lk=='netbanking'||lk=='net banking')return 'Net Banking'; if(lk=='wallet')return 'Wallet'; if(lk=='credit')return 'Credit'; return k }
+            def billIds = billList.collect { it.transactionId }
+            def payAgg = [:]
+            if (billIds) ec.entity.find("zenith.erp.pos.PosPayment").condition("transactionId","in",billIds).list().each { p ->
+                def mm = payAgg.get(p.transactionId, [:]); def k = canon(p.paymentMethod); mm[k] = (mm[k] ?: 0.0G) + ((p.amount ?: 0) as BigDecimal) }
+            def payTypeByTxn = [:]
+            payAgg.each { tid, mm -> payTypeByTxn[tid] = mm.entrySet().max{ it.value }.key }
+            context.payTypeByTxn = payTypeByTxn
+
+            // 5 stat cards
+            def completed = billList.findAll { it.statusId == 'PtCompleted' }
+            def salesBills = completed.findAll { it.isCredit != 'Y' }
+            def creditBills = billList.findAll { it.isCredit == 'Y' }
+            def pendingBills = billList.findAll { (((it.payableAmount ?: 0) as BigDecimal) - ((it.paidAmount ?: 0) as BigDecimal)) > 0 }
+            def totalSales = salesBills.inject(0.0G) { a, it -> a + ((it.payableAmount ?: 0) as BigDecimal) }
+            def totalDiscount = completed.inject(0.0G) { a, it -> a + ((it.discountTotal ?: 0) as BigDecimal) }
+            def pendingAmt = pendingBills.inject(0.0G) { a, it -> a + (((it.payableAmount ?: 0) as BigDecimal) - ((it.paidAmount ?: 0) as BigDecimal)) }
+            def creditAmt = creditBills.inject(0.0G) { a, it -> a + ((it.payableAmount ?: 0) as BigDecimal) }
+            def avgDiscPct = totalSales > 0 ? (totalDiscount * 100 / totalSales) : 0.0G
+
+            totalSalesStr = '₹ ' + zinr.inr(ec.l10n.format(totalSales, '#,##0.00'))
+            salesBillsStr = salesBills.size() + ' Bills'
+            totalBillsCount = billList.size()
+            terminalsStr = (billList.collect { it.terminalName }.findAll { it }.unique().size()) + ' Terminals'
+            totalDiscountStr = '₹ ' + zinr.inr(ec.l10n.format(totalDiscount, '#,##0.00'))
+            avgDiscStr = 'Avg. Discount ' + ec.l10n.format(avgDiscPct, '#0.00') + '%'
+            pendingAmtStr = '₹ ' + zinr.inr(ec.l10n.format(pendingAmt, '#,##0.00'))
+            pendingBillsStr = pendingBills.size() + ' Bills'
+            creditAmtStr = '₹ ' + zinr.inr(ec.l10n.format(creditAmt, '#,##0.00'))
+            creditBillsStr = creditBills.size() + ' Bills'
         ]]></script>
     </actions>
 
     <widgets>
-        <container style="q-mb-md">
-            <form-single name="BillFilter" transition=".">
-                <field name="fromDate"><default-field title="From">
-                    <date-time type="date" default-value="${fromDate}"/>
-                </default-field></field>
-                <field name="thruDate"><default-field title="To">
-                    <date-time type="date" default-value="${thruDate}"/>
-                </default-field></field>
-                <field name="statusId"><default-field title="Status">
-                    <drop-down allow-empty="true">
-                        <option key="PtCompleted" text="Completed"/>
-                        <option key="PtVoided" text="Voided"/>
-                        <option key="PtCreated" text="Created"/>
-                    </drop-down>
-                </default-field></field>
-                <field name="searchBtn"><default-field title="">
-                    <submit text="Search" icon="fa fa-search"/>
-                </default-field></field>
-            </form-single>
+        <container style="q-pa-md">
+            <!-- Filter card (row1: dates+status ; row2: search + Filter) -->
+            <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md q-mb-md">
+                <form-single name="BillFilter" transition=".">
+                    <field name="fromDate"><default-field title="From Date">
+                        <date-time type="date" default-value="${fromDate}"/></default-field></field>
+                    <field name="thruDate"><default-field title="To Date">
+                        <date-time type="date" default-value="${thruDate}"/></default-field></field>
+                    <field name="statusId"><default-field title="Status">
+                        <drop-down allow-empty="false">
+                            <option key="" text="All Status"/>
+                            <option key="PtCompleted" text="Completed"/>
+                            <option key="PtHeld" text="Held"/>
+                            <option key="PtCreated" text="Created"/>
+                            <option key="PtVoided" text="Cancelled"/>
+                        </drop-down></default-field></field>
+                    <field name="searchText"><default-field title="Search">
+                        <text-line size="24" default-value="${searchText ?: ''}"/></default-field></field>
+                    <field name="submitButton"><default-field title="">
+                        <submit text="Filter" icon="fa fa-filter"/></default-field></field>
+                    <field-layout>
+                        <field-row><field-ref name="fromDate"/><field-ref name="thruDate"/><field-ref name="statusId"/></field-row>
+                        <field-row><field-ref name="searchText"/><field-ref name="submitButton"/></field-row>
+                    </field-layout>
+                </form-single>
+                <container style="z-btnrow q-mt-sm">
+                    <link url="exportCsv" text="CSV" icon="download" link-type="anchor" style="z-obtn"/>
+                    <link url="downloadPdf" text="PDF" icon="picture_as_pdf" link-type="anchor" style="z-obtn"/>
+                </container>
+            </container>
+
+            <!-- 5 KPI stat cards -->
+            <container style="z-statrow">
+                <container style="z-statcell z-statcard-violet q-pa-md">
+                    <container style="z-statinner">
+                        <container style="z-icobadge lg primary"><label text="trending_up" type="span" style="material-icons"/></container>
+                        <container style="z-statmeta">
+                            <label text="Total Sales" type="span" style="z-statlabel"/>
+                            <label text="${totalSalesStr}" type="span" style="z-statnum-sm z-txt-primary"/>
+                            <label text="${salesBillsStr}" type="span" style="z-statdesc"/>
+                        </container>
+                    </container>
+                </container>
+                <container style="z-statcell z-statcard-blue q-pa-md">
+                    <container style="z-statinner">
+                        <container style="z-icobadge lg blue"><label text="receipt_long" type="span" style="material-icons"/></container>
+                        <container style="z-statmeta">
+                            <label text="Total Bills" type="span" style="z-statlabel"/>
+                            <label text="${totalBillsCount}" type="span" style="z-statnum-sm z-amt-blue"/>
+                            <label text="${terminalsStr}" type="span" style="z-statdesc"/>
+                        </container>
+                    </container>
+                </container>
+                <container style="z-statcell z-statcard-green q-pa-md">
+                    <container style="z-statinner">
+                        <container style="z-icobadge lg green"><label text="sell" type="span" style="material-icons"/></container>
+                        <container style="z-statmeta">
+                            <label text="Total Discount" type="span" style="z-statlabel"/>
+                            <label text="${totalDiscountStr}" type="span" style="z-statnum-sm z-amt-green"/>
+                            <label text="${avgDiscStr}" type="span" style="z-statdesc"/>
+                        </container>
+                    </container>
+                </container>
+                <container style="z-statcell z-statcard-orange q-pa-md">
+                    <container style="z-statinner">
+                        <container style="z-icobadge lg orange"><label text="account_balance_wallet" type="span" style="material-icons"/></container>
+                        <container style="z-statmeta">
+                            <label text="Pending Amount" type="span" style="z-statlabel"/>
+                            <label text="${pendingAmtStr}" type="span" style="z-statnum-sm z-txt-red"/>
+                            <label text="${pendingBillsStr}" type="span" style="z-statdesc"/>
+                        </container>
+                    </container>
+                </container>
+                <container style="z-statcell z-statcard-violet q-pa-md">
+                    <container style="z-statinner">
+                        <container style="z-icobadge lg primary"><label text="credit_card" type="span" style="material-icons"/></container>
+                        <container style="z-statmeta">
+                            <label text="Total Credit Bills" type="span" style="z-statlabel"/>
+                            <label text="${creditAmtStr}" type="span" style="z-statnum-sm z-txt-primary"/>
+                            <label text="${creditBillsStr}" type="span" style="z-statdesc"/>
+                        </container>
+                    </container>
+                </container>
+            </container>
+
+            <!-- Bill table -->
+            <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md">
+                <form-list name="BillWiseList" list="billList" list-entry="bill" skip-form="true">
+                    <row-actions>
+                        <script><![CDATA[
+                            billNo = bill.transactionNumber ?: bill.transactionId
+                            def pt = (bill.isCredit == 'Y') ? 'Credit' : (payTypeByTxn[bill.transactionId] ?: '—')
+                            paymentType = pt
+                            payColor = [Cash:'success', UPI:'primary', Card:'info', 'Net Banking':'teal', Wallet:'warning', Credit:'warning'][pt] ?: 'grey'
+                            def scMap = [PtCompleted:'success', PtVoided:'grey', PtHeld:'warning', PtCreated:'warning']
+                            def slMap = [PtCompleted:'Completed', PtVoided:'Cancelled', PtHeld:'Pending', PtCreated:'Pending']
+                            if (bill.isCredit == 'Y') { statusText = 'Credit'; statusColor = 'info' }
+                            else { statusColor = scMap[bill.statusId] ?: 'grey'; statusText = slMap[bill.statusId] ?: (bill.statusId ?: '—') }
+                            customerDisp = bill.customerName ?: 'Walk-in Customer'
+                        ]]></script>
+                    </row-actions>
+                    <field name="transactionNumber"><header-field title="Bill No"/>
+                        <default-field><link url="viewTransaction" text="${billNo}" parameter-map="[transactionId:bill.transactionId]"
+                              link-type="anchor" style="z-vlink"/></default-field></field>
+                    <field name="entryDate"><header-field title="Date"/>
+                        <default-field><display format="dd-MM-yyyy HH:mm"/></default-field></field>
+                    <field name="terminalName"><header-field title="Terminal"/>
+                        <default-field><label text="${bill.terminalName ?: '—'}" type="span" style="text-dark"/></default-field></field>
+                    <field name="customerName"><header-field title="Customer"/>
+                        <default-field><label text="${customerDisp}" type="span" style="text-dark"/></default-field></field>
+                    <field name="subtotal"><header-field title="Subtotal (₹)"/>
+                        <default-field><display format="#,##0.00"/></default-field></field>
+                    <field name="discountTotal"><header-field title="Discount (₹)"/>
+                        <default-field><display format="#,##0.00"/></default-field></field>
+                    <field name="totalTaxAmount"><header-field title="Tax (₹)"/>
+                        <default-field><display format="#,##0.00"/></default-field></field>
+                    <field name="payableAmount"><header-field title="Net Amount (₹)"/>
+                        <default-field><label text="${zinr.inr(ec.l10n.format((bill.payableAmount ?: 0) as BigDecimal, '#,##0.00'))}" type="span" style="text-dark text-weight-medium"/></default-field></field>
+                    <field name="paymentType"><header-field title="Payment Type"/>
+                        <default-field><label text="${paymentType}" type="span" style="zenith-badge nd ${payColor}"/></default-field></field>
+                    <field name="statusId"><header-field title="Status"/>
+                        <default-field><label text="${statusText}" type="span" style="zenith-badge nd ${statusColor}"/></default-field></field>
+                </form-list>
+            </container>
         </container>
-
-        <container style="row items-center justify-end q-mb-md q-gutter-sm">
-            <link url="goTerminal" text="Billing" icon="fa fa-calculator" btn-type="success" style="q-btn--dense"/>
-            <link url="goDailySummary" text="Daily Summary" icon="fa fa-calendar" btn-type="info" style="q-btn--dense"/>
-            <link url="goTransactions" text="Transactions" icon="fa fa-list" btn-type="primary" style="q-btn--dense"/>
-            <link url="goPriceOverrides" text="Price Overrides" icon="fa fa-exchange" btn-type="danger" style="q-btn--dense"/>
-            <link url="goDashboard" text="Dashboard" icon="fa fa-dashboard" style="q-btn--dense"/>
-        </container>
-
-        <container-row>
-            <row-col lg="4" md="4" sm="4">
-                <container style="zenith-card bg-white shadow-2 q-pa-md q-mb-md text-center">
-                    <label text="Total Sales" style="text-grey-7 text-caption"/>
-                    <label text="${zinr.inr(ec.l10n.format(reportTotalSales, '#,##0.00'))}" type="h5" style="text-weight-bold text-positive q-my-xs"/>
-                </container>
-            </row-col>
-            <row-col lg="4" md="4" sm="4">
-                <container style="zenith-card bg-white shadow-2 q-pa-md q-mb-md text-center">
-                    <label text="Bills" style="text-grey-7 text-caption"/>
-                    <label text="${reportTotalBills}" type="h5" style="text-weight-bold text-primary q-my-xs"/>
-                </container>
-            </row-col>
-            <row-col lg="4" md="4" sm="4">
-                <container style="zenith-card bg-white shadow-2 q-pa-md q-mb-md text-center">
-                    <label text="Total Discount" style="text-grey-7 text-caption"/>
-                    <label text="${zinr.inr(ec.l10n.format(reportTotalDiscount, '#,##0.00'))}" type="h5" style="text-weight-bold text-orange-7 q-my-xs"/>
-                </container>
-            </row-col>
-        </container-row>
-
-        <form-list name="BillWiseList" list="billList" list-entry="bill" skip-form="true"
-                   show-csv-button="true" show-xlsx-button="true">
-            <field name="transactionNumber"><default-field title="Bill No">
-                <link url="viewTransaction" text="${bill.transactionNumber}" parameter-map="[transactionId:bill.transactionId]"
-                      link-type="anchor"/>
-            </default-field></field>
-            <field name="entryDate"><default-field title="Date">
-                <display format="dd-MM-yyyy HH:mm"/>
-            </default-field></field>
-            <field name="terminalName"><default-field title="Terminal">
-                <display/>
-            </default-field></field>
-            <field name="customerName"><default-field title="Customer">
-                <display default-text="-"/>
-            </default-field></field>
-            <field name="subtotal"><default-field title="Subtotal">
-                <display format="#,##0.00"/>
-            </default-field></field>
-            <field name="discountTotal"><default-field title="Discount">
-                <display format="#,##0.00"/>
-            </default-field></field>
-            <field name="totalTaxAmount"><default-field title="Tax">
-                <display format="#,##0.00"/>
-            </default-field></field>
-            <field name="payableAmount"><default-field title="Net Amount">
-                <display format="#,##0.00"/>
-            </default-field></field>
-            <field name="statusId"><default-field title="Status">
-                <display-entity entity-name="moqui.basic.StatusItem"/>
-            </default-field></field>
-        </form-list>
     </widgets>
 </screen>
