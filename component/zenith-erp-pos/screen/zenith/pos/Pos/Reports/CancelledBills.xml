@@ -4,89 +4,145 @@
         default-menu-title="Cancelled Bills" default-menu-index="4">
 
     <transition name="viewTransaction"><default-response url="../../EditTransaction"/></transition>
-    <transition name="goTransactions"><default-response url="../../PosTransactions"/></transition>
-    <transition name="goDailySummary"><default-response url="../../DailySummary"/></transition>
-    <transition name="goDashboard"><default-response url="../../Dashboard"/></transition>
-    <transition name="goTerminal"><default-response url="../../Terminal"/></transition>
+
+    <transition name="exportCsv" read-only="true">
+        <actions>
+            <script><![CDATA[
+                import org.moqui.context.ExecutionContext
+                ExecutionContext ec = context.ec
+                def fromD = (fromDate ?: ec.l10n.format(ec.user.nowTimestamp, 'yyyy-MM-dd'))
+                def thruD = (thruDate ?: fromD)
+                def ds = java.sql.Timestamp.valueOf(fromD + ' 00:00:00')
+                def de = java.sql.Timestamp.valueOf(thruD + ' 23:59:59')
+                def _org = ec.user.getPreference("ACTIVE_ORGANIZATION")
+                def ef = ec.entity.find("zenith.erp.pos.PosTransactionView").condition("statusId","PtVoided")
+                    .condition("entryDate","greater-equals",ds).condition("entryDate","less-equals",de).orderBy("-entryDate")
+                if (_org) ef.condition("organizationPartyId", _org)
+                def rows = ef.list()
+                def stx = (searchText ?: '').trim().toLowerCase()
+                if (stx) rows = rows.findAll { ((it.transactionNumber ?: '').toLowerCase().contains(stx)) }
+                def esc = { v -> if (v == null) return ""; String s = v.toString().trim(); (s.contains(",")||s.contains("\"")||s.contains("\n")) ? "\"" + s.replace("\"","\"\"") + "\"" : s }
+                def num = { v -> String.format("%.2f", (v ?: 0.0) as double) }
+                def dt = { v -> v == null ? "" : ec.l10n.format(v, 'dd-MM-yyyy HH:mm') }
+                StringBuilder csv = new StringBuilder()
+                csv.append("ZetaERP - Cancelled Bills Report\n")
+                csv.append("Period: ${fromD} to ${thruD}  |  Generated: ${ec.l10n.format(ec.user.nowTimestamp, 'dd MMM yyyy HH:mm')}\n\n")
+                csv.append("Bill No,Date,Terminal,Subtotal,Discount,Amount\n")
+                rows.each { r ->
+                    csv.append("${esc(r.transactionNumber ?: r.transactionId)},${dt(r.entryDate)},${esc(r.terminalName)},${num(r.subtotal)},${num(r.discountTotal)},${num(r.payableAmount)}\n")
+                }
+                ec.web.sendTextResponse(csv.toString(), "text/csv", "Cancelled_Bills_${ec.l10n.format(ec.user.nowTimestamp, 'yyyyMMdd_HHmm')}.csv")
+            ]]></script>
+        </actions>
+        <default-response type="none"/>
+    </transition>
+
+    <transition name="downloadPdf" read-only="true">
+        <default-response url="${ec.web.getWebappRootUrl(false, null) + '/fop/apps/zenith/pos/Reports/CancelledBillsPdf?fromDate=' + (fromDate ?: '') + '&amp;thruDate=' + (thruDate ?: '') + '&amp;searchText=' + java.net.URLEncoder.encode(searchText ?: '', 'UTF-8')}" url-type="plain"/>
+    </transition>
 
     <actions>
         <set field="fromDate" from="fromDate ?: ec.l10n.format(ec.user.nowTimestamp, 'yyyy-MM-dd')"/>
         <set field="thruDate" from="thruDate ?: fromDate"/>
+        <set field="searchText" from="searchText ?: ''"/>
         <set field="dayStart" from="java.sql.Timestamp.valueOf(fromDate + ' 00:00:00')"/>
         <set field="dayEnd" from="java.sql.Timestamp.valueOf(thruDate + ' 23:59:59')"/>
+        <set field="searchLike" from="searchText ? ('%' + searchText + '%') : null"/>
+        <script>context.zinr = com.zenith.Fmt.INSTANCE</script>
 
         <entity-find entity-name="zenith.erp.pos.PosTransactionView" list="cancelledList">
             <econdition field-name="statusId" value="PtVoided"/>
             <econdition field-name="entryDate" operator="greater-equals" from="dayStart"/>
             <econdition field-name="entryDate" operator="less-equals" from="dayEnd"/>
+            <econdition field-name="transactionNumber" operator="like" from="searchLike" ignore-if-empty="true"/>
             <order-by field-name="-entryDate"/>
-            <!-- ZE-SALES-014 f/u: org-isolate CSV/XLSX export (standalone render bypasses the MANTLE_ACTIVE_ORG authz filter) -->
+            <!-- ZE-SALES-014 f/u: org-isolate CSV/PDF export (standalone render bypasses the MANTLE_ACTIVE_ORG authz filter) -->
             <econdition field-name="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
         </entity-find>
 
         <script><![CDATA[
+            def zinr = context.zinr
             cancelledTotal = cancelledList.sum { (it.payableAmount ?: 0) as BigDecimal } ?: BigDecimal.ZERO
             cancelledCount = cancelledList.size()
+            cancelledTotalStr = '₹ ' + zinr.inr(ec.l10n.format(cancelledTotal, '#,##0.00'))
         ]]></script>
     </actions>
 
     <widgets>
-        <container style="row items-center justify-end q-px-md q-pt-md q-gutter-sm">
-            <link url="goTerminal" text="Billing" icon="fa fa-calculator" btn-type="success" style="q-btn--dense"/>
-            <link url="goTransactions" text="Transactions" icon="fa fa-list" btn-type="primary" style="q-btn--dense"/>
-            <link url="goDailySummary" text="Daily Summary" icon="fa fa-calendar" btn-type="info" style="q-btn--dense"/>
-            <link url="goDashboard" text="Dashboard" icon="fa fa-dashboard" style="q-btn--dense"/>
-        </container>
-        <container style="q-mb-md">
-            <form-single name="CancelFilter" transition=".">
-                <field name="fromDate"><default-field title="From">
-                    <date-time type="date" default-value="${fromDate}"/>
-                </default-field></field>
-                <field name="thruDate"><default-field title="To">
-                    <date-time type="date" default-value="${thruDate}"/>
-                </default-field></field>
-                <field name="searchBtn"><default-field title="">
-                    <submit text="Search" icon="fa fa-search"/>
-                </default-field></field>
-            </form-single>
-        </container>
-
-        <container-row>
-            <row-col lg="6" md="6" sm="6">
-                <container style="zenith-card bg-white shadow-2 q-pa-md q-mb-md text-center">
-                    <label text="Cancelled Bills" style="text-grey-7 text-caption"/>
-                    <label text="${cancelledCount}" type="h5" style="text-weight-bold text-negative q-my-xs"/>
+        <container style="q-pa-md">
+            <!-- Filter bar -->
+            <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md q-mb-md">
+                <form-single name="CancelFilter" transition=".">
+                    <field name="searchText"><default-field title="Search">
+                        <text-line size="20" default-value="${searchText ?: ''}"/></default-field></field>
+                    <field name="fromDate"><default-field title="From">
+                        <date-time type="date" default-value="${fromDate}"/></default-field></field>
+                    <field name="thruDate"><default-field title="To">
+                        <date-time type="date" default-value="${thruDate}"/></default-field></field>
+                    <field name="submitButton"><default-field title="">
+                        <submit text="Search" icon="fa fa-search"/></default-field></field>
+                    <field name="filterBtn"><default-field title="">
+                        <submit text="Filter" icon="fa fa-filter"/></default-field></field>
+                    <field-layout>
+                        <field-row>
+                            <field-ref name="searchText"/><field-ref name="fromDate"/><field-ref name="thruDate"/>
+                            <field-ref name="submitButton"/><field-ref name="filterBtn"/>
+                        </field-row>
+                    </field-layout>
+                </form-single>
+                <container style="z-btnrow q-mt-sm">
+                    <link url="exportCsv" text="CSV" icon="download" link-type="anchor" style="z-obtn"/>
+                    <link url="downloadPdf" text="PDF" icon="picture_as_pdf" link-type="anchor" style="z-obtn"/>
                 </container>
-            </row-col>
-            <row-col lg="6" md="6" sm="6">
-                <container style="zenith-card bg-white shadow-2 q-pa-md q-mb-md text-center">
-                    <label text="Cancelled Amount" style="text-grey-7 text-caption"/>
-                    <label text="${zinr.inr(ec.l10n.format(cancelledTotal, '#,##0.00'))}" type="h5" style="text-weight-bold text-negative q-my-xs"/>
-                </container>
-            </row-col>
-        </container-row>
+            </container>
 
-        <form-list name="CancelledList" list="cancelledList" list-entry="bill" skip-form="true"
-                   show-csv-button="true" show-xlsx-button="true">
-            <field name="transactionNumber"><default-field title="Bill No">
-                <link url="viewTransaction" text="${bill.transactionNumber}" parameter-map="[transactionId:bill.transactionId]"
-                      link-type="anchor"/>
-            </default-field></field>
-            <field name="entryDate"><default-field title="Date">
-                <display format="dd-MM-yyyy HH:mm"/>
-            </default-field></field>
-            <field name="terminalName"><default-field title="Terminal">
-                <display/>
-            </default-field></field>
-            <field name="subtotal"><default-field title="Subtotal">
-                <display format="#,##0.00"/>
-            </default-field></field>
-            <field name="discountTotal"><default-field title="Discount">
-                <display format="#,##0.00"/>
-            </default-field></field>
-            <field name="payableAmount"><default-field title="Amount">
-                <display format="#,##0.00"/>
-            </default-field></field>
-        </form-list>
+            <!-- 2 RED KPI stat cards (cancelled) -->
+            <container style="z-statrow">
+                <container style="z-statcell z-statcard-red q-pa-md">
+                    <container style="z-statinner">
+                        <container style="z-icobadge lg red"><label text="receipt_long" type="span" style="material-icons"/></container>
+                        <container style="z-statmeta">
+                            <label text="Cancelled Bills" type="span" style="z-statlabel"/>
+                            <label text="${cancelledCount}" type="span" style="z-statnum z-txt-red"/>
+                            <label text="Voided transactions" type="span" style="z-statdesc"/>
+                        </container>
+                    </container>
+                </container>
+                <container style="z-statcell z-statcard-red q-pa-md">
+                    <container style="z-statinner">
+                        <container style="z-icobadge lg red"><label text="currency_rupee" type="span" style="material-icons"/></container>
+                        <container style="z-statmeta">
+                            <label text="Cancelled Amount" type="span" style="z-statlabel"/>
+                            <label text="${cancelledTotalStr}" type="span" style="z-statnum z-txt-red"/>
+                            <label text="Value not collected" type="span" style="z-statdesc"/>
+                        </container>
+                    </container>
+                </container>
+            </container>
+
+            <!-- Cancelled bills table -->
+            <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md">
+                <form-list name="CancelledList" list="cancelledList" list-entry="bill" skip-form="true">
+                    <row-actions>
+                        <set field="billNo" from="bill.transactionNumber ?: bill.transactionId"/>
+                    </row-actions>
+                    <field name="transactionNumber"><header-field title="Bill No"/>
+                        <default-field>
+                            <link url="viewTransaction" text="${billNo}" parameter-map="[transactionId:bill.transactionId]"
+                                  link-type="anchor" style="z-redlink"/>
+                        </default-field></field>
+                    <field name="entryDate"><header-field title="Date"/>
+                        <default-field><display format="dd-MM-yyyy HH:mm"/></default-field></field>
+                    <field name="terminalName"><header-field title="Terminal"/>
+                        <default-field><label text="${bill.terminalName ?: '—'}" type="span" style="text-dark"/></default-field></field>
+                    <field name="subtotal"><header-field title="Subtotal"/>
+                        <default-field><display format="#,##0.00"/></default-field></field>
+                    <field name="discountTotal"><header-field title="Discount"/>
+                        <default-field><display format="#,##0.00"/></default-field></field>
+                    <field name="payableAmount"><header-field title="Amount"/>
+                        <default-field><display format="#,##0.00"/></default-field></field>
+                </form-list>
+            </container>
+        </container>
     </widgets>
 </screen>
