@@ -1,0 +1,139 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
+        default-menu-title="Wastage Summary PDF" default-menu-include="false"
+        render-mode="xsl-fo" standalone="true">
+
+    <parameter name="fromDate"/>
+    <parameter name="thruDate"/>
+
+    <actions>
+        <!-- standalone screens do NOT inherit ZenithApp's shared zinr regrouper — set it locally -->
+        <script>context.zinr = com.zenith.Fmt.INSTANCE</script>
+        <script><![CDATA[
+            def fromD = fromDate ?: ec.l10n.format(ec.user.nowTimestamp, 'yyyy-MM-dd')
+            def thruD = thruDate ?: fromD
+            periodStr = "${fromD} to ${thruD}"
+            generatedStr = ec.l10n.format(ec.user.nowTimestamp, 'dd MMM yyyy HH:mm')
+            def dStart = java.sql.Timestamp.valueOf(fromD + ' 00:00:00')
+            def dEnd = java.sql.Timestamp.valueOf(thruD + ' 23:59:59')
+
+            // ZE-INV-IV-035 pattern: this is a standalone (fop) path outside the authz filter — scope org explicitly
+            def _org = ec.user.getPreference("ACTIVE_ORGANIZATION")
+            def wf = ec.entity.find("zenith.erp.pos.PosStockWastage")
+                .condition("wastageDate", "greater-equals", dStart)
+                .condition("wastageDate", "less-equals", dEnd)
+            if (_org && _org != '_NA_') wf.condition("organizationPartyId", _org)
+            def wastages = wf.list()
+
+            def reasonMap = new LinkedHashMap(); def productMap = new LinkedHashMap()
+            wastages.each { w ->
+                def reason = w.wastageReason ?: 'Other'
+                if (!reasonMap[reason]) {
+                    def ev = ec.entity.find("moqui.basic.Enumeration").condition("enumId", reason).one()
+                    reasonMap[reason] = [name: ev?.description ?: reason, loss: 0.0G, qty: 0.0G, n: 0]
+                }
+                reasonMap[reason].loss += (w.totalLoss ?: 0) as BigDecimal
+                reasonMap[reason].qty += (w.quantity ?: 0) as BigDecimal
+                reasonMap[reason].n++
+                def pn = w.productName ?: w.productId ?: 'Unknown'
+                if (!productMap[pn]) productMap[pn] = [name: pn, loss: 0.0G, qty: 0.0G, n: 0]
+                productMap[pn].loss += (w.totalLoss ?: 0) as BigDecimal
+                productMap[pn].qty += (w.quantity ?: 0) as BigDecimal
+                productMap[pn].n++
+            }
+            def zinr = context.zinr
+            def fmtAmt = { v -> zinr.inr(ec.l10n.format((v ?: 0) as BigDecimal, '#,##0.00')) }
+            def fmtQty = { v -> zinr.inr(ec.l10n.format((v ?: 0) as BigDecimal, '#,##0')) }
+
+            reasons = reasonMap.values().sort { -(it.loss as BigDecimal) }.collect {
+                [name: it.name, nStr: it.n.toString(), qtyStr: fmtQty(it.qty), lossStr: fmtAmt(it.loss)] }
+            products = productMap.values().sort { -(it.loss as BigDecimal) }.collect {
+                [name: it.name, nStr: it.n.toString(), qtyStr: fmtQty(it.qty), lossStr: fmtAmt(it.loss)] }
+
+            def tLoss = reasonMap.values().sum { it.loss } ?: 0.0G
+            def tQty = reasonMap.values().sum { it.qty } ?: 0.0G
+            def tN = reasonMap.values().sum { it.n } ?: 0
+            totLossStr = fmtAmt(tLoss)
+            totLossCardStr = 'Rs. ' + fmtAmt(tLoss)
+            totQtyStr = fmtQty(tQty)
+            totNStr = tN.toString()
+        ]]></script>
+    </actions>
+
+    <widgets>
+        <render-mode><text type="xsl-fo" template="true" encode="false" no-boundary-comment="true"><![CDATA[
+<fo:root xmlns:fo="http://www.w3.org/1999/XSL/Format">
+    <fo:layout-master-set>
+        <fo:simple-page-master master-name="a4" page-width="210mm" page-height="297mm"
+                margin-top="15mm" margin-bottom="15mm" margin-left="15mm" margin-right="15mm">
+            <fo:region-body/>
+        </fo:simple-page-master>
+    </fo:layout-master-set>
+
+    <fo:page-sequence master-reference="a4">
+        <fo:flow flow-name="xsl-region-body">
+            <fo:block font-size="16pt" font-weight="bold" color="#111827">Wastage Summary</fo:block>
+            <fo:block font-size="9pt" color="#6B7280" space-before="1mm">Period: ${periodStr}</fo:block>
+            <fo:block font-size="8pt" color="#6B7280" space-after="5mm">Generated: ${generatedStr}</fo:block>
+
+            <#-- Summary numbers -->
+            <fo:table table-layout="fixed" width="100%" space-after="6mm">
+                <fo:table-column column-width="proportional-column-width(1)"/>
+                <fo:table-column column-width="proportional-column-width(1)"/>
+                <fo:table-body>
+                    <fo:table-row>
+                        <fo:table-cell border="0.5pt solid #E5E7EB" padding="4mm">
+                            <fo:block font-size="9pt" color="#6B7280">Total Loss Amount</fo:block>
+                            <fo:block font-size="18pt" font-weight="bold" color="#DC2626" space-before="1mm">${totLossCardStr}</fo:block>
+                        </fo:table-cell>
+                        <fo:table-cell border="0.5pt solid #E5E7EB" padding="4mm">
+                            <fo:block font-size="9pt" color="#6B7280">Total Quantity Wasted</fo:block>
+                            <fo:block font-size="18pt" font-weight="bold" color="#111827" space-before="1mm">${totQtyStr}</fo:block>
+                        </fo:table-cell>
+                    </fo:table-row>
+                </fo:table-body>
+            </fo:table>
+
+            <#macro sumtable title col1 rows>
+            <fo:block font-size="12pt" font-weight="bold" color="#111827" space-after="2mm">${title}</fo:block>
+            <fo:table table-layout="fixed" width="100%" space-after="6mm">
+                <fo:table-column column-width="proportional-column-width(3)"/>
+                <fo:table-column column-width="proportional-column-width(1)"/>
+                <fo:table-column column-width="proportional-column-width(1.4)"/>
+                <fo:table-column column-width="proportional-column-width(1.8)"/>
+                <fo:table-header>
+                    <fo:table-row background-color="#F8F9FC">
+                        <fo:table-cell padding="2mm" border-bottom="0.5pt solid #E5E7EB"><fo:block font-size="8pt" font-weight="bold" color="#6B7280">${col1}</fo:block></fo:table-cell>
+                        <fo:table-cell padding="2mm" border-bottom="0.5pt solid #E5E7EB"><fo:block font-size="8pt" font-weight="bold" color="#6B7280">Entries</fo:block></fo:table-cell>
+                        <fo:table-cell padding="2mm" border-bottom="0.5pt solid #E5E7EB"><fo:block font-size="8pt" font-weight="bold" color="#6B7280">Qty Wasted</fo:block></fo:table-cell>
+                        <fo:table-cell padding="2mm" border-bottom="0.5pt solid #E5E7EB"><fo:block font-size="8pt" font-weight="bold" color="#6B7280" text-align="right">Loss Amount</fo:block></fo:table-cell>
+                    </fo:table-row>
+                </fo:table-header>
+                <fo:table-body>
+                    <#list rows as r>
+                    <fo:table-row>
+                        <fo:table-cell padding="2mm" border-bottom="0.3pt solid #E5E7EB"><fo:block font-size="8pt" color="#111827">${r.name}</fo:block></fo:table-cell>
+                        <fo:table-cell padding="2mm" border-bottom="0.3pt solid #E5E7EB"><fo:block font-size="8pt" color="#111827">${r.nStr}</fo:block></fo:table-cell>
+                        <fo:table-cell padding="2mm" border-bottom="0.3pt solid #E5E7EB"><fo:block font-size="8pt" color="#111827">${r.qtyStr}</fo:block></fo:table-cell>
+                        <fo:table-cell padding="2mm" border-bottom="0.3pt solid #E5E7EB"><fo:block font-size="8pt" color="#111827" text-align="right">${r.lossStr}</fo:block></fo:table-cell>
+                    </fo:table-row>
+                    </#list>
+                    <fo:table-row background-color="#F8F9FC">
+                        <fo:table-cell padding="2mm" border-top="0.5pt solid #E5E7EB"><fo:block font-size="8pt" font-weight="bold">Total</fo:block></fo:table-cell>
+                        <fo:table-cell padding="2mm" border-top="0.5pt solid #E5E7EB"><fo:block font-size="8pt" font-weight="bold">${totNStr}</fo:block></fo:table-cell>
+                        <fo:table-cell padding="2mm" border-top="0.5pt solid #E5E7EB"><fo:block font-size="8pt" font-weight="bold">${totQtyStr}</fo:block></fo:table-cell>
+                        <fo:table-cell padding="2mm" border-top="0.5pt solid #E5E7EB"><fo:block font-size="8pt" font-weight="bold" text-align="right">${totLossStr}</fo:block></fo:table-cell>
+                    </fo:table-row>
+                </fo:table-body>
+            </fo:table>
+            </#macro>
+
+            <@sumtable title="By Reason" col1="Reason" rows=reasons![] />
+            <@sumtable title="By Product" col1="Product" rows=products![] />
+        </fo:flow>
+    </fo:page-sequence>
+</fo:root>
+        ]]></text></render-mode>
+    </widgets>
+</screen>

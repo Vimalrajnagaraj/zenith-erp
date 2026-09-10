@@ -3,9 +3,79 @@
         xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
         default-menu-title="Summary" default-menu-index="2">
 
-    <transition name="goStock"><default-response url="../../Stock"/></transition>
-    <transition name="goTerminal"><default-response url="../../Terminal"/></transition>
-    <transition name="goDashboard"><default-response url="../../Dashboard"/></transition>
+    <transition name="downloadPdf" read-only="true">
+        <default-response url="${ec.web.getWebappRootUrl(false, null)}/fop/apps/zenith/pos/Wastage/WastageSummaryPdf" url-type="plain">
+            <parameter name="fromDate"/>
+            <parameter name="thruDate"/>
+        </default-response>
+    </transition>
+
+    <transition name="exportCsv" read-only="true">
+        <actions>
+            <script><![CDATA[
+                import org.moqui.context.ExecutionContext
+                ExecutionContext ec = context.ec
+
+                def fromD = fromDate ?: ec.l10n.format(ec.user.nowTimestamp, 'yyyy-MM-dd')
+                def thruD = thruDate ?: fromD
+                def dStart = java.sql.Timestamp.valueOf(fromD + ' 00:00:00')
+                def dEnd = java.sql.Timestamp.valueOf(thruD + ' 23:59:59')
+
+                def _org = ec.user.getPreference("ACTIVE_ORGANIZATION")
+                def wf = ec.entity.find("zenith.erp.pos.PosStockWastage")
+                    .condition("wastageDate", "greater-equals", dStart)
+                    .condition("wastageDate", "less-equals", dEnd)
+                if (_org) wf.condition("organizationPartyId", _org)
+                def wastages = wf.list()
+
+                def reasonMap = new LinkedHashMap(); def productMap = new LinkedHashMap()
+                wastages.each { w ->
+                    def reason = w.wastageReason ?: 'Other'
+                    if (!reasonMap[reason]) {
+                        def ev = ec.entity.find("moqui.basic.Enumeration").condition("enumId", reason).one()
+                        reasonMap[reason] = [name: ev?.description ?: reason, loss: 0.0G, qty: 0.0G, n: 0]
+                    }
+                    reasonMap[reason].loss += (w.totalLoss ?: 0) as BigDecimal
+                    reasonMap[reason].qty += (w.quantity ?: 0) as BigDecimal
+                    reasonMap[reason].n++
+                    def pn = w.productName ?: w.productId ?: 'Unknown'
+                    if (!productMap[pn]) productMap[pn] = [name: pn, loss: 0.0G, qty: 0.0G, n: 0]
+                    productMap[pn].loss += (w.totalLoss ?: 0) as BigDecimal
+                    productMap[pn].qty += (w.quantity ?: 0) as BigDecimal
+                    productMap[pn].n++
+                }
+                def reasons = reasonMap.values().sort { -(it.loss as BigDecimal) }
+                def products = productMap.values().sort { -(it.loss as BigDecimal) }
+                def tLoss = reasons.sum { it.loss } ?: 0.0G
+                def tQty = reasons.sum { it.qty } ?: 0.0G
+                def tN = reasons.sum { it.n } ?: 0
+
+                def esc = { v -> if (v == null) return ""; String s = v.toString().trim(); (s.contains(",")||s.contains("\"")||s.contains("\n")) ? "\"" + s.replace("\"","\"\"") + "\"" : s }
+                def amt = { v -> String.format("%.2f", (v ?: 0.0) as double) }
+
+                StringBuilder csv = new StringBuilder()
+                csv.append("ZetaERP - Wastage Summary\n")
+                csv.append("Period: ${fromD} to ${thruD}\n")
+                csv.append("Generated on: ${ec.l10n.format(ec.user.nowTimestamp, 'dd MMM yyyy HH:mm')}\n\n")
+                csv.append("Total Loss Amount,${amt(tLoss)}\n")
+                csv.append("Total Quantity Wasted,${amt(tQty)}\n\n")
+
+                csv.append("By Reason\n")
+                csv.append("Reason,Entries,Qty Wasted,Loss Amount\n")
+                reasons.each { csv.append("${esc(it.name)},${it.n},${amt(it.qty)},${amt(it.loss)}\n") }
+                csv.append("Total,${tN},${amt(tQty)},${amt(tLoss)}\n\n")
+
+                csv.append("By Product\n")
+                csv.append("Product,Entries,Qty Wasted,Loss Amount\n")
+                products.each { csv.append("${esc(it.name)},${it.n},${amt(it.qty)},${amt(it.loss)}\n") }
+                csv.append("Total,${tN},${amt(tQty)},${amt(tLoss)}\n")
+
+                String fileName = "Wastage_Summary_${ec.l10n.format(ec.user.nowTimestamp, 'yyyyMMdd_HHmm')}.csv"
+                ec.web.sendTextResponse(csv.toString(), "text/csv", fileName)
+            ]]></script>
+        </actions>
+        <default-response type="none"/>
+    </transition>
 
     <actions>
         <set field="fromDate" from="fromDate ?: ec.l10n.format(ec.user.nowTimestamp, 'yyyy-MM-dd')"/>
@@ -14,7 +84,8 @@
         <set field="dayEnd" from="java.sql.Timestamp.valueOf(thruDate + ' 23:59:59')"/>
 
         <script><![CDATA[
-            // ZE-SALES-014 f/u: org-isolate the CSV/XLSX export (standalone render skips the authz filter)
+            def zinr = context.zinr ?: com.zenith.Fmt.INSTANCE
+            // ZE-SALES-014 f/u: org-isolate (standalone render skips the authz filter)
             def _org = ec.user.getPreference("ACTIVE_ORGANIZATION")
             def _wastageFind = ec.entity.find("zenith.erp.pos.PosStockWastage")
                 .condition("wastageDate", "greater-equals", dayStart)
@@ -24,14 +95,12 @@
 
             grandTotalLoss = BigDecimal.ZERO
             grandTotalQty = BigDecimal.ZERO
-
             reasonSummary = []
             productSummary = []
 
             if (wastages) {
                 def reasonMap = new LinkedHashMap()
                 def productMap = new LinkedHashMap()
-
                 wastages.each { w ->
                     def reason = w.wastageReason ?: 'Other'
                     if (!reasonMap[reason]) {
@@ -42,7 +111,6 @@
                     reasonMap[reason].totalLoss += (w.totalLoss ?: 0) as BigDecimal
                     reasonMap[reason].totalQty += (w.quantity ?: 0) as BigDecimal
                     reasonMap[reason].entryCount++
-
                     def pName = w.productName ?: w.productId ?: 'Unknown'
                     if (!productMap[pName]) {
                         productMap[pName] = [productName: pName,
@@ -52,84 +120,111 @@
                     productMap[pName].totalQty += (w.quantity ?: 0) as BigDecimal
                     productMap[pName].entryCount++
                 }
-
                 reasonSummary = reasonMap.values().sort { -(it.totalLoss as BigDecimal) }
                 productSummary = productMap.values().sort { -(it.totalLoss as BigDecimal) }
                 grandTotalLoss = reasonSummary.sum { it.totalLoss } ?: BigDecimal.ZERO
                 grandTotalQty = reasonSummary.sum { it.totalQty } ?: BigDecimal.ZERO
             }
+
+            // pre-format for the render-mode tables + cards (Indian grouping via zinr)
+            def fmtAmt = { v -> zinr.inr(ec.l10n.format((v ?: 0) as BigDecimal, '#,##0.00')) }
+            def fmtQty = { v -> zinr.inr(ec.l10n.format((v ?: 0) as BigDecimal, '#,##0')) }
+            reasonSummary.each { it.qtyStr = fmtQty(it.totalQty); it.lossStr = fmtAmt(it.totalLoss) }
+            productSummary.each { it.qtyStr = fmtQty(it.totalQty); it.lossStr = fmtAmt(it.totalLoss) }
+            reasonTotEntries = (reasonSummary.sum { it.entryCount } ?: 0) as int
+            productTotEntries = (productSummary.sum { it.entryCount } ?: 0) as int
+            grandLossCardStr = '₹ ' + fmtAmt(grandTotalLoss)
+            grandLossStr = fmtAmt(grandTotalLoss)
+            grandQtyStr = fmtQty(grandTotalQty)
+            reasonTotEntriesStr = fmtQty(reasonTotEntries)
+            productTotEntriesStr = fmtQty(productTotEntries)
         ]]></script>
     </actions>
 
     <widgets>
         <container style="q-pa-md">
-            <container style="row items-center justify-end q-mb-sm q-gutter-sm">
-                <link url="goTerminal" text="Billing" icon="fa fa-calculator" btn-type="success" style="q-btn--dense"/>
-                <link url="goStock" text="Stock" icon="fa fa-cubes" btn-type="primary" style="q-btn--dense"/>
-                <link url="goDashboard" text="Dashboard" icon="fa fa-dashboard" style="q-btn--dense"/>
-            </container>
-            <container style="q-mb-md">
+            <!-- Filter (left) + CSV/PDF export (right) -->
+            <container style="zsec-hdr row items-center justify-between q-mb-md">
                 <form-single name="SummaryFilter" transition=".">
-                    <field name="fromDate"><default-field title="From">
-                        <date-time type="date" default-value="${fromDate}"/>
-                    </default-field></field>
-                    <field name="thruDate"><default-field title="To">
-                        <date-time type="date" default-value="${thruDate}"/>
-                    </default-field></field>
-                    <field name="searchBtn"><default-field title="">
-                        <submit text="Search" icon="fa fa-search"/>
-                    </default-field></field>
+                    <field name="fromDate"><default-field title="From"><date-time type="date" default-value="${fromDate}"/></default-field></field>
+                    <field name="thruDate"><default-field title="To"><date-time type="date" default-value="${thruDate}"/></default-field></field>
+                    <field name="searchBtn"><default-field title=""><submit text="Search" icon="fa fa-search"/></default-field></field>
                 </form-single>
+                <container style="z-btnrow">
+                    <link url="exportCsv" text="CSV" icon="download" link-type="anchor" style="z-obtn"
+                          parameter-map="[fromDate:fromDate, thruDate:thruDate]"/>
+                    <link url="downloadPdf" text="PDF" icon="picture_as_pdf" link-type="anchor" style="z-obtn"
+                          parameter-map="[fromDate:fromDate, thruDate:thruDate]"/>
+                </container>
             </container>
 
-            <container-row>
-                <row-col lg="6" md="6" sm="6">
-                    <container style="zenith-card bg-white shadow-2 q-pa-md q-mb-md text-center border-radius-lg">
-                        <label text="Total Loss Amount" style="text-grey-7 text-caption"/>
-                        <label text="${zinr.inr(ec.l10n.format(grandTotalLoss, '#,##0.00'))}" type="h5" style="text-weight-bold text-negative q-my-xs"/>
-                    </container>
-                </row-col>
-                <row-col lg="6" md="6" sm="6">
-                    <container style="zenith-card bg-white shadow-2 q-pa-md q-mb-md text-center border-radius-lg">
-                        <label text="Total Qty Wasted" style="text-grey-7 text-caption"/>
-                        <label text="${zinr.inr(ec.l10n.format(grandTotalQty, '#,##0'))}" type="h5" style="text-weight-bold text-orange-7 q-my-xs"/>
-                    </container>
-                </row-col>
-            </container-row>
+            <!-- Summary stat cards: Total Loss Amount (red) + Total Quantity Wasted (dark) -->
+            <container style="z-statrow">
+                <container style="z-statcell zenith-card bg-white border-radius-lg q-pa-lg text-center">
+                    <label text="Total Loss Amount (₹)" type="div" style="text-grey-7"/>
+                    <label text="${grandLossCardStr}" type="div" style="z-waste-big z-txt-red"/>
+                </container>
+                <container style="z-statcell zenith-card bg-white border-radius-lg q-pa-lg text-center">
+                    <label text="Total Quantity Wasted" type="div" style="text-grey-7"/>
+                    <label text="${grandQtyStr}" type="div" style="z-waste-big text-dark"/>
+                </container>
+            </container>
 
-            <label text="By Reason" type="h6" style="text-weight-bold q-mb-sm"/>
-            <form-list name="ReasonSummaryList" list="reasonSummary" skip-form="true"
-                       show-csv-button="true" show-xlsx-button="true">
-                <field name="reasonName"><default-field title="Reason">
-                    <display/>
-                </default-field></field>
-                <field name="entryCount"><default-field title="Entries">
-                    <display/>
-                </default-field></field>
-                <field name="totalQty"><default-field title="Qty Wasted">
-                    <display format="#,##0"/>
-                </default-field></field>
-                <field name="totalLoss"><default-field title="Loss Amount">
-                    <display format="#,##0.00"/>
-                </default-field></field>
-            </form-list>
-
-            <label text="By Product" type="h6" style="text-weight-bold q-mt-lg q-mb-sm"/>
-            <form-list name="ProductSummaryList" list="productSummary" skip-form="true"
-                       show-csv-button="true" show-xlsx-button="true">
-                <field name="productName"><default-field title="Product">
-                    <display/>
-                </default-field></field>
-                <field name="entryCount"><default-field title="Entries">
-                    <display/>
-                </default-field></field>
-                <field name="totalQty"><default-field title="Qty Wasted">
-                    <display format="#,##0"/>
-                </default-field></field>
-                <field name="totalLoss"><default-field title="Loss Amount">
-                    <display format="#,##0.00"/>
-                </default-field></field>
-            </form-list>
+            <!-- By Reason / By Product side-by-side panels, each a table with a Total row -->
+            <container style="z-statrow">
+                <container style="z-statcell zenith-card bg-white border-radius-lg q-pa-md">
+                    <label text="By Reason" type="h6" style="text-weight-bold q-mt-none q-mb-md"/>
+                    <render-mode><text type="html,qvt" template="true"><![CDATA[
+                        <table class="z-sumtable">
+                            <thead><tr>
+                                <th>Reason</th><th>Entries</th><th>Qty Wasted</th><th class="z-num">Loss Amount (₹)</th>
+                            </tr></thead>
+                            <tbody>
+                                <#list (reasonSummary![]) as r>
+                                <tr>
+                                    <td>${r.reasonName!''}</td>
+                                    <td>${r.entryCount!0}</td>
+                                    <td>${r.qtyStr!'0'}</td>
+                                    <td class="z-num">${r.lossStr!'0.00'}</td>
+                                </tr>
+                                </#list>
+                                <tr class="z-sumtotal">
+                                    <td>Total</td>
+                                    <td>${reasonTotEntriesStr!'0'}</td>
+                                    <td>${grandQtyStr!'0'}</td>
+                                    <td class="z-num">${grandLossStr!'0.00'}</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    ]]></text></render-mode>
+                </container>
+                <container style="z-statcell zenith-card bg-white border-radius-lg q-pa-md">
+                    <label text="By Product" type="h6" style="text-weight-bold q-mt-none q-mb-md"/>
+                    <render-mode><text type="html,qvt" template="true"><![CDATA[
+                        <table class="z-sumtable">
+                            <thead><tr>
+                                <th>Product</th><th>Entries</th><th>Qty Wasted</th><th class="z-num">Loss Amount (₹)</th>
+                            </tr></thead>
+                            <tbody>
+                                <#list (productSummary![]) as p>
+                                <tr>
+                                    <td>${p.productName!''}</td>
+                                    <td>${p.entryCount!0}</td>
+                                    <td>${p.qtyStr!'0'}</td>
+                                    <td class="z-num">${p.lossStr!'0.00'}</td>
+                                </tr>
+                                </#list>
+                                <tr class="z-sumtotal">
+                                    <td>Total</td>
+                                    <td>${productTotEntriesStr!'0'}</td>
+                                    <td>${grandQtyStr!'0'}</td>
+                                    <td class="z-num">${grandLossStr!'0.00'}</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    ]]></text></render-mode>
+                </container>
+            </container>
         </container>
     </widgets>
 </screen>
