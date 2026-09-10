@@ -7,7 +7,7 @@
         <service-call name="zenith.india.Gstr2Services.importAndReconcile#Gstr2b"/>
         <default-response url="."/>
     </transition>
-    
+
     <transition name="exportCsv" read-only="true">
         <actions>
             <script><![CDATA[
@@ -16,8 +16,11 @@
                 // Use searchFormInputs to apply the same filters the user applied on the UI
                 def ef = ec.entity.find("zenith.erp.india.Gstr2bReconView")
                 ef.searchFormInputs("", "-invoiceDate", false)
+                // ZE-SALES-014 f/u: org-isolate the CSV export (standalone render bypasses the MANTLE_ACTIVE_ORG authz filter)
+                def activeOrg = ec.user.getPreference('ACTIVE_ORGANIZATION')
+                if (activeOrg) ef.condition("organizationPartyId", activeOrg)
                 def reconList = ef.list()
-                
+
                 def escapeCsv = { val ->
                     if (val == null) return ""
                     String str = val.toString().trim()
@@ -26,31 +29,44 @@
                     }
                     return str
                 }
-                
+                def num = { v -> String.format("%.2f", (v ?: 0.0) as double) }
+
                 StringBuilder csv = new StringBuilder()
                 csv.append("ZetaERP - GSTR-2B Reconciliation Report\n")
                 csv.append("Generated on: ${ec.l10n.format(ec.user.nowTimestamp, 'dd MMM yyyy HH:mm')}\n\n")
-                
+
                 csv.append("Supplier GSTIN,Supplier,Portal Inv#,Portal Date,Portal Taxable,IGST,CGST,SGST,Book Inv#,Book Taxable,Status,ITC,Mismatch\n")
-                
+
+                def statusLabel = { s ->
+                    if (s == 'MissingInBooks') return 'Missing in Books'
+                    if (s == 'MissingInPortal') return 'Missing in Portal'
+                    return s ?: ''
+                }
+
                 for (def row in reconList) {
                     def dateStr = row.invoiceDate ? ec.l10n.format(row.invoiceDate, "dd/MM/yyyy") : ""
-                    
+                    def portalTax = (row.taxableAmount ?: 0.0) as BigDecimal
+                    def bookTax = (row.bookTaxableAmount ?: 0.0) as BigDecimal
+                    def mismatch = (portalTax - bookTax).abs()
+                    def itc = (row.itcAvailable == 'Y')
+                        ? (((row.cgstAmount ?: 0.0) as BigDecimal) + ((row.sgstAmount ?: 0.0) as BigDecimal) + ((row.igstAmount ?: 0.0) as BigDecimal))
+                        : (0.0 as BigDecimal)
+
                     csv.append(escapeCsv(row.supplierGstin)).append(",")
                     csv.append(escapeCsv(row.supplierName)).append(",")
                     csv.append(escapeCsv(row.invoiceNumber)).append(",")
                     csv.append(escapeCsv(dateStr)).append(",")
-                    csv.append(escapeCsv(String.format("%.2f", row.taxableAmount ?: 0.0))).append(",")
-                    csv.append(escapeCsv(String.format("%.2f", row.igstAmount ?: 0.0))).append(",")
-                    csv.append(escapeCsv(String.format("%.2f", row.cgstAmount ?: 0.0))).append(",")
-                    csv.append(escapeCsv(String.format("%.2f", row.sgstAmount ?: 0.0))).append(",")
+                    csv.append(escapeCsv(num(row.taxableAmount))).append(",")
+                    csv.append(escapeCsv(num(row.igstAmount))).append(",")
+                    csv.append(escapeCsv(num(row.cgstAmount))).append(",")
+                    csv.append(escapeCsv(num(row.sgstAmount))).append(",")
                     csv.append(escapeCsv(row.bookInvoiceNumber)).append(",")
-                    csv.append(escapeCsv(String.format("%.2f", row.bookTaxableAmount ?: 0.0))).append(",")
-                    csv.append(escapeCsv(row.matchStatus)).append(",")
-                    csv.append(escapeCsv(row.itcAvailable)).append(",")
-                    csv.append(escapeCsv(row.mismatchReasons)).append("\n")
+                    csv.append(escapeCsv(num(row.bookTaxableAmount))).append(",")
+                    csv.append(escapeCsv(statusLabel(row.matchStatus))).append(",")
+                    csv.append(escapeCsv(num(itc))).append(",")
+                    csv.append(escapeCsv(num(mismatch))).append("\n")
                 }
-                
+
                 String fileName = "GSTR2B_Recon_${ec.l10n.format(ec.user.nowTimestamp, 'yyyyMMdd_HHmm')}.csv"
                 ec.web.sendTextResponse(csv.toString(), "text/csv", fileName)
             ]]></script>
@@ -67,132 +83,256 @@
 
         <entity-find entity-name="zenith.erp.india.Gstr2bReconView" list="reconList">
             <search-form-inputs default-order-by="-invoiceDate"/>
+            <!-- ZE-SALES-014 f/u: org-isolate CSV/XLSX export (standalone render bypasses the MANTLE_ACTIVE_ORG authz filter) -->
+            <econdition field-name="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
         </entity-find>
         <entity-find entity-name="mantle.party.PartyDetailAndRole" list="orgList">
             <econdition field-name="roleTypeId" value="OrgInternal"/>
             <econdition field-name="disabled" value="N" or-null="true"/>
             <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
         </entity-find>
-        
+
         <entity-find-count entity-name="zenith.erp.india.Gstr2bReconView" count-field="matchedCount">
+            <econdition field-name="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
             <econdition field-name="matchStatus" value="Matched"/>
         </entity-find-count>
         <entity-find-count entity-name="zenith.erp.india.Gstr2bReconView" count-field="unmatchedCount">
+            <econdition field-name="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
             <econdition field-name="matchStatus" value="Unmatched"/>
         </entity-find-count>
         <entity-find-count entity-name="zenith.erp.india.Gstr2bReconView" count-field="missingInBooksCount">
+            <econdition field-name="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
             <econdition field-name="matchStatus" value="MissingInBooks"/>
         </entity-find-count>
         <entity-find-count entity-name="zenith.erp.india.Gstr2bReconView" count-field="missingInPortalCount">
+            <econdition field-name="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
             <econdition field-name="matchStatus" value="MissingInPortal"/>
         </entity-find-count>
     </actions>
 
     <widgets>
-        <label text="GSTR-2B Reconciliation" type="h4"/>
-        <label text="Financial Year: ${currentFy}" type="div" style="text-muted"/>
+        <!-- Page header: title + FY subtitle (left), solid Reconcile Now CTA (right) -->
+        <container style="zsec-hdr row items-center justify-between q-mb-lg">
+            <container style="column">
+                <label text="GSTR-2B Reconciliation" type="h3" style="text-primary text-weight-bold q-my-none"/>
+                <label text="Financial Year: ${currentFy}" type="p" style="text-grey-7 q-mt-sm q-mb-none"/>
+            </container>
+            <container style="z-newbtn-wrap">
+                <container-dialog id="ReconcileTopDialog" button-text="Reconcile Now" width="500"
+                    button-class="q-btn q-btn-item non-selectable no-outline q-btn--standard q-btn--rectangle bg-primary text-white q-btn--actionable q-focusable q-hoverable text-weight-bold q-px-md z-newbtn">
+                    <form-single name="ReconcileTopForm" transition="runReconciliation">
+                        <field name="organizationPartyId"><default-field title="Organization">
+                            <drop-down allow-empty="false">
+                                <list-options list="orgList" key="${partyId}" text="${organizationName}"/>
+                            </drop-down>
+                        </default-field></field>
+                        <field name="returnPeriod">
+                            <default-field title="Return Period (MMYYYY)" tooltip="Enter exactly 6 digits, e.g., 052026">
+                                <text-line size="6" maxlength="6" default-value="${(mn &lt; 10 ? '0' : '') + mn}${yr}"/>
+                            </default-field>
+                        </field>
+                        <field name="gstr2bJsonFile"><default-field title="GSTR-2B JSON File"><file/></default-field></field>
+                        <field name="submitButton"><default-field title=""><submit text="Start Reconciliation" icon="fa fa-play" type="success"/></default-field></field>
+                    </form-single>
+                </container-dialog>
+            </container>
+        </container>
 
-        <!-- Reconciliation Summary Cards -->
-        <container-row>
-            <row-col lg="3">
-                <container-box><box-header title="Matched"/><box-body>
-                    <label text="${matchedCount ?: 0}" type="h2" style="text-success mb-2"/>
-                    <label text="Invoices where portal data matches your books within ₹1 tolerance." type="p" style="text-muted"/>
-                </box-body></container-box>
-            </row-col>
-            <row-col lg="3">
-                <container-box><box-header title="Unmatched"/><box-body>
-                    <label text="${unmatchedCount ?: 0}" type="h2" style="text-warning mb-2"/>
-                    <label text="Found in both portal and books but amounts differ." type="p" style="text-muted"/>
-                </box-body></container-box>
-            </row-col>
-            <row-col lg="3">
-                <container-box><box-header title="Missing in Books"/><box-body>
-                    <label text="${missingInBooksCount ?: 0}" type="h2" style="text-danger mb-2"/>
-                    <label text="Present in GSTR-2B but no matching invoice in your books." type="p" style="text-muted"/>
-                </box-body></container-box>
-            </row-col>
-            <row-col lg="3">
-                <container-box><box-header title="Missing in Portal"/><box-body>
-                    <label text="${missingInPortalCount ?: 0}" type="h2" style="text-info mb-2"/>
-                    <label text="In your books but supplier hasn't filed in GSTR-1." type="p" style="text-muted"/>
-                </box-body></container-box>
-            </row-col>
-        </container-row>
+        <!-- KPI stat cards (mockup §3): Matched(green)/Unmatched(orange)/Missing in Books(red)/Missing in Portal(blue) -->
+        <container style="z-statrow">
+            <container style="z-statcell zenith-card bg-white border-radius-lg q-pa-md">
+                <container style="z-statinner">
+                    <container style="z-icobadge lg green"><label text="verified" type="span" style="material-icons"/></container>
+                    <container style="z-statmeta">
+                        <label text="Matched" type="span" style="z-statlabel"/>
+                        <label text="${matchedCount ?: 0}" type="span" style="z-statnum z-amt-green"/>
+                        <label text="Invoices where portal data matches your books within ₹1 tolerance." type="span" style="z-statdesc"/>
+                    </container>
+                </container>
+            </container>
+            <container style="z-statcell zenith-card bg-white border-radius-lg q-pa-md">
+                <container style="z-statinner">
+                    <container style="z-icobadge lg orange"><label text="error" type="span" style="material-icons"/></container>
+                    <container style="z-statmeta">
+                        <label text="Unmatched" type="span" style="z-statlabel"/>
+                        <label text="${unmatchedCount ?: 0}" type="span" style="z-statnum z-txt-orange"/>
+                        <label text="Found in both portal and books but amounts differ." type="span" style="z-statdesc"/>
+                    </container>
+                </container>
+            </container>
+            <container style="z-statcell zenith-card bg-white border-radius-lg q-pa-md">
+                <container style="z-statinner">
+                    <container style="z-icobadge lg red"><label text="description" type="span" style="material-icons"/></container>
+                    <container style="z-statmeta">
+                        <label text="Missing in Books" type="span" style="z-statlabel"/>
+                        <label text="${missingInBooksCount ?: 0}" type="span" style="z-statnum z-txt-red"/>
+                        <label text="Present in GSTR-2B but no matching invoice in your books." type="span" style="z-statdesc"/>
+                    </container>
+                </container>
+            </container>
+            <container style="z-statcell zenith-card bg-white border-radius-lg q-pa-md">
+                <container style="z-statinner">
+                    <container style="z-icobadge lg blue"><label text="cloud_upload" type="span" style="material-icons"/></container>
+                    <container style="z-statmeta">
+                        <label text="Missing in Portal" type="span" style="z-statlabel"/>
+                        <label text="${missingInPortalCount ?: 0}" type="span" style="z-statnum z-amt-blue"/>
+                        <label text="In your books but supplier hasn't filed in GSTR-1." type="span" style="z-statdesc"/>
+                    </container>
+                </container>
+            </container>
+        </container>
 
-        <!-- Run Reconciliation -->
-        <container-box><box-header title="Run Reconciliation"/><box-toolbar>
-            <container-dialog id="RunReconDialog" button-text="Reconcile Now" button-class="btn btn-primary" width="500">
-                <form-single name="RunReconForm" transition="runReconciliation">
-                    <field name="organizationPartyId"><default-field title="Organization">
-                        <drop-down allow-empty="false">
-                            <list-options list="orgList" key="${partyId}" text="${organizationName}"/>
-                        </drop-down>
-                    </default-field></field>
-                    <field name="returnPeriod">
-                        <default-field title="Return Period (MMYYYY)" tooltip="Enter exactly 6 digits, e.g., 052026">
-                            <text-line size="6" maxlength="6" default-value="${(mn &lt; 10 ? '0' : '') + mn}${yr}"/>
-                        </default-field>
-                    </field>
-                    <field name="gstr2bJsonFile"><default-field title="GSTR-2B JSON File"><file/></default-field></field>
-                    <field name="submitButton"><default-field title=""><submit text="Start Reconciliation" icon="fa fa-play" type="success"/></default-field></field>
-                </form-single>
-            </container-dialog>
-        </box-toolbar><box-body>
-            <label text="Upload GSTR-2B JSON from the GST portal, then run reconciliation to match against purchase invoices." type="p"/>
-        </box-body></container-box>
+        <!-- Run Reconciliation card: icon + text (left), outline Reconcile Now (right) -->
+        <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md q-mb-lg">
+            <container style="zsec-hdr row items-center justify-between">
+                <container style="z-statinner">
+                    <container style="z-icobadge lg primary"><label text="fact_check" type="span" style="material-icons"/></container>
+                    <container style="column">
+                        <label text="Run Reconciliation" type="h6" style="text-weight-bold q-my-none"/>
+                        <label text="Upload GSTR-2B JSON from the GST portal, then run reconciliation to match against purchase invoices." type="p" style="text-grey-7 q-mb-none q-mt-none"/>
+                    </container>
+                </container>
+                <container-dialog id="RunReconDialog" button-text="Reconcile Now" button-class="btn btn-default" width="500">
+                    <form-single name="RunReconForm" transition="runReconciliation">
+                        <field name="organizationPartyId"><default-field title="Organization">
+                            <drop-down allow-empty="false">
+                                <list-options list="orgList" key="${partyId}" text="${organizationName}"/>
+                            </drop-down>
+                        </default-field></field>
+                        <field name="returnPeriod">
+                            <default-field title="Return Period (MMYYYY)" tooltip="Enter exactly 6 digits, e.g., 052026">
+                                <text-line size="6" maxlength="6" default-value="${(mn &lt; 10 ? '0' : '') + mn}${yr}"/>
+                            </default-field>
+                        </field>
+                        <field name="gstr2bJsonFile"><default-field title="GSTR-2B JSON File"><file/></default-field></field>
+                        <field name="submitButton"><default-field title=""><submit text="Start Reconciliation" icon="fa fa-play" type="success"/></default-field></field>
+                    </form-single>
+                </container-dialog>
+            </container>
+        </container>
 
-        <!-- Reconciliation Results -->
-        <container-box><box-header title="Reconciliation Records"/><box-toolbar>
-            <link url="exportCsv" text="Export CSV" icon="fa fa-download" class="btn btn-success"/>
-        </box-toolbar><box-body>
-            <form-list name="ReconListForm" list="reconList" skip-form="true" header-dialog="true"
-                       show-csv-button="false" show-xlsx-button="false" show-page-size="true">
+        <!-- Reconciliation Records -->
+        <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md">
+            <container style="zsec-hdr row items-center justify-between q-mb-md">
+                <label text="Reconciliation Records" type="h6" style="text-weight-bold q-my-none"/>
+                <container style="z-btnrow">
+                    <container-dialog id="FindOptionsDialog" button-text="Find Options" button-class="btn btn-default">
+                        <form-single name="FindOptionsForm" transition="." type="find">
+                            <field name="supplierGstin"><default-field title="Supplier GSTIN"><text-find hide-options="true"/></default-field></field>
+                            <field name="invoiceNumber"><default-field title="Portal Inv#"><text-find hide-options="true"/></default-field></field>
+                            <field name="invoiceDate"><default-field title="Portal Date"><date-find/></default-field></field>
+                            <field name="matchStatus">
+                                <default-field title="Status">
+                                    <drop-down allow-empty="true">
+                                        <option key="Matched"/><option key="Unmatched"/>
+                                        <option key="MissingInBooks" text="Missing in Books"/>
+                                        <option key="MissingInPortal" text="Missing in Portal"/>
+                                    </drop-down>
+                                </default-field>
+                            </field>
+                            <field name="searchButton"><default-field title=""><submit text="Search" icon="fa fa-search"/></default-field></field>
+                        </form-single>
+                    </container-dialog>
+                    <link url="exportCsv" text="CSV" icon="download" link-type="anchor" style="z-obtn"/>
+                </container>
+            </container>
+
+            <form-list name="ReconListForm" list="reconList" skip-form="true">
+                <row-actions>
+                    <script><![CDATA[
+                        def portalTax = (taxableAmount ?: 0.0) as BigDecimal
+                        def bookTax = (bookTaxableAmount ?: 0.0) as BigDecimal
+                        def mismatchAmt = (portalTax - bookTax).abs()
+                        def itcAmt = (itcAvailable == 'Y')
+                            ? (((cgstAmount ?: 0.0) as BigDecimal) + ((sgstAmount ?: 0.0) as BigDecimal) + ((igstAmount ?: 0.0) as BigDecimal))
+                            : (0.0 as BigDecimal)
+
+                        def scMap = [Matched:'success', Unmatched:'warning', MissingInBooks:'danger', MissingInPortal:'info']
+                        statusColor = scMap[matchStatus] ?: 'grey'
+                        def slMap = [Matched:'Matched', Unmatched:'Unmatched', MissingInBooks:'Missing in Books', MissingInPortal:'Missing in Portal']
+                        statusText = slMap[matchStatus] ?: (matchStatus ?: '—')
+
+                        def rupee = { v -> v != null ? ('₹' + ec.l10n.format(v, '#,##,##0.00')) : '—' }
+                        gstinDisp = supplierGstin ?: '—'
+                        supplierDisp = supplierName ?: '—'
+                        portalInvDisp = invoiceNumber ?: '—'
+                        portalDateDisp = invoiceDate ? ec.l10n.format(invoiceDate, 'dd MMM yyyy') : '—'
+                        portalTaxDisp = rupee(taxableAmount)
+                        igstDisp = rupee(igstAmount)
+                        cgstDisp = rupee(cgstAmount)
+                        sgstDisp = rupee(sgstAmount)
+                        bookInvDisp = bookInvoiceNumber ?: '—'
+                        bookTaxDisp = rupee(bookTaxableAmount)
+                        itcDisp = '₹' + ec.l10n.format(itcAmt, '#,##,##0.00')
+                        mismatchDisp = '₹' + ec.l10n.format(mismatchAmt, '#,##,##0.00')
+                        mismatchIsZero = (mismatchAmt.compareTo(0.0 as BigDecimal) == 0)
+
+                        // muted-dash flags (portal cols null on MissingInPortal rows; book cols null on MissingInBooks)
+                        portalInvMuted = (invoiceNumber == null)
+                        portalDateMuted = (invoiceDate == null)
+                        portalTaxMuted = (taxableAmount == null)
+                        igstMuted = (igstAmount == null)
+                        cgstMuted = (cgstAmount == null)
+                        sgstMuted = (sgstAmount == null)
+                        bookInvMuted = (bookInvoiceNumber == null)
+                        bookTaxMuted = (bookTaxableAmount == null)
+
+                        isCsv = ec.web?.parameters?.renderMode == 'csv' || ec.web?.parameters?.renderMode == 'xlsx'
+                    ]]></script>
+                </row-actions>
                 <field name="supplierGstin">
-                    <header-field title="Supplier GSTIN"><text-line/></header-field>
-                    <default-field><display/></default-field>
+                    <header-field title="Supplier GSTIN" show-order-by="true"/>
+                    <default-field><label text="${gstinDisp}" type="span" style="z-txt-primary text-weight-medium"/></default-field>
                 </field>
                 <field name="supplierName">
-                    <default-field title="Supplier"><display/></default-field>
+                    <header-field title="Supplier"/>
+                    <default-field><label text="${supplierDisp}" type="span" style="text-dark"/></default-field>
                 </field>
                 <field name="invoiceNumber">
-                    <header-field title="Portal Inv#"><text-line/></header-field>
-                    <default-field><display/></default-field>
+                    <header-field title="Portal Inv#"/>
+                    <default-field><label text="${portalInvDisp}" type="span" style="${portalInvMuted ? 'text-grey-6' : 'z-txt-primary text-weight-medium'}"/></default-field>
                 </field>
                 <field name="invoiceDate">
-                    <header-field title="Portal Date" show-order-by="true"><date-find/></header-field>
-                    <default-field><display format="dd/MM/yyyy"/></default-field>
+                    <header-field title="Portal Date" show-order-by="true"/>
+                    <default-field><label text="${portalDateDisp}" type="span" style="${portalDateMuted ? 'text-grey-6' : 'text-dark'}"/></default-field>
                 </field>
                 <field name="taxableAmount">
-                    <default-field title="Portal Taxable"><display format="#,##,##0.00"/></default-field>
+                    <header-field title="Portal Taxable"/>
+                    <default-field><label text="${portalTaxDisp}" type="span" style="${portalTaxMuted ? 'text-grey-6' : 'text-dark'}"/></default-field>
                 </field>
-                <field name="igstAmount"><default-field title="IGST"><display format="#,##,##0.00"/></default-field></field>
-                <field name="cgstAmount"><default-field title="CGST"><display format="#,##,##0.00"/></default-field></field>
-                <field name="sgstAmount"><default-field title="SGST"><display format="#,##,##0.00"/></default-field></field>
+                <field name="igstAmount">
+                    <header-field title="IGST"/>
+                    <default-field><label text="${igstDisp}" type="span" style="${igstMuted ? 'text-grey-6' : 'text-dark'}"/></default-field>
+                </field>
+                <field name="cgstAmount">
+                    <header-field title="CGST"/>
+                    <default-field><label text="${cgstDisp}" type="span" style="${cgstMuted ? 'text-grey-6' : 'text-dark'}"/></default-field>
+                </field>
+                <field name="sgstAmount">
+                    <header-field title="SGST"/>
+                    <default-field><label text="${sgstDisp}" type="span" style="${sgstMuted ? 'text-grey-6' : 'text-dark'}"/></default-field>
+                </field>
                 <field name="bookInvoiceNumber">
-                    <default-field title="Book Inv#"><display/></default-field>
+                    <header-field title="Book Inv#"/>
+                    <default-field><label text="${bookInvDisp}" type="span" style="${bookInvMuted ? 'text-grey-6' : 'z-txt-primary text-weight-medium'}"/></default-field>
                 </field>
                 <field name="bookTaxableAmount">
-                    <default-field title="Book Taxable"><display format="#,##,##0.00"/></default-field>
+                    <header-field title="Book Taxable"/>
+                    <default-field><label text="${bookTaxDisp}" type="span" style="${bookTaxMuted ? 'text-grey-6' : 'text-dark'}"/></default-field>
                 </field>
                 <field name="matchStatus">
-                    <header-field title="Status">
-                        <drop-down allow-empty="true">
-                            <option key="Matched"/><option key="Unmatched"/>
-                            <option key="MissingInBooks" text="Missing in Books"/>
-                            <option key="MissingInPortal" text="Missing in Portal"/>
-                        </drop-down>
-                    </header-field>
-                    <default-field><display/></default-field>
+                    <header-field title="Status"/>
+                    <default-field><label text="${statusText}" type="span" style="zenith-badge nd ${statusColor}"/></default-field>
                 </field>
                 <field name="itcAvailable">
-                    <default-field title="ITC"><display/></default-field>
+                    <header-field title="ITC"/>
+                    <default-field><label text="${itcDisp}" type="span" style="text-dark"/></default-field>
                 </field>
                 <field name="mismatchReasons">
-                    <default-field title="Mismatch"><display/></default-field>
+                    <header-field title="Mismatch"/>
+                    <default-field><label text="${mismatchDisp}" type="span" style="${mismatchIsZero ? 'text-grey-6' : 'z-txt-red text-weight-medium'}"/></default-field>
                 </field>
-                <field name="submitButton"><header-field title="Find"><submit/></header-field></field>
             </form-list>
-        </box-body></container-box>
+        </container>
     </widgets>
 </screen>
