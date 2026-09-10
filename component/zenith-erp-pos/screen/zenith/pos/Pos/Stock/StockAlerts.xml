@@ -3,50 +3,65 @@
         xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
         default-menu-title="Alerts" default-menu-index="1">
 
-    <transition name="goImport"><default-response url="../../ProductImport"/></transition>
-    <transition name="goWastage"><default-response url="../../Wastage"/></transition>
-    <transition name="goDashboard"><default-response url="../../Dashboard"/></transition>
-    <transition name="goTerminal"><default-response url="../../Terminal"/></transition>
+    <transition name="goTakeAction"><default-response url="../StockList"/></transition>
+
+    <transition name="exportCsv" read-only="true">
+        <actions>
+            <script><![CDATA[
+                import org.moqui.context.ExecutionContext
+                ExecutionContext ec = context.ec
+                def ef = ec.entity.find("zenith.erp.inventory.ProductStockView").condition("productTypeEnumId","PtAsset").orderBy("productName")
+                def _org = ec.user.getPreference('ACTIVE_ORGANIZATION')
+                if (_org) ef.condition("ownerPartyId", _org)
+                def esc = { v -> if (v == null) return ""; String s = v.toString().trim(); (s.contains(",")||s.contains("\"")||s.contains("\n")) ? "\"" + s.replace("\"","\"\"") + "\"" : s }
+                def num = { v -> String.format("%.2f", (v ?: 0.0) as double) }
+                def intn = { v -> String.format("%d", (long)((v ?: 0) as double)) }
+                StringBuilder csv = new StringBuilder()
+                csv.append("ZetaERP - Zero Stock Products\n")
+                csv.append("Generated on: ${ec.l10n.format(ec.user.nowTimestamp, 'dd MMM yyyy HH:mm')}\n\n")
+                csv.append("SKU,Product,MRP,Reorder Pt,Stock\n")
+                ef.list().each { r ->
+                    if (((r.totalQoh ?: 0) as BigDecimal) <= 0)
+                        csv.append("${esc(r.pseudoId)},${esc(r.productName)},${num(r.mrpAmount)},${intn(r.reorderPoint)},${intn(r.totalQoh)}\n")
+                }
+                ec.web.sendTextResponse(csv.toString(), "text/csv", "Zero_Stock_${ec.l10n.format(ec.user.nowTimestamp, 'yyyyMMdd_HHmm')}.csv")
+            ]]></script>
+        </actions>
+        <default-response type="none"/>
+    </transition>
+
+    <transition name="downloadPdf" read-only="true">
+        <default-response url="${ec.web.getWebappRootUrl(false, null)}/fop/apps/zenith/pos/Stock/StockAlertsPdf" url-type="plain"/>
+    </transition>
 
     <actions>
         <script><![CDATA[
-            // ZE-SALES-014 f/u: org-isolate the CSV/XLSX export (standalone render skips the authz filter)
             def _org = ec.user.getPreference("ACTIVE_ORGANIZATION")
-            def _prodFind = ec.entity.find("zenith.erp.inventory.ProductStockView")
-                .condition("productTypeEnumId", "PtAsset")
+            def _prodFind = ec.entity.find("zenith.erp.inventory.ProductStockView").condition("productTypeEnumId", "PtAsset")
             if (_org) _prodFind.condition("ownerPartyId", _org)
             def allProducts = _prodFind.list()
 
             totalProducts = allProducts.size()
-            totalStockValue = BigDecimal.ZERO
-
             zeroStockList = []
             lowStockList = []
-
             allProducts.each { p ->
                 def qoh = (p.totalQoh ?: 0) as BigDecimal
                 def reorder = (p.reorderPoint ?: 0) as BigDecimal
-
                 if (qoh <= 0) {
                     zeroStockList.add([productId: p.productId, pseudoId: p.pseudoId ?: '',
                         productName: p.productName ?: p.pseudoId ?: p.productId,
-                        mrpAmount: p.mrpAmount ?: BigDecimal.ZERO,
-                        reorderPoint: reorder, totalQoh: qoh])
+                        mrpAmount: p.mrpAmount ?: BigDecimal.ZERO, reorderPoint: reorder, totalQoh: qoh])
                 } else if (reorder > 0 && qoh <= reorder) {
                     lowStockList.add([productId: p.productId, pseudoId: p.pseudoId ?: '',
                         productName: p.productName ?: p.pseudoId ?: p.productId,
-                        mrpAmount: p.mrpAmount ?: BigDecimal.ZERO,
-                        reorderPoint: reorder, totalQoh: qoh,
+                        mrpAmount: p.mrpAmount ?: BigDecimal.ZERO, reorderPoint: reorder, totalQoh: qoh,
                         shortfall: (reorder - qoh).setScale(2, java.math.RoundingMode.HALF_UP)])
                 }
-
-                totalStockValue += (qoh > 0 && p.mrpAmount) ? qoh * (p.mrpAmount as BigDecimal) : BigDecimal.ZERO
             }
-
             zeroStockCount = zeroStockList.size()
             lowStockCount = lowStockList.size()
             inStockCount = totalProducts - zeroStockCount
-
+            reorderRecommended = zeroStockCount + lowStockCount
             zeroStockList.sort { it.productName }
             lowStockList.sort { (it.shortfall as BigDecimal) }
             lowStockList = lowStockList.reverse()
@@ -55,87 +70,121 @@
 
     <widgets>
         <container style="q-pa-md">
-            <container-row>
-                <row-col lg="3" md="3" sm="6">
-                    <container style="zenith-card bg-white shadow-2 q-pa-md q-mb-md text-center border-radius-lg">
-                        <label text="Total Products" style="text-grey-7 text-caption"/>
-                        <label text="${totalProducts}" type="h5" style="text-weight-bold text-primary q-my-xs"/>
-                    </container>
-                </row-col>
-                <row-col lg="3" md="3" sm="6">
-                    <container style="zenith-card bg-white shadow-2 q-pa-md q-mb-md text-center border-radius-lg">
-                        <label text="In Stock" style="text-grey-7 text-caption"/>
-                        <label text="${inStockCount}" type="h5" style="text-weight-bold text-positive q-my-xs"/>
-                    </container>
-                </row-col>
-                <row-col lg="3" md="3" sm="6">
-                    <container style="zenith-card bg-white shadow-2 q-pa-md q-mb-md text-center border-radius-lg">
-                        <label text="Zero Stock" style="text-grey-7 text-caption"/>
-                        <label text="${zeroStockCount}" type="h5" style="text-weight-bold text-negative q-my-xs"/>
-                    </container>
-                </row-col>
-                <row-col lg="3" md="3" sm="6">
-                    <container style="zenith-card bg-white shadow-2 q-pa-md q-mb-md text-center border-radius-lg">
-                        <label text="Low Stock" style="text-grey-7 text-caption"/>
-                        <label text="${lowStockCount}" type="h5" style="text-weight-bold text-orange-7 q-my-xs"/>
-                    </container>
-                </row-col>
-            </container-row>
-
-            <container style="row items-center justify-between q-mb-md">
-                <label text="" style=""/>
-                <container style="row q-gutter-sm">
-                    <link url="goTerminal" text="Billing" icon="fa fa-calculator" btn-type="success" style="q-btn--dense"/>
-                    <link url="goImport" text="Import" icon="fa fa-upload" btn-type="primary" style="q-btn--dense"/>
-                    <link url="goWastage" text="Wastage" icon="fa fa-trash" btn-type="danger" style="q-btn--dense"/>
-                    <link url="goDashboard" text="Dashboard" icon="fa fa-dashboard" style="q-btn--dense"/>
+            <!-- Toolbar: CSV/PDF (left), Refresh (right) -->
+            <container style="zsec-hdr row items-center justify-between q-mb-md">
+                <container style="z-btnrow">
+                    <link url="exportCsv" text="CSV" icon="download" link-type="anchor" style="z-obtn"/>
+                    <link url="downloadPdf" text="PDF" icon="picture_as_pdf" link-type="anchor" style="z-obtn"/>
+                </container>
+                <container style="z-btnrow">
+                    <link url="." text="Refresh" icon="refresh" link-type="anchor" style="z-obtn"/>
                 </container>
             </container>
 
-            <label text="Zero Stock Products" type="h6" style="text-weight-bold text-negative q-mb-sm"/>
-            <container style="q-mb-lg">
-                <form-list name="ZeroStockList" list="zeroStockList" skip-form="true"
-                           show-csv-button="true" show-xlsx-button="true">
-                    <field name="pseudoId"><default-field title="SKU">
-                        <display/>
-                    </default-field></field>
-                    <field name="productName"><default-field title="Product">
-                        <display/>
-                    </default-field></field>
-                    <field name="mrpAmount"><default-field title="MRP">
-                        <display format="#,##0.00"/>
-                    </default-field></field>
-                    <field name="reorderPoint"><default-field title="Reorder Pt">
-                        <display format="#,##0"/>
-                    </default-field></field>
-                    <field name="totalQoh"><default-field title="Stock">
-                        <display format="#,##0"/>
-                    </default-field></field>
+            <!-- 4 KPI stat cards -->
+            <container style="z-statrow">
+                <container style="z-statcell zenith-card bg-white border-radius-lg q-pa-md">
+                    <container style="z-statinner">
+                        <container style="z-icobadge lg primary"><label text="inventory_2" type="span" style="material-icons"/></container>
+                        <container style="z-statmeta">
+                            <label text="Total Products" type="span" style="z-statlabel"/>
+                            <label text="${totalProducts ?: 0}" type="span" style="z-statnum"/>
+                            <label text="All products in catalog" type="span" style="z-statdesc"/>
+                        </container>
+                    </container>
+                </container>
+                <container style="z-statcell zenith-card bg-white border-radius-lg q-pa-md">
+                    <container style="z-statinner">
+                        <container style="z-icobadge lg green"><label text="check_circle" type="span" style="material-icons"/></container>
+                        <container style="z-statmeta">
+                            <label text="In Stock" type="span" style="z-statlabel"/>
+                            <label text="${inStockCount ?: 0}" type="span" style="z-statnum"/>
+                            <label text="Products available" type="span" style="z-statdesc"/>
+                        </container>
+                    </container>
+                </container>
+                <container style="z-statcell zenith-card bg-white border-radius-lg q-pa-md">
+                    <container style="z-statinner">
+                        <container style="z-icobadge lg red"><label text="error" type="span" style="material-icons"/></container>
+                        <container style="z-statmeta">
+                            <label text="Zero Stock" type="span" style="z-statlabel"/>
+                            <label text="${zeroStockCount ?: 0}" type="span" style="z-statnum z-txt-red"/>
+                            <label text="Out of stock items" type="span" style="z-statdesc"/>
+                        </container>
+                    </container>
+                </container>
+                <container style="z-statcell zenith-card bg-white border-radius-lg q-pa-md">
+                    <container style="z-statinner">
+                        <container style="z-icobadge lg orange"><label text="warning" type="span" style="material-icons"/></container>
+                        <container style="z-statmeta">
+                            <label text="Low Stock" type="span" style="z-statlabel"/>
+                            <label text="${lowStockCount ?: 0}" type="span" style="z-statnum z-txt-orange"/>
+                            <label text="Reorder soon" type="span" style="z-statdesc"/>
+                        </container>
+                    </container>
+                </container>
+            </container>
+
+            <!-- Alert banner: out-of-stock + reorder-recommended + Take Action CTA -->
+            <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md q-mb-md">
+                <container style="z-statrow">
+                    <container style="z-statcell">
+                        <container style="z-statinner">
+                            <container style="z-icobadge lg red"><label text="error" type="span" style="material-icons"/></container>
+                            <container style="z-statmeta">
+                                <label text="${zeroStockCount ?: 0} products are out of stock" type="span" style="text-weight-bold z-txt-red"/>
+                                <label text="These items need immediate attention" type="span" style="z-statdesc"/>
+                            </container>
+                        </container>
+                    </container>
+                    <container style="z-statcell">
+                        <container style="z-statinner">
+                            <container style="z-icobadge lg green"><label text="eco" type="span" style="material-icons"/></container>
+                            <container style="z-statmeta">
+                                <label text="Reorder recommended" type="span" style="z-statdesc"/>
+                                <label text="${reorderRecommended ?: 0} items" type="span" style="text-weight-bold text-dark"/>
+                                <label text="Suggested to reorder" type="span" style="z-statdesc"/>
+                            </container>
+                        </container>
+                    </container>
+                    <container style="z-statcell z-statcard-violet q-pa-md">
+                        <container style="z-statmeta">
+                            <link url="goTakeAction" text="Take Action ›" style="z-vlink text-weight-bold"/>
+                            <label text="Review and reorder" type="span" style="z-txt-primary"/>
+                        </container>
+                    </container>
+                </container>
+            </container>
+
+            <!-- Zero Stock Products table -->
+            <label text="Zero Stock Products" type="h6" style="text-weight-bold z-txt-red q-mb-sm"/>
+            <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md q-mb-lg">
+                <form-list name="ZeroStockList" list="zeroStockList" skip-form="true" show-page-size="true">
+                    <field name="pseudoId"><header-field title="SKU"/>
+                        <default-field><label text="${pseudoId}" type="span" style="text-dark text-weight-medium"/></default-field></field>
+                    <field name="productName"><header-field title="Product"/>
+                        <default-field><label text="${productName}" type="span" style="text-dark"/></default-field></field>
+                    <field name="mrpAmount"><header-field title="MRP"/>
+                        <default-field><display format="#,##0.00"/></default-field></field>
+                    <field name="reorderPoint"><header-field title="Reorder Pt"/>
+                        <default-field><display format="#,##0"/></default-field></field>
+                    <field name="totalQoh"><header-field title="Stock"/>
+                        <default-field><label text="${ec.l10n.format(totalQoh ?: 0, '#,##0')}" type="span" style="z-txt-red text-weight-medium"/></default-field></field>
                 </form-list>
             </container>
 
-            <label text="Low Stock Products (Below Reorder Point)" type="h6" style="text-weight-bold text-orange-7 q-mb-sm"/>
-            <form-list name="LowStockList" list="lowStockList" skip-form="true"
-                       show-csv-button="true" show-xlsx-button="true">
-                <field name="pseudoId"><default-field title="SKU">
-                    <display/>
-                </default-field></field>
-                <field name="productName"><default-field title="Product">
-                    <display/>
-                </default-field></field>
-                <field name="totalQoh"><default-field title="Current Stock">
-                    <display format="#,##0"/>
-                </default-field></field>
-                <field name="reorderPoint"><default-field title="Reorder Point">
-                    <display format="#,##0"/>
-                </default-field></field>
-                <field name="shortfall"><default-field title="Shortfall">
-                    <display format="#,##0"/>
-                </default-field></field>
-                <field name="mrpAmount"><default-field title="MRP">
-                    <display format="#,##0.00"/>
-                </default-field></field>
-            </form-list>
+            <!-- Low Stock detail (below the mockup layout; a useful companion to the Zero Stock list) -->
+            <label text="Low Stock Products (Below Reorder Point)" type="h6" style="text-weight-bold z-txt-orange q-mb-sm"/>
+            <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md">
+                <form-list name="LowStockList" list="lowStockList" skip-form="true" show-page-size="true">
+                    <field name="pseudoId"><header-field title="SKU"/><default-field><label text="${pseudoId}" type="span" style="text-dark text-weight-medium"/></default-field></field>
+                    <field name="productName"><header-field title="Product"/><default-field><label text="${productName}" type="span" style="text-dark"/></default-field></field>
+                    <field name="totalQoh"><header-field title="Current Stock"/><default-field><label text="${ec.l10n.format(totalQoh ?: 0, '#,##0')}" type="span" style="z-txt-orange text-weight-medium"/></default-field></field>
+                    <field name="reorderPoint"><header-field title="Reorder Point"/><default-field><display format="#,##0"/></default-field></field>
+                    <field name="shortfall"><header-field title="Shortfall"/><default-field><display format="#,##0"/></default-field></field>
+                    <field name="mrpAmount"><header-field title="MRP"/><default-field><display format="#,##0.00"/></default-field></field>
+                </form-list>
+            </container>
         </container>
     </widgets>
 </screen>
