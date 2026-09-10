@@ -12,30 +12,34 @@
         <actions>
             <script><![CDATA[
                 import org.moqui.context.ExecutionContext
-                
+
                 ExecutionContext ec = context.ec
-                def grnList = ec.entity.find("zenith.erp.purchase.GoodsReceiptNote").orderBy("-receiptDate").list()
-                
+                def csym = context.currSymbol ?: '₹'
+                def ef = ec.entity.find("zenith.erp.purchase.GoodsReceiptNoteView").orderBy("-receiptDate")
+                // ZE-SALES-014 f/u: org-isolate the CSV export (standalone render bypasses the MANTLE_ACTIVE_ORG authz filter)
+                def activeOrg = ec.user.getPreference('ACTIVE_ORGANIZATION')
+                if (activeOrg) ef.condition("customerPartyId", activeOrg)
+                def grnList = ef.list()
+
                 StringBuilder csv = new StringBuilder()
                 csv.append("ZetaERP - Goods Receipt Notes\n")
                 csv.append("Generated on: ${ec.l10n.format(ec.user.nowTimestamp, 'dd MMM yyyy HH:mm')}\n\n")
-                csv.append("GRN No.,Purchase Order,Vendor,Receipt Date,Freight (${currSymbol}),Insurance (${currSymbol}),Customs Duty (${currSymbol}),Total Landed Surcharges (${currSymbol})\n")
-                
+                csv.append("GRN No.,Purchase Order,Vendor,Receipt Date,Freight (${csym}),Insurance (${csym}),Customs Duty (${csym}),Total Landed Surcharges (${csym})\n")
+
                 for (def grn in grnList) {
                     def po = ec.entity.find("mantle.order.OrderHeaderAndPart").condition("orderId", grn.purchaseOrderId).one()
                     def vendor = po?.vendorPartyId ? ec.entity.find("mantle.party.PartyDetail").condition("partyId", po.vendorPartyId).one() : null
-                    
+
                     def vendorName = (vendor?.organizationName ?: vendor?.firstName ?: "") + " " + (vendor?.lastName ?: "")
                     vendorName = vendorName.trim().replace('"', '""')
-                    
+
                     def freight = grn.freightAmount ?: 0.0
                     def insurance = grn.insuranceAmount ?: 0.0
                     def customs = grn.customsDutyAmount ?: 0.0
-                    def other = grn.otherChargesAmount ?: 0.0
-                    def total = freight + insurance + customs + other
-                    
+                    def total = freight + insurance + customs
+
                     def dateStr = grn.receiptDate ? ec.l10n.format(grn.receiptDate, "dd MMM yyyy") : ""
-                    
+
                     csv.append("${grn.grnId},")
                     csv.append("${grn.purchaseOrderId},")
                     csv.append("\"${vendorName}\",")
@@ -45,7 +49,7 @@
                     csv.append(String.format("%.2f", customs) + ",")
                     csv.append(String.format("%.2f", total) + "\n")
                 }
-                
+
                 String fileName = "GRN_Export_${ec.l10n.format(ec.user.nowTimestamp, 'yyyyMMdd_HHmm')}.csv"
                 ec.web.sendTextResponse(csv.toString(), "text/csv", fileName)
             ]]></script>
@@ -54,102 +58,133 @@
     </transition>
 
     <actions>
-        <entity-find entity-name="zenith.erp.purchase.GoodsReceiptNote" list="grnList">
+        <set field="currSymbol" from="currSymbol ?: '₹'"/>
+        <set field="activeOrgId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+        <entity-find entity-name="zenith.erp.purchase.GoodsReceiptNoteView" list="grnList">
             <search-form-inputs default-order-by="-receiptDate"/>
+            <!-- ZE-SALES-014 f/u: org-isolate the list (buying org lives on the joined OrderHeader) -->
+            <econdition field-name="customerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
         </entity-find>
     </actions>
 
     <widgets>
-        <container-box><box-header title="Goods Receipt Notes"/><box-toolbar>
-            <link url="exportCsv" text="Export CSV" icon="fa fa-download" class="btn btn-success"/>
-            <!-- ZE-PUR: New GRN (receive goods) is a write action — hidden for view-only users -->
-            <section name="NewGrnWrite">
-              <condition><expression>modCanWrite</expression></condition>
-              <widgets>
-            <container-dialog id="CreateGrnDialog" button-text="New GRN">
-                <form-single name="CreateGrnForm" transition="createGrn">
-                        <field name="purchaseOrderId">
-                            <default-field title="Purchase Order">
-                                <drop-down allow-empty="false">
-                                    <entity-options key="${orderId}" text="PO-${orderId} - ${vendorParty?.organizationName ?: ''}">
-                                        <entity-find entity-name="mantle.order.OrderHeaderAndPart">
-                                            <econdition field-name="customerPartyId" from="activeOrgId" ignore-if-empty="true"/>
-                                            <econdition field-name="vendorPartyId" operator="is-not-null"/>
-                                        </entity-find>
-                                    </entity-options>
-                                </drop-down>
-                            </default-field>
-                        </field>
-                        <field name="receiptDate"><default-field><date-time type="date"/></default-field></field>
-                        <field name="freightAmount"><default-field title="Freight Charges"><text-line size="15"/></default-field></field>
-                        <field name="insuranceAmount"><default-field title="Insurance Charges"><text-line size="15"/></default-field></field>
-                        <field name="customsDutyAmount"><default-field title="Customs Duty (Imports)"><text-line size="15"/></default-field></field>
-                        <field name="submitButton"><default-field title="Create GRN"><submit/></default-field></field>
+        <!-- Page header: title + subtitle (left); Export CSV (violet outline) + New GRN (solid) (right) -->
+        <container style="zsec-hdr row items-center justify-between q-mb-lg z-newbtn-wrap">
+            <container style="column">
+                <label text="Goods Receipt Notes" type="h3" style="text-primary text-weight-bold q-my-none"/>
+                <label text="Receive inventory and apportion Freight, Insurance, and Customs Duty for Landed Cost (Ind AS 2)." type="p" style="text-grey-7 q-mt-sm q-mb-none"/>
+            </container>
+            <container style="z-hdractions">
+                <link url="exportCsv" text="Export CSV" icon="download" link-type="anchor" style="z-obtn"/>
+                <!-- ZE-PUR: New GRN (receive goods) is a write action — hidden for view-only users -->
+                <section name="NewGrnWrite">
+                  <condition><expression>modCanWrite</expression></condition>
+                  <widgets>
+                    <container-dialog id="CreateGrnDialog" button-text="+ New GRN"
+                        button-class="q-btn q-btn-item non-selectable no-outline q-btn--standard q-btn--rectangle bg-primary text-white q-btn--actionable q-focusable q-hoverable text-weight-bold q-px-md z-newbtn">
+                        <form-single name="CreateGrnForm" transition="createGrn">
+                            <field name="purchaseOrderId">
+                                <default-field title="Purchase Order">
+                                    <drop-down allow-empty="false">
+                                        <entity-options key="${orderId}" text="PO-${orderId} - ${vendorParty?.organizationName ?: ''}">
+                                            <entity-find entity-name="mantle.order.OrderHeaderAndPart">
+                                                <econdition field-name="customerPartyId" from="activeOrgId" ignore-if-empty="true"/>
+                                                <econdition field-name="vendorPartyId" operator="is-not-null"/>
+                                            </entity-find>
+                                        </entity-options>
+                                    </drop-down>
+                                </default-field>
+                            </field>
+                            <field name="receiptDate"><default-field><date-time type="date"/></default-field></field>
+                            <field name="freightAmount"><default-field title="Freight Charges"><text-line size="15"/></default-field></field>
+                            <field name="insuranceAmount"><default-field title="Insurance Charges"><text-line size="15"/></default-field></field>
+                            <field name="customsDutyAmount"><default-field title="Customs Duty (Imports)"><text-line size="15"/></default-field></field>
+                            <field name="submitButton"><default-field title="Create GRN"><submit/></default-field></field>
+                        </form-single>
+                    </container-dialog>
+                  </widgets>
+                </section>
+            </container>
+        </container>
+
+        <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md">
+            <container style="zsec-hdr row items-center justify-between q-mb-md">
+                <container-dialog id="FindOptionsDialog" button-text="Find Options" button-class="btn btn-default">
+                    <form-single name="FindOptionsForm" transition="." type="find">
+                        <field name="grnId"><default-field title="GRN No."><text-find hide-options="true"/></default-field></field>
+                        <field name="purchaseOrderId"><default-field title="Purchase Order"><text-find hide-options="true"/></default-field></field>
+                        <field name="receiptDate"><default-field title="Receipt Date"><date-find/></default-field></field>
+                        <field name="searchButton"><default-field title=""><submit text="Search" icon="fa fa-search"/></default-field></field>
                     </form-single>
-            </container-dialog>
-              </widgets>
-            </section>
-        </box-toolbar><box-body>
-            <label text="Receive inventory and apportion Freight, Insurance, and Customs Duty for Landed Cost (Ind AS 2)." type="p"/>
-            <form-list name="GrnList" list="grnList" skip-form="true" header-dialog="true" show-csv-button="false" show-xlsx-button="false" show-page-size="true">
-                    <row-actions>
-                        <set field="totalAdditionalCost" from="(freightAmount?:0.0) + (insuranceAmount?:0.0) + (customsDutyAmount?:0.0)" type="BigDecimal"/>
-                        <entity-find-one entity-name="mantle.order.OrderHeaderAndPart" value-field="po">
-                            <field-map field-name="orderId" from="purchaseOrderId"/>
-                        </entity-find-one>
-                        <entity-find-one entity-name="mantle.party.PartyDetail" value-field="vendor">
-                            <field-map field-name="partyId" from="po?.vendorPartyId"/>
-                        </entity-find-one>
-                    </row-actions>
-                    
-                    <field name="grnId">
-                        <header-field title="GRN No." show-order-by="true"><text-find hide-options="true"/></header-field>
-                        <default-field><display/></default-field>
-                    </field>
-                    
-                    <field name="purchaseOrderId">
-                        <header-field title="Purchase Order"><text-find hide-options="true"/></header-field>
-                        <default-field>
-                            <display text="${purchaseOrderId}"/>
-                        </default-field>
-                    </field>
+                </container-dialog>
+            </container>
 
-                    <field name="vendorName">
-                        <header-field title="Vendor"/>
-                        <default-field>
-                            <display text="${vendor?.organizationName ?: vendor?.firstName ?: ''} ${vendor?.lastName ?: ''}"/>
-                        </default-field>
-                    </field>
+            <form-list name="GrnList" list="grnList" skip-form="true">
+                <row-actions>
+                    <set field="vendorLookupId" from="poVendorPartyId ?: vendorPartyId"/>
+                    <entity-find-one entity-name="mantle.party.PartyDetail" value-field="vendor">
+                        <field-map field-name="partyId" from="vendorLookupId"/>
+                    </entity-find-one>
+                    <script><![CDATA[
+                        def grp = { v -> ec.l10n.format((v ?: 0.0) as BigDecimal, '#,##,##0.00') }
+                        vendorDisp = ((vendor?.organizationName ?: vendor?.firstName ?: '') + ' ' + (vendor?.lastName ?: '')).trim() ?: '—'
+                        freightDisp = grp(freightAmount)
+                        insuranceDisp = grp(insuranceAmount)
+                        customsDisp = grp(customsDutyAmount)
+                        totalLanded = (freightAmount ?: 0.0G) + (insuranceAmount ?: 0.0G) + (customsDutyAmount ?: 0.0G)
+                        totalDisp = grp(totalLanded)
+                        receiptDisp = receiptDate ? ec.l10n.format(receiptDate, 'dd MMM yyyy') : '—'
+                        isCsv = ec.web?.parameters?.renderMode == 'csv' || ec.web?.parameters?.renderMode == 'xlsx'
+                    ]]></script>
+                </row-actions>
 
-                    <field name="receiptDate">
-                        <header-field title="Receipt Date" show-order-by="true"><date-find/></header-field>
-                        <default-field><display format="dd MMM yyyy"/></default-field>
-                    </field>
-                    
-                    <field name="freightAmount">
-                        <header-field title="Freight (${currSymbol})"/>
-                        <default-field><display format="#,##,##0.00"/></default-field>
-                    </field>
-
-                    <field name="insuranceAmount">
-                        <header-field title="Insurance (${currSymbol})"/>
-                        <default-field><display format="#,##,##0.00"/></default-field>
-                    </field>
-
-                    <field name="customsDutyAmount">
-                        <header-field title="Customs Duty (${currSymbol})"/>
-                        <default-field><display format="#,##,##0.00"/></default-field>
-                    </field>
-
-                    <field name="totalAdditionalCost">
-                        <header-field title="Total Landed Surcharges (${currSymbol})"/>
-                        <default-field>
-                            <display format="#,##,##0.00"/>
-                        </default-field>
-                    </field>
-                    
-                    <field name="findButton"><header-field title="Find"><submit/></header-field></field>
-                </form-list>
-        </box-body></container-box>
+                <field name="grnId">
+                    <header-field title="GRN No." show-order-by="true"/>
+                    <conditional-field condition="isCsv"><display text="${grnId}"/></conditional-field>
+                    <default-field><link text="${grnId}" url="." parameter-map="[grnId:grnId]" style="z-pillid"/></default-field>
+                </field>
+                <field name="purchaseOrderId">
+                    <header-field title="Purchase Order"/>
+                    <default-field><label text="${purchaseOrderId}" type="span" style="text-dark"/></default-field>
+                </field>
+                <field name="vendorName">
+                    <header-field title="Vendor"/>
+                    <default-field><label text="${vendorDisp}" type="span" style="text-dark"/></default-field>
+                </field>
+                <field name="receiptDate">
+                    <header-field title="Receipt Date" show-order-by="true"/>
+                    <conditional-field condition="isCsv"><display format="dd MMM yyyy"/></conditional-field>
+                    <default-field>
+                        <label text="event" type="span" style="material-icons z-cellico-primary"/>
+                        <label text="${receiptDisp}" type="span" style="text-dark"/>
+                    </default-field>
+                </field>
+                <field name="freightAmount">
+                    <header-field title="Freight (${currSymbol})"/>
+                    <conditional-field condition="isCsv"><display format="#,##,##0.00"/></conditional-field>
+                    <default-field><label text="${freightDisp}" type="span" style="z-amt-green text-weight-medium"/></default-field>
+                </field>
+                <field name="insuranceAmount">
+                    <header-field title="Insurance (${currSymbol})"/>
+                    <conditional-field condition="isCsv"><display format="#,##,##0.00"/></conditional-field>
+                    <default-field><label text="${insuranceDisp}" type="span" style="z-amt-blue text-weight-medium"/></default-field>
+                </field>
+                <field name="customsDutyAmount">
+                    <header-field title="Customs Duty (${currSymbol})"/>
+                    <conditional-field condition="isCsv"><display format="#,##,##0.00"/></conditional-field>
+                    <default-field><label text="${customsDisp}" type="span" style="z-txt-orange text-weight-medium"/></default-field>
+                </field>
+                <field name="totalLanded">
+                    <header-field title="Total Landed Surcharges (${currSymbol})"/>
+                    <conditional-field condition="isCsv"><display text="${totalDisp}"/></conditional-field>
+                    <default-field><label text="${totalDisp}" type="span" style="text-dark text-weight-medium"/></default-field>
+                </field>
+                <field name="rowAction">
+                    <header-field title=""/>
+                    <conditional-field condition="isCsv"><display text=""/></conditional-field>
+                    <default-field><label text="⋮" type="span" style="z-kebab-static"/></default-field>
+                </field>
+            </form-list>
+        </container>
     </widgets>
 </screen>
