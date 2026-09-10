@@ -3,68 +3,204 @@
         xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
         default-menu-title="All Stock" default-menu-index="2">
 
-    <transition name="goImport"><default-response url="../../ProductImport"/></transition>
-    <transition name="goWastage"><default-response url="../../Wastage"/></transition>
-    <transition name="goTerminal"><default-response url="../../Terminal"/></transition>
-    <transition name="goDashboard"><default-response url="../../Dashboard"/></transition>
+    <transition name="goAddStock"><default-response url="../../ProductImport"/></transition>
+
+    <transition name="exportCsv" read-only="true">
+        <actions>
+            <script><![CDATA[
+                import org.moqui.context.ExecutionContext
+                ExecutionContext ec = context.ec
+                def ef = ec.entity.find("zenith.erp.inventory.ProductStockView").condition("productTypeEnumId","PtAsset").orderBy("productName")
+                def _org = ec.user.getPreference('ACTIVE_ORGANIZATION')
+                if (_org) ef.condition("ownerPartyId", _org)
+                def rows = ef.list()
+                def esc = { v -> if (v == null) return ""; String s = v.toString().trim(); (s.contains(",")||s.contains("\"")||s.contains("\n")) ? "\"" + s.replace("\"","\"\"") + "\"" : s }
+                def num = { v -> String.format("%.2f", (v ?: 0.0) as double) }
+                def intn = { v -> String.format("%d", (long)((v ?: 0) as double)) }
+                StringBuilder csv = new StringBuilder()
+                csv.append("ZetaERP - Stock (All)\n")
+                csv.append("Generated on: ${ec.l10n.format(ec.user.nowTimestamp, 'dd MMM yyyy HH:mm')}\n\n")
+                csv.append("SKU,Product,On Hand,Available,Reorder Pt,MRP,Status\n")
+                rows.each { r ->
+                    def q=(r.totalQoh ?: 0) as BigDecimal; def rp=(r.reorderPoint ?: 0) as BigDecimal
+                    def st = q <= 0 ? 'Out of Stock' : ((rp > 0 && q <= rp) ? 'Low Stock' : 'In Stock')
+                    csv.append("${esc(r.pseudoId)},${esc(r.productName)},${intn(r.totalQoh)},${intn(r.totalAtp)},${intn(r.reorderPoint)},${num(r.mrpAmount)},${st}\n")
+                }
+                ec.web.sendTextResponse(csv.toString(), "text/csv", "Stock_All_${ec.l10n.format(ec.user.nowTimestamp, 'yyyyMMdd_HHmm')}.csv")
+            ]]></script>
+        </actions>
+        <default-response type="none"/>
+    </transition>
+
+    <transition name="downloadPdf" read-only="true">
+        <default-response url="${ec.web.getWebappRootUrl(false, null)}/fop/apps/zenith/pos/Stock/StockListPdf" url-type="plain"/>
+    </transition>
 
     <actions>
-        <entity-find entity-name="zenith.erp.inventory.ProductStockView" list="stockList">
+        <set field="showOnlyAlerts" from="showOnlyAlerts ?: 'N'"/>
+        <entity-find entity-name="zenith.erp.inventory.ProductStockView" list="allStock">
             <econdition field-name="productTypeEnumId" value="PtAsset"/>
-            <econdition field-name="productName" operator="like" value="%${searchText}%" ignore-if-empty="true" ignore-case="true"/>
-            <econdition field-name="pseudoId" operator="like" value="%${searchSku}%" ignore-if-empty="true" ignore-case="true"/>
             <order-by field-name="productName"/>
-            <!-- ZE-SALES-014 f/u: org-isolate CSV/XLSX export (standalone render bypasses the MANTLE_ACTIVE_ORG authz filter) -->
+            <!-- ZE-SALES-014 f/u: org-isolate (standalone render bypasses the MANTLE_ACTIVE_ORG authz filter) -->
             <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
         </entity-find>
+
+        <script><![CDATA[
+            def zinr = context.zinr ?: com.zenith.Fmt.INSTANCE
+            def total = allStock.size()
+            def outCount = allStock.count { ((it.totalQoh ?: 0) as BigDecimal) <= 0 }
+            def lowCount = allStock.count { def q=(it.totalQoh ?: 0) as BigDecimal; def r=(it.reorderPoint ?: 0) as BigDecimal; q > 0 && r > 0 && q <= r }
+            def inCount = total - outCount - lowCount
+            def invValue = allStock.inject(0.0G) { acc, it -> acc + (((it.totalQoh ?: 0) as BigDecimal) * ((it.mrpAmount ?: 0) as BigDecimal)) }
+            def pct = { n -> total > 0 ? ec.l10n.format((n * 100.0) / total, '#,##0.00') + '% of total' : '0% of total' }
+            totalProducts = total
+            inStockCount = inCount; inStockPct = pct(inCount)
+            lowStockCount = lowCount; lowStockPct = pct(lowCount)
+            outStockCount = outCount; outStockPct = pct(outCount)
+            invValueStr = '₹ ' + zinr.inr(ec.l10n.format(invValue, '#,##0.00'))
+
+            // filter for the table (product name / sku / low+out toggle)
+            def st = (searchText ?: '').trim().toLowerCase()
+            def sk = (searchSku ?: '').trim().toLowerCase()
+            def onlyAlerts = (showOnlyAlerts == 'Y')
+            stockList = allStock.findAll { s ->
+                def q=(s.totalQoh ?: 0) as BigDecimal; def r=(s.reorderPoint ?: 0) as BigDecimal
+                def isOut = q <= 0; def isLow = !isOut && r > 0 && q <= r
+                def nameOk = !st || ((s.productName ?: '').toLowerCase().contains(st))
+                def skuOk = !sk || ((s.pseudoId ?: '').toLowerCase().contains(sk))
+                def alertOk = !onlyAlerts || isOut || isLow
+                nameOk && skuOk && alertOk
+            }
+        ]]></script>
     </actions>
 
     <widgets>
         <container style="q-pa-md">
-            <container style="row items-center justify-end q-mb-sm q-gutter-sm">
-                <link url="goTerminal" text="Billing" icon="fa fa-calculator" btn-type="success" style="q-btn--dense"/>
-                <link url="goImport" text="Import" icon="fa fa-upload" btn-type="primary" style="q-btn--dense"/>
-                <link url="goWastage" text="Wastage" icon="fa fa-trash" btn-type="danger" style="q-btn--dense"/>
-                <link url="goDashboard" text="Dashboard" icon="fa fa-dashboard" style="q-btn--dense"/>
+            <!-- Page header: title + Add Stock CTA -->
+            <container style="zsec-hdr row items-center justify-between q-mb-md">
+                <label text="Stock" type="h3" style="text-primary text-weight-bold q-my-none"/>
+                <section name="AddStock_write"><condition><expression>modCanWrite</expression></condition><widgets>
+                    <link url="goAddStock" text="+ Add Stock" style="z-solid"/>
+                </widgets></section>
             </container>
-            <container style="q-mb-md">
+
+            <!-- Toolbar: CSV/PDF (left), Refresh (right) -->
+            <container style="zsec-hdr row items-center justify-between q-mb-md">
+                <container style="z-btnrow">
+                    <link url="exportCsv" text="CSV" icon="download" link-type="anchor" style="z-obtn"/>
+                    <link url="downloadPdf" text="PDF" icon="picture_as_pdf" link-type="anchor" style="z-obtn"/>
+                </container>
+                <container style="z-btnrow">
+                    <link url="." text="Refresh" icon="refresh" link-type="anchor" style="z-obtn"/>
+                </container>
+            </container>
+
+            <!-- 5 KPI stat cards -->
+            <container style="z-statrow">
+                <container style="z-statcell zenith-card bg-white border-radius-lg q-pa-md">
+                    <container style="z-statinner">
+                        <container style="z-icobadge lg primary"><label text="inventory_2" type="span" style="material-icons"/></container>
+                        <container style="z-statmeta">
+                            <label text="Total Products" type="span" style="z-statlabel"/>
+                            <label text="${totalProducts ?: 0}" type="span" style="z-statnum"/>
+                            <label text="All products in catalog" type="span" style="z-statdesc"/>
+                        </container>
+                    </container>
+                </container>
+                <container style="z-statcell zenith-card bg-white border-radius-lg q-pa-md">
+                    <container style="z-statinner">
+                        <container style="z-icobadge lg green"><label text="check_circle" type="span" style="material-icons"/></container>
+                        <container style="z-statmeta">
+                            <label text="In Stock" type="span" style="z-statlabel"/>
+                            <label text="${inStockCount ?: 0}" type="span" style="z-statnum"/>
+                            <label text="${inStockPct}" type="span" style="z-statdesc"/>
+                        </container>
+                    </container>
+                </container>
+                <container style="z-statcell zenith-card bg-white border-radius-lg q-pa-md">
+                    <container style="z-statinner">
+                        <container style="z-icobadge lg orange"><label text="trending_up" type="span" style="material-icons"/></container>
+                        <container style="z-statmeta">
+                            <label text="Low Stock" type="span" style="z-statlabel"/>
+                            <label text="${lowStockCount ?: 0}" type="span" style="z-statnum"/>
+                            <label text="${lowStockPct}" type="span" style="z-statdesc"/>
+                        </container>
+                    </container>
+                </container>
+                <container style="z-statcell zenith-card bg-white border-radius-lg q-pa-md">
+                    <container style="z-statinner">
+                        <container style="z-icobadge lg red"><label text="error" type="span" style="material-icons"/></container>
+                        <container style="z-statmeta">
+                            <label text="Out of Stock" type="span" style="z-statlabel"/>
+                            <label text="${outStockCount ?: 0}" type="span" style="z-statnum"/>
+                            <label text="${outStockPct}" type="span" style="z-statdesc"/>
+                        </container>
+                    </container>
+                </container>
+                <container style="z-statcell zenith-card bg-white border-radius-lg q-pa-md">
+                    <container style="z-statinner">
+                        <container style="z-icobadge lg blue"><label text="currency_rupee" type="span" style="material-icons"/></container>
+                        <container style="z-statmeta">
+                            <label text="Total Inventory Value" type="span" style="z-statlabel"/>
+                            <label text="${invValueStr}" type="span" style="z-statnum z-amt-blue"/>
+                            <label text="Based on MRP" type="span" style="z-statdesc"/>
+                        </container>
+                    </container>
+                </container>
+            </container>
+
+            <!-- Filter panel -->
+            <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md q-mb-md">
                 <form-single name="StockSearch" transition=".">
                     <field name="searchText"><default-field title="Product Name">
-                        <text-line size="30" default-value="${searchText ?: ''}"/>
+                        <text-line size="34" default-value="${searchText ?: ''}"/>
                     </default-field></field>
                     <field name="searchSku"><default-field title="SKU">
-                        <text-line size="20" default-value="${searchSku ?: ''}"/>
+                        <text-line size="24" default-value="${searchSku ?: ''}"/>
+                    </default-field></field>
+                    <field name="showOnlyAlerts"><default-field title="Show only low &amp; out of stock">
+                        <check><option key="Y" text="&#160;"/></check>
                     </default-field></field>
                     <field name="searchBtn"><default-field title="">
                         <submit text="Search" icon="fa fa-search"/>
                     </default-field></field>
+                    <field name="clearBtn"><default-field title="">
+                        <link url="." text="Clear" btn-type="default"/>
+                    </default-field></field>
                 </form-single>
             </container>
 
-            <form-list name="FullStockList" list="stockList" list-entry="s" skip-form="true"
-                       show-csv-button="true" show-xlsx-button="true" show-page-size="true">
-                <field name="pseudoId"><default-field title="SKU">
-                    <display/>
-                </default-field></field>
-                <field name="productName"><default-field title="Product">
-                    <display/>
-                </default-field></field>
-                <field name="totalQoh"><default-field title="On Hand">
-                    <display format="#,##0"/>
-                </default-field></field>
-                <field name="totalAtp"><default-field title="Available">
-                    <display format="#,##0"/>
-                </default-field></field>
-                <field name="reorderPoint"><default-field title="Reorder Pt">
-                    <display format="#,##0"/>
-                </default-field></field>
-                <field name="mrpAmount"><default-field title="MRP">
-                    <display format="#,##0.00"/>
-                </default-field></field>
-                <field name="stockStatus"><default-field title="Status">
-                    <display text="${(s.totalQoh ?: 0) &lt;= 0 ? 'OUT' : ((s.reorderPoint ?: 0) &gt; 0 &amp;&amp; (s.totalQoh ?: 0) &lt;= (s.reorderPoint ?: 0) ? 'LOW' : 'OK')}"/>
-                </default-field></field>
-            </form-list>
+            <!-- Stock table -->
+            <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md">
+                <form-list name="FullStockList" list="stockList" list-entry="s" skip-form="true" show-page-size="true">
+                    <row-actions>
+                        <script><![CDATA[
+                            def q = (s.totalQoh ?: 0) as BigDecimal
+                            def r = (s.reorderPoint ?: 0) as BigDecimal
+                            def isOut = q <= 0
+                            def isLow = !isOut && r > 0 && q <= r
+                            statusText = isOut ? 'Out of Stock' : (isLow ? 'Low Stock' : 'In Stock')
+                            statusColor = isOut ? 'danger' : (isLow ? 'warning' : 'success')
+                            availColor = isOut ? 'z-txt-red' : (isLow ? 'z-txt-orange' : 'z-amt-green')
+                            availStr = ec.l10n.format((s.totalAtp ?: 0), '#,##0')
+                        ]]></script>
+                    </row-actions>
+                    <field name="pseudoId"><header-field title="SKU" show-order-by="true"/>
+                        <default-field><label text="${s.pseudoId}" type="span" style="text-dark text-weight-medium"/></default-field></field>
+                    <field name="productName"><header-field title="Product" show-order-by="true"/>
+                        <default-field><label text="${s.productName}" type="span" style="text-dark"/></default-field></field>
+                    <field name="totalQoh"><header-field title="On Hand" show-order-by="true"/>
+                        <default-field><display format="#,##0"/></default-field></field>
+                    <field name="totalAtp"><header-field title="Available"/>
+                        <default-field><label text="${availStr}" type="span" style="${availColor} text-weight-medium"/></default-field></field>
+                    <field name="reorderPoint"><header-field title="Reorder Pt"/>
+                        <default-field><display format="#,##0"/></default-field></field>
+                    <field name="mrpAmount"><header-field title="MRP" show-order-by="true"/>
+                        <default-field><display format="#,##0.00"/></default-field></field>
+                    <field name="stockStatus"><header-field title="Status"/>
+                        <default-field><label text="${statusText}" type="span" style="zenith-badge nd ${statusColor}"/></default-field></field>
+                </form-list>
+            </container>
         </container>
     </widgets>
 </screen>
