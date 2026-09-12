@@ -8,68 +8,233 @@
     <transition name="goReports"><default-response url="../Reports"/></transition>
     <transition name="goDashboard"><default-response url="../Dashboard"/></transition>
 
-    <actions>
-        <!-- Scope the audit trail to the operator's organization (whole store) -->
-        <set field="opParty" from="ec.user.userAccount?.partyId"/>
-        <entity-find entity-name="zenith.erp.pos.PosSession" list="recentSess" limit="1">
-            <econdition field-name="operatorPartyId" from="opParty"/>
-            <order-by field-name="-openDate"/>
-        </entity-find>
-        <set field="myOrg" from="null"/>
-        <if condition="recentSess">
-            <entity-find-one entity-name="zenith.erp.pos.PosTerminal" value-field="myTerm">
-                <field-map field-name="terminalId" from="recentSess[0].terminalId"/>
-            </entity-find-one>
-            <set field="myOrg" from="myTerm?.organizationPartyId"/>
-        </if>
+    <transition name="exportCsv" read-only="true">
+        <actions>
+            <script><![CDATA[
+                import org.moqui.context.ExecutionContext
+                ExecutionContext ec = context.ec
+                def _org = ec.user.getPreference("ACTIVE_ORGANIZATION")
+                def f = ec.entity.find("zenith.erp.pos.PosAmendmentView")
+                if (_org) f.condition("organizationPartyId", _org)
+                if (fromDate) f.condition("amendmentDate", "greater-equals", java.sql.Timestamp.valueOf(fromDate + ' 00:00:00'))
+                if (thruDate) f.condition("amendmentDate", "less-equals", java.sql.Timestamp.valueOf(thruDate + ' 23:59:59'))
+                if (changeType) f.condition("changeType", changeType)
+                if (changedBy) f.condition("amendedByPartyId", changedBy)
+                f.orderBy("-amendmentDate")
+                def rows = f.list()
+                def st = (searchText ?: '').trim().toLowerCase()
+                def matches = { r -> def nm = "${r.firstName ?: ''} ${r.lastName ?: ''}".toString();
+                    ([r.transactionNumber, r.productName, r.reason, nm, r.amendedByPartyId, r.oldValue, r.newValue]
+                        .collect { (it ?: '').toString().toLowerCase() }.any { it.contains(st) }) }
+                if (st) rows = rows.findAll(matches)
+                def esc = { v -> if (v == null) return ""; String s = v.toString().trim(); (s.contains(",")||s.contains("\"")||s.contains("\n")) ? "\"" + s.replace("\"","\"\"") + "\"" : s }
+                def dt = { v -> v == null ? "" : ec.l10n.format(v, 'dd-MM-yyyy HH:mm') }
+                def who = { r -> def nm = "${r.firstName ?: ''} ${r.lastName ?: ''}".toString().trim(); nm ?: (r.amendedByPartyId ?: '') }
+                StringBuilder csv = new StringBuilder()
+                csv.append("ZetaERP - Audit Report (Bill Edit Trail)\n")
+                csv.append("Generated: ${ec.l10n.format(ec.user.nowTimestamp, 'dd MMM yyyy HH:mm')}\n\n")
+                csv.append("Date / Time,Bill Number,Change Type,Product / Item,Old Value,New Value,Changed By,Terminal,Reason\n")
+                rows.each { r ->
+                    csv.append("${esc(dt(r.amendmentDate))},${esc(r.transactionNumber)},${esc(r.changeType)},${esc(r.productName)},${esc(r.oldValue)},${esc(r.newValue)},${esc(who(r))},${esc(r.terminalName)},${esc(r.reason)}\n")
+                }
+                ec.web.sendTextResponse(csv.toString(), "text/csv", "Audit_Report_${ec.l10n.format(ec.user.nowTimestamp, 'yyyyMMdd_HHmm')}.csv")
+            ]]></script>
+        </actions>
+        <default-response type="none"/>
+    </transition>
 
-        <entity-find entity-name="zenith.erp.pos.PosAmendmentView" list="auditList">
-            <search-form-inputs default-order-by="-amendmentDate"/>
-            <!-- ZE-SALES-014 f/u: org-isolate CSV/XLSX export (redirect from myOrg, which is null when the operator has no recent session) -->
-            <econdition field-name="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
-        </entity-find>
+    <transition name="downloadPdf" read-only="true">
+        <default-response url="${ec.web.getWebappRootUrl(false, null) + '/fop/apps/zenith/pos/BillAuditReportPdf?fromDate=' + (fromDate ?: '') + '&amp;thruDate=' + (thruDate ?: '') + '&amp;changeType=' + (changeType ?: '') + '&amp;changedBy=' + (changedBy ?: '') + '&amp;searchText=' + java.net.URLEncoder.encode(searchText ?: '', 'UTF-8')}" url-type="plain"/>
+    </transition>
+
+    <actions>
+        <set field="fromDate" from="fromDate ?: ''"/>
+        <set field="thruDate" from="thruDate ?: ''"/>
+        <set field="changeType" from="changeType ?: ''"/>
+        <set field="changedBy" from="changedBy ?: ''"/>
+        <set field="searchText" from="searchText ?: ''"/>
+
+        <script><![CDATA[
+            def _org = ec.user.getPreference("ACTIVE_ORGANIZATION")
+
+            // ---- distinct users for the "Changed By" filter (org-scoped, unaffected by other filters) ----
+            def optFind = ec.entity.find("zenith.erp.pos.PosAmendmentView")
+            if (_org) optFind.condition("organizationPartyId", _org)
+            def userSet = new LinkedHashMap()
+            optFind.list().each { r ->
+                if (r.amendedByPartyId && !userSet.containsKey(r.amendedByPartyId)) {
+                    def nm = "${r.firstName ?: ''} ${r.lastName ?: ''}".toString().trim()
+                    userSet[r.amendedByPartyId] = (nm ?: r.amendedByPartyId)
+                }
+            }
+            changedByOptions = userSet.collect { k, v -> [id: k, name: v] }.sort { it.name?.toString()?.toLowerCase() }
+
+            // ---- filtered audit rows ----
+            def f = ec.entity.find("zenith.erp.pos.PosAmendmentView")
+            if (_org) f.condition("organizationPartyId", _org)
+            if (fromDate) f.condition("amendmentDate", "greater-equals", java.sql.Timestamp.valueOf(fromDate + ' 00:00:00'))
+            if (thruDate) f.condition("amendmentDate", "less-equals", java.sql.Timestamp.valueOf(thruDate + ' 23:59:59'))
+            if (changeType) f.condition("changeType", changeType)
+            if (changedBy) f.condition("amendedByPartyId", changedBy)
+            f.orderBy("-amendmentDate")
+            def rows = f.list()
+            def st = (searchText ?: '').trim().toLowerCase()
+            if (st) rows = rows.findAll { r -> def nm = "${r.firstName ?: ''} ${r.lastName ?: ''}".toString();
+                [r.transactionNumber, r.productName, r.reason, nm, r.amendedByPartyId, r.oldValue, r.newValue]
+                    .collect { (it ?: '').toString().toLowerCase() }.any { it.contains(st) } }
+            auditList = rows
+
+            // ---- KPI counts (over the filtered set) ----
+            statTotal   = rows.size()
+            statAdded   = rows.count { it.changeType == 'ITEM_ADDED' }
+            statRemoved = rows.count { it.changeType == 'ITEM_REMOVED' }
+            statQty     = rows.count { it.changeType == 'QTY_CHANGE' }
+            statValue   = rows.count { it.changeType == 'PRICE_CHANGE' || it.changeType == 'DISCOUNT_CHANGE' }
+        ]]></script>
     </actions>
 
     <widgets>
         <render-mode><text type="html,qvt" template="true"><![CDATA[<details id="posHelp_billaudit" open style="background:#e8f0fe;border:1px solid #4285f4;border-left:6px solid #1a73e8;border-radius:10px;padding:10px 16px;margin:8px 12px 4px 12px;font-family:Segoe UI,Arial,sans-serif"><summary style="cursor:pointer;font-weight:800;font-size:15px;color:#174ea6;outline:none">&#128737; Audit Report &mdash; quick help <span style="font-weight:600;color:#5f6368;font-size:12px">(click to hide / show)</span></summary><div style="font-size:13px;color:#202124;line-height:1.9;margin-top:8px">A <b>tamper trail</b>: every edit made to an already-issued bill, showing the old and new values and who changed them.<br>Read-only &mdash; it exists to protect billing integrity.</div></details>]]></text></render-mode>
-        <container style="row items-center justify-end q-px-md q-pt-md q-gutter-sm">
-            <link url="goTerminal" text="Billing" icon="fa fa-calculator" btn-type="success" style="q-btn--dense"/>
-            <link url="goTransactions" text="Transactions" icon="fa fa-list" btn-type="info" style="q-btn--dense"/>
-            <link url="goReports" text="Reports" icon="fa fa-bar-chart" btn-type="warning" style="q-btn--dense"/>
-            <link url="goDashboard" text="Dashboard" icon="fa fa-dashboard" style="q-btn--dense"/>
-        </container>
-        <container-box>
-            <box-header title="Bill Edit Audit Trail"/>
-            <box-body>
-                <form-list name="AuditList" list="auditList" skip-form="true" header-dialog="true"
-                           select-columns="true" saved-finds="true" show-csv-button="true" show-all-button="true">
-                    <field name="amendmentDate"><header-field title="Date / Time" show-order-by="true"><date-period/></header-field>
+        <container style="q-pa-md">
+            <!-- Header -->
+            <container style="zsec-hdr q-mb-md">
+                <container>
+                    <container style="row items-center q-gutter-xs">
+                        <render-mode><text type="html,qvt"><![CDATA[<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#7C3AED" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/></svg>]]></text></render-mode>
+                        <label text="Audit Report" type="h5" style="text-weight-bold q-my-none"/>
+                    </container>
+                    <label text="Track and review all system changes and activities" type="span" style="z-statdesc"/>
+                </container>
+            </container>
+
+            <!-- Filter card -->
+            <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md q-mb-md">
+                <form-single name="AuditFilter" transition=".">
+                    <field name="searchText"><default-field title="Search">
+                        <text-line size="32" default-value="${searchText ?: ''}"/></default-field></field>
+                    <field name="fromDate"><default-field title="From Date">
+                        <date-time type="date" default-value="${fromDate}"/></default-field></field>
+                    <field name="thruDate"><default-field title="To Date">
+                        <date-time type="date" default-value="${thruDate}"/></default-field></field>
+                    <field name="changeType"><default-field title="Change Type">
+                        <drop-down allow-empty="false">
+                            <option key="" text="All Types"/>
+                            <option key="ITEM_ADDED" text="Item Added"/>
+                            <option key="ITEM_REMOVED" text="Item Removed"/>
+                            <option key="QTY_CHANGE" text="Quantity Changed"/>
+                            <option key="PRICE_CHANGE" text="Price Change"/>
+                        </drop-down></default-field></field>
+                    <field name="changedBy"><default-field title="Changed By">
+                        <drop-down allow-empty="false">
+                            <option key="" text="All Users"/>
+                            <list-options list="changedByOptions" key="${id}" text="${name}"/>
+                        </drop-down></default-field></field>
+                    <field name="submitButton"><default-field title="">
+                        <submit text="Search" icon="fa fa-search"/></default-field></field>
+                    <field name="resetBtn"><default-field title="">
+                        <link url="." text="Reset" icon="refresh" btn-type="default"/></default-field></field>
+                    <field-layout>
+                        <field-row><field-ref name="searchText"/><field-ref name="submitButton"/></field-row>
+                        <field-row><field-ref name="fromDate"/><field-ref name="thruDate"/><field-ref name="changeType"/><field-ref name="changedBy"/><field-ref name="resetBtn"/></field-row>
+                    </field-layout>
+                </form-single>
+                <container style="z-btnrow q-mt-sm">
+                    <link url="exportCsv" text="CSV" icon="download" link-type="anchor" style="z-obtn"/>
+                    <link url="downloadPdf" text="PDF" icon="picture_as_pdf" link-type="anchor" style="z-obtn"/>
+                </container>
+            </container>
+
+            <!-- 5 KPI stat cards -->
+            <container style="z-statrow">
+                <container style="z-statcell z-statcard-violet q-pa-md">
+                    <container style="z-statinner">
+                        <container style="z-icobadge lg primary"><label text="autorenew" type="span" style="material-icons"/></container>
+                        <container style="z-statmeta">
+                            <label text="Total Changes" type="span" style="z-statlabel"/>
+                            <label text="${statTotal ?: 0}" type="span" style="z-statnum z-txt-primary"/>
+                            <label text="All recorded changes" type="span" style="z-statdesc"/>
+                        </container>
+                    </container>
+                </container>
+                <container style="z-statcell z-statcard-blue q-pa-md">
+                    <container style="z-statinner">
+                        <container style="z-icobadge lg blue"><label text="add_circle" type="span" style="material-icons"/></container>
+                        <container style="z-statmeta">
+                            <label text="Item Added" type="span" style="z-statlabel"/>
+                            <label text="${statAdded ?: 0}" type="span" style="z-statnum z-amt-blue"/>
+                            <label text="New items added" type="span" style="z-statdesc"/>
+                        </container>
+                    </container>
+                </container>
+                <container style="z-statcell z-statcard-green q-pa-md">
+                    <container style="z-statinner">
+                        <container style="z-icobadge lg green"><label text="delete" type="span" style="material-icons"/></container>
+                        <container style="z-statmeta">
+                            <label text="Item Removed" type="span" style="z-statlabel"/>
+                            <label text="${statRemoved ?: 0}" type="span" style="z-statnum z-amt-green"/>
+                            <label text="Items removed" type="span" style="z-statdesc"/>
+                        </container>
+                    </container>
+                </container>
+                <container style="z-statcell z-statcard-orange q-pa-md">
+                    <container style="z-statinner">
+                        <container style="z-icobadge lg orange"><label text="swap_vert" type="span" style="material-icons"/></container>
+                        <container style="z-statmeta">
+                            <label text="Quantity Changed" type="span" style="z-statlabel"/>
+                            <label text="${statQty ?: 0}" type="span" style="z-statnum z-txt-orange"/>
+                            <label text="Quantity modifications" type="span" style="z-statdesc"/>
+                        </container>
+                    </container>
+                </container>
+                <container style="z-statcell z-statcard-violet q-pa-md">
+                    <container style="z-statinner">
+                        <container style="z-icobadge lg primary"><label text="currency_rupee" type="span" style="material-icons"/></container>
+                        <container style="z-statmeta">
+                            <label text="Value Changed" type="span" style="z-statlabel"/>
+                            <label text="${statValue ?: 0}" type="span" style="z-statnum z-txt-primary"/>
+                            <label text="Value modifications" type="span" style="z-statdesc"/>
+                        </container>
+                    </container>
+                </container>
+            </container>
+
+            <!-- Audit table -->
+            <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md">
+                <container style="row items-center q-mb-md q-gutter-sm">
+                    <label text="Bill Edit Audit Trail" type="h6" style="text-weight-bold q-my-none"/>
+                    <label text="${(auditList?.size() ?: 0)} changes" type="span" style="zenith-badge nd primary"/>
+                </container>
+                <form-list name="AuditList" list="auditList" list-entry="am" skip-form="true">
+                    <row-actions><script><![CDATA[
+                        def ct = am.changeType ?: ''
+                        badgeClass = (ct == 'ITEM_REMOVED') ? 'danger'
+                            : (ct == 'QTY_CHANGE') ? 'info'
+                            : (ct == 'ITEM_ADDED') ? 'success'
+                            : (ct == 'PRICE_CHANGE') ? 'primary'
+                            : (ct == 'DISCOUNT_CHANGE') ? 'warning' : 'grey'
+                        def nm = "${am.firstName ?: ''} ${am.lastName ?: ''}".toString().trim()
+                        changedByName = nm ?: (am.amendedByPartyId ?: '—')
+                    ]]></script></row-actions>
+                    <field name="amendmentDate"><header-field title="Date / Time"/>
                         <default-field><display format="dd-MM-yyyy HH:mm"/></default-field></field>
-                    <field name="transactionNumber"><header-field title="Bill Number" show-order-by="true"><text-find/></header-field>
-                        <default-field><display/></default-field></field>
-                    <field name="changeType"><header-field title="Change Type">
-                            <drop-down allow-empty="true">
-                                <option key="QTY_CHANGE" text="Qty Change"/>
-                                <option key="PRICE_CHANGE" text="Price Change"/>
-                                <option key="ITEM_ADDED" text="Item Added"/>
-                                <option key="ITEM_REMOVED" text="Item Removed"/>
-                            </drop-down></header-field>
-                        <default-field><display/></default-field></field>
-                    <field name="productName"><header-field title="Product"><text-find/></header-field>
-                        <default-field><display/></default-field></field>
-                    <field name="oldValue"><default-field title="Old Value"><display/></default-field></field>
-                    <field name="newValue"><default-field title="New Value"><display/></default-field></field>
-                    <field name="oldGrandTotal"><default-field title="Old Total"><display format="#,##,##0.00"/></default-field></field>
-                    <field name="newGrandTotal"><default-field title="New Total"><display format="#,##,##0.00"/></default-field></field>
-                    <field name="reason"><header-field title="Reason"><text-find/></header-field>
-                        <default-field><display/></default-field></field>
-                    <field name="amendedByPartyId"><header-field title="Changed By" show-order-by="true"><text-find/></header-field>
-                        <default-field><display/></default-field></field>
+                    <field name="transactionNumber"><header-field title="Bill Number"/>
+                        <default-field><label text="${am.transactionNumber ?: '—'}" type="span" style="z-idbadge"/></default-field></field>
+                    <field name="changeType"><header-field title="Change Type"/>
+                        <default-field><label text="${am.changeType ?: '—'}" type="span" style="zenith-badge nd ${badgeClass}"/></default-field></field>
+                    <field name="productName"><header-field title="Product / Item"/>
+                        <default-field><label text="${am.productName ?: '—'}" type="span" style="text-dark"/></default-field></field>
+                    <field name="oldValue"><header-field title="Old Value"/>
+                        <default-field><label text="${am.oldValue ?: '—'}" type="span" style="text-grey-8"/></default-field></field>
+                    <field name="newValue"><header-field title="New Value"/>
+                        <default-field><label text="${am.newValue ?: '—'}" type="span" style="text-dark text-weight-medium"/></default-field></field>
+                    <field name="amendedByPartyId"><header-field title="Changed By"/>
+                        <default-field><label text="${changedByName}" type="span" style="text-dark"/></default-field></field>
                     <field name="terminalName"><header-field title="Terminal"/>
-                        <default-field><display/></default-field></field>
-                    <field name="findButton"><header-field title="Find"><submit/></header-field></field>
+                        <default-field><label text="${am.terminalName ?: '—'}" type="span" style="z-plainlink"/></default-field></field>
+                    <field name="reason"><header-field title="Reason"/>
+                        <default-field><label text="${am.reason ?: '—'}" type="span" style="text-grey-8"/></default-field></field>
                 </form-list>
-            </box-body>
-        </container-box>
+            </container>
+        </container>
     </widgets>
 </screen>
