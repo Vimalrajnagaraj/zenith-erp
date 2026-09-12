@@ -10,20 +10,14 @@
     <transition name="updatePriceList">
         <actions>
             <service-call name="zenith.pricing.PricingServices.assert#PriceListAccess" in-map="[priceListId:priceListId]" out-map="_acc"/>
-            <!-- ZE-PRC-002 (PRC-040): reject an inverted validity window (Valid Thru earlier than Valid From) on edit;
-                 entity-auto update# does no cross-field validation. Skips the update (below) when invalid. -->
+            <!-- ZE-PRC-002 (PRC-040): reject an inverted validity window (Valid Thru earlier than Valid From) on edit. -->
             <service-call name="zenith.pricing.PricingServices.assert#ValidDateRange"
                           in-map="[validFromDate:validFromDate, validThruDate:validThruDate]" out-map="_dr"/>
-            <!-- ZE-PRC-025 (PRC-025 + f/u): validate the Fallback Price List server-side (the org-scoped
-                 dropdown only blocks the UI path; a tampered request could POST a self / cross-org / cyclic
-                 parentPriceListId). Rejects self, non-existent, cross-org, and cycle. Skips the update below
-                 when invalid. -->
+            <!-- ZE-PRC-025 (PRC-025 + f/u): validate the Fallback Price List server-side (self/cross-org/cyclic). -->
             <service-call name="zenith.pricing.PricingServices.assert#ValidPriceListParent"
                           in-map="[priceListId:priceListId, parentPriceListId:parentPriceListId]" out-map="_cy"/>
             <if condition="_acc.allowed &amp;&amp; _dr.valid &amp;&amp; _cy.valid">
-                <!-- ZE-PRC-003 (PRC-013): entity-auto update# doesn't enforce single-default, so editing a list to
-                     Default=Y could leave multiple same-currency defaults. Unset the others (org+type+currency,
-                     excluding this list) first. Resolve type/currency from the saved values, falling back to the row. -->
+                <!-- ZE-PRC-003 (PRC-013): entity-auto update# doesn't enforce single-default; unset the others first. -->
                 <if condition="isDefault == 'Y'">
                     <entity-find-one entity-name="zenith.erp.pricing.PriceList" value-field="_plRow"/>
                     <if condition="_plRow">
@@ -69,11 +63,41 @@
         </actions>
         <default-response url="."/>
     </transition>
+    <!-- ZE-PRC redesign: Delete Price List (items + volume first for FK) + Duplicate, org-guarded. -->
+    <transition name="deletePriceList">
+        <actions>
+            <service-call name="zenith.pricing.PricingServices.assert#PriceListAccess" in-map="[priceListId:priceListId]" out-map="_acc"/>
+            <if condition="_acc.allowed"><script><![CDATA[
+                ec.entity.find("zenith.erp.pricing.PriceListItem").condition("priceListId", priceListId).deleteAll()
+                ec.entity.find("zenith.erp.pricing.VolumePricing").condition("priceListId", priceListId).deleteAll()
+                ec.entity.find("zenith.erp.pricing.PriceList").condition("priceListId", priceListId).deleteAll()
+            ]]></script></if>
+        </actions>
+        <default-response url="../FindPriceList"/>
+    </transition>
+    <transition name="duplicatePriceList">
+        <actions>
+            <service-call name="zenith.pricing.PricingServices.assert#PriceListAccess" in-map="[priceListId:priceListId]" out-map="_acc"/>
+            <set field="newId" from="null"/>
+            <if condition="_acc.allowed"><script><![CDATA[
+                def src = ec.entity.find("zenith.erp.pricing.PriceList").condition("priceListId", priceListId).one()
+                if (src) {
+                    def created = ec.service.sync().name("create#zenith.erp.pricing.PriceList").parameters([
+                        priceListName: ((src.priceListName ?: 'Price List') + ' (copy)'), description: src.description,
+                        priceListTypeEnumId: src.priceListTypeEnumId, currencyUomId: src.currencyUomId,
+                        parentPriceListId: src.parentPriceListId, isDefault: 'N', isActive: 'N',
+                        validFromDate: src.validFromDate, validThruDate: src.validThruDate,
+                        roundingMode: src.roundingMode, roundingPrecision: src.roundingPrecision,
+                        organizationPartyId: src.organizationPartyId]).call()
+                    newId = created?.priceListId
+                }
+            ]]></script></if>
+        </actions>
+        <default-response url="../EditPriceList"><parameter name="priceListId" from="newId ?: priceListId"/></default-response>
+    </transition>
 
     <actions>
-        <!-- ZE-DASH-025: assert the price list belongs to this tenant BEFORE loading any of its data, so tenant B
-             can never render tenant A's price list by ID. `<return/>` in screen actions halts widget render, and
-             sendRedirect throws "Committed" in a subscreen, so gate with a noAccess flag instead. -->
+        <!-- ZE-DASH-025: assert the price list belongs to this tenant BEFORE loading any of its data. -->
         <service-call name="zenith.pricing.PricingServices.assert#PriceListAccess" in-map="[priceListId:priceListId]" out-map="_acc"/>
         <set field="noAccess" from="!(_acc.allowed)"/>
         <if condition="!noAccess">
@@ -86,6 +110,25 @@
                 <econdition field-name="priceListId"/>
                 <order-by field-name="productId,minQuantity"/>
             </entity-find>
+
+            <script><![CDATA[
+                def typeEnum = ec.entity.find("moqui.basic.Enumeration").condition("enumId", priceList.priceListTypeEnumId).one()
+                typeLabel = typeEnum?.description ?: (priceList.priceListTypeEnumId ?: '—')
+                typeShort = typeLabel.replace(' Price List', '').trim()
+                currencyLabel = priceList.currencyUomId ?: '—'
+                def curUom = ec.entity.find("moqui.basic.Uom").condition("uomId", priceList.currencyUomId).one()
+                currencyFull = (priceList.currencyUomId ?: '') + (curUom?.description ? (' — ' + curUom.description) : '')
+                statusActive = (priceList.isActive == 'Y')
+                statusLabel = statusActive ? 'Active' : 'Inactive'
+                itemCount = priceItems.size(); volumeCount = volumePrices.size()
+                def rmMap = [HALF_UP:'Half Up', HALF_DOWN:'Half Down', HALF_EVEN:'Half Even', UP:'Up', DOWN:'Down', CEILING:'Ceiling', FLOOR:'Floor']
+                roundingShort = rmMap[priceList.roundingMode] ?: (priceList.roundingMode ?: 'Half Up')
+                def rp = (priceList.roundingPrecision != null ? priceList.roundingPrecision : 2)
+                roundingSub = rp + ' decimal precision'
+                itemSub = priceItems ? ((priceItems[0].pseudoId ?: '') + (priceItems[0].productName ? (' · ' + priceItems[0].productName) : '')) : 'No items yet'
+                volumeSub = (volumeCount > 0) ? 'Quantity break active' : 'No volume rules'
+                hasVolume = (volumeCount > 0)
+            ]]></script>
         </if>
     </actions>
 
@@ -97,180 +140,237 @@
             </container>
         </widgets></section>
         <section name="prc_hasAccess" condition="!noAccess"><widgets>
-        <!-- ZE-PRC-001 (PRC-030/050): the Add Item / Add Volume Price dialogs "shake up/down" in real Chrome/Edge
-             (the visible modal-dialog transform oscillates). Pin transform + kill transition/animation on JUST these
-             two modals (by id) so the popup stays still and users can type. /apps renders injected <style>; on /qapps
-             the ids don't match so it's a no-op. Injected via <img onload> so it survives the /qapps script/style strip. -->
-        <render-mode><text type="html,qvt" template="true"><![CDATA[
-            <img src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" alt="" style="display:none" onload="if(!document.getElementById('zPrc001DlgFix')){var s=document.createElement('style');s.id='zPrc001DlgFix';s.textContent='#AddPriceItem .modal-dialog,#AddVolumePricing .modal-dialog{transition:none !important;transform:none !important;animation:none !important}';document.head.appendChild(s);}"/>
-        ]]></text></render-mode>
-        <container style="row items-center justify-between q-mb-lg">
-            <label text="Price List: ${priceList?.priceListName}" type="h4" style="text-weight-bold q-my-none"/>
-            <link url="../FindPriceList" text="Back to List" style="text-primary"/>
-        </container>
+        <!-- cross-surface interaction bootstrap: 3-tab switching, 2 add-form toggles, Update + Duplicate forwarding -->
+        <render-mode><text type="html,qvt"><![CDATA[<img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" alt="" style="display:none" onload="(function(){if(window.__pplInit)return;window.__pplInit=1;document.addEventListener('click',function(ev){var t=ev.target.closest?ev.target.closest('.prr-tab,.prr-additem-toggle,.prr-additem-cancel,.prr-addvol-toggle,.prr-addvol-cancel,.prr-update-btn,.prr-dup-btn'):null;if(!t)return;if(t.classList.contains('prr-tab')){var n=t.getAttribute('data-tab');[].forEach.call(document.querySelectorAll('.prr-tab'),function(x){if(x===t)x.classList.add('prr-active');else x.classList.remove('prr-active');});[].forEach.call(document.querySelectorAll('.prr-panel'),function(p){if(p.className.indexOf('prr-panel-'+n)>=0)p.classList.add('prr-active');else p.classList.remove('prr-active');});}else if(t.classList.contains('prr-additem-toggle')){var f=document.querySelector('.prr-additem-form');if(f)f.classList.toggle('prr-show');}else if(t.classList.contains('prr-additem-cancel')){var f=document.querySelector('.prr-additem-form');if(f)f.classList.remove('prr-show');}else if(t.classList.contains('prr-addvol-toggle')){var f=document.querySelector('.prr-addvol-form');if(f)f.classList.toggle('prr-show');}else if(t.classList.contains('prr-addvol-cancel')){var f=document.querySelector('.prr-addvol-form');if(f)f.classList.remove('prr-show');}else if(t.classList.contains('prr-update-btn')){var s=document.getElementById('UpdatePriceList_submitBtn');if(s)s.click();}else if(t.classList.contains('prr-dup-btn')){var d=document.querySelector('.prr-dup-real');if(d)d.click();}},true);})()"/>]]></text></render-mode>
+        <link url="duplicatePriceList" text="Duplicate" parameter-map="[priceListId:priceList.priceListId]" style="prr-dup-real"/>
 
-        <!-- Price List Details -->
-        <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-lg">
-            <label text="Price List Details" type="h5" style="text-weight-bold q-mb-md"/>
-            <form-single name="UpdatePriceList" transition="updatePriceList" map="priceList">
-                <field name="priceListId"><default-field><hidden/></default-field></field>
-                <field name="priceListName"><default-field title="Name"><text-line size="40"/></default-field></field>
-                <field name="description"><default-field><text-area rows="2" cols="50"/></default-field></field>
-                <field name="priceListTypeEnumId"><default-field title="Type">
-                    <drop-down><entity-options key="${enumId}" text="${description}">
-                        <entity-find entity-name="moqui.basic.Enumeration">
-                            <econdition field-name="enumTypeId" value="PriceListType"/>
-                        </entity-find>
-                    </entity-options></drop-down></default-field></field>
-                <field name="currencyUomId"><default-field title="Currency">
-                    <drop-down><entity-options key="${uomId}" text="${abbreviation} - ${description}">
-                        <entity-find entity-name="moqui.basic.Uom">
-                            <econdition field-name="uomTypeEnumId" value="UT_CURRENCY_MEASURE"/>
-                        </entity-find>
-                    </entity-options></drop-down></default-field></field>
-                <field name="parentPriceListId"><default-field title="Fallback Price List">
-                    <drop-down allow-empty="true"><entity-options key="${priceListId}" text="${priceListName}">
-                        <entity-find entity-name="zenith.erp.pricing.PriceList">
-                            <econdition field-name="isActive" value="Y"/>
-                            <econdition field-name="priceListId" operator="not-equals" from="priceListId"/>
-                            <econdition field-name="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
-                        </entity-find>
-                    </entity-options></drop-down></default-field></field>
-                <field name="isDefault"><default-field title="Default?">
-                    <drop-down><option key="N" text="No"/><option key="Y" text="Yes"/></drop-down>
-                </default-field></field>
-                <field name="isActive"><default-field title="Active?">
-                    <drop-down><option key="Y" text="Active"/><option key="N" text="Inactive"/></drop-down>
-                </default-field></field>
-                <field name="validFromDate"><default-field title="Valid From"><date-time type="date"/></default-field></field>
-                <field name="validThruDate"><default-field title="Valid Thru"><date-time type="date"/></default-field></field>
-                <!-- ZE-PRC-022: expose the rounding config (the entity + create#/update# services already carry
-                     roundingMode/roundingPrecision, and calculate#Price applies them via
-                     setScale(roundingPrecision, RoundingMode.valueOf(roundingMode))). Options are the valid
-                     java.math.RoundingMode names; an invalid value falls back to HALF_UP/2 in calculate#Price. -->
-                <field name="roundingMode"><default-field title="Rounding Mode">
-                    <drop-down no-current-selected-key="HALF_UP">
-                        <option key="HALF_UP" text="Half Up (.5 away from zero)"/>
-                        <option key="HALF_DOWN" text="Half Down (.5 toward zero)"/>
-                        <option key="HALF_EVEN" text="Half Even (banker's rounding)"/>
-                        <option key="UP" text="Up (away from zero)"/>
-                        <option key="DOWN" text="Down (toward zero / truncate)"/>
-                        <option key="CEILING" text="Ceiling (toward +infinity)"/>
-                        <option key="FLOOR" text="Floor (toward -infinity)"/>
-                    </drop-down>
-                </default-field></field>
-                <field name="roundingPrecision"><default-field title="Rounding Precision (decimals)">
-                    <drop-down no-current-selected-key="2">
-                        <option key="0" text="0"/><option key="1" text="1"/><option key="2" text="2"/>
-                        <option key="3" text="3"/><option key="4" text="4"/>
-                    </drop-down>
-                </default-field></field>
-                <field name="submitBtn">
-                    <conditional-field name="prc_plist_save_write" condition="modCanWrite" title="Update"><submit/></conditional-field>
-                    <default-field title="Update"><label text="You have view-only access — changes are disabled." type="span" style="text-grey-7"/></default-field>
-                </field>
-            </form-single>
-        </container>
+        <container style="prr-wrap">
+            <render-mode><text type="html,qvt" template="true"><![CDATA[
+<div class="prr-breadcrumb"><a href="../FindPriceList">Pricing</a><span>/</span><a href="../FindPriceList">Price Lists</a><span>/</span><span class="prr-bc-cur">${priceList.priceListName!"Price List"}</span></div>
+<div class="prr-header">
+  <div class="prr-avatar"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg></div>
+  <div class="prr-hmeta">
+    <h1>${priceList.priceListName!"Price List"}</h1>
+    <div class="prr-metarow">
+      <span>${typeLabel}</span><span class="prr-sep">|</span><span>${currencyFull}</span>
+      <span class="prr-badge ${statusActive?string('prr-badge-green','prr-badge-grey')}">${statusLabel}</span>
+      <span class="prr-badge prr-badge-purple">${itemCount} Item${(itemCount==1)?string('','s')}</span>
+      <#if hasVolume><span class="prr-badge prr-badge-blue">Volume Pricing</span></#if>
+    </div>
+  </div>
+  <div class="prr-hactions">
+    <button type="button" class="prr-btn prr-btn-outline prr-dup-btn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>Duplicate</button>
+    <button type="button" class="prr-btn prr-btn-primary prr-update-btn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>Update Price List</button>
+  </div>
+</div>
+<div class="prr-stats">
+  <div class="prr-stat"><div class="prr-stat-label">Type</div><div class="prr-stat-value" style="font-size:18px">${typeShort}</div><div class="prr-stat-sub">Price List</div></div>
+  <div class="prr-stat"><div class="prr-stat-label">Price Items</div><div class="prr-stat-value" style="color:#7C3AED">${itemCount}</div><div class="prr-stat-sub">${itemSub}</div></div>
+  <div class="prr-stat"><div class="prr-stat-label">Volume Rules</div><div class="prr-stat-value" style="color:#D97706">${volumeCount}</div><div class="prr-stat-sub">${volumeSub}</div></div>
+  <div class="prr-stat"><div class="prr-stat-label">Rounding</div><div class="prr-stat-value" style="font-size:16px">${roundingShort}</div><div class="prr-stat-sub">${roundingSub}</div></div>
+</div>
+<div class="prr-tabs"><button type="button" class="prr-tab prr-active" data-tab="details">List Details</button><button type="button" class="prr-tab" data-tab="items">Price Items</button><button type="button" class="prr-tab" data-tab="volume">Volume Pricing</button></div>
+            ]]></text></render-mode>
 
-        <!-- Price List Items -->
-        <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-lg">
-            <container style="row items-center justify-between q-mb-md">
-                <label text="Price Items" type="h5" style="text-weight-bold q-my-none"/>
-                <section name="prc_AddPriceItem_write"><condition><expression>modCanWrite</expression></condition><widgets>
-                <container-dialog id="AddPriceItem" button-text="Add Item" type="success">
-                    <form-single name="AddPriceItemForm" transition="setPriceItem">
-                        <field name="priceListId"><default-field><hidden default-value="${priceListId}"/></default-field></field>
-                        <field name="productId"><default-field title="Product">
-                            <drop-down><entity-options key="${productId}" text="${pseudoId} - ${productName}">
-                                <entity-find entity-name="mantle.product.Product">
-                                    <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
-                                    <order-by field-name="pseudoId"/>
+            <container style="prr-tabbody">
+                <!-- ===== List Details ===== -->
+                <container style="prr-panel prr-panel-details prr-active">
+                    <form-single name="UpdatePriceList" transition="updatePriceList" map="priceList">
+                        <field name="priceListId"><default-field><hidden/></default-field></field>
+                        <field name="priceListName"><default-field title="Name"><text-line size="40"/></default-field></field>
+                        <field name="priceListTypeEnumId"><default-field title="Type">
+                            <drop-down><entity-options key="${enumId}" text="${description}">
+                                <entity-find entity-name="moqui.basic.Enumeration"><econdition field-name="enumTypeId" value="PriceListType"/><order-by field-name="sequenceNum"/></entity-find>
+                            </entity-options></drop-down></default-field></field>
+                        <field name="currencyUomId"><default-field title="Currency">
+                            <drop-down><entity-options key="${uomId}" text="${abbreviation} - ${description}">
+                                <entity-find entity-name="moqui.basic.Uom"><econdition field-name="uomTypeEnumId" value="UT_CURRENCY_MEASURE"/><order-by field-name="abbreviation"/></entity-find>
+                            </entity-options></drop-down></default-field></field>
+                        <field name="description"><default-field title="Description"><text-area rows="2" cols="60"/></default-field></field>
+                        <field name="parentPriceListId"><default-field title="Fallback Price List">
+                            <drop-down allow-empty="true"><entity-options key="${priceListId}" text="${priceListName}">
+                                <entity-find entity-name="zenith.erp.pricing.PriceList">
+                                    <econdition field-name="isActive" value="Y"/>
+                                    <econdition field-name="priceListId" operator="not-equals" from="priceListId"/>
+                                    <econdition field-name="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
                                 </entity-find>
                             </entity-options></drop-down></default-field></field>
-                        <!-- ZE-PRC-014 (PRC-082): support Discount-type items. Fixed => enter Unit Price; Discount =>
-                             enter Discount % (calculate#Price prices it as MRP*(100-discount%)/100). set#PriceListItem
-                             requires the matching field per type and stores a 0 unit price for a discount item. -->
-                        <field name="priceTypeEnumId"><default-field title="Price Type">
-                            <drop-down no-current-selected-key="PtpFixed">
-                                <option key="PtpFixed" text="Fixed Price"/>
-                                <option key="PtpDiscount" text="Discount % off MRP"/>
-                            </drop-down></default-field></field>
-                        <field name="unitPrice"><default-field title="Unit Price (Fixed)"><text-line size="12" format="₹#,##0.00"/></default-field></field>
-                        <field name="discountPercent"><default-field title="Discount % (Discount type)"><text-line size="8"/></default-field></field>
-                        <field name="minQuantity"><default-field title="Min Qty"><text-line size="8" default-value="1"/></default-field></field>
-                        <field name="maxQuantity"><default-field title="Max Qty"><text-line size="8"/></default-field></field>
-                        <!-- ZE-PRC-021: item-level validity. The entity + set#PriceListItem already carry these, and
-                             calculate#Price's price-list-item find already has a <date-filter> on them (an expired
-                             item is skipped -> it falls back to the parent price list / list price). Leave blank for
-                             an always-valid item; set Valid Thru in the past to expire this item's price. -->
+                        <field name="isDefault"><default-field title="Default?">
+                            <drop-down><option key="N" text="No"/><option key="Y" text="Yes"/></drop-down></default-field></field>
+                        <field name="isActive"><default-field title="Status">
+                            <drop-down><option key="Y" text="Active"/><option key="N" text="Inactive"/></drop-down></default-field></field>
                         <field name="validFromDate"><default-field title="Valid From"><date-time type="date"/></default-field></field>
                         <field name="validThruDate"><default-field title="Valid Thru"><date-time type="date"/></default-field></field>
-                        <field name="changeReason"><default-field title="Reason"><text-line size="30"/></default-field></field>
-                        <field name="submitBtn"><default-field title="Add"><submit/></default-field></field>
+                        <field name="roundingMode"><default-field title="Rounding Mode">
+                            <drop-down no-current-selected-key="HALF_UP">
+                                <option key="HALF_UP" text="Half Up (.5 away from zero)"/><option key="HALF_DOWN" text="Half Down (.5 toward zero)"/>
+                                <option key="HALF_EVEN" text="Half Even (banker's rounding)"/><option key="UP" text="Up (away from zero)"/>
+                                <option key="DOWN" text="Down (toward zero / truncate)"/><option key="CEILING" text="Ceiling (toward +infinity)"/><option key="FLOOR" text="Floor (toward -infinity)"/>
+                            </drop-down></default-field></field>
+                        <field name="roundingPrecision"><default-field title="Rounding Precision (decimals)">
+                            <drop-down no-current-selected-key="2"><option key="0" text="0"/><option key="1" text="1"/><option key="2" text="2"/><option key="3" text="3"/><option key="4" text="4"/></drop-down></default-field></field>
+                        <field name="submitBtn">
+                            <conditional-field name="prc_plist_save_write" condition="modCanWrite" title=""><submit text="Update Price List"/></conditional-field>
+                            <default-field title=""><label text="You have view-only access — changes are disabled." type="span" style="text-grey-7"/></default-field></field>
+                        <field-layout>
+                            <field-group title="Basic Information">
+                                <field-row><field-ref name="priceListName"/><field-ref name="priceListTypeEnumId"/><field-ref name="currencyUomId"/></field-row>
+                                <field-ref name="description"/>
+                            </field-group>
+                            <field-group title="Configuration">
+                                <field-row><field-ref name="parentPriceListId"/><field-ref name="isDefault"/><field-ref name="isActive"/></field-row>
+                            </field-group>
+                            <field-group title="Validity &amp; Rounding">
+                                <field-row><field-ref name="validFromDate"/><field-ref name="validThruDate"/><field-ref name="roundingMode"/></field-row>
+                                <field-row><field-ref name="roundingPrecision"/></field-row>
+                            </field-group>
+                            <field-ref name="priceListId"/>
+                            <field-ref name="submitBtn"/>
+                        </field-layout>
                     </form-single>
-                </container-dialog>
-                </widgets></section>
-            </container>
-            <form-list name="PriceItemsForm" list="priceItems" skip-form="true" show-csv-button="true" show-xlsx-button="true">
-                <field name="pseudoId"><default-field title="SKU"><display/></default-field></field>
-                <field name="productName"><default-field title="Product"><display/></default-field></field>
-                <field name="unitPrice"><default-field title="Price"><display format="₹#,##0.00"/></default-field></field>
-                <field name="minQuantity"><default-field title="Min Qty"><display/></default-field></field>
-                <field name="maxQuantity"><default-field title="Max Qty"><display/></default-field></field>
-                <field name="validFromDate"><default-field title="Valid From"><display format="dd-MMM-yyyy"/></default-field></field>
-                <field name="validThruDate"><default-field title="Valid Thru"><display format="dd-MMM-yyyy"/></default-field></field>
-                <field name="priceTypeEnumId"><default-field title="Type">
-                    <display-entity entity-name="moqui.basic.Enumeration" key-field-name="enumId" text="${description}"/>
-                </default-field></field>
-                <field name="discountPercent"><default-field title="Discount %"><display format="#0.##"/></default-field></field>
-                <field name="deleteBtn">
-                    <conditional-field name="prc_pitem_del_write" condition="modCanWrite" title="">
-                    <link url="deletePriceItem" text="Remove" parameter-map="[priceListItemId:priceListItemId]"
-                          confirmation="Remove this price item?" style="text-negative"/>
-                    </conditional-field>
-                    <default-field title=""><label text="" type="span"/></default-field>
-                </field>
-            </form-list>
-        </container>
+                </container>
 
-        <!-- Volume Pricing -->
-        <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg">
-            <container style="row items-center justify-between q-mb-md">
-                <label text="Volume / Quantity Break Pricing" type="h5" style="text-weight-bold q-my-none"/>
-                <section name="prc_AddVolumePricing_write"><condition><expression>modCanWrite</expression></condition><widgets>
-                <container-dialog id="AddVolumePricing" button-text="Add Volume Price" type="success">
-                    <form-single name="AddVolumePricingForm" transition="setVolumePricing">
-                        <field name="priceListId"><default-field><hidden default-value="${priceListId}"/></default-field></field>
-                        <field name="productId"><default-field title="Product">
-                            <drop-down><entity-options key="${productId}" text="${pseudoId} - ${productName}">
-                                <entity-find entity-name="mantle.product.Product">
-                                    <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
-                                    <order-by field-name="pseudoId"/>
-                                </entity-find>
-                            </entity-options></drop-down></default-field></field>
-                        <field name="minQuantity"><default-field title="Min Qty"><text-line size="8"/></default-field></field>
-                        <field name="maxQuantity"><default-field title="Max Qty"><text-line size="8"/></default-field></field>
-                        <field name="unitPrice"><default-field title="Unit Price"><text-line size="12" format="₹#,##0.00"/></default-field></field>
-                        <field name="discountPercent"><default-field title="Or Discount %"><text-line size="8"/></default-field></field>
-                        <field name="submitBtn"><default-field title="Add"><submit/></default-field></field>
-                    </form-single>
-                </container-dialog>
-                </widgets></section>
+                <!-- ===== Price Items ===== -->
+                <container style="prr-panel prr-panel-items">
+                    <render-mode><text type="html,qvt"><![CDATA[
+<div class="prr-sectitle"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>Price Items</div>
+<div class="prr-condtoolbar"><p>Items with fixed or discounted prices in this list.</p><button type="button" class="prr-btn prr-btn-outline prr-additem-toggle"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>Add Item</button></div>
+                    ]]></text></render-mode>
+                    <section name="prc_AddPriceItem_write"><condition><expression>modCanWrite</expression></condition><widgets>
+                    <container style="prr-addform prr-additem-form">
+                        <form-single name="AddPriceItemForm" transition="setPriceItem">
+                            <field name="priceListId"><default-field><hidden default-value="${priceListId}"/></default-field></field>
+                            <field name="productId"><default-field title="Product">
+                                <drop-down><entity-options key="${productId}" text="${pseudoId} - ${productName}">
+                                    <entity-find entity-name="mantle.product.Product"><econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/><order-by field-name="pseudoId"/></entity-find>
+                                </entity-options></drop-down></default-field></field>
+                            <field name="priceTypeEnumId"><default-field title="Type">
+                                <drop-down no-current-selected-key="PtpFixed"><option key="PtpFixed" text="Fixed Price"/><option key="PtpDiscount" text="Discount % off MRP"/></drop-down></default-field></field>
+                            <field name="unitPrice"><default-field title="Price (₹)"><text-line size="12" format="₹#,##0.00"/></default-field></field>
+                            <field name="discountPercent"><default-field title="Discount %"><text-line size="8"/></default-field></field>
+                            <field name="minQuantity"><default-field title="Min Qty"><text-line size="8" default-value="1"/></default-field></field>
+                            <field name="maxQuantity"><default-field title="Max Qty"><text-line size="8"/></default-field></field>
+                            <field name="validFromDate"><default-field title="Valid From"><date-time type="date"/></default-field></field>
+                            <field name="validThruDate"><default-field title="Valid Thru"><date-time type="date"/></default-field></field>
+                            <field name="changeReason"><default-field title="Reason"><text-line size="24"/></default-field></field>
+                            <field name="cancelBtn"><default-field title="">
+                                <render-mode><text type="html,qvt"><![CDATA[<button type="button" class="prr-btn prr-btn-ghost prr-additem-cancel">Cancel</button>]]></text></render-mode></default-field></field>
+                            <field name="submitBtn"><default-field title=""><submit text="Add Item"/></default-field></field>
+                            <field-layout>
+                                <field-row><field-ref name="productId"/><field-ref name="priceTypeEnumId"/><field-ref name="unitPrice"/></field-row>
+                                <field-row><field-ref name="discountPercent"/><field-ref name="minQuantity"/><field-ref name="maxQuantity"/></field-row>
+                                <field-row><field-ref name="validFromDate"/><field-ref name="validThruDate"/><field-ref name="changeReason"/></field-row>
+                                <field-ref name="priceListId"/>
+                                <field-row><field-ref name="cancelBtn"/><field-ref name="submitBtn"/></field-row>
+                            </field-layout>
+                        </form-single>
+                    </container>
+                    </widgets></section>
+                    <container style="prr-condtable">
+                        <form-list name="PriceItemsForm" list="priceItems" list-entry="pi" skip-form="true" show-csv-button="true" show-xlsx-button="true">
+                            <row-actions><script><![CDATA[
+                                def z = com.zenith.Fmt.INSTANCE
+                                skuStr = pi.pseudoId ?: '—'
+                                prodStr = pi.productName ?: '—'
+                                priceStr = (pi.unitPrice != null) ? ('₹' + z.inr(ec.l10n.format(pi.unitPrice, '#,##0.00'))) : '—'
+                                minqStr = (pi.minQuantity != null) ? pi.minQuantity.toString() : '1'
+                                maxqStr = (pi.maxQuantity != null) ? pi.maxQuantity.toString() : '—'
+                                vfStr = pi.validFromDate ? ec.l10n.format(pi.validFromDate, 'dd-MMM-yyyy') : '—'
+                                vtStr = pi.validThruDate ? ec.l10n.format(pi.validThruDate, 'dd-MMM-yyyy') : '—'
+                                def pt = ec.entity.find("moqui.basic.Enumeration").condition("enumId", pi.priceTypeEnumId).one()
+                                typeItemLabel = pt?.description ?: (pi.priceTypeEnumId ?: 'Fixed Price')
+                                typeItemBadge = (pi.priceTypeEnumId == 'PtpDiscount') ? 'warning' : 'primary'
+                                discStr = (pi.discountPercent != null) ? (ec.l10n.format(pi.discountPercent, '#0.##') + '%') : '—'
+                            ]]></script></row-actions>
+                            <field name="pseudoId"><header-field title="SKU"/><default-field><label text="${skuStr}" type="span" style="prr-mono"/></default-field></field>
+                            <field name="productName"><header-field title="Product"/><default-field><label text="${prodStr}" type="span" style="text-weight-bold text-dark"/></default-field></field>
+                            <field name="unitPrice"><header-field title="Price"/><default-field><label text="${priceStr}" type="span" style="text-dark text-weight-medium"/></default-field></field>
+                            <field name="minQuantity"><header-field title="Min Qty"/><default-field><label text="${minqStr}" type="span" style="text-dark"/></default-field></field>
+                            <field name="maxQuantity"><header-field title="Max Qty"/><default-field><label text="${maxqStr}" type="span" style="text-grey-6"/></default-field></field>
+                            <field name="validFromDate"><header-field title="Valid From"/><default-field><label text="${vfStr}" type="span" style="text-grey-7"/></default-field></field>
+                            <field name="validThruDate"><header-field title="Valid Thru"/><default-field><label text="${vtStr}" type="span" style="text-grey-7"/></default-field></field>
+                            <field name="priceTypeEnumId"><header-field title="Type"/><default-field><label text="${typeItemLabel}" type="span" style="zenith-badge nd ${typeItemBadge}"/></default-field></field>
+                            <field name="discountPercent"><header-field title="Discount %"/><default-field><label text="${discStr}" type="span" style="text-grey-7"/></default-field></field>
+                            <field name="deleteBtn">
+                                <conditional-field name="prc_pitem_del_write" condition="modCanWrite" title="">
+                                    <link url="deletePriceItem" text="Remove" icon="fa fa-trash" parameter-map="[priceListItemId:pi.priceListItemId]" confirmation="Remove this price item?" style="prr-btn-danger-sm"/>
+                                </conditional-field>
+                                <default-field title=""><label text="" type="span"/></default-field></field>
+                        </form-list>
+                    </container>
+                </container>
+
+                <!-- ===== Volume Pricing ===== -->
+                <container style="prr-panel prr-panel-volume">
+                    <render-mode><text type="html,qvt"><![CDATA[
+<div class="prr-sectitle"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>Volume / Quantity Break Pricing</div>
+<div class="prr-condtoolbar"><p>Tiered pricing rules that apply when order quantities fall within specific ranges.</p><button type="button" class="prr-btn prr-btn-outline prr-addvol-toggle"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>Add Volume Price</button></div>
+                    ]]></text></render-mode>
+                    <section name="prc_AddVolumePricing_write"><condition><expression>modCanWrite</expression></condition><widgets>
+                    <container style="prr-addform prr-addvol-form">
+                        <form-single name="AddVolumePricingForm" transition="setVolumePricing">
+                            <field name="priceListId"><default-field><hidden default-value="${priceListId}"/></default-field></field>
+                            <field name="productId"><default-field title="Product">
+                                <drop-down><entity-options key="${productId}" text="${pseudoId} - ${productName}">
+                                    <entity-find entity-name="mantle.product.Product"><econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/><order-by field-name="pseudoId"/></entity-find>
+                                </entity-options></drop-down></default-field></field>
+                            <field name="minQuantity"><default-field title="Min Qty"><text-line size="8"/></default-field></field>
+                            <field name="maxQuantity"><default-field title="Max Qty"><text-line size="8"/></default-field></field>
+                            <field name="unitPrice"><default-field title="Price (₹)"><text-line size="12" format="₹#,##0.00"/></default-field></field>
+                            <field name="discountPercent"><default-field title="Discount %"><text-line size="8"/></default-field></field>
+                            <field name="cancelBtn"><default-field title="">
+                                <render-mode><text type="html,qvt"><![CDATA[<button type="button" class="prr-btn prr-btn-ghost prr-addvol-cancel">Cancel</button>]]></text></render-mode></default-field></field>
+                            <field name="submitBtn"><default-field title=""><submit text="Add Volume Price"/></default-field></field>
+                            <field-layout>
+                                <field-row><field-ref name="productId"/><field-ref name="minQuantity"/><field-ref name="maxQuantity"/></field-row>
+                                <field-row><field-ref name="unitPrice"/><field-ref name="discountPercent"/></field-row>
+                                <field-ref name="priceListId"/>
+                                <field-row><field-ref name="cancelBtn"/><field-ref name="submitBtn"/></field-row>
+                            </field-layout>
+                        </form-single>
+                    </container>
+                    </widgets></section>
+                    <container style="prr-condtable">
+                        <form-list name="VolumePricesForm" list="volumePrices" list-entry="vp" skip-form="true">
+                            <row-actions><script><![CDATA[
+                                def z = com.zenith.Fmt.INSTANCE
+                                vProd = vp.productId ?: '—'
+                                vMin = (vp.minQuantity != null) ? vp.minQuantity.toString() : '—'
+                                vMax = (vp.maxQuantity != null) ? vp.maxQuantity.toString() : '—'
+                                vPrice = (vp.unitPrice != null) ? ('₹' + z.inr(ec.l10n.format(vp.unitPrice, '#,##0.00'))) : '—'
+                                vDisc = (vp.discountPercent != null) ? (ec.l10n.format(vp.discountPercent, '#0.##') + '%') : '—'
+                            ]]></script></row-actions>
+                            <field name="productId"><header-field title="Product"/><default-field><label text="${vProd}" type="span" style="prr-mono text-weight-bold"/></default-field></field>
+                            <field name="minQuantity"><header-field title="Min Qty"/><default-field><label text="${vMin}" type="span" style="text-dark"/></default-field></field>
+                            <field name="maxQuantity"><header-field title="Max Qty"/><default-field><label text="${vMax}" type="span" style="text-dark"/></default-field></field>
+                            <field name="unitPrice"><header-field title="Price"/><default-field><label text="${vPrice}" type="span" style="text-dark text-weight-medium"/></default-field></field>
+                            <field name="discountPercent"><header-field title="Discount %"/><default-field><label text="${vDisc}" type="span" style="text-grey-7"/></default-field></field>
+                            <field name="deleteBtn">
+                                <conditional-field name="prc_vol_del_write" condition="modCanWrite" title="">
+                                    <link url="deleteVolumePricing" text="Remove" icon="fa fa-trash" parameter-map="[volumePricingId:vp.volumePricingId]" confirmation="Remove this volume price?" style="prr-btn-danger-sm"/>
+                                </conditional-field>
+                                <default-field title=""><label text="" type="span"/></default-field></field>
+                        </form-list>
+                    </container>
+                    <section name="prc_volsummary" condition="hasVolume"><widgets>
+                        <render-mode><text type="html,qvt" template="true"><![CDATA[
+<div class="prr-summary">
+  <div class="prr-summary-title"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>Volume Pricing Summary</div>
+  <div class="prr-summary-body">${volumeCount} quantity-break tier${(volumeCount==1)?string('','s')} configured. Orders whose quantity falls in a tier's Min–Max range get that tier's price; quantities outside every tier fall back to the standard list price.</div>
+</div>
+                        ]]></text></render-mode>
+                    </widgets></section>
+                </container>
+
+                <!-- ===== Save bar ===== -->
+                <container style="prr-savebar">
+                    <link url="deletePriceList" text="Delete Price List" parameter-map="[priceListId:priceList.priceListId]"
+                          confirmation="Delete this price list and all its items and volume rules? This cannot be undone." style="prr-btn-danger"/>
+                    <container style="prr-savebar-spacer"/>
+                    <link url="." text="Discard Changes" style="prr-btn-outline"/>
+                    <render-mode><text type="html,qvt"><![CDATA[<button type="button" class="prr-btn prr-btn-primary prr-update-btn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>Update Price List</button>]]></text></render-mode>
+                </container>
             </container>
-            <form-list name="VolumePricesForm" list="volumePrices" skip-form="true">
-                <field name="productId"><default-field title="Product"><display/></default-field></field>
-                <field name="minQuantity"><default-field title="Min Qty"><display/></default-field></field>
-                <field name="maxQuantity"><default-field title="Max Qty"><display/></default-field></field>
-                <field name="unitPrice"><default-field title="Price"><display format="₹#,##0.00"/></default-field></field>
-                <field name="discountPercent"><default-field title="Discount %"><display format="#0.##"/></default-field></field>
-                <field name="deleteBtn">
-                    <conditional-field name="prc_vol_del_write" condition="modCanWrite" title="">
-                    <link url="deleteVolumePricing" text="Remove" parameter-map="[volumePricingId:volumePricingId]"
-                          confirmation="Remove this volume price?" style="text-negative"/>
-                    </conditional-field>
-                    <default-field title=""><label text="" type="span"/></default-field>
-                </field>
-            </form-list>
         </container>
         </widgets></section>
     </widgets>
