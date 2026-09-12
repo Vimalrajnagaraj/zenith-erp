@@ -6,14 +6,11 @@
     <transition name="createSubscription" begin-transaction="true">
         <service-call name="zenith.subscriptions.SubscriptionServices.create#Subscription"/>
         <default-response url="../EditSubscription"/>
-        <!-- On validation error (e.g. no active org, invalid discount) stay on the list and show the message
-             instead of redirecting to EditSubscription with no subscriptionId. -->
+        <!-- On validation error (e.g. no active org, invalid discount) stay on the list and show the message. -->
         <error-response url="."/>
     </transition>
     <transition name="editSubscription"><default-response url="../EditSubscription"/></transition>
-    <!-- ZE-SB-013 f/u: org-scoped party picker (ownerPartyId==active org) for the customer field, replacing
-         the leaky free-text input. The server guard in create#Subscription is the real boundary; this makes
-         a foreign id un-pickable in the UI too. NEVER the stock SimpleScreens searchPartyList (cross-tenant). -->
+    <!-- ZE-SB-013 f/u: org-scoped party picker (ownerPartyId==active org) for the customer field. -->
     <transition-include name="searchPartyList" location="component://zenith-erp-base/screen/include/PartyPicker.xml"/>
 
     <actions>
@@ -21,67 +18,131 @@
             <econdition field-name="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
             <search-form-inputs default-order-by="-startDate"/>
         </entity-find>
-        <!-- ZE-SUB-004: does THIS tenant have any plan to enrol a customer into? A subscription requires one of
-             the tenant's own plans (org-scoped, same as the Plan dropdown below). If none exist the New
-             Subscription dialog must guide them to create a plan first instead of showing an empty required
-             dropdown (a dead end). -->
+        <!-- ZE-SUB-004: does THIS tenant have any plan to enrol a customer into? -->
         <entity-find-count entity-name="zenith.erp.subscriptions.SubscriptionPlan" count-field="planCount">
             <econdition field-name="isActive" value="Y"/>
             <econdition field-name="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
         </entity-find-count>
         <set field="hasPlans" from="planCount > 0"/>
+
+        <!-- KPI cards + pill maps (unfiltered org totals, so they don't shrink with the table's search filter) -->
+        <script><![CDATA[
+            def z = com.zenith.Fmt.INSTANCE
+            def _org = ec.user.getPreference('ACTIVE_ORGANIZATION')
+            def kf = ec.entity.find("zenith.erp.subscriptions.SubscriptionView")
+            if (_org) kf.condition("organizationPartyId", _org)
+            def allSubs = kf.list()
+            totalSubs = allSubs.size()
+            activeSubs = allSubs.count { it.statusId == 'SubActive' }
+            def now = ec.user.nowTimestamp
+            def in7 = new java.sql.Timestamp(now.getTime() + 7L * 86400000L)
+            expiringSoon = allSubs.count { it.nextBillingDate != null && !it.nextBillingDate.before(now) && !it.nextBillingDate.after(in7) && (it.statusId in ['SubActive','SubTrial']) }
+            def freqDiv = [BfMonthly:1.0G, BfAnnually:12.0G, BfQuarterly:3.0G, BfHalfYearly:6.0G, BfOneTime:0.0G]
+            def mrr = 0.0G
+            allSubs.each { s -> if (s.statusId == 'SubActive' && s.billingAmount != null) { def d = freqDiv[s.billingFrequency]; if (d != null && d > 0) mrr += ((s.billingAmount as BigDecimal) / d) } }
+            totalSubsStr = z.inr(totalSubs.toString())
+            activeSubsStr = z.inr(activeSubs.toString())
+            expiringSoonStr = expiringSoon.toString()
+            mrrStr = '₹ ' + z.inr(ec.l10n.format(mrr.setScale(0, java.math.RoundingMode.HALF_UP), '#,##0'))
+            def monthStart = java.sql.Timestamp.valueOf(ec.l10n.format(now, 'yyyy-MM') + '-01 00:00:00')
+            newThisMonth = allSubs.count { it.startDate != null && !it.startDate.before(monthStart) }
+            totalDeltaCol = (newThisMonth > 0) ? '#059669' : '#9CA3AF'
+            totalDeltaStr = (newThisMonth > 0) ? ('&#8593; ' + newThisMonth + ' this month') : 'no change'
+
+            freqDescMap = [BfMonthly:'Monthly', BfOneTime:'One-Time', BfAnnually:'Annually', BfHalfYearly:'Half-Yearly', BfQuarterly:'Quarterly']
+            freqBadgeMap = [BfMonthly:'primary', BfOneTime:'info', BfAnnually:'success', BfHalfYearly:'warning', BfQuarterly:'grey']
+            statusDescMap = [SubActive:'Active', SubTrial:'Trial', SubPastDue:'Past Due', SubPaused:'Paused', SubCancelled:'Cancelled', SubExpired:'Expired']
+            statusBadgeMap = [SubActive:'success', SubTrial:'warning', SubPastDue:'danger', SubPaused:'grey', SubCancelled:'danger', SubExpired:'grey']
+        ]]></script>
     </actions>
 
     <widgets>
-        <container-box>
-            <box-header title="Subscriptions"/>
-            <box-toolbar>
-                <section name="sub_newsub_write"><condition><expression>modCanWrite</expression></condition><widgets>
-                <container-dialog id="CreateSubDialog" button-text="New Subscription">
-                    <!-- ZE-SUB-004: no plans yet -> guide to the Plans tab instead of an empty required dropdown. -->
-                    <section name="CreateSubNoPlans" condition="!hasPlans"><widgets>
-                        <render-mode><text type="html"><![CDATA[
+        <container style="q-pa-md">
+            <!-- Header -->
+            <container style="zsec-hdr q-mb-md">
+                <container>
+                    <label text="Subscriptions" type="h5" style="text-weight-bold q-my-none"/>
+                    <label text="Monitor and manage all customer subscriptions." type="span" style="z-statdesc"/>
+                </container>
+                <container style="z-btnrow">
+                    <link url="." text="Refresh" icon="refresh" link-type="anchor" style="z-obtn"/>
+                    <section name="sub_newsub_write"><condition><expression>modCanWrite</expression></condition><widgets>
+                    <container style="z-newbtn-wrap">
+                    <container-dialog id="CreateSubDialog" button-text="+ New Subscription">
+                        <!-- ZE-SUB-004: no plans yet -> guide to the Plans tab instead of an empty required dropdown. -->
+                        <section name="CreateSubNoPlans" condition="!hasPlans"><widgets>
+                            <render-mode><text type="html,qvt"><![CDATA[
 <div style="padding:18px 6px; color:#555; max-width:520px;">
   <div style="font-size:40px; line-height:1; margin-bottom:10px;">📋</div>
   <h3 style="margin:0 0 8px; color:#333;">Create a plan first</h3>
   <p style="margin:0 0 16px;">A subscription enrols a customer in one of <b>your</b> plans — its price, billing cycle and GST. You don't have any plans yet. Add one on the <b>Plans</b> tab, then come back here to enrol a customer.</p>
 </div>
-                        ]]></text></render-mode>
-                        <link url="../Plans" text="Go to Plans →" btn-type="primary"/>
+                            ]]></text></render-mode>
+                            <link url="../Plans" text="Go to Plans →" btn-type="primary"/>
+                        </widgets></section>
+                        <section name="CreateSubHasPlans" condition="hasPlans"><widgets>
+                        <form-single name="CreateSubForm" transition="createSubscription">
+                            <field name="customerPartyId"><default-field title="Customer">
+                                <drop-down><dynamic-options transition="searchPartyList" server-search="true" min-length="2"/></drop-down>
+                            </default-field></field>
+                            <field name="planId"><default-field title="Plan"><drop-down>
+                                <entity-options key="${planId}" text="${planName} — ₹${billingAmount}/${billingFrequency}">
+                                    <entity-find entity-name="zenith.erp.subscriptions.SubscriptionPlan">
+                                        <econdition field-name="isActive" value="Y"/>
+                                        <econdition field-name="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+                                        <order-by field-name="billingAmount"/>
+                                    </entity-find>
+                                </entity-options>
+                            </drop-down></default-field></field>
+                            <field name="paymentMethodId"><default-field title="Payment Method"><drop-down allow-empty="true">
+                                <entity-options key="${enumId}" text="${description}">
+                                    <entity-find entity-name="moqui.basic.Enumeration">
+                                        <econdition field-name="enumTypeId" value="SubPaymentMethod"/>
+                                        <order-by field-name="sequenceNum"/>
+                                    </entity-find>
+                                </entity-options>
+                            </drop-down></default-field></field>
+                            <field name="discountCode"><default-field title="Discount Code"><text-line size="15"/></default-field></field>
+                            <field name="notes"><default-field title="Notes"><text-area rows="2" cols="40"/></default-field></field>
+                            <field name="submitButton"><default-field title="Create"><submit/></default-field></field>
+                        </form-single>
+                        </widgets></section>
+                    </container-dialog>
+                    </container>
                     </widgets></section>
-                    <section name="CreateSubHasPlans" condition="hasPlans"><widgets>
-                    <form-single name="CreateSubForm" transition="createSubscription">
-                        <field name="customerPartyId"><default-field title="Customer">
-                            <drop-down><dynamic-options transition="searchPartyList" server-search="true" min-length="2"/></drop-down>
-                        </default-field></field>
-                        <field name="planId"><default-field title="Plan"><drop-down>
-                            <entity-options key="${planId}" text="${planName} — ₹${billingAmount}/${billingFrequency}">
-                                <entity-find entity-name="zenith.erp.subscriptions.SubscriptionPlan">
-                                    <econdition field-name="isActive" value="Y"/>
-                                    <econdition field-name="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
-                                    <order-by field-name="billingAmount"/>
-                                </entity-find>
-                            </entity-options>
-                        </drop-down></default-field></field>
-                        <field name="paymentMethodId"><default-field title="Payment Method"><drop-down allow-empty="true">
-                            <entity-options key="${enumId}" text="${description}">
-                                <entity-find entity-name="moqui.basic.Enumeration">
-                                    <econdition field-name="enumTypeId" value="SubPaymentMethod"/>
-                                    <order-by field-name="sequenceNum"/>
-                                </entity-find>
-                            </entity-options>
-                        </drop-down></default-field></field>
-                        <field name="discountCode"><default-field title="Discount Code"><text-line size="15"/></default-field></field>
-                        <field name="notes"><default-field title="Notes"><text-area rows="2" cols="40"/></default-field></field>
-                        <field name="submitButton"><default-field title="Create"><submit/></default-field></field>
-                    </form-single>
-                    </widgets></section>
-                </container-dialog>
-                </widgets></section>
-            </box-toolbar>
-            <box-body>
+                </container>
+            </container>
+
+            <!-- 4 KPI stat cards -->
+            <render-mode><text type="html,qvt" template="true"><![CDATA[
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px;margin-bottom:24px;font-family:Inter,Segoe UI,Arial,sans-serif">
+  <div style="background:#fff;border:1px solid #E5E7EB;border-radius:12px;padding:20px">
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:10px"><div style="width:44px;height:44px;border-radius:8px;background:#F5F3FF;color:#7C3AED;display:flex;align-items:center;justify-content:center;flex:0 0 auto"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 21.73a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73z"/><path d="M12 22V12"/><polyline points="3.29 7 12 12 20.71 7"/><path d="m7.5 4.27 9 5.15"/></svg></div><span style="font-size:12.5px;font-weight:500;color:#6B7280">Total Subscriptions</span></div>
+    <div style="font-size:28px;font-weight:700;color:#111827;line-height:1.1">${totalSubsStr}</div>
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-top:8px"><span style="font-size:11.5px;color:#9CA3AF">All time</span><span style="font-size:11.5px;font-weight:600;color:${totalDeltaCol}">${totalDeltaStr}</span></div>
+  </div>
+  <div style="background:#fff;border:1px solid #E5E7EB;border-radius:12px;padding:20px">
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:10px"><div style="width:44px;height:44px;border-radius:8px;background:#ECFDF5;color:#10B981;display:flex;align-items:center;justify-content:center;flex:0 0 auto"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.801 10A10 10 0 1 1 17 3.335"/><path d="m9 11 3 3L22 4"/></svg></div><span style="font-size:12.5px;font-weight:500;color:#6B7280">Active Subscriptions</span></div>
+    <div style="font-size:28px;font-weight:700;color:#111827;line-height:1.1">${activeSubsStr}</div>
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-top:8px"><span style="font-size:11.5px;color:#9CA3AF">Ongoing</span><span style="font-size:11.5px;color:#9CA3AF"></span></div>
+  </div>
+  <div style="background:#fff;border:1px solid #E5E7EB;border-radius:12px;padding:20px">
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:10px"><div style="width:44px;height:44px;border-radius:8px;background:#FFFBEB;color:#F59E0B;display:flex;align-items:center;justify-content:center;flex:0 0 auto"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg></div><span style="font-size:12.5px;font-weight:500;color:#6B7280">Expiring Soon</span></div>
+    <div style="font-size:28px;font-weight:700;color:#111827;line-height:1.1">${expiringSoonStr}</div>
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-top:8px"><span style="font-size:11.5px;color:#9CA3AF">Within 7 days</span><span style="font-size:11.5px;color:#9CA3AF"></span></div>
+  </div>
+  <div style="background:#fff;border:1px solid #E5E7EB;border-radius:12px;padding:20px">
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:10px"><div style="width:44px;height:44px;border-radius:8px;background:#F5F3FF;color:#7C3AED;display:flex;align-items:center;justify-content:center;flex:0 0 auto"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3h12"/><path d="M6 8h12"/><path d="m6 13 8.5 8"/><path d="M6 13h3"/><path d="M9 13c6.667 0 6.667-10 0-10"/></svg></div><span style="font-size:12.5px;font-weight:500;color:#6B7280">Monthly Recurring Revenue</span></div>
+    <div style="font-size:28px;font-weight:700;color:#111827;line-height:1.1">${mrrStr}</div>
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-top:8px"><span style="font-size:11.5px;color:#9CA3AF">MRR</span><span style="font-size:11.5px;color:#9CA3AF"></span></div>
+  </div>
+</div>
+            ]]></text></render-mode>
+
+            <!-- Table card -->
+            <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md z-txntable">
                 <section name="SubsNoMatch" condition="!subList &amp;&amp; (customerPartyId || statusId)"><widgets>
-                    <render-mode><text type="html"><![CDATA[
+                    <render-mode><text type="html,qvt"><![CDATA[
 <div style="text-align:center; padding:40px 20px; color:#555;">
   <div style="font-size:44px; line-height:1; margin-bottom:12px;">🔍</div>
   <h3 style="margin:0 0 8px; color:#333;">No subscriptions match your search</h3>
@@ -90,7 +151,7 @@
                     ]]></text></render-mode>
                 </widgets></section>
                 <section name="SubsEmptyState" condition="!subList &amp;&amp; !(customerPartyId || statusId)"><widgets>
-                    <render-mode><text type="html"><![CDATA[
+                    <render-mode><text type="html,qvt"><![CDATA[
 <div style="text-align:center; padding:40px 20px; color:#555;">
   <div style="font-size:44px; line-height:1; margin-bottom:12px;">🧾</div>
   <h3 style="margin:0 0 8px; color:#333;">No subscriptions yet</h3>
@@ -99,38 +160,44 @@
                     ]]></text></render-mode>
                 </widgets></section>
                 <section name="SubsListSection" condition="subList"><widgets>
-                <form-list name="SubListForm" list="subList" skip-form="true" header-dialog="true">
-                    <field name="subscriptionNumber"><header-field show-order-by="true"/>
-                        <default-field title="Sub #">
-                            <link url="editSubscription" text="${subscriptionNumber}" link-type="anchor">
-                                <parameter name="subscriptionId"/>
-                            </link>
-                        </default-field>
-                    </field>
+                <form-list name="SubListForm" list="subList" list-entry="sub" skip-form="true" header-dialog="true"
+                           select-columns="true" show-csv-button="true">
+                    <row-actions><script><![CDATA[
+                        freqLabel = freqDescMap[sub.billingFrequency] ?: (sub.billingFrequency ?: '—')
+                        freqBadge = freqBadgeMap[sub.billingFrequency] ?: 'grey'
+                        statusLabel = statusDescMap[sub.statusId] ?: (sub.statusId ?: '—')
+                        statusBadge = statusBadgeMap[sub.statusId] ?: 'grey'
+                        totalStr = (sub.totalAmount != null) ? ('₹' + com.zenith.Fmt.INSTANCE.inr(ec.l10n.format(sub.totalAmount, '#,##0.00'))) : '—'
+                        startStr = sub.startDate ? ec.l10n.format(sub.startDate, 'dd-MM-yyyy') : '—'
+                        nextStr = sub.nextBillingDate ? ec.l10n.format(sub.nextBillingDate, 'dd-MM-yyyy') : '—'
+                        custStr = sub.customerPartyId ?: '—'
+                        planStr = sub.planName ?: '—'
+                    ]]></script></row-actions>
+                    <field name="subscriptionNumber"><header-field title="Subscription ID" show-order-by="true"/>
+                        <default-field><link url="editSubscription" text="${sub.subscriptionNumber}" parameter-map="[subscriptionId:sub.subscriptionId]" link-type="anchor" style="z-vlink"/></default-field></field>
                     <field name="customerPartyId"><header-field title="Customer"><text-find size="15" hide-options="true"/></header-field>
-                        <default-field title="Customer"><display/></default-field></field>
-                    <field name="planName"><default-field title="Plan"><display/></default-field></field>
-                    <field name="billingFrequency"><default-field title="Frequency">
-                        <display-entity entity-name="moqui.basic.Enumeration" key-field-name="enumId" text="${description}"/>
-                    </default-field></field>
-                    <field name="totalAmount"><default-field title="Total (${currSymbol})"><display format="#,##,##0.00"/></default-field></field>
-                    <field name="startDate"><header-field show-order-by="true"/>
-                        <default-field title="Start"><display format="dd-MM-yyyy"/></default-field></field>
-                    <field name="endDate"><default-field title="End"><display format="dd-MM-yyyy"/></default-field></field>
-                    <field name="nextBillingDate"><default-field title="Next Billing"><display format="dd-MM-yyyy"/></default-field></field>
+                        <default-field><label text="${custStr}" type="span" style="text-dark"/></default-field></field>
+                    <field name="planName"><header-field title="Plan"/>
+                        <default-field><label text="${planStr}" type="span" style="text-dark"/></default-field></field>
+                    <field name="billingFrequency"><header-field title="Frequency"/>
+                        <default-field><label text="${freqLabel}" type="span" style="zenith-badge nd ${freqBadge}"/></default-field></field>
+                    <field name="totalAmount"><header-field title="Total (₹)"/>
+                        <default-field><label text="${totalStr}" type="span" style="text-dark text-weight-medium"/></default-field></field>
+                    <field name="startDate"><header-field title="Start Date" show-order-by="true"/>
+                        <default-field><label text="${startStr}" type="span" style="text-grey-8"/></default-field></field>
+                    <field name="nextBillingDate"><header-field title="Next Billing"/>
+                        <default-field><label text="${nextStr}" type="span" style="text-grey-8"/></default-field></field>
                     <field name="statusId"><header-field title="Status"><drop-down allow-empty="true">
                             <entity-options key="${statusId}" text="${description}">
-                                <entity-find entity-name="moqui.basic.StatusItem">
-                                    <econdition field-name="statusTypeId" value="Subscription"/>
-                                </entity-find></entity-options></drop-down></header-field>
-                        <default-field title="Status">
-                            <display-entity entity-name="moqui.basic.StatusItem"/>
-                        </default-field>
-                    </field>
+                                <entity-find entity-name="moqui.basic.StatusItem"><econdition field-name="statusTypeId" value="Subscription"/></entity-find>
+                            </entity-options></drop-down></header-field>
+                        <default-field><label text="${statusLabel}" type="span" style="zenith-badge nd ${statusBadge}"/></default-field></field>
+                    <field name="rowMenu"><header-field title="Actions"/>
+                        <default-field><link url="editSubscription" text="⋮" parameter-map="[subscriptionId:sub.subscriptionId]" link-type="anchor" style="z-kebab"/></default-field></field>
                     <field name="find"><header-field title="Find"><submit/></header-field></field>
                 </form-list>
                 </widgets></section>
-            </box-body>
-        </container-box>
+            </container>
+        </container>
     </widgets>
 </screen>
