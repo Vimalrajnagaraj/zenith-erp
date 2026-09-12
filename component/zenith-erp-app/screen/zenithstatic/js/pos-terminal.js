@@ -1065,40 +1065,101 @@ window._posOffline = (function() {
 
     /* === Credit Bills screen: list outstanding credit bills + settle (partial allowed) === */
     function creditFmt(n) { return Number(n||0).toFixed(2); }
+    // credit-bills mockup (ZE-CBILLS): header + 4 stat cards + toolbar + card rows w/ a 3-step progress tracker
+    function creditProgress(settled) {
+        var G='#10B981',GT='#059669',O='#F59E0B',OT='#D97706',BD='#E5E7EB',MU='#9CA3AF',W='#fff';
+        var CK='<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
+        var CL='<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polyline points="12 8 12 12 15 14"/></svg>';
+        function step(bg,brd,ic,lbl,lc){return '<div style="display:flex;flex-direction:column;align-items:center;gap:6px;flex:0 0 auto"><div style="width:24px;height:24px;border-radius:50%;background:'+bg+';border:'+(brd?'2px solid '+brd:'none')+';box-sizing:border-box;display:flex;align-items:center;justify-content:center">'+ic+'</div><span style="font-size:11px;font-weight:600;color:'+lc+';white-space:nowrap">'+lbl+'</span></div>';}
+        function conn(c){return '<div style="flex:1 1 auto;height:2px;background:'+c+';margin:0 6px;margin-top:11px"></div>';}
+        var s1=step(G,null,CK,'Bill Created',GT);
+        var s2=settled?step(G,null,CK,'Outstanding',GT):step(O,null,CL,'Outstanding',OT);
+        var s3=settled?step(G,null,CK,'Settled',GT):step(W,BD,'','Settled',MU);
+        return '<div style="display:flex;align-items:flex-start;flex:1 1 auto;max-width:360px;min-width:240px">'+s1+conn(G)+s2+conn(settled?G:BD)+s3+'</div>';
+    }
+    function creditStatCards(d) {
+        var doc='<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M10 9H8"/><path d="M16 13H8"/><path d="M16 17H8"/></svg>';
+        var rup='<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3h12"/><path d="M6 8h12"/><path d="m6 13 8.5 8"/><path d="M6 13h3"/><path d="M9 13c6.667 0 6.667-10 0-10"/></svg>';
+        var clk='<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>';
+        var chk='<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>';
+        function card(bg,ib,ac,ic,label,val,cap,vc){
+            return '<div style="background:'+bg+';border:1px solid #E5E7EB;border-radius:12px;padding:18px;display:flex;gap:12px;align-items:flex-start">'
+                +'<div style="width:44px;height:44px;border-radius:50%;background:'+ib+';color:'+ac+';display:flex;align-items:center;justify-content:center;flex:0 0 auto">'+ic+'</div>'
+                +'<div><div style="font-size:12.5px;color:#6B7280;font-weight:500">'+label+'</div><div style="font-size:22px;font-weight:800;color:'+vc+';margin:2px 0">'+val+'</div><div style="font-size:11.5px;color:#9CA3AF">'+cap+'</div></div></div>';
+        }
+        return '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(215px,1fr));gap:16px;margin-bottom:20px">'
+            + card('#F5F3FF','#EDE9FE','#7C3AED',doc,'Total Credit Bills',(d.allCount||0),'All time','#7C3AED')
+            + card('#ECFDF5','#D1FAE5','#059669',rup,'Total Outstanding','₹ '+creditFmt(d.outSum),(d.outCount||0)+' Bills','#059669')
+            + card('#FFFBEB','#FEF3C7','#D97706',clk,'Overdue Bills',(d.overdueCount||0),'Require attention','#D97706')
+            + card('#EFF6FF','#DBEAFE','#2563EB',chk,'Paid This Month','₹ '+creditFmt(d.paidMonthAmt),(d.paidMonthCount||0)+' Bills','#2563EB')
+            + '</div>';
+    }
+    var _creditData = null, _creditSort = 'latest';
+    function creditSortBills(bills){
+        var a = bills.slice();
+        if (_creditSort==='oldest') a.reverse();
+        else if (_creditSort==='high') a.sort(function(x,y){return (y.outstanding||0)-(x.outstanding||0);});
+        else if (_creditSort==='low') a.sort(function(x,y){return (x.outstanding||0)-(y.outstanding||0);});
+        return a; // 'latest' = server order (-entryDate)
+    }
+    function creditPaintList(){
+        var host = document.getElementById('credit-list-host'); if (!host || !_creditData) return;
+        var bills = creditSortBills(_creditData.bills||[]);
+        if (bills.length === 0) { host.innerHTML = '<div style="text-align:center;padding:50px;color:#9CA3AF">No credit bills found</div>'; return; }
+        var h = '';
+        bills.forEach(function(b, i){
+            var settled = (Number(b.outstanding||0) <= 0.0001);
+            h += '<div style="display:flex;align-items:center;gap:20px;flex-wrap:wrap;padding:18px 20px;'+(i<bills.length-1?'border-bottom:1px solid #F1F5F9':'')+'">'
+                + '<div style="width:40px;height:40px;border-radius:50%;background:#EDE9FE;color:#7C3AED;display:flex;align-items:center;justify-content:center;flex:0 0 auto"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M10 9H8"/><path d="M16 13H8"/><path d="M16 17H8"/></svg></div>'
+                + '<div style="display:flex;flex-direction:column;gap:3px;min-width:210px;flex:0 1 auto">'
+                +   '<span style="font-size:14px;font-weight:600;color:#7C3AED">#'+b.billNo+'</span>'
+                +   '<span style="font-size:12px;color:#6B7280">'+b.date+'</span>'
+                +   '<span style="font-size:12px;color:#6B7280">'+b.customer+(b.phone?' • '+b.phone:'')+' • '+b.itemCount+' item'+(b.itemCount!==1?'s':'')+'</span>'
+                + '</div>'
+                + creditProgress(settled)
+                + '<div style="display:flex;flex-direction:column;align-items:flex-end;gap:2px;min-width:120px;text-align:right;flex:0 0 auto">'
+                +   '<span style="font-size:11.5px;color:#6B7280">Due Amount</span>'
+                +   '<span style="font-size:18px;font-weight:800;color:'+(settled?'#059669':'#DC2626')+'">₹'+creditFmt(b.outstanding)+'</span>'
+                +   '<span style="font-size:11.5px;color:#9CA3AF">Total ₹'+creditFmt(b.grand)+' • Paid ₹'+creditFmt(b.paid)+'</span>'
+                + '</div>'
+                + (settled
+                    ? '<span style="display:inline-flex;align-items:center;gap:6px;height:36px;padding:0 14px;background:#ECFDF5;color:#059669;border-radius:8px;font-size:13px;font-weight:600;flex:0 0 auto">Settled</span>'
+                    : '<button class="credit-settle-btn" data-tx="'+b.txId+'" style="display:inline-flex;align-items:center;gap:6px;height:36px;padding:0 14px;background:#059669;color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;flex:0 0 auto"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="14" x="2" y="5" rx="2"/><line x1="2" x2="22" y1="10" y2="10"/></svg> Settle Payment</button>')
+                + '</div>';
+        });
+        host.innerHTML = h;
+        host.querySelectorAll('.credit-settle-btn').forEach(function(btn){
+            btn.addEventListener('click', function(){ var bill=(_creditData.bills||[]).find(function(x){return x.txId===btn.dataset.tx;}); if (bill) openSettleOverlay(bill); });
+        });
+    }
     function renderCreditBills(search) {
         var root = document.getElementById('credit-bills-root');
         if (!root) return;
         root.innerHTML = '<div style="text-align:center;padding:40px;color:#999">Loading credit bills…</div>';
         historyPost({action:'creditBills', search: search||''}).then(function(d) {
             if (!d || !d.success) { root.innerHTML = '<div style="text-align:center;padding:40px;color:#c62828">Error loading credit bills</div>'; return; }
-            var h = '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:12px">'
-                + '<input id="credit-search" type="text" placeholder="Search bill no, customer or phone…" value="'+(search||'')+'" style="flex:1;min-width:220px;padding:10px 14px;border:1px solid #ccc;border-radius:8px;font-size:14px;outline:none"/>'
-                + '<div style="font-size:14px;font-weight:700;color:#e65100">Total Due: ₹'+creditFmt(d.totalOutstanding)+' &middot; '+d.total+' bill'+(d.total!==1?'s':'')+'</div></div>';
-            if (!d.bills || d.bills.length === 0) {
-                h += '<div style="text-align:center;padding:40px;color:#999">No outstanding credit bills</div>';
-            } else {
-                d.bills.forEach(function(b) {
-                    h += '<div style="border:1px solid #ffe0b2;background:#fff8f0;border-radius:10px;padding:14px;margin-bottom:10px">'
-                        + '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px">'
-                        + '<div><span style="font-weight:700;font-size:15px;color:#7C3AED">#'+b.billNo+'</span>'
-                        + '<span style="font-size:12px;color:#777;margin-left:8px">'+b.date+'</span></div>'
-                        + '<span style="font-weight:800;font-size:16px;color:#c62828">Due ₹'+creditFmt(b.outstanding)+'</span></div>'
-                        + '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;margin-top:6px">'
-                        + '<div style="font-size:13px;color:#555">'+b.customer+(b.phone?' &middot; '+b.phone:'')+' &middot; '+b.itemCount+' item'+(b.itemCount!==1?'s':'')+'</div>'
-                        + '<div style="font-size:12px;color:#777">Total ₹'+creditFmt(b.grand)+' &middot; Paid ₹'+creditFmt(b.paid)+'</div></div>'
-                        + '<button class="credit-settle-btn" data-tx="'+b.txId+'" style="margin-top:10px;width:100%;padding:10px;background:#2e7d32;color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:700;cursor:pointer">&#128181; Settle Payment</button>'
-                        + '</div>';
-                });
-            }
+            _creditData = d;
+            var h = '<div style="font-family:Inter,Segoe UI,Arial,sans-serif">'
+                + '<div style="display:flex;align-items:flex-start;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:18px">'
+                +   '<div><div style="font-size:13px;color:#6B7280">Track and manage all credit bills and outstanding dues</div></div>'
+                +   '<a href="/apps/zenith/pos/Terminal" style="display:inline-flex;align-items:center;gap:8px;height:40px;padding:0 16px;background:#7C3AED;color:#fff;border-radius:8px;font-size:13px;font-weight:600;text-decoration:none">+ New Credit Bill</a>'
+                + '</div>'
+                + creditStatCards(d)
+                + '<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:18px">'
+                +   '<input id="credit-search" type="text" placeholder="Search by bill no, customer or phone..." value="'+(search||'').replace(/"/g,'&quot;')+'" style="flex:1;min-width:240px;height:40px;padding:0 14px;border:1px solid #E5E7EB;border-radius:8px;font-size:13px;outline:none"/>'
+                +   '<label style="font-size:12.5px;color:#6B7280;font-weight:500;display:inline-flex;align-items:center;gap:8px">Sort by:'
+                +     '<select id="credit-sort" style="height:40px;padding:0 10px;border:1px solid #E5E7EB;border-radius:8px;font-size:12.5px;color:#111827;outline:none">'
+                +       '<option value="latest">Latest First</option><option value="oldest">Oldest First</option><option value="high">Highest Amount</option><option value="low">Lowest Amount</option>'
+                +     '</select></label>'
+                + '</div>'
+                + '<div style="background:#fff;border:1px solid #E5E7EB;border-radius:12px;overflow:hidden;margin-bottom:16px"><div id="credit-list-host"></div></div>'
+                + '<div style="font-size:12.5px;color:#6B7280">Showing '+(d.bills?d.bills.length:0)+' of '+(d.allCount||0)+' credit bills</div>'
+                + '</div>';
             root.innerHTML = h;
+            var sel = document.getElementById('credit-sort'); if (sel) { sel.value = _creditSort; sel.addEventListener('change', function(){ _creditSort = sel.value; creditPaintList(); }); }
             var si = document.getElementById('credit-search');
             if (si) { var t=null; si.addEventListener('input', function(){ clearTimeout(t); t=setTimeout(function(){ renderCreditBills(si.value); }, 400); }); }
-            root.querySelectorAll('.credit-settle-btn').forEach(function(btn){
-                btn.addEventListener('click', function(){
-                    var bill = (d.bills||[]).find(function(x){ return x.txId === btn.dataset.tx; });
-                    if (bill) openSettleOverlay(bill);
-                });
-            });
+            creditPaintList();
         }).catch(function(){
             // Never leave the page silently stuck on "Loading…" if the fetch/JSON fails (ZE-POS-002).
             if (root) root.innerHTML = '<div style="text-align:center;padding:40px;color:#c62828">Could not load credit bills — please refresh the page.</div>';
