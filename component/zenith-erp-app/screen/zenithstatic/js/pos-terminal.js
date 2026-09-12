@@ -1094,71 +1094,139 @@ window._posOffline = (function() {
             + card('#EFF6FF','#DBEAFE','#2563EB',chk,'Paid This Month','₹ '+creditFmt(d.paidMonthAmt),(d.paidMonthCount||0)+' Bills','#2563EB')
             + '</div>';
     }
-    var _creditData = null, _creditSort = 'latest';
-    function creditSortBills(bills){
-        var a = bills.slice();
-        if (_creditSort==='oldest') a.reverse();
+    var _creditData = null, _creditSort = 'latest', _creditFilter = 'all', _creditFrom = '', _creditTo = '', _creditView = 'list', _creditPainted = [];
+    var CBI = 'padding:9px 14px;font-size:13px;cursor:pointer;white-space:nowrap;color:#334155';
+    function creditCloseMenus(){ document.querySelectorAll('.cb-menu').forEach(function(m){ m.style.display='none'; }); }
+    function creditFilterBills(){
+        var a = (_creditData && _creditData.bills || []).slice();
+        var cut = Date.now() - 30*864e5;
+        a = a.filter(function(b){
+            var out = Number(b.outstanding||0);
+            if (_creditFilter==='outstanding' && !(out>0.0001)) return false;
+            if (_creditFilter==='settled' && out>0.0001) return false;
+            if (_creditFilter==='overdue' && !(out>0.0001 && (b.ts||0)<cut)) return false;
+            if (_creditFrom) { var f=new Date(_creditFrom+'T00:00:00').getTime(); if ((b.ts||0)<f) return false; }
+            if (_creditTo) { var t=new Date(_creditTo+'T23:59:59').getTime(); if ((b.ts||0)>t) return false; }
+            return true;
+        });
+        if (_creditSort==='oldest') a.sort(function(x,y){return (x.ts||0)-(y.ts||0);});
         else if (_creditSort==='high') a.sort(function(x,y){return (y.outstanding||0)-(x.outstanding||0);});
         else if (_creditSort==='low') a.sort(function(x,y){return (x.outstanding||0)-(y.outstanding||0);});
-        return a; // 'latest' = server order (-entryDate)
+        else a.sort(function(x,y){return (y.ts||0)-(x.ts||0);});
+        return a;
+    }
+    function creditExportCsv(){
+        var bills = creditFilterBills();
+        var esc = function(v){ v=(v==null?'':''+v); return /[",\n]/.test(v) ? '"'+v.replace(/"/g,'""')+'"' : v; };
+        var lines = ['Bill No,Date,Customer,Phone,Items,Total,Paid,Outstanding'];
+        bills.forEach(function(b){ lines.push([esc(b.billNo),esc(b.date),esc(b.customer),esc(b.phone),b.itemCount,creditFmt(b.grand),creditFmt(b.paid),creditFmt(b.outstanding)].join(',')); });
+        try { var blob=new Blob([lines.join('\n')],{type:'text/csv'}); var a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='CreditBills_'+new Date().toISOString().slice(0,10)+'.csv'; document.body.appendChild(a); a.click(); setTimeout(function(){ URL.revokeObjectURL(a.href); a.remove(); },100); } catch(_e){}
+    }
+    function creditRowKebab(i){
+        return '<div style="position:relative;flex:0 0 auto">'
+            + '<button class="cb-kebab" data-i="'+i+'" style="width:32px;height:32px;border:none;background:transparent;border-radius:8px;cursor:pointer;color:#9CA3AF;font-size:18px;line-height:1">&#8942;</button>'
+            + '<div class="cb-menu" style="display:none;position:absolute;right:0;top:36px;background:#fff;border:1px solid #E5E7EB;border-radius:10px;box-shadow:0 6px 20px rgba(17,24,39,.12);z-index:50;overflow:hidden;min-width:160px">'
+            +   '<div class="cb-item" data-i="'+i+'" data-act="view" style="'+CBI+'">View / Edit Bill</div>'
+            +   '<div class="cb-item" data-i="'+i+'" data-act="print" style="'+CBI+'">Print Receipt</div>'
+            +   '<div class="cb-item" data-i="'+i+'" data-act="copy" style="'+CBI+'">Copy Bill No.</div>'
+            +   '<div style="height:1px;background:#F1F5F9"></div>'
+            +   '<div class="cb-item" data-i="'+i+'" data-act="cancel" style="'+CBI+';color:#DC2626">Cancel Bill</div>'
+            + '</div></div>';
     }
     function creditPaintList(){
         var host = document.getElementById('credit-list-host'); if (!host || !_creditData) return;
-        var bills = creditSortBills(_creditData.bills||[]);
-        if (bills.length === 0) { host.innerHTML = '<div style="text-align:center;padding:50px;color:#9CA3AF">No credit bills found</div>'; return; }
+        var bills = creditFilterBills(); _creditPainted = bills;
+        var cnt = document.getElementById('credit-count'); if (cnt) cnt.textContent = 'Showing '+bills.length+' of '+(_creditData.allCount||0)+' credit bills';
+        if (bills.length === 0) { host.innerHTML = '<div style="text-align:center;padding:50px;color:#9CA3AF">No credit bills match the filters</div>'; return; }
+        var compact = (_creditView === 'compact');
         var h = '';
         bills.forEach(function(b, i){
             var settled = (Number(b.outstanding||0) <= 0.0001);
-            h += '<div style="display:flex;align-items:center;gap:20px;flex-wrap:wrap;padding:18px 20px;'+(i<bills.length-1?'border-bottom:1px solid #F1F5F9':'')+'">'
-                + '<div style="width:40px;height:40px;border-radius:50%;background:#EDE9FE;color:#7C3AED;display:flex;align-items:center;justify-content:center;flex:0 0 auto"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M10 9H8"/><path d="M16 13H8"/><path d="M16 17H8"/></svg></div>'
-                + '<div style="display:flex;flex-direction:column;gap:3px;min-width:210px;flex:0 1 auto">'
+            var settleCtl = settled
+                ? '<span style="display:inline-flex;align-items:center;gap:6px;height:36px;padding:0 14px;background:#ECFDF5;color:#059669;border-radius:8px;font-size:13px;font-weight:600;flex:0 0 auto">Settled</span>'
+                : '<button class="credit-settle-btn" data-tx="'+b.txId+'" style="display:inline-flex;align-items:center;gap:6px;height:36px;padding:0 14px;background:#059669;color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;flex:0 0 auto"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="14" x="2" y="5" rx="2"/><line x1="2" x2="22" y1="10" y2="10"/></svg> Settle Payment</button>';
+            h += '<div style="display:flex;align-items:center;gap:'+(compact?'14px':'20px')+';flex-wrap:wrap;padding:'+(compact?'12px 20px':'18px 20px')+';'+(i<bills.length-1?'border-bottom:1px solid #F1F5F9':'')+'">'
+                + '<div style="width:'+(compact?'32px;height:32px':'40px;height:40px')+';border-radius:50%;background:#EDE9FE;color:#7C3AED;display:flex;align-items:center;justify-content:center;flex:0 0 auto"><svg width="'+(compact?'16':'18')+'" height="'+(compact?'16':'18')+'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M10 9H8"/><path d="M16 13H8"/><path d="M16 17H8"/></svg></div>'
+                + '<div style="display:flex;flex-direction:column;gap:3px;min-width:200px;flex:1 1 auto">'
                 +   '<span style="font-size:14px;font-weight:600;color:#7C3AED">#'+b.billNo+'</span>'
                 +   '<span style="font-size:12px;color:#6B7280">'+b.date+'</span>'
                 +   '<span style="font-size:12px;color:#6B7280">'+b.customer+(b.phone?' • '+b.phone:'')+' • '+b.itemCount+' item'+(b.itemCount!==1?'s':'')+'</span>'
                 + '</div>'
-                + creditProgress(settled)
+                + (compact ? '' : creditProgress(settled))
                 + '<div style="display:flex;flex-direction:column;align-items:flex-end;gap:2px;min-width:120px;text-align:right;flex:0 0 auto">'
                 +   '<span style="font-size:11.5px;color:#6B7280">Due Amount</span>'
                 +   '<span style="font-size:18px;font-weight:800;color:'+(settled?'#059669':'#DC2626')+'">₹'+creditFmt(b.outstanding)+'</span>'
                 +   '<span style="font-size:11.5px;color:#9CA3AF">Total ₹'+creditFmt(b.grand)+' • Paid ₹'+creditFmt(b.paid)+'</span>'
                 + '</div>'
-                + (settled
-                    ? '<span style="display:inline-flex;align-items:center;gap:6px;height:36px;padding:0 14px;background:#ECFDF5;color:#059669;border-radius:8px;font-size:13px;font-weight:600;flex:0 0 auto">Settled</span>'
-                    : '<button class="credit-settle-btn" data-tx="'+b.txId+'" style="display:inline-flex;align-items:center;gap:6px;height:36px;padding:0 14px;background:#059669;color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;flex:0 0 auto"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="14" x="2" y="5" rx="2"/><line x1="2" x2="22" y1="10" y2="10"/></svg> Settle Payment</button>')
+                + settleCtl
+                + creditRowKebab(i)
                 + '</div>';
         });
         host.innerHTML = h;
         host.querySelectorAll('.credit-settle-btn').forEach(function(btn){
-            btn.addEventListener('click', function(){ var bill=(_creditData.bills||[]).find(function(x){return x.txId===btn.dataset.tx;}); if (bill) openSettleOverlay(bill); });
+            btn.addEventListener('click', function(e){ e.stopPropagation(); var bill=(_creditData.bills||[]).find(function(x){return x.txId===btn.dataset.tx;}); if (bill) openSettleOverlay(bill); });
+        });
+        host.querySelectorAll('.cb-kebab').forEach(function(btn){
+            btn.addEventListener('click', function(e){ e.stopPropagation(); var m=btn.nextElementSibling; var open=(m.style.display==='block'); creditCloseMenus(); m.style.display=open?'none':'block'; });
+        });
+        host.querySelectorAll('.cb-item').forEach(function(it){
+            it.addEventListener('click', function(e){ e.stopPropagation(); creditCloseMenus();
+                var b=_creditPainted[+it.dataset.i]; if(!b) return; var act=it.dataset.act;
+                var et='/apps/zenith/pos/EditTransaction?transactionId='+encodeURIComponent(b.txId);
+                if (act==='view' || act==='cancel') location.href=et;
+                else if (act==='print') window.open('/fop/apps/zenith/pos/ReceiptPdf?transactionId='+encodeURIComponent(b.txId),'_blank');
+                else if (act==='copy') { try { navigator.clipboard.writeText(''+b.billNo); } catch(_e){} }
+            });
         });
     }
     function renderCreditBills(search) {
         var root = document.getElementById('credit-bills-root');
         if (!root) return;
+        if (!window.__cbDocClose) { window.__cbDocClose = true; document.addEventListener('click', creditCloseMenus); }
         root.innerHTML = '<div style="text-align:center;padding:40px;color:#999">Loading credit bills…</div>';
         historyPost({action:'creditBills', search: search||''}).then(function(d) {
             if (!d || !d.success) { root.innerHTML = '<div style="text-align:center;padding:40px;color:#c62828">Error loading credit bills</div>'; return; }
             _creditData = d;
+            var listSvg = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" x2="21" y1="6" y2="6"/><line x1="8" x2="21" y1="12" y2="12"/><line x1="8" x2="21" y1="18" y2="18"/><line x1="3" x2="3.01" y1="6" y2="6"/><line x1="3" x2="3.01" y1="12" y2="12"/><line x1="3" x2="3.01" y1="18" y2="18"/></svg>';
+            var funnel = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>';
+            var vActive = (_creditView==='compact');
             var h = '<div style="font-family:Inter,Segoe UI,Arial,sans-serif">'
                 + '<div style="display:flex;align-items:flex-start;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:18px">'
                 +   '<div><div style="font-size:13px;color:#6B7280">Track and manage all credit bills and outstanding dues</div></div>'
-                +   '<a href="/apps/zenith/pos/Terminal" style="display:inline-flex;align-items:center;gap:8px;height:40px;padding:0 16px;background:#7C3AED;color:#fff;border-radius:8px;font-size:13px;font-weight:600;text-decoration:none">+ New Credit Bill</a>'
+                +   '<div style="display:flex;gap:10px;align-items:center">'
+                +     '<a href="/apps/zenith/pos/Terminal" style="display:inline-flex;align-items:center;gap:8px;height:40px;padding:0 16px;background:#7C3AED;color:#fff;border-radius:8px;font-size:13px;font-weight:600;text-decoration:none">+ New Credit Bill</a>'
+                +     '<div style="position:relative"><button id="credit-hdr-kebab" style="width:40px;height:40px;border:1px solid #7C3AED;border-radius:8px;background:#fff;color:#7C3AED;cursor:pointer;font-size:18px;line-height:1">&#8942;</button>'
+                +       '<div class="cb-menu" style="display:none;position:absolute;right:0;top:44px;background:#fff;border:1px solid #E5E7EB;border-radius:10px;box-shadow:0 6px 20px rgba(17,24,39,.12);z-index:50;overflow:hidden;min-width:150px">'
+                +         '<div class="cb-hdr-item" data-act="export" style="'+CBI+'">Export CSV</div>'
+                +         '<div class="cb-hdr-item" data-act="refresh" style="'+CBI+'">Refresh</div>'
+                +       '</div></div>'
+                +   '</div>'
                 + '</div>'
                 + creditStatCards(d)
                 + '<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:18px">'
-                +   '<input id="credit-search" type="text" placeholder="Search by bill no, customer or phone..." value="'+(search||'').replace(/"/g,'&quot;')+'" style="flex:1;min-width:240px;height:40px;padding:0 14px;border:1px solid #E5E7EB;border-radius:8px;font-size:13px;outline:none"/>'
-                +   '<label style="font-size:12.5px;color:#6B7280;font-weight:500;display:inline-flex;align-items:center;gap:8px">Sort by:'
-                +     '<select id="credit-sort" style="height:40px;padding:0 10px;border:1px solid #E5E7EB;border-radius:8px;font-size:12.5px;color:#111827;outline:none">'
-                +       '<option value="latest">Latest First</option><option value="oldest">Oldest First</option><option value="high">Highest Amount</option><option value="low">Lowest Amount</option>'
-                +     '</select></label>'
+                +   '<input id="credit-search" type="text" placeholder="Search by bill no, customer or phone..." value="'+(search||'').replace(/"/g,'&quot;')+'" style="flex:1;min-width:220px;height:40px;padding:0 14px;border:1px solid #E5E7EB;border-radius:8px;font-size:13px;outline:none"/>'
+                +   '<div style="display:flex;align-items:center;gap:6px;height:40px;padding:0 12px;border:1px solid #E5E7EB;border-radius:8px"><input id="credit-from" type="date" value="'+_creditFrom+'" style="border:none;outline:none;font-size:12.5px;color:#111827;background:transparent"/><span style="color:#9CA3AF">–</span><input id="credit-to" type="date" value="'+_creditTo+'" style="border:none;outline:none;font-size:12.5px;color:#111827;background:transparent"/></div>'
+                +   '<div style="position:relative"><button id="credit-filter-btn" style="height:40px;padding:0 14px;border:1px solid '+(_creditFilter!=='all'?'#7C3AED':'#E5E7EB')+';border-radius:8px;background:#fff;color:'+(_creditFilter!=='all'?'#7C3AED':'#6B7280')+';cursor:pointer;font-size:12.5px;display:inline-flex;align-items:center;gap:6px">'+funnel+' Filter'+(_creditFilter!=='all'?' •':'')+'</button>'
+                +     '<div class="cb-menu" style="display:none;position:absolute;left:0;top:44px;background:#fff;border:1px solid #E5E7EB;border-radius:10px;box-shadow:0 6px 20px rgba(17,24,39,.12);z-index:50;overflow:hidden;min-width:150px">'
+                +       '<div class="cb-filter" data-f="all" style="'+CBI+'">All Bills</div><div class="cb-filter" data-f="outstanding" style="'+CBI+'">Outstanding</div><div class="cb-filter" data-f="overdue" style="'+CBI+'">Overdue</div><div class="cb-filter" data-f="settled" style="'+CBI+'">Settled</div>'
+                +     '</div></div>'
+                +   '<label style="font-size:12.5px;color:#6B7280;font-weight:500;display:inline-flex;align-items:center;gap:8px">Sort by:<select id="credit-sort" style="height:40px;padding:0 10px;border:1px solid #E5E7EB;border-radius:8px;font-size:12.5px;color:#111827;outline:none"><option value="latest">Latest First</option><option value="oldest">Oldest First</option><option value="high">Highest Amount</option><option value="low">Lowest Amount</option></select></label>'
+                +   '<button id="credit-view-btn" title="Toggle compact view" style="width:40px;height:40px;border:1px solid #E5E7EB;border-radius:8px;background:'+(vActive?'#F5F3FF':'#fff')+';color:'+(vActive?'#7C3AED':'#6B7280')+';cursor:pointer;display:inline-flex;align-items:center;justify-content:center">'+listSvg+'</button>'
                 + '</div>'
                 + '<div style="background:#fff;border:1px solid #E5E7EB;border-radius:12px;overflow:hidden;margin-bottom:16px"><div id="credit-list-host"></div></div>'
-                + '<div style="font-size:12.5px;color:#6B7280">Showing '+(d.bills?d.bills.length:0)+' of '+(d.allCount||0)+' credit bills</div>'
+                + '<div id="credit-count" style="font-size:12.5px;color:#6B7280"></div>'
                 + '</div>';
             root.innerHTML = h;
             var sel = document.getElementById('credit-sort'); if (sel) { sel.value = _creditSort; sel.addEventListener('change', function(){ _creditSort = sel.value; creditPaintList(); }); }
             var si = document.getElementById('credit-search');
             if (si) { var t=null; si.addEventListener('input', function(){ clearTimeout(t); t=setTimeout(function(){ renderCreditBills(si.value); }, 400); }); }
+            var cf = document.getElementById('credit-from'); if (cf) cf.addEventListener('change', function(){ _creditFrom=cf.value; creditPaintList(); });
+            var ct = document.getElementById('credit-to'); if (ct) ct.addEventListener('change', function(){ _creditTo=ct.value; creditPaintList(); });
+            var vb = document.getElementById('credit-view-btn'); if (vb) vb.addEventListener('click', function(){ _creditView=(_creditView==='list'?'compact':'list'); var on=(_creditView==='compact'); vb.style.background=on?'#F5F3FF':'#fff'; vb.style.color=on?'#7C3AED':'#6B7280'; creditPaintList(); });
+            var fb = document.getElementById('credit-filter-btn'); if (fb) fb.addEventListener('click', function(e){ e.stopPropagation(); var m=fb.nextElementSibling; var open=(m.style.display==='block'); creditCloseMenus(); m.style.display=open?'none':'block'; });
+            root.querySelectorAll('.cb-filter').forEach(function(it){ it.addEventListener('click', function(e){ e.stopPropagation(); _creditFilter=it.dataset.f; creditCloseMenus(); var on=(_creditFilter!=='all'); if (fb){ fb.style.borderColor=on?'#7C3AED':'#E5E7EB'; fb.style.color=on?'#7C3AED':'#6B7280'; } creditPaintList(); }); });
+            var hk = document.getElementById('credit-hdr-kebab'); if (hk) hk.addEventListener('click', function(e){ e.stopPropagation(); var m=hk.nextElementSibling; var open=(m.style.display==='block'); creditCloseMenus(); m.style.display=open?'none':'block'; });
+            root.querySelectorAll('.cb-hdr-item').forEach(function(it){ it.addEventListener('click', function(e){ e.stopPropagation(); creditCloseMenus(); if (it.dataset.act==='export') creditExportCsv(); else renderCreditBills(si?si.value:(search||'')); }); });
             creditPaintList();
         }).catch(function(){
             // Never leave the page silently stuck on "Loading…" if the fetch/JSON fails (ZE-POS-002).
