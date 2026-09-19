@@ -132,6 +132,29 @@ unexpected FK block is a diagnostic — investigate, never force.
 
 ---
 
+## Keeping GitHub in sync with production
+
+**Rule: the repo must always reflect what is running in production.** Two things guarantee it:
+
+1. **Every production change goes through git.** The deploy flow above is *deploy from the
+   repo*, so a change only reaches production after it exists locally — and it is not "done"
+   until it is **committed and pushed** (merged to `master` on GitHub). Never leave a deployed
+   change unpushed.
+2. **Never edit files directly inside the running container.** If an emergency hotfix ever *is*
+   applied on the server, capture it back into the repo immediately:
+
+   ```bash
+   bash docs/infra/sync-from-live.sh
+   ```
+
+   It pulls the live container's source, writes any real drift back into the repo (ignoring
+   CRLF/LF noise), lists new files, and prints `git status`. Review the diff (a hotfix must
+   still be clean of secrets/customer data), then commit and push. Run it periodically as an
+   audit even if you think nothing drifted.
+
+> Verified in-sync check: the repo's source is compared to the live container content-only
+> (line endings ignored). "In sync" means byte-identical source once CRLF/LF is normalised.
+
 ## Rollback
 
 1. Revert the change in git (`git revert <sha>` on a branch → PR → merge) — never rewrite
