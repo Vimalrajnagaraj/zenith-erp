@@ -80,8 +80,14 @@ All `master` changes go through a **pull request**. A CI guard
 check** if the commit did not arrive via a PR. If you see that red check on your commit, you
 pushed directly — move the work onto a branch and open a PR. A short `ALLOWLIST` at the top of
 the workflow can exempt specific maintainers from the guard; everyone else must use a PR.
-*(On the current GitHub plan this is an after-the-fact signal, not a hard block; full
-enforcement needs GitHub Pro branch protection.)*
+
+A companion guard (`.github/workflows/no-force-push.yml`) **fails on any force-push to
+`master`** — for everyone, no exemptions — because force-pushing shared history can erase other
+people's commits. If it fires, restore master's previous tip immediately (the failure log
+prints the exact `git push --force-with-lease` command).
+
+*(On the current GitHub plan both are after-the-fact signals, not hard blocks; full enforcement
+— required checks, blocked force-push/deletion — needs GitHub Pro branch protection.)*
 
 ## Deploy pipeline (owner / maintainers)
 
