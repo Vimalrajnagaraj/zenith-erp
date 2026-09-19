@@ -73,6 +73,16 @@ The hook is bypassable locally with `--no-verify`, so the **same guards also run
 Actions** (`.github/workflows/repo-guards.yml`) on every push and PR, where they **cannot be
 skipped**. A red check blocks the merge — fix the cause, never work around it.
 
+### Don't push straight to `master`
+
+All `master` changes go through a **pull request**. A CI guard
+(`.github/workflows/no-direct-push.yml`) runs on every push to `master` and **fails with a red
+check** if the commit did not arrive via a PR (bypassing the flow). Maintainers on its
+allowlist are exempt (owner hotfixes / deploys). If you see that red check on your commit, you
+pushed directly — move the work onto a branch and open a PR. *(On the current GitHub plan this
+is an after-the-fact signal, not a hard block; full enforcement needs GitHub Pro branch
+protection.)*
+
 ## Deploy pipeline (owner / maintainers)
 
 Source lives here; the running system is a Docker container on the server. The flow is: edit

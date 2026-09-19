@@ -1,0 +1,64 @@
+name: no-direct-push-to-master
+
+# Free-plan approximation of branch protection.
+#
+# GitHub only offers real branch protection / rulesets on private repos under a PAID plan, so
+# we cannot *block* a direct push to master. Instead this workflow runs AFTER each push to
+# master and FAILS (a loud red ❌ check + notification) when the pushed commit did NOT arrive
+# through a pull request — i.e. someone committed straight to master, bypassing the PR flow in
+# docs/SOP-commit-and-deploy.md. It detects merges made by merge-commit, squash, or rebase.
+#
+# It is a visible, auditable signal, not a hard gate. Upgrade to GitHub Pro to enforce it for
+# real (require a PR + the `guards` check before merge).
+
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  guard-direct-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if this commit did not arrive via a pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+          ACTOR: ${{ github.actor }}
+          # Space-separated GitHub usernames allowed to push straight to master (owner /
+          # maintainers who run hotfixes and the deploy pipeline). Edit this list to taste —
+          # clear it to make the guard strict for everyone, including the owner.
+          ALLOWLIST: "amalnathkp13-boop"
+        run: |
+          set -u
+          for u in $ALLOWLIST; do
+            if [ "$u" = "$ACTOR" ]; then
+              echo "::notice::Direct push to master by allowlisted actor '$ACTOR' — permitted."
+              exit 0
+            fi
+          done
+
+          # Did this commit reach master through a PR? The commits/{sha}/pulls API associates
+          # the resulting master commit with its PR for merge-commit, squash AND rebase merges.
+          if prs=$(gh api "repos/${{ github.repository }}/commits/${SHA}/pulls" \
+                     -H "Accept: application/vnd.github+json" --jq 'length' 2>/dev/null); then
+            if [ "${prs:-0}" -gt 0 ]; then
+              echo "::notice::Commit ${SHA} arrived via a pull request — OK."
+              exit 0
+            fi
+          else
+            echo "::warning::Could not query PR association for ${SHA}; not failing the build."
+            exit 0
+          fi
+
+          echo "::error title=Direct push to master::'$ACTOR' pushed commit ${SHA} straight to master without a pull request."
+          echo ""
+          echo "master changes must go through a pull request. Please:"
+          echo "  1) branch off master:   git switch -c fix/<name>"
+          echo "  2) move this commit onto the branch and open a PR against master"
+          echo "  3) merge the PR after review + green checks"
+          echo "See docs/SOP-commit-and-deploy.md and CONTRIBUTING.md."
+          exit 1
