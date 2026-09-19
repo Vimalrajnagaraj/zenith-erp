@@ -28,6 +28,9 @@ ssh -o StrictHostKeyChecking=no "$HOST" \
 mkdir -p "$TMP/live"; tar xf "$TMP/live.tar" -C "$TMP/live"
 
 cd "$REPO"
+# Skip test/ files — they are not deployed to the running container, so the repo (not the
+# container) is authoritative for them; pulling the stale container copy would be wrong.
+EXCLUDE='(^|/)test/'
 updated=0
 while IFS= read -r f; do
   rel="${f#component/}"; src="$TMP/live/$rel"
@@ -39,13 +42,13 @@ while IFS= read -r f; do
     cp "$src" "$f"                                            # binary: copy as-is
   fi
   echo "   updated from live: $f"; updated=$((updated+1))
-done < <(git ls-files component)
+done < <(git ls-files component | grep -vE "$EXCLUDE")
 
 echo "==> ${updated} file(s) updated from the live container."
 
 echo "==> NEW source files in the container but not tracked in git (review, add if intended):"
-( cd "$TMP/live" && find . -type f \( -name '*.xml' -o -name '*.groovy' -o -name '*.ftl' \
-      -o -name '*.css' -o -name '*.js' -o -name '*.ftl.xml' \) ) \
+( cd "$TMP/live" && find . -type f -not -path '*/test/*' \( -name '*.xml' -o -name '*.groovy' \
+      -o -name '*.ftl' -o -name '*.css' -o -name '*.js' \) ) \
   | sed 's#^\./#component/#' \
   | while IFS= read -r p; do git ls-files --error-unmatch "$p" >/dev/null 2>&1 || echo "     $p"; done \
   | head -50

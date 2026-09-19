@@ -149,8 +149,14 @@ unexpected FK block is a diagnostic — investigate, never force.
 
    It pulls the live container's source, writes any real drift back into the repo (ignoring
    CRLF/LF noise), lists new files, and prints `git status`. Review the diff (a hotfix must
-   still be clean of secrets/customer data), then commit and push. Run it periodically as an
-   audit even if you think nothing drifted.
+   still be clean of secrets/customer data), then commit and push.
+
+3. **A daily read-only audit watches for you.** `docs/infra/audit-live-sync.sh` compares the
+   repo to the live container **without changing anything** and, on drift, drops a
+   `ZENITH-SYNC-DRIFT.txt` marker on the owner's Desktop and logs to
+   `~/.zenith-sync-audit.log`. It runs via the Windows Task Scheduler task
+   **`ZenithLiveSyncAudit`** (daily, 9:00 AM). If that marker appears, run `sync-from-live.sh`,
+   review, commit, and push. Re-register/adjust the schedule with `docs/infra/schedule-audit.ps1`.
 
 > Verified in-sync check: the repo's source is compared to the live container content-only
 > (line endings ignored). "In sync" means byte-identical source once CRLF/LF is normalised.
