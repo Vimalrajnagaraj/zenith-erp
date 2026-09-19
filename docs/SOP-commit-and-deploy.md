@@ -1,0 +1,149 @@
+# SOP — Committing changes & reflecting them to live production
+
+**Audience:** every contributor. **Scope:** how a change goes from your editor to the live
+system at https://erp.zetaclantech.com without breaking a live tenant or leaking data.
+
+> This is a **live commercial multi-tenant SaaS**. Read [`../CONTRIBUTING.md`](../CONTRIBUTING.md)
+> and [`../SECURITY.md`](../SECURITY.md) first — the non-negotiables there override anything here.
+
+---
+
+## 0. Prerequisites (once per machine)
+
+```bash
+git clone https://github.com/amalnathkp13-boop/zenith-erp.git
+cd zenith-erp
+sh docs/infra/install-git-hooks.sh          # arm the pre-commit lint guards
+```
+
+Deploying to production additionally needs **SSH access to the prod host and the Docker deploy
+setup**. The host and container details live in [`infra/README.md`](infra/README.md); SSH is
+**key-based** (no passwords in the repo). **Ask the owner for access — do not deploy until you
+have it and have been walked through it once.** Only the owner/maintainers deploy.
+
+Set these once in your shell (values in `docs/infra/`):
+
+```bash
+SERVER=root@<PROD_HOST>          # from docs/infra/README.md
+APP=deploy-moqui-1               # app container
+DB=deploy-db-1                   # Postgres container (db: moqui / user: moqui)
+```
+
+---
+
+## Part A — Branch → commit → PR (everyone)
+
+### A1. Branch off `master`
+```bash
+git switch master && git pull
+git switch -c feature/<short-name>       # or fix/… , chore/…
+```
+Never commit directly to `master`.
+
+### A2. Make **one** logical change
+- Keep the data layer and any write/billing path untouched **unless that is the change**.
+- Preserve org isolation: every list/detail/JSON path scopes by `organizationPartyId`.
+- CSS/JS under `zenithstatic/` changed? Bump the `?v=N` cache-bust in `ZenithApp.xml`.
+
+### A3. Pre-commit safety pass (do this every time)
+- [ ] No secrets in the diff (passwords, API keys, tokens, real `.env`).
+- [ ] No customer/user/security data; no fabricated GSTIN/HSN/PAN/prices/stock.
+- [ ] Billing/auth/org-isolation paths reviewed for safety.
+- [ ] All test data purged (seed with a unique prefix → verify → delete by exact ids).
+
+### A4. Commit (stage **explicit paths** — never `git add -A` / `.`)
+```bash
+git add component/<comp>/<path> [more explicit paths]
+git commit -m "type: short subject
+
+Why the change, and HOW it was verified (throwaway tenant, DB asserts, both surfaces)."
+```
+The pre-commit hook runs the lint guards (css-comments, party-picker,
+cross-module-transitions, form-dom-collisions). **If a guard fails, fix the cause — never
+`--no-verify`.**
+
+### A5. Push & open a PR
+```bash
+git push -u origin feature/<short-name>
+```
+Open a PR against `master`, fill in the checklist (`.github/PULL_REQUEST_TEMPLATE.md`). The
+`repo-guards` CI runs the same guards on GitHub and **cannot be skipped**. Get a review for
+anything touching billing, auth, or org isolation. Merge to `master` after approval + green CI.
+
+---
+
+## Part B — Reflect the change to live production (owner / maintainers)
+
+The running system is the Docker container on the prod host; git is the source of record. The
+flow: **deploy the file into the container → persist the image → restart → verify → confirm the
+git commit is the undo point.** The [`moqui-deploy`](infra/) scripts automate this; the manual
+steps are below so you understand what they do.
+
+### B1. Pre-flight — is it safe for live tenants?
+Any billing-path change must be **no-op-safe for the flagship tenant** (MARUTHI, org `100000`).
+Prove it on a **throwaway tenant** first (seed prefixed rows → exercise → assert DB → purge by
+exact ids, residue 0). Never test a write path against a real tenant.
+
+### B2. Deploy the changed file(s) into the container
+Local `component/<comp>/<path>` ↔ container `/opt/moqui/runtime/component/<comp>/<path>`:
+```bash
+cat "component/<comp>/<path>" | ssh "$SERVER" \
+  "docker exec -i $APP sh -c 'cat > /opt/moqui/runtime/component/<comp>/<path>'"
+# confirm it landed:
+ssh "$SERVER" "docker exec $APP sh -c 'grep -c <a-marker> /opt/moqui/runtime/component/<comp>/<path>'"
+```
+
+### B3. Persist into the image (so a future recreate keeps it)
+```bash
+ssh "$SERVER" 'docker commit '"$APP"' zetaerp-moqui:latest && docker image prune -f'
+```
+
+### B4. Reload — **`restart`, NEVER `up -d`**
+`up -d` recreates the container and **discards uncommitted in-container edits** (and once filled
+the disk → whole-site outage). Always:
+```bash
+ssh "$SERVER" 'cd /opt/deploy/deploy && docker compose restart moqui'
+```
+
+### B5. Poll until healthy (Moqui warms ~30–90s)
+```bash
+for i in $(seq 1 45); do c=$(curl -s -o /dev/null -w "%{http_code}" -u <user>:<pass> \
+  "https://erp.zetaclantech.com/apps/zenith" --insecure); [ "$c" = 200 ] && { echo up; break; }; sleep 4; done
+```
+
+### B6. Static assets (CSS/JS) reminder
+XML screens/services/entities + Groovy reload on restart. Assets under `zenithstatic/` are
+served as-is — the `?v=N` bump in `ZenithApp.xml` (step A2) is what makes browsers refetch.
+
+### B7. Verify on **both** surfaces
+Render the change on **/apps** and **/qapps** and confirm ground-truth (DB state or the actual
+UI), not a cached echo. Remove any test data you created.
+
+### B8. Record the undo point
+Make sure the corresponding commit is merged to `master` and pushed — that is your rollback
+reference.
+
+### Database access (read/verify)
+```bash
+echo "SELECT …;" | ssh "$SERVER" "docker exec -i $DB psql -U moqui -d moqui -P pager=off"
+```
+On the live DB, **DELETE only by exact captured ids**, never by a class predicate. An
+unexpected FK block is a diagnostic — investigate, never force.
+
+---
+
+## Rollback
+
+1. Revert the change in git (`git revert <sha>` on a branch → PR → merge) — never rewrite
+   `master` history.
+2. Redeploy the reverted file(s) via **B2–B5**.
+3. Re-verify (**B7**).
+Do **not** alter or renumber any already-issued bill/invoice as part of a rollback.
+
+---
+
+## One-line summary
+
+**branch → change (one thing) → safety pass → commit explicit paths (hook lints) → PR + green
+CI → merge → deploy file to container → `docker commit` → `docker compose restart` (never
+`up -d`) → poll 200 → verify both surfaces → clean up test data.**

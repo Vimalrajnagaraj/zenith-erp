@@ -78,8 +78,11 @@ skipped**. A red check blocks the merge — fix the cause, never work around it.
 Source lives here; the running system is a Docker container on the server. The flow is: edit
 locally → deploy the file into the container → commit the image to its tag → **`docker compose
 restart`** (never `up -d`, which discards uncommitted in-container edits) → poll for 200 →
-verify on both surfaces → `git commit` here as an undo point. Scripts and the full runbook are
-in `docs/infra/`. **Server access and credentials are not in this repo** — ask the owner.
+verify on both surfaces → `git commit` here as an undo point.
+
+**Full step-by-step runbook: [`docs/SOP-commit-and-deploy.md`](docs/SOP-commit-and-deploy.md)**
+(commit → PR → deploy → verify → rollback). Scripts are in `docs/infra/`. **Server access and
+credentials are not in this repo** — ask the owner.
 
 Static assets (CSS/JS under `zenithstatic/`) are cache-busted via a `?v=N` query in
 `ZenithApp.xml`; bump it when you change them.

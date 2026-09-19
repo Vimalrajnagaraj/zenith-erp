@@ -94,7 +94,8 @@ the deploy walkthrough — infra credentials are **not** in this repo.
 
 ## Contributing
 
-Read [`CONTRIBUTING.md`](CONTRIBUTING.md) first. In short:
+Read [`CONTRIBUTING.md`](CONTRIBUTING.md) first, and the deploy runbook
+[`docs/SOP-commit-and-deploy.md`](docs/SOP-commit-and-deploy.md). In short:
 
 - Branch from `master`; never commit straight to `master`.
 - Run the lint guards locally (the pre-commit hook does this automatically); the same guards
