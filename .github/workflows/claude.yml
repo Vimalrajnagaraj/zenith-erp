@@ -1,4 +1,4 @@
-name: claude-agent
+name: Claude Code
 
 # Background Claude Code agent. It runs on GitHub Actions when a collaborator:
 #   - comments "@claude <task>" on an issue or PR (or in a PR review / review comment),
@@ -6,16 +6,19 @@ name: claude-agent
 #   - adds the "claude" label to an issue.
 # Claude works on a claude/<...> branch cut from master, runs the lint guards and the
 # pr-safety-reviewer subagent, and opens a DRAFT PR that fills in .github/PULL_REQUEST_TEMPLATE.md.
-# It never pushes to master, never merges, and never deploys. Rules: CLAUDE.md -> "Running as the
-# GitHub agent". Extra CI-only denies (ssh/docker/curl/purge/merge…): .github/claude-agent-settings.json.
+# It never pushes to master (that would trip the no-direct-push guard; the bot isn't allowlisted),
+# never merges, and never deploys. Rules: CLAUDE.md -> "Running as the GitHub agent". Extra CI-only
+# denies (ssh/docker/curl/purge/merge…): .github/claude-agent-settings.json.
 #
-# One-time setup (repo owner):
-#   1. Install the Claude GitHub App on this repo: https://github.com/apps/claude
-#      (pushes made with the App token trigger repo-guards, unlike pushes made with GITHUB_TOKEN).
-#   2. Add ONE auth secret under Settings -> Secrets and variables -> Actions:
-#        CLAUDE_CODE_OAUTH_TOKEN  (Claude Pro/Max subscription: run `claude setup-token` locally), or
-#        ANTHROPIC_API_KEY        (API billing; then swap the input below).
-#   3. Create an issue label named "claude".
+# REQUIRES the repository secret CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`, value starts
+# with sk-ant-oat01-). Set it via: gh secret set CLAUDE_CODE_OAUTH_TOKEN -R amalnathkp13-boop/zenith-erp
+# Runs bill against the Claude account that minted the token.
+#
+# GitHub ops use the workflow's built-in GITHUB_TOKEN, so the Claude GitHub App isn't required.
+# Trade-off: pushes/PRs made with GITHUB_TOKEN do NOT trigger other workflows, so repo-guards
+# won't run automatically on Claude's branches — the agent runs the same four guards itself before
+# pushing, and a maintainer can re-run CI (or push any commit) before merge. Installing the App
+# (https://github.com/apps/claude) and removing `github_token` below restores automatic CI.
 
 on:
   issue_comment:
@@ -25,7 +28,7 @@ on:
   pull_request_review:
     types: [submitted]
   issues:
-    types: [opened, labeled]
+    types: [opened, assigned, labeled]
 
 # One agent run per issue/PR at a time; queue rather than cancel so no half-pushed work is lost.
 concurrency:
@@ -34,7 +37,8 @@ concurrency:
 
 jobs:
   claude:
-    # Only repo owners/members/collaborators can start the agent (the action also re-checks write access).
+    # Only run when "@claude" is mentioned (or the "claude" label is added), and only for repo
+    # owners/members/collaborators, so ordinary comments don't spend usage.
     if: |
       (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude') &&
         contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) ||
@@ -42,18 +46,18 @@ jobs:
         contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) ||
       (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude') &&
         contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.review.author_association)) ||
-      (github.event_name == 'issues' && github.event.action == 'opened' &&
+      (github.event_name == 'issues' && github.event.action != 'labeled' &&
         (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')) &&
         contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association)) ||
       (github.event_name == 'issues' && github.event.action == 'labeled' && github.event.label.name == 'claude')
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
-      contents: write
-      pull-requests: write
-      issues: write
-      id-token: write
-      actions: read # lets Claude read CI (repo-guards) results on its PRs
+      contents: write        # create branches / commits (never a direct push to master)
+      pull-requests: write   # open and comment on PRs
+      issues: write          # comment on issues
+      id-token: write        # OIDC for the action
+      actions: read          # read CI results on the PR
     steps:
       - name: Check out the repo
         uses: actions/checkout@v4
@@ -68,10 +72,10 @@ jobs:
       - name: Run Claude Code agent
         uses: anthropics/claude-code-action@v1
         env:
-          GH_TOKEN: ${{ github.token }} # for `gh pr create --draft` / `gh pr view` / `gh issue view`
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # for `gh pr create --draft` / `gh pr view` / `gh issue view`
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          # anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}   # use this instead if on API billing
+          github_token: ${{ secrets.GITHUB_TOKEN }}
           base_branch: master
           branch_prefix: claude/
           label_trigger: claude
@@ -80,4 +84,4 @@ jobs:
             --model claude-opus-5-5
             --max-turns 100
             --allowedTools "Bash(sh docs/infra/lint-css-comments.sh),Bash(sh docs/infra/lint-party-picker.sh),Bash(sh docs/infra/lint-cross-module-transitions.sh),Bash(sh docs/infra/lint-form-dom-collisions.sh),Bash(git status),Bash(git diff:*),Bash(git log:*),Bash(git fetch:*),Bash(git add:*),Bash(git commit:*),Bash(git push origin claude/:*),Bash(git push -u origin claude/:*),Bash(gh pr create:*),Bash(gh pr view:*),Bash(gh pr edit:*),Bash(gh pr checks:*),Bash(gh issue view:*),Bash(xmllint:*)"
-            --append-system-prompt "You are the ZetaERP background agent. Follow CLAUDE.md, section 'Running as the GitHub agent', exactly: one logical change, lint guards, pr-safety-reviewer subagent before any PR, explicit-path staging, push only the claude/ branch, open a DRAFT PR against master that fills every section of .github/PULL_REQUEST_TEMPLATE.md honestly (no runtime available in CI). Never merge, deploy, or touch production. Ask in a comment when scope or real business data is unclear."
+            --append-system-prompt "You are the ZetaERP background agent. Follow CLAUDE.md, section 'Running as the GitHub agent', exactly: one logical change, lint guards, pr-safety-reviewer subagent before any PR, explicit-path staging, push only the claude/ branch, open a DRAFT PR against master that fills every section of .github/PULL_REQUEST_TEMPLATE.md honestly (no runtime available in CI; repo-guards will not auto-run on your push, so paste your own guard results into the PR). Never merge, deploy, or touch production. Ask in a comment when scope or real business data is unclear."
