@@ -8,6 +8,15 @@ system at https://erp.zetaclantech.com without breaking a live tenant or leaking
 
 ---
 
+**Contents**
+
+- [0. Prerequisites (once per machine)](#0-prerequisites-once-per-machine)
+- [Part A — Branch → commit → PR (everyone)](#part-a--branch--commit--pr-everyone)
+- [Part B — Reflect the change to live production (owner / maintainers)](#part-b--reflect-the-change-to-live-production-owner--maintainers)
+- [Keeping GitHub in sync with production](#keeping-github-in-sync-with-production)
+- [Rollback](#rollback)
+- [One-line summary](#one-line-summary)
+
 ## 0. Prerequisites (once per machine)
 
 ```bash
