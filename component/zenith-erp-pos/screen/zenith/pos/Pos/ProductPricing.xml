@@ -6,6 +6,8 @@
     <parameter name="searchTerm"/>
     <parameter name="catId"/>
     <parameter name="pageIndex"/>
+    <parameter name="pricingStatus"/>
+    <parameter name="gstFilter"/>
 
     <!-- Save one product's Retail / Wholesale / Custom prices (AJAX, returns JSON). -->
     <transition name="savePrices" begin-transaction="true">
@@ -62,9 +64,54 @@
         <default-response type="none"/>
     </transition>
 
+    <!-- Export the current (filtered) product pricing as CSV. Read-only; honours the same filters. -->
+    <transition name="exportCsv" read-only="true">
+        <actions>
+            <script><![CDATA[
+                def p = ec.web.parameters
+                def _searchTerm = p.searchTerm; def _catId = p.catId; def _pricingStatus = p.pricingStatus; def _gstFilter = p.gstFilter
+                def posOrg = ec.user.getPreference('ACTIVE_ORGANIZATION')
+                def catPIds = null
+                if (_catId) { catPIds = [] as Set; ec.entity.find("mantle.product.category.ProductCategoryMember").condition("productCategoryId", _catId).list().each { catPIds.add(it.productId) } }
+                def slab = [:]; try { ec.entity.find("zenith.erp.india.IndiaGstSlab").list().each { slab[it.gstSlabId] = it.gstRate } } catch (Exception ig) {}
+                def rateSlab = { pr -> (pr.gstSlabId && slab[pr.gstSlabId] != null) ? (slab[pr.gstSlabId] as BigDecimal) : null }
+                def pf = ec.entity.find("mantle.product.Product").condition("productTypeEnumId", "PtAsset")
+                if (posOrg) pf.condition("ownerPartyId", posOrg)
+                def cands = pf.orderBy("productName").limit(5000).list()
+                def tl = (_searchTerm ?: '').toLowerCase().trim()
+                def fl = cands.findAll { pr ->
+                    (tl == '' || (pr.productName ?: '').toLowerCase().contains(tl) || (pr.pseudoId ?: '').toLowerCase().contains(tl)) &&
+                    (catPIds == null || catPIds.contains(pr.productId)) &&
+                    (_pricingStatus != 'with' || (pr.mrpAmount != null && (pr.mrpAmount as BigDecimal) > 0G)) &&
+                    (_pricingStatus != 'without' || pr.mrpAmount == null || (pr.mrpAmount as BigDecimal) <= 0G) &&
+                    (!_gstFilter || (rateSlab(pr) != null && rateSlab(pr).stripTrailingZeros().toPlainString() == _gstFilter))
+                }
+                def ids = fl.collect { it.productId }
+                def wM = [:]; def eM = [:]; def wT = [:]
+                if (ids) { ec.entity.find("zenith.erp.pos.PosProductModePrice").condition("productId", "in", ids).list().each { mp ->
+                    if (mp.salesModeId == 'WHOLESALE') { wM[mp.productId] = mp.price; wT[mp.productId] = mp.thresholdQty } else if (mp.salesModeId == 'EMPLOYEE') eM[mp.productId] = mp.price } }
+                def esc = { v -> if (v == null) return ""; String s = v.toString().trim(); (s.contains(",")||s.contains("\"")||s.contains("\n")) ? "\"" + s.replace("\"","\"\"") + "\"" : s }
+                def bd = { v -> v == null ? "" : (v as BigDecimal).stripTrailingZeros().toPlainString() }
+                StringBuilder csv = new StringBuilder()
+                csv.append("ZetaERP - Product Pricing (all prices are BEFORE GST)\n")
+                csv.append("Generated: ${ec.l10n.format(ec.user.nowTimestamp, 'dd MMM yyyy HH:mm')}\n\n")
+                csv.append("#,Product Name,SKU,GST %,Retail (Before GST),Wholesale (Before GST),Auto-WS Qty,Custom (Before GST)\n")
+                int i = 0
+                fl.each { pr -> i++; def rt = rateSlab(pr)
+                    csv.append("${i},${esc(pr.productName ?: pr.productId)},${esc(pr.pseudoId ?: '')},${rt != null ? rt.stripTrailingZeros().toPlainString()+'%' : ''},${bd(pr.mrpAmount)},${bd(wM[pr.productId])},${bd(wT[pr.productId])},${bd(eM[pr.productId])}\n") }
+                ec.web.sendTextResponse(csv.toString(), "text/csv", "Product_Pricing_${ec.l10n.format(ec.user.nowTimestamp, 'yyyyMMdd_HHmm')}.csv")
+            ]]></script>
+        </actions>
+        <default-response type="none"/>
+    </transition>
+
     <actions>
         <script><![CDATA[
             def posOrg = ec.user.getPreference('ACTIVE_ORGANIZATION')
+            // Root-relative app base ("/apps" | "/qapps" | "/vapps") for the cross-module "Add Product" link.
+            def _uri = (ec.web?.request?.requestURI ?: '')
+            def _zi = _uri.indexOf('/zenith/')
+            appBase = _zi > 0 ? _uri.substring(0, _zi) : ''
             def pageSize = 60
             def pIdx = 0
             try { if (pageIndex) pIdx = (pageIndex as Integer) } catch (Exception ig) { pIdx = 0 }
@@ -86,11 +133,20 @@
             def pf = ec.entity.find("mantle.product.Product").condition("productTypeEnumId", "PtAsset")
             if (posOrg) pf.condition("ownerPartyId", posOrg)
             def candidates = pf.orderBy("productName").limit(5000).list()
+            // GST slab -> rate map (used by the GST filter, the average-GST stat card, and the rows; cheap, no HSN fallback).
+            def slabRates = [:]
+            try { ec.entity.find("zenith.erp.india.IndiaGstSlab").list().each { slabRates[it.gstSlabId] = it.gstRate } } catch (Exception ig) {}
+            def rateSlabOf = { pr -> (pr.gstSlabId && slabRates[pr.gstSlabId] != null) ? (slabRates[pr.gstSlabId] as BigDecimal) : null }
             def termLower = (searchTerm ?: '').toLowerCase().trim()
             def filtered = candidates.findAll { pr ->
                 (termLower == '' || (pr.productName ?: '').toLowerCase().contains(termLower) || (pr.pseudoId ?: '').toLowerCase().contains(termLower)) &&
-                (catProdIds == null || catProdIds.contains(pr.productId))
+                (catProdIds == null || catProdIds.contains(pr.productId)) &&
+                (pricingStatus != 'with' || (pr.mrpAmount != null && (pr.mrpAmount as BigDecimal) > 0G)) &&
+                (pricingStatus != 'without' || pr.mrpAmount == null || (pr.mrpAmount as BigDecimal) <= 0G) &&
+                (!gstFilter || (rateSlabOf(pr) != null && rateSlabOf(pr).stripTrailingZeros().toPlainString() == gstFilter))
             }
+            // distinct GST rates present (for the 'More Filters' GST dropdown), ascending as plain strings.
+            distinctGstRates = candidates.collect { rateSlabOf(it) }.findAll { it != null }.unique().sort().collect { it.stripTrailingZeros().toPlainString() }
             totalCount = filtered.size()
             pageCount = (int) Math.ceil(totalCount / (double) pageSize)
             if (pageCount < 1) pageCount = 1
@@ -110,9 +166,7 @@
                 }
             }
             // Each product's GST rate (prices are GST-EXCLUSIVE -> the customer pays price + this %).
-            // Resolve the product's configured GST slab -> rate; blank if not GST-rated.
-            def slabRates = [:]
-            try { ec.entity.find("zenith.erp.india.IndiaGstSlab").list().each { slabRates[it.gstSlabId] = it.gstRate } } catch (Exception ig) {}
+            // Resolve the product's configured GST slab -> rate; blank if not GST-rated. (slabRates loaded above.)
             def rateOf = { pr ->
                 def sid = pr.gstSlabId
                 if (!sid && (pr.hsnCode ?: pr.productTaxCode)) {
@@ -186,20 +240,39 @@
                 </div>
             </details>
 
-            <form method="get" action="ProductPricing" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:16px 0 0">
-                <div style="position:relative;flex:1;min-width:240px">
+            <div style="display:flex;gap:10px;align-items:flex-start;flex-wrap:wrap;margin:16px 0 0">
+              <form method="get" action="ProductPricing" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;flex:1;min-width:0">
+                <div style="position:relative;flex:1;min-width:220px">
                   <span class="material-icons" style="position:absolute;left:10px;top:50%;transform:translateY(-50%);font-size:18px;color:#9CA3AF;pointer-events:none">search</span>
                   <input type="text" name="searchTerm" value="${(searchTerm!'')?html}" placeholder="Search by product name or SKU..." style="width:100%;padding:9px 12px 9px 36px;border:1px solid #E5E7EB;border-radius:8px;font-size:13px;box-sizing:border-box;background:#fff"/>
                 </div>
-                <select name="catId" style="padding:9px 12px;border:1px solid #E5E7EB;border-radius:8px;font-size:13px;color:#374151;background:#fff">
+                <select name="catId" onchange="this.form.submit()" style="padding:9px 12px;border:1px solid #E5E7EB;border-radius:8px;font-size:13px;color:#374151;background:#fff">
                     <option value="">All categories</option>
                     <#list (categories![]) as c>
                         <option value="${c.productCategoryId}" <#if (catId!'') == c.productCategoryId>selected</#if>>${(c.categoryName!c.productCategoryId)?html}</option>
                     </#list>
                 </select>
+                <select name="pricingStatus" onchange="this.form.submit()" style="padding:9px 12px;border:1px solid #E5E7EB;border-radius:8px;font-size:13px;color:#374151;background:#fff">
+                    <option value="" <#if (pricingStatus!'')==''>selected</#if>>All pricing status</option>
+                    <option value="with" <#if (pricingStatus!'')=='with'>selected</#if>>With pricing</option>
+                    <option value="without" <#if (pricingStatus!'')=='without'>selected</#if>>Without pricing</option>
+                </select>
+                <button type="button" onclick="var r=document.getElementById('ppGstRow');if(r)r.style.display=(r.style.display==='none'?'flex':'none');" style="display:inline-flex;align-items:center;gap:6px;padding:9px 14px;border:1px solid #E5E7EB;border-radius:8px;background:#fff;color:#374151;font-size:13px;font-weight:500;cursor:pointer"><span class="material-icons" style="font-size:16px">filter_list</span>More Filters</button>
                 <input type="hidden" name="pageIndex" value="0"/>
                 <button type="submit" style="display:inline-flex;align-items:center;gap:6px;padding:9px 18px;background:#7C3AED;color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer"><span class="material-icons" style="font-size:16px">search</span>Search</button>
-            </form>
+                <div id="ppGstRow" style="<#if (gstFilter!'')?has_content>display:flex<#else>display:none</#if>;flex-basis:100%;align-items:center;gap:8px;font-size:13px;color:#374151;padding-top:2px">
+                    <span style="color:#6B7280">GST rate:</span>
+                    <select name="gstFilter" onchange="this.form.submit()" style="padding:8px 12px;border:1px solid #E5E7EB;border-radius:8px;font-size:13px;color:#374151;background:#fff">
+                        <option value="">All GST rates</option>
+                        <#list (distinctGstRates![]) as g>
+                            <option value="${g}" <#if (gstFilter!'')==g>selected</#if>>${g}%</option>
+                        </#list>
+                    </select>
+                </div>
+              </form>
+              <a href="${appBase!''}/zenith/pos/ProductPricing/exportCsv?searchTerm=${(searchTerm!'')?url('UTF-8')}&catId=${(catId!'')?url('UTF-8')}&pricingStatus=${(pricingStatus!'')?url('UTF-8')}&gstFilter=${(gstFilter!'')?url('UTF-8')}" target="_blank" style="display:inline-flex;align-items:center;gap:6px;padding:9px 16px;border:1px solid #E5E7EB;border-radius:8px;background:#fff;color:#374151;font-size:13px;font-weight:600;text-decoration:none;white-space:nowrap"><span class="material-icons" style="font-size:16px">download</span>Export</a>
+              <a href="${appBase!''}/zenith/inventory/FindProduct" style="display:inline-flex;align-items:center;gap:6px;padding:9px 16px;background:#7C3AED;color:#fff;border-radius:8px;font-size:13px;font-weight:600;text-decoration:none;white-space:nowrap"><span class="material-icons" style="font-size:16px">add</span>Add Product</a>
+            </div>
 
             <div style="background:#fff;border:1px solid #E5E7EB;border-radius:12px;margin-top:16px;overflow-x:auto">
             <table style="width:100%;border-collapse:collapse;font-size:13px;min-width:960px">
@@ -211,7 +284,7 @@
                         <th style="padding:11px 8px;font-weight:600;width:64px;text-align:center">GST %</th>
                         <th style="padding:11px 10px;font-weight:600;width:132px;text-align:right">Retail Price <span style="font-weight:400;color:#9CA3AF">(Before GST)</span></th>
                         <th style="padding:11px 10px;font-weight:600;width:150px;text-align:right">Wholesale Price <span style="font-weight:400;color:#9CA3AF">(Before GST)</span></th>
-                        <th style="padding:11px 10px;font-weight:600;width:118px;text-align:center">Auto-WS Qty <span style="font-weight:400;color:#9CA3AF">(blank = off)</span></th>
+                        <th style="padding:11px 10px;font-weight:600;width:132px;text-align:center">Auto-WS <span style="font-weight:400;color:#9CA3AF">(&rarr; WS at qty)</span></th>
                         <th style="padding:11px 10px;font-weight:600;width:132px;text-align:right">Custom Price <span style="font-weight:400;color:#9CA3AF">(Before GST)</span></th>
                         <th style="padding:11px 10px;font-weight:600;width:84px;text-align:center">Status</th>
                         <th style="padding:11px 10px;font-weight:600;width:96px;text-align:center">Action</th>
@@ -226,7 +299,7 @@
                         <td style="padding:7px 8px;text-align:center"><#if (r.gstRate!'')?has_content><span class="zenith-badge primary nd" style="padding:2px 9px;font-size:11.5px">${r.gstRate}%</span><#else><span style="color:#C4C4C4" title="No GST slab set on this product">&mdash;</span></#if></td>
                         <td style="padding:7px 10px"><input class="pp-retail pp-price" type="number" step="0.01" value="${r.retail}" style="width:100%;text-align:right;padding:6px;border:1px solid #ccc;border-radius:5px;font-size:14px;box-sizing:border-box"/><div class="pp-incl" style="font-size:10px;color:#888;text-align:right;height:13px;line-height:13px;margin-top:1px"></div></td>
                         <td style="padding:7px 10px"><input class="pp-wholesale pp-price" type="number" step="0.01" value="${r.wholesale}" placeholder="blank = blocked" style="width:100%;text-align:right;padding:6px;border:1px solid #ccc;border-radius:5px;font-size:14px;box-sizing:border-box"/><div class="pp-incl" style="font-size:10px;color:#888;text-align:right;height:13px;line-height:13px;margin-top:1px"></div></td>
-                        <td style="padding:7px 10px"><input class="pp-wsthreshold" type="number" step="1" min="0" value="${r.wholesaleThreshold}" placeholder="off" style="width:100%;text-align:right;padding:6px;border:1px solid #ccc;border-radius:5px;font-size:14px;box-sizing:border-box"/></td>
+                        <td style="padding:7px 10px;text-align:center;white-space:nowrap"><label class="pp-switch" title="Auto-switch this Retail line to the Wholesale price at a quantity"><input type="checkbox" class="pp-wstoggle" <#if (r.wholesaleThreshold!'')?has_content>checked</#if>/><span class="pp-switch-sl"></span></label><span class="pp-wswrap" style="<#if (r.wholesaleThreshold!'')?has_content>display:inline-flex<#else>display:none</#if>;align-items:center;gap:3px;margin-left:7px;font-size:11px;color:#6B7280">at <input class="pp-wsthreshold" type="number" step="1" min="0" value="${r.wholesaleThreshold}" placeholder="qty" style="width:50px;text-align:center;padding:4px 5px;border:1px solid #ccc;border-radius:5px;font-size:12.5px;box-sizing:border-box"/></span></td>
                         <td style="padding:7px 10px"><input class="pp-employee pp-price" type="number" step="0.01" value="${r.employee}" placeholder="blank = blocked" style="width:100%;text-align:right;padding:6px;border:1px solid #ccc;border-radius:5px;font-size:14px;box-sizing:border-box"/><div class="pp-incl" style="font-size:10px;color:#888;text-align:right;height:13px;line-height:13px;margin-top:1px"></div></td>
                         <td style="padding:9px 10px;text-align:center"><span class="zenith-badge success nd" style="padding:2px 10px;font-size:11px">Active</span></td>
                         <td style="padding:7px 10px;text-align:center"><button type="button" class="pp-save" style="padding:7px 14px;background:#2e7d32;color:#fff;border:none;border-radius:6px;font-size:13px;font-weight:700;cursor:pointer">Save</button></td>
@@ -279,6 +352,12 @@
                     .then(function(d){ btn.disabled=false; if(d&&d.success){ if(d.warning){ note(btn,'⚠ Saved','#e65100'); alert(d.warning); } else { note(btn,'✓ Saved','#1b5e20'); } } else { note(btn,'✗ '+((d&&d.error)||'Error'),'#c62828'); } })
                     .catch(function(e){ btn.disabled=false; note(btn,'✗ '+e.message,'#c62828'); });
             });
+            // Auto-WS toggle: ON reveals the qty box (auto-switch a Retail line to the Wholesale price at that qty);
+            // OFF clears the qty so Save writes a blank threshold (feature off). Save reads .pp-wsthreshold as before.
+            function syncWs(tg){ var td=tg.closest&&tg.closest('td'); if(!td) return; var wrap=td.querySelector('.pp-wswrap'); var qty=td.querySelector('.pp-wsthreshold');
+                if(tg.checked){ if(wrap) wrap.style.display='inline-flex'; if(qty){ qty.disabled=false; if(!qty.value) qty.focus(); } }
+                else { if(wrap) wrap.style.display='none'; if(qty){ qty.value=''; qty.disabled=true; } } }
+            document.addEventListener('change',function(ev){ var t=ev.target; if(t.classList&&t.classList.contains('pp-wstoggle')) syncWs(t); });
         })();
         </script>
         ]]></text></render-mode>
