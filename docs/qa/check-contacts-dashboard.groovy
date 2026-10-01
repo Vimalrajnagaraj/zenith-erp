@@ -85,3 +85,12 @@ for(int i=0;i<texts.length;i++) {
 assert rendered.join('').contains('O&#39;Brien') || rendered.join('').contains('O\'Brien')
 if(args.length>1) new File(args[1]).text=rendered.find { it.contains('zc-dashboard-controls') }+rendered.find { it.contains('<main class="zc-dashboard"') }
 println 'PASS: org separation, aggregate parity, date validation/reversal, growth periods, empty states, map deduplication, JSON escaping, and all FreeMarker template renders.'
+
+// The Contacts content must never restyle or hide shared ERP shell controls.
+def css=new File(repo, 'component/zenith-erp-app/screen/zenithstatic/css/contacts-dashboard.css').text
+assert !(css =~ /(?m)(^|[},\s])body[:\s{]/).find() && !css.contains('#z-') && !css.contains('#zq-') && !css.contains('#footer')
+def selectors = (css.replaceAll(/(?s)\/\*.*?\*\//, '') =~ /([^{}]+)\{/).collect { it[1].trim() }.findAll { !it.startsWith('@') }
+assert selectors.every { it.split(',').every { part -> part.trim().startsWith('.zc-dashboard-page') } }
+assert !source.text.contains('zc-dashboard-footer')
+assert source.text.contains('class="zc-dashboard-page"')
+println 'PASS: dashboard CSS is content-scoped; shared shell and footer are untouched.'
