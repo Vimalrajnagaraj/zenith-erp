@@ -3,152 +3,168 @@
         xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
         default-menu-title="Tax Rates" default-menu-index="3">
 
+    <parameter name="dashDate"/>
+    <parameter name="dashDateTo"/>
+
+    <!-- Custom TaxRate CRUD transitions kept for EditTaxRate reachability (the mockup view is the statutory
+         GST-slab reference; custom tax-rate records are platform-admin master data). -->
     <transition name="editTaxRate"><default-response url="../EditTaxRate"/></transition>
     <transition name="createTaxRate">
         <service-call name="zenith.tax.TaxServices.store#TaxRate"/>
         <default-response url="../EditTaxRate"/>
     </transition>
-    <!-- ZE-TAX sweep: platform-admin-only delete; refuses if the rate is referenced anywhere. -->
     <transition name="deleteTaxRate" begin-transaction="true">
         <service-call name="zenith.tax.TaxServices.delete#TaxRate"/>
         <default-response url="."/>
     </transition>
+    <!-- Download the GST rate slabs as CSV (read-only → allowed via a GET link). -->
+    <transition name="downloadReport" read-only="true">
+        <actions><script><![CDATA[
+            def slabs = ec.entity.find("zenith.erp.india.IndiaGstSlab").condition("isActive","Y").orderBy("gstRate").list()
+            def esc = { v -> def s = (v == null) ? '' : v.toString(); (s.contains(',') || s.contains('"') || s.contains("\n")) ? ('"' + s.replace('"','""') + '"') : s }
+            def pf = { n -> ec.l10n.format((n ?: 0) as BigDecimal, '#0.##') }
+            def sb = new StringBuilder("Slab / Description,GST %,CGST %,SGST %,IGST %,Cess %,Total Tax %\n")
+            slabs.each { def tot = (((it.gstRate ?: 0G) as BigDecimal) + ((it.cessRate ?: 0G) as BigDecimal)); sb.append([esc(it.slabName), pf(it.gstRate), pf(it.cgstRate), pf(it.sgstRate), pf(it.igstRate), pf(it.cessRate), pf(tot)].join(',')).append("\n") }
+            ec.web.sendTextResponse(sb.toString(), "text/csv", "GstRateSlabs.csv")
+        ]]></script></actions>
+        <default-response type="none"/>
+    </transition>
 
     <actions>
-        <!-- Tax rates are GLOBAL master data (no org). Only platform super-admins may
-             create/edit/delete; tenants get a read-only view (real GST rates are the statutory
-             IndiaGstSlab list shown below). -->
-        <set field="isSuperAdmin" from="ec.user.isInGroup('ADMIN')"/>
-        <entity-find entity-name="zenith.erp.tax.TaxRate" list="taxRates">
-            <search-form-inputs default-order-by="taxName"/>
-        </entity-find>
-        <set field="gstSlabs" from="[]"/>
-        <script>try { gstSlabs = ec.entity.find("zenith.erp.india.IndiaGstSlab").condition("isActive","Y").orderBy("gstRate").list() } catch (Exception e) {}</script>
+        <!-- ===== KPI counts ===== -->
+        <entity-find-count entity-name="zenith.erp.tax.TaxAuthority" count-field="totalAuthorities">
+            <econdition field-name="isActive" value="Y"/>
+        </entity-find-count>
+        <set field="totalRates" from="0"/>
+        <script>try { totalRates = ec.entity.find("zenith.erp.india.IndiaGstSlab").condition("isActive","Y").count() as int } catch (Exception e) { try { totalRates = ec.entity.find("zenith.erp.tax.TaxRate").condition("isActive","Y").count() as int } catch (Exception e2) {} }</script>
+        <entity-find-count entity-name="zenith.erp.tax.TaxCategory" count-field="totalCategories"/>
+        <entity-find-count entity-name="zenith.erp.tax.TaxExemption" count-field="totalExemptions">
+            <econdition field-name="isActive" value="Y"/>
+        </entity-find-count>
+        <entity-find-count entity-name="zenith.erp.tax.TaxRegistration" count-field="totalRegistrations">
+            <econdition field-name="isActive" value="Y"/>
+        </entity-find-count>
+
+        <script><![CDATA[
+            import java.math.BigDecimal
+            def _uri = (ec.web?.request?.requestURI ?: ''); def _zi = _uri.indexOf('/zenith/'); appBase = _zi > 0 ? _uri.substring(0, _zi) : ''
+            // date-range pill (present for parity; the statutory slabs are not date-filtered)
+            def sdf = new java.text.SimpleDateFormat("yyyy-MM-dd"); def pretty = new java.text.SimpleDateFormat("dd MMM yyyy")
+            def now = ec.user.nowTimestamp; def todayStr = sdf.format(now)
+            def _cm = java.util.Calendar.getInstance(); _cm.setTime(now); _cm.set(java.util.Calendar.DAY_OF_MONTH,1)
+            if (!dashDate) dashDate = sdf.format(_cm.getTime())
+            if (!dashDateTo) dashDateTo = todayStr
+            try { rangeLabel = pretty.format(java.sql.Timestamp.valueOf(dashDate + " 00:00:00")) + " - " + pretty.format(java.sql.Timestamp.valueOf(dashDateTo + " 00:00:00")) } catch (Exception e) { rangeLabel = "Select range" }
+
+            // GST rate slabs → rows with per-row pill colour + total tax %
+            def slabs = []
+            try { slabs = ec.entity.find("zenith.erp.india.IndiaGstSlab").condition("isActive","Y").orderBy("gstRate,slabName").list() } catch (Exception e) {}
+            def pills = [ violet:['rgba(124,58,237,.12)','#7C3AED'], blue:['#DBEAFE','#2563EB'], green:['rgba(16,185,129,.14)','#0E9F6E'], orange:['rgba(217,119,6,.14)','#B45309'], amber:['#FDE9D3','#C2410C'], red:['#FEE2E2','#DC2626'] ]
+            def pf = { n -> ec.l10n.format((n ?: 0) as BigDecimal, '#0.##') }
+            slabRows = slabs.collect { s ->
+                def r = (s.gstRate ?: 0G) as BigDecimal
+                def cat = (r == 0G) ? 'violet' : (r < 1G ? 'blue' : (r < 3G ? 'green' : (r < 12G ? 'orange' : (r < 18G ? 'amber' : 'red'))))
+                def pc = pills[cat]
+                def tot = r + ((s.cessRate ?: 0G) as BigDecimal)
+                [ name: (s.slabName ?: s.gstSlabId), pillBg: pc[0], pillFg: pc[1],
+                  gst: pf(s.gstRate), cgst: pf(s.cgstRate), sgst: pf(s.sgstRate), igst: pf(s.igstRate), cess: pf(s.cessRate), total: pf(tot) ]
+            }
+        ]]></script>
     </actions>
 
     <widgets>
-        <container style="row items-center justify-between q-mb-lg">
-            <label text="Tax Rates" type="h4" style="text-weight-bold q-my-none"/>
-            <section name="RateCreate">
-                <condition><expression>isSuperAdmin &amp;&amp; modCanWrite</expression></condition>
-                <widgets>
-            <container-dialog id="CreateTaxRate" button-text="New Tax Rate" type="success">
-                <form-single name="CreateTaxRateForm" transition="createTaxRate">
-                    <field name="taxName"><default-field title="Tax Name"><text-line size="30"/></default-field></field>
-                    <field name="taxAuthorityId"><default-field title="Tax Authority">
-                        <drop-down allow-empty="true"><entity-options key="${taxAuthorityId}" text="${description}">
-                            <entity-find entity-name="zenith.erp.tax.TaxAuthority">
-                                <econdition field-name="isActive" value="Y"/>
-                                <order-by field-name="description"/>
-                            </entity-find>
-                        </entity-options></drop-down></default-field></field>
-                    <field name="taxCategoryId"><default-field title="Tax Category">
-                        <drop-down allow-empty="true"><entity-options key="${taxCategoryId}" text="${categoryName}">
-                            <entity-find entity-name="zenith.erp.tax.TaxCategory">
-                                <econdition field-name="isActive" value="Y"/>
-                                <order-by field-name="categoryName"/>
-                            </entity-find>
-                        </entity-options></drop-down></default-field></field>
-                    <field name="taxTypeEnumId"><default-field title="Tax Type">
-                        <drop-down allow-empty="true"><entity-options key="${enumId}" text="${description}">
-                            <entity-find entity-name="moqui.basic.Enumeration">
-                                <econdition field-name="enumTypeId" value="TaxType"/>
-                                <order-by field-name="sequenceNum"/>
-                            </entity-find>
-                        </entity-options></drop-down></default-field></field>
-                    <field name="rate"><default-field title="Rate"><text-line size="10"/></default-field></field>
-                    <field name="rateTypeEnumId"><default-field title="Rate Type">
-                        <drop-down><entity-options key="${enumId}" text="${description}">
-                            <entity-find entity-name="moqui.basic.Enumeration">
-                                <econdition field-name="enumTypeId" value="TaxRateType"/>
-                                <order-by field-name="sequenceNum"/>
-                            </entity-find>
-                        </entity-options></drop-down></default-field></field>
-                    <field name="effectiveFrom"><default-field title="Effective From"><date-time type="date"/></default-field></field>
-                    <field name="effectiveThru"><default-field title="Effective Thru"><date-time type="date"/></default-field></field>
-                    <field name="countryGeoId"><default-field title="Country">
-                        <drop-down allow-empty="true"><entity-options key="${geoId}" text="${geoName}">
-                            <entity-find entity-name="moqui.basic.Geo">
-                                <econdition field-name="geoTypeEnumId" value="GEOT_COUNTRY"/>
-                                <order-by field-name="geoName"/>
-                            </entity-find>
-                        </entity-options></drop-down></default-field></field>
-                    <field name="regionGeoId"><default-field title="Region">
-                        <drop-down allow-empty="true"><entity-options key="${geoId}" text="${geoName}">
-                            <entity-find entity-name="moqui.basic.Geo">
-                                <econdition field-name="geoTypeEnumId" operator="in" value="GEOT_STATE,GEOT_PROVINCE,GEOT_TERRITORY"/>
-                                <order-by field-name="geoName"/>
-                            </entity-find>
-                        </entity-options></drop-down></default-field></field>
-                    <field name="submitBtn"><default-field title="Create"><submit/></default-field></field>
-                </form-single>
-            </container-dialog>
-                </widgets>
-            </section>
-        </container>
+        <!-- ===== header: title + subtitle + date pill + Download Report ===== -->
+        <render-mode><text type="html,qvt" template="true"><![CDATA[
+            <div style="display:flex;flex-wrap:wrap;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:20px">
+                <div>
+                    <div style="font-size:24px;font-weight:700;line-height:1.2;color:var(--z-text-main,#111827)">Tax Rates</div>
+                    <div style="font-size:13px;margin-top:5px;color:var(--z-text-muted,#6B7280)">Manage GST rates and slabs used for billing.</div>
+                </div>
+                <div style="display:flex;align-items:center;gap:10px">
+                    <details class="zdash-dr" style="position:relative">
+                        <summary class="zdash-dr-sum" style="gap:8px;height:40px;padding:0 14px;border:1px solid var(--z-border,#E5E7EB);border-radius:8px;background:var(--z-bg-card,#fff);color:var(--z-text-main,#111827);font-size:13px"><span class="material-icons" style="font-size:18px;color:#6B7280">calendar_today</span>${rangeLabel}<span class="material-icons" style="font-size:18px;color:#9CA3AF">expand_more</span></summary>
+                        <form method="get" action="." class="zdash-dr-pop" style="right:0;left:auto">
+                            <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px"><span style="width:38px;font-size:12px;color:#6B7280">From</span><input type="date" name="dashDate" value="${dashDate}" style="flex:1;height:34px;border:1px solid #E5E7EB;border-radius:7px;padding:0 8px;font-size:13px"/></div>
+                            <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px"><span style="width:38px;font-size:12px;color:#6B7280">To</span><input type="date" name="dashDateTo" value="${dashDateTo}" style="flex:1;height:34px;border:1px solid #E5E7EB;border-radius:7px;padding:0 8px;font-size:13px"/></div>
+                            <button type="submit" style="width:100%;height:36px;background:#7C3AED;color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer">Apply</button>
+                        </form>
+                    </details>
+                    <a href="${appBase}/zenith/tax/FindTaxRate/downloadReport" style="display:inline-flex;align-items:center;gap:7px;height:40px;padding:0 16px;background:var(--z-text-main,#111827);color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:600;text-decoration:none"><span class="material-icons" style="font-size:18px">file_download</span>Download Report</a>
+                </div>
+            </div>
 
-        <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg z-listchrome">
-            <render-mode><text type="html,qvt"><![CDATA[<span class="zlc-ph" data-ph="Search tax rates..." style="display:none"></span>]]></text></render-mode>
-            <form-list name="TaxRatesForm" list="taxRates" skip-form="true" header-dialog="true"
-                       select-columns="true" saved-finds="true" show-csv-button="true" show-xlsx-button="true">
-                <field name="taxName"><header-field title="Tax Name" show-order-by="true"><text-find size="20"/></header-field>
-                    <conditional-field name="taxName" title="Tax Name"><condition><expression>isSuperAdmin</expression></condition>
-                        <link url="editTaxRate" text="${taxName}" parameter-map="[taxRateId:taxRateId]"/>
-                    </conditional-field>
-                    <default-field title="Tax Name"><display/></default-field></field>
-                <field name="taxAuthorityId"><header-field title="Authority" show-order-by="true">
-                    <drop-down allow-empty="true"><entity-options key="${taxAuthorityId}" text="${description}">
-                        <entity-find entity-name="zenith.erp.tax.TaxAuthority">
-                            <econdition field-name="isActive" value="Y"/>
-                        </entity-find>
-                    </entity-options></drop-down></header-field>
-                    <default-field title="Authority">
-                        <display-entity entity-name="zenith.erp.tax.TaxAuthority" key-field-name="taxAuthorityId" text="${description}"/>
-                    </default-field></field>
-                <field name="taxTypeEnumId"><header-field title="Type" show-order-by="true">
-                    <drop-down allow-empty="true"><entity-options key="${enumId}" text="${description}">
-                        <entity-find entity-name="moqui.basic.Enumeration">
-                            <econdition field-name="enumTypeId" value="TaxType"/>
-                        </entity-find>
-                    </entity-options></drop-down></header-field>
-                    <default-field title="Type">
-                        <display-entity entity-name="moqui.basic.Enumeration" key-field-name="enumId" text="${description}"/>
-                    </default-field></field>
-                <field name="rate"><header-field show-order-by="true"/>
-                    <default-field title="Rate"><display format="#0.####"/></default-field></field>
-                <field name="rateTypeEnumId">
-                    <default-field title="Rate Type">
-                        <display-entity entity-name="moqui.basic.Enumeration" key-field-name="enumId" text="${description}"/>
-                    </default-field></field>
-                <field name="effectiveFrom"><header-field show-order-by="true"/>
-                    <default-field title="From"><display format="dd-MMM-yyyy"/></default-field></field>
-                <field name="effectiveThru"><header-field show-order-by="true"/>
-                    <default-field title="Thru"><display format="dd-MMM-yyyy"/></default-field></field>
-                <field name="isActive"><header-field show-order-by="true">
-                    <drop-down allow-empty="true"><option key="Y" text="Active"/><option key="N" text="Inactive"/></drop-down>
-                </header-field>
-                    <default-field title="Active"><display/></default-field></field>
-                <field name="deleteBtn">
-                    <conditional-field name="deleteBtn" title="Actions"><condition><expression>isSuperAdmin &amp;&amp; modCanWrite</expression></condition>
-                        <link url="deleteTaxRate" text="Delete" parameter-map="[taxRateId:taxRateId]"
-                              confirmation="Delete this tax rate? Only allowed if it is not used anywhere." style="text-negative"/>
-                    </conditional-field>
-                    <default-field title=""><label text=""/></default-field></field>
-                <!-- ZE-PRC-004 sweep: Find submit button so the header-dialog filters can be applied (was a dead dialog). -->
-                <field name="submitButton"><header-field title="Find"><submit/></header-field></field>
-            </form-list>
-        </container>
-        <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mt-md">
-            <label text="GST Rate Slabs (India)" type="h6" style="text-weight-bold q-mb-xs"/>
-            <label text="Statutory GST slabs used by the tax engine for billing. Assign a slab to each product under Inventory." type="p" style="text-grey-7 q-mb-md"/>
-            <form-list name="GstSlabList" list="gstSlabs" skip-form="true">
-                <field name="slabName"><default-field title="Slab"><display/></default-field></field>
-                <field name="gstRate"><default-field title="GST %"><display format="#0.##"/></default-field></field>
-                <field name="cgstRate"><default-field title="CGST %"><display format="#0.##"/></default-field></field>
-                <field name="sgstRate"><default-field title="SGST %"><display format="#0.##"/></default-field></field>
-                <field name="igstRate"><default-field title="IGST %"><display format="#0.##"/></default-field></field>
-                <field name="cessRate"><default-field title="Cess %"><display format="#0.##"/></default-field></field>
-            </form-list>
-        </container>
+            <#assign stats = [
+                {"lbl":"Tax Authorities","val":"${totalAuthorities!0}","sub":"Active","subcol":"#0E9F6E","ico":"account_balance","bg":"rgba(124,58,237,.12)","fg":"#7C3AED"},
+                {"lbl":"Tax Rates","val":"${totalRates!0}","sub":"Active","subcol":"#0E9F6E","ico":"percent","bg":"rgba(16,185,129,.14)","fg":"#0E9F6E"},
+                {"lbl":"Tax Categories","val":"${totalCategories!0}","sub":"${((totalCategories!0) > 0)?string('Active','No categories added')}","subcol":"#B45309","ico":"local_offer","bg":"#FEF3C7","fg":"#B45309"},
+                {"lbl":"Exemptions","val":"${totalExemptions!0}","sub":"Active","subcol":"#DC2626","ico":"verified_user","bg":"#FEE2E2","fg":"#DC2626"},
+                {"lbl":"Registrations","val":"${totalRegistrations!0}","sub":"Active","subcol":"#2563EB","ico":"description","bg":"#DBEAFE","fg":"#2563EB"}]/>
+            <div style="display:flex;flex-wrap:wrap;gap:16px;margin-bottom:20px">
+                <#list stats as c>
+                <div style="flex:1 1 180px;min-width:175px;background:var(--z-bg-card,#fff);border:1px solid var(--z-border,#E5E7EB);border-radius:12px;padding:18px 20px;box-shadow:0 1px 2px rgba(0,0,0,.04)">
+                    <div style="display:flex;align-items:center;gap:14px">
+                        <div style="width:44px;height:44px;flex:0 0 auto;border-radius:10px;display:flex;align-items:center;justify-content:center;background:${c.bg}"><span class="material-icons" style="font-size:22px;color:${c.fg}">${c.ico}</span></div>
+                        <div style="min-width:0"><div style="font-size:12.5px;color:var(--z-text-muted,#6B7280)">${c.lbl}</div><div style="font-size:26px;font-weight:700;line-height:1.1;color:var(--z-text-main,#111827)">${c.val}</div></div>
+                    </div>
+                    <div style="font-size:12px;font-weight:600;color:${c.subcol};margin-top:10px">${c.sub}</div>
+                </div>
+                </#list>
+            </div>
+        ]]></text></render-mode>
+
+        <container-row>
+            <!-- ===== left column: About + Need-to-change ===== -->
+            <row-col lg="4" md="12">
+                <render-mode><text type="html,qvt"><![CDATA[
+                    <div style="background:var(--z-bg-card,#fff);border:1px solid var(--z-border,#E5E7EB);border-radius:12px;padding:20px;margin-bottom:16px">
+                        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px"><span style="font-size:15px;font-weight:600;color:var(--z-text-main,#111827)">About GST Rate Slabs</span><span class="material-icons" style="font-size:16px;color:#9CA3AF">info</span></div>
+                        <div style="font-size:12.5px;color:var(--z-text-muted,#6B7280);margin-bottom:14px">These are the standard GST slabs used in India.</div>
+                        <div style="display:flex;gap:12px;padding:12px;border-radius:10px;background:rgba(124,58,237,.05);margin-bottom:10px"><span style="width:36px;height:36px;flex:0 0 auto;border-radius:9px;background:rgba(124,58,237,.12);display:inline-flex;align-items:center;justify-content:center"><span class="material-icons" style="font-size:19px;color:#7C3AED">percent</span></span><div><div style="font-size:13px;font-weight:600;color:var(--z-text-main,#111827)">What are GST Slabs?</div><div style="font-size:12px;color:var(--z-text-muted,#6B7280);margin-top:2px">Different tax rates applied to different types of products and services.</div></div></div>
+                        <div style="display:flex;gap:12px;padding:12px;border-radius:10px;background:rgba(16,185,129,.06);margin-bottom:10px"><span style="width:36px;height:36px;flex:0 0 auto;border-radius:9px;background:rgba(16,185,129,.14);display:inline-flex;align-items:center;justify-content:center"><span class="material-icons" style="font-size:19px;color:#0E9F6E">account_tree</span></span><div><div style="font-size:13px;font-weight:600;color:var(--z-text-main,#111827)">Used In</div><div style="font-size:12px;color:var(--z-text-muted,#6B7280);margin-top:2px">Billing, Invoices, Purchase, Inventory Valuation.</div></div></div>
+                        <div style="display:flex;gap:12px;padding:12px;border-radius:10px;background:rgba(217,119,6,.06)"><span style="width:36px;height:36px;flex:0 0 auto;border-radius:9px;background:#FEF3C7;display:inline-flex;align-items:center;justify-content:center"><span class="material-icons" style="font-size:19px;color:#B45309">description</span></span><div><div style="font-size:13px;font-weight:600;color:var(--z-text-main,#111827)">You Can</div><div style="font-size:12px;color:var(--z-text-muted,#6B7280);margin-top:2px">View slabs, percentages and cess details below.</div></div></div>
+                    </div>
+                    <div style="background:rgba(124,58,237,.06);border:1px solid rgba(124,58,237,.12);border-radius:12px;padding:18px 20px">
+                        <div style="font-size:15px;font-weight:600;color:var(--z-text-main,#111827);margin-bottom:6px">Need to make a change?</div>
+                        <div style="font-size:12.5px;color:var(--z-text-muted,#6B7280);margin-bottom:14px">To add custom taxes or categories, go to <span style="color:#7C3AED;font-weight:600">Tax Categories</span>.</div>
+                        <a href="${appBase}/zenith/tax/TaxDashboard" style="display:inline-flex;align-items:center;gap:8px;height:40px;padding:0 16px;border:1px solid var(--z-border,#E5E7EB);border-radius:8px;background:var(--z-bg-card,#fff);color:#7C3AED;font-size:13px;font-weight:600;text-decoration:none">Go to Tax Categories <span class="material-icons" style="font-size:17px">arrow_forward</span></a>
+                    </div>
+                ]]></text></render-mode>
+            </row-col>
+
+            <!-- ===== right column: GST Rate Slabs table ===== -->
+            <row-col lg="8" md="12">
+                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg">
+                    <render-mode><text type="html,qvt" template="true"><![CDATA[
+                        <div style="display:flex;flex-wrap:wrap;align-items:flex-start;justify-content:space-between;gap:10px;margin-bottom:14px">
+                            <div><div style="font-size:15px;font-weight:600;color:var(--z-text-main,#111827)">GST Rate Slabs (India)</div><div style="font-size:12.5px;color:var(--z-text-muted,#6B7280);margin-top:3px">Standard GST slabs used for billing. Assign a slab to each product under Inventory.</div></div>
+                            <span style="display:inline-flex;align-items:center;gap:6px;padding:5px 11px;border:1px solid var(--z-border,#E5E7EB);border-radius:8px;font-size:12px;color:var(--z-text-main,#111827);white-space:nowrap">&#127470;&#127475; Effective in India</span>
+                        </div>
+                        <div style="overflow-x:auto">
+                        <table style="width:100%;border-collapse:collapse;font-size:13px">
+                            <thead><tr style="color:var(--z-text-muted,#6B7280);font-size:12px;font-weight:600;border-bottom:1px solid var(--z-border,#E5E7EB)">
+                                <th style="text-align:left;padding:10px 12px">Slab / Description</th><th style="text-align:right;padding:10px 12px">GST %</th><th style="text-align:right;padding:10px 12px">CGST %</th><th style="text-align:right;padding:10px 12px">SGST %</th><th style="text-align:right;padding:10px 12px">IGST %</th><th style="text-align:right;padding:10px 12px">Cess %</th><th style="text-align:right;padding:10px 12px">Total Tax %</th>
+                            </tr></thead>
+                            <tbody>
+                            <#list (slabRows![]) as r>
+                                <tr style="border-bottom:1px solid var(--z-border,#EEF0F4)">
+                                    <td style="padding:12px"><span style="display:inline-block;padding:3px 11px;border-radius:7px;background:${r.pillBg};color:${r.pillFg};font-size:11.5px;font-weight:600">${r.name?html}</span></td>
+                                    <td style="text-align:right;padding:12px;color:var(--z-text-main,#111827)">${r.gst}</td>
+                                    <td style="text-align:right;padding:12px;color:var(--z-text-main,#111827)">${r.cgst}</td>
+                                    <td style="text-align:right;padding:12px;color:var(--z-text-main,#111827)">${r.sgst}</td>
+                                    <td style="text-align:right;padding:12px;color:var(--z-text-main,#111827)">${r.igst}</td>
+                                    <td style="text-align:right;padding:12px;color:var(--z-text-main,#111827)">${r.cess}</td>
+                                    <td style="text-align:right;padding:12px;font-weight:600;color:var(--z-text-main,#111827)">${r.total}%</td>
+                                </tr>
+                            <#else>
+                                <tr><td colspan="7" style="padding:36px;text-align:center;color:#9CA3AF">No GST slabs configured.</td></tr>
+                            </#list>
+                            </tbody>
+                        </table>
+                        </div>
+                        <div style="display:flex;align-items:center;gap:7px;margin-top:14px;font-size:12px;color:var(--z-text-muted,#6B7280);font-style:italic"><span class="material-icons" style="font-size:16px;color:#9CA3AF">lightbulb</span>Total Tax % = GST % + Cess % (applies for IGST or combined)</div>
+                    ]]></text></render-mode>
+                </container>
+            </row-col>
+        </container-row>
     </widgets>
 </screen>
