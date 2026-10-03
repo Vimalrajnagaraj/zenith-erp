@@ -3,16 +3,6 @@
         xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
         default-menu-title="Bill Register" default-menu-index="17">
 
-    <transition name="goTerminal"><default-response url="../Terminal"/></transition>
-    <transition name="goAudit"><default-response url="../BillAuditReport"/></transition>
-    <transition name="goReports"><default-response url="../Reports"/></transition>
-    <transition name="goDashboard"><default-response url="../Dashboard"/></transition>
-
-    <!-- Custom date range: redirect back to this screen with period=custom + the chosen dates -->
-    <transition name="applyFilter" read-only="true">
-        <default-response url="." parameter-map="[period:'custom', fromDate:fromDate, thruDate:thruDate, viewMode:viewMode]"/>
-    </transition>
-
     <!-- Read-only print view: clean, self-contained HTML report that auto-opens the print dialog. -->
     <transition name="printDoc" read-only="true">
         <actions>
@@ -74,11 +64,51 @@
         <default-response type="none"/>
     </transition>
 
+    <!-- Read-only CSV export of the number-by-number register (org-scoped, same filters). -->
+    <transition name="exportCsv" read-only="true">
+        <actions>
+            <script><![CDATA[
+                def vm = ec.web.parameters.viewMode ?: 'all'
+                def pd = ec.web.parameters.period ?: 'all'
+                def fd = ec.web.parameters.fromDate
+                def td = ec.web.parameters.thruDate
+                def opParty = ec.user.userAccount?.partyId
+                def rs = ec.entity.find("zenith.erp.pos.PosSession").condition("operatorPartyId", opParty).orderBy("-openDate").limit(1).list()
+                def myOrg = ec.user.getPreference("ACTIVE_ORGANIZATION")
+                if (rs && !myOrg) { def tm = ec.entity.find("zenith.erp.pos.PosTerminal").condition("terminalId", rs[0].terminalId).one(); myOrg = tm?.organizationPartyId }
+                def res = ec.service.sync().name("zenith.pos.PosReportServices.get#BillNumberRegister")
+                    .parameters([organizationPartyId: myOrg, viewMode: vm, period: pd, fromDate: fd, thruDate: td]).call()
+                def regList = res.registerList ?: []
+                def q = { v -> '"' + (v == null ? '' : v.toString().replace('"','""')) + '"' }
+                def money = { v -> (v == null) ? '' : ec.l10n.format(v as BigDecimal, "#,##0.00") }
+                def sb = new StringBuilder()
+                sb.append("Store,Sequence,Bill Number,Status,Sales Value,Date & Time\r\n")
+                for (r in regList) {
+                    def fn = (r.fullNumber ?: '').toString()
+                    def seqPart = fn.contains('/') ? fn.substring(0, fn.lastIndexOf('/')) : fn
+                    def numPart = fn.contains('/') ? fn.substring(fn.lastIndexOf('/') + 1) : fn
+                    def isSale = (r.statusLabel != null && r.statusLabel.toString().startsWith('Sale issued'))
+                    def dt = r.entryDate ? ec.l10n.format(r.entryDate, "dd-MM-yyyy hh:mm a") : ''
+                    sb.append(q(r.orgName)).append(',').append(q(seqPart)).append(',').append(q(numPart)).append(',')
+                      .append(q(r.statusLabel)).append(',').append(q(isSale && r.amount != null ? money(r.amount) : '')).append(',')
+                      .append(q(dt)).append("\r\n")
+                }
+                ec.web.sendTextResponse(sb.toString(), "text/csv", "bill-register.csv")
+            ]]></script>
+        </actions>
+        <default-response type="none"/>
+    </transition>
+
     <actions>
         <set field="viewMode" from="ec.web.parameters.viewMode ?: 'all'"/>
         <set field="period" from="ec.web.parameters.period ?: 'all'"/>
         <set field="fromDate" from="ec.web.parameters.fromDate"/>
         <set field="thruDate" from="ec.web.parameters.thruDate"/>
+        <script><![CDATA[
+            def _uri = (ec.web?.request?.requestURI ?: '')
+            def _zi = _uri.indexOf('/zenith/')
+            appBase = _zi > 0 ? _uri.substring(0, _zi) : ''
+        ]]></script>
         <!-- Scope to the operator's organization (whole store) -->
         <set field="opParty" from="ec.user.userAccount?.partyId"/>
         <entity-find entity-name="zenith.erp.pos.PosSession" list="recentSess" limit="1">
@@ -95,90 +125,176 @@
         </if>
         <service-call name="zenith.pos.PosReportServices.get#BillNumberRegister" out-map="regOut"
             in-map="[organizationPartyId:myOrg, viewMode:viewMode, period:period, fromDate:fromDate, thruDate:thruDate]"/>
-        <set field="register" from="regOut.registerList"/>
-        <set field="seqInfo" from="regOut.seqList"/>
         <set field="periodLabel" from="regOut.periodLabel"/>
         <set field="grandSalesFmt" from="zinr.inr(ec.l10n.format(regOut.grandSalesValue ?: 0, '#,##,##0.00'))"/>
+        <script><![CDATA[
+            // ---- KPI roll-ups from the per-sequence summary ----
+            def sums = [total:0, sale:0, held:0, inc:0, voided:0, gap:0]
+            (regOut.seqList ?: []).each { s ->
+                sums.total += (s.total ?: 0); sums.sale += (s.sale ?: 0); sums.held += (s.held ?: 0)
+                sums.inc += (s.inc ?: 0); sums.voided += (s.voided ?: 0); sums.gap += (s.gap ?: 0)
+            }
+            kpiTotal = sums.total; kpiSale = sums.sale; kpiHeld = sums.held; kpiVoided = sums.voided; kpiGap = sums.gap
+
+            // ---- Pre-build the number-by-number rows (split sequence/number, badge, formatted amount/date) ----
+            def badgeOf = { lb ->
+                if (lb == null) return ['grey','—']
+                def s = lb.toString()
+                if (s.startsWith('Sale issued')) return ['success','Sale issued']
+                if (s.startsWith('Voided')) return ['danger','Voided']
+                if (s.startsWith('Held')) return ['warning','Held']
+                if (s.startsWith('Incomplete')) return ['grey','Incomplete']
+                if (s.startsWith('UNUSED')) return ['info','Unused']
+                return ['grey', s]
+            }
+            rows = (regOut.registerList ?: []).collect { r ->
+                def fn = (r.fullNumber ?: '').toString()
+                def seqPart = fn.contains('/') ? fn.substring(0, fn.lastIndexOf('/')) : fn
+                def numPart = fn.contains('/') ? fn.substring(fn.lastIndexOf('/') + 1) : fn
+                def isSale = (r.statusLabel != null && r.statusLabel.toString().startsWith('Sale issued'))
+                def b = badgeOf(r.statusLabel)
+                [store:(r.orgName ?: ''), seq:seqPart, num:numPart, badgeClass:b[0], badgeText:b[1],
+                 salesVal:(isSale && r.amount != null ? zinr.inr(ec.l10n.format(r.amount as BigDecimal, '#,##,##0.00')) : null),
+                 dt:(r.entryDate ? ec.l10n.format(r.entryDate, 'dd-MM-yyyy hh:mm a') : '')]
+            }
+            rowCount = rows.size()
+        ]]></script>
     </actions>
 
     <widgets>
-        <render-mode><text type="html,qvt" template="true"><![CDATA[<details id="posHelp_billregister" open style="background:#e8f0fe;border:1px solid #4285f4;border-left:6px solid #1a73e8;border-radius:10px;padding:10px 16px;margin:8px 12px 4px 12px;font-family:Segoe UI,Arial,sans-serif"><summary style="cursor:pointer;font-weight:800;font-size:15px;color:#174ea6;outline:none">&#128290; Bill Register &mdash; quick help <span style="font-weight:600;color:#5f6368;font-size:12px">(click to hide / show)</span></summary><div style="font-size:13px;color:#202124;line-height:1.9;margin-top:8px">Confirms <b>every bill number is accounted for</b>, with no gaps.<br><b>1</b>&nbsp;Pick a <b>period</b>.<br><b>2</b>&nbsp;Choose <b>all numbers</b> or <b>gaps only</b> to spot any missing or skipped bills.</div></details>]]></text></render-mode>
-        <container style="row items-center justify-end q-px-md q-pt-md q-gutter-sm">
-            <link url="goTerminal" text="Billing" icon="fa fa-calculator" btn-type="success" style="q-btn--dense"/>
-            <link url="goAudit" text="Edit Audit" icon="fa fa-history" btn-type="info" style="q-btn--dense"/>
-            <link url="goReports" text="Reports" icon="fa fa-bar-chart" btn-type="warning" style="q-btn--dense"/>
-            <link url="goDashboard" text="Dashboard" icon="fa fa-dashboard" style="q-btn--dense"/>
-        </container>
+        <render-mode><text type="html,qvt" template="true"><![CDATA[<details id="posHelp_billregister" style="background:#EEF2FF;border:1px solid #C7D2FE;border-left:5px solid #6366F1;border-radius:10px;padding:9px 16px;margin:8px 16px 0 16px;font-family:Segoe UI,Arial,sans-serif"><summary style="cursor:pointer;font-weight:700;font-size:14px;color:#3730A3;outline:none">&#128290; Bill Register &mdash; quick help <span style="font-weight:500;color:#6B7280;font-size:12px">(click to hide / show)</span></summary><div style="font-size:13px;color:#202124;line-height:1.9;margin-top:8px">Confirms <b>every bill number is accounted for</b>, with no gaps. An <b>UNUSED</b> number was never printed on a customer bill.<br><b>1</b>&nbsp;Pick a <b>period</b>.<br><b>2</b>&nbsp;Choose <b>All Numbers</b> or <b>Gaps Only</b> to spot any missing or skipped bills.</div></details>]]></text></render-mode>
 
-        <container style="row items-center q-px-md q-pt-sm q-gutter-sm">
-            <label text="View:" type="span" style="text-weight-medium"/>
-            <link url="." text="All Numbers" parameter-map="[viewMode:'all', period:period, fromDate:fromDate, thruDate:thruDate]" btn-type="info" style="q-btn--dense"/>
-            <link url="." text="Gaps Only" parameter-map="[viewMode:'gaps', period:period, fromDate:fromDate, thruDate:thruDate]" btn-type="warning" style="q-btn--dense"/>
-            <label text="(showing: ${viewMode == 'gaps' ? 'gaps only' : 'all numbers'})" type="span" style="text-grey-7"/>
-            <render-mode>
-                <text type="qvt,html"><![CDATA[
-                    <a href="${sri.buildUrl('printDoc').url}?viewMode=${viewMode!'all'}&amp;period=${period!'all'}&amp;fromDate=${fromDate!''}&amp;thruDate=${thruDate!''}" target="_blank"
-                       style="margin-left:12px;display:inline-flex;align-items:center;gap:6px;padding:6px 16px;border-radius:6px;background:#7C3AED;color:#fff;text-decoration:none;font-weight:600;font-size:13px">Print Report</a>
-                ]]></text>
-            </render-mode>
-        </container>
+        <render-mode><text type="html,qvt" template="true"><![CDATA[
+        <#assign bu = (appBase!'') + '/zenith/pos/BillNumberRegister'>
+        <#assign fd = (fromDate!'')?string>
+        <#assign td = (thruDate!'')?string>
+        <#assign qp = '&period=' + (period!'all') + '&viewMode=' + (viewMode!'all') + '&fromDate=' + fd?url('UTF-8') + '&thruDate=' + td?url('UTF-8')>
+        <#macro vtab label mode><#assign on = (viewMode!'all') == mode>
+            <a href="${bu}?viewMode=${mode}&period=${(period!'all')}&fromDate=${fd?url('UTF-8')}&thruDate=${td?url('UTF-8')}" style="display:inline-flex;align-items:center;height:34px;padding:0 14px;border-radius:8px;font-size:12.5px;font-weight:600;text-decoration:none;<#if on>background:#7C3AED;color:#fff;border:1px solid #7C3AED;<#else>background:#fff;color:#6B7280;border:1px solid #E5E7EB;</#if>">${label}</a>
+        </#macro>
+        <#macro ptab label pd icon=''><#assign on = (period!'all') == pd>
+            <a href="${bu}?period=${pd}&viewMode=${(viewMode!'all')}" style="display:inline-flex;align-items:center;gap:5px;height:34px;padding:0 14px;border-radius:8px;font-size:12.5px;font-weight:600;text-decoration:none;<#if on>background:#F5F3FF;color:#7C3AED;border:1px solid #7C3AED;<#else>background:#fff;color:#6B7280;border:1px solid #E5E7EB;</#if>"><#if icon?has_content><span class="material-icons" style="font-size:15px">${icon}</span></#if>${label}</a>
+        </#macro>
+        <div style="padding:16px 16px 24px;font-family:'Segoe UI',Arial,sans-serif">
+            <!-- Page header -->
+            <div style="display:flex;align-items:center;gap:14px;margin-bottom:18px">
+                <span class="z-icobadge lg primary"><span class="material-icons">description</span></span>
+                <div>
+                    <div style="font-size:20px;font-weight:800;color:#111827;line-height:1.3">Bill Register</div>
+                    <div style="font-size:13px;color:#6B7280;line-height:1.5">Track and verify every bill number in each sequence. View issued, voided, unused and missing numbers.</div>
+                </div>
+            </div>
 
-        <container style="row items-center q-px-md q-pt-sm q-gutter-sm">
-            <label text="Period:" type="span" style="text-weight-medium"/>
-            <link url="." text="All Dates" parameter-map="[period:'all', viewMode:viewMode]" btn-type="info" style="q-btn--dense"/>
-            <link url="." text="This Month" parameter-map="[period:'thisMonth', viewMode:viewMode]" btn-type="info" style="q-btn--dense"/>
-            <link url="." text="Last Month" parameter-map="[period:'lastMonth', viewMode:viewMode]" btn-type="info" style="q-btn--dense"/>
-            <label text="Showing: ${periodLabel ?: 'All dates'}" type="span" style="text-weight-medium text-primary"/>
-        </container>
+            <!-- KPI stat cards -->
+            <div class="z-statrow">
+                <div class="z-statcell z-statcard-violet" style="padding:16px"><div class="z-statinner"><span class="z-icobadge lg primary"><span class="material-icons">description</span></span><div class="z-statmeta"><span class="z-statnum" style="color:#7C3AED">${kpiTotal!0}</span><span class="z-statlabel">Total Numbers</span><span class="z-statdesc">In selected period</span></div></div></div>
+                <div class="z-statcell z-statcard-green" style="padding:16px"><div class="z-statinner"><span class="z-icobadge lg green"><span class="material-icons">check_circle</span></span><div class="z-statmeta"><span class="z-statnum" style="color:#0E9F6E">${kpiSale!0}</span><span class="z-statlabel">Sales Issued</span><span class="z-statdesc">Printed to customers</span></div></div></div>
+                <div class="z-statcell z-statcard-orange" style="padding:16px"><div class="z-statinner"><span class="z-icobadge lg orange"><span class="material-icons">pause_circle</span></span><div class="z-statmeta"><span class="z-statnum" style="color:#B45309">${kpiHeld!0}</span><span class="z-statlabel">Held</span><span class="z-statdesc">Reserved numbers</span></div></div></div>
+                <div class="z-statcell z-statcard-red" style="padding:16px"><div class="z-statinner"><span class="z-icobadge lg red"><span class="material-icons">cancel</span></span><div class="z-statmeta"><span class="z-statnum" style="color:#DC2626">${kpiVoided!0}</span><span class="z-statlabel">Voided</span><span class="z-statdesc">Cancelled bills</span></div></div></div>
+                <div class="z-statcell z-statcard-blue" style="padding:16px"><div class="z-statinner"><span class="z-icobadge lg blue"><span class="material-icons">more_horiz</span></span><div class="z-statmeta"><span class="z-statnum" style="color:#2563EB">${kpiGap!0}</span><span class="z-statlabel">Unused (Gaps)</span><span class="z-statdesc">Numbers not issued</span></div></div></div>
+                <div class="z-statcell z-statcard-violet" style="padding:16px"><div class="z-statinner"><span class="z-icobadge lg primary"><span class="material-icons">currency_rupee</span></span><div class="z-statmeta"><span class="z-statnum" style="color:#7C3AED;font-size:21px">&#8377;${grandSalesFmt!'0.00'}</span><span class="z-statlabel">Sales Value</span><span class="z-statdesc">In selected period</span></div></div></div>
+            </div>
 
-        <container style="row items-center q-px-md q-pb-xs q-gutter-sm">
-            <label text="Total sales value (in view): &#8377; ${grandSalesFmt ?: '0.00'}" type="span" style="text-h6 text-positive text-weight-bold"/>
-        </container>
+            <!-- Filter toolbar -->
+            <div style="background:#fff;border:1px solid #E5E7EB;border-radius:12px;padding:16px;margin-bottom:18px">
+                <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+                    <span style="font-size:12.5px;color:#6B7280;font-weight:600">View:</span>
+                    <div style="display:flex;gap:8px"><@vtab label="All Numbers" mode="all"/><@vtab label="Gaps Only" mode="gaps"/></div>
+                    <span style="font-size:12.5px;color:#6B7280;font-weight:600;margin-left:8px">Period:</span>
+                    <div style="display:flex;gap:8px;flex-wrap:wrap"><@ptab label="All Dates" pd="all"/><@ptab label="This Month" pd="thisMonth"/><@ptab label="Last Month" pd="lastMonth"/>
+                        <button type="button" id="br-customBtn" style="display:inline-flex;align-items:center;gap:5px;height:34px;padding:0 14px;border-radius:8px;font-size:12.5px;font-weight:600;cursor:pointer;<#if (period!'all')=='custom'>background:#F5F3FF;color:#7C3AED;border:1px solid #7C3AED;<#else>background:#fff;color:#6B7280;border:1px solid #E5E7EB;</#if>"><span class="material-icons" style="font-size:15px">event</span>Custom Range</button>
+                    </div>
+                    <a href="${sri.buildUrl('printDoc').url}?viewMode=${(viewMode!'all')}&amp;period=${(period!'all')}&amp;fromDate=${fd?url('UTF-8')}&amp;thruDate=${td?url('UTF-8')}" target="_blank" style="margin-left:auto;display:inline-flex;align-items:center;gap:6px;height:38px;padding:0 16px;border-radius:8px;background:#7C3AED;color:#fff;text-decoration:none;font-weight:600;font-size:12.5px"><span class="material-icons" style="font-size:16px">print</span>Print Report</a>
+                </div>
+                <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:14px">
+                    <span style="font-size:12.5px;color:#374151;font-weight:600">From</span>
+                    <input type="date" id="br-from" value="${fd?html}" style="height:36px;padding:0 10px;border:1px solid #E5E7EB;border-radius:8px;font-size:13px;color:#374151"/>
+                    <span style="font-size:12.5px;color:#374151;font-weight:600">To</span>
+                    <input type="date" id="br-thru" value="${td?html}" style="height:36px;padding:0 10px;border:1px solid #E5E7EB;border-radius:8px;font-size:13px;color:#374151"/>
+                    <button type="button" id="br-apply" style="height:36px;padding:0 16px;border-radius:8px;background:#fff;color:#7C3AED;border:1px solid #7C3AED;font-size:12.5px;font-weight:600;cursor:pointer">Apply</button>
+                    <div style="margin-left:auto;display:flex;align-items:center;gap:8px">
+                        <span style="font-size:12.5px;color:#6B7280;font-weight:600">Total sales value (in view):</span>
+                        <span style="background:#D1FAE5;color:#0E9F6E;padding:4px 10px;border-radius:8px;font-weight:700;font-size:12.5px">&#8377;${grandSalesFmt!'0.00'}</span>
+                    </div>
+                </div>
+            </div>
 
-        <container style="row items-center q-px-md q-pb-sm">
-            <form-single name="DateRange" transition="applyFilter">
-                <field name="viewMode"><default-field><hidden/></default-field></field>
-                <field name="fromDate"><default-field title="From"><date-time type="date"/></default-field></field>
-                <field name="thruDate"><default-field title="To"><date-time type="date"/></default-field></field>
-                <field name="applyBtn"><default-field title=""><submit text="Apply Custom Range"/></default-field></field>
-            </form-single>
-        </container>
+            <!-- Register panel -->
+            <div style="background:#fff;border:1px solid #E5E7EB;border-radius:12px;overflow:hidden">
+                <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:16px 20px">
+                    <div style="display:flex;align-items:flex-start;gap:12px">
+                        <span class="z-icobadge primary"><span class="material-icons">description</span></span>
+                        <div>
+                            <div style="font-size:15px;font-weight:700;color:#111827">Bill Number Register &ndash; every number accounted for</div>
+                            <div style="font-size:12px;color:#6B7280;line-height:1.5;max-width:860px">This shows every bill number in each sequence, from the first to the last issued. An 'UNUSED' number was never printed on a customer bill - older system behaviour reserved a number when a cart was opened, so a cancelled or abandoned cart left a gap.</div>
+                        </div>
+                    </div>
+                    <div style="display:flex;gap:8px;flex-shrink:0;position:relative">
+                        <button type="button" id="br-colsBtn" style="display:inline-flex;align-items:center;gap:6px;height:34px;padding:0 14px;border-radius:8px;background:#fff;color:#6B7280;border:1px solid #E5E7EB;font-size:12.5px;font-weight:600;cursor:pointer"><span class="material-icons" style="font-size:16px">view_column</span>Columns</button>
+                        <div id="br-colsMenu" style="display:none;position:absolute;top:40px;right:60px;background:#fff;border:1px solid #E5E7EB;border-radius:10px;box-shadow:0 8px 24px rgba(17,24,39,.12);padding:8px;z-index:30;min-width:170px">
+                            <label style="display:flex;align-items:center;gap:8px;padding:6px 8px;font-size:13px;color:#374151;cursor:pointer"><input type="checkbox" class="br-colchk" data-col="store" checked/> Store</label>
+                            <label style="display:flex;align-items:center;gap:8px;padding:6px 8px;font-size:13px;color:#374151;cursor:pointer"><input type="checkbox" class="br-colchk" data-col="seq" checked/> Sequence</label>
+                            <label style="display:flex;align-items:center;gap:8px;padding:6px 8px;font-size:13px;color:#374151;cursor:pointer"><input type="checkbox" class="br-colchk" data-col="billno" checked/> Bill Number</label>
+                            <label style="display:flex;align-items:center;gap:8px;padding:6px 8px;font-size:13px;color:#374151;cursor:pointer"><input type="checkbox" class="br-colchk" data-col="status" checked/> Status</label>
+                            <label style="display:flex;align-items:center;gap:8px;padding:6px 8px;font-size:13px;color:#374151;cursor:pointer"><input type="checkbox" class="br-colchk" data-col="salesval" checked/> Sales Value</label>
+                            <label style="display:flex;align-items:center;gap:8px;padding:6px 8px;font-size:13px;color:#374151;cursor:pointer"><input type="checkbox" class="br-colchk" data-col="datetime" checked/> Date &amp; Time</label>
+                            <label style="display:flex;align-items:center;gap:8px;padding:6px 8px;font-size:13px;color:#374151;cursor:pointer"><input type="checkbox" class="br-colchk" data-col="action" checked/> Action</label>
+                        </div>
+                        <a href="${sri.buildUrl('exportCsv').url}?viewMode=${(viewMode!'all')}&amp;period=${(period!'all')}&amp;fromDate=${fd?url('UTF-8')}&amp;thruDate=${td?url('UTF-8')}" target="_blank" style="display:inline-flex;align-items:center;gap:6px;height:34px;padding:0 14px;border-radius:8px;background:#fff;color:#6B7280;border:1px solid #E5E7EB;font-size:12.5px;font-weight:600;text-decoration:none"><span class="material-icons" style="font-size:16px">download</span>CSV</a>
+                    </div>
+                </div>
+                <div style="overflow-x:auto">
+                <table id="br-table" style="width:100%;border-collapse:collapse;font-size:12.5px;min-width:900px">
+                    <thead>
+                        <tr style="background:#F5F3FF;color:#6B7280;text-align:left">
+                            <th style="padding:11px 16px;font-weight:600;font-size:11.5px">#</th>
+                            <th data-col="store" style="padding:11px 16px;font-weight:600;font-size:11.5px">Store</th>
+                            <th data-col="seq" style="padding:11px 16px;font-weight:600;font-size:11.5px">Sequence</th>
+                            <th data-col="billno" style="padding:11px 16px;font-weight:600;font-size:11.5px">Bill Number</th>
+                            <th data-col="status" style="padding:11px 16px;font-weight:600;font-size:11.5px">Status</th>
+                            <th data-col="salesval" style="padding:11px 16px;font-weight:600;font-size:11.5px;text-align:right">Sales Value</th>
+                            <th data-col="datetime" style="padding:11px 16px;font-weight:600;font-size:11.5px">Date &amp; Time</th>
+                            <th data-col="action" style="padding:11px 16px;font-weight:600;font-size:11.5px">Action</th>
+                        </tr>
+                    </thead>
+                    <tbody id="br-tbody">
+                        <#list (rows![]) as r>
+                        <tr class="br-row" style="border-top:1px solid #F1F1F4">
+                            <td style="padding:11px 16px;color:#9CA3AF">${r_index + 1}</td>
+                            <td data-col="store" style="padding:11px 16px;color:#111827">${(r.store)?html}</td>
+                            <td data-col="seq" style="padding:11px 16px;color:#6B7280">${(r.seq)?html}</td>
+                            <td data-col="billno" style="padding:11px 16px;color:#111827;font-weight:600">${(r.num)?html}</td>
+                            <td data-col="status" style="padding:11px 16px"><span class="zenith-badge ${r.badgeClass} nd">${(r.badgeText)?html}</span></td>
+                            <td data-col="salesval" style="padding:11px 16px;text-align:right;<#if (r.salesVal)??>color:#111827;font-weight:600<#else>color:#9CA3AF</#if>"><#if (r.salesVal)??>&#8377;${r.salesVal}<#else>&mdash;</#if></td>
+                            <td data-col="datetime" style="padding:11px 16px;color:#6B7280">${(r.dt)?html}</td>
+                            <td data-col="action" style="padding:11px 16px;color:#9CA3AF">&mdash;</td>
+                        </tr>
+                        </#list>
+                    </tbody>
+                </table>
+                </div>
+                <#if (rowCount!0) == 0>
+                <div style="padding:40px 20px;text-align:center;color:#9CA3AF;font-size:13px">No bill numbers found for this period.</div>
+                </#if>
+                <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:14px 20px;border-top:1px solid #F1F1F4">
+                    <span id="br-showing" style="font-size:12.5px;color:#6B7280"></span>
+                    <div style="display:flex;align-items:center;gap:12px">
+                        <nav id="br-pager" style="display:flex;align-items:center;gap:6px"></nav>
+                        <select id="br-perpage" style="height:32px;padding:0 8px;border:1px solid #E5E7EB;border-radius:8px;font-size:12.5px;color:#374151;background:#fff">
+                            <option value="10">10 per page</option>
+                            <option value="25">25 per page</option>
+                            <option value="50">50 per page</option>
+                            <option value="100">100 per page</option>
+                        </select>
+                    </div>
+                </div>
+            </div>
+        </div>
 
-        <container-box>
-            <box-header title="Bill Number Register - every number accounted for"/>
-            <box-body>
-                <label type="p" text="This shows every bill number in each sequence, from the first to the last issued. An 'UNUSED' number was never printed on a customer bill - older system behaviour reserved a number when a cart was opened, so a cancelled or abandoned cart left a gap. That is now fixed: a number is assigned only when payment is taken. No issued bill has been changed or renumbered - this report only explains the gaps."/>
-                <form-list name="SeqSummary" list="seqInfo" skip-form="true">
-                    <field name="orgName"><default-field title="Store"><display/></default-field></field>
-                    <field name="prefix"><default-field title="Sequence"><display/></default-field></field>
-                    <field name="rangeText"><default-field title="Number Range"><display/></default-field></field>
-                    <field name="total"><default-field title="Total Numbers"><display/></default-field></field>
-                    <field name="sale"><default-field title="Sales Issued"><display/></default-field></field>
-                    <field name="held"><default-field title="Held"><display/></default-field></field>
-                    <field name="inc"><default-field title="Incomplete"><display/></default-field></field>
-                    <field name="voided"><default-field title="Voided"><display/></default-field></field>
-                    <field name="gap"><default-field title="Unused (Gaps)"><display/></default-field></field>
-                    <field name="salesValue"><default-field title="Sales Value"><display format="#,##,##0.00"/></default-field></field>
-                    <field name="note"><default-field title=" "><display/></default-field></field>
-                </form-list>
-            </box-body>
-        </container-box>
-
-        <container-box>
-            <box-header title="Number-by-Number Register"/>
-            <box-body>
-                <label type="caption" text="Legend: Sale issued = a real customer sale. Held = a parked sale. Incomplete cart = started but never paid. Voided = cancelled. UNUSED = the number was never issued as a bill."/>
-                <form-list name="Register" list="register" skip-form="true" select-columns="true" show-csv-button="true" show-all-button="true">
-                    <field name="orgName"><header-field title="Store"><text-find/></header-field>
-                        <default-field><display/></default-field></field>
-                    <field name="fullNumber"><header-field title="Bill Number"><text-find/></header-field>
-                        <default-field><display/></default-field></field>
-                    <field name="statusLabel"><header-field title="Status"><text-find/></header-field>
-                        <default-field><display/></default-field></field>
-                    <field name="entryDate"><default-field title="Date / Time"><display format="dd-MM-yyyy HH:mm"/></default-field></field>
-                    <field name="amount"><default-field title="Amount"><display format="#,##,##0.00"/></default-field></field>
-                </form-list>
-            </box-body>
-        </container-box>
+        <!-- /qapps strips inline <script>, so bootstrap the page JS via an <img onload> that appends an
+             EXTERNAL script (dynamically-created <script src> is not stripped). Runs on BOTH surfaces;
+             re-calls __brInit on SPA re-navigation once loaded. -->
+        <img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" alt="" width="1" height="1" style="position:absolute;width:0;height:0;opacity:0;pointer-events:none" onload="if(window.__brInit){window.__brInit();}else if(!window.__brLoading){window.__brLoading=1;var s=document.createElement('script');s.src='/zenithstatic/js/bill-register.js?v=1';document.body.appendChild(s);}"/>
+        ]]></text></render-mode>
     </widgets>
 </screen>
