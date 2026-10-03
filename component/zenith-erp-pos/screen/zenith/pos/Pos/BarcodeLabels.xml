@@ -4,6 +4,8 @@
         default-menu-title="Barcode Labels" default-menu-index="19">
 
     <parameter name="searchTerm"/>
+    <parameter name="categoryId"/>
+    <parameter name="barcodeOnly"/>
 
     <actions>
         <script><![CDATA[
@@ -17,15 +19,56 @@
             def bcMap = [:]
             bcFind.condition("isActive","Y").orderBy("productId,-isPrimary").list().each { if (!bcMap.containsKey(it.productId)) bcMap[it.productId] = it.barcodeValue }
             def effCode = { pr -> (bcMap[pr.productId] ?: pr.pseudoId ?: '') }
+
+            // --- filters (server-side, via the Apply form) ---
+            searchTerm = ec.web.parameters.searchTerm
+            categoryId = ec.web.parameters.categoryId ?: ''
+            barcodeOnly = (ec.web.parameters.barcodeOnly == 'Y')
+
+            // categories for the dropdown
+            def catFinder = ec.entity.find("mantle.product.category.ProductCategory")
+            categories = catFinder.orderBy("categoryName").list()
+            def catProdIds = null
+            if (categoryId) { catProdIds = [] as Set
+                ec.entity.find("mantle.product.category.ProductCategoryMember").condition("productCategoryId", categoryId).list().each { catProdIds.add(it.productId) } }
+
             def candidates = pf.orderBy("productName").limit(5000).list()
             def termLower = (searchTerm ?: '').toLowerCase().trim()
             def filtered = candidates.findAll { pr ->
-                termLower == '' || (pr.productName ?: '').toLowerCase().contains(termLower) || effCode(pr).toLowerCase().contains(termLower)
+                (termLower == '' || (pr.productName ?: '').toLowerCase().contains(termLower) || effCode(pr).toLowerCase().contains(termLower)) &&
+                (categoryId == '' || (catProdIds != null && catProdIds.contains(pr.productId))) &&
+                (!barcodeOnly || effCode(pr) != '')
             }
             if (filtered.size() > 300) filtered = filtered.subList(0, 300)
-            rows = filtered.collect { pr -> [productId: pr.productId, productName: (pr.productName ?: pr.productId),
-                                             code: effCode(pr),
-                                             price: (pr.mrpAmount != null ? (pr.mrpAmount as BigDecimal).toPlainString() : '')] }
+            def dispIds = filtered.collect { it.productId }
+
+            // stock status per displayed product (real QOH vs reorder point) — bounded to the shown set
+            def stockMap = [:]
+            if (dispIds) {
+                def sf = ec.entity.find("zenith.erp.inventory.ProductStockView").condition("productId", "in", dispIds)
+                if (posOrg) sf.condition("ownerPartyId", posOrg)
+                sf.list().each { stockMap[it.productId] = [qoh: it.totalQoh, rp: it.reorderPoint] }
+            }
+            // first category per displayed product
+            def catOfProduct = [:]
+            if (dispIds) { ec.entity.find("mantle.product.category.ProductCategoryMember").condition("productId", "in", dispIds).list().each { if (!catOfProduct.containsKey(it.productId)) catOfProduct[it.productId] = it.productCategoryId } }
+            def catNameById = [:]; categories.each { catNameById[it.productCategoryId] = it.categoryName }
+
+            rows = filtered.collect { pr ->
+                def st = stockMap[pr.productId]
+                def qoh = (st?.qoh != null) ? (st.qoh as BigDecimal) : null
+                def rp = (st?.rp != null) ? (st.rp as BigDecimal) : null
+                def status = 'na'
+                if (qoh != null) {
+                    if (qoh <= 0) status = 'out'
+                    else if (rp != null && rp > 0 && qoh <= rp) status = 'low'
+                    else status = 'in'
+                }
+                [productId: pr.productId, productName: (pr.productName ?: pr.productId), code: effCode(pr),
+                 price: (pr.mrpAmount != null ? (pr.mrpAmount as BigDecimal).toPlainString() : ''),
+                 category: (catOfProduct[pr.productId] != null ? (catNameById[catOfProduct[pr.productId]] ?: '') : ''),
+                 status: status]
+            }
             totalShown = filtered.size()
 
             // BC-032 f/u: expose the org's Label Templates so this printer honors the SAME Show/Hide +
@@ -40,79 +83,178 @@
 
     <widgets>
         <render-mode><text type="html,qvt" template="true"><![CDATA[
-        <div style="padding:14px 16px;max-width:1000px;margin:0 auto;font-family:'Segoe UI',Arial,sans-serif">
-            <!-- The /qapps SPA strips <script> tags from screen content, so bootstrap the external
-                 JS via an <img onload> attribute (inline event attributes survive); a script element
-                 created with appendChild executes normally. -->
-            <img src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" alt="" style="display:none" onload="if(!window.__blBoot){window.__blBoot=1;var s=document.createElement('script');s.src='/zenithstatic/js/pos-barcode-labels.js?v=5';document.body.appendChild(s);}"/>
+        <div style="padding:16px 16px 24px;font-family:'Segoe UI',Arial,sans-serif">
+            <!-- /qapps strips inline <script> bodies from screen content, so bootstrap the external JS via an
+                 <img onload> (inline event attrs survive); a script element created with appendChild executes. -->
+            <img src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" alt="" style="display:none" onload="if(window.__blInit){window.__blInit();}else if(!window.__blBoot){window.__blBoot=1;var s=document.createElement('script');s.src='/zenithstatic/js/pos-barcode-labels.js?v=6';document.body.appendChild(s);}"/>
             <div id="bl-token" data-t="${(blToken!'')?html}" style="display:none"></div>
-            <div style="font-size:22px;font-weight:800;color:#463D7A;margin-bottom:2px">&#127991;&#65039; Barcode Labels</div>
-            <div style="font-size:13px;color:#5f6368;margin-bottom:12px">Print scannable barcode stickers for your products.</div>
 
-            <details open style="background:#e8f0fe;border:1px solid #4285f4;border-left:6px solid #1a73e8;border-radius:10px;padding:10px 16px;margin-bottom:14px">
-                <summary style="cursor:pointer;font-weight:800;font-size:15px;color:#174ea6;outline:none">&#127991;&#65039; New here? Read this first <span style="font-weight:600;color:#5f6368;font-size:12px">(click to hide / show)</span></summary>
+            <!-- Page header -->
+            <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:18px">
+                <div>
+                    <div style="font-size:24px;font-weight:800;color:#111827;line-height:1.3">Barcode Labels</div>
+                    <div style="font-size:13.5px;color:#6B7280;line-height:1.5">Print barcode stickers for your products</div>
+                </div>
+                <a href="#posHelp_barcodelabels" onclick="var d=document.getElementById('posHelp_barcodelabels');if(d){d.open=true;d.scrollIntoView({behavior:'smooth',block:'nearest'});}" style="display:inline-flex;align-items:center;gap:7px;background:#7C3AED;color:#fff;border:none;border-radius:999px;padding:9px 18px;font-size:13px;font-weight:600;text-decoration:none;white-space:nowrap"><span class="material-icons" style="font-size:18px">play_circle</span>How to use?</a>
+            </div>
+
+            <details id="posHelp_barcodelabels" style="background:#EEF2FF;border:1px solid #C7D2FE;border-left:5px solid #6366F1;border-radius:10px;padding:10px 16px;margin-bottom:16px">
+                <summary style="cursor:pointer;font-weight:700;font-size:14px;color:#3730A3;outline:none">&#127991;&#65039; New here? Read this first <span style="font-weight:500;color:#6B7280;font-size:12px">(click to hide / show)</span></summary>
                 <div style="font-size:13.5px;color:#202124;line-height:1.85;margin-top:10px">
                     <div style="margin-bottom:6px">Make printable stickers with a real scannable barcode for each product. Stick them on items or shelves so the cashier can scan instead of searching.</div>
-                    <div style="font-weight:700;color:#174ea6;margin-bottom:3px">How to print labels</div>
-                    <div style="margin-bottom:6px">1&nbsp; <b>Tick</b> the products you want &nbsp;&rarr;&nbsp; 2&nbsp; Choose a <b>label size</b> and how many <b>copies</b> of each &nbsp;&rarr;&nbsp; 3&nbsp; Click <b>Preview</b>, then <b>Print</b>.</div>
-                    <div style="background:#fff3cd;border:1px solid #ffe082;border-radius:7px;padding:8px 11px;color:#6d4c00">&#9888;&#65039; A product with <b>no code</b> can't have a barcode &mdash; set its code on the <b>Barcodes</b> page first. The barcode uses each product's barcode type (<b>Code 128</b> by default) and is readable by any scanner.</div>
+                    <div style="margin-bottom:6px"><b>1</b>&nbsp; <b>Tick</b> the products you want &nbsp;&rarr;&nbsp; <b>2</b>&nbsp; Choose a <b>label template</b> and how many <b>copies</b> of each &nbsp;&rarr;&nbsp; <b>3</b>&nbsp; Click <b>Preview Labels</b>, then <b>Print Labels</b>.</div>
+                    <div style="background:#FEF3C7;border:1px solid #FDE68A;border-radius:7px;padding:8px 11px;color:#92400E">&#9888;&#65039; A product with <b>no code</b> can't have a barcode &mdash; set its code on the <b>Barcodes</b> page first. The barcode uses each product's type (<b>Code 128</b> by default) and is readable by any scanner.</div>
                 </div>
             </details>
 
-            <form method="get" action="BarcodeLabels" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
-                <input type="text" name="searchTerm" value="${(searchTerm!'')?html}" placeholder="Search name or code..." style="flex:1;min-width:200px;padding:9px 12px;border:1px solid #bbb;border-radius:7px;font-size:14px"/>
-                <button type="submit" style="padding:9px 20px;background:#7C3AED;color:#fff;border:none;border-radius:7px;font-size:14px;font-weight:700;cursor:pointer">Search</button>
-            </form>
+            <!-- Config + filter toolbar (2-col) -->
+            <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:stretch;margin-bottom:16px">
+                <!-- LEFT: template / copies / preview / print -->
+                <section style="flex:1 1 360px;min-width:0;background:#fff;border:1px solid #E5E7EB;border-radius:12px;padding:20px;box-shadow:0 1px 3px rgba(17,24,39,.06)">
+                    <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:flex-end;margin-bottom:16px">
+                        <div style="flex:1 1 180px;min-width:0">
+                            <label style="display:block;font-size:12.5px;font-weight:600;color:#111827;margin-bottom:6px">Label Template</label>
+                            <select id="bl-template" style="width:100%;box-sizing:border-box;height:38px;padding:0 12px;border:1px solid #E5E7EB;border-radius:8px;font-size:13px;color:#111827;background:#fff">
+                                <option value="">&mdash; Custom size &mdash;</option>
+                                <#list (templates![]) as t>
+                                <option value="${(t.labelId)?html}" data-showname="${(t.showProductName)!'Y'}" data-showprice="${(t.showPrice)!'Y'}" data-showsku="${(t.showSku)!'N'}" data-w="${(t.labelWidth!50)?c}" data-h="${(t.labelHeight!30)?c}"<#if (t.isDefault!'N') == 'Y'> selected</#if>>${(t.labelName)?html}<#if (t.isDefault!'N') == 'Y'> (Default)</#if></option>
+                                </#list>
+                            </select>
+                        </div>
+                        <div>
+                            <label style="display:block;font-size:12.5px;font-weight:600;color:#111827;margin-bottom:6px">Copies per product</label>
+                            <div style="display:flex;align-items:stretch;border:1px solid #E5E7EB;border-radius:8px;overflow:hidden;height:38px">
+                                <button type="button" id="bl-copies-dec" style="width:36px;background:#fff;border:none;border-right:1px solid #E5E7EB;color:#6B7280;cursor:pointer;display:flex;align-items:center;justify-content:center"><span class="material-icons" style="font-size:18px">remove</span></button>
+                                <input id="bl-copies" type="number" min="1" max="200" value="1" style="width:52px;text-align:center;border:none;outline:none;font-size:14px;color:#111827"/>
+                                <button type="button" id="bl-copies-inc" style="width:36px;background:#fff;border:none;border-left:1px solid #E5E7EB;color:#6B7280;cursor:pointer;display:flex;align-items:center;justify-content:center"><span class="material-icons" style="font-size:18px">add</span></button>
+                            </div>
+                        </div>
+                    </div>
+                    <!-- custom-size controls (shown only when no template is picked; driven by the JS) -->
+                    <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:center;margin-bottom:16px">
+                        <div id="bl-size-wrap"<#if hasDefaultTpl!false> style="display:none"</#if>>
+                            <label style="display:block;font-size:12px;font-weight:600;color:#6B7280;margin-bottom:5px">Label size</label>
+                            <select id="bl-size" style="height:36px;padding:0 10px;border:1px solid #E5E7EB;border-radius:8px;font-size:13px">
+                                <option value="50,25">50 &times; 25 mm</option>
+                                <option value="38,25">38 &times; 25 mm</option>
+                                <option value="65,35">65 &times; 35 mm</option>
+                                <option value="100,50">100 &times; 50 mm</option>
+                            </select>
+                        </div>
+                        <label id="bl-price-wrap" style="font-size:13px;color:#374151;display:flex;align-items:center;gap:6px<#if hasDefaultTpl!false>;display:none</#if>"><input type="checkbox" id="bl-showprice" checked style="accent-color:#7C3AED"/> Show price</label>
+                    </div>
+                    <div style="display:flex;gap:12px;flex-wrap:wrap">
+                        <button type="button" id="bl-preview" style="display:inline-flex;align-items:center;gap:7px;padding:10px 18px;background:#D1FAE5;color:#0E9F6E;border:1px solid #0E9F6E;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer"><span class="material-icons" style="font-size:18px">visibility</span>Preview Labels</button>
+                        <button type="button" id="bl-print" style="display:inline-flex;align-items:center;gap:7px;padding:10px 18px;background:#7C3AED;color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer"><span class="material-icons" style="font-size:18px">print</span>Print Labels</button>
+                    </div>
+                </section>
 
-            <div style="display:flex;gap:18px;flex-wrap:wrap;align-items:flex-end;background:#f5f7fb;border:1px solid #e0e4ea;border-radius:9px;padding:10px 14px;margin-bottom:10px">
-                <div><div style="font-size:12px;font-weight:700;color:#444;margin-bottom:3px">Label template</div>
-                    <select id="bl-template" style="padding:8px 10px;border:1px solid #bbb;border-radius:7px;font-size:14px;min-width:150px">
-                        <option value="">&mdash; Custom size &mdash;</option>
-                        <#list (templates![]) as t>
-                        <option value="${(t.labelId)?html}" data-showname="${(t.showProductName)!'Y'}" data-showprice="${(t.showPrice)!'Y'}" data-showsku="${(t.showSku)!'N'}" data-w="${(t.labelWidth!50)?c}" data-h="${(t.labelHeight!30)?c}"<#if (t.isDefault!'N') == 'Y'> selected</#if>>${(t.labelName)?html}<#if (t.isDefault!'N') == 'Y'> (default)</#if></option>
+                <!-- RIGHT: filters (server-side GET form) -->
+                <form method="get" action="BarcodeLabels" style="flex:1.4 1 420px;min-width:0;background:#fff;border:1px solid #E5E7EB;border-radius:12px;padding:20px;box-shadow:0 1px 3px rgba(17,24,39,.06)">
+                    <div style="display:flex;gap:16px;align-items:flex-start">
+                        <span class="z-icobadge primary" style="flex:0 0 auto"><span class="material-icons">filter_list</span></span>
+                        <div style="flex:1;min-width:0;display:flex;gap:16px;flex-wrap:wrap">
+                            <div style="flex:1 1 220px;min-width:0">
+                                <label style="display:block;font-size:12.5px;font-weight:600;color:#111827;margin-bottom:6px">Search</label>
+                                <div style="display:flex;align-items:center;border:1px solid #E5E7EB;border-radius:8px;height:38px;padding:0 10px;gap:8px">
+                                    <span class="material-icons" style="font-size:18px;color:#9CA3AF">search</span>
+                                    <input type="text" name="searchTerm" value="${(searchTerm!'')?html}" placeholder="Product name or code..." style="flex:1;min-width:0;border:none;outline:none;font-size:13px;color:#111827"/>
+                                </div>
+                            </div>
+                            <div style="flex:1 1 180px;min-width:0">
+                                <label style="display:block;font-size:12.5px;font-weight:600;color:#111827;margin-bottom:6px">Category</label>
+                                <select name="categoryId" style="width:100%;box-sizing:border-box;height:38px;padding:0 12px;border:1px solid #E5E7EB;border-radius:8px;font-size:13px;color:#111827;background:#fff">
+                                    <option value="">All Categories</option>
+                                    <#list (categories![]) as c>
+                                    <option value="${(c.productCategoryId)?html}"<#if (categoryId!'') == c.productCategoryId> selected</#if>>${(c.categoryName!c.productCategoryId)?html}</option>
+                                    </#list>
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+                    <label style="display:flex;align-items:center;gap:8px;margin:14px 0 0 44px;font-size:13px;color:#374151;cursor:pointer"><input type="checkbox" name="barcodeOnly" value="Y"<#if barcodeOnly!false> checked</#if> style="width:15px;height:15px;accent-color:#7C3AED"/> Show only products with barcode</label>
+                    <div style="display:flex;gap:12px;margin:16px 0 0 44px">
+                        <button type="submit" style="display:inline-flex;align-items:center;gap:6px;padding:9px 18px;background:#F5F3FF;color:#7C3AED;border:1px solid #DDD6FE;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer"><span class="material-icons" style="font-size:17px">filter_list</span>Apply</button>
+                        <a href="BarcodeLabels" style="display:inline-flex;align-items:center;gap:6px;padding:9px 16px;background:#fff;color:#6B7280;border:1px solid #E5E7EB;border-radius:8px;font-size:13px;font-weight:600;text-decoration:none"><span class="material-icons" style="font-size:16px">restart_alt</span>Reset</a>
+                    </div>
+                </form>
+            </div>
+
+            <!-- Product table -->
+            <div style="background:#fff;border:1px solid #E5E7EB;border-radius:12px;overflow:hidden;box-shadow:0 1px 3px rgba(17,24,39,.06)">
+                <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:12px 16px;border-bottom:1px solid #F1F1F4">
+                    <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+                        <label style="display:flex;align-items:center;gap:8px;font-size:13px;font-weight:600;color:#111827;cursor:pointer"><input type="checkbox" id="bl-selectall" style="width:16px;height:16px;accent-color:#7C3AED"/> Select All (${totalShown!0} products)</label>
+                        <button type="button" id="bl-none" style="padding:6px 12px;background:#F5F3FF;color:#7C3AED;border:1px solid #DDD6FE;border-radius:8px;font-size:12.5px;font-weight:600;cursor:pointer">Clear Selection</button>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap">
+                        <div style="display:flex;align-items:center;gap:7px">
+                            <span class="material-icons" style="font-size:16px;color:#6B7280">swap_vert</span>
+                            <span style="font-size:12.5px;color:#6B7280">Sort by</span>
+                            <select id="bl-sort" style="height:32px;padding:0 8px;border:1px solid #E5E7EB;border-radius:8px;font-size:12.5px;color:#111827;background:#fff">
+                                <option value="name-asc">Product Name (A - Z)</option>
+                                <option value="name-desc">Product Name (Z - A)</option>
+                                <option value="price-asc">Price (Low - High)</option>
+                                <option value="price-desc">Price (High - Low)</option>
+                            </select>
+                        </div>
+                        <div style="display:flex;align-items:center;gap:7px">
+                            <span style="font-size:12.5px;color:#6B7280">Show</span>
+                            <select id="bl-perpage" style="height:32px;padding:0 8px;border:1px solid #E5E7EB;border-radius:8px;font-size:12.5px;color:#111827;background:#fff">
+                                <option value="10">10</option>
+                                <option value="20" selected>20</option>
+                                <option value="50">50</option>
+                                <option value="100">100</option>
+                            </select>
+                            <span style="font-size:12.5px;color:#6B7280">per page</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="overflow-x:auto">
+                <table style="width:100%;border-collapse:collapse;font-size:13px;min-width:860px">
+                    <thead>
+                        <tr style="background:#F9FAFB;color:#6B7280;text-align:left">
+                            <th style="padding:11px 16px;width:40px"></th>
+                            <th style="padding:11px 16px;font-weight:600;font-size:11.5px">Product Name</th>
+                            <th style="padding:11px 16px;font-weight:600;font-size:11.5px">Product Code</th>
+                            <th style="padding:11px 16px;font-weight:600;font-size:11.5px;text-align:right">Price</th>
+                            <th style="padding:11px 16px;font-weight:600;font-size:11.5px">Stock</th>
+                            <th style="padding:11px 16px;font-weight:600;font-size:11.5px">Category</th>
+                            <th style="padding:11px 16px;font-weight:600;font-size:11.5px">Brand</th>
+                        </tr>
+                    </thead>
+                    <tbody id="bl-tbody">
+                        <#list (rows![]) as r>
+                        <tr class="bl-row" data-sortname="${(r.productName?lower_case)?html}" data-sortprice="${(r.price!'0')}" style="border-top:1px solid #F1F1F4">
+                            <td style="padding:10px 16px;text-align:center">
+                                <#if (r.code)?has_content><input type="checkbox" class="bl-pick" value="${(r.productId)?html}" data-name="${(r.productName)?html}" data-code="${(r.code)?html}" data-price="${(r.price)?html}" style="width:16px;height:16px;accent-color:#7C3AED"/>
+                                <#else><span title="No code set — set it on the Barcodes page" style="color:#DC2626">&#9888;</span></#if>
+                            </td>
+                            <td style="padding:10px 16px;color:#111827;font-weight:500">${(r.productName)?html}</td>
+                            <td style="padding:10px 16px;color:#6B7280;font-size:12.5px"><#if (r.code)?has_content>${(r.code)?html}<#else><span style="color:#DC2626">no code</span></#if></td>
+                            <td style="padding:10px 16px;text-align:right;color:#111827"><#if (r.price)?has_content>&#8377;${r.price}<#else>&mdash;</#if></td>
+                            <td style="padding:10px 16px"><#if r.status == 'in'><span class="zenith-badge success">In Stock</span><#elseif r.status == 'low'><span class="zenith-badge warning">Low Stock</span><#elseif r.status == 'out'><span class="zenith-badge danger">Out of Stock</span><#else><span style="color:#9CA3AF">&mdash;</span></#if></td>
+                            <td style="padding:10px 16px;color:#6B7280"><#if (r.category)?has_content>${(r.category)?html}<#else>&mdash;</#if></td>
+                            <td style="padding:10px 16px;color:#9CA3AF">&mdash;</td>
+                        </tr>
                         </#list>
-                    </select></div>
-                <div id="bl-size-wrap"<#if hasDefaultTpl!false> style="display:none"</#if>><div style="font-size:12px;font-weight:700;color:#444;margin-bottom:3px">Label size</div>
-                    <select id="bl-size" style="padding:8px 10px;border:1px solid #bbb;border-radius:7px;font-size:14px">
-                        <option value="50,25">50 &times; 25 mm</option>
-                        <option value="38,25">38 &times; 25 mm</option>
-                        <option value="65,35">65 &times; 35 mm</option>
-                        <option value="100,50">100 &times; 50 mm</option>
-                    </select></div>
-                <div><div style="font-size:12px;font-weight:700;color:#444;margin-bottom:3px">Copies of each</div>
-                    <input id="bl-copies" type="number" min="1" max="200" value="1" style="width:90px;padding:8px;border:1px solid #bbb;border-radius:7px;font-size:14px"/></div>
-                <label id="bl-price-wrap" style="font-size:13px;color:#333;display:flex;align-items:center;gap:6px<#if hasDefaultTpl!false>;display:none</#if>"><input type="checkbox" id="bl-showprice" checked/> Show price</label>
-                <button type="button" id="bl-preview" style="padding:9px 20px;background:#2e7d32;color:#fff;border:none;border-radius:7px;font-size:14px;font-weight:700;cursor:pointer">Preview labels</button>
-                <button type="button" id="bl-print" style="padding:9px 20px;background:#1a73e8;color:#fff;border:none;border-radius:7px;font-size:14px;font-weight:700;cursor:pointer">&#128424;&#65039; Print</button>
-            </div>
-
-            <div style="display:flex;gap:8px;margin-bottom:6px">
-                <button type="button" id="bl-all" style="padding:6px 12px;background:#eceff1;border:1px solid #cfd8dc;border-radius:6px;font-size:12px;font-weight:700;cursor:pointer">Select all shown</button>
-                <button type="button" id="bl-none" style="padding:6px 12px;background:#eceff1;border:1px solid #cfd8dc;border-radius:6px;font-size:12px;font-weight:700;cursor:pointer">Clear</button>
-                <span style="font-size:12px;color:#777;align-self:center">${totalShown!0} product(s) shown</span>
-            </div>
-
-            <div style="max-height:300px;overflow-y:auto;border:1px solid #e0e0e0;border-radius:8px;margin-bottom:16px">
-                <table style="width:100%;border-collapse:collapse;font-size:13.5px">
-                    <#list (rows![]) as r>
-                    <tr style="border-bottom:1px solid #eee">
-                        <td style="padding:6px 8px;width:34px;text-align:center">
-                            <#if (r.code)?has_content><input type="checkbox" class="bl-pick" value="${(r.productId)?html}" data-name="${(r.productName)?html}" data-code="${(r.code)?html}" data-price="${(r.price)?html}"/>
-                            <#else><span title="No code set" style="color:#b71c1c">&#9888;</span></#if>
-                        </td>
-                        <td style="padding:6px 8px">${(r.productName)?html}</td>
-                        <td style="padding:6px 8px;color:#777;font-size:12px"><#if (r.code)?has_content>${(r.code)?html}<#else><span style="color:#b71c1c">no code &mdash; set it on the Barcodes page</span></#if></td>
-                        <td style="padding:6px 8px;text-align:right;color:#333"><#if (r.price)?has_content>&#8377;${r.price}</#if></td>
-                    </tr>
-                    </#list>
-                    <#if !(rows?has_content)><tr><td style="padding:20px;text-align:center;color:#888">No products found.</td></tr></#if>
+                    </tbody>
                 </table>
+                </div>
+                <#if (totalShown!0) == 0>
+                <div style="padding:40px 20px;text-align:center;color:#9CA3AF;font-size:13px">No products found.</div>
+                </#if>
+                <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:14px 16px;border-top:1px solid #F1F1F4">
+                    <span id="bl-showing" style="font-size:12.5px;color:#6B7280"></span>
+                    <nav id="bl-pager" style="display:flex;align-items:center;gap:6px"></nav>
+                </div>
             </div>
 
-            <div id="bl-preview-area" style="display:none">
-                <div style="font-size:13px;color:#555;margin-bottom:8px">Preview below &mdash; click <b>Print</b> above (or the Print button inside the preview) to print.</div>
+            <!-- Preview iframe (unchanged contract) -->
+            <div id="bl-preview-area" style="display:none;margin-top:16px">
+                <div style="font-size:13px;color:#6B7280;margin-bottom:8px">Preview below &mdash; click <b>Print Labels</b> above (or the Print button inside the preview) to print.</div>
                 <div id="bl-loading" style="display:none;padding:24px;text-align:center;font-size:14px;color:#7C3AED;font-weight:700">&#8987; Generating preview&hellip;</div>
-                <iframe id="bl-frame" title="Label preview" style="width:100%;height:520px;border:1px solid #bbb;border-radius:8px;background:#fff"></iframe>
+                <iframe id="bl-frame" title="Label preview" style="width:100%;height:520px;border:1px solid #E5E7EB;border-radius:8px;background:#fff"></iframe>
             </div>
         </div>
         ]]></text></render-mode>
