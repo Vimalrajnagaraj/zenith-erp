@@ -10,13 +10,19 @@
             <!-- ZE-TAX security: block editing another tenant's tax registration via a forged POST -->
             <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" in-map="[entityName:'zenith.erp.tax.TaxRegistration', idField:'registrationId', idValue:registrationId, orgField:'organizationPartyId']" out-map="_acc"/>
             <if condition="!_acc.allowed"><return error="true" message="You do not have access to this record."/></if>
-            <service-call name="zenith.tax.TaxServices.store#TaxRegistration"/>
+            <script><![CDATA[
+                // The restyled form submits ISO yyyy-MM-dd; parse explicitly so locale date parsing
+                // can never mangle it before store#TaxRegistration (which takes Date params).
+                if (effectiveFrom) effectiveFrom = ec.l10n.parseDate(effectiveFrom.toString(), 'yyyy-MM-dd')
+                if (effectiveThru) effectiveThru = ec.l10n.parseDate(effectiveThru.toString(), 'yyyy-MM-dd')
+            ]]></script>
+            <service-call name="zenith.tax.TaxServices.store#TaxRegistration" in-map="context"/>
         </actions>
         <default-response url="."/>
     </transition>
 
-    <!-- ZE-TAX-008 (live refilter): country->region options-url for the dependent Region drop-down.
-         Global geo reference data only — no tenant/org data, so no org-scoping needed. -->
+    <!-- ZE-TAX-008: country->region options for the dependent Region drop-down. Global geo reference
+         data only — no tenant/org data, so no org-scoping needed. -->
     <transition name="getRegionsForCountry">
         <service-call name="org.moqui.impl.BasicServices.get#GeoRegionsForDropDown"
                       in-map="[geoId:countryGeoId, term:term]" web-send-json-response="resultList"/>
@@ -30,84 +36,169 @@
                       in-map="[entityName:'zenith.erp.tax.TaxRegistration', idField:'registrationId', idValue:registrationId, orgField:'organizationPartyId']"/>
         <set field="noAccess" from="!_acc.allowed"/>
         <if condition="_acc.allowed">
-        <entity-find-one entity-name="zenith.erp.tax.TaxRegistration" value-field="taxRegistration"/>
+            <entity-find-one entity-name="zenith.erp.tax.TaxRegistration" value-field="taxRegistration"/>
+            <script><![CDATA[
+                def _uri = (ec.web?.request?.requestURI ?: ''); def _zi = _uri.indexOf('/zenith/')
+                appBase = _zi > 0 ? _uri.substring(0, _zi) : ''
+                def org = ec.user.getPreference('ACTIVE_ORGANIZATION')
+
+                def pf = ec.entity.find("mantle.party.PartyDetail")
+                if (org) pf.condition("ownerPartyId", org)
+                parties = pf.orderBy("organizationName,lastName,firstName").limit(1000).list().collect { p ->
+                    def nm = p.organizationName ?: ((((p.firstName ?: '') + ' ' + (p.lastName ?: '')).trim()) ?: p.partyId)
+                    [id: p.partyId, label: nm]
+                }
+                taxAuthorities = ec.entity.find("zenith.erp.tax.TaxAuthority").condition("isActive", "Y").orderBy("description").list().collect { a -> [id: a.taxAuthorityId, label: a.description ?: a.taxAuthorityId] }
+                regTypes = ec.entity.find("moqui.basic.Enumeration").condition("enumTypeId", "TaxRegistrationType").orderBy("sequenceNum").list().collect { e -> [id: e.enumId, label: e.description ?: e.enumId] }
+                countries = ec.entity.find("moqui.basic.Geo").condition("geoTypeEnumId", "GEOT_COUNTRY").orderBy("geoName").list().collect { g -> [id: g.geoId, label: g.geoName ?: g.geoId] }
+
+                // regions for the currently-saved country (the JS refilters live when Country changes)
+                regions = []
+                if (taxRegistration?.countryGeoId) {
+                    try { def rr = ec.service.sync().name("org.moqui.impl.BasicServices.get#GeoRegionsForDropDown").parameters([geoId: taxRegistration.countryGeoId]).call()
+                        regions = (rr?.resultList ?: []).collect { [id: (it.geoId ?: it.value), label: (it.label ?: it.geoName ?: it.geoId)] } } catch (e) {}
+                }
+
+                curParty   = taxRegistration?.partyId ?: ''
+                curAuth    = taxRegistration?.taxAuthorityId ?: ''
+                curType    = taxRegistration?.registrationTypeEnumId ?: ''
+                curNumber  = taxRegistration?.registrationNumber ?: ''
+                curCountry = taxRegistration?.countryGeoId ?: ''
+                curRegion  = taxRegistration?.regionGeoId ?: ''
+                curDesc    = taxRegistration?.description ?: ''
+                curActive  = taxRegistration?.isActive ?: 'Y'
+                effFromVal = taxRegistration?.effectiveFrom ? ec.l10n.format(taxRegistration.effectiveFrom, 'yyyy-MM-dd') : ''
+                effThruVal = taxRegistration?.effectiveThru ? ec.l10n.format(taxRegistration.effectiveThru, 'yyyy-MM-dd') : ''
+                effFromDisp = taxRegistration?.effectiveFrom ? ec.l10n.format(taxRegistration.effectiveFrom, 'dd - MM - yyyy') : ''
+                effThruDisp = taxRegistration?.effectiveThru ? ec.l10n.format(taxRegistration.effectiveThru, 'dd - MM - yyyy') : ''
+                exTitle = taxRegistration?.registrationNumber ?: taxRegistration?.registrationId
+            ]]></script>
         </if>
     </actions>
 
     <widgets>
-        <!-- back link stays reachable even when blocked -->
-        <container style="q-mb-md">
-            <link url="../FindTaxRegistration" text="Back to List" style="text-primary"/>
-        </container>
+        <render-mode><text type="html,qvt" template="true"><![CDATA[
+        <#assign fRow="display:flex;align-items:center;gap:16px;margin-bottom:14px">
+        <#assign fLbl="width:150px;flex:0 0 auto;text-align:right;font-size:13.5px;font-weight:500;color:#111827">
+        <#assign fSelW="width:100%;box-sizing:border-box;height:42px;padding:0 52px 0 12px;border:1px solid #E5E7EB;border-radius:8px;font-size:13px;color:#111827;background:#F5F3FF;outline:none">
+        <#assign fInp="flex:1;min-width:0;height:42px;box-sizing:border-box;padding:0 12px;border:1px solid #E5E7EB;border-radius:8px;font-size:13px;color:#111827;background:#fff;outline:none">
+        <#assign fClr="position:absolute;right:30px;top:50%;transform:translateY(-50%);width:18px;height:18px;border-radius:50%;background:#9CA3AF;color:#fff;display:none;align-items:center;justify-content:center;font-size:14px;line-height:1;cursor:pointer;z-index:2">
+        <#assign fDwrap="position:relative;flex:0 0 200px">
+        <#assign fDico="position:absolute;left:10px;top:50%;transform:translateY(-50%);font-size:18px;color:#6B7280;pointer-events:none;z-index:1">
+        <#assign fDtxt="width:100%;box-sizing:border-box;height:42px;padding:0 12px 0 38px;border:1px solid #E5E7EB;border-radius:8px;font-size:13px;color:#111827;background:#fff;pointer-events:none">
+        <#assign fDnat="position:absolute;top:0;left:0;width:100%;height:100%;opacity:0;cursor:pointer;z-index:2">        <div style="padding:16px 16px 24px;font-family:'Segoe UI',Arial,sans-serif">
+            <a href="${(appBase!'')}/zenith/tax/FindTaxRegistration" style="display:inline-flex;align-items:center;gap:7px;background:#fff;color:#7C3AED;border:1px solid #7C3AED;border-radius:8px;padding:8px 16px;font-size:13px;font-weight:600;text-decoration:none;margin-bottom:18px"><span class="material-icons" style="font-size:18px">arrow_back</span>Back to List</a>
 
-        <!-- cross-tenant / missing registration — plain notice, never another org's tax data -->
-        <section name="NoAccess">
-            <condition><expression>noAccess</expression></condition>
-            <widgets>
-                <container style="zenith-card q-pa-lg bg-white shadow-1 border-radius-md q-mt-md text-center">
-                    <label text="That tax registration isn't part of your account." type="h5" style="text-grey-8 q-mb-xs"/>
-                    <label text="It may belong to another organization, or it may not exist. Use “Back to List” above to return to your list." type="p" style="text-grey-6 q-mb-none"/>
-                </container>
-            </widgets>
-        </section>
+            <#if noAccess>
+            <div style="background:#fff;border:1px solid #E5E7EB;border-radius:12px;padding:40px 24px;text-align:center">
+                <div style="font-size:18px;font-weight:700;color:#374151;margin-bottom:6px">That tax registration isn't part of your account.</div>
+                <div style="font-size:13px;color:#6B7280">It may belong to another organization, or it may not exist. Use &ldquo;Back to List&rdquo; above to return to your list.</div>
+            </div>
+            <#else>
+            <div style="font-size:24px;font-weight:800;color:#111827;margin-bottom:18px">Tax Registration: ${(exTitle!'')?html}</div>
 
-        <section name="TheRecord">
-        <condition><expression>!noAccess</expression></condition>
-        <widgets>
-        <container style="row items-center justify-between q-mb-lg">
-            <label text="Tax Registration: ${taxRegistration.registrationNumber ?: taxRegistration.registrationId}" type="h4" style="text-weight-bold q-my-none"/>
-        </container>
+            <div style="background:#fff;border:1px solid #E5E7EB;border-radius:12px;padding:24px;box-shadow:0 1px 3px rgba(17,24,39,.06)">
+                <div style="font-size:17px;font-weight:700;color:#111827;margin-bottom:20px">Registration Details</div>
+                <div style="display:flex;gap:40px;flex-wrap:wrap;align-items:flex-start">
+                    <!-- LEFT column -->
+                    <div style="flex:1.5 1 480px;min-width:0">
+                        <div style="${fRow}"><label style="${fLbl}">Party <span style="color:#DC2626">*</span></label>
+                            <div style="position:relative;flex:1;min-width:0"><select id="tx-party" style="${fSelW}"><option value="">&mdash; None &mdash;</option><#list (parties![]) as p><option value="${(p.id)?html}"<#if curParty == p.id> selected</#if>>${(p.label)?html}</option></#list></select><span class="tx-clear" data-for="tx-party" title="Clear" style="${fClr}">&times;</span></div></div>
+                        <div style="${fRow}"><label style="${fLbl}">Tax Authority <span style="color:#DC2626">*</span></label>
+                            <select id="tx-auth" style="${fSelW};padding-right:34px"><option value="">&mdash; None &mdash;</option><#list (taxAuthorities![]) as a><option value="${(a.id)?html}"<#if curAuth == a.id> selected</#if>>${(a.label)?html}</option></#list></select></div>
+                        <div style="${fRow}"><label style="${fLbl}">Registration Type <span style="color:#DC2626">*</span></label>
+                            <select id="tx-regtype" style="${fSelW};padding-right:34px"><option value="">&mdash; None &mdash;</option><#list (regTypes![]) as e><option value="${(e.id)?html}"<#if curType == e.id> selected</#if>>${(e.label)?html}</option></#list></select></div>
+                        <div style="${fRow}"><label style="${fLbl}">Registration Number <span style="color:#DC2626">*</span></label>
+                            <input id="tx-regnumber" type="text" value="${(curNumber!'')?html}" placeholder="Enter registration number" style="${fInp}"/></div>
+                        <div style="${fRow}"><label style="${fLbl}">Country <span style="color:#DC2626">*</span></label>
+                            <div style="position:relative;flex:1;min-width:0"><select id="tx-country" style="${fSelW}"><option value="">&mdash; None &mdash;</option><#list (countries![]) as c><option value="${(c.id)?html}"<#if curCountry == c.id> selected</#if>>${(c.label)?html}</option></#list></select><span class="tx-clear" data-for="tx-country" title="Clear" style="${fClr}">&times;</span></div></div>
+                        <div style="${fRow}"><label style="${fLbl}">Region</label>
+                            <div style="position:relative;flex:1;min-width:0"><select id="tx-region" style="${fSelW}"><option value="">Select region</option><#list (regions![]) as r><option value="${(r.id)?html}"<#if curRegion == r.id> selected</#if>>${(r.label)?html}</option></#list></select><span class="tx-clear" data-for="tx-region" title="Clear" style="${fClr}">&times;</span></div></div>
+                        <div style="display:flex;align-items:center;gap:14px;margin-bottom:0;flex-wrap:wrap">
+                            <label style="${fLbl}">Effective From <span style="color:#DC2626">*</span></label>
+                            <div style="${fDwrap}"><span class="material-icons" style="${fDico}">event</span><input id="tx-efffrom-disp" type="text" readonly placeholder="DD - MM - YYYY" value="${(effFromDisp!'')?html}" style="${fDtxt}"/><input id="tx-efffrom" type="date" value="${(effFromVal!'')?html}" onclick="if(this.showPicker){try{this.showPicker();}catch(e){}}" style="${fDnat}"/></div>
+                            <label style="flex:0 0 auto;font-size:13.5px;font-weight:500;color:#111827">Effective Thru <span style="color:#DC2626">*</span></label>
+                            <div style="${fDwrap}"><span class="material-icons" style="${fDico}">event</span><input id="tx-effthru-disp" type="text" readonly placeholder="DD - MM - YYYY" value="${(effThruDisp!'')?html}" style="${fDtxt}"/><input id="tx-effthru" type="date" value="${(effThruVal!'')?html}" onclick="if(this.showPicker){try{this.showPicker();}catch(e){}}" style="${fDnat}"/></div>
+                        </div>
+                    </div>
+                    <!-- RIGHT column -->
+                    <div style="flex:1 1 280px;min-width:0">
+                        <div style="display:flex;align-items:center;gap:16px;margin-bottom:18px"><label style="flex:0 0 auto;font-size:13.5px;font-weight:500;color:#111827">Active <span style="color:#DC2626">*</span></label>
+                            <select id="tx-active" style="flex:1;min-width:0;height:42px;box-sizing:border-box;padding:0 34px 0 12px;border:1px solid #E5E7EB;border-radius:8px;font-size:13px;color:#111827;background:#F5F3FF;outline:none"><option value="Y"<#if curActive == 'Y'> selected</#if>>Active</option><option value="N"<#if curActive == 'N'> selected</#if>>Inactive</option></select></div>
+                        <div><label style="display:block;font-size:13.5px;font-weight:500;color:#111827;margin-bottom:6px">Description</label>
+                            <textarea id="tx-desc" rows="3" placeholder="Enter description (optional)" style="width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid #E5E7EB;border-radius:8px;font-size:13px;color:#111827;background:#fff;resize:vertical;outline:none">${(curDesc!'')?html}</textarea></div>
+                    </div>
+                </div>
+                <div style="margin-top:22px">
+                    <#if (modCanWrite!false)>
+                    <button type="button" id="tx-update" style="display:inline-flex;align-items:center;gap:7px;height:44px;padding:0 24px;background:#7C3AED;color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer"><span class="material-icons" style="font-size:18px">save</span>Update</button>
+                    <#else>
+                    <span style="font-size:13px;color:#6B7280">You have view-only access &mdash; changes are disabled.</span>
+                    </#if>
+                    <div id="tx-result" style="margin-top:10px;font-size:13px"></div>
+                </div>
+            </div>
+            </#if>
+        </div>
 
-        <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg">
-            <label text="Registration Details" type="h5" style="text-weight-bold q-mb-md"/>
-            <form-single name="UpdateTaxRegistration" transition="updateTaxRegistration" map="taxRegistration">
-                <field name="registrationId"><default-field><hidden/></default-field></field>
-                <field name="partyId"><default-field title="Party *">
-                    <drop-down allow-empty="true"><entity-options key="${partyId}" text="${organizationName ? organizationName : (firstName + ' ' + lastName)}">
-                        <entity-find entity-name="mantle.party.PartyDetail">
-                            <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
-                        </entity-find>
-                    </entity-options></drop-down></default-field></field>
-                <field name="taxAuthorityId"><default-field title="Tax Authority *">
-                    <drop-down allow-empty="true"><entity-options key="${taxAuthorityId}" text="${description}">
-                        <entity-find entity-name="zenith.erp.tax.TaxAuthority">
-                            <econdition field-name="isActive" value="Y"/>
-                            <order-by field-name="description"/>
-                        </entity-find>
-                    </entity-options></drop-down></default-field></field>
-                <field name="registrationTypeEnumId"><default-field title="Registration Type *">
-                    <drop-down allow-empty="true"><entity-options key="${enumId}" text="${description}">
-                        <entity-find entity-name="moqui.basic.Enumeration">
-                            <econdition field-name="enumTypeId" value="TaxRegistrationType"/>
-                            <order-by field-name="sequenceNum"/>
-                        </entity-find>
-                    </entity-options></drop-down></default-field></field>
-                <field name="registrationNumber"><default-field title="Registration Number *"><text-line size="25"/></default-field></field>
-                <field name="countryGeoId"><default-field title="Country">
-                    <drop-down allow-empty="true"><entity-options key="${geoId}" text="${geoName}">
-                        <entity-find entity-name="moqui.basic.Geo">
-                            <econdition field-name="geoTypeEnumId" value="GEOT_COUNTRY"/>
-                            <order-by field-name="geoName"/>
-                        </entity-find>
-                    </entity-options></drop-down></default-field></field>
-                <field name="regionGeoId"><default-field title="Region">
-                    <!-- ZE-TAX-008 (live refilter): dynamic-options options-url makes the depends-on watch
-                         fire on /qapps; Region refilters live when Country changes. Opening it fetches the
-                         saved (or newly-chosen) country's regions. -->
-                    <drop-down allow-empty="true">
-                        <dynamic-options transition="getRegionsForCountry" value-field="geoId" label-field="label">
-                            <depends-on field="countryGeoId"/>
-                        </dynamic-options>
-                    </drop-down></default-field></field>
-                <field name="effectiveFrom"><default-field title="Effective From"><date-time type="date"/></default-field></field>
-                <field name="effectiveThru"><default-field title="Effective Thru"><date-time type="date"/></default-field></field>
-                <field name="isActive"><default-field title="Active">
-                    <drop-down><option key="Y" text="Active"/><option key="N" text="Inactive"/></drop-down>
-                </default-field></field>
-                <field name="submitBtn"><conditional-field name="save_write" condition="modCanWrite" title="Update"><submit/></conditional-field><default-field title="Update"><label text="You have view-only access — changes are disabled." type="span" style="text-grey-7"/></default-field></field>
-            </form-single>
-        </container>
-        </widgets>
-        </section>
+        <#if (!noAccess && (modCanWrite!false))>
+        <script>
+        (function(){
+            var APPBASE='${(appBase!'')}';
+            function fmtDisp(iso){ if(!iso) return ''; var p=iso.split('-'); return (p.length===3) ? (p[2]+' - '+p[1]+' - '+p[0]) : iso; }
+            ['tx-efffrom','tx-effthru'].forEach(function(id){
+                var h=document.getElementById(id), d=document.getElementById(id+'-disp');
+                if(h && d){ h.addEventListener('change', function(){ d.value=fmtDisp(h.value); }); }
+            });
+            function toggleClear(sel){ var c=document.querySelector('.tx-clear[data-for="'+sel.id+'"]'); if(c) c.style.display = sel.value ? 'flex' : 'none'; }
+            Array.prototype.forEach.call(document.querySelectorAll('select[id^="tx-"]'), function(s){
+                if(document.querySelector('.tx-clear[data-for="'+s.id+'"]')){ toggleClear(s); s.addEventListener('change', function(){ toggleClear(s); }); }
+            });
+            document.addEventListener('click', function(ev){
+                var c = ev.target.closest ? ev.target.closest('.tx-clear') : null; if(!c) return;
+                var sel=document.getElementById(c.getAttribute('data-for')); if(sel){ sel.value=''; toggleClear(sel); }
+            });
+            // Country -> Region live refilter (JSON from getRegionsForCountry; build options via createElement to avoid markup)
+            function loadRegions(countryVal, selectVal){
+                var rsel=document.getElementById('tx-region'); if(!rsel) return;
+                function reset(){ rsel.innerHTML=''; var o=document.createElement('option'); o.value=''; o.textContent='Select region'; rsel.appendChild(o); toggleClear(rsel); }
+                if(!countryVal){ reset(); return; }
+                fetch(APPBASE+'/zenith/tax/EditTaxRegistration/getRegionsForCountry?countryGeoId='+encodeURIComponent(countryVal),{credentials:'same-origin'})
+                    .then(function(r){ return r.json(); })
+                    .then(function(d){ var list=(d && d.resultList) ? d.resultList : (Array.isArray(d) ? d : []);
+                        reset();
+                        list.forEach(function(it){ var o=document.createElement('option'); o.value=(it.geoId||it.value||''); o.textContent=(it.label||it.geoName||o.value); if(selectVal && o.value===selectVal) o.selected=true; rsel.appendChild(o); });
+                        toggleClear(rsel);
+                    }).catch(function(){});
+            }
+            var cc=document.getElementById('tx-country');
+            if(cc) cc.addEventListener('change', function(){ loadRegions(cc.value, ''); });
+
+            var btn=document.getElementById('tx-update');
+            if(btn && !btn.__txWired){
+                btn.__txWired=1;
+                btn.addEventListener('click', function(){
+                    var g=function(id){ var e=document.getElementById(id); return e ? e.value : ''; };
+                    var party=g('tx-party'), auth=g('tx-auth'), type=g('tx-regtype'), num=g('tx-regnumber');
+                    if(!party){ alert('Party is required.'); return; }
+                    if(!auth){ alert('Tax Authority is required.'); return; }
+                    if(!type){ alert('Registration Type is required.'); return; }
+                    if(!num){ alert('Registration Number is required.'); return; }
+                    var tok=''; try{ tok=window.moqui.webrootVue.moquiSessionToken; }catch(e){}
+                    btn.disabled=true; var ot=btn.innerHTML; btn.textContent='Saving...';
+                    var body=new URLSearchParams({ registrationId:'${(taxRegistration.registrationId)!''}', partyId:party,
+                        taxAuthorityId:auth, registrationTypeEnumId:type, registrationNumber:num,
+                        countryGeoId:g('tx-country'), regionGeoId:g('tx-region'),
+                        effectiveFrom:g('tx-efffrom'), effectiveThru:g('tx-effthru'),
+                        description:g('tx-desc'), isActive:g('tx-active'), moquiSessionToken:tok });
+                    fetch(APPBASE+'/zenith/tax/EditTaxRegistration/updateTaxRegistration',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body,credentials:'same-origin'})
+                        .then(function(){ location.reload(); })
+                        .catch(function(){ btn.disabled=false; btn.innerHTML=ot; var r=document.getElementById('tx-result'); if(r){ r.textContent='Update failed — please try again.'; r.style.color='#DC2626'; } });
+                });
+            }
+        })();
+        </script>
+        </#if>
+        ]]></text></render-mode>
     </widgets>
 </screen>
