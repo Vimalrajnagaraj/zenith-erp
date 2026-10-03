@@ -6,10 +6,12 @@
     <transition name="createTemplate">
         <actions>
             <set field="org" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-            <if condition="org == '_NA_'"><set field="org" from="null"/></if>
+            <!-- treat empty / '_NA_' (no active org, e.g. platform admin) as null -->
+            <if condition="!org || org == '_NA_'"><set field="org" from="null"/></if>
             <service-call name="create#zenith.erp.barcode.BarcodeLabel" out-map="createOut" in-map="context + [organizationPartyId:org]"/>
-            <!-- BC-031: keep a single default -->
-            <if condition="isDefault == 'Y' &amp;&amp; org != null">
+            <!-- BC-031: keep a single default — only meaningful when scoped to an org (truthy guard: skip for
+                 an empty/no org, else enforce# fails "Field cannot be empty" and rolls back the whole create) -->
+            <if condition="isDefault == 'Y' &amp;&amp; org">
                 <service-call name="zenith.barcode.BarcodeServices.enforce#SingleDefaultTemplate" in-map="[organizationPartyId:org, keepLabelId:createOut.labelId]"/>
             </if>
         </actions>
@@ -43,38 +45,34 @@
             <econdition field-name="organizationPartyId" from="_ao" ignore-if-empty="true"/>
             <order-by field-name="labelName"/>
         </entity-find>
+        <!-- New Label Template modal: barcode-format options + surface-aware post target -->
+        <entity-find entity-name="moqui.basic.Enumeration" list="_fmtEnums">
+            <econdition field-name="enumTypeId" value="BarcodeType"/>
+            <order-by field-name="sequenceNum"/>
+        </entity-find>
+        <script><![CDATA[
+            fmtOptions = []
+            for (e in (_fmtEnums ?: [])) { fmtOptions.add([id: e.enumId, label: (e.description ?: e.enumId)]) }
+            toggles = [
+                [k:'showProductName', ico:'local_offer', badge:'', label:'Show Product Name', def:'Y'],
+                [k:'showPrice',       ico:'currency_rupee', badge:'', label:'Show Price', def:'Y'],
+                [k:'showSku',         ico:'', badge:'SKU', label:'Show SKU', def:'N'],
+                [k:'showMrp',         ico:'', badge:'MRP', label:'Show MRP', def:'N'],
+                [k:'default',         ico:'star', badge:'', label:'Set as Default', def:'N']
+            ]
+            def _uri = (ec.web?.request?.requestURI ?: ''); def _zi = _uri.indexOf('/zenith/')
+            appBase = (_zi > 0) ? _uri.substring(0, _zi) : ''
+            moquiToken = (ec.web != null) ? (ec.web.sessionToken ?: '') : ''
+        ]]></script>
     </actions>
 
     <widgets>
         <container style="row items-center justify-between q-mb-lg">
             <label text="Label Templates" type="h4" style="text-weight-bold q-my-none"/>
             <section name="bar_CreateTemplate_write"><condition><expression>modCanWrite</expression></condition><widgets>
-            <container-dialog id="CreateTemplate" button-text="New Template" type="success">
-                <form-single name="CreateTemplateForm" transition="createTemplate">
-                    <field name="labelName"><default-field title="Name"><text-line size="25"/></default-field></field>
-                    <field name="labelWidth"><default-field title="Width (mm)"><text-line size="8"/></default-field></field>
-                    <field name="labelHeight"><default-field title="Height (mm)"><text-line size="8"/></default-field></field>
-                    <field name="barcodeTypeEnumId"><default-field title="Barcode Format">
-                        <drop-down><entity-options key="${enumId}" text="${description}">
-                            <entity-find entity-name="moqui.basic.Enumeration">
-                                <econdition field-name="enumTypeId" value="BarcodeType"/>
-                                <order-by field-name="sequenceNum"/>
-                            </entity-find>
-                        </entity-options></drop-down></default-field></field>
-                    <field name="columnsPerRow"><default-field title="Columns Per Row"><text-line size="4" default-value="3"/></default-field></field>
-                    <field name="showProductName"><default-field title="Show Product Name">
-                        <drop-down><option key="Y" text="Yes"/><option key="N" text="No"/></drop-down></default-field></field>
-                    <field name="showPrice"><default-field title="Show Price">
-                        <drop-down><option key="Y" text="Yes"/><option key="N" text="No"/></drop-down></default-field></field>
-                    <field name="showSku"><default-field title="Show SKU">
-                        <drop-down><option key="N" text="No"/><option key="Y" text="Yes"/></drop-down></default-field></field>
-                    <field name="showMrp"><default-field title="Show MRP">
-                        <drop-down><option key="N" text="No"/><option key="Y" text="Yes"/></drop-down></default-field></field>
-                    <field name="isDefault"><default-field title="Set as Default">
-                        <drop-down><option key="N" text="No"/><option key="Y" text="Yes"/></drop-down></default-field></field>
-                    <field name="submitBtn"><default-field title="Create"><submit/></default-field></field>
-                </form-single>
-            </container-dialog>
+            <render-mode><text type="html,qvt"><![CDATA[
+                <button type="button" onclick="var o=document.getElementById('nlt-overlay');if(o)o.style.display='flex'" style="display:inline-flex;align-items:center;gap:7px;height:40px;padding:0 16px;background:#7C3AED;color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer"><span class="material-icons" style="font-size:18px">add</span>New Template</button>
+            ]]></text></render-mode>
             </widgets></section>
         </container>
 
@@ -97,5 +95,131 @@
                 </field>
             </form-list>
         </container>
+
+        <!-- ===== New Label Template modal (custom <div>+fetch; posts to the unchanged createTemplate transition) ===== -->
+        <section name="bar_NewTemplateModal"><condition><expression>modCanWrite</expression></condition><widgets>
+        <render-mode><text type="html,qvt" template="true"><![CDATA[
+        <#assign nltRow="display:flex;align-items:center;gap:12px;margin-bottom:13px">
+        <#assign nltIco="width:34px;height:34px;flex:0 0 auto;border-radius:8px;background:rgba(124,58,237,.1);display:flex;align-items:center;justify-content:center;color:#7C3AED">
+        <#assign nltBadge="width:34px;height:34px;flex:0 0 auto;border-radius:8px;background:rgba(124,58,237,.1);color:#7C3AED;font-size:9px;font-weight:700;display:flex;align-items:center;justify-content:center">
+        <#assign nltLbl="width:140px;flex:0 0 auto;font-size:13.5px;font-weight:600;color:#111827">
+        <#assign nltInp="flex:1;min-width:0;height:40px;box-sizing:border-box;padding:0 12px;border:1px solid #E5E7EB;border-radius:8px;font-size:14px;color:#111827;background:#fff;outline:none">
+        <#assign nltStep="width:32px;height:32px;flex:0 0 auto;border:1px solid #E5E7EB;border-radius:8px;background:#fff;color:#6B7280;cursor:pointer;display:inline-flex;align-items:center;justify-content:center">
+        <#assign nltPill="display:inline-flex;align-items:center;gap:5px;height:32px;padding:0 14px;border:1px solid #E5E7EB;border-radius:999px;background:#fff;color:#6B7280;font-size:13px;font-weight:600;cursor:pointer">
+        <div id="nlt-overlay" style="display:none;position:fixed;inset:0;background:rgba(17,24,39,.4);z-index:12000;align-items:flex-start;justify-content:center;padding:36px 16px;overflow-y:auto;font-family:'Segoe UI',Arial,sans-serif">
+            <div id="nlt-modal" style="background:#fff;border-radius:12px;box-shadow:0 20px 40px rgba(17,24,39,.16);width:100%;max-width:720px">
+                <input id="nlt-token" type="hidden" value="${(moquiToken)!''}"/>
+                <div style="display:flex;align-items:center;justify-content:space-between;padding:18px 24px;border-bottom:1px solid #E5E7EB">
+                    <div style="font-size:18px;font-weight:700;color:#111827">New Label Template</div>
+                    <button type="button" onclick="document.getElementById('nlt-overlay').style.display='none'" title="Close" style="width:32px;height:32px;border:none;background:transparent;color:#9CA3AF;cursor:pointer;border-radius:8px;display:flex;align-items:center;justify-content:center"><span class="material-icons" style="font-size:20px">close</span></button>
+                </div>
+                <div style="display:flex;gap:20px;padding:20px 24px;flex-wrap:wrap">
+                    <div style="flex:1 1 370px;min-width:320px">
+                        <div style="${nltRow}"><span style="${nltIco}"><span class="material-icons" style="font-size:18px">title</span></span><label style="${nltLbl}">Template Name</label><input id="nlt-name" type="text" placeholder="Enter template name" style="${nltInp}"/></div>
+                        <div style="${nltRow}"><span style="${nltIco}"><span class="material-icons" style="font-size:18px">open_in_full</span></span><label style="${nltLbl}">Width (mm)</label><input id="nlt-width" type="number" min="0" placeholder="Enter width" style="${nltInp}"/></div>
+                        <div style="${nltRow}"><span style="${nltIco}"><span class="material-icons" style="font-size:18px">open_in_full</span></span><label style="${nltLbl}">Height (mm)</label><input id="nlt-height" type="number" min="0" placeholder="Enter height" style="${nltInp}"/></div>
+                        <div style="${nltRow}"><span style="${nltIco}"><span class="material-icons" style="font-size:18px">view_week</span></span><label style="${nltLbl}">Barcode Format</label><div style="flex:1;min-width:0"><select id="nlt-format" style="${nltInp}"><#list (fmtOptions![]) as f><option value="${(f.id)?html}"<#if f.id=='BctUpcA'> selected</#if>>${(f.label)?html}</option></#list></select></div></div>
+                        <div style="${nltRow}"><span style="${nltIco}"><span class="material-icons" style="font-size:18px">grid_view</span></span><label style="${nltLbl}">Columns Per Row</label>
+                            <div style="flex:1;display:flex;align-items:center;gap:10px">
+                                <button type="button" id="nlt-cdec" style="${nltStep}"><span class="material-icons" style="font-size:16px">remove</span></button>
+                                <span id="nlt-cval" style="min-width:26px;text-align:center;font-size:14px;font-weight:700;color:#111827">3</span>
+                                <button type="button" id="nlt-cinc" style="${nltStep}"><span class="material-icons" style="font-size:16px">add</span></button>
+                            </div>
+                        </div>
+                        <#list (toggles![]) as t>
+                        <div style="${nltRow}">
+                            <#if (t.badge)?has_content><span style="${nltBadge}">${t.badge}</span><#else><span style="${nltIco}"><span class="material-icons" style="font-size:18px">${t.ico}</span></span></#if>
+                            <label style="${nltLbl}">${t.label}</label>
+                            <div class="nlt-tg" data-k="${t.k}" style="flex:1;display:flex;gap:8px;justify-content:flex-end">
+                                <button type="button" class="nlt-pill" data-v="Y" style="${nltPill}"><span class="material-icons nlt-pico" style="font-size:16px;display:none">check_circle</span>Yes</button>
+                                <button type="button" class="nlt-pill" data-v="N" style="${nltPill}"><span class="material-icons nlt-pico" style="font-size:16px;display:none">cancel</span>No</button>
+                            </div>
+                            <input type="hidden" id="nlt-${t.k}" value="${t.def}"/>
+                        </div>
+                        </#list>
+                    </div>
+                    <div style="flex:1 1 230px;min-width:220px;background:#F5F3FF;border-radius:12px;padding:18px">
+                        <div style="text-align:center;font-size:13px;font-weight:600;color:#6B7280;margin-bottom:14px">Preview</div>
+                        <div style="background:#fff;border:1px solid #E5E7EB;border-radius:8px;padding:18px 16px;text-align:center">
+                            <div style="font-size:15px;font-weight:700;color:#111827">Product Name</div>
+                            <div style="font-size:12px;color:#6B7280;margin-top:4px">SKU12345</div>
+                            <div style="font-size:13px;font-weight:600;color:#111827;margin-top:4px">&#8377; 299.00</div>
+                            <div style="height:40px;margin:12px 6px 6px;background:repeating-linear-gradient(90deg,#111 0,#111 2px,#fff 2px,#fff 4px)"></div>
+                            <div style="font-size:12px;color:#6B7280;letter-spacing:1.5px">ZEN000001</div>
+                        </div>
+                        <div style="margin-top:16px;border-top:1px solid #E5E7EB;padding-top:12px;font-size:12.5px">
+                            <div style="display:flex;justify-content:space-between;padding:4px 0"><span style="color:#6B7280">Format</span><span id="nlt-pv-fmt" style="color:#111827;font-weight:600">UPC-A</span></div>
+                            <div style="display:flex;justify-content:space-between;padding:4px 0"><span style="color:#6B7280">Columns</span><span id="nlt-pv-cols" style="color:#111827;font-weight:600">3 per row</span></div>
+                            <div style="display:flex;justify-content:space-between;padding:4px 0"><span style="color:#6B7280">Size</span><span id="nlt-pv-size" style="color:#111827;font-weight:600">&#8212; x &#8212; mm</span></div>
+                        </div>
+                    </div>
+                </div>
+                <div style="display:flex;justify-content:flex-end;gap:12px;padding:16px 24px;border-top:1px solid #E5E7EB">
+                    <button type="button" onclick="document.getElementById('nlt-overlay').style.display='none'" style="height:40px;padding:0 20px;border:1px solid #E5E7EB;border-radius:8px;background:#fff;color:#6B7280;font-size:14px;font-weight:600;cursor:pointer">Cancel</button>
+                    <button type="button" id="nlt-create" style="height:40px;padding:0 20px;border:none;border-radius:8px;background:#7C3AED;color:#fff;font-size:14px;font-weight:600;cursor:pointer">Create Template</button>
+                </div>
+            </div>
+        </div>
+        <script>
+        (function(){
+            var ov=document.getElementById('nlt-overlay'); if(!ov) return;
+            function styleTG(tg){
+                var k=tg.getAttribute('data-k'); var hid=document.getElementById('nlt-'+k); var val=hid?hid.value:'Y';
+                Array.prototype.forEach.call(tg.querySelectorAll('.nlt-pill'), function(p){
+                    var v=p.getAttribute('data-v'); var ico=p.querySelector('.nlt-pico'); var on=(v===val);
+                    if(on && v==='Y'){ p.style.background='rgba(16,185,129,.12)'; p.style.borderColor='#10B981'; p.style.color='#0E9F6E'; }
+                    else if(on){ p.style.background='rgba(220,38,38,.1)'; p.style.borderColor='#DC2626'; p.style.color='#DC2626'; }
+                    else { p.style.background='#fff'; p.style.borderColor='#E5E7EB'; p.style.color='#6B7280'; }
+                    if(ico) ico.style.display = on ? 'inline-block' : 'none';
+                });
+            }
+            Array.prototype.forEach.call(ov.querySelectorAll('.nlt-tg'), function(tg){
+                styleTG(tg);
+                Array.prototype.forEach.call(tg.querySelectorAll('.nlt-pill'), function(p){
+                    p.addEventListener('click', function(){ var hid=document.getElementById('nlt-'+tg.getAttribute('data-k')); if(hid) hid.value=p.getAttribute('data-v'); styleTG(tg); });
+                });
+            });
+            var cv=document.getElementById('nlt-cval');
+            function setCols(n){ n=Math.min(10, Math.max(1, n)); cv.textContent=n; var pc=document.getElementById('nlt-pv-cols'); if(pc) pc.textContent=n+' per row'; }
+            document.getElementById('nlt-cdec').addEventListener('click', function(){ setCols((parseInt(cv.textContent,10)||1)-1); });
+            document.getElementById('nlt-cinc').addEventListener('click', function(){ setCols((parseInt(cv.textContent,10)||1)+1); });
+            function g(id){ var e=document.getElementById(id); return e?(e.value||'').trim():''; }
+            var fmt=document.getElementById('nlt-format');
+            function upd(){
+                var pf=document.getElementById('nlt-pv-fmt'); if(pf && fmt) pf.textContent=fmt.options[fmt.selectedIndex].text;
+                var w=g('nlt-width'), h=g('nlt-height'); var ps=document.getElementById('nlt-pv-size');
+                if(ps) ps.textContent=(w||'—')+' x '+(h||'—')+' mm';
+            }
+            if(fmt) fmt.addEventListener('change', upd);
+            document.getElementById('nlt-width').addEventListener('input', upd);
+            document.getElementById('nlt-height').addEventListener('input', upd);
+            upd();
+            var create=document.getElementById('nlt-create');
+            if(create && !create.__w){ create.__w=1; create.addEventListener('click', function(){
+                var name=g('nlt-name'); if(!name){ alert('Template Name is required.'); return; }
+                var tok=''; try{ tok=window.moqui.webrootVue.moquiSessionToken; }catch(e){}
+                if(!tok){ var t=document.getElementById('nlt-token'); tok=t?t.value:''; }
+                var body=new URLSearchParams();
+                body.append('labelName', name);
+                body.append('labelWidth', g('nlt-width'));
+                body.append('labelHeight', g('nlt-height'));
+                body.append('barcodeTypeEnumId', g('nlt-format'));
+                body.append('columnsPerRow', cv.textContent);
+                body.append('showProductName', g('nlt-showProductName'));
+                body.append('showPrice', g('nlt-showPrice'));
+                body.append('showSku', g('nlt-showSku'));
+                body.append('showMrp', g('nlt-showMrp'));
+                body.append('isDefault', g('nlt-default'));
+                body.append('moquiSessionToken', tok);
+                var base=location.pathname.split('/zenith/')[0];
+                create.disabled=true; create.textContent='Creating...';
+                fetch(base+'/zenith/barcode/LabelTemplates/createTemplate',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body,credentials:'same-origin'})
+                    .then(function(r){ location.href = r.url || location.href; })
+                    .catch(function(){ create.disabled=false; create.textContent='Create Template'; alert('Create failed — please try again.'); });
+            }); }
+        })();
+        </script>
+        ]]></text></render-mode>
+        </widgets></section>
     </widgets>
 </screen>
