@@ -166,14 +166,37 @@
     try {
       var tb = buildToolbar(card);
       var foot = buildFoot(card);
-      // toolbar first, footer last, inside the card
-      card.insertBefore(tb, card.firstChild);
-      card.appendChild(foot);
+      // Place the toolbar just above the list's rendered root and the footer just below it, so the chrome
+      // lands tightly around the table even when the card holds other content (a title/banner, or a
+      // container-box's box-header/box-toolbar sitting above a box-body list).
+      var root = listRoot(card);
+      if (root && root.parentElement) {
+        root.parentElement.insertBefore(tb, root);
+        if (root.nextSibling) root.parentElement.insertBefore(foot, root.nextSibling); else root.parentElement.appendChild(foot);
+      } else {
+        card.insertBefore(tb, card.firstChild); card.appendChild(foot);
+      }
       card.classList.add('zlc-on'); // triggers the CSS that hides native chrome
     } catch (e) { card.__zlc = 0; /* leave native chrome visible on failure */ }
   }
 
-  function scan() { qa(document, '.z-listchrome:not(.zlc-on)').forEach(enhance); }
+  function listRoot(card) {
+    var nav = card.querySelector('tr.form-list-nav-row'); if (!nav) return null;
+    var el = nav; while (el.parentElement && el.parentElement !== card) el = el.parentElement;
+    return el; // the direct child of the card that contains the form-list's nav row (= its table root)
+  }
+  // Derive the card from each placeholder marker (its nearest ancestor containing a form-list nav row) and
+  // tag it — so a screen only needs the marker beside its list, and this works for plain cards AND
+  // container-box (box-body) layouts without the markup declaring which element is the card.
+  function tagFromMarkers() {
+    qa(document, '.zlc-ph').forEach(function (m) {
+      if (m.__zlcTag) return;
+      var el = m.parentElement, card = null;
+      while (el) { try { if (el.querySelector('tr.form-list-nav-row')) { card = el; break; } } catch (e) {} el = el.parentElement; }
+      if (card) { m.__zlcTag = 1; if (!card.classList.contains('z-listchrome')) card.classList.add('z-listchrome'); }
+    });
+  }
+  function scan() { tagFromMarkers(); qa(document, '.z-listchrome:not(.zlc-on)').forEach(enhance); }
 
   function boot() {
     scan();
