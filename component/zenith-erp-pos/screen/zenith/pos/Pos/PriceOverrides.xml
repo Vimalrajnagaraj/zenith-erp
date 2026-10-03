@@ -3,53 +3,199 @@
         xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
         default-menu-title="Price Overrides" default-menu-index="16">
 
-    <transition name="goDashboard"><default-response url="../Dashboard"/></transition>
-    <transition name="goTransactions"><default-response url="../PosTransactions"/></transition>
-    <transition name="goReports"><default-response url="../Reports"/></transition>
-    <transition name="goTerminal"><default-response url="../Terminal"/></transition>
-    <transition name="goDailySummary"><default-response url="../DailySummary"/></transition>
+    <parameter name="searchText"/>
+    <parameter name="fromDate"/>
+    <parameter name="thruDate"/>
+    <parameter name="orderByField"/>
+    <parameter name="pageIndex"/>
+
+    <!-- Export the current (filtered) price-override log as CSV. Read-only. -->
+    <transition name="exportCsv" read-only="true">
+        <actions>
+            <script><![CDATA[
+                def p = ec.web.parameters
+                def _searchText = p.searchText; def _fromDate = p.fromDate; def _thruDate = p.thruDate
+                def _org = ec.user.getPreference("ACTIVE_ORGANIZATION")
+                def f = ec.entity.find("zenith.erp.pos.PosItemPriceOverrideView")
+                if (_org && _org != '_NA_') f.condition("organizationPartyId", _org)
+                if (_fromDate) f.condition("changeDate", "greater-equals", java.sql.Timestamp.valueOf(_fromDate + ' 00:00:00'))
+                if (_thruDate) f.condition("changeDate", "less-equals", java.sql.Timestamp.valueOf(_thruDate + ' 23:59:59'))
+                f.orderBy("-changeDate")
+                def rows = f.list()
+                def st = (_searchText ?: '').trim().toLowerCase()
+                if (st) rows = rows.findAll { r -> def nm = "${r.firstName ?: ''} ${r.lastName ?: ''}".toString();
+                    [r.transactionNumber, r.productName, r.productId, r.sessionId, nm]
+                        .collect { (it ?: '').toString().toLowerCase() }.any { it.contains(st) } }
+                def esc = { v -> if (v == null) return ""; String s = v.toString().trim(); (s.contains(",")||s.contains("\"")||s.contains("\n")) ? "\"" + s.replace("\"","\"\"") + "\"" : s }
+                def dt = { v -> v == null ? "" : ec.l10n.format(v, 'dd-MM-yyyy HH:mm') }
+                def amt = { v -> v == null ? "0.00" : ec.l10n.format((v as BigDecimal), '#,##0.00') }
+                def who = { r -> def nm = "${r.firstName ?: ''} ${r.lastName ?: ''}".toString().trim(); nm ?: (r.changedByPartyId ?: '') }
+                StringBuilder csv = new StringBuilder()
+                csv.append("ZetaERP - Price Override Audit Log (amounts before GST)\n")
+                csv.append("Generated: ${ec.l10n.format(ec.user.nowTimestamp, 'dd MMM yyyy HH:mm')}\n\n")
+                csv.append("Date / Time,Bill No,Product,Product ID,Original Price,New Price,Difference,Changed By,Session\n")
+                rows.each { r ->
+                    def orig = r.originalPrice != null ? (r.originalPrice as BigDecimal) : 0G
+                    def np = r.newPrice != null ? (r.newPrice as BigDecimal) : 0G
+                    def d = np - orig
+                    csv.append("${esc(dt(r.changeDate))},${esc(r.transactionNumber)},${esc(r.productName)},${esc(r.productId)},${esc(amt(orig))},${esc(amt(np))},${esc((d>=0G?'+':'-')+amt(d.abs()))},${esc(who(r))},${esc(r.sessionId)}\n")
+                }
+                ec.web.sendTextResponse(csv.toString(), "text/csv", "Price_Overrides_${ec.l10n.format(ec.user.nowTimestamp, 'yyyyMMdd_HHmm')}.csv")
+            ]]></script>
+        </actions>
+        <default-response type="none"/>
+    </transition>
 
     <actions>
-        <entity-find entity-name="zenith.erp.pos.PosItemPriceOverrideView" list="overrideList">
-            <search-form-inputs default-order-by="-changeDate"/>
-            <!-- ZE-SALES-014 f/u: org-isolate CSV/XLSX export (standalone render bypasses the MANTLE_ACTIVE_ORG authz filter) -->
-            <econdition field-name="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
-        </entity-find>
+        <script><![CDATA[
+            def _org = ec.user.getPreference('ACTIVE_ORGANIZATION')
+            def _uri = (ec.web?.request?.requestURI ?: '')
+            def _zi = _uri.indexOf('/zenith/')
+            appBase = _zi > 0 ? _uri.substring(0, _zi) : ''
+
+            def f = ec.entity.find('zenith.erp.pos.PosItemPriceOverrideView')
+            if (_org && _org != '_NA_') f.condition('organizationPartyId', _org)
+            if (fromDate) f.condition('changeDate', 'greater-equals', java.sql.Timestamp.valueOf(fromDate + ' 00:00:00'))
+            if (thruDate) f.condition('changeDate', 'less-equals', java.sql.Timestamp.valueOf(thruDate + ' 23:59:59'))
+            def raw = f.list()
+            def st = (searchText ?: '').trim().toLowerCase()
+            if (st) raw = raw.findAll { r -> def nm = "${r.firstName ?: ''} ${r.lastName ?: ''}".toString();
+                [r.transactionNumber, r.productName, r.productId, r.sessionId, nm]
+                    .collect { (it ?: '').toString().toLowerCase() }.any { it.contains(st) } }
+
+            def fmt2 = { v -> ec.l10n.format((v ?: 0G) as BigDecimal, '#,##0.00') }
+            def all = raw.collect { r ->
+                def orig = r.originalPrice != null ? (r.originalPrice as BigDecimal) : 0G
+                def np = r.newPrice != null ? (r.newPrice as BigDecimal) : 0G
+                def d = np - orig
+                def who = "${r.firstName ?: ''} ${r.lastName ?: ''}".toString().trim()
+                [changeDate: r.changeDate, bill: (r.transactionNumber ?: ''), product: (r.productName ?: ''),
+                 productId: (r.productId ?: ''), orig: orig, np: np, diff: d, who: (who ?: (r.changedByPartyId ?: '')), session: (r.sessionId ?: ''),
+                 dateStr: (r.changeDate != null ? ec.l10n.format(r.changeDate, 'dd MMM yyyy hh:mm a') : ''),
+                 origStr: '₹' + fmt2(orig), newStr: '₹' + fmt2(np),
+                 diffStr: (d > 0G ? '+' : (d < 0G ? '-' : '')) + '₹' + fmt2(d.abs()),
+                 diffClass: (d < 0G ? 'success' : (d > 0G ? 'danger' : 'grey'))]
+            }
+
+            // sort by orderByField (whitelist; leading '-' = desc)
+            def curOb = orderByField ?: '-changeDate'
+            def desc = curOb.startsWith('-'); def key = desc ? curOb.substring(1) : curOb
+            def keyMap = [changeDate:'changeDate', transactionNumber:'bill', productName:'product', productId:'productId',
+                          originalPrice:'orig', newPrice:'np', priceDiff:'diff', changedBy:'who', sessionId:'session']
+            def sk = keyMap[key] ?: 'changeDate'
+            all = all.sort { a, b -> def av = a[sk]; def bv = b[sk];
+                (av instanceof Comparable && bv != null && av.class == bv.class) ? (av <=> bv) : ((av ?: '').toString().toLowerCase() <=> (bv ?: '').toString().toLowerCase()) }
+            if (desc) all = all.reverse()
+            sortCols = [:]
+            ['changeDate','transactionNumber','productName','productId','originalPrice','newPrice','priceDiff','changedBy','sessionId'].each { fld ->
+                def a = (curOb == fld); def dn = (curOb == '-' + fld)
+                sortCols[fld] = [next: (a ? '-' + fld : fld), arrow: (a ? ' ▲' : (dn ? ' ▼' : ''))]
+            }
+
+            // paginate (10 per page, matching the mockup)
+            totalCount = all.size()
+            def pageSize = 10
+            def pIdx = 0
+            try { if (pageIndex) pIdx = (pageIndex as Integer) } catch (Exception ig) { pIdx = 0 }
+            pageCount = (int) Math.ceil(totalCount / (double) pageSize); if (pageCount < 1) pageCount = 1
+            if (pIdx < 0) pIdx = 0; if (pIdx >= pageCount) pIdx = pageCount - 1
+            curPage = pIdx
+            def fromIx = pIdx * pageSize
+            def toIx = Math.min(fromIx + pageSize, totalCount)
+            rows = (fromIx < totalCount) ? all.subList(fromIx, toIx) : []
+            showFrom = totalCount == 0 ? 0 : (fromIx + 1)
+            showTo = toIx
+            def ws = Math.max(0, pIdx - 3); def we = Math.min(pageCount, ws + 7)
+            pageNums = (ws..<we).toList()
+        ]]></script>
     </actions>
 
     <widgets>
-        <render-mode><text type="html,qvt" template="true"><![CDATA[<details id="posHelp_priceoverrides" open style="background:#e8f0fe;border:1px solid #4285f4;border-left:6px solid #1a73e8;border-radius:10px;padding:10px 16px;margin:8px 12px 4px 12px;font-family:Segoe UI,Arial,sans-serif"><summary style="cursor:pointer;font-weight:800;font-size:15px;color:#174ea6;outline:none">&#127991; Price Overrides &mdash; quick help <span style="font-weight:600;color:#5f6368;font-size:12px">(click to hide / show)</span></summary><div style="font-size:13px;color:#202124;line-height:1.9;margin-top:8px">A read-only <b>log</b> of every manual price change made during billing.<br>It shows who changed which item&#39;s price, when, and by how much &mdash; for your oversight. Nothing to edit here.</div></details>]]></text></render-mode>
-        <container style="row items-center justify-end q-px-md q-pt-md q-gutter-sm">
-            <link url="goTerminal" text="Billing" icon="fa fa-calculator" btn-type="success" style="q-btn--dense"/>
-            <link url="goTransactions" text="Transactions" icon="fa fa-list" btn-type="primary" style="q-btn--dense"/>
-            <link url="goDailySummary" text="Daily Summary" icon="fa fa-calendar" btn-type="info" style="q-btn--dense"/>
-            <link url="goReports" text="Reports" icon="fa fa-bar-chart" btn-type="warning" style="q-btn--dense"/>
-            <link url="goDashboard" text="Dashboard" icon="fa fa-dashboard" style="q-btn--dense"/>
-        </container>
-        <container-box>
-            <box-header title="Price Override Audit Log"/>
-            <box-body>
-                <form-list name="PriceOverrideList" list="overrideList" skip-form="true" header-dialog="true"
-                           select-columns="true" saved-finds="true" show-csv-button="true" show-all-button="true">
-                    <field name="changeDate"><header-field title="Date" show-order-by="true"><date-period/></header-field>
-                        <default-field><display format="dd-MM-yyyy HH:mm"/></default-field></field>
-                    <field name="transactionNumber"><header-field title="Bill No" show-order-by="true"><text-find/></header-field>
-                        <default-field><display/></default-field></field>
-                    <field name="productName"><header-field title="Product"><text-find/></header-field>
-                        <default-field><display/></default-field></field>
-                    <field name="productId"><header-field title="Product ID"><text-find/></header-field>
-                        <default-field><display/></default-field></field>
-                    <field name="originalPrice"><default-field title="Original Price"><display format="#,##0.00"/></default-field></field>
-                    <field name="newPrice"><default-field title="New Price"><display format="#,##0.00"/></default-field></field>
-                    <field name="priceDiff"><default-field title="Difference">
-                        <display text="${zinr.inr(ec.l10n.format((newPrice ?: 0) - (originalPrice ?: 0), '#,##0.00'))}"/></default-field></field>
-                    <field name="changedBy"><default-field title="Changed By">
-                        <display text="${(firstName ?: '') + ' ' + (lastName ?: '')}"/></default-field></field>
-                    <field name="sessionId"><header-field title="Session" show-order-by="true"><text-find/></header-field>
-                        <default-field><display/></default-field></field>
-                    <field name="findButton"><header-field title="Find"><submit/></header-field></field>
-                </form-list>
-            </box-body>
-        </container-box>
+        <render-mode><text type="html,qvt" template="true"><![CDATA[
+        <#assign qb = "PriceOverrides?searchText=" + (searchText!'')?url('UTF-8') + "&fromDate=" + (fromDate!'')?url('UTF-8') + "&thruDate=" + (thruDate!'')?url('UTF-8') + "&pageIndex=0&orderByField=">
+        <#assign qp = "PriceOverrides?searchText=" + (searchText!'')?url('UTF-8') + "&fromDate=" + (fromDate!'')?url('UTF-8') + "&thruDate=" + (thruDate!'')?url('UTF-8') + "&orderByField=" + (orderByField!'')?url('UTF-8') + "&pageIndex=">
+        <div style="padding:20px 24px;font-family:'Segoe UI',Arial,sans-serif;background:#F8F9FC">
+            <!-- Page header -->
+            <div style="display:flex;align-items:center;gap:14px;margin-bottom:18px">
+                <span class="z-icobadge lg primary"><span class="material-icons">receipt_long</span></span>
+                <div>
+                    <div style="font-size:20px;font-weight:800;color:#111827;line-height:1.3">Price Overrides</div>
+                    <div style="font-size:13px;color:#6B7280;max-width:860px;line-height:1.5">Manage and track all manual price overrides made at POS. Monitor changes, ensure compliance and maintain transparency.</div>
+                </div>
+            </div>
+
+            <!-- Toolbar: search + Filter + Search + PDF + CSV -->
+            <form method="get" action="PriceOverrides" style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:18px">
+                <div style="position:relative;flex:1;min-width:260px">
+                    <span class="material-icons" style="position:absolute;left:10px;top:50%;transform:translateY(-50%);font-size:18px;color:#9CA3AF;pointer-events:none">search</span>
+                    <input type="text" name="searchText" value="${(searchText!'')?html}" placeholder="Search by bill no, product name, product ID or session..." style="width:100%;padding:10px 12px 10px 36px;border:1px solid #E5E7EB;border-radius:8px;font-size:13px;box-sizing:border-box;background:#fff"/>
+                </div>
+                <input type="hidden" name="orderByField" value="${(orderByField!'')?html}"/>
+                <input type="hidden" name="pageIndex" value="0"/>
+                <button type="button" onclick="var r=document.getElementById('poFilterRow');if(r)r.style.display=(r.style.display==='none'?'flex':'none');" style="display:inline-flex;align-items:center;gap:6px;padding:10px 16px;border:1px solid #E5E7EB;border-radius:8px;background:#fff;color:#6B7280;font-size:13px;font-weight:500;cursor:pointer"><span class="material-icons" style="font-size:16px">filter_list</span>Filter</button>
+                <button type="submit" style="display:inline-flex;align-items:center;gap:6px;padding:10px 18px;background:#7C3AED;color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer"><span class="material-icons" style="font-size:16px">search</span>Search</button>
+                <a href="/fop/apps/zenith/pos/PriceOverridesPdf?searchText=${(searchText!'')?url('UTF-8')}&fromDate=${(fromDate!'')?url('UTF-8')}&thruDate=${(thruDate!'')?url('UTF-8')}" target="_blank" style="display:inline-flex;align-items:center;gap:6px;padding:10px 16px;border:1px solid #E5E7EB;border-radius:8px;background:#fff;color:#6B7280;font-size:13px;font-weight:600;text-decoration:none"><span class="material-icons" style="font-size:16px">picture_as_pdf</span>PDF</a>
+                <a href="${appBase!''}/zenith/pos/PriceOverrides/exportCsv?searchText=${(searchText!'')?url('UTF-8')}&fromDate=${(fromDate!'')?url('UTF-8')}&thruDate=${(thruDate!'')?url('UTF-8')}" target="_blank" style="display:inline-flex;align-items:center;gap:6px;padding:10px 16px;border:1px solid #E5E7EB;border-radius:8px;background:#fff;color:#6B7280;font-size:13px;font-weight:600;text-decoration:none"><span class="material-icons" style="font-size:16px">table_view</span>CSV</a>
+                <div id="poFilterRow" style="<#if (fromDate!'')?has_content || (thruDate!'')?has_content>display:flex<#else>display:none</#if>;flex-basis:100%;align-items:center;gap:10px;font-size:13px;color:#374151;padding-top:2px">
+                    <span style="color:#6B7280">From</span>
+                    <input type="date" name="fromDate" value="${(fromDate!'')?html}" style="padding:8px 10px;border:1px solid #E5E7EB;border-radius:8px;font-size:13px;color:#374151"/>
+                    <span style="color:#6B7280">To</span>
+                    <input type="date" name="thruDate" value="${(thruDate!'')?html}" style="padding:8px 10px;border:1px solid #E5E7EB;border-radius:8px;font-size:13px;color:#374151"/>
+                    <a href="PriceOverrides" style="color:#7C3AED;font-weight:600;text-decoration:none;font-size:12.5px">Reset</a>
+                </div>
+            </form>
+
+            <!-- Audit log card -->
+            <div style="background:#fff;border:1px solid #E5E7EB;border-radius:12px;overflow:hidden">
+                <div style="font-size:16px;font-weight:700;color:#111827;padding:16px 20px">Price Override Audit Log</div>
+                <div style="overflow-x:auto">
+                <table style="width:100%;border-collapse:collapse;font-size:13px;min-width:960px">
+                    <thead>
+                        <tr style="background:#F5F3FF;text-align:left">
+                            <th style="padding:11px 16px;font-weight:600;color:#374151"><a href="${qb}${sortCols.changeDate.next}" style="color:inherit;text-decoration:none">Date${sortCols.changeDate.arrow}</a></th>
+                            <th style="padding:11px 16px;font-weight:600;color:#374151"><a href="${qb}${sortCols.transactionNumber.next}" style="color:inherit;text-decoration:none">Bill No${sortCols.transactionNumber.arrow}</a></th>
+                            <th style="padding:11px 16px;font-weight:600;color:#374151"><a href="${qb}${sortCols.productName.next}" style="color:inherit;text-decoration:none">Product${sortCols.productName.arrow}</a></th>
+                            <th style="padding:11px 16px;font-weight:600;color:#374151"><a href="${qb}${sortCols.productId.next}" style="color:inherit;text-decoration:none">Product ID${sortCols.productId.arrow}</a></th>
+                            <th style="padding:11px 16px;font-weight:600;color:#374151;text-align:right"><a href="${qb}${sortCols.originalPrice.next}" style="color:inherit;text-decoration:none">Original Price${sortCols.originalPrice.arrow}</a></th>
+                            <th style="padding:11px 16px;font-weight:600;color:#374151;text-align:right"><a href="${qb}${sortCols.newPrice.next}" style="color:inherit;text-decoration:none">New Price${sortCols.newPrice.arrow}</a></th>
+                            <th style="padding:11px 16px;font-weight:600;color:#374151"><a href="${qb}${sortCols.priceDiff.next}" style="color:inherit;text-decoration:none">Difference${sortCols.priceDiff.arrow}</a></th>
+                            <th style="padding:11px 16px;font-weight:600;color:#374151"><a href="${qb}${sortCols.changedBy.next}" style="color:inherit;text-decoration:none">Changed By${sortCols.changedBy.arrow}</a></th>
+                            <th style="padding:11px 16px;font-weight:600;color:#374151"><a href="${qb}${sortCols.sessionId.next}" style="color:inherit;text-decoration:none">Session${sortCols.sessionId.arrow}</a></th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <#list (rows![]) as r>
+                        <tr style="border-top:1px solid #F1F1F4">
+                            <td style="padding:12px 16px;color:#111827;white-space:nowrap">${(r.dateStr)!''}</td>
+                            <td style="padding:12px 16px"><span style="color:#7C3AED;font-weight:500">${(r.bill)?html}</span></td>
+                            <td style="padding:12px 16px;color:#111827">${(r.product)?html}</td>
+                            <td style="padding:12px 16px;color:#6B7280">${(r.productId)?html}</td>
+                            <td style="padding:12px 16px;color:#111827;text-align:right;white-space:nowrap">${(r.origStr)!''}</td>
+                            <td style="padding:12px 16px;color:#111827;text-align:right;white-space:nowrap">${(r.newStr)!''}</td>
+                            <td style="padding:12px 16px"><span class="zenith-badge ${r.diffClass} nd" style="font-size:12px">${(r.diffStr)!''}</span></td>
+                            <td style="padding:12px 16px;color:#111827">${(r.who)?html}</td>
+                            <td style="padding:12px 16px;color:#6B7280">${(r.session)?html}</td>
+                        </tr>
+                        </#list>
+                        <#if !(rows?has_content)>
+                        <tr><td colspan="9" style="padding:40px 16px;text-align:center;color:#9CA3AF">No price overrides found for the current filters.</td></tr>
+                        </#if>
+                    </tbody>
+                </table>
+                </div>
+                <!-- Footer / pagination -->
+                <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;padding:14px 20px;border-top:1px solid #F1F1F4;font-size:13px;color:#6B7280">
+                    <span>Showing ${showFrom!0} to ${showTo!0} of ${totalCount!0} results</span>
+                    <div style="display:flex;gap:6px;align-items:center">
+                        <#if (curPage!0) gt 0><a href="${qp}${(curPage!0)-1}" style="display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;border:1px solid #E5E7EB;border-radius:8px;text-decoration:none;color:#374151;font-size:18px">&#8249;</a><#else><span style="display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;border:1px solid #F1F1F4;border-radius:8px;color:#C4C4C4;font-size:18px">&#8249;</span></#if>
+                        <#list (pageNums![]) as pn>
+                        <#if pn == (curPage!0)><span style="display:inline-flex;align-items:center;justify-content:center;min-width:32px;height:32px;padding:0 6px;border-radius:8px;background:#7C3AED;color:#fff;font-weight:600">${pn+1}</span><#else><a href="${qp}${pn}" style="display:inline-flex;align-items:center;justify-content:center;min-width:32px;height:32px;padding:0 6px;border:1px solid #E5E7EB;border-radius:8px;text-decoration:none;color:#374151">${pn+1}</a></#if>
+                        </#list>
+                        <#if (curPage!0)+1 lt (pageCount!1)><a href="${qp}${(curPage!0)+1}" style="display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;border:1px solid #E5E7EB;border-radius:8px;text-decoration:none;color:#374151;font-size:18px">&#8250;</a><#else><span style="display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;border:1px solid #F1F1F4;border-radius:8px;color:#C4C4C4;font-size:18px">&#8250;</span></#if>
+                    </div>
+                </div>
+            </div>
+        </div>
+        ]]></text></render-mode>
     </widgets>
 </screen>
