@@ -10,7 +10,13 @@
             <!-- ZE-TAX security: block editing another tenant's tax exemption via a forged POST -->
             <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" in-map="[entityName:'zenith.erp.tax.TaxExemption', idField:'exemptionId', idValue:exemptionId, orgField:'organizationPartyId']" out-map="_acc"/>
             <if condition="!_acc.allowed"><return error="true" message="You do not have access to this record."/></if>
-            <service-call name="zenith.tax.TaxServices.store#TaxExemption"/>
+            <script><![CDATA[
+                // The restyled form submits ISO yyyy-MM-dd; parse explicitly so locale date parsing
+                // can never mangle it before store#TaxExemption (which takes Date params).
+                if (effectiveFrom) effectiveFrom = ec.l10n.parseDate(effectiveFrom.toString(), 'yyyy-MM-dd')
+                if (effectiveThru) effectiveThru = ec.l10n.parseDate(effectiveThru.toString(), 'yyyy-MM-dd')
+            ]]></script>
+            <service-call name="zenith.tax.TaxServices.store#TaxExemption" in-map="context"/>
         </actions>
         <default-response url="."/>
     </transition>
@@ -22,76 +28,125 @@
                       in-map="[entityName:'zenith.erp.tax.TaxExemption', idField:'exemptionId', idValue:exemptionId, orgField:'organizationPartyId']"/>
         <set field="noAccess" from="!_acc.allowed"/>
         <if condition="_acc.allowed">
-        <entity-find-one entity-name="zenith.erp.tax.TaxExemption" value-field="taxExemption"/>
+            <entity-find-one entity-name="zenith.erp.tax.TaxExemption" value-field="taxExemption"/>
+            <script><![CDATA[
+                def _uri = (ec.web?.request?.requestURI ?: ''); def _zi = _uri.indexOf('/zenith/')
+                appBase = _zi > 0 ? _uri.substring(0, _zi) : ''
+                def org = ec.user.getPreference('ACTIVE_ORGANIZATION')
+
+                // Dropdown option lists (same sources as the former native form)
+                def pf = ec.entity.find("mantle.party.PartyDetail")
+                if (org) pf.condition("ownerPartyId", org)
+                parties = pf.orderBy("organizationName,lastName,firstName").limit(1000).list().collect { p ->
+                    def nm = p.organizationName ?: ((((p.firstName ?: '') + ' ' + (p.lastName ?: '')).trim()) ?: p.partyId)
+                    [id: p.partyId, label: nm]
+                }
+                def prf = ec.entity.find("mantle.product.Product")
+                if (org) prf.condition("ownerPartyId", org)
+                products = prf.orderBy("pseudoId").limit(1000).list().collect { pr -> [id: pr.productId, label: ((pr.pseudoId ?: '') + ' - ' + (pr.productName ?: ''))] }
+                taxAuthorities = ec.entity.find("zenith.erp.tax.TaxAuthority").condition("isActive", "Y").orderBy("description").list().collect { a -> [id: a.taxAuthorityId, label: a.description ?: a.taxAuthorityId] }
+                exemptionTypes = ec.entity.find("moqui.basic.Enumeration").condition("enumTypeId", "TaxExemptionType").orderBy("sequenceNum").list().collect { e -> [id: e.enumId, label: e.description ?: e.enumId] }
+
+                // Current values
+                curParty  = taxExemption?.partyId ?: ''
+                curProduct = taxExemption?.productId ?: ''
+                curAuth   = taxExemption?.taxAuthorityId ?: ''
+                curType   = taxExemption?.exemptionTypeEnumId ?: ''
+                curNumber = taxExemption?.exemptionNumber ?: ''
+                curDesc   = taxExemption?.description ?: ''
+                curActive = taxExemption?.isActive ?: 'Y'
+                effFromVal = taxExemption?.effectiveFrom ? ec.l10n.format(taxExemption.effectiveFrom, 'yyyy-MM-dd') : ''
+                effThruVal = taxExemption?.effectiveThru ? ec.l10n.format(taxExemption.effectiveThru, 'yyyy-MM-dd') : ''
+                exTitle = taxExemption?.exemptionNumber ?: taxExemption?.exemptionId
+            ]]></script>
         </if>
     </actions>
 
     <widgets>
-        <!-- back link stays reachable even when blocked -->
-        <container style="q-mb-md">
-            <link url="../FindTaxExemption" text="Back to List" style="text-primary"/>
-        </container>
+        <render-mode><text type="html,qvt" template="true"><![CDATA[
+        <#assign fRow="display:flex;align-items:center;gap:16px;margin-bottom:14px">
+        <#assign fLbl="width:130px;flex:0 0 auto;text-align:right;font-size:13.5px;font-weight:500;color:#111827">
+        <#assign fSel="flex:1;min-width:0;height:42px;box-sizing:border-box;padding:0 12px;border:1px solid #E5E7EB;border-radius:8px;font-size:13px;color:#111827;background:#F5F3FF;outline:none">
+        <#assign fInp="flex:1;min-width:0;height:42px;box-sizing:border-box;padding:0 12px;border:1px solid #E5E7EB;border-radius:8px;font-size:13px;color:#111827;background:#fff;outline:none">
+        <#assign fDate="flex:0 0 240px;height:42px;box-sizing:border-box;padding:0 12px;border:1px solid #E5E7EB;border-radius:8px;font-size:13px;color:#111827;background:#fff;outline:none">
+        <div style="padding:16px 16px 24px;font-family:'Segoe UI',Arial,sans-serif">
+            <a href="${(appBase!'')}/zenith/tax/FindTaxExemption" style="display:inline-flex;align-items:center;gap:7px;background:#fff;color:#7C3AED;border:1px solid #7C3AED;border-radius:8px;padding:8px 16px;font-size:13px;font-weight:600;text-decoration:none;margin-bottom:18px"><span class="material-icons" style="font-size:18px">arrow_back</span>Back to List</a>
 
-        <!-- cross-tenant / missing exemption — plain notice, never another org's tax data -->
-        <section name="NoAccess">
-            <condition><expression>noAccess</expression></condition>
-            <widgets>
-                <container style="zenith-card q-pa-lg bg-white shadow-1 border-radius-md q-mt-md text-center">
-                    <label text="That tax exemption isn't part of your account." type="h5" style="text-grey-8 q-mb-xs"/>
-                    <label text="It may belong to another organization, or it may not exist. Use “Back to List” above to return to your list." type="p" style="text-grey-6 q-mb-none"/>
-                </container>
-            </widgets>
-        </section>
+            <#if noAccess>
+            <div style="background:#fff;border:1px solid #E5E7EB;border-radius:12px;padding:40px 24px;text-align:center">
+                <div style="font-size:18px;font-weight:700;color:#374151;margin-bottom:6px">That tax exemption isn't part of your account.</div>
+                <div style="font-size:13px;color:#6B7280">It may belong to another organization, or it may not exist. Use &ldquo;Back to List&rdquo; above to return to your list.</div>
+            </div>
+            <#else>
+            <div style="font-size:24px;font-weight:800;color:#111827;margin-bottom:18px">Tax Exemption: ${(exTitle!'')?html}</div>
 
-        <section name="TheRecord">
-        <condition><expression>!noAccess</expression></condition>
-        <widgets>
-        <container style="row items-center justify-between q-mb-lg">
-            <label text="Tax Exemption: ${taxExemption.exemptionNumber ?: taxExemption.exemptionId}" type="h4" style="text-weight-bold q-my-none"/>
-        </container>
+            <div style="background:#fff;border:1px solid #E5E7EB;border-radius:12px;padding:24px;box-shadow:0 1px 3px rgba(17,24,39,.06)">
+                <div style="font-size:17px;font-weight:700;color:#111827;margin-bottom:20px">Exemption Details</div>
+                <div style="display:flex;gap:40px;flex-wrap:wrap;align-items:flex-start">
+                    <!-- LEFT column -->
+                    <div style="flex:1.4 1 440px;min-width:0">
+                        <div style="${fRow}"><label style="${fLbl}">Party <span style="color:#DC2626">*</span></label>
+                            <select id="tx-party" style="${fSel}"><option value="">&mdash; None &mdash;</option><#list (parties![]) as p><option value="${(p.id)?html}"<#if curParty == p.id> selected</#if>>${(p.label)?html}</option></#list></select></div>
+                        <div style="${fRow}"><label style="${fLbl}">Product</label>
+                            <select id="tx-product" style="${fSel}"><option value="">&mdash; None &mdash;</option><#list (products![]) as p><option value="${(p.id)?html}"<#if curProduct == p.id> selected</#if>>${(p.label)?html}</option></#list></select></div>
+                        <div style="${fRow}"><label style="${fLbl}">Tax Authority <span style="color:#DC2626">*</span></label>
+                            <select id="tx-auth" style="${fSel}"><option value="">&mdash; None &mdash;</option><#list (taxAuthorities![]) as a><option value="${(a.id)?html}"<#if curAuth == a.id> selected</#if>>${(a.label)?html}</option></#list></select></div>
+                        <div style="${fRow}"><label style="${fLbl}">Exemption Type <span style="color:#DC2626">*</span></label>
+                            <select id="tx-type" style="${fSel}"><option value="">&mdash; None &mdash;</option><#list (exemptionTypes![]) as e><option value="${(e.id)?html}"<#if curType == e.id> selected</#if>>${(e.label)?html}</option></#list></select></div>
+                        <div style="${fRow}"><label style="${fLbl}">Exemption Number</label>
+                            <input id="tx-number" type="text" value="${(curNumber!'')?html}" placeholder="Enter exemption number" style="${fInp}"/></div>
+                        <div style="${fRow}"><label style="${fLbl}">Effective From</label>
+                            <input id="tx-efffrom" type="date" value="${(effFromVal!'')?html}" style="${fDate}"/></div>
+                        <div style="${fRow}"><label style="${fLbl}">Effective Thru</label>
+                            <input id="tx-effthru" type="date" value="${(effThruVal!'')?html}" style="${fDate}"/></div>
+                    </div>
+                    <!-- RIGHT column -->
+                    <div style="flex:1 1 300px;min-width:0">
+                        <div style="margin-bottom:18px"><label style="display:block;font-size:13.5px;font-weight:500;color:#111827;margin-bottom:6px">Description</label>
+                            <textarea id="tx-desc" rows="3" placeholder="Enter description (optional)" style="width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid #E5E7EB;border-radius:8px;font-size:13px;color:#111827;background:#fff;resize:vertical;outline:none">${(curDesc!'')?html}</textarea></div>
+                        <div><label style="display:block;font-size:13.5px;font-weight:500;color:#111827;margin-bottom:6px">Active</label>
+                            <select id="tx-active" style="width:100%;box-sizing:border-box;height:42px;padding:0 12px;border:1px solid #E5E7EB;border-radius:8px;font-size:13px;color:#111827;background:#F5F3FF;outline:none"><option value="Y"<#if curActive == 'Y'> selected</#if>>Active</option><option value="N"<#if curActive == 'N'> selected</#if>>Inactive</option></select></div>
+                    </div>
+                </div>
+                <div style="margin-top:22px">
+                    <#if (modCanWrite!false)>
+                    <button type="button" id="tx-update" style="display:inline-flex;align-items:center;gap:7px;height:44px;padding:0 24px;background:#7C3AED;color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer"><span class="material-icons" style="font-size:18px">save</span>Update</button>
+                    <#else>
+                    <span style="font-size:13px;color:#6B7280">You have view-only access &mdash; changes are disabled.</span>
+                    </#if>
+                    <div id="tx-result" style="margin-top:10px;font-size:13px"></div>
+                </div>
+            </div>
+            </#if>
+        </div>
 
-        <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg">
-            <label text="Exemption Details" type="h5" style="text-weight-bold q-mb-md"/>
-            <form-single name="UpdateTaxExemption" transition="updateTaxExemption" map="taxExemption">
-                <field name="exemptionId"><default-field><hidden/></default-field></field>
-                <field name="partyId"><default-field title="Party">
-                    <drop-down allow-empty="true"><entity-options key="${partyId}" text="${organizationName ? organizationName : (firstName + ' ' + lastName)}">
-                        <entity-find entity-name="mantle.party.PartyDetail">
-                            <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
-                        </entity-find>
-                    </entity-options></drop-down></default-field></field>
-                <field name="productId"><default-field title="Product">
-                    <drop-down allow-empty="true"><entity-options key="${productId}" text="${pseudoId} - ${productName}">
-                        <entity-find entity-name="mantle.product.Product">
-                            <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
-                            <order-by field-name="pseudoId"/>
-                        </entity-find>
-                    </entity-options></drop-down></default-field></field>
-                <field name="taxAuthorityId"><default-field title="Tax Authority *">
-                    <drop-down allow-empty="true"><entity-options key="${taxAuthorityId}" text="${description}">
-                        <entity-find entity-name="zenith.erp.tax.TaxAuthority">
-                            <econdition field-name="isActive" value="Y"/>
-                            <order-by field-name="description"/>
-                        </entity-find>
-                    </entity-options></drop-down></default-field></field>
-                <field name="exemptionTypeEnumId"><default-field title="Exemption Type *">
-                    <drop-down allow-empty="true"><entity-options key="${enumId}" text="${description}">
-                        <entity-find entity-name="moqui.basic.Enumeration">
-                            <econdition field-name="enumTypeId" value="TaxExemptionType"/>
-                            <order-by field-name="sequenceNum"/>
-                        </entity-find>
-                    </entity-options></drop-down></default-field></field>
-                <field name="exemptionNumber"><default-field title="Exemption Number"><text-line size="20"/></default-field></field>
-                <field name="effectiveFrom"><default-field title="Effective From"><date-time type="date"/></default-field></field>
-                <field name="effectiveThru"><default-field title="Effective Thru"><date-time type="date"/></default-field></field>
-                <field name="description"><default-field><text-area rows="2" cols="50"/></default-field></field>
-                <field name="isActive"><default-field title="Active">
-                    <drop-down><option key="Y" text="Active"/><option key="N" text="Inactive"/></drop-down>
-                </default-field></field>
-                <field name="submitBtn"><conditional-field name="save_write" condition="modCanWrite" title="Update"><submit/></conditional-field><default-field title="Update"><label text="You have view-only access — changes are disabled." type="span" style="text-grey-7"/></default-field></field>
-            </form-single>
-        </container>
-        </widgets>
-        </section>
+        <#if (!noAccess && (modCanWrite!false))>
+        <script>
+        (function(){
+            var APPBASE='${(appBase!'')}';
+            var btn=document.getElementById('tx-update');
+            if(btn && !btn.__txWired){
+                btn.__txWired=1;
+                btn.addEventListener('click', function(){
+                    var g=function(id){ var e=document.getElementById(id); return e ? e.value : ''; };
+                    var auth=g('tx-auth'), type=g('tx-type'), party=g('tx-party'), prod=g('tx-product');
+                    if(!auth){ alert('Tax Authority is required.'); return; }
+                    if(!type){ alert('Exemption Type is required.'); return; }
+                    if(!party && !prod){ alert('Select a Party or a Product.'); return; }
+                    var tok=''; try{ tok=window.moqui.webrootVue.moquiSessionToken; }catch(e){}
+                    btn.disabled=true; var ot=btn.innerHTML; btn.textContent='Saving...';
+                    var body=new URLSearchParams({ exemptionId:'${(taxExemption.exemptionId)!''}', partyId:party, productId:prod,
+                        taxAuthorityId:auth, exemptionTypeEnumId:type, exemptionNumber:g('tx-number'),
+                        effectiveFrom:g('tx-efffrom'), effectiveThru:g('tx-effthru'), description:g('tx-desc'),
+                        isActive:g('tx-active'), moquiSessionToken:tok });
+                    fetch(APPBASE+'/zenith/tax/EditTaxExemption/updateTaxExemption',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body,credentials:'same-origin'})
+                        .then(function(){ location.reload(); })
+                        .catch(function(){ btn.disabled=false; btn.innerHTML=ot; var r=document.getElementById('tx-result'); if(r){ r.textContent='Update failed — please try again.'; r.style.color='#DC2626'; } });
+                });
+            }
+        })();
+        </script>
+        </#if>
+        ]]></text></render-mode>
     </widgets>
 </screen>
