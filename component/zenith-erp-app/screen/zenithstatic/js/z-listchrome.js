@@ -14,6 +14,7 @@
  */
 (function () {
   'use strict';
+  var DEFAULT_SIZE = 10; // sensible page size (matches the mockup's "10 per page")
   function qa(root, sel) { try { return Array.prototype.slice.call(root.querySelectorAll(sel)); } catch (e) { return []; } }
   function txt(el) { return ((el && (el.innerText || el.textContent || el.getAttribute && (el.getAttribute('aria-label') || el.title))) || '').trim(); }
   function mk(tag, cls, html) { var e = document.createElement(tag); if (cls) e.className = cls; if (html != null) e.innerHTML = html; return e; }
@@ -109,7 +110,7 @@
     // the ?pageSize= param, else the mockup default (10). Moqui persists the chosen size per user per form.
     var detected = (p.total > p.end && p.end >= p.start) ? (p.end - p.start + 1) : 0;
     var urlSize = (function () { try { var m = /[?&]pageSize=(\d+)/.exec(location.search); return m ? +m[1] : 0; } catch (e) { return 0; } })();
-    var sel = detected || urlSize || 10;
+    var sel = detected || urlSize || DEFAULT_SIZE;
     var sizes = [10, 25, 50, 100];
     if (sizes.indexOf(sel) < 0) sizes.push(sel);
     sizes.sort(function (a, b) { return a - b; });
@@ -145,6 +146,22 @@
   function enhance(card) {
     if (!card || card.__zlc) return;
     if (!card.querySelector('tr.form-list-nav-row')) return; // native chrome not rendered yet
+    // Self-heal a stale/tiny persisted page size (Moqui remembers pageSize per user): if more rows exist
+    // than are shown and the page is below the sensible default — and the URL doesn't already pin a size —
+    // bump to the default ONCE. Moqui persists it, so a no-param load thereafter is already correct and
+    // this never fires again (also loop-safe: after the redirect the URL carries pageSize).
+    try {
+      var hasParam = /[?&]pageSize=\d+/.test(location.search);
+      if (!hasParam) {
+        var p0 = pager(card), shown0 = rowsOf(card).length;
+        if (shown0 > 0 && p0.total > shown0 && shown0 < DEFAULT_SIZE) {
+          card.__zlc = 1;
+          var uu = new URL(location.href); uu.searchParams.set('pageSize', DEFAULT_SIZE); uu.searchParams.delete('pageIndex');
+          location.replace(uu.toString());
+          return;
+        }
+      }
+    } catch (e) {}
     card.__zlc = 1;
     try {
       var tb = buildToolbar(card);
