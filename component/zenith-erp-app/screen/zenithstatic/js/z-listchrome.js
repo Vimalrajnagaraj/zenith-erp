@@ -105,9 +105,16 @@
     var right = mk('div', 'zlc-foot-right');
     // per-page select (navigates with pageSize; best-effort — tiny master lists fit one page)
     var pp = mk('select', 'zlc-pp');
-    [10, 25, 50, 100].forEach(function (n) { var o = mk('option', null, n + ' per page'); o.value = n; pp.appendChild(o); });
-    var curSize = (function () { try { var m = /[?&]pageSize=(\d+)/.exec(location.search); return m ? +m[1] : 10; } catch (e) { return 10; } })();
-    pp.value = String([10, 25, 50, 100].indexOf(curSize) >= 0 ? curSize : 10);
+    // Reflect the REAL page size: when more than one page exists it is (end-start+1); otherwise fall back to
+    // the ?pageSize= param, else the mockup default (10). Moqui persists the chosen size per user per form.
+    var detected = (p.total > p.end && p.end >= p.start) ? (p.end - p.start + 1) : 0;
+    var urlSize = (function () { try { var m = /[?&]pageSize=(\d+)/.exec(location.search); return m ? +m[1] : 0; } catch (e) { return 0; } })();
+    var sel = detected || urlSize || 10;
+    var sizes = [10, 25, 50, 100];
+    if (sizes.indexOf(sel) < 0) sizes.push(sel);
+    sizes.sort(function (a, b) { return a - b; });
+    sizes.forEach(function (n) { var o = mk('option', null, n + ' per page'); o.value = n; pp.appendChild(o); });
+    pp.value = String(sel);
     pp.addEventListener('change', function () {
       try { var u = new URL(location.href); u.searchParams.set('pageSize', pp.value); u.searchParams.delete('pageIndex'); location.href = u.toString(); } catch (e) {}
     });
