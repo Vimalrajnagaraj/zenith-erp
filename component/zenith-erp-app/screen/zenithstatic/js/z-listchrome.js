@@ -20,8 +20,11 @@
   function mk(tag, cls, html) { var e = document.createElement(tag); if (cls) e.className = cls; if (html != null) e.innerHTML = html; return e; }
   function ico(name) { return '<span class="material-icons">' + name + '</span>'; }
 
-  var COUNT_RE = /(\d+)\s*-\s*(\d+)\s*(?:\/|of)\s*(\d+)/i;         // "1 - 2 of 2" or "1-2 / 2"
-  var PAGE_RE = /(?:page\s+)?(\d+)\s*(?:of|\/)\s*(\d+)/i;          // "Page 1 of 1" or "1 / 1"
+  // numbers may be thousands-grouped on /apps (e.g. "1,219" via the app-wide Indian number formatter),
+  // so capture digit-runs WITH commas and strip them before parsing (bare \d+ stopped at the comma -> total 1).
+  var COUNT_RE = /([\d,]+)\s*-\s*([\d,]+)\s*(?:\/|of)\s*([\d,]+)/i; // "1 - 2 of 2" or "1-10 of 1,219"
+  var PAGE_RE = /(?:page\s+)?([\d,]+)\s*(?:of|\/)\s*([\d,]+)/i;     // "Page 1 of 122" or "1 / 122"
+  function toNum(s) { return parseInt(String(s).replace(/[,\s]/g, ''), 10) || 0; }
 
   function rowsOf(card) {
     if (card.querySelector('.q-table')) return qa(card, '.q-table .tbody > .tr'); // /qapps div-table
@@ -57,8 +60,8 @@
     // counts: scan the nav row for the "(a-b of/ n)" text + "page x of y"
     var navTxt = '';
     qa(card, 'tr.form-list-nav-row').forEach(function (nr) { navTxt += ' ' + txt(nr); });
-    var m = COUNT_RE.exec(navTxt); if (m) { p.start = +m[1]; p.end = +m[2]; p.total = +m[3]; }
-    var pm = PAGE_RE.exec(navTxt); if (pm) { p.page = +pm[1]; p.pages = +pm[2]; }
+    var m = COUNT_RE.exec(navTxt); if (m) { p.start = toNum(m[1]); p.end = toNum(m[2]); p.total = toNum(m[3]); }
+    var pm = PAGE_RE.exec(navTxt); if (pm) { p.page = toNum(pm[1]); p.pages = toNum(pm[2]); }
     return p;
   }
 
