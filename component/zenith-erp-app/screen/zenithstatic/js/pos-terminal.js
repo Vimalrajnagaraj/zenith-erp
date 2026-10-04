@@ -2543,16 +2543,17 @@ window.posToggleFullscreen = function() {
         function buildSummary(d) {
             extractHeldInfo(document); // keep held count/id in sync with the live header badge
             var modeLabel = SM ? (SM.charAt(0).toUpperCase() + SM.slice(1).toLowerCase()) : 'Retail';
-            var sh = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">'
+            var sh = '<div class="pos-sum-strip" style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">'
                 + '<div style="font-size:13px;color:#777">Last: - / 0</div>'
                 + '<div style="display:flex;gap:16px;font-size:14px">'
                 + '<span style="color:#555">Qty: <b id="posSumQty">'+fmt(d.tQty)+'</b></span>'
                 + '<span style="color:#555">Tax: <b id="posSumTax">'+fmt(d.tax)+'</b></span>'
                 + '<span style="color:#555">Disc: <b id="posSumDisc">'+fmt(d.disc)+'</b></span>'
                 + '</div></div>'
-                + '<div style="background:#7C3AED;color:#fff;padding:clamp(5px,1vh,12px) 20px;border-radius:10px;display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">'
+                + '<div class="pos-sum-total" style="background:#7C3AED;color:#fff;padding:clamp(5px,1vh,12px) 20px;border-radius:10px;display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">'
                 + '<span style="font-size:16px;font-weight:600">'+modeLabel+' TOTAL</span>'
                 + '<span id="posSumTotal" style="font-size:28px;font-weight:800;letter-spacing:1px">'+CS+fmt(d.pay)+'</span></div>';
+            sh += '<div class="pos-paywrap">';
             if (d.items.length > 0) {
                 sh += '<button type="button" class="pos-discount-btn" style="display:block;width:100%;padding:clamp(7px,1.1vh,12px) 8px;border-radius:10px;font-size:14px;font-weight:700;cursor:pointer;background:#6a1b9a;color:#fff;border:none;text-align:center;margin-bottom:8px;box-sizing:border-box">&#127991;&#65039; DISCOUNT / ROUND-OFF</button>';
                 sh += '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:8px">'
@@ -2570,19 +2571,20 @@ window.posToggleFullscreen = function() {
                 sh += '<div style="text-align:center;padding:16px;color:#aaa;font-size:16px">Tap products to add items</div>';
                 if (heldCount > 0 && heldId) sh += '<div style="margin-top:8px">' + recallBtn() + '</div>';
             }
+            sh += '</div>';
             return sh;
         }
 
         function buildSplitPanel() {
             var modeLabel = SM ? (SM.charAt(0).toUpperCase() + SM.slice(1).toLowerCase()) : 'Retail';
-            return '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">'
+            return '<div class="pos-sum-strip" style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">'
                 + '<div style="font-size:13px;color:#777">Last: - / 0</div>'
                 + '<div style="display:flex;gap:16px;font-size:14px">'
                 + '<span style="color:#555">Qty: <b>'+(lastCartData ? fmt(lastCartData.tQty) : '0')+'</b></span>'
                 + '<span style="color:#555">Tax: <b>'+(lastCartData ? fmt(lastCartData.tax) : '0')+'</b></span>'
                 + '<span style="color:#555">Disc: <b>'+(lastCartData ? fmt(lastCartData.disc) : '0')+'</b></span>'
                 + '</div></div>'
-                + '<div style="background:#7C3AED;color:#fff;padding:clamp(5px,1vh,12px) 20px;border-radius:10px;display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">'
+                + '<div class="pos-sum-total" style="background:#7C3AED;color:#fff;padding:clamp(5px,1vh,12px) 20px;border-radius:10px;display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">'
                 + '<span style="font-size:16px;font-weight:600">'+modeLabel+' TOTAL</span>'
                 + '<span style="font-size:28px;font-weight:800;letter-spacing:1px">'+CS+fmt(lastPay)+'</span></div>'
                 + '<div class="pos-split-panel" style="border:2px solid #7C3AED;border-radius:10px;padding:14px;background:#ECE8FB">'
@@ -2637,14 +2639,14 @@ window.posToggleFullscreen = function() {
 
         function buildCashPanel() {
             var modeLabel = SM ? (SM.charAt(0).toUpperCase() + SM.slice(1).toLowerCase()) : 'Retail';
-            return '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">'
+            return '<div class="pos-sum-strip" style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">'
                 + '<div style="font-size:13px;color:#777">Last: - / 0</div>'
                 + '<div style="display:flex;gap:16px;font-size:14px">'
                 + '<span style="color:#555">Qty: <b>'+(lastCartData ? fmt(lastCartData.tQty) : '0')+'</b></span>'
                 + '<span style="color:#555">Tax: <b>'+(lastCartData ? fmt(lastCartData.tax) : '0')+'</b></span>'
                 + '<span style="color:#555">Disc: <b>'+(lastCartData ? fmt(lastCartData.disc) : '0')+'</b></span>'
                 + '</div></div>'
-                + '<div style="background:#7C3AED;color:#fff;padding:clamp(5px,1vh,12px) 20px;border-radius:10px;display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">'
+                + '<div class="pos-sum-total" style="background:#7C3AED;color:#fff;padding:clamp(5px,1vh,12px) 20px;border-radius:10px;display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">'
                 + '<span style="font-size:16px;font-weight:600">'+modeLabel+' TOTAL</span>'
                 + '<span style="font-size:28px;font-weight:800;letter-spacing:1px">'+CS+fmt(lastPay)+'</span></div>'
                 + '<div class="pos-cash-panel" style="border:2px solid #4caf50;border-radius:10px;padding:14px;background:#e8f5e9">'
