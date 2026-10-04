@@ -1,0 +1,292 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
+        default-menu-title="KOT Billing" default-menu-index="2">
+
+    <!-- Create a Kitchen Order Ticket (ticket-only: KitchenOrderTicket + KotItem rows, NO PosTransaction
+         => NOT a billing path). Write transition with actions => must be POSTed with moquiSessionToken. -->
+    <transition name="createKot">
+        <actions>
+            <script><![CDATA[
+                org = ec.user.getPreference('ACTIVE_ORGANIZATION')
+                if (!org || org == '_NA_') org = null
+
+                def items = []
+                try { if (itemsJson) items = new groovy.json.JsonSlurper().parseText(itemsJson) } catch (e) { items = [] }
+                if (!items) { ec.message.addError('No items to send to the kitchen.'); return }
+
+                // Next KOT number (display only; not a legal bill number). Most recent org KOT + 1, else 1001.
+                def kf = ec.entity.find('zenith.erp.pos.KitchenOrderTicket')
+                if (org) kf.condition('organizationPartyId', org)
+                def last = kf.orderBy('-kotDate').limit(1).list()
+                def nextNum = 1001
+                if (last) { try { nextNum = ((last[0].kotNumber ?: '1000') as Integer) + 1 } catch (e) { nextNum = 1001 } }
+
+                def notesVal = (orderType ? ('[' + orderType + '] ') : '') + (notes ?: '')
+
+                def kr = ec.service.sync().name('create#zenith.erp.pos.KitchenOrderTicket')
+                    .parameters([organizationPartyId:org, kotNumber:String.valueOf(nextNum),
+                                 tableNumber:tableNumber, statusId:'KotNew', printCount:0,
+                                 kotDate:ec.user.nowTimestamp, notes:notesVal]).call()
+                def newKotId = kr.kotId
+
+                def seq = 0
+                items.each { it2 ->
+                    seq++
+                    ec.service.sync().name('create#zenith.erp.pos.KotItem')
+                        .parameters([kotId:newKotId, kotItemSeqId:String.format('%05d', seq),
+                                     productId:it2.productId, productName:it2.productName,
+                                     quantity:((it2.quantity ?: 1) as BigDecimal),
+                                     specialInstructions:it2.specialInstructions]).call()
+                }
+                ec.message.addMessage('KOT #' + nextNum + ' sent to the kitchen.')
+            ]]></script>
+        </actions>
+        <default-response url="."/>
+    </transition>
+    <transition name="goKotHistory"><default-response url="../KotHistory"/></transition>
+
+    <actions>
+        <script><![CDATA[
+            import java.math.RoundingMode
+            org = ec.user.getPreference('ACTIVE_ORGANIZATION')
+            if (!org || org == '_NA_') org = null
+
+            def inr = { amt ->
+                def n = ((amt ?: 0) as BigDecimal).setScale(2, RoundingMode.HALF_UP)
+                def neg = n.signum() < 0; n = n.abs()
+                def intPart = n.toBigInteger().toString()
+                def frac = n.remainder(BigDecimal.ONE).movePointRight(2).toBigInteger().toString().padLeft(2, '0')
+                def res
+                if (intPart.length() <= 3) { res = intPart }
+                else {
+                    def last3 = intPart.substring(intPart.length() - 3)
+                    def rest = intPart.substring(0, intPart.length() - 3)
+                    def sb = new StringBuilder()
+                    while (rest.length() > 2) { sb.insert(0, ',' + rest.substring(rest.length() - 2)); rest = rest.substring(0, rest.length() - 2) }
+                    sb.insert(0, rest); res = sb.toString() + ',' + last3
+                }
+                return (neg ? '-' : '') + '₹' + res + '.' + frac
+            }
+
+            // Categories (org-scoped)
+            def cf = ec.entity.find('mantle.product.category.ProductCategory')
+            if (org) cf.condition('ownerPartyId', org)
+            categoryList = cf.orderBy('categoryName').limit(60).list()
+
+            // Products (sellable assets, org-scoped) with MRP as the menu price
+            def pf = ec.entity.find('mantle.product.Product').condition('productTypeEnumId', 'PtAsset')
+            if (org) pf.condition('ownerPartyId', org)
+            def products = pf.orderBy('productName').limit(300).list()
+
+            // product -> first category id (for client-side category filtering)
+            def prodCat = [:]
+            if (products) {
+                def pids = products.collect { it.productId }
+                def mems = ec.entity.find('mantle.product.category.ProductCategoryMember')
+                    .condition('productId', org.moqui.entity.EntityCondition.ComparisonOperator.IN, pids)
+                    .conditionDate('fromDate', 'thruDate', ec.user.nowTimestamp)
+                    .orderBy('sequenceNum,productCategoryId').list()
+                mems.each { m -> if (!prodCat[m.productId]) prodCat[m.productId] = m.productCategoryId }
+            }
+
+            menuItems = products.collect { p ->
+                def price = (p.mrpAmount ?: 0) as BigDecimal
+                def nm = (p.productName ?: p.productId)
+                [ id:p.productId, name:nm, price:price.setScale(2, RoundingMode.HALF_UP).toPlainString(),
+                  priceStr:inr(price), cat:(prodCat[p.productId] ?: ''),
+                  initial:(nm?.trim() ? nm.trim().substring(0, 1).toUpperCase() : 'X') ]
+            }
+
+            // Tables for the Table/Token selector
+            tables = ec.entity.find('zenith.erp.pos.RestaurantTable').orderBy('tableNumber').limit(200).list()
+
+            // Recent KOTs (org-scoped)
+            def kf2 = ec.entity.find('zenith.erp.pos.KitchenOrderTicket')
+            if (org) kf2.condition('organizationPartyId', org)
+            def recentRaw = kf2.orderBy('-kotDate').limit(24).list()
+            recentKots = recentRaw.collect { k ->
+                def st = k.statusId; def badge = 'grey'; def label = 'Unknown'; def active = false
+                if (st == 'KotNew') { badge = 'orange'; label = 'Pending'; active = true }
+                else if (st == 'KotPreparing') { badge = 'green'; label = 'In Kitchen'; active = true }
+                else if (st == 'KotReady') { badge = 'green'; label = 'Ready'; active = true }
+                else if (st == 'KotServed') { badge = 'grey'; label = 'Served' }
+                else if (st == 'KotCancelled') { badge = 'grey'; label = 'Cancelled' }
+                [ num:(k.kotNumber ?: k.kotId), table:(k.tableNumber ?: '-'),
+                  time:(k.kotDate ? ec.l10n.format(k.kotDate, 'hh:mm a') : ''),
+                  badge:badge, label:label, active:active ]
+            }
+            nowTime = ec.l10n.format(ec.user.nowTimestamp, 'hh:mm a')
+        ]]></script>
+    </actions>
+
+    <widgets>
+        <render-mode><text type="html,qvt" template="true"><![CDATA[
+<#macro ic name sz=15>
+<svg width="${sz}" height="${sz}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><#rt>
+<#if name=='bag'><path d="M6 2 3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4Z"/><path d="M3 6h18"/><path d="M16 10a4 4 0 0 1-8 0"/>
+<#elseif name=='box'><path d="m7.5 4.27 9 5.15"/><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4a2 2 0 0 0 1-1.73Z"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/>
+<#elseif name=='search'><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>
+<#elseif name=='x'><path d="M18 6 6 18"/><path d="m6 6 12 12"/>
+<#elseif name=='plus'><path d="M5 12h14"/><path d="M12 5v14"/>
+<#elseif name=='minus'><path d="M5 12h14"/>
+<#elseif name=='trash'><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/>
+<#elseif name=='clock'><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
+<#elseif name=='save'><path d="M15.2 3a2 2 0 0 1 1.4.6l3.8 3.8a2 2 0 0 1 .6 1.4V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/><path d="M17 21v-7a1 1 0 0 0-1-1H8a1 1 0 0 0-1 1v7"/><path d="M7 3v4a1 1 0 0 0 1 1h7"/>
+<#elseif name=='printer'><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><path d="M6 9V3a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v6"/><rect x="6" y="14" width="12" height="8" rx="1"/>
+<#elseif name=='arrow'><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/>
+</#if>
+</svg></#macro>
+
+<div class="kb-wrap" id="kb-wrap">
+  <input type="hidden" id="kb-token" value="${(ec.web.sessionToken)!''}"/>
+
+  <div class="kb-head">
+    <h1 class="kb-title">KOT Operations</h1>
+    <p class="kb-sub">Create and manage kitchen orders</p>
+  </div>
+
+  <div class="kb-toolbar">
+    <div class="kb-tabs">
+      <button type="button" class="kb-tab is-active" data-tab="new" onclick="kbTab('new',this)">New Order</button>
+      <button type="button" class="kb-tab" data-tab="active" onclick="kbTab('active',this)">Active Orders</button>
+      <button type="button" class="kb-tab" data-tab="completed" onclick="kbTab('completed',this)">Completed Orders</button>
+    </div>
+    <div class="kb-otype">
+      <button type="button" class="kb-otbtn is-active" data-ot="Dine In" onclick="kbOrderType('Dine In',this)"><@ic 'bag'/> Dine In</button>
+      <button type="button" class="kb-otbtn" data-ot="Take Away" onclick="kbOrderType('Take Away',this)"><@ic 'box'/> Take Away</button>
+    </div>
+    <div class="kb-search">
+      <@ic 'search'/>
+      <input type="text" id="kb-search" placeholder="Search menu items..." oninput="kbSearch(this.value)"/>
+    </div>
+    <button type="button" class="kb-clear" id="kb-clear" onclick="kbClear()"><@ic 'x'/> Clear Cart</button>
+  </div>
+
+  <div class="kb-content">
+
+    <!-- categories rail -->
+    <div class="kb-cats">
+      <ul class="kb-catlist">
+        <li class="kb-cat is-active" data-cat="" onclick="kbCat('',this)">All Items</li>
+        <#list categoryList as c>
+          <li class="kb-cat" data-cat="${c.productCategoryId}" onclick="kbCat('${c.productCategoryId}',this)">${(c.categoryName)!c.productCategoryId}</li>
+        </#list>
+      </ul>
+    </div>
+
+    <!-- middle: menu + recent -->
+    <div class="kb-mid">
+      <div class="kb-menu">
+        <div class="kb-menu__head">
+          <span class="kb-menu__lbl">Show Available Only</span>
+          <div class="kb-tgl" id="kb-avail" onclick="this.classList.toggle('off')"></div>
+        </div>
+        <#if menuItems?has_content>
+        <div class="kb-grid" id="kb-grid">
+          <#list menuItems as m>
+            <article class="kb-card" data-id="${m.id}" data-name="${m.name?html}" data-price="${m.price}" data-cat="${m.cat}">
+              <div class="kb-card__img">${m.initial}</div>
+              <div class="kb-card__b">
+                <div class="kb-card__name">${m.name}</div>
+                <div class="kb-card__row">
+                  <span class="kb-card__price">${m.priceStr}</span>
+                  <button type="button" class="kb-add" onclick="kbAdd('${m.id}')"><@ic 'plus' 12/> Add</button>
+                  <span class="kb-cardstep">
+                    <button type="button" onclick="kbDec('${m.id}')"><@ic 'minus' 12/></button>
+                    <span data-q="${m.id}">0</span>
+                    <button type="button" onclick="kbInc('${m.id}')"><@ic 'plus' 12/></button>
+                  </span>
+                </div>
+              </div>
+            </article>
+          </#list>
+        </div>
+        <div class="kb-menu__empty" id="kb-noresult" style="display:none">No menu items match your search.</div>
+        <#else>
+        <div class="kb-menu__empty">No menu items found for this organization. Add sellable products (with an MRP) to build your menu.</div>
+        </#if>
+
+        <div class="kb-recent">
+          <div class="kb-recent__head">
+            <h2 class="kb-recent__title">Recent Active KOTs</h2>
+            <a class="kb-recent__all" onclick="kbGo('goKotHistory')">View All</a>
+          </div>
+          <#if recentKots?has_content>
+          <div class="kb-recent__grid" id="kb-recent">
+            <#list recentKots as k>
+              <article class="kb-rcard" data-active="${k.active?string('1','0')}">
+                <div class="kb-rcard__t">KOT #${k.num}</div>
+                <div class="kb-rcard__m">Table ${k.table} &#183; ${k.time}</div>
+                <span class="kb-rbadge" data-s="${k.badge}">${k.label}</span>
+              </article>
+            </#list>
+          </div>
+          <div class="kb-recent__empty" id="kb-recent-empty" style="display:none">No orders in this view.</div>
+          <#else>
+          <div class="kb-recent__empty">No kitchen orders yet.</div>
+          </#if>
+        </div>
+      </div>
+    </div>
+
+    <!-- order panel -->
+    <aside class="kb-panel">
+      <div class="kb-panel__head">
+        <h2 class="kb-panel__title">Order Details</h2>
+        <span class="kb-panel__badge">New KOT</span>
+        <span class="kb-panel__time"><@ic 'clock' 13/> ${nowTime!''}</span>
+      </div>
+      <div class="kb-fields">
+        <div class="kb-fld">
+          <label>Table / Token</label>
+          <select id="kb-table">
+            <option value="">— Select —</option>
+            <#list tables as t>
+              <option value="${(t.tableNumber)!t.tableId}">Table ${(t.tableNumber)!'?'}<#if t.seatingCapacity?has_content> &#183; ${t.seatingCapacity}</#if></option>
+            </#list>
+          </select>
+        </div>
+        <div class="kb-fld">
+          <label>Order Type</label>
+          <select id="kb-ordertype" onchange="kbOrderTypeSel(this.value)">
+            <option value="Dine In">Dine In</option>
+            <option value="Take Away">Take Away</option>
+          </select>
+        </div>
+      </div>
+
+      <table class="kb-otable">
+        <thead><tr><th>Item</th><th>Qty</th><th class="r">Price</th><th class="r">Amount</th><th></th></tr></thead>
+        <tbody id="kb-cart"></tbody>
+      </table>
+      <div class="kb-cartempty" id="kb-cartempty">No items yet. Tap <b>Add</b> on a menu item to start the order.</div>
+
+      <div class="kb-instr">
+        <label>Add Special Instructions (Optional)</label>
+        <textarea id="kb-instr" placeholder="e.g. No onion, Less spicy, Extra sauce..."></textarea>
+      </div>
+
+      <div class="kb-sum">
+        <div class="kb-sum__row"><span>Subtotal</span><span id="kb-subtotal">&#8377;0.00</span></div>
+        <div class="kb-sum__row"><span>CGST (2.5%)</span><span id="kb-cgst">&#8377;0.00</span></div>
+        <div class="kb-sum__row"><span>SGST (2.5%)</span><span id="kb-sgst">&#8377;0.00</span></div>
+        <div class="kb-sum__row is-total"><span class="l">Grand Total</span><span class="v" id="kb-grand">&#8377;0.00</span></div>
+      </div>
+
+      <div class="kb-actions">
+        <button type="button" class="kb-abtn" id="kb-draft" onclick="kbDraft()"><@ic 'save' 14/> Save as Draft</button>
+        <button type="button" class="kb-abtn" id="kb-print" onclick="kbPrint()"><@ic 'printer' 14/> Print KOT</button>
+        <button type="button" class="kb-abtn is-primary is-disabled" id="kb-send" onclick="kbSend()">Send to Kitchen <@ic 'arrow' 14/></button>
+      </div>
+    </aside>
+
+  </div>
+
+  <!-- external JS via img-onload: runs on BOTH /apps and /qapps (Quasar strips inline <script>) -->
+  <img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==" alt="" style="display:none"
+       onload="(function(){if(window.__kbJs)return;window.__kbJs=1;var s=document.createElement('script');s.src='/zenithstatic/js/kot-billing.js?v=2';document.head.appendChild(s);})()"/>
+</div>
+        ]]></text></render-mode>
+    </widgets>
+</screen>
