@@ -9,13 +9,9 @@
         <service-call name="zenith.stores.StoreServices.update#Store"/>
         <default-response url="."/>
     </transition>
-    <transition name="setHours">
-        <service-call name="zenith.stores.StoreServices.set#OperatingHours"/>
-        <default-response url="."/>
-    </transition>
     <transition name="setTarget">
         <service-call name="zenith.stores.StoreServices.set#StoreTarget"/>
-        <default-response url="."/>
+        <default-response url="." parameter-map="[storeId:storeId]"/>
     </transition>
     <transition name="addHoliday">
         <actions>
@@ -23,13 +19,61 @@
             <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" out-map="_ca"
                           in-map="[entityName:'zenith.erp.stores.Store', idField:'storeId', idValue:storeId, orgField:'organizationPartyId']"/>
             <if condition="!_ca.allowed"><return error="true" message="Store not found for your account."/></if>
-            <service-call name="create#zenith.erp.stores.StoreHoliday" in-map="context"/>
+            <service-call name="create#zenith.erp.stores.StoreHoliday"
+                          in-map="[storeId:storeId, holidayDate:holidayDate, description:description]"/>
         </actions>
-        <default-response url="."/>
+        <default-response url="." parameter-map="[storeId:storeId]"/>
     </transition>
     <transition name="assignCounter">
         <service-call name="zenith.stores.StoreServices.assign#ShopCounter"/>
-        <default-response url="."/>
+        <default-response url="." parameter-map="[storeId:storeId]"/>
+    </transition>
+
+    <!-- Save the whole profile: store fields (org-guarded update#Store) + all 7 operating-hours days in one atomic call. -->
+    <transition name="saveStoreProfile">
+        <actions>
+            <service-call name="zenith.stores.StoreServices.update#Store" in-map="context"/>
+            <script><![CDATA[
+                def asList = { v -> (v instanceof List) ? v : (v != null ? [v] : []) }
+                def days = asList(ec.web.parameters.hDay)
+                def opens = asList(ec.web.parameters.hOpen)
+                def closes = asList(ec.web.parameters.hClose)
+                def closeds = asList(ec.web.parameters.hClosed)
+                days.eachWithIndex { d, i ->
+                    ec.service.sync().name('zenith.stores.StoreServices.set#OperatingHours').parameters([
+                        storeId: storeId, dayOfWeek: d,
+                        openTime: (i < opens.size() ? opens[i] : null),
+                        closeTime: (i < closes.size() ? closes[i] : null),
+                        isClosed: ((i < closeds.size() && closeds[i] == 'Y') ? 'Y' : 'N')
+                    ]).call()
+                }
+            ]]></script>
+        </actions>
+        <default-response url="." parameter-map="[storeId:storeId]"/>
+    </transition>
+
+    <!-- Delete the store profile + its children, then its 1:1 facility. The facility delete is FK-protected:
+         if the facility is still in use (counters/inventory/txns) it throws and the whole tx rolls back -> nothing
+         deleted, user sees an error. Only a truly-empty store deletes cleanly (so reconcile won't re-adopt it). -->
+    <transition name="deleteStore">
+        <actions>
+            <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" out-map="_ca"
+                          in-map="[entityName:'zenith.erp.stores.Store', idField:'storeId', idValue:storeId, orgField:'organizationPartyId']"/>
+            <if condition="!_ca.allowed"><return error="true" message="Store not found for your account."/></if>
+            <entity-find-one entity-name="zenith.erp.stores.Store" value-field="_st"/>
+            <entity-delete-by-condition entity-name="zenith.erp.stores.StoreOperatingHours"><econdition field-name="storeId"/></entity-delete-by-condition>
+            <entity-delete-by-condition entity-name="zenith.erp.stores.StoreTarget"><econdition field-name="storeId"/></entity-delete-by-condition>
+            <entity-delete-by-condition entity-name="zenith.erp.stores.StoreHoliday"><econdition field-name="storeId"/></entity-delete-by-condition>
+            <entity-delete-by-condition entity-name="zenith.erp.stores.StoreConfiguration"><econdition field-name="storeId"/></entity-delete-by-condition>
+            <entity-delete value-field="_st"/>
+            <if condition="_st.facilityId">
+                <entity-find-one entity-name="mantle.facility.Facility" value-field="_fac">
+                    <field-map field-name="facilityId" from="_st.facilityId"/></entity-find-one>
+                <if condition="_fac"><entity-delete value-field="_fac"/></if>
+            </if>
+            <script>ec.message.addMessage("Store deleted.")</script>
+        </actions>
+        <default-response url="../FindStore"/>
     </transition>
 
     <actions>
@@ -54,166 +98,325 @@
             <econdition field-name="storeId"/>
             <order-by field-name="holidayDate"/>
         </entity-find>
-        <!-- ZE-SHOP: this org's POS counters, to bind them to this shop's facility -->
         <entity-find entity-name="zenith.erp.pos.PosTerminal" list="orgTerminals">
             <econdition field-name="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
             <order-by field-name="terminalName"/>
         </entity-find>
-        <script>shopTermCount = 0; orgTerminals.each { if (it.facilityId == store.facilityId) shopTermCount++ }</script>
+
+        <script><![CDATA[
+            def _enumDesc = { id -> id ? (ec.entity.find('moqui.basic.Enumeration').condition('enumId', id).useCache(true).one()?.description ?: id) : null }
+            def _facName = { id -> id ? (ec.entity.find('mantle.facility.Facility').condition('facilityId', id).one()?.facilityName ?: id) : null }
+
+            def _uri = (ec.web?.request?.requestURI ?: ''); def _zi = _uri.indexOf('/zenith/')
+            appBase = (_zi > 0) ? _uri.substring(0, _zi) : ''
+            moquiToken = (ec.web != null) ? (ec.web.sessionToken ?: '') : ''
+
+            // avatar initials
+            def _nm = ((store.storeName ?: 'Store') as String).trim()
+            def _parts = _nm.split(/\s+/).findAll { it }
+            avatarInit = ((_parts.size() >= 2) ? ('' + _parts[0].charAt(0) + _parts[1].charAt(0)) : (_nm.length() >= 2 ? _nm.substring(0,2) : (_nm ?: 'S'))).toUpperCase()
+
+            storeTypeLabel = _enumDesc(store.storeTypeEnumId) ?: '—'
+            facilityName = _facName(store.facilityId) ?: ''
+            statusLabel = store.statusId ? (ec.entity.find('moqui.basic.StatusItem').condition('statusId', store.statusId).useCache(true).one()?.description ?: store.statusId) : '—'
+            isActiveStore = (store.statusId == 'StActive')
+            areaStr = (store.areaSqFt != null) ? (store.areaSqFt.stripTrailingZeros().toPlainString()) : null
+
+            // counters
+            totalCounters = (orgTerminals ?: []).size()
+            assignedHere = 0; (orgTerminals ?: []).each { if (it.facilityId == store.facilityId) assignedHere++ }
+
+            // option lists
+            storeTypeOptions = ec.entity.find('moqui.basic.Enumeration').condition('enumTypeId','StoreType').orderBy('sequenceNum').list().collect { [id: it.enumId, label: it.description] }
+            def _org = ec.user.getPreference('ACTIVE_ORGANIZATION')
+            def _facFind = ec.entity.find('mantle.facility.Facility').condition('facilityTypeEnumId','FcTpRetailStore')
+            if (_org && _org != '_NA_') _facFind.condition('ownerPartyId', _org)
+            facilityOptions = _facFind.orderBy('facilityName').list().collect { [id: it.facilityId, label: it.facilityName] }
+            managerOptions = ec.entity.find('mantle.party.PersonAndUserAccount').orderBy('firstName').list().collect { [id: it.partyId, label: (((it.firstName ?: '') + ' ' + (it.lastName ?: '')).trim() ?: it.partyId)] }
+            // status: current + reachable (status flow) so we never offer an invalid transition
+            statusOptions = [[id: store.statusId, label: statusLabel]]
+            ec.entity.find('moqui.basic.StatusFlowTransition').condition('statusFlowId','Default').condition('statusId', store.statusId).list().each { tr ->
+                statusOptions.add([id: tr.toStatusId, label: (ec.entity.find('moqui.basic.StatusItem').condition('statusId', tr.toStatusId).useCache(true).one()?.description ?: tr.toStatusId)])
+            }
+            targetPeriodOptions = ec.entity.find('moqui.basic.Enumeration').condition('enumTypeId','TargetPeriod').orderBy('sequenceNum').list().collect { [id: it.enumId, label: it.description] }
+
+            // counter rows
+            counterRows = (orgTerminals ?: []).collect { t -> [id: t.terminalId, name: (t.terminalName ?: t.terminalId), facName: (_facName(t.facilityId) ?: '—'), here: (t.facilityId == store.facilityId)] }
+
+            // operating hours by day (Mon..Sun)
+            def _hmap = [:]; (hours ?: []).each { _hmap[it.dayOfWeek] = it }
+            def _dayName = [Mon:'Monday', Tue:'Tuesday', Wed:'Wednesday', Thu:'Thursday', Fri:'Friday', Sat:'Saturday', Sun:'Sunday']
+            hoursRows = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'].collect { d -> def h=_hmap[d]; [day:d, name:_dayName[d], open:(h?.openTime ?: ''), close:(h?.closeTime ?: ''), closed:(h?.isClosed == 'Y')] }
+
+            // targets with progress
+            targetRows = (targets ?: []).collect { t ->
+                def tgt = (t.salesTarget ?: 0) as BigDecimal
+                def act = (t.actualSales ?: 0) as BigDecimal
+                def pct = (tgt > 0) ? Math.min(100, (act * 100 / tgt).setScale(0, java.math.RoundingMode.HALF_UP).intValue()) : 0
+                [period: (_enumDesc(t.targetPeriodEnumId) ?: ''),
+                 from: (t.periodStart != null ? ec.l10n.format(t.periodStart,'dd MMM yyyy') : ''),
+                 thru: (t.periodEnd != null ? ec.l10n.format(t.periodEnd,'dd MMM yyyy') : ''),
+                 tgt: ec.l10n.format(tgt,'#,##0'), act: ec.l10n.format(act,'#,##0'), pct: pct]
+            }
+            // holidays
+            holidayRows = (holidays ?: []).collect { h ->
+                [day: (h.holidayDate != null ? ec.l10n.format(h.holidayDate,'dd') : '?'),
+                 mon: (h.holidayDate != null ? ec.l10n.format(h.holidayDate,'MMM').toUpperCase() : ''),
+                 reason: (h.description ?: '—')]
+            }
+        ]]></script>
     </actions>
 
     <widgets>
-        <container style="q-mb-lg">
-            <label text="Store: ${store.storeName}" type="h4" style="text-weight-bold q-my-none"/>
-        </container>
+        <render-mode><text type="html,qvt" template="true"><![CDATA[
+        <#assign fLbl="display:block;font-size:12px;font-weight:500;text-transform:uppercase;letter-spacing:.04em;color:#9CA3AF;margin-bottom:4px">
+        <#assign fInp="width:100%;box-sizing:border-box;height:42px;padding:0 12px;border:1px solid #E5E7EB;border-radius:8px;font-size:14px;font-weight:500;color:#111827;background:#F8F9FC;outline:none">
+        <#assign secTitle="display:flex;align-items:center;gap:8px;font-size:15px;font-weight:700;color:#111827;padding-bottom:8px;border-bottom:1px solid #EEF0F4;margin:0 0 16px">
+        <#assign tabBtn="padding:14px 20px;font-size:13px;font-weight:600;background:none;border:none;border-bottom:2px solid transparent;cursor:pointer;white-space:nowrap">
+        <#assign btnPri="display:inline-flex;align-items:center;gap:6px;height:38px;padding:0 16px;background:#7C3AED;color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;text-decoration:none">
+        <#assign btnOut="display:inline-flex;align-items:center;gap:6px;height:38px;padding:0 16px;background:#fff;color:#374151;border:1px solid #E5E7EB;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;text-decoration:none">
+        <#assign statCard="flex:1 1 200px;min-width:180px;background:#fff;border:1px solid #E5E7EB;border-radius:12px;padding:16px 20px;box-shadow:0 1px 2px rgba(0,0,0,.04)">
+        <input id="st-token" type="hidden" value="${(moquiToken)!''}"/>
 
-        <container-row>
-            <row-col lg="8" md="12">
-                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-md">
-                    <label text="Store Details" type="h5" style="text-weight-bold q-mb-md"/>
-                    <form-single name="StoreForm" map="store" transition="updateStore">
-                        <field name="storeId"><default-field><hidden/></default-field></field>
-                        <field name="storeName"><default-field title="Name"><text-line size="25"/></default-field></field>
-                        <field name="storeCode"><default-field title="Code"><display/></default-field></field>
-                        <field name="storeTypeEnumId"><default-field title="Type">
-                            <drop-down><entity-options key="${enumId}" text="${description}">
-                                <entity-find entity-name="moqui.basic.Enumeration">
-                                    <econdition field-name="enumTypeId" value="StoreType"/>
-                                </entity-find>
-                            </entity-options></drop-down></default-field></field>
-                        <field name="facilityId"><default-field title="Facility">
-                            <drop-down allow-empty="true"><entity-options key="${facilityId}" text="${facilityName}">
-                                <entity-find entity-name="mantle.facility.Facility">
-                                    <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
-                                    <econdition field-name="facilityTypeEnumId" value="FcTpRetailStore"/>
-                                    <order-by field-name="facilityName"/>
-                                </entity-find>
-                            </entity-options></drop-down></default-field></field>
-                        <field name="managerPartyId"><default-field title="Manager">
-                            <drop-down allow-empty="true"><entity-options key="${partyId}" text="${((firstName?:'') + ' ' + (lastName?:'')).trim()}">
-                                <entity-find entity-name="mantle.party.PersonAndUserAccount"/>
-                            </entity-options></drop-down></default-field></field>
-                        <field name="address"><default-field><text-area rows="2" cols="40"/></default-field></field>
-                        <field name="city"><default-field><text-line size="20"/></default-field></field>
-                        <field name="phone"><default-field><text-line size="15"/></default-field></field>
-                        <field name="email"><default-field><text-line size="25"/></default-field></field>
-                        <field name="areaSqFt"><default-field title="Area (sq ft)"><text-line size="10"/></default-field></field>
-                        <field name="statusId"><default-field title="Status">
-                            <drop-down>
-                                <entity-options key="${toStatusId}" text="${transitionName}">
-                                    <entity-find entity-name="moqui.basic.StatusFlowTransition">
-                                        <econdition field-name="statusFlowId" value="Default"/>
-                                        <econdition field-name="statusId" from="store.statusId"/>
-                                    </entity-find>
-                                </entity-options>
-                                <option key="${store.statusId}" text="${store.statusId}"/>
-                            </drop-down></default-field></field>
-                        <field name="submitBtn"><default-field title="Update"><submit/></default-field></field>
-                    </form-single>
-                </container>
+        <!-- breadcrumb -->
+        <div style="font-size:13px;color:#9CA3AF;margin-bottom:16px">
+            <a href="${appBase}/zenith/Stores/FindStore" style="color:#7C3AED;font-weight:500;text-decoration:none">Shops</a>
+            <span style="margin:0 6px">/</span>
+            <a href="${appBase}/zenith/Stores/FindStore" style="color:#7C3AED;font-weight:500;text-decoration:none">All Stores</a>
+            <span style="margin:0 6px">/</span>
+            <span style="color:#111827;font-weight:500">${(store.storeName!'Store')?html}</span>
+        </div>
 
-                <!-- ZE-SHOP: counters (POS terminals) bound to this shop's facility -->
-                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-md">
-                    <label text="Counters (POS terminals)" type="h5" style="text-weight-bold q-mb-xs"/>
-                    <label text="Bind billing counters to this shop so its POS sales are attributed here." type="p" style="text-grey-7 q-mb-md"/>
-                    <section name="NoCounterWarn" condition="shopTermCount == 0">
-                        <widgets>
-                            <render-mode><text type="html,qvt"><![CDATA[<div style="background:#FEF3E2;border:1px solid #F5D9A8;color:#8A5A00;border-radius:8px;padding:9px 13px;margin-bottom:12px;font-size:13px">&#9888; This shop has no counter yet — its POS sales won't be attributed to it until you assign one below.</div>]]></text></render-mode>
-                        </widgets>
-                    </section>
-                    <form-list name="CountersForm" list="orgTerminals" skip-form="true">
-                        <field name="terminalName"><default-field title="Counter"><display/></default-field></field>
-                        <field name="facilityId"><default-field title="Current shop">
-                            <display-entity entity-name="mantle.facility.Facility" key-field-name="facilityId" text="${facilityName}"/>
-                        </default-field></field>
-                        <field name="act">
-                            <conditional-field condition="facilityId == store.facilityId" title="">
-                                <label text="&#10003; Here" style="text-positive text-weight-bold"/>
-                            </conditional-field>
-                            <default-field title="">
-                                <link url="assignCounter" text="Assign here" parameter-map="[storeId:store.storeId, terminalId:terminalId]"/>
-                            </default-field>
-                        </field>
-                    </form-list>
-                </container>
+        <!-- store header -->
+        <div style="background:#fff;border:1px solid #E5E7EB;border-radius:12px;box-shadow:0 1px 2px rgba(0,0,0,.04);display:flex;align-items:center;gap:18px;padding:24px 28px;margin-bottom:20px;flex-wrap:wrap">
+            <div style="width:64px;height:64px;flex:0 0 auto;border-radius:16px;background:linear-gradient(135deg,#7C3AED,#6D28D9);color:#fff;display:flex;align-items:center;justify-content:center;font-size:22px;font-weight:700">${(avatarInit)?html}</div>
+            <div style="flex:1;min-width:200px">
+                <div style="font-size:22px;font-weight:700;color:#111827;line-height:1.3">${(store.storeName!'Store')?html}</div>
+                <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:6px;font-size:13px;color:#6B7280">
+                    <span>Code: ${(store.storeCode!'—')?html}</span>
+                    <span style="color:#E5E7EB">|</span>
+                    <span>${(storeTypeLabel)?html}</span>
+                    <#if isActiveStore><span style="padding:2px 10px;border-radius:99px;font-size:11px;font-weight:600;letter-spacing:.02em;background:#ECFDF5;color:#059669">Active</span>
+                    <#else><span style="padding:2px 10px;border-radius:99px;font-size:11px;font-weight:600;letter-spacing:.02em;background:#F3F4F6;color:#6B7280">${(statusLabel)?html}</span></#if>
+                    <span style="padding:2px 10px;border-radius:99px;font-size:11px;font-weight:600;letter-spacing:.02em;background:#EDE9FE;color:#7C3AED">${totalCounters} Counter${(totalCounters == 1)?string('','s')}</span>
+                </div>
+            </div>
+            <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+                <a href="${appBase}/zenith/pos/Terminal" style="${btnOut}"><span class="material-icons" style="font-size:17px">point_of_sale</span>Open POS</a>
+                <button type="button" onclick="window.stSave()" style="${btnPri}"><span class="material-icons" style="font-size:17px">check</span>Save Store</button>
+                <button type="button" title="More actions" style="${btnOut};padding:0 10px"><span class="material-icons" style="font-size:19px;color:#9CA3AF">more_vert</span></button>
+            </div>
+        </div>
 
-                <!-- Operating Hours -->
-                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-md">
-                    <label text="Operating Hours" type="h5" style="text-weight-bold q-mb-md"/>
-                    <form-list name="HoursForm" list="hours" transition="setHours">
-                        <field name="storeId"><default-field><hidden/></default-field></field>
-                        <field name="dayOfWeek"><default-field title="Day"><display/></default-field></field>
-                        <field name="openTime"><default-field title="Open"><text-line size="8"/></default-field></field>
-                        <field name="closeTime"><default-field title="Close"><text-line size="8"/></default-field></field>
-                        <field name="isClosed"><default-field title="Closed?">
-                            <drop-down><option key="N" text="No"/><option key="Y" text="Yes"/></drop-down>
-                        </default-field></field>
-                        <field name="submitBtn"><default-field title="Save"><submit/></default-field></field>
-                    </form-list>
-                </container>
+        <!-- quick stats -->
+        <div style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:24px">
+            <div style="${statCard}"><div style="${fLbl}">Status</div><div style="font-size:22px;font-weight:700;color:${isActiveStore?string('#10B981','#6B7280')}">${(statusLabel)?html}</div><div style="font-size:12px;color:#6B7280">${(storeTypeLabel)?html}</div></div>
+            <div style="${statCard}"><div style="${fLbl}">POS Counters</div><div style="font-size:22px;font-weight:700;color:#7C3AED">${totalCounters}</div><div style="font-size:12px;color:#6B7280">${assignedHere} assigned here</div></div>
+            <div style="${statCard}"><div style="${fLbl}">Area</div><div style="font-size:22px;font-weight:700;color:#9CA3AF"><#if areaStr??>${areaStr}<#else>N/A</#if></div><div style="font-size:12px;color:#6B7280"><#if areaStr??>sq ft<#else>sq ft not set</#if></div></div>
+            <div style="${statCard}"><div style="${fLbl}">Facility</div><div style="font-size:16px;font-weight:700;color:#111827"><#if (facilityName?has_content)>${facilityName?html}<#else>Not linked</#if></div><div style="font-size:12px;color:#6B7280">Linked facility</div></div>
+        </div>
 
-                <!-- Targets -->
-                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg">
-                    <container style="row items-center justify-between q-mb-md">
-                        <label text="Targets" type="h5" style="text-weight-bold q-my-none"/>
-                        <container-dialog id="SetTarget" button-text="Set Target" type="success">
-                            <form-single name="SetTargetForm" transition="setTarget">
-                                <field name="storeId" from="store.storeId"><default-field><hidden/></default-field></field>
-                                <field name="targetPeriodEnumId"><default-field title="Period">
-                                    <drop-down><entity-options key="${enumId}" text="${description}">
-                                        <entity-find entity-name="moqui.basic.Enumeration">
-                                            <econdition field-name="enumTypeId" value="TargetPeriod"/>
-                                        </entity-find>
-                                    </entity-options></drop-down></default-field></field>
-                                <field name="periodStart"><default-field><date-time type="date"/></default-field></field>
-                                <field name="periodEnd"><default-field><date-time type="date"/></default-field></field>
-                                <field name="salesTarget"><default-field title="Sales Target"><text-line size="12"/></default-field></field>
-                                <field name="transactionTarget"><default-field title="Txn Target"><text-line size="8"/></default-field></field>
-                                <field name="submitBtn"><default-field title="Set"><submit/></default-field></field>
-                            </form-single>
-                        </container-dialog>
-                    </container>
-                    <form-list name="TargetsForm" list="targets" skip-form="true">
-                        <field name="targetPeriodEnumId"><default-field title="Period">
-                            <display-entity entity-name="moqui.basic.Enumeration" key-field-name="enumId" text="${description}"/>
-                        </default-field></field>
-                        <field name="periodStart"><default-field title="From"><display format="dd-MMM-yyyy"/></default-field></field>
-                        <field name="periodEnd"><default-field title="To"><display format="dd-MMM-yyyy"/></default-field></field>
-                        <field name="salesTarget"><default-field title="Target"><display format="#,##0"/></default-field></field>
-                        <field name="actualSales"><default-field title="Actual"><display format="#,##0"/></default-field></field>
-                    </form-list>
-                </container>
-            </row-col>
+        <!-- tabs -->
+        <div style="background:#fff;border:1px solid #E5E7EB;border-bottom:none;border-radius:12px 12px 0 0;box-shadow:0 1px 2px rgba(0,0,0,.04)">
+            <div style="display:flex;padding:0 24px;border-bottom:1px solid #E5E7EB;overflow-x:auto">
+                <button type="button" id="tab-details" onclick="window.stTab('details')" style="${tabBtn};color:#7C3AED;border-bottom-color:#7C3AED">Store Details</button>
+                <button type="button" id="tab-counters" onclick="window.stTab('counters')" style="${tabBtn};color:#6B7280">POS Counters</button>
+                <button type="button" id="tab-hours" onclick="window.stTab('hours')" style="${tabBtn};color:#6B7280">Operating Hours</button>
+                <button type="button" id="tab-targets" onclick="window.stTab('targets')" style="${tabBtn};color:#6B7280">Targets</button>
+                <button type="button" id="tab-holidays" onclick="window.stTab('holidays')" style="${tabBtn};color:#6B7280">Holidays</button>
+            </div>
+        </div>
+        <div style="background:#fff;border:1px solid #E5E7EB;border-top:none;border-radius:0 0 12px 12px;box-shadow:0 1px 2px rgba(0,0,0,.04);padding:28px">
 
-            <row-col lg="4" md="12">
-                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-md text-center">
-                    <label text="Status" type="p" style="text-grey-7 text-uppercase text-weight-bold q-mb-xs"/>
-                    <label text="${store.statusId}" type="h5" style="text-primary text-weight-bold q-my-sm"/>
-                </container>
-                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-md text-center">
-                    <label text="Area" type="p" style="text-grey-7 text-uppercase text-weight-bold q-mb-xs"/>
-                    <label text="${store.areaSqFt ?: 'N/A'} sq ft" type="h5" style="text-dark text-weight-bold q-my-sm"/>
-                </container>
+            <!-- Store Details -->
+            <div id="panel-details" style="display:block">
+                <div style="${secTitle}"><span class="material-icons" style="font-size:18px;color:#7C3AED">home</span>General Information</div>
+                <div style="display:flex;flex-wrap:wrap;gap:16px 24px;margin-bottom:24px">
+                    <div style="flex:1 1 280px"><span style="${fLbl}">Store Name</span><input id="st-name" class="st-inp" type="text" value="${(store.storeName!'')?html}" style="${fInp}"/></div>
+                    <div style="flex:1 1 280px"><span style="${fLbl}">Store Code</span><div style="${fInp};display:flex;align-items:center;font-family:'SF Mono',Consolas,monospace;letter-spacing:.04em">${(store.storeCode!'—')?html}</div></div>
+                    <div style="flex:1 1 280px"><span style="${fLbl}">Store Type</span><select id="st-type" class="st-sel" style="${fInp}"><#list storeTypeOptions as o><option value="${(o.id)?html}"<#if o.id == (store.storeTypeEnumId!'')> selected</#if>>${(o.label)?html}</option></#list></select></div>
+                    <div style="flex:1 1 280px"><span style="${fLbl}">Facility</span><select id="st-facility" class="st-sel" style="${fInp}"><option value="">Not linked</option><#list facilityOptions as o><option value="${(o.id)?html}"<#if o.id == (store.facilityId!'')> selected</#if>>${(o.label)?html}</option></#list></select></div>
+                    <div style="flex:1 1 280px"><span style="${fLbl}">Manager</span><select id="st-manager" class="st-sel" style="${fInp}"><option value="">Select Manager</option><#list managerOptions as o><option value="${(o.id)?html}"<#if o.id == (store.managerPartyId!'')> selected</#if>>${(o.label)?html}</option></#list></select></div>
+                    <div style="flex:1 1 280px"><span style="${fLbl}">Status</span><select id="st-status" class="st-sel" style="${fInp}"><#list statusOptions as o><option value="${(o.id)?html}"<#if o.id == (store.statusId!'')> selected</#if>>${(o.label)?html}</option></#list></select></div>
+                </div>
+                <div style="${secTitle}"><span class="material-icons" style="font-size:18px;color:#7C3AED">place</span>Location &amp; Contact</div>
+                <div style="display:flex;flex-wrap:wrap;gap:16px 24px">
+                    <div style="flex:1 1 100%"><span style="${fLbl}">Address</span><textarea id="st-address" class="st-ta" style="${fInp};height:auto;min-height:72px;padding:10px 12px;resize:vertical">${(store.address!'')?html}</textarea></div>
+                    <div style="flex:1 1 220px"><span style="${fLbl}">City</span><input id="st-city" class="st-inp" type="text" value="${(store.city!'')?html}" style="${fInp}"/></div>
+                    <div style="flex:1 1 220px"><span style="${fLbl}">Phone</span><input id="st-phone" class="st-inp" type="tel" value="${(store.phone!'')?html}" style="${fInp}"/></div>
+                    <div style="flex:1 1 220px"><span style="${fLbl}">Email</span><input id="st-email" class="st-inp" type="email" value="${(store.email!'')?html}" placeholder="store@example.com" style="${fInp}"/></div>
+                    <div style="flex:1 1 220px"><span style="${fLbl}">Area (sq ft)</span><input id="st-area" class="st-inp" type="number" value="<#if areaStr??>${areaStr}</#if>" placeholder="Enter area" style="${fInp}"/></div>
+                </div>
+            </div>
 
-                <!-- Holidays -->
-                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg">
-                    <container style="row items-center justify-between q-mb-md">
-                        <label text="Holidays" type="h6" style="text-weight-bold q-my-none"/>
-                        <container-dialog id="AddHoliday" button-text="Add" type="info">
-                            <form-single name="AddHolidayForm" transition="addHoliday">
-                                <field name="storeId" from="store.storeId"><default-field><hidden/></default-field></field>
-                                <field name="holidayDate"><default-field title="Date"><date-time type="date"/></default-field></field>
-                                <field name="description"><default-field><text-line size="20"/></default-field></field>
-                                <field name="submitBtn"><default-field title="Add"><submit/></default-field></field>
-                            </form-single>
-                        </container-dialog>
-                    </container>
-                    <form-list name="HolidaysForm" list="holidays" skip-form="true">
-                        <field name="holidayDate"><default-field title="Date"><display format="dd-MMM"/></default-field></field>
-                        <field name="description"><default-field title="Reason"><display/></default-field></field>
-                    </form-list>
-                </container>
-            </row-col>
-        </container-row>
+            <!-- POS Counters -->
+            <div id="panel-counters" style="display:none">
+                <div style="${secTitle}"><span class="material-icons" style="font-size:18px;color:#7C3AED">point_of_sale</span>POS Counter Assignments</div>
+                <p style="font-size:13px;color:#6B7280;margin:0 0 16px">Assign POS counters to this store. Counters currently assigned to other stores can be reassigned here.</p>
+                <table style="width:100%;border-collapse:collapse;font-size:13px">
+                    <thead><tr style="text-align:left;color:#9CA3AF;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;border-bottom:1px solid #E5E7EB">
+                        <th style="padding:12px">Counter Name</th><th style="padding:12px">Current Assignment</th><th style="padding:12px;text-align:right;width:140px">Action</th>
+                    </tr></thead>
+                    <tbody>
+                    <#list counterRows as c>
+                        <tr style="border-bottom:1px solid #EEF0F4">
+                            <td style="padding:12px;font-weight:600;color:#111827">${(c.name)?html}</td>
+                            <td style="padding:12px"><span style="font-size:12px;<#if c.here>color:#059669;font-weight:600<#else>color:#6B7280</#if>">${(c.facName)?html}</span></td>
+                            <td style="padding:12px;text-align:right">
+                                <#if c.here><span style="display:inline-flex;align-items:center;gap:5px;padding:4px 12px;border-radius:99px;font-size:12px;font-weight:600;background:#ECFDF5;color:#059669"><span class="material-icons" style="font-size:13px">check</span>Assigned</span>
+                                <#else><button type="button" onclick="window.stAssign('${(c.id)?js_string}')" style="padding:4px 12px;border-radius:99px;font-size:12px;font-weight:600;border:1px solid #E5E7EB;background:#fff;color:#6B7280;cursor:pointer">Assign Here</button></#if>
+                            </td>
+                        </tr>
+                    </#list>
+                    <#if !(counterRows?has_content)><tr><td colspan="3" style="padding:24px;text-align:center;color:#9CA3AF">No POS counters in this organization yet.</td></tr></#if>
+                    </tbody>
+                </table>
+            </div>
+
+            <!-- Operating Hours -->
+            <div id="panel-hours" style="display:none">
+                <div style="${secTitle}"><span class="material-icons" style="font-size:18px;color:#7C3AED">schedule</span>Weekly Schedule</div>
+                <p style="font-size:13px;color:#6B7280;margin:0 0 18px">Set regular operating hours for this store. Toggle &ldquo;Closed&rdquo; to mark non-working days, then click Save Store Profile.</p>
+                <div style="display:grid;grid-template-columns:120px 1fr 1fr 80px;gap:10px;padding-bottom:6px;font-size:11px;font-weight:600;color:#9CA3AF;text-transform:uppercase;letter-spacing:.05em">
+                    <div>Day</div><div>Open</div><div>Close</div><div>Closed?</div>
+                </div>
+                <#list hoursRows as h>
+                <div class="st-hrow" data-day="${h.day}" style="display:grid;grid-template-columns:120px 1fr 1fr 80px;gap:10px;align-items:center;padding:7px 0;border-bottom:1px solid #EEF0F4">
+                    <div style="font-size:13px;font-weight:600;color:#111827">${h.name}</div>
+                    <input type="time" class="st-inp st-htime" value="${h.open}" <#if h.closed>disabled</#if> style="height:38px;padding:0 10px;border:1px solid #E5E7EB;border-radius:8px;font-size:13px;background:#F8F9FC;color:#111827;<#if h.closed>opacity:.5</#if>"/>
+                    <input type="time" class="st-inp st-htime" value="${h.close}" <#if h.closed>disabled</#if> style="height:38px;padding:0 10px;border:1px solid #E5E7EB;border-radius:8px;font-size:13px;background:#F8F9FC;color:#111827;<#if h.closed>opacity:.5</#if>"/>
+                    <span class="st-tgl${h.closed?string(' on','')}" onclick="window.stToggleDay(this)"></span>
+                </div>
+                </#list>
+            </div>
+
+            <!-- Targets -->
+            <div id="panel-targets" style="display:none">
+                <div style="${secTitle}"><span class="material-icons" style="font-size:18px;color:#7C3AED">track_changes</span>Sales Targets</div>
+                <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:18px">
+                    <p style="font-size:13px;color:#6B7280;margin:0">Set periodic revenue targets and track actuals against them.</p>
+                    <button type="button" onclick="document.getElementById('st-target-form').style.display='block'" style="${btnOut}"><span class="material-icons" style="font-size:16px">add</span>Set Target</button>
+                </div>
+                <div id="st-target-form" style="display:none;margin-bottom:22px">
+                    <div style="border:1px dashed #7C3AED;background:#F8F9FC;border-radius:8px;padding:16px 20px">
+                        <div style="display:flex;flex-wrap:wrap;gap:16px 24px;margin-bottom:12px">
+                            <div style="flex:1 1 200px"><span style="${fLbl}">Period</span><select id="tg-period" class="st-sel" style="${fInp}"><#list targetPeriodOptions as o><option value="${(o.id)?html}"<#if o.id=='TpMonthly'> selected</#if>>${(o.label)?html}</option></#list></select></div>
+                            <div style="flex:1 1 200px"><span style="${fLbl}">From Date</span><input id="tg-from" class="st-inp" type="date" style="${fInp}"/></div>
+                            <div style="flex:1 1 200px"><span style="${fLbl}">To Date</span><input id="tg-to" class="st-inp" type="date" style="${fInp}"/></div>
+                            <div style="flex:1 1 200px"><span style="${fLbl}">Target Amount (&#8377;)</span><input id="tg-amt" class="st-inp" type="number" placeholder="e.g. 500000" style="${fInp}"/></div>
+                        </div>
+                        <div style="display:flex;gap:8px;justify-content:flex-end">
+                            <button type="button" onclick="document.getElementById('st-target-form').style.display='none'" style="background:none;border:none;color:#6B7280;font-size:13px;font-weight:600;cursor:pointer;padding:8px 12px">Cancel</button>
+                            <button type="button" onclick="window.stAddTarget()" style="${btnPri}">Add Target</button>
+                        </div>
+                    </div>
+                </div>
+                <#if (targetRows?has_content)>
+                    <#list targetRows as t>
+                    <div style="border:1px solid #E5E7EB;border-radius:8px;padding:16px 20px;margin-bottom:12px">
+                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px"><span style="font-size:14px;font-weight:600;color:#111827">${(t.period)?html}</span><span style="font-size:12px;color:#6B7280">${(t.from)?html} &#8212; ${(t.thru)?html}</span></div>
+                        <div style="height:6px;border-radius:99px;background:#EEF0F4;overflow:hidden"><div style="height:100%;width:${t.pct}%;background:#7C3AED;border-radius:99px"></div></div>
+                        <div style="display:flex;justify-content:space-between;margin-top:8px;font-size:12px;color:#6B7280"><span>&#8377; ${(t.act)?html} achieved</span><span>Target: &#8377; ${(t.tgt)?html} (${t.pct}%)</span></div>
+                    </div>
+                    </#list>
+                <#else>
+                    <div style="text-align:center;padding:40px 20px;color:#9CA3AF"><span class="material-icons" style="font-size:36px;opacity:.3">track_changes</span><div style="font-size:13px;margin-top:8px">No targets set yet</div><div style="font-size:12px;margin-top:4px">Click &ldquo;Set Target&rdquo; to define a sales target for this store.</div></div>
+                </#if>
+            </div>
+
+            <!-- Holidays -->
+            <div id="panel-holidays" style="display:none">
+                <div style="${secTitle}"><span class="material-icons" style="font-size:18px;color:#7C3AED">event</span>Store Holidays</div>
+                <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:18px">
+                    <p style="font-size:13px;color:#6B7280;margin:0">Add specific dates when this store will be closed (besides the regular weekly schedule).</p>
+                    <button type="button" onclick="document.getElementById('st-holiday-form').style.display='block'" style="${btnOut}"><span class="material-icons" style="font-size:16px">add</span>Add Holiday</button>
+                </div>
+                <div id="st-holiday-form" style="display:none;margin-bottom:22px">
+                    <div style="border:1px dashed #7C3AED;background:#F8F9FC;border-radius:8px;padding:16px 20px">
+                        <div style="display:flex;flex-wrap:wrap;gap:16px 24px;margin-bottom:12px">
+                            <div style="flex:1 1 220px"><span style="${fLbl}">Date</span><input id="hl-date" class="st-inp" type="date" style="${fInp}"/></div>
+                            <div style="flex:1 1 220px"><span style="${fLbl}">Reason</span><input id="hl-reason" class="st-inp" type="text" placeholder="e.g. Pongal, Diwali" style="${fInp}"/></div>
+                        </div>
+                        <div style="display:flex;gap:8px;justify-content:flex-end">
+                            <button type="button" onclick="document.getElementById('st-holiday-form').style.display='none'" style="background:none;border:none;color:#6B7280;font-size:13px;font-weight:600;cursor:pointer;padding:8px 12px">Cancel</button>
+                            <button type="button" onclick="window.stAddHol()" style="${btnPri}">Add Holiday</button>
+                        </div>
+                    </div>
+                </div>
+                <#if (holidayRows?has_content)>
+                    <#list holidayRows as h>
+                    <div style="display:flex;align-items:center;gap:14px;padding:10px 0;border-bottom:1px solid #EEF0F4">
+                        <div style="width:48px;height:48px;flex:0 0 auto;border-radius:8px;background:#EDE9FE;display:flex;flex-direction:column;align-items:center;justify-content:center"><span style="font-size:16px;font-weight:700;color:#7C3AED;line-height:1">${h.day}</span><span style="font-size:10px;font-weight:600;color:#7C3AED;text-transform:uppercase">${h.mon}</span></div>
+                        <div style="font-size:13px;color:#111827">${(h.reason)?html}</div>
+                    </div>
+                    </#list>
+                <#else>
+                    <div style="text-align:center;padding:40px 20px;color:#9CA3AF"><span class="material-icons" style="font-size:36px;opacity:.3">event</span><div style="font-size:13px;margin-top:8px">No holidays added yet</div><div style="font-size:12px;margin-top:4px">Click &ldquo;Add Holiday&rdquo; to mark specific closure dates.</div></div>
+                </#if>
+            </div>
+
+            <!-- save bar -->
+            <div style="display:flex;align-items:center;gap:12px;padding:16px 0 0;margin-top:24px;border-top:1px solid #E5E7EB">
+                <button type="button" onclick="window.stDelete()" style="background:none;border:none;color:#EF4444;font-size:13px;font-weight:600;cursor:pointer;padding:8px 14px;border-radius:8px">Delete Store</button>
+                <div style="flex:1"></div>
+                <a href="${appBase}/zenith/Stores/EditStore?storeId=${(store.storeId)?url('UTF-8')}" style="${btnOut}">Discard Changes</a>
+                <button type="button" onclick="window.stSave()" style="${btnPri}">Save Store Profile</button>
+            </div>
+        </div>
+
+        <script>
+        (function(){
+            window.stTok = function(){ var t=''; try{ t=window.moqui.webrootVue.moquiSessionToken; }catch(e){} if(!t){ var h=document.getElementById('st-token'); t=h?h.value:''; } return t; };
+            window.stTab = function(n){
+                ['details','counters','hours','targets','holidays'].forEach(function(t){
+                    var b=document.getElementById('tab-'+t), p=document.getElementById('panel-'+t); var on=(t===n);
+                    if(b){ b.style.color=on?'#7C3AED':'#6B7280'; b.style.borderBottomColor=on?'#7C3AED':'transparent'; }
+                    if(p){ p.style.display=on?'block':'none'; }
+                });
+            };
+            window.stToggleDay = function(el){
+                var closed=!el.classList.contains('on');
+                if(closed){ el.classList.add('on'); } else { el.classList.remove('on'); }
+                var row=el.closest('.st-hrow'); if(row){ Array.prototype.forEach.call(row.querySelectorAll('.st-htime'), function(inp){ inp.disabled=closed; inp.style.opacity=closed?'.5':'1'; }); }
+            };
+            var txUrl=function(name){ return location.pathname.replace(/\/$/,'') + '/' + name; };
+            var post=function(name, pairs){
+                var body=new URLSearchParams();
+                for(var k in pairs){ if(Object.prototype.hasOwnProperty.call(pairs,k)){ body.append(k, pairs[k]==null?'':pairs[k]); } }
+                body.append('moquiSessionToken', window.stTok());
+                return fetch(txUrl(name),{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body,credentials:'same-origin'});
+            };
+            var g=function(id){ var e=document.getElementById(id); return e?(e.value||''):''; };
+            window.stSave = function(){
+                var body=new URLSearchParams();
+                body.append('storeId','${(store.storeId)?js_string}');
+                ['st-name|storeName','st-type|storeTypeEnumId','st-facility|facilityId','st-manager|managerPartyId','st-status|statusId','st-address|address','st-city|city','st-phone|phone','st-email|email','st-area|areaSqFt'].forEach(function(m){ var a=m.split('|'); body.append(a[1], g(a[0])); });
+                Array.prototype.forEach.call(document.querySelectorAll('.st-hrow'), function(row){
+                    body.append('hDay', row.getAttribute('data-day'));
+                    var ins=row.querySelectorAll('.st-htime');
+                    body.append('hOpen', ins[0]?ins[0].value:'');
+                    body.append('hClose', ins[1]?ins[1].value:'');
+                    var tg=row.querySelector('.st-tgl');
+                    body.append('hClosed', (tg && tg.classList.contains('on'))?'Y':'N');
+                });
+                body.append('moquiSessionToken', window.stTok());
+                fetch(txUrl('saveStoreProfile'),{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body,credentials:'same-origin'}).then(function(r){ location.href=r.url||location.href; }).catch(function(){ alert('Save failed - please try again.'); });
+            };
+            window.stAssign = function(tid){ post('assignCounter',{storeId:'${(store.storeId)?js_string}', terminalId:tid}).then(function(r){ location.href=r.url||location.href; }).catch(function(){ alert('Assign failed.'); }); };
+            window.stAddTarget = function(){
+                if(!g('tg-from') || !g('tg-to')){ alert('From and To dates are required.'); return; }
+                post('setTarget',{storeId:'${(store.storeId)?js_string}', targetPeriodEnumId:g('tg-period'), periodStart:g('tg-from'), periodEnd:g('tg-to'), salesTarget:g('tg-amt')}).then(function(r){ location.href=r.url||location.href; }).catch(function(){ alert('Add target failed.'); });
+            };
+            window.stAddHol = function(){
+                if(!g('hl-date')){ alert('Date is required.'); return; }
+                post('addHoliday',{storeId:'${(store.storeId)?js_string}', holidayDate:g('hl-date'), description:g('hl-reason')}).then(function(r){ location.href=r.url||location.href; }).catch(function(){ alert('Add holiday failed.'); });
+            };
+            window.stDelete = function(){
+                if(!confirm('Delete this store profile and its hours/targets/holidays? The linked facility is removed only if it is no longer in use. This cannot be undone.')) return;
+                post('deleteStore',{storeId:'${(store.storeId)?js_string}'}).then(function(r){ location.href=r.url||location.href; }).catch(function(){ alert('Delete failed.'); });
+            };
+        })();
+        </script>
+        ]]></text></render-mode>
     </widgets>
 </screen>
