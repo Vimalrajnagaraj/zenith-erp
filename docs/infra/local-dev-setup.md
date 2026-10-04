@@ -53,22 +53,32 @@ These are **constraint #1 and #2** from `CLAUDE.md`, applied to your laptop:
 
 The app image (`zetaerp-moqui:latest`, ~530 MB compressed) is **not in a public registry**. Two ways:
 
-### Path A — load a prebuilt image from the owner  *(recommended — fastest, no secrets to handle)*
+### Path A — load a prebuilt image from the owner  *(recommended — fastest)*
 
-The owner exports it once from the running container and shares the file (internal channel, not a
-public link):
+The owner exports it once. **Important:** the prod image bakes in the QZ receipt-signing private key
+(`/opt/moqui/WEB-INF/classes/qz-private-key.pem`) — never ship that to a laptop. Strip it first (it's
+not needed to verify screens), then export the sanitized image tagged `zetaerp-moqui:local`:
 
 ```bash
 # owner runs on the prod host:
-docker save zetaerp-moqui:latest | gzip > zetaerp-moqui.tar.gz
+mkdir -p /tmp/qzsan && cd /tmp/qzsan
+openssl genrsa -out dummy-qz.pem 2048 2>/dev/null                    # throwaway key
+printf 'FROM zetaerp-moqui:latest\nCOPY dummy-qz.pem /opt/moqui/WEB-INF/classes/qz-private-key.pem\n' > Dockerfile
+docker build -t zetaerp-moqui:local .                               # prod image minus the real key
+docker save zetaerp-moqui:local | gzip > zetaerp-moqui-local.tar.gz
+docker rmi zetaerp-moqui:local; docker image prune -f; rm -rf /tmp/qzsan   # keep the host clean
+sha256sum zetaerp-moqui-local.tar.gz                                # share this to verify the transfer
 ```
 
-You load it locally and re-tag it for local use:
+Share the ~500 MB file over an internal channel (a drive / file transfer, not a public link). The
+teammate loads it — it comes in already tagged `zetaerp-moqui:local`, matching the compose below:
 
 ```bash
-docker load < zetaerp-moqui.tar.gz
-docker tag zetaerp-moqui:latest zetaerp-moqui:local
+sha256sum zetaerp-moqui-local.tar.gz     # confirm it matches what the owner sent
+docker load < zetaerp-moqui-local.tar.gz
 ```
+
+> Receipt *printing* won't sign locally (dummy key) — irrelevant for verifying a screen.
 
 ### Path B — build it from source  *(for maintainers, or if you can't get the tar)*
 
