@@ -3,8 +3,8 @@
         xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
         default-menu-title="KOT Billing" default-menu-index="2">
 
-    <!-- Create a Kitchen Order Ticket (ticket-only: KitchenOrderTicket + KotItem rows, NO PosTransaction
-         => NOT a billing path). Write transition with actions => must be POSTed with moquiSessionToken. -->
+    <!-- Create a live Kitchen Order Ticket (KotNew). Ticket-only: KitchenOrderTicket + KotItem, NO
+         PosTransaction => NOT a billing path. Write transition => POST with moquiSessionToken. -->
     <transition name="createKot">
         <actions>
             <script><![CDATA[
@@ -12,24 +12,21 @@
                 if (!org || org == '_NA_') org = null
 
                 def items = []
-                try { if (itemsJson) items = new groovy.json.JsonSlurper().parseText(itemsJson) } catch (e) { items = [] }
+                try { if (ec.context.itemsJson) items = new groovy.json.JsonSlurper().parseText(ec.context.itemsJson) } catch (e) { items = [] }
                 if (!items) { ec.message.addError('No items to send to the kitchen.'); return }
 
-                // Next KOT number (display only; not a legal bill number). Most recent org KOT + 1, else 1001.
                 def kf = ec.entity.find('zenith.erp.pos.KitchenOrderTicket')
                 if (org) kf.condition('organizationPartyId', org)
                 def last = kf.orderBy('-kotDate').limit(1).list()
                 def nextNum = 1001
                 if (last) { try { nextNum = ((last[0].kotNumber ?: '1000') as Integer) + 1 } catch (e) { nextNum = 1001 } }
 
-                def notesVal = (orderType ? ('[' + orderType + '] ') : '') + (notes ?: '')
-
+                def notesVal = (ec.context.orderType ? ('[' + ec.context.orderType + '] ') : '') + (ec.context.notes ?: '')
                 def kr = ec.service.sync().name('create#zenith.erp.pos.KitchenOrderTicket')
                     .parameters([organizationPartyId:org, kotNumber:String.valueOf(nextNum),
-                                 tableNumber:tableNumber, statusId:'KotNew', printCount:0,
+                                 tableNumber:ec.context.tableNumber, statusId:'KotNew', printCount:0,
                                  kotDate:ec.user.nowTimestamp, notes:notesVal]).call()
                 def newKotId = kr.kotId
-
                 def seq = 0
                 items.each { it2 ->
                     seq++
@@ -39,16 +36,91 @@
                                      quantity:((it2.quantity ?: 1) as BigDecimal),
                                      specialInstructions:it2.specialInstructions]).call()
                 }
+                // if this order was resumed from a saved draft, remove the draft (it has become live)
+                def dId = ec.context.loadedDraftId
+                if (dId) {
+                    def d = ec.entity.find('zenith.erp.pos.KitchenOrderTicket').condition('kotId', dId).one()
+                    if (d && d.statusId == 'KotDraft' && (!org || d.organizationPartyId == org)) {
+                        ec.entity.find('zenith.erp.pos.KotItem').condition('kotId', dId).deleteAll()
+                        d.delete()
+                    }
+                }
                 ec.message.addMessage('KOT #' + nextNum + ' sent to the kitchen.')
             ]]></script>
         </actions>
         <default-response url="."/>
     </transition>
+
+    <!-- Save the current order as a persisted DRAFT (KotDraft). Replaces an existing draft if one was resumed. -->
+    <transition name="saveDraft">
+        <actions>
+            <script><![CDATA[
+                org = ec.user.getPreference('ACTIVE_ORGANIZATION')
+                if (!org || org == '_NA_') org = null
+
+                def items = []
+                try { if (ec.context.itemsJson) items = new groovy.json.JsonSlurper().parseText(ec.context.itemsJson) } catch (e) { items = [] }
+                if (!items) { ec.message.addError('Add items before saving a draft.'); return }
+
+                // replacing a resumed draft => delete the old one first
+                def exId = ec.context.existingDraftId
+                if (exId) {
+                    def ex = ec.entity.find('zenith.erp.pos.KitchenOrderTicket').condition('kotId', exId).one()
+                    if (ex && ex.statusId == 'KotDraft' && (!org || ex.organizationPartyId == org)) {
+                        ec.entity.find('zenith.erp.pos.KotItem').condition('kotId', exId).deleteAll()
+                        ex.delete()
+                    }
+                }
+
+                def kf = ec.entity.find('zenith.erp.pos.KitchenOrderTicket')
+                if (org) kf.condition('organizationPartyId', org)
+                def last = kf.orderBy('-kotDate').limit(1).list()
+                def nextNum = 1001
+                if (last) { try { nextNum = ((last[0].kotNumber ?: '1000') as Integer) + 1 } catch (e) { nextNum = 1001 } }
+
+                def notesVal = (ec.context.orderType ? ('[' + ec.context.orderType + '] ') : '') + (ec.context.notes ?: '')
+                def kr = ec.service.sync().name('create#zenith.erp.pos.KitchenOrderTicket')
+                    .parameters([organizationPartyId:org, kotNumber:String.valueOf(nextNum),
+                                 tableNumber:ec.context.tableNumber, statusId:'KotDraft', printCount:0,
+                                 kotDate:ec.user.nowTimestamp, notes:notesVal]).call()
+                def newKotId = kr.kotId
+                def seq = 0
+                items.each { it2 ->
+                    seq++
+                    ec.service.sync().name('create#zenith.erp.pos.KotItem')
+                        .parameters([kotId:newKotId, kotItemSeqId:String.format('%05d', seq),
+                                     productId:it2.productId, productName:it2.productName,
+                                     quantity:((it2.quantity ?: 1) as BigDecimal),
+                                     specialInstructions:it2.specialInstructions]).call()
+                }
+                ec.message.addMessage('Saved as Draft #' + nextNum + '.')
+            ]]></script>
+        </actions>
+        <default-response url="."/>
+    </transition>
+
+    <!-- Discard a saved draft (KotDraft only, org-guarded). -->
+    <transition name="deleteDraft">
+        <actions>
+            <script><![CDATA[
+                org = ec.user.getPreference('ACTIVE_ORGANIZATION')
+                if (!org || org == '_NA_') org = null
+                def k = ec.entity.find('zenith.erp.pos.KitchenOrderTicket').condition('kotId', ec.context.kotId).one()
+                if (k && k.statusId == 'KotDraft' && (!org || k.organizationPartyId == org)) {
+                    ec.entity.find('zenith.erp.pos.KotItem').condition('kotId', ec.context.kotId).deleteAll()
+                    k.delete()
+                }
+            ]]></script>
+        </actions>
+        <default-response url="."/>
+    </transition>
+
     <transition name="goKotHistory"><default-response url="../KotHistory"/></transition>
 
     <actions>
         <script><![CDATA[
             import java.math.RoundingMode
+            import groovy.json.JsonOutput
             org = ec.user.getPreference('ACTIVE_ORGANIZATION')
             if (!org || org == '_NA_') org = null
 
@@ -69,27 +141,24 @@
                 return (neg ? '-' : '') + '₹' + res + '.' + frac
             }
 
-            // Categories (org-scoped)
             def cf = ec.entity.find('mantle.product.category.ProductCategory')
             if (org) cf.condition('ownerPartyId', org)
             categoryList = cf.orderBy('categoryName').limit(60).list()
 
-            // Products (sellable assets, org-scoped) with MRP as the menu price
             def pf = ec.entity.find('mantle.product.Product').condition('productTypeEnumId', 'PtAsset')
             if (org) pf.condition('ownerPartyId', org)
             def products = pf.orderBy('productName').limit(300).list()
 
-            // product -> first category id (for client-side category filtering)
+            def IN = org.moqui.entity.EntityCondition.ComparisonOperator.IN
             def prodCat = [:]
             if (products) {
                 def pids = products.collect { it.productId }
                 def mems = ec.entity.find('mantle.product.category.ProductCategoryMember')
-                    .condition('productId', org.moqui.entity.EntityCondition.ComparisonOperator.IN, pids)
+                    .condition('productId', IN, pids)
                     .conditionDate('fromDate', 'thruDate', ec.user.nowTimestamp)
                     .orderBy('sequenceNum,productCategoryId').list()
                 mems.each { m -> if (!prodCat[m.productId]) prodCat[m.productId] = m.productCategoryId }
             }
-
             menuItems = products.collect { p ->
                 def price = (p.mrpAmount ?: 0) as BigDecimal
                 def nm = (p.productName ?: p.productId)
@@ -98,24 +167,65 @@
                   initial:(nm?.trim() ? nm.trim().substring(0, 1).toUpperCase() : 'X') ]
             }
 
-            // Tables for the Table/Token selector
             tables = ec.entity.find('zenith.erp.pos.RestaurantTable').orderBy('tableNumber').limit(200).list()
 
-            // Recent KOTs (org-scoped)
-            def kf2 = ec.entity.find('zenith.erp.pos.KitchenOrderTicket')
-            if (org) kf2.condition('organizationPartyId', org)
-            def recentRaw = kf2.orderBy('-kotDate').limit(24).list()
-            recentKots = recentRaw.collect { k ->
-                def st = k.statusId; def badge = 'grey'; def label = 'Unknown'; def active = false
-                if (st == 'KotNew') { badge = 'orange'; label = 'Pending'; active = true }
-                else if (st == 'KotPreparing') { badge = 'green'; label = 'In Kitchen'; active = true }
-                else if (st == 'KotReady') { badge = 'green'; label = 'Ready'; active = true }
-                else if (st == 'KotServed') { badge = 'grey'; label = 'Served' }
-                else if (st == 'KotCancelled') { badge = 'grey'; label = 'Cancelled' }
-                [ num:(k.kotNumber ?: k.kotId), table:(k.tableNumber ?: '-'),
-                  time:(k.kotDate ? ec.l10n.format(k.kotDate, 'hh:mm a') : ''),
-                  badge:badge, label:label, active:active ]
+            def kotLabel = { st ->
+                if (st == 'KotNew') return 'Pending'
+                if (st == 'KotPreparing') return 'In Kitchen'
+                if (st == 'KotReady') return 'Ready'
+                if (st == 'KotServed') return 'Served'
+                if (st == 'KotCancelled') return 'Cancelled'
+                if (st == 'KotDraft') return 'Draft'
+                return st
             }
+            def kotBadge = { st ->
+                if (st == 'KotNew') return 'orange'
+                if (st == 'KotPreparing' || st == 'KotReady') return 'green'
+                return 'grey'
+            }
+            def loadKots = { statuses, lim ->
+                def f = ec.entity.find('zenith.erp.pos.KitchenOrderTicket').condition('statusId', IN, statuses)
+                if (org) f.condition('organizationPartyId', org)
+                def ks = f.orderBy('-kotDate').limit(lim).list()
+                if (!ks) return []
+                def kids = ks.collect { it.kotId }
+                def its = ec.entity.find('zenith.erp.pos.KotItem').condition('kotId', IN, kids).orderBy('kotId,kotItemSeqId').list()
+                def byKot = [:]
+                its.each { i ->
+                    def lst = byKot[i.kotId]; if (lst == null) { lst = []; byKot[i.kotId] = lst }
+                    lst.add([ name:(i.productName ?: i.productId), qty:(((i.quantity ?: 1) as BigDecimal).stripTrailingZeros().toPlainString()) ])
+                }
+                return ks.collect { k -> [ id:k.kotId, num:(k.kotNumber ?: k.kotId), table:(k.tableNumber ?: '-'),
+                    time:(k.kotDate ? ec.l10n.format(k.kotDate, 'hh:mm a') : ''),
+                    label:kotLabel(k.statusId), badge:kotBadge(k.statusId), items:(byKot[k.kotId] ?: []) ] }
+            }
+
+            activeKots = loadKots(['KotNew', 'KotPreparing', 'KotReady'], 60)
+            completedKots = loadKots(['KotServed', 'KotCancelled'], 60)
+            draftKots = loadKots(['KotDraft'], 30)
+            recentKots = activeKots.take(8)
+
+            // resume a draft into the cart?
+            loadedDraftId = ec.context.loadDraft ?: ''
+            def draftLoadItems = []
+            draftLoadTable = ''; draftLoadType = ''; draftLoadInstr = ''
+            if (loadedDraftId) {
+                def dk = ec.entity.find('zenith.erp.pos.KitchenOrderTicket').condition('kotId', loadedDraftId).one()
+                if (dk && dk.statusId == 'KotDraft' && (!org || dk.organizationPartyId == org)) {
+                    def dits = ec.entity.find('zenith.erp.pos.KotItem').condition('kotId', loadedDraftId).orderBy('kotItemSeqId').list()
+                    draftLoadItems = dits.collect { [ productId:it.productId, productName:it.productName,
+                        quantity:(((it.quantity ?: 1) as BigDecimal).stripTrailingZeros().toPlainString()) ] }
+                    draftLoadTable = dk.tableNumber ?: ''
+                    def nt = dk.notes ?: ''
+                    def mm = (nt =~ /^\[([^\]]*)\]\s?(.*)$/)
+                    if (mm.find()) { draftLoadType = mm.group(1); draftLoadInstr = mm.group(2) } else { draftLoadInstr = nt }
+                } else { loadedDraftId = '' }
+            }
+
+            def printMap = [:]
+            (activeKots + completedKots + draftKots).each { k -> printMap[k.id] = [num:k.num, table:k.table, time:k.time, items:k.items] }
+            printOrdersJson = JsonOutput.toJson(printMap)
+            draftLoadJson = JsonOutput.toJson(draftLoadItems)
             nowTime = ec.l10n.format(ec.user.nowTimestamp, 'hh:mm a')
         ]]></script>
     </actions>
@@ -138,8 +248,25 @@
 </#if>
 </svg></#macro>
 
+<#macro ordercard k>
+<div class="kb-ocard">
+  <div class="kb-ocard__h">
+    <span class="kb-ocard__n">KOT #${k.num}</span>
+    <span class="kb-ocard__b" data-s="${k.badge}">${k.label}</span>
+    <span class="kb-ocard__m">Table ${k.table} &#183; ${k.time}</span>
+  </div>
+  <#if k.items?has_content>
+  <ul class="kb-ocard__items">
+    <#list k.items as it><li><span>${it.name}</span><span class="kb-ocard__q">&#215; ${it.qty}</span></li></#list>
+  </ul>
+  </#if>
+  <div class="kb-ocard__f"><button type="button" class="kb-oprint" onclick="kbPrintKot('${k.id}')"><@ic 'printer' 13/> Print</button></div>
+</div>
+</#macro>
+
 <div class="kb-wrap" id="kb-wrap">
   <input type="hidden" id="kb-token" value="${(ec.web.sessionToken)!''}"/>
+  <div id="kb-data" style="display:none" data-orders="${printOrdersJson?html}" data-draftload="${draftLoadJson?html}" data-draftid="${(loadedDraftId!'')?html}" data-drafttable="${(draftLoadTable!'')?html}" data-drafttype="${(draftLoadType!'')?html}" data-draftinstr="${(draftLoadInstr!'')?html}"></div>
 
   <div class="kb-head">
     <h1 class="kb-title">KOT Operations</h1>
@@ -165,7 +292,6 @@
 
   <div class="kb-content">
 
-    <!-- categories rail -->
     <div class="kb-cats">
       <ul class="kb-catlist">
         <li class="kb-cat is-active" data-cat="" onclick="kbCat('',this)">All Items</li>
@@ -175,8 +301,21 @@
       </ul>
     </div>
 
-    <!-- middle: menu + recent -->
     <div class="kb-mid">
+      <#if draftKots?has_content>
+      <div class="kb-draftbar">
+        <div class="kb-draftbar__t"><@ic 'save' 14/> Saved drafts</div>
+        <div class="kb-draftlist">
+          <#list draftKots as d>
+          <span class="kb-draftchip"><b>Draft #${d.num}</b> &#183; ${(d.items?size)!0} item(s)<#if d.table != '-'> &#183; Table ${d.table}</#if>
+            <a class="load" onclick="kbLoadDraft('${d.id}')">Load</a>
+            <a class="disc" onclick="kbDiscardDraft('${d.id}')">Discard</a>
+          </span>
+          </#list>
+        </div>
+      </div>
+      </#if>
+
       <div class="kb-menu">
         <div class="kb-menu__head">
           <span class="kb-menu__lbl">Show Available Only</span>
@@ -213,28 +352,40 @@
             <a class="kb-recent__all" onclick="kbGo('goKotHistory')">View All</a>
           </div>
           <#if recentKots?has_content>
-          <div class="kb-recent__grid" id="kb-recent">
+          <div class="kb-recent__grid">
             <#list recentKots as k>
-              <article class="kb-rcard" data-active="${k.active?string('1','0')}">
+              <article class="kb-rcard">
                 <div class="kb-rcard__t">KOT #${k.num}</div>
                 <div class="kb-rcard__m">Table ${k.table} &#183; ${k.time}</div>
                 <span class="kb-rbadge" data-s="${k.badge}">${k.label}</span>
               </article>
             </#list>
           </div>
-          <div class="kb-recent__empty" id="kb-recent-empty" style="display:none">No orders in this view.</div>
           <#else>
-          <div class="kb-recent__empty">No kitchen orders yet.</div>
+          <div class="kb-recent__empty">No active kitchen orders yet.</div>
           </#if>
         </div>
       </div>
     </div>
 
-    <!-- order panel -->
+    <!-- Active / Completed full order lists (shown by the toolbar tabs) -->
+    <section class="kb-orders" id="kb-orders-active">
+      <h2 class="kb-ordhead">Active Orders (${activeKots?size})</h2>
+      <#if activeKots?has_content>
+      <div class="kb-ogrid"><#list activeKots as k><@ordercard k/></#list></div>
+      <#else><div class="kb-orders__empty">No active kitchen orders.</div></#if>
+    </section>
+    <section class="kb-orders" id="kb-orders-completed">
+      <h2 class="kb-ordhead">Completed Orders (${completedKots?size})</h2>
+      <#if completedKots?has_content>
+      <div class="kb-ogrid"><#list completedKots as k><@ordercard k/></#list></div>
+      <#else><div class="kb-orders__empty">No completed or cancelled orders yet.</div></#if>
+    </section>
+
     <aside class="kb-panel">
       <div class="kb-panel__head">
         <h2 class="kb-panel__title">Order Details</h2>
-        <span class="kb-panel__badge">New KOT</span>
+        <span class="kb-panel__badge" id="kb-badge">New KOT</span>
         <span class="kb-panel__time"><@ic 'clock' 13/> ${nowTime!''}</span>
       </div>
       <div class="kb-fields">
@@ -275,7 +426,7 @@
       </div>
 
       <div class="kb-actions">
-        <button type="button" class="kb-abtn" id="kb-draft" onclick="kbDraft()"><@ic 'save' 14/> Save as Draft</button>
+        <button type="button" class="kb-abtn" id="kb-draft" onclick="kbSaveDraft()"><@ic 'save' 14/> Save as Draft</button>
         <button type="button" class="kb-abtn" id="kb-print" onclick="kbPrint()"><@ic 'printer' 14/> Print KOT</button>
         <button type="button" class="kb-abtn is-primary is-disabled" id="kb-send" onclick="kbSend()">Send to Kitchen <@ic 'arrow' 14/></button>
       </div>
@@ -283,9 +434,8 @@
 
   </div>
 
-  <!-- external JS via img-onload: runs on BOTH /apps and /qapps (Quasar strips inline <script>) -->
   <img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==" alt="" style="display:none"
-       onload="(function(){if(window.__kbJs)return;window.__kbJs=1;var s=document.createElement('script');s.src='/zenithstatic/js/kot-billing.js?v=2';document.head.appendChild(s);})()"/>
+       onload="(function(){if(window.__kbJs)return;window.__kbJs=1;var s=document.createElement('script');s.src='/zenithstatic/js/kot-billing.js?v=4';document.head.appendChild(s);})()"/>
 </div>
         ]]></text></render-mode>
     </widgets>
