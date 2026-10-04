@@ -2670,7 +2670,7 @@ window.posToggleFullscreen = function() {
             if (!tb) return;
             var h = '';
             if (d.items.length === 0) {
-                h = '<tr><td colspan="7" style="text-align:center;padding:40px;color:#aaa;font-size:16px">Tap products to add items</td></tr>';
+                h = '<tr><td colspan="8" style="text-align:center;padding:40px;color:#aaa;font-size:16px">Tap products to add items</td></tr>';
             }
             d.items.forEach(function(it, idx) {
                 h += '<tr style="border-bottom:1px solid #e0e0e0">';
