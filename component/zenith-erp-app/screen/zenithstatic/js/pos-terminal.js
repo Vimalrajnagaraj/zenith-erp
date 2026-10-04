@@ -2675,13 +2675,25 @@ window.posToggleFullscreen = function() {
             d.items.forEach(function(it, idx) {
                 h += '<tr style="border-bottom:1px solid #e0e0e0">';
                 h += '<td style="padding:3px 10px;text-align:center;font-size:13px;font-weight:700;color:#777;vertical-align:middle;width:30px">'+(idx+1)+'</td>';
-                var modeSel = '';
-                if (d.modes && d.modes.length > 1) {
-                    var mo = '';
-                    d.modes.forEach(function(m){ mo += '<option value="'+m.id+'"'+(it.mode===m.id?' selected':'')+'>'+m.name+(Number(m.disc)>0?(' −'+Number(m.disc)+'%'):'')+'</option>'; });
-                    modeSel = '<select class="aj-mode" data-seq="'+it.seq+'" title="Sale mode for this item" style="flex-shrink:0;font-size:11px;padding:3px 4px;border:1px solid #CBB8F0;border-radius:4px;color:#7C3AED;font-weight:700;max-width:120px;background:#f5f8ff;cursor:pointer">'+mo+'</select>';
+                // Mode chip in its own column, coloured by sale mode (Retail blue / Wholesale orange / Custom teal)
+                var modeCell = '-';
+                if (d.modes && d.modes.length) {
+                    var _cm = null; for (var _mi = 0; _mi < d.modes.length; _mi++) { if (d.modes[_mi].id === it.mode) { _cm = d.modes[_mi]; break; } }
+                    if (!_cm) _cm = d.modes[0];
+                    var _mn = _cm ? _cm.name : '';
+                    var _cbg = '#DBEAFE', _cfg = '#2563EB';
+                    if (/whole/i.test(_mn)) { _cbg = '#FFEDD5'; _cfg = '#EA580C'; }
+                    else if (/custom/i.test(_mn)) { _cbg = '#D5F0EC'; _cfg = '#0F766E'; }
+                    if (d.modes.length > 1) {
+                        var mo = '';
+                        d.modes.forEach(function(m){ mo += '<option value="'+m.id+'"'+(it.mode===m.id?' selected':'')+'>'+m.name+(Number(m.disc)>0?(' −'+Number(m.disc)+'%'):'')+'</option>'; });
+                        modeCell = '<select class="aj-mode" data-seq="'+it.seq+'" title="Sale mode for this item" style="font-size:12px;font-weight:600;padding:3px 6px;border:1px solid '+_cbg+';border-radius:6px;background:'+_cbg+';color:'+_cfg+';cursor:pointer;max-width:120px">'+mo+'</select>';
+                    } else {
+                        modeCell = '<span style="display:inline-block;font-size:12px;font-weight:600;padding:3px 8px;border-radius:6px;background:'+_cbg+';color:'+_cfg+'">'+_mn+'</span>';
+                    }
                 }
-                h += '<td style="padding:3px 10px"><div style="display:flex;align-items:center;gap:8px"><div style="font-size:14px;font-weight:600;color:#000;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+it.name+'</div>'+modeSel+'</div><div style="font-size:11px;color:#555">'+it.pid+'</div></td>';
+                h += '<td style="padding:3px 10px"><div style="font-size:14px;font-weight:600;color:#000;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+it.name+'</div><div style="font-size:11px;color:#555">'+it.pid+'</div></td>';
+                h += '<td style="padding:3px 8px;text-align:left;vertical-align:middle">'+modeCell+'</td>';
                 h += '<td style="padding:4px 4px;text-align:right;vertical-align:middle"><div style="display:flex;align-items:center;gap:3px;justify-content:flex-end">';
                 h += '<input type="text" inputmode="decimal" value="'+Number(it.price)+'" data-seq="'+it.seq+'" class="aj-p" style="width:65px;padding:8px 6px;border:1px solid #ccc;border-radius:6px;font-size:14px;text-align:right;background:#fff;color:#000;box-sizing:border-box"/>';
                 h += '<button data-seq="'+it.seq+'" class="aj-pb" style="width:32px;height:32px;border:none;background:#7C3AED;color:#fff;border-radius:6px;cursor:pointer;font-size:14px;display:flex;align-items:center;justify-content:center;padding:0;flex-shrink:0">&#10003;</button>';
@@ -2693,6 +2705,7 @@ window.posToggleFullscreen = function() {
                 if (it.uom) h += '<span style="font-size:11px;color:#e65100;font-weight:700;margin-left:5px;white-space:nowrap;flex-shrink:0">'+it.uom+'</span>';
                 h += '</div>';
                 h += '</td>';
+                h += '<td style="padding:3px 10px;text-align:right;font-size:14px;color:#6B7280;vertical-align:middle">'+Number(it.tax||0).toFixed(3)+'</td>';
                 h += '<td style="padding:3px 10px;text-align:right;font-size:15px;font-weight:700;color:#000;vertical-align:middle">'+fmt2(it.total)+'</td>';
                 h += '<td style="padding:4px 6px;text-align:center;vertical-align:middle"><button data-seq="'+it.seq+'" class="aj-rm" style="width:32px;height:32px;border:none;background:#e53935;color:#fff;border-radius:6px;cursor:pointer;font-size:16px;display:flex;align-items:center;justify-content:center;padding:0" title="Remove item">&#10005;</button></td>';
                 h += '</tr>';
