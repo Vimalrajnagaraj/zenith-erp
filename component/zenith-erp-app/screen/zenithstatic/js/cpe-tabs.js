@@ -5,6 +5,17 @@
    document so it survives the /qapps + /vapps SPA transclude (which strip inline <script>). */
 (function () {
   if (window.__cpeTabs) return; window.__cpeTabs = 1;
+  // Native page-size links retain pageIndex, which can put the new page beyond the last record.
+  // Reset only All Contacts page-size navigation; keep the framework's search/filter parameters.
+  document.addEventListener('click', function (e) {
+    var link = e.target.closest && e.target.closest('a[href]');
+    if (!link || !document.querySelector('.zac-page')) return;
+    var url = new URL(link.href, location.href);
+    if (url.pathname !== location.pathname || !url.searchParams.has('pageSize') ||
+        url.searchParams.get('pageSize') === (new URL(location.href).searchParams.get('pageSize') || '20')) return;
+    url.searchParams.set('pageIndex', '0');
+    e.preventDefault(); e.stopImmediatePropagation(); location.href = url.href;
+  }, true);
   document.addEventListener('click', function (e) {
     var tgt = e.target;
     // Persistent action-bar Save: proxy the click to the real (hidden) submit inside ContactDetailForm,
@@ -38,11 +49,11 @@
     // ZE-CUST-FINAL: "+ New Customer" dropdown (Customers list) — toggle the menu; a menu item proxies its click to
     // the real (hidden) create-dialog trigger, which opens the Bootstrap modal (/apps) or the q-dialog (/qapps).
     var ncTrig = tgt && tgt.closest ? tgt.closest('.cust-nc-trigger') : null;
-    if (ncTrig) { e.preventDefault(); var ncw = ncTrig.closest('.cust-newcust'); if (ncw) ncw.classList.toggle('open'); return; }
+    if (ncTrig) { e.preventDefault(); var ncw = ncTrig.closest('.cust-newcust'); if (ncw) { var ncExpanded = ncw.classList.toggle('open'); if (ncTrig.hasAttribute('aria-expanded')) ncTrig.setAttribute('aria-expanded', String(ncExpanded)); } return; }
     var ncItem = tgt && tgt.closest ? tgt.closest('.cust-nc-item, .cust-nc-solo') : null;
     if (ncItem) {
       e.preventDefault();
-      var ncw2 = ncItem.closest('.cust-newcust'); if (ncw2) ncw2.classList.remove('open');
+      var ncw2 = ncItem.closest('.cust-newcust'); if (ncw2) { ncw2.classList.remove('open'); var ncBtn = ncw2.querySelector('.cust-nc-trigger[aria-expanded]'); if (ncBtn) ncBtn.setAttribute('aria-expanded', 'false'); }
       // container-dialog IGNORES button-class on BOTH surfaces, so match the real trigger (/apps <button data-target>,
       // /qapps .q-btn) by its button text within the hidden .cust-nc-src wrapper, then click it to open the dialog.
       // data-nctext lets a single-action CTA (e.g. Add Group) name its trigger; dropdown items fall back to the class.
@@ -57,7 +68,7 @@
     }
     if (!(tgt && tgt.closest && tgt.closest('.cust-newcust'))) {
       var ncOpen = document.querySelectorAll('.cust-newcust.open');
-      for (var nk = 0; nk < ncOpen.length; nk++) ncOpen[nk].classList.remove('open');
+      for (var nk = 0; nk < ncOpen.length; nk++) { ncOpen[nk].classList.remove('open'); var ncClose = ncOpen[nk].querySelector('.cust-nc-trigger[aria-expanded]'); if (ncClose) ncClose.setAttribute('aria-expanded', 'false'); }
     }
     var btn = tgt && tgt.closest ? tgt.closest('.cpe-tab') : null;
     if (!btn) return;
@@ -138,7 +149,36 @@
       if (t.indexOf('Find Options') !== -1 && t.length < 40) c.classList.add('sup-fo-native');
     }
   }
-  function cgInit() { cgPlaceholders(); cgActiveToggle(); hideNativeFindOpts(); }
+  // All Contacts selection is presentation-only: select the visible page, never call a bulk write service.
+  function contactSelection() {
+    var page = document.querySelector('.zac-page'), head = page && page.querySelector('#ContactListForm_table .thead .tr .th, #ContactListForm_table thead tr:last-child th');
+    var size = page && page.querySelector('.zac-pagesize'), nav = page && page.querySelector('.form-list-nav');
+    if (size && nav && size.parentElement !== nav) nav.insertBefore(size, nav.querySelector('.pagination'));
+    if (!head || head.querySelector('.zac-select-all')) return;
+    var all = document.createElement('input');
+    all.type = 'checkbox'; all.className = 'zac-select-all'; all.setAttribute('aria-label', 'Select all contacts on this page');
+    head.appendChild(all);
+    // The framework always emits a summary row, even with no active filters. Hide only that empty row.
+    var summaries = page.querySelectorAll('#ContactListForm_table .thead > tr:not(.form-list-nav-row), #ContactListForm_table thead > tr:not(.form-list-nav-row)');
+    for (var si = 0; si < summaries.length; si++) {
+      if (!summaries[si].textContent.trim()) summaries[si].hidden = true;
+    }
+  }
+  document.addEventListener('change', function (e) {
+    if (e.target.matches('.zac-pagesize')) {
+      var url = new URL(location.href);
+      url.searchParams.set('pageSize', e.target.value); url.searchParams.set('pageIndex', '0');
+      location.href = url.href; return;
+    }
+    if (!e.target.matches('.zac-select, .zac-select-all')) return;
+    var page = e.target.closest('.zac-page'), rows = page.querySelectorAll('.zac-select'), all = page.querySelector('.zac-select-all'), checked = 0;
+    for (var i = 0; i < rows.length; i++) {
+      if (e.target === all) rows[i].checked = all.checked;
+      if (rows[i].checked) checked++;
+    }
+    if (all) { all.checked = rows.length > 0 && checked === rows.length; all.indeterminate = checked > 0 && checked < rows.length; }
+  });
+  function cgInit() { cgPlaceholders(); cgActiveToggle(); hideNativeFindOpts(); contactSelection(); }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', cgInit); else cgInit();
   // /qapps renders screens AFTER DOMContentLoaded (async SPA transclude), so a load-time call is too early — re-run
   // when the DOM settles (idempotent; guarded by data-cgtog and the existing-placeholder check).
