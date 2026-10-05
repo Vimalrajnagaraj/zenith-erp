@@ -295,6 +295,15 @@
 
     // ---- per-module sub-nav bar (below the header): current module's sections as horizontal tabs ----
     var subBar = null;
+    // Contacts can wrap the header; reserve its actual height without changing other modules.
+    function syncContactsHeader() {
+        if (!subBar || !subBar.matches('.show[data-mod="Contacts"]')) {
+            document.body.style.removeProperty('--zq-contacts-header-height');
+            return;
+        }
+        var header = document.querySelector('.q-header');
+        if (header) document.body.style.setProperty('--zq-contacts-header-height', (header.offsetHeight || 51) + 'px');
+    }
     function updateSubnav() {
         if (!subBar) return;
         var rel = location.pathname.replace(/^\/qapps\/zenith/, '') || '/';
@@ -312,12 +321,13 @@
                 subBar.appendChild(a);
             });
             subBar.classList.add('show'); document.body.classList.add('zq-has-subnav');
+            syncContactsHeader();
             return;
         }
         var key = null, klen = -1;
         for (var k in SUBNAV) { if (rel.indexOf(k) === 0 && k.length > klen) { key = k; klen = k.length; } }
         subBar.innerHTML = '';
-        if (!key) { subBar.classList.remove('show'); document.body.classList.remove('zq-has-subnav'); return; }
+        if (!key) { subBar.classList.remove('show'); document.body.classList.remove('zq-has-subnav'); syncContactsHeader(); return; }
         var arr = SUBNAV[key], mount = key.slice(1);
         subBar.setAttribute('data-mod', mount);  // ZE-CONTACTS-DS: lets CSS scope the active-tab pill to Contacts only
         // ZE-NAV-ALIAS: a detail/edit screen (menu-include=false, e.g. EditStockTransfer) shares no URL prefix with its
@@ -342,6 +352,7 @@
         }
         if (active) active.classList.add('on');
         subBar.classList.add('show'); document.body.classList.add('zq-has-subnav');
+        syncContactsHeader();
         if (active) { try { var r = active.getBoundingClientRect(), br = subBar.getBoundingClientRect(); subBar.scrollLeft += (r.left - br.left) - (subBar.clientWidth / 2) + (r.width / 2); } catch (_e) {} }
     }
 
@@ -360,6 +371,8 @@
         subBar.style.top = (header.offsetHeight || 51) + 'px';
         body.appendChild(subBar);
         updateSubnav();
+        if (window.ResizeObserver) new ResizeObserver(syncContactsHeader).observe(header);
+        else window.addEventListener('resize', syncContactsHeader);
         // collapse (persisted)
         try { if (localStorage.getItem('zqSideCollapsed') === '1') body.classList.add('zq-side-collapsed'); } catch (_e) {}
         var tgl = document.getElementById('zq-side-toggle');
