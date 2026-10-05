@@ -5,127 +5,305 @@
 
     <transition name="editTaxExemption"><default-response url="../EditTaxExemption"/></transition>
     <transition name="createTaxExemption">
-        <service-call name="zenith.tax.TaxServices.store#TaxExemption" in-map="context + [organizationPartyId:ec.user.getPreference('ACTIVE_ORGANIZATION')]"/>
-        <default-response url="../EditTaxExemption"/>
+        <actions>
+            <!-- the restyled modal submits ISO yyyy-MM-dd; parse explicitly so locale parsing can't mangle it -->
+            <script><![CDATA[
+                if (effectiveFrom) effectiveFrom = ec.l10n.parseDate(effectiveFrom.toString(), 'yyyy-MM-dd')
+                if (effectiveThru) effectiveThru = ec.l10n.parseDate(effectiveThru.toString(), 'yyyy-MM-dd')
+            ]]></script>
+            <service-call name="zenith.tax.TaxServices.store#TaxExemption" out-map="context" in-map="context + [organizationPartyId:ec.user.getPreference('ACTIVE_ORGANIZATION')]"/>
+        </actions>
+        <default-response url="../EditTaxExemption" parameter-map="[exemptionId:exemptionId]"/>
     </transition>
     <!-- ZE-TAX-004: delete routed through the org-guarded service (never the auto delete# keyed by PK). -->
     <transition name="deleteTaxExemption" begin-transaction="true">
         <service-call name="zenith.tax.TaxServices.delete#TaxExemption"/>
         <default-response url="."/>
     </transition>
+    <!-- Export the org's exemptions as CSV (read-only → allowed via a GET link). -->
+    <transition name="exportExemptions" read-only="true">
+        <actions><script><![CDATA[
+            def _org = ec.user.isInGroup('ADMIN') ? null : (ec.user.getPreference('ACTIVE_ORGANIZATION') ?: '_NA_')
+            def q = ec.entity.find("zenith.erp.tax.TaxExemption"); if (_org) q.condition("organizationPartyId", _org)
+            def rows = q.orderBy("-exemptionId").list()
+            def df = new java.text.SimpleDateFormat("yyyy-MM-dd")
+            def esc = { v -> def s = (v == null) ? '' : v.toString(); (s.contains(',') || s.contains('"') || s.contains("\n")) ? ('"' + s.replace('"','""') + '"') : s }
+            def sb = new StringBuilder("ID,Product,Party,Type,Authority,Rule No,From,To,Status\n")
+            rows.each { sb.append([esc(it.exemptionId), esc(it.productId), esc(it.partyId), esc(it.exemptionTypeEnumId), esc(it.taxAuthorityId), esc(it.exemptionNumber), esc(it.effectiveFrom != null ? df.format(it.effectiveFrom) : ''), esc(it.effectiveThru != null ? df.format(it.effectiveThru) : ''), esc(it.isActive == 'Y' ? 'Active' : 'Inactive')].join(',')).append("\n") }
+            ec.web.sendTextResponse(sb.toString(), "text/csv", "TaxExemptions.csv")
+        ]]></script></actions>
+        <default-response type="none"/>
+    </transition>
 
     <actions>
-        <!-- ZE-TAX-004: scope the list to the active org (was unfiltered → cross-tenant leak).
-             Super-admins (ADMIN, no active org) still see every tenant's exemptions. -->
+        <!-- ZE-TAX-004: scope the list to the active org. Super-admins (ADMIN, no active org) see all tenants'. -->
         <set field="_org" from="ec.user.isInGroup('ADMIN') ? null : (ec.user.getPreference('ACTIVE_ORGANIZATION') ?: '_NA_')"/>
         <entity-find entity-name="zenith.erp.tax.TaxExemption" list="taxExemptions">
             <search-form-inputs default-order-by="-exemptionId"/>
             <econdition field-name="organizationPartyId" from="_org" ignore-if-empty="true"/>
         </entity-find>
+
+        <script><![CDATA[
+            // Option lists for the New Tax Exemption modal (also reused to label the table)
+            def _uri = (ec.web?.request?.requestURI ?: ''); def _zi = _uri.indexOf('/zenith/'); appBase = _zi > 0 ? _uri.substring(0, _zi) : ''
+            def _o = ec.user.getPreference('ACTIVE_ORGANIZATION')
+            def _pf = ec.entity.find("mantle.party.PartyDetail"); if (_o) _pf.condition("ownerPartyId", _o)
+            parties = _pf.orderBy("organizationName,lastName,firstName").limit(1000).list().collect { p -> def nm = p.organizationName ?: ((((p.firstName ?: '') + ' ' + (p.lastName ?: '')).trim()) ?: p.partyId); [id: p.partyId, label: nm] }
+            def _prf = ec.entity.find("mantle.product.Product"); if (_o) _prf.condition("ownerPartyId", _o)
+            products = _prf.orderBy("pseudoId").limit(1000).list().collect { pr -> [id: pr.productId, label: ((pr.pseudoId ?: '') + ' - ' + (pr.productName ?: ''))] }
+            taxAuthorities = ec.entity.find("zenith.erp.tax.TaxAuthority").condition("isActive", "Y").orderBy("description").list().collect { a -> [id: a.taxAuthorityId, label: a.description ?: a.taxAuthorityId] }
+            exemptionTypes = ec.entity.find("moqui.basic.Enumeration").condition("enumTypeId", "TaxExemptionType").orderBy("sequenceNum").list().collect { e -> [id: e.enumId, label: e.description ?: e.enumId] }
+
+            // id → label maps for the table
+            def partyMap = [:]; parties.each { partyMap[it.id] = it.label }
+            def productMap = [:]; products.each { productMap[it.id] = it.label }
+            def authMap = [:]; taxAuthorities.each { authMap[it.id] = it.label }
+            def typeMap = [:]; exemptionTypes.each { typeMap[it.id] = it.label }
+
+            def rcTypes = ['TexReverseCharge'] as Set
+            def noGstTypes = ['TexFull','TexZeroRated','TexExport','TexSez'] as Set
+            def _pal = ['#F97316','#2563EB','#10B981','#7C3AED','#DC2626','#0EA5E9','#D97706']
+            def _init = { nm -> if (!nm) return '?'; def ps = nm.trim().split('\\s+'); def a = (ps[0] ? ps[0][0] : ''); def b = ((ps.size()>1 && ps[-1]) ? ps[-1][0] : ''); return (a + b).toUpperCase() }
+            def sdfP = new java.text.SimpleDateFormat("dd MMM yyyy")
+
+            exRows = (taxExemptions ?: []).collect { ex ->
+                def prodLabel = productMap[ex.productId]
+                if (!prodLabel && ex.productId) { try { def pr = ec.entity.find("mantle.product.Product").condition("productId", ex.productId).selectField("pseudoId").selectField("productName").one(); if (pr) prodLabel = ((pr.pseudoId ?: '') + ' - ' + (pr.productName ?: '')).trim() } catch (Exception e) {} }
+                if (!prodLabel) prodLabel = ex.productId
+                def ptyName = partyMap[ex.partyId]
+                if (!ptyName && ex.partyId) { try { def pt = ec.entity.find("mantle.party.PartyDetail").condition("partyId", ex.partyId).one(); if (pt) ptyName = (pt.organizationName ?: (((pt.firstName ?: '') + ' ' + (pt.lastName ?: '')).trim())) } catch (Exception e) {} }
+                if (!ptyName) ptyName = ex.partyId
+                def ptyRole = 'Customer'
+                try { def roles = ec.entity.find("mantle.party.PartyRole").condition("partyId", ex.partyId).selectField("roleTypeId").list()*.roleTypeId
+                    if (roles.contains('Vendor') || roles.contains('Supplier')) ptyRole = 'Vendor' } catch (Exception e) {}
+                def tcat = rcTypes.contains(ex.exemptionTypeEnumId) ? 'rc' : (noGstTypes.contains(ex.exemptionTypeEnumId) ? 'nogst' : 'other')
+                def typeLabel = (tcat == 'rc') ? 'Reverse Charge' : (typeMap[ex.exemptionTypeEnumId] ?: 'Exemption')
+                def typeDesc = (tcat == 'rc') ? 'Buyer pays the GST instead of seller' : ((tcat == 'nogst') ? 'No GST charged for selected items/parties' : 'Special provision / government order')
+                def h = Math.abs(((ptyName ?: '') as String).hashCode())
+                [ id: ex.exemptionId, prod: prodLabel,
+                  pty: ptyName, ptyRole: ptyRole, initials: _init(ptyName), avColor: _pal[h % _pal.size()],
+                  tcat: tcat, typeLabel: typeLabel, typeDesc: typeDesc,
+                  auth: (authMap[ex.taxAuthorityId] ?: (ex.taxAuthorityId ?: '—')),
+                  ruleNo: (ex.exemptionNumber ?: '—'),
+                  fromStr: (ex.effectiveFrom ? sdfP.format(ex.effectiveFrom) : '—'),
+                  toStr: (ex.effectiveThru ? sdfP.format(ex.effectiveThru) : '—'),
+                  active: (ex.isActive == 'Y'),
+                  since: (ex.effectiveFrom ? sdfP.format(ex.effectiveFrom) : '—') ]
+            }
+            exCount = exRows.size()
+
+            def actives = (taxExemptions ?: []).findAll { it.isActive == 'Y' }
+            statTotal = actives.size()
+            statNoGst = actives.findAll { noGstTypes.contains(it.exemptionTypeEnumId) }.size()
+            statRc = actives.findAll { rcTypes.contains(it.exemptionTypeEnumId) }.size()
+            def _now = ec.user.nowTimestamp; def _30 = new java.sql.Timestamp(_now.getTime() + 30L*24*3600*1000)
+            statExpiry = actives.findAll { it.effectiveThru != null && !it.effectiveThru.before(_now) && it.effectiveThru.before(_30) }.size()
+        ]]></script>
     </actions>
 
     <widgets>
-        <container style="row items-center justify-between q-mb-lg">
-            <label text="Tax Exemptions" type="h4" style="text-weight-bold q-my-none"/>
-            <section name="CreateTaxExemption_write"><condition><expression>modCanWrite</expression></condition><widgets>
-            <container-dialog id="CreateTaxExemption" button-text="New Tax Exemption" type="success">
-                <form-single name="CreateTaxExemptionForm" transition="createTaxExemption">
-                    <field name="partyId"><default-field title="Party">
-                        <drop-down allow-empty="true"><entity-options key="${partyId}" text="${organizationName ? organizationName : (firstName + ' ' + lastName)}">
-                            <entity-find entity-name="mantle.party.PartyDetail">
-                                <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
-                            </entity-find>
-                        </entity-options></drop-down></default-field></field>
-                    <field name="productId"><default-field title="Product">
-                        <drop-down allow-empty="true"><entity-options key="${productId}" text="${pseudoId} - ${productName}">
-                            <entity-find entity-name="mantle.product.Product">
-                                <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
-                                <order-by field-name="pseudoId"/>
-                            </entity-find>
-                        </entity-options></drop-down></default-field></field>
-                    <field name="taxAuthorityId"><default-field title="Tax Authority *">
-                        <drop-down allow-empty="true"><entity-options key="${taxAuthorityId}" text="${description}">
-                            <entity-find entity-name="zenith.erp.tax.TaxAuthority">
-                                <econdition field-name="isActive" value="Y"/>
-                                <order-by field-name="description"/>
-                            </entity-find>
-                        </entity-options></drop-down></default-field></field>
-                    <field name="exemptionTypeEnumId"><default-field title="Exemption Type *">
-                        <drop-down allow-empty="true"><entity-options key="${enumId}" text="${description}">
-                            <entity-find entity-name="moqui.basic.Enumeration">
-                                <econdition field-name="enumTypeId" value="TaxExemptionType"/>
-                                <order-by field-name="sequenceNum"/>
-                            </entity-find>
-                        </entity-options></drop-down></default-field></field>
-                    <field name="exemptionNumber"><default-field title="Exemption Number"><text-line size="20"/></default-field></field>
-                    <field name="effectiveFrom"><default-field title="Effective From"><date-time type="date"/></default-field></field>
-                    <field name="effectiveThru"><default-field title="Effective Thru"><date-time type="date"/></default-field></field>
-                    <field name="description"><default-field><text-area rows="2" cols="50"/></default-field></field>
-                    <field name="submitBtn"><default-field title="Create"><submit/></default-field></field>
-                </form-single>
-            </container-dialog>
-            </widgets></section>
-        </container>
+        <!-- ===== breadcrumb + header + stat cards + info banner + table (render-mode; inline styles render on
+             both /apps and /qapps; the only stripped-on-/qapps parts are <style>/<script> elements — the table
+             <script> has no bare '<' so it runs on both). ===== -->
+        <render-mode><text type="html,qvt" template="true"><![CDATA[
+            <div style="font-size:12.5px;color:var(--z-text-muted,#6B7280);margin-bottom:6px"><a href="${appBase}/zenith/tax/TaxDashboard" style="color:#7C3AED;text-decoration:none">Tax</a> &#8250; Tax Exemptions</div>
+            <div style="display:flex;flex-wrap:wrap;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:20px">
+                <div>
+                    <div style="font-size:24px;font-weight:700;line-height:1.2;color:var(--z-text-main,#111827)">Tax Exemptions</div>
+                    <div style="font-size:13px;margin-top:5px;color:var(--z-text-muted,#6B7280)">Manage exemptions for specific goods, services, or transactions.</div>
+                </div>
+                <div style="display:flex;align-items:center;gap:10px">
+                    <a href="#te-infocard" style="display:inline-flex;align-items:center;gap:7px;height:42px;padding:0 16px;border:1px solid var(--z-border,#E5E7EB);border-radius:8px;background:var(--z-bg-card,#fff);color:var(--z-text-main,#111827);font-size:13px;font-weight:600;text-decoration:none"><span class="material-icons" style="font-size:18px;color:#6B7280">help_outline</span>Learn More</a>
+                    <#if (modCanWrite!false)>
+                    <button type="button" onclick="var o=document.getElementById('te-overlay');if(o)o.style.display='flex'" style="display:inline-flex;align-items:center;gap:7px;height:42px;padding:0 18px;background:#7C3AED;color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer"><span class="material-icons" style="font-size:19px">add</span>Add New Exemption</button>
+                    </#if>
+                </div>
+            </div>
 
-        <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg">
-            <form-list name="TaxExemptionsForm" list="taxExemptions" skip-form="true" header-dialog="true"
-                       select-columns="true" saved-finds="true" show-csv-button="true" show-xlsx-button="true">
-                <field name="exemptionId"><header-field title="ID" show-order-by="true"/>
-                    <default-field title="ID">
-                        <link url="editTaxExemption" text="${exemptionId}" parameter-map="[exemptionId:exemptionId]"/>
-                    </default-field></field>
-                <field name="partyId"><header-field title="Party" show-order-by="true">
-                    <drop-down allow-empty="true"><entity-options key="${partyId}" text="${organizationName ? organizationName : (firstName + ' ' + lastName)}">
-                        <entity-find entity-name="mantle.party.PartyDetail">
-                            <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
-                        </entity-find>
-                    </entity-options></drop-down></header-field>
-                    <default-field title="Party">
-                        <display-entity entity-name="mantle.party.PartyDetail" key-field-name="partyId"
-                                        text="${organizationName ? organizationName : (firstName + ' ' + lastName)}"/>
-                    </default-field></field>
-                <field name="productId"><header-field title="Product" show-order-by="true"/>
-                    <default-field title="Product">
-                        <display-entity entity-name="mantle.product.Product" key-field-name="productId" text="${pseudoId} - ${productName}"/>
-                    </default-field></field>
-                <field name="taxAuthorityId"><header-field title="Authority" show-order-by="true">
-                    <drop-down allow-empty="true"><entity-options key="${taxAuthorityId}" text="${description}">
-                        <entity-find entity-name="zenith.erp.tax.TaxAuthority">
-                            <econdition field-name="isActive" value="Y"/>
-                        </entity-find>
-                    </entity-options></drop-down></header-field>
-                    <default-field title="Authority">
-                        <display-entity entity-name="zenith.erp.tax.TaxAuthority" key-field-name="taxAuthorityId" text="${description}"/>
-                    </default-field></field>
-                <field name="exemptionTypeEnumId"><header-field title="Type" show-order-by="true">
-                    <drop-down allow-empty="true"><entity-options key="${enumId}" text="${description}">
-                        <entity-find entity-name="moqui.basic.Enumeration">
-                            <econdition field-name="enumTypeId" value="TaxExemptionType"/>
-                        </entity-find>
-                    </entity-options></drop-down></header-field>
-                    <default-field title="Type">
-                        <display-entity entity-name="moqui.basic.Enumeration" key-field-name="enumId" text="${description}"/>
-                    </default-field></field>
-                <field name="exemptionNumber"><header-field show-order-by="true"><text-find size="15"/></header-field>
-                    <default-field title="Number"><display/></default-field></field>
-                <field name="effectiveFrom"><header-field show-order-by="true"/>
-                    <default-field title="From"><display format="dd-MMM-yyyy"/></default-field></field>
-                <field name="effectiveThru"><header-field show-order-by="true"/>
-                    <default-field title="Thru"><display format="dd-MMM-yyyy"/></default-field></field>
-                <field name="isActive"><header-field show-order-by="true">
-                    <drop-down allow-empty="true"><option key="Y" text="Active"/><option key="N" text="Inactive"/></drop-down>
-                </header-field>
-                    <default-field title="Active"><display/></default-field></field>
-                <field name="editBtn"><default-field title="Actions">
-                    <link url="editTaxExemption" text="Edit" parameter-map="[exemptionId:exemptionId]" style="text-primary" condition="modCanWrite"/>
-                </default-field></field>
-                <field name="deleteBtn"><default-field title="">
-                    <link url="deleteTaxExemption" text="Delete" parameter-map="[exemptionId:exemptionId]"
-                          confirmation="Delete this tax exemption? This cannot be undone." style="text-negative" condition="modCanWrite"/>
-                </default-field></field>
-                <!-- ZE-PRC-004 sweep: Find submit button so the header-dialog filters can be applied (was a dead dialog). -->
-                <field name="submitButton"><header-field title="Find"><submit/></header-field></field>
-            </form-list>
-        </container>
+            <#assign stats = [
+                {"lbl":"Total Exemptions","val":"${statTotal!0}","sub":"Active Exemptions","subcol":"#0E9F6E","ico":"local_offer","bg":"rgba(16,185,129,.14)","fg":"#0E9F6E"},
+                {"lbl":"Exemptions (No GST)","val":"${statNoGst!0}","sub":"Exemptions","subcol":"#6B7280","ico":"verified_user","bg":"#DBEAFE","fg":"#2563EB"},
+                {"lbl":"Reverse Charge","val":"${statRc!0}","sub":"Active Exemptions","subcol":"#6B7280","ico":"swap_horiz","bg":"rgba(217,119,6,.14)","fg":"#B45309"},
+                {"lbl":"Upcoming Expiry","val":"${statExpiry!0}","sub":"Next 30 Days","subcol":"#6B7280","ico":"event","bg":"rgba(124,58,237,.12)","fg":"#7C3AED"}]/>
+            <div style="display:flex;flex-wrap:wrap;gap:16px;margin-bottom:20px">
+                <#list stats as c>
+                <div style="flex:1 1 210px;min-width:200px;background:var(--z-bg-card,#fff);border:1px solid var(--z-border,#E5E7EB);border-radius:12px;padding:18px 20px;box-shadow:0 1px 2px rgba(0,0,0,.04);display:flex;align-items:center;gap:16px">
+                    <div style="width:48px;height:48px;flex:0 0 auto;border-radius:50%;display:flex;align-items:center;justify-content:center;background:${c.bg}"><span class="material-icons" style="font-size:24px;color:${c.fg}">${c.ico}</span></div>
+                    <div style="min-width:0">
+                        <div style="font-size:12.5px;color:var(--z-text-muted,#6B7280)">${c.lbl}</div>
+                        <div style="font-size:28px;font-weight:700;line-height:1.15;color:var(--z-text-main,#111827)">${c.val}</div>
+                        <div style="font-size:12px;font-weight:600;color:${c.subcol}">${c.sub}</div>
+                    </div>
+                </div>
+                </#list>
+            </div>
+
+            <div id="te-infocard" style="background:var(--z-bg-card,#fff);border:1px solid var(--z-border,#E5E7EB);border-radius:12px;padding:20px 22px;margin-bottom:20px">
+                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
+                    <div style="display:flex;align-items:center;gap:10px"><span style="width:30px;height:30px;border-radius:50%;background:rgba(124,58,237,.12);display:inline-flex;align-items:center;justify-content:center"><span class="material-icons" style="font-size:18px;color:#7C3AED">lightbulb</span></span><span style="font-size:14px;font-weight:700;color:var(--z-text-main,#111827)">Understand Exemption Types</span></div>
+                    <a href="${appBase}/zenith/tax/GstReturns" style="font-size:12.5px;font-weight:600;color:#7C3AED;text-decoration:none">Know more &#8594;</a>
+                </div>
+                <div style="display:flex;flex-wrap:wrap;gap:20px">
+                    <div style="flex:1 1 260px;min-width:240px;display:flex;gap:12px"><span style="width:40px;height:40px;flex:0 0 auto;border-radius:10px;background:rgba(16,185,129,.14);display:inline-flex;align-items:center;justify-content:center"><span class="material-icons" style="font-size:20px;color:#0E9F6E">sell</span></span><div><div style="font-size:13px;font-weight:600;color:var(--z-text-main,#111827)">Exemption (No GST)</div><div style="font-size:12px;color:var(--z-text-muted,#6B7280);margin-top:2px">No GST will be charged for the selected items/parties.</div></div></div>
+                    <div style="flex:1 1 260px;min-width:240px;display:flex;gap:12px"><span style="width:40px;height:40px;flex:0 0 auto;border-radius:10px;background:rgba(217,119,6,.14);display:inline-flex;align-items:center;justify-content:center"><span class="material-icons" style="font-size:20px;color:#B45309">swap_horiz</span></span><div><div style="font-size:13px;font-weight:600;color:var(--z-text-main,#111827)">Reverse Charge</div><div style="font-size:12px;color:var(--z-text-muted,#6B7280);margin-top:2px">Buyer will pay the GST instead of seller (as per GST rules).</div></div></div>
+                    <div style="flex:1 1 260px;min-width:240px;display:flex;gap:12px"><span style="width:40px;height:40px;flex:0 0 auto;border-radius:10px;background:#DBEAFE;display:inline-flex;align-items:center;justify-content:center"><span class="material-icons" style="font-size:20px;color:#2563EB">percent</span></span><div><div style="font-size:13px;font-weight:600;color:var(--z-text-main,#111827)">Other Exemptions</div><div style="font-size:12px;color:var(--z-text-muted,#6B7280);margin-top:2px">Exemptions under special provisions, notifications, or government orders.</div></div></div>
+                </div>
+            </div>
+
+            <div style="background:var(--z-bg-card,#fff);border:1px solid var(--z-border,#E5E7EB);border-radius:12px;padding:18px 20px">
+                <div style="display:flex;flex-wrap:wrap;align-items:center;gap:12px;margin-bottom:16px">
+                    <div style="font-size:15px;font-weight:600;color:var(--z-text-main,#111827)">Your Tax Exemptions</div>
+                    <div style="position:relative;flex:1 1 300px;max-width:420px"><span class="material-icons" style="position:absolute;left:11px;top:50%;transform:translateY(-50%);font-size:18px;color:#9CA3AF">search</span><input id="te-search" type="text" placeholder="Search by product, party or type..." style="width:100%;box-sizing:border-box;height:38px;padding:0 12px 0 37px;border:1px solid var(--z-border,#E5E7EB);border-radius:8px;font-size:13px;background:var(--z-bg-card,#fff);color:var(--z-text-main,#111827);outline:none"/></div>
+                    <div style="display:flex;gap:10px;margin-left:auto">
+                        <button type="button" class="zte-btn"><span class="material-icons" style="font-size:17px;color:#6B7280">filter_list</span>Filters</button>
+                        <a href="${appBase}/zenith/tax/FindTaxExemption/exportExemptions" class="zte-btn"><span class="material-icons" style="font-size:17px;color:#6B7280">file_download</span>Export</a>
+                    </div>
+                </div>
+                <div style="overflow-x:auto">
+                <table style="width:100%;border-collapse:collapse;font-size:13px">
+                    <thead><tr style="text-align:left;color:var(--z-text-muted,#6B7280);font-size:12px;font-weight:600;border-bottom:1px solid var(--z-border,#E5E7EB)">
+                        <th style="padding:10px 12px">Product / Service</th><th style="padding:10px 12px">Party (Customer/Vendor)</th><th style="padding:10px 12px">Exemption Type</th><th style="padding:10px 12px">Exemption Details</th><th style="padding:10px 12px">Valid Period</th><th style="padding:10px 12px">Status</th><th style="padding:10px 12px">Actions</th>
+                    </tr></thead>
+                    <tbody>
+                    <#assign tcoMap = {"rc":{"bg":"rgba(217,119,6,.14)","fg":"#B45309","ico":"swap_horiz"},"nogst":{"bg":"rgba(16,185,129,.14)","fg":"#0E9F6E","ico":"sell"},"other":{"bg":"#DBEAFE","fg":"#2563EB","ico":"percent"}}/>
+                    <#list (exRows![]) as r>
+                        <#assign tco = (tcoMap[r.tcat])!(tcoMap["other"])/>
+                        <tr class="te-trow" style="border-bottom:1px solid var(--z-border,#EEF0F4);vertical-align:top">
+                            <td style="padding:14px 12px">
+                                <div style="display:flex;align-items:center;gap:10px"><span style="width:36px;height:36px;flex:0 0 auto;border-radius:8px;background:rgba(124,58,237,.12);display:inline-flex;align-items:center;justify-content:center"><span class="material-icons" style="font-size:19px;color:#7C3AED">inventory_2</span></span><div><div style="font-weight:600;color:var(--z-text-main,#111827)">${(r.prod)!'&mdash;'}</div><#if r.prod??><span style="display:inline-block;margin-top:3px;padding:1px 8px;border-radius:6px;background:rgba(124,58,237,.12);color:#7C3AED;font-size:11px;font-weight:600">Product</span></#if></div></div>
+                            </td>
+                            <td style="padding:14px 12px">
+                                <#if r.pty??><div style="display:flex;align-items:center;gap:10px"><span style="width:34px;height:34px;flex:0 0 auto;border-radius:50%;background:${r.avColor};color:#fff;display:inline-flex;align-items:center;justify-content:center;font-size:12px;font-weight:700">${r.initials}</span><div><div style="font-weight:600;color:var(--z-text-main,#111827)">${r.pty?html}</div><span style="display:inline-block;margin-top:3px;padding:1px 8px;border-radius:6px;background:#DBEAFE;color:#2563EB;font-size:11px;font-weight:600">${r.ptyRole}</span></div></div><#else><span style="color:#9CA3AF">&mdash;</span></#if>
+                            </td>
+                            <td style="padding:14px 12px">
+                                <span style="display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:7px;background:${tco.bg};color:${tco.fg};font-size:11.5px;font-weight:600"><span class="material-icons" style="font-size:15px">${tco.ico}</span>${r.typeLabel?html}</span>
+                                <div style="font-size:12px;color:var(--z-text-muted,#6B7280);margin-top:6px;max-width:200px">${r.typeDesc}</div>
+                            </td>
+                            <td style="padding:14px 12px">
+                                <div style="font-size:11px;color:var(--z-text-muted,#9CA3AF)">Authority</div><div style="color:var(--z-text-main,#111827)">${r.auth?html}</div>
+                                <div style="font-size:11px;color:var(--z-text-muted,#9CA3AF);margin-top:6px">Rule No.</div><div style="color:var(--z-text-main,#111827)">${r.ruleNo?html}</div>
+                            </td>
+                            <td style="padding:14px 12px">
+                                <div style="font-size:11px;color:var(--z-text-muted,#9CA3AF)">From</div><div style="color:var(--z-text-main,#111827)">${r.fromStr}</div>
+                                <div style="font-size:11px;color:var(--z-text-muted,#9CA3AF);margin-top:6px">To</div><div style="color:var(--z-text-main,#111827)">${r.toStr}</div>
+                            </td>
+                            <td style="padding:14px 12px">
+                                <#if r.active><span style="display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:99px;background:rgba(16,185,129,.14);color:#0E9F6E;font-size:11.5px;font-weight:600"><span style="width:7px;height:7px;border-radius:50%;background:#0E9F6E"></span>Active</span><#else><span style="display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:99px;background:#F3F4F6;color:#6B7280;font-size:11.5px;font-weight:600"><span style="width:7px;height:7px;border-radius:50%;background:#9CA3AF"></span>Inactive</span></#if>
+                                <div style="font-size:11px;color:var(--z-text-muted,#9CA3AF);margin-top:6px">Since ${r.since}</div>
+                            </td>
+                            <td style="padding:14px 12px">
+                                <#if (modCanWrite!false)>
+                                <div style="display:flex;flex-direction:column;gap:7px">
+                                    <a href="${appBase}/zenith/tax/FindTaxExemption/editTaxExemption?exemptionId=${r.id?url('UTF-8')}" style="display:inline-flex;align-items:center;gap:6px;padding:5px 12px;border:1px solid #7C3AED;border-radius:7px;color:#7C3AED;font-size:12px;font-weight:600;text-decoration:none"><span class="material-icons" style="font-size:15px">edit</span>Edit</a>
+                                    <button type="button" class="te-del" data-id="${r.id?html}" style="display:inline-flex;align-items:center;gap:6px;padding:5px 12px;border:1px solid #DC2626;border-radius:7px;background:var(--z-bg-card,#fff);color:#DC2626;font-size:12px;font-weight:600;cursor:pointer"><span class="material-icons" style="font-size:15px">delete</span>Delete</button>
+                                </div>
+                                <#else><span style="color:#9CA3AF;font-size:12px">&mdash;</span></#if>
+                            </td>
+                        </tr>
+                    <#else>
+                        <tr><td colspan="7" style="padding:36px 12px;text-align:center;color:#9CA3AF">No tax exemptions yet. Click &ldquo;Add New Exemption&rdquo; to create one.</td></tr>
+                    </#list>
+                    </tbody>
+                </table>
+                </div>
+                <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding-top:14px;margin-top:6px;border-top:1px solid var(--z-border,#EEF0F4)">
+                    <div id="te-count" style="font-size:12px;color:var(--z-text-muted,#6B7280)">Showing ${exCount!0} of ${exCount!0} rule<#if (exCount!0) != 1>s</#if></div>
+                    <div style="display:flex;align-items:center;gap:7px">
+                        <span style="display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;border:1px solid var(--z-border,#E5E7EB);border-radius:8px;color:#9CA3AF"><span class="material-icons" style="font-size:18px">chevron_left</span></span>
+                        <span style="min-width:32px;height:32px;padding:0 9px;border:1px solid #7C3AED;border-radius:8px;background:rgba(124,58,237,.10);color:#7C3AED;font-weight:600;font-size:12.5px;display:inline-flex;align-items:center;justify-content:center">1</span>
+                        <span style="display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;border:1px solid var(--z-border,#E5E7EB);border-radius:8px;color:#9CA3AF"><span class="material-icons" style="font-size:18px">chevron_right</span></span>
+                        <span style="display:inline-flex;align-items:center;gap:6px;height:32px;padding:0 10px;border:1px solid var(--z-border,#E5E7EB);border-radius:8px;color:var(--z-text-main,#111827);font-size:12.5px">10 / page <span class="material-icons" style="font-size:17px;color:#9CA3AF">expand_more</span></span>
+                    </div>
+                </div>
+            </div>
+            <script>
+            (function(){
+                var APPBASE='${appBase!""}';
+                var si=document.getElementById('te-search');
+                if(si && !si.__w){ si.__w=1; si.addEventListener('input', function(){ var q=(si.value||'').toLowerCase().trim(); var shown=0; var total=0;
+                    Array.prototype.forEach.call(document.querySelectorAll('tr.te-trow'), function(row){ total++; var hit=(!q || (row.textContent||'').toLowerCase().indexOf(q)>=0); row.style.display=hit?'':'none'; if(hit)shown++; });
+                    var cc=document.getElementById('te-count'); if(cc){ cc.textContent='Showing '+shown+' of '+total+' rule'+(total!=1?'s':''); } }); }
+                if(!document.__teDel){ document.__teDel=1; document.addEventListener('click', function(ev){ var b=ev.target.closest?ev.target.closest('.te-del'):null; if(!b)return;
+                    var id=b.getAttribute('data-id'); if(!window.confirm('Delete this tax exemption? This cannot be undone.'))return;
+                    var tok=''; try{ tok=window.moqui.webrootVue.moquiSessionToken; }catch(e){}
+                    b.disabled=true;
+                    fetch(APPBASE+'/zenith/tax/FindTaxExemption/deleteTaxExemption',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({exemptionId:id,moquiSessionToken:tok}),credentials:'same-origin'})
+                        .then(function(){ location.reload(); }).catch(function(){ b.disabled=false; alert('Delete failed — please try again.'); }); }); }
+            })();
+            </script>
+        ]]></text></render-mode>
+
+        <!-- New Tax Exemption modal (custom; posts to the byte-identical createTaxExemption transition). -->
+        <section name="NewTaxExemptionModal"><condition><expression>modCanWrite</expression></condition><widgets>
+        <render-mode><text type="html,qvt" template="true"><![CDATA[
+        <#assign teRow="display:flex;align-items:center;gap:18px;margin-bottom:16px">
+        <#assign teLbl="width:170px;flex:0 0 auto;text-align:right;font-size:14px;font-weight:500;color:#111827">
+        <#assign teSelWhite="width:100%;box-sizing:border-box;height:48px;padding:0 52px 0 16px;border:1px solid #E5E7EB;border-radius:8px;font-size:14px;outline:none;background:#fff">
+        <#assign teSelLav="width:100%;box-sizing:border-box;height:48px;padding:0 52px 0 16px;border:1px solid transparent;border-radius:8px;font-size:14px;outline:none;background:#F5F3FF">
+        <#assign teInp="flex:1;min-width:0;height:48px;box-sizing:border-box;padding:0 16px;border:1px solid #E5E7EB;border-radius:8px;font-size:14px;color:#111827;background:#fff;outline:none">
+        <#assign teClr="position:absolute;right:34px;top:50%;transform:translateY(-50%);width:20px;height:20px;border-radius:50%;background:#9CA3AF;color:#fff;display:none;align-items:center;justify-content:center;font-size:15px;line-height:1;cursor:pointer;z-index:2">
+        <#assign teDwrap="position:relative;flex:0 0 340px">
+        <#assign teDico="position:absolute;left:14px;top:50%;transform:translateY(-50%);font-size:18px;color:#6B7280;pointer-events:none;z-index:1">
+        <#assign teDtxt="width:100%;box-sizing:border-box;height:48px;padding:0 16px 0 44px;border:1px solid #E5E7EB;border-radius:8px;font-size:14px;color:#111827;background:#fff;pointer-events:none">
+        <#assign teDnat="position:absolute;top:0;left:0;width:100%;height:100%;opacity:0;cursor:pointer;z-index:2">
+        <div id="te-overlay" style="display:none;position:fixed;inset:0;background:rgba(17,24,39,.45);z-index:12000;align-items:flex-start;justify-content:center;padding:36px 16px;overflow-y:auto;font-family:'Segoe UI',Arial,sans-serif">
+            <div style="background:#fff;border-radius:12px;box-shadow:0 20px 40px rgba(17,24,39,.25);width:100%;max-width:880px;max-height:92vh;overflow-y:auto">
+                <div style="display:flex;align-items:center;justify-content:space-between;padding:22px 28px;border-bottom:1px solid #E5E7EB">
+                    <div style="font-size:22px;font-weight:700;color:#111827">New Tax Exemption</div>
+                    <button type="button" onclick="document.getElementById('te-overlay').style.display='none'" title="Close" style="width:34px;height:34px;border:none;background:transparent;color:#6B7280;cursor:pointer;border-radius:8px;display:flex;align-items:center;justify-content:center"><span class="material-icons">close</span></button>
+                </div>
+                <div style="padding:28px 28px 20px">
+                    <div style="${teRow}"><label style="${teLbl}">Party <span style="color:#DC2626">*</span></label>
+                        <div style="position:relative;flex:1;min-width:0"><select id="te-party" style="${teSelWhite}"><option value="">Select party</option><#list (parties![]) as p><option value="${(p.id)?html}">${(p.label)?html}</option></#list></select><span class="te-clear" data-for="te-party" style="${teClr}">&times;</span></div></div>
+                    <div style="${teRow}"><label style="${teLbl}">Product</label>
+                        <div style="position:relative;flex:1;min-width:0"><select id="te-product" style="${teSelLav}"><option value="">Select product</option><#list (products![]) as p><option value="${(p.id)?html}">${(p.label)?html}</option></#list></select><span class="te-clear" data-for="te-product" style="${teClr}">&times;</span></div></div>
+                    <div style="${teRow}"><label style="${teLbl}">Tax Authority <span style="color:#DC2626">*</span></label>
+                        <div style="position:relative;flex:1;min-width:0"><select id="te-auth" style="${teSelLav}"><option value="">Select tax authority</option><#list (taxAuthorities![]) as a><option value="${(a.id)?html}">${(a.label)?html}</option></#list></select><span class="te-clear" data-for="te-auth" style="${teClr}">&times;</span></div></div>
+                    <div style="${teRow}"><label style="${teLbl}">Exemption Type <span style="color:#DC2626">*</span></label>
+                        <div style="position:relative;flex:1;min-width:0"><select id="te-type" style="${teSelLav}"><option value="">Select exemption type</option><#list (exemptionTypes![]) as e><option value="${(e.id)?html}">${(e.label)?html}</option></#list></select><span class="te-clear" data-for="te-type" style="${teClr}">&times;</span></div></div>
+                    <div style="${teRow}"><label style="${teLbl}">Exemption Number</label>
+                        <input id="te-number" type="text" placeholder="Enter exemption number" style="${teInp}"/></div>
+                    <div style="${teRow}"><label style="${teLbl}">Effective From <span style="color:#DC2626">*</span></label>
+                        <div style="${teDwrap}"><span class="material-icons" style="${teDico}">event</span><input id="te-efffrom-disp" type="text" readonly placeholder="DD - MM - YYYY" style="${teDtxt}"/><input id="te-efffrom" type="date" onclick="if(this.showPicker){try{this.showPicker();}catch(e){}}" style="${teDnat}"/></div></div>
+                    <div style="${teRow}"><label style="${teLbl}">Effective Thru <span style="color:#DC2626">*</span></label>
+                        <div style="${teDwrap}"><span class="material-icons" style="${teDico}">event</span><input id="te-effthru-disp" type="text" readonly placeholder="DD - MM - YYYY" style="${teDtxt}"/><input id="te-effthru" type="date" onclick="if(this.showPicker){try{this.showPicker();}catch(e){}}" style="${teDnat}"/></div></div>
+                    <div style="display:flex;align-items:flex-start;gap:18px;margin-bottom:20px"><label style="${teLbl};padding-top:10px">Description</label>
+                        <textarea id="te-desc" rows="3" placeholder="Enter description (optional)" style="flex:1;min-width:0;box-sizing:border-box;padding:12px 16px;border:1px solid #E5E7EB;border-radius:8px;font-size:14px;color:#111827;background:#fff;resize:vertical;outline:none"></textarea></div>
+                    <div style="display:flex;align-items:center;gap:14px">
+                        <button type="button" id="te-create" style="display:inline-flex;align-items:center;gap:8px;height:48px;padding:0 24px;background:#7C3AED;color:#fff;border:none;border-radius:8px;font-size:15px;font-weight:600;cursor:pointer"><span class="material-icons" style="font-size:20px">add_circle</span>Create</button>
+                        <span id="te-result" style="font-size:13px"></span>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <script>
+        (function(){
+            var APPBASE='${(appBase!'')}';
+            function setColor(s){ s.style.color = s.value ? '#111827' : '#9CA3AF'; }
+            function fmtDisp(iso){ if(!iso) return ''; var p=iso.split('-'); return (p.length===3) ? (p[2]+' - '+p[1]+' - '+p[0]) : iso; }
+            ['te-efffrom','te-effthru'].forEach(function(id){ var h=document.getElementById(id), d=document.getElementById(id+'-disp'); if(h && d){ h.addEventListener('change', function(){ d.value=fmtDisp(h.value); }); } });
+            function toggleClear(sel){ var c=document.querySelector('.te-clear[data-for="'+sel.id+'"]'); if(c) c.style.display = sel.value ? 'flex' : 'none'; }
+            Array.prototype.forEach.call(document.querySelectorAll('select[id^="te-"]'), function(s){ setColor(s); toggleClear(s); s.addEventListener('change', function(){ setColor(s); toggleClear(s); }); });
+            document.addEventListener('click', function(ev){ var c=ev.target.closest ? ev.target.closest('.te-clear') : null; if(!c) return; var sel=document.getElementById(c.getAttribute('data-for')); if(sel){ sel.value=''; setColor(sel); toggleClear(sel); } });
+            var btn=document.getElementById('te-create');
+            if(btn && !btn.__w){ btn.__w=1; btn.addEventListener('click', function(){
+                var g=function(id){ var e=document.getElementById(id); return e ? (e.value||'').trim() : ''; };
+                var party=g('te-party'), prod=g('te-product'), auth=g('te-auth'), type=g('te-type');
+                if(!auth){ alert('Tax Authority is required.'); return; }
+                if(!type){ alert('Exemption Type is required.'); return; }
+                if(!party && !prod){ alert('Select a Party or a Product.'); return; }
+                var tok=''; try{ tok=window.moqui.webrootVue.moquiSessionToken; }catch(e){}
+                btn.disabled=true; var ot=btn.innerHTML; btn.textContent='Creating...';
+                var body=new URLSearchParams({ partyId:party, productId:prod, taxAuthorityId:auth, exemptionTypeEnumId:type,
+                    exemptionNumber:g('te-number'), effectiveFrom:g('te-efffrom'), effectiveThru:g('te-effthru'),
+                    description:g('te-desc'), moquiSessionToken:tok });
+                fetch(APPBASE+'/zenith/tax/FindTaxExemption/createTaxExemption',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body,credentials:'same-origin'})
+                    .then(function(r){ var u=r.url||''; if(u.indexOf('EditTaxExemption')>=0 && u.indexOf('exemptionId')>=0){ location.href=u; } else { location.reload(); } })
+                    .catch(function(){ btn.disabled=false; btn.innerHTML=ot; var rr=document.getElementById('te-result'); if(rr){ rr.textContent='Create failed — please try again.'; rr.style.color='#DC2626'; } });
+            }); }
+        })();
+        </script>
+        ]]></text></render-mode>
+        </widgets></section>
     </widgets>
 </screen>

@@ -8,9 +8,26 @@
         <default-response url="."/>
     </transition>
     <transition name="updateTableStatus">
+        <!-- Direct entity-update: the auto update# service's checkStatus blocks every change
+             because RestaurantTable has no StatusFlowTransition rows. Table statuses are freely
+             interchangeable (Available/Occupied/Reserved/Cleaning), so set it directly. -->
         <actions>
-            <service-call name="update#zenith.erp.pos.RestaurantTable"
-                          in-map="[tableId:tableId, statusId:statusId]"/>
+            <entity-find-one entity-name="zenith.erp.pos.RestaurantTable" value-field="tbl"/>
+            <if condition="tbl != null &amp;&amp; statusId">
+                <set field="tbl.statusId" from="statusId"/>
+                <entity-update value-field="tbl"/>
+            </if>
+        </actions>
+        <default-response url="."/>
+    </transition>
+    <transition name="closeTable">
+        <actions>
+            <entity-find-one entity-name="zenith.erp.pos.RestaurantTable" value-field="tbl"/>
+            <if condition="tbl != null">
+                <set field="tbl.statusId" value="TblAvailable"/>
+                <set field="tbl.currentTransactionId" from="null"/>
+                <entity-update value-field="tbl"/>
+            </if>
         </actions>
         <default-response url="."/>
     </transition>
@@ -25,186 +42,345 @@
     <actions>
         <entity-find entity-name="zenith.erp.pos.RestaurantTable" list="tables">
             <order-by field-name="sectionName,tableNumber"/>
+            <order-by field-name="-lastUpdatedStamp"/>
+        </entity-find>
+        <entity-find entity-name="mantle.facility.Facility" list="facilities">
+            <order-by field-name="facilityName"/>
         </entity-find>
 
         <script><![CDATA[
             totalTables = tables.size()
             availableCount = tables.count { it.statusId == 'TblAvailable' || !it.statusId }
-            occupiedCount = tables.count { it.statusId == 'TblOccupied' }
-            reservedCount = tables.count { it.statusId == 'TblReserved' }
-            cleaningCount = tables.count { it.statusId == 'TblCleaning' }
+            occupiedCount  = tables.count { it.statusId == 'TblOccupied' }
+            reservedCount  = tables.count { it.statusId == 'TblReserved' }
+            cleaningCount  = tables.count { it.statusId == 'TblCleaning' }
 
-            sections = tables.collect { it.sectionName ?: 'Main' }.unique().sort()
-            tablesBySection = [:]
-            sections.each { sec ->
-                tablesBySection[sec] = tables.findAll { (it.sectionName ?: 'Main') == sec }
+            // Indian-grouped rupee formatter (café bills can reach lakhs)
+            def inr = { amt ->
+                def n = (amt ?: 0) as BigDecimal
+                def neg = n < 0
+                n = n.abs().setScale(0, java.math.RoundingMode.HALF_UP)
+                def s = n.toBigInteger().toString()
+                def res
+                if (s.length() <= 3) { res = s }
+                else {
+                    def last3 = s.substring(s.length() - 3)
+                    def rest = s.substring(0, s.length() - 3)
+                    def sb = new StringBuilder()
+                    while (rest.length() > 2) {
+                        sb.insert(0, ',' + rest.substring(rest.length() - 2))
+                        rest = rest.substring(0, rest.length() - 2)
+                    }
+                    sb.insert(0, rest)
+                    res = sb.toString() + ',' + last3
+                }
+                return (neg ? '-' : '') + '₹' + res
+            }
+
+            now = System.currentTimeMillis()
+            tmCard = [:]     // tableId -> [key, label, circle, meta]
+            tmOrder = [:]    // tableId -> [orderNum, time, items, subtotal, tax, total, step]
+
+            tables.each { t ->
+                def sid = t.statusId ?: 'TblAvailable'
+                def skey = 'available', slabel = 'Available'
+                if (sid == 'TblOccupied')      { skey = 'occupied'; slabel = 'Occupied' }
+                else if (sid == 'TblReserved') { skey = 'reserved'; slabel = 'Reserved' }
+                else if (sid == 'TblCleaning') { skey = 'cleaning'; slabel = 'Cleaning' }
+
+                def seats = ((t.seatingCapacity ?: 4) as Integer)
+                def circle = seats <= 2
+
+                def ord = null
+                def metaStr = ''
+                if (t.currentTransactionId) {
+                    def txn = ec.entity.find('zenith.erp.pos.PosTransaction')
+                                .condition('transactionId', t.currentTransactionId).one()
+                    if (txn) {
+                        def items = ec.entity.find('zenith.erp.pos.PosTransactionItem')
+                                      .condition('transactionId', t.currentTransactionId)
+                                      .orderBy('itemSeqId').list()
+                        def mins = txn.entryDate ? (long)((now - txn.entryDate.time) / 60000L) : null
+                        def kots = ec.entity.find('zenith.erp.pos.KitchenOrderTicket')
+                                     .condition('transactionId', t.currentTransactionId)
+                                     .orderBy('-kotDate').list()
+                        def ks = kots ? kots[0].statusId : null
+                        def step = 2
+                        if (ks == 'KotReady' || ks == 'KotServed') step = 3
+                        if (txn.statusId == 'PtCompleted') step = 4
+
+                        ord = [
+                            orderNum : (txn.transactionNumber ?: txn.transactionId),
+                            time     : (txn.entryDate ? ec.l10n.format(txn.entryDate, 'hh:mm a') : ''),
+                            items    : items.collect { [
+                                            q    : (it.quantity != null ? (it.quantity as BigDecimal).stripTrailingZeros().toPlainString() : '1'),
+                                            name : (it.productName ?: 'Item'),
+                                            amt  : inr(it.lineTotal)
+                                        ] },
+                            subtotal : inr(txn.subtotal),
+                            tax      : inr(txn.totalTaxAmount),
+                            total    : inr(txn.grandTotal),
+                            step     : step
+                        ]
+                        def parts = []
+                        if (mins != null) parts.add(mins + ' min')
+                        if (txn.grandTotal) parts.add(inr(txn.grandTotal))
+                        metaStr = parts.join(' · ')
+                    }
+                }
+                if (!metaStr) { metaStr = (t.tableName ?: (t.sectionName ?: '')) }
+
+                tmCard[t.tableId] = [key: skey, label: slabel, circle: circle, meta: metaStr]
+                if (ord) tmOrder[t.tableId] = ord
             }
         ]]></script>
     </actions>
 
     <widgets>
-        <container style="q-pa-md">
-            <container style="row items-center justify-end q-mb-sm q-gutter-sm">
-                <link url="goTerminal" text="Billing" icon="fa fa-calculator" btn-type="success" style="q-btn--dense"/>
-                <link url="goTransactions" text="Transactions" icon="fa fa-list" btn-type="primary" style="q-btn--dense"/>
-                <link url="goDashboard" text="Dashboard" icon="fa fa-dashboard" style="q-btn--dense"/>
-            </container>
-            <container-row>
-                <row-col lg="3" md="3" sm="6">
-                    <container style="zenith-card bg-white shadow-1 q-pa-md q-mb-md text-center border-radius-lg">
-                        <label text="Total Tables" style="text-grey-7 text-caption"/>
-                        <label text="${totalTables}" type="h4" style="text-weight-bold text-primary q-my-xs"/>
-                    </container>
-                </row-col>
-                <row-col lg="3" md="3" sm="6">
-                    <container style="zenith-card bg-green-1 shadow-1 q-pa-md q-mb-md text-center border-radius-lg">
-                        <label text="Available" style="text-grey-7 text-caption"/>
-                        <label text="${availableCount}" type="h4" style="text-weight-bold text-green-8 q-my-xs"/>
-                    </container>
-                </row-col>
-                <row-col lg="3" md="3" sm="6">
-                    <container style="zenith-card bg-red-1 shadow-1 q-pa-md q-mb-md text-center border-radius-lg">
-                        <label text="Occupied" style="text-grey-7 text-caption"/>
-                        <label text="${occupiedCount}" type="h4" style="text-weight-bold text-red-8 q-my-xs"/>
-                    </container>
-                </row-col>
-                <row-col lg="3" md="3" sm="6">
-                    <container style="zenith-card bg-amber-1 shadow-1 q-pa-md q-mb-md text-center border-radius-lg">
-                        <label text="Reserved" style="text-grey-7 text-caption"/>
-                        <label text="${reservedCount}" type="h4" style="text-weight-bold text-amber-8 q-my-xs"/>
-                    </container>
-                </row-col>
-            </container-row>
-
-            <container style="row items-center justify-between q-mb-md">
-                <label text="Table Layout" type="h6" style="text-weight-bold"/>
-                <section name="AddTable_write"><condition><expression>modCanWrite</expression></condition><widgets>
-                <container-dialog id="AddTable" button-text="Add Table" type="success">
-                    <form-single name="CreateTableForm" transition="createTable">
-                        <field name="tableNumber"><default-field title="Table Number">
-                            <text-line size="6"/>
-                        </default-field></field>
-                        <field name="tableName"><default-field title="Table Name">
-                            <text-line size="20"/>
-                        </default-field></field>
-                        <field name="seatingCapacity"><default-field title="Seats">
-                            <text-line size="4" input-type="number" default-value="4"/>
-                        </default-field></field>
-                        <field name="sectionName"><default-field title="Section">
-                            <text-line size="15" default-value="Main"/>
-                        </default-field></field>
-                        <field name="facilityId"><default-field title="Facility">
-                            <drop-down allow-empty="true"><entity-options key="${facilityId}" text="${facilityName}">
-                                <entity-find entity-name="mantle.facility.Facility"/>
-                            </entity-options></drop-down>
-                        </default-field></field>
-                        <field name="statusId" from="'TblAvailable'"><default-field><hidden/></default-field></field>
-                        <field name="submitBtn"><default-field title="">
-                            <submit text="Add Table" icon="fa fa-plus"/>
-                        </default-field></field>
-                    </form-single>
-                </container-dialog>
-                </widgets></section>
-            </container>
-
-            <render-mode><text type="html,qvt" template="true"><![CDATA[
-<#list sections as section>
-    <div style="margin-bottom:20px;">
-        <div style="font-weight:bold; font-size:14px; color:#555; margin-bottom:10px; text-transform:uppercase; letter-spacing:1px;">
-            &#127978; ${section}
-        </div>
-        <div style="display:flex; flex-wrap:wrap; gap:12px;">
-            <#list tablesBySection[section] as tbl>
-                <#assign statusColor = "#4CAF50"/>
-                <#assign statusBg = "#E8F5E9"/>
-                <#assign statusText = "Available"/>
-                <#assign statusIcon = "&#9989;"/>
-                <#if tbl.statusId! == "TblOccupied">
-                    <#assign statusColor = "#F44336"/>
-                    <#assign statusBg = "#FFEBEE"/>
-                    <#assign statusText = "Occupied"/>
-                    <#assign statusIcon = "&#127860;"/>
-                <#elseif tbl.statusId! == "TblReserved">
-                    <#assign statusColor = "#FF9800"/>
-                    <#assign statusBg = "#FFF3E0"/>
-                    <#assign statusText = "Reserved"/>
-                    <#assign statusIcon = "&#128338;"/>
-                <#elseif tbl.statusId! == "TblCleaning">
-                    <#assign statusColor = "#9E9E9E"/>
-                    <#assign statusBg = "#F5F5F5"/>
-                    <#assign statusText = "Cleaning"/>
-                    <#assign statusIcon = "&#129529;"/>
-                </#if>
-
-                <div style="width:150px; background:${statusBg}; border:2px solid ${statusColor}; border-radius:12px; padding:14px; text-align:center; position:relative;">
-                    <div style="font-size:28px; margin-bottom:4px;">${statusIcon}</div>
-                    <div style="font-weight:bold; font-size:20px; color:#333;">T${tbl.tableNumber!''}</div>
-                    <#if tbl.tableName?has_content>
-                        <div style="font-size:11px; color:#666; margin-top:2px;">${tbl.tableName}</div>
-                    </#if>
-                    <div style="font-size:11px; color:#888; margin-top:4px;">&#128101; ${tbl.seatingCapacity!4} seats</div>
-                    <div style="margin-top:6px;">
-                        <span style="background:${statusColor}; color:#fff; padding:2px 10px; border-radius:10px; font-size:10px; font-weight:bold;">${statusText}</span>
-                    </div>
-                    <#if tbl.currentTransactionId?has_content>
-                        <div style="font-size:10px; color:#555; margin-top:4px;">Txn: ${tbl.currentTransactionId}</div>
-                    </#if>
-
-                    <#if modCanWrite>
-                    <div style="margin-top:8px; display:flex; gap:3px; justify-content:center; flex-wrap:wrap;">
-                        <#if tbl.statusId! != "TblAvailable">
-                            <a href="updateTableStatus?tableId=${tbl.tableId}&statusId=TblAvailable" style="background:#4CAF50; color:#fff; padding:2px 6px; border-radius:4px; text-decoration:none; font-size:10px;">Free</a>
-                        </#if>
-                        <#if tbl.statusId! != "TblOccupied">
-                            <a href="updateTableStatus?tableId=${tbl.tableId}&statusId=TblOccupied" style="background:#F44336; color:#fff; padding:2px 6px; border-radius:4px; text-decoration:none; font-size:10px;">Occupy</a>
-                        </#if>
-                        <#if tbl.statusId! != "TblReserved">
-                            <a href="updateTableStatus?tableId=${tbl.tableId}&statusId=TblReserved" style="background:#FF9800; color:#fff; padding:2px 6px; border-radius:4px; text-decoration:none; font-size:10px;">Reserve</a>
-                        </#if>
-                        <#if tbl.statusId! != "TblCleaning">
-                            <a href="updateTableStatus?tableId=${tbl.tableId}&statusId=TblCleaning" style="background:#9E9E9E; color:#fff; padding:2px 6px; border-radius:4px; text-decoration:none; font-size:10px;">Clean</a>
-                        </#if>
-                    </div>
-                    </#if>
-                </div>
-            </#list>
-        </div>
-    </div>
-</#list>
-
-<#if !tables?? || tables?size == 0>
-    <div style="text-align:center; padding:40px; color:#999;">
-        <div style="font-size:48px; margin-bottom:10px;">&#127978;</div>
-        <div style="font-size:16px;">No tables configured</div>
-        <div style="font-size:13px; margin-top:4px;">Click "Add Table" to set up your restaurant tables</div>
-    </div>
+        <render-mode><text type="html,qvt" template="true"><![CDATA[
+<#macro ic name sz=15>
+<svg width="${sz}" height="${sz}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><#rt>
+<#if name=='filter'><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/>
+<#elseif name=='pencil'><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/>
+<#elseif name=='plus'><path d="M5 12h14"/><path d="M12 5v14"/>
+<#elseif name=='copy'><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>
+<#elseif name=='rotate-cw'><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/>
+<#elseif name=='trash'><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/>
+<#elseif name=='undo'><path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5a5.5 5.5 0 0 1-5.5 5.5H11"/>
+<#elseif name=='x'><path d="M18 6 6 18"/><path d="m6 6 12 12"/>
+<#elseif name=='armchair'><path d="M19 9V6a2 2 0 0 0-2-2H7a2 2 0 0 0-2 2v3"/><path d="M3 16a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-2a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2Z"/><path d="M5 18v2"/><path d="M19 18v2"/>
+<#elseif name=='clock'><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
+<#elseif name=='flame'><path d="M8.5 14.5A2.5 2.5 0 0 0 11 12c0-1.38-.5-2-1-3-1.072-2.143-.224-4.054 2-6 .5 2.5 2 4.9 4 6.5 2 1.6 3 3.5 3 5.5a7 7 0 1 1-14 0c0-1.153.433-2.294 1-3a2.5 2.5 0 0 0 2.5 2.5z"/>
+<#elseif name=='swap'><path d="m16 3 4 4-4 4"/><path d="M20 7H4"/><path d="m8 21-4-4 4-4"/><path d="M4 17h16"/>
+<#elseif name=='scissors'><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><line x1="20" x2="8.12" y1="4" y2="15.88"/><line x1="14.47" x2="20" y1="14.48" y2="20"/><line x1="8.12" x2="12" y1="8.12" y2="12"/>
+<#elseif name=='printer'><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><path d="M6 9V3a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v6"/><rect x="6" y="14" width="12" height="8" rx="1"/>
+<#elseif name=='xcircle'><circle cx="12" cy="12" r="10"/><path d="m15 9-6 6"/><path d="m9 9 6 6"/>
+<#elseif name=='check'><path d="M20 6 9 17l-5-5"/>
+<#elseif name=='bell'><path d="M10.268 21a2 2 0 0 0 3.464 0"/><path d="M3.262 15.326A1 1 0 0 0 4 17h16a1 1 0 0 0 .74-1.673C19.41 13.956 18 12.499 18 8A6 6 0 0 0 6 8c0 4.499-1.411 5.956-2.738 7.326"/>
+<#elseif name=='receipt'><path d="M4 2v20l2-1 2 1 2-1 2 1 2-1 2 1 2-1 2 1V2l-2 1-2-1-2 1-2-1-2 1-2-1-2 1Z"/><path d="M16 8h-6a2 2 0 1 0 0 4h4a2 2 0 1 1 0 4H8"/><path d="M12 17.5v-11"/>
 </#if>
-            ]]></text></render-mode>
+</svg></#macro>
 
-            <label text="Table List" type="h6" style="text-weight-bold q-mt-lg q-mb-sm"/>
-            <form-list name="TableManageList" list="tables" list-entry="t" skip-form="true">
-                <field name="tableNumber"><default-field title="Table #">
-                    <display/>
-                </default-field></field>
-                <field name="tableName"><default-field title="Name">
-                    <display default-text="-"/>
-                </default-field></field>
-                <field name="seatingCapacity"><default-field title="Seats">
-                    <display/>
-                </default-field></field>
-                <field name="sectionName"><default-field title="Section">
-                    <display default-text="Main"/>
-                </default-field></field>
-                <field name="statusId"><default-field title="Status">
-                    <display text="${ec.entity.find('moqui.basic.StatusItem').condition('statusId', statusId).useCache(true).one()?.description ?: statusId}"/>
-                </default-field></field>
-                <field name="deleteBtn"><default-field title="">
-                    <link url="deleteTable" text="" icon="fa fa-trash" btn-type="danger"
-                          parameter-map="[tableId:t.tableId]"
-                          condition="modCanWrite"
-                          confirmation="Delete table ${t.tableNumber}?"/>
-                </default-field></field>
-            </form-list>
-        </container>
+<div class="tm-wrap" id="tm-wrap">
+  <input type="hidden" id="tm-token" value="${(ec.web.sessionToken)!''}"/>
+
+  <div class="tm-head">
+    <div>
+      <h1 class="tm-title">Table Management</h1>
+      <p class="tm-sub">Manage tables, orders and reservations</p>
+    </div>
+    <div class="tm-head-actions">
+      <button type="button" class="tm-btn is-primary tm-viewbtn" onclick="tmView('floor', this)">Floor View</button>
+      <button type="button" class="tm-btn tm-viewbtn" onclick="tmView('list', this)">List View</button>
+      <button type="button" class="tm-btn" onclick="tmSoon('wrap','Advanced filter')"><@ic 'filter'/> Filter</button>
+      <#if modCanWrite>
+      <button type="button" class="tm-btn" id="tm-editbtn" onclick="tmEdit(this)"><@ic 'pencil'/> Edit Layout</button>
+      </#if>
+    </div>
+  </div>
+
+  <div class="tm-filters">
+    <button type="button" class="tm-fpill is-active" data-f="all" onclick="tmFilter('all', this)">All (${totalTables})</button>
+    <button type="button" class="tm-fpill" data-f="available" onclick="tmFilter('available', this)"><span class="tm-dot" style="background:#10B981"></span>Available (${availableCount})</button>
+    <button type="button" class="tm-fpill" data-f="occupied" onclick="tmFilter('occupied', this)"><span class="tm-dot" style="background:#EF4444"></span>Occupied (${occupiedCount})</button>
+    <button type="button" class="tm-fpill" data-f="reserved" onclick="tmFilter('reserved', this)"><span class="tm-dot" style="background:#F59E0B"></span>Reserved (${reservedCount})</button>
+    <button type="button" class="tm-fpill" data-f="cleaning" onclick="tmFilter('cleaning', this)"><span class="tm-dot" style="background:#3B82F6"></span>Cleaning (${cleaningCount})</button>
+  </div>
+
+  <#if modCanWrite>
+  <div class="tm-ebanner">
+    <div>
+      <span class="tm-ebanner__title"><@ic 'pencil' 14/> Edit Layout Mode</span>
+      <span class="tm-ebanner__sub">Add or remove tables &#183; Select a table, then Delete</span>
+    </div>
+    <div class="tm-ebanner__actions">
+      <button type="button" class="tm-ebtn" onclick="tmModal(true)"><@ic 'plus' 14/> Add Table</button>
+      <button type="button" class="tm-ebtn" onclick="tmSoon('wrap','Duplicate')"><@ic 'copy' 14/> Duplicate</button>
+      <button type="button" class="tm-ebtn" onclick="tmSoon('wrap','Rotate')"><@ic 'rotate-cw' 14/> Rotate</button>
+      <button type="button" class="tm-ebtn is-danger is-disabled" id="tm-ebtn-delete" onclick="tmDelete()"><@ic 'trash' 14/> Delete</button>
+      <button type="button" class="tm-ebtn" onclick="tmSoon('wrap','Undo')"><@ic 'undo' 14/> Undo</button>
+      <button type="button" class="tm-ebtn" onclick="tmEdit(document.getElementById('tm-editbtn'))">Cancel</button>
+      <button type="button" class="tm-ebtn is-primary" onclick="tmSoon('wrap','Save Layout')">Save Layout</button>
+    </div>
+  </div>
+  </#if>
+
+  <div class="tm-content">
+
+    <!-- FLOOR VIEW -->
+    <div class="tm-floorwrap">
+      <div class="tm-floor">
+        <#if tables?has_content>
+        <div class="tm-grid">
+          <#list tables as tbl>
+            <#assign cd = tmCard[tbl.tableId]/>
+            <#assign ord = (tmOrder[tbl.tableId])!/>
+            <div class="tm-card<#if cd.circle> is-circle</#if>" data-status="${cd.key}" data-table-id="${tbl.tableId}"
+                 onclick="tmSelect('${tbl.tableId}')">
+              <span class="tm-card__num">${(tbl.tableNumber)!'?'}</span>
+              <span class="tm-card__status">${cd.label}</span>
+              <span class="tm-card__seats"><@ic 'armchair' 11/> ${(tbl.seatingCapacity)!4}</span>
+              <#if cd.meta?has_content><span class="tm-card__meta">${cd.meta}</span></#if>
+            </div>
+          </#list>
+        </div>
+        <#else>
+        <div class="tm-empty">
+          <div class="tm-empty__ico">&#127869;</div>
+          <div style="font-size:15px;font-weight:600;color:#6B7280;">No tables configured</div>
+          <div style="font-size:12.5px;margin-top:4px;">Set up your restaurant floor to start managing tables.</div>
+          <#if modCanWrite>
+          <button type="button" class="tm-btn is-primary" style="margin-top:14px;" onclick="tmModal(true)"><@ic 'plus'/> Add Table</button>
+          </#if>
+        </div>
+        </#if>
+        <span class="tm-floor__entrance">Entrance</span>
+      </div>
+    </div>
+
+    <!-- DETAIL PANEL -->
+    <div class="tm-panelwrap">
+      <div class="tm-panel-empty" id="tm-panel-empty">
+        Select a table on the floor to view its order, status and actions.
+      </div>
+
+      <#list tables as tbl>
+        <#assign cd = tmCard[tbl.tableId]/>
+        <#assign ord = (tmOrder[tbl.tableId])!/>
+        <div class="tm-panel" id="tm-panel-${tbl.tableId}" data-table-id="${tbl.tableId}">
+          <div class="tm-panel__head">
+            <h2 class="tm-panel__title">TABLE ${(tbl.tableNumber)!'?'}</h2>
+            <span class="tm-panel__badge" data-status="${cd.key}">${cd.label}</span>
+            <button type="button" class="tm-panel__close" onclick="tmClosePanel()" title="Close"><@ic 'x' 16/></button>
+          </div>
+          <div class="tm-panel__meta">
+            <span><@ic 'armchair' 13/> ${(tbl.seatingCapacity)!4} Seats</span>
+            <#if cd.meta?has_content><span><@ic 'clock' 13/> ${cd.meta}</span></#if>
+          </div>
+
+          <#if ord?has_content>
+          <div class="tm-oinfo">
+            <div class="tm-oinfo__head">
+              <h3>Order Information</h3>
+              <span class="tm-oinfo__time">${ord.time}</span>
+            </div>
+            <span class="tm-oinfo__id">Order #${ord.orderNum}</span>
+            <#if ord.items?has_content>
+            <ul class="tm-oitems">
+              <#list ord.items as it>
+              <li class="tm-oitem"><span class="tm-oitem__name">${it.q} &#215; ${it.name}</span><span class="tm-oitem__amt">${it.amt}</span></li>
+              </#list>
+            </ul>
+            </#if>
+            <div class="tm-osum__row"><span>Subtotal</span><span>${ord.subtotal}</span></div>
+            <div class="tm-osum__row"><span>Tax</span><span>${ord.tax}</span></div>
+            <div class="tm-osum__row is-total"><span class="tm-osum__lbl">TOTAL</span><span class="tm-osum__val">${ord.total}</span></div>
+          </div>
+
+          <div class="tm-ostatus">
+            <h3>Order Status</h3>
+            <#assign c2 = (ord.step gt 2)?string('is-done', (ord.step == 2)?string('is-active',''))/>
+            <#assign c3 = (ord.step gt 3)?string('is-done', (ord.step == 3)?string('is-active',''))/>
+            <#assign c4 = (ord.step gt 3)?string('is-done','')/>
+            <div class="tm-stepper">
+              <div class="tm-step is-done"><span class="tm-step__dot"><@ic 'check' 15/></span><span class="tm-step__lbl">Order Placed</span></div>
+              <div class="tm-step ${c2}"><span class="tm-step__dot"><@ic 'flame' 15/></span><span class="tm-step__lbl">Kitchen</span></div>
+              <div class="tm-step ${c3}"><span class="tm-step__dot"><@ic 'bell' 15/></span><span class="tm-step__lbl">Ready</span></div>
+              <div class="tm-step ${c4}"><span class="tm-step__dot"><@ic 'receipt' 15/></span><span class="tm-step__lbl">Bill Paid</span></div>
+            </div>
+          </div>
+          <#else>
+          <div class="tm-noorder">No active order for this table.</div>
+          </#if>
+
+          <div class="tm-actions">
+            <button type="button" class="tm-abtn is-primary" onclick="tmGo('goTerminal')"><@ic 'plus' 14/> Add Items</button>
+            <button type="button" class="tm-abtn" onclick="tmSoon('${tbl.tableId}','Send to Kitchen')"><@ic 'flame' 14/> Send to Kitchen</button>
+            <button type="button" class="tm-abtn" onclick="tmSoon('${tbl.tableId}','Transfer Table')"><@ic 'swap' 14/> Transfer Table</button>
+            <button type="button" class="tm-abtn" onclick="tmSoon('${tbl.tableId}','Split Bill')"><@ic 'scissors' 14/> Split Bill</button>
+            <#if ord?has_content>
+            <button type="button" class="tm-abtn" onclick="tmGo('goTransactions')"><@ic 'printer' 14/> Print Bill</button>
+            <#else>
+            <button type="button" class="tm-abtn" onclick="tmSoon('${tbl.tableId}','Print Bill')"><@ic 'printer' 14/> Print Bill</button>
+            </#if>
+            <#if modCanWrite>
+            <button type="button" class="tm-abtn is-danger" onclick="tmPost('closeTable',{tableId:'${tbl.tableId}'})"><@ic 'xcircle' 14/> Close Table</button>
+            </#if>
+          </div>
+
+          <#if modCanWrite>
+          <div class="tm-setrow">
+            <span class="tm-setrow__lbl">Set status</span>
+            <a class="tm-setlink" onclick="tmPost('updateTableStatus',{tableId:'${tbl.tableId}',statusId:'TblOccupied'})">Occupied</a>
+            <a class="tm-setlink" onclick="tmPost('updateTableStatus',{tableId:'${tbl.tableId}',statusId:'TblReserved'})">Reserved</a>
+            <a class="tm-setlink" onclick="tmPost('updateTableStatus',{tableId:'${tbl.tableId}',statusId:'TblCleaning'})">Cleaning</a>
+            <a class="tm-setlink" onclick="tmPost('updateTableStatus',{tableId:'${tbl.tableId}',statusId:'TblAvailable'})">Available</a>
+          </div>
+          </#if>
+
+          <div class="tm-soonmsg" id="tm-soon-${tbl.tableId}"></div>
+        </div>
+      </#list>
+    </div>
+
+    <!-- LIST VIEW -->
+    <div class="tm-listwrap">
+      <table class="tm-table">
+        <thead><tr><th>Table #</th><th>Name</th><th>Seats</th><th>Section</th><th>Status</th><#if modCanWrite><th></th></#if></tr></thead>
+        <tbody>
+          <#if tables?has_content>
+          <#list tables as tbl>
+            <#assign cd = tmCard[tbl.tableId]/>
+            <tr>
+              <td style="font-weight:600;">${(tbl.tableNumber)!'?'}</td>
+              <td>${(tbl.tableName)!'-'}</td>
+              <td>${(tbl.seatingCapacity)!4}</td>
+              <td>${(tbl.sectionName)!'Main'}</td>
+              <td><span class="tm-sbadge" data-status="${cd.key}">${cd.label}</span></td>
+              <#if modCanWrite>
+              <td style="text-align:right;"><a class="tm-delx" onclick="if(confirm('Delete table ${(tbl.tableNumber)!''}?')) tmPost('deleteTable',{tableId:'${tbl.tableId}'})">Delete</a></td>
+              </#if>
+            </tr>
+          </#list>
+          <#else>
+          <tr><td colspan="6" style="text-align:center;color:#9CA3AF;padding:28px;">No tables configured.</td></tr>
+          </#if>
+        </tbody>
+      </table>
+    </div>
+
+  </div>
+
+  <#if modCanWrite>
+  <!-- ADD TABLE MODAL -->
+  <div class="tm-modal" id="tm-addmodal">
+    <div class="tm-modal__card">
+      <h3 class="tm-modal__title">Add Table</h3>
+      <p class="tm-modal__sub">Create a new table on the restaurant floor.</p>
+      <div class="tm-fld"><label>Table Number *</label><input type="text" id="tm-f-num" placeholder="e.g. 14"/></div>
+      <div class="tm-fld"><label>Table Name</label><input type="text" id="tm-f-name" placeholder="Optional"/></div>
+      <div class="tm-fld"><label>Seats</label><input type="number" id="tm-f-seat" value="4" min="1"/></div>
+      <div class="tm-fld"><label>Section</label><input type="text" id="tm-f-sec" value="Main"/></div>
+      <div class="tm-fld"><label>Facility</label>
+        <select id="tm-f-fac">
+          <option value="">(none)</option>
+          <#list facilities as f><option value="${f.facilityId}">${(f.facilityName)!f.facilityId}</option></#list>
+        </select>
+      </div>
+      <div class="tm-modal__actions">
+        <button type="button" class="tm-btn" onclick="tmModal(false)">Cancel</button>
+        <button type="button" class="tm-btn is-primary" id="tm-addsave" onclick="tmAddSave()">Add Table</button>
+      </div>
+    </div>
+  </div>
+  </#if>
+
+  <!-- JS runs from an external file injected via img-onload: reliable on BOTH /apps and /qapps
+       (/qapps' Vue template compiler strips inline <script> and chokes on a second root). -->
+  <img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==" alt="" style="display:none"
+       onload="(function(){if(window.__tmJs)return;window.__tmJs=1;var s=document.createElement('script');s.src='/zenithstatic/js/tm-tables.js?v=2';document.head.appendChild(s);})()"/>
+
+</div>
+        ]]></text></render-mode>
     </widgets>
 </screen>

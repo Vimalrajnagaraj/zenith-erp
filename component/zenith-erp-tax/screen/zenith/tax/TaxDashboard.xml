@@ -3,143 +3,321 @@
         xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
         default-menu-title="Dashboard" default-menu-index="1">
 
+    <parameter name="dashDate"/>
+    <parameter name="dashDateTo"/>
+
+    <!-- Export the selected range's tenant-scoped tax lines as CSV (download). -->
+    <transition name="exportTaxLines" read-only="true">
+        <actions><script><![CDATA[
+            def dashDate = ec.web.parameters.dashDate
+            def dashDateTo = ec.web.parameters.dashDateTo
+            def orgId = ec.user.getPreference('ACTIVE_ORGANIZATION')
+            def txIds = [] as Set
+            if (orgId) { try { txIds = (ec.entity.find("zenith.erp.pos.PosTransaction").condition("organizationPartyId", orgId).selectField("transactionId").list()*.transactionId) as Set } catch (Exception e) {} }
+            def rawLines = ec.entity.find("zenith.erp.tax.TaxLineDetail").orderBy("-taxLineDetailId").limit(4000).list()
+            def tLines = orgId ? rawLines.findAll { txIds.contains(it.referenceId) } : rawLines
+            def ps = dashDate ? java.sql.Timestamp.valueOf(dashDate + " 00:00:00") : null
+            def pe = null
+            if (dashDateTo) { def _c = java.util.Calendar.getInstance(); _c.setTime(java.sql.Timestamp.valueOf(dashDateTo + " 00:00:00")); _c.add(java.util.Calendar.DAY_OF_MONTH,1); pe = new java.sql.Timestamp(_c.getTimeInMillis()) }
+            def lines = (ps && pe) ? tLines.findAll { it.lastUpdatedStamp != null && !it.lastUpdatedStamp.before(ps) && it.lastUpdatedStamp.before(pe) } : tLines
+            def df = new java.text.SimpleDateFormat("yyyy-MM-dd")
+            def esc = { v -> def s = (v == null) ? '' : v.toString(); (s.contains(',') || s.contains('"') || s.contains("\n")) ? ('"' + s.replace('"','""') + '"') : s }
+            def sb = new StringBuilder("ID,Ref Type,Ref ID,Tax,Rate,Taxable Amount,Tax Amount,Currency,Date\n")
+            lines.each { sb.append([esc(it.taxLineDetailId), esc(it.referenceType), esc(it.referenceId), esc(it.taxName), esc(it.taxRate), esc(it.taxableAmount), esc(it.taxAmount), esc(it.currencyUomId ?: 'INR'), esc(it.lastUpdatedStamp != null ? df.format(it.lastUpdatedStamp) : '')].join(',')).append("\n") }
+            ec.web.sendTextResponse(sb.toString(), "text/csv", "TaxLines.csv")
+        ]]></script></actions>
+        <default-response type="none"/>
+    </transition>
     <transition name="findTaxAuthority"><default-response url="../FindTaxAuthority"/></transition>
     <transition name="findTaxRate"><default-response url="../FindTaxRate"/></transition>
     <transition name="findTaxExemption"><default-response url="../FindTaxExemption"/></transition>
     <transition name="findTaxRegistration"><default-response url="../FindTaxRegistration"/></transition>
 
     <actions>
+        <!-- ===== KPI counts (not date-filtered) ===== -->
         <entity-find-count entity-name="zenith.erp.tax.TaxAuthority" count-field="totalAuthorities">
             <econdition field-name="isActive" value="Y"/>
         </entity-find-count>
-
-        <!-- Real tax rates for India tenants live in the GST slab table -->
         <set field="totalRates" from="0"/>
         <script>try { totalRates = ec.entity.find("zenith.erp.india.IndiaGstSlab").condition("isActive","Y").count() as int } catch (Exception e) { try { totalRates = ec.entity.find("zenith.erp.tax.TaxRate").condition("isActive","Y").count() as int } catch (Exception e2) {} }</script>
-
         <entity-find-count entity-name="zenith.erp.tax.TaxCategory" count-field="totalCategories"/>
-
         <entity-find-count entity-name="zenith.erp.tax.TaxExemption" count-field="totalExemptions">
             <econdition field-name="isActive" value="Y"/>
         </entity-find-count>
-
         <entity-find-count entity-name="zenith.erp.tax.TaxRegistration" count-field="totalRegistrations">
             <econdition field-name="isActive" value="Y"/>
         </entity-find-count>
 
-        <!-- Recent tax lines scoped to THIS tenant's transactions (PosTransaction is org-filtered) -->
+        <!-- ===== date range (default current month) + tenant-scoped tax-line aggregation (ONE script: Moqui
+             shares the binding across <script> blocks, so splitting would redeclare now/periodStart/etc.) ===== -->
         <script><![CDATA[
-            def raw = ec.entity.find("zenith.erp.tax.TaxLineDetail").orderBy("-taxLineDetailId").limit(60).list()
-            def refIds = raw.collect { it.referenceId }.findAll { it }.unique()
-            def orgSet = [] as Set
-            if (refIds) orgSet = (ec.entity.find("zenith.erp.pos.PosTransaction").condition("transactionId","in",refIds).selectField("transactionId").list()*.transactionId) as Set
-            recentTaxLines = raw.findAll { orgSet.contains(it.referenceId) }.take(10)
+            import java.math.BigDecimal
+            import java.math.RoundingMode
+            def _uri = (ec.web?.request?.requestURI ?: ''); def _zi = _uri.indexOf('/zenith/'); appBase = _zi > 0 ? _uri.substring(0, _zi) : ''
+            def sdf = new java.text.SimpleDateFormat("yyyy-MM-dd")
+            def pretty = new java.text.SimpleDateFormat("dd MMM yyyy")
+            def now = ec.user.nowTimestamp
+            def todayStr = sdf.format(now)
+
+            def orgId = ec.user.getPreference('ACTIVE_ORGANIZATION')
+            def txIds = [] as Set
+            if (orgId) { try { txIds = (ec.entity.find("zenith.erp.pos.PosTransaction").condition("organizationPartyId", orgId).selectField("transactionId").list()*.transactionId) as Set } catch (Exception e) {} }
+            def rawLines = ec.entity.find("zenith.erp.tax.TaxLineDetail").orderBy("-taxLineDetailId").limit(4000).list()
+            def tLines = orgId ? rawLines.findAll { txIds.contains(it.referenceId) } : rawLines
+
+            // default the range to the month containing the most recent tax line (so the dashboard opens populated);
+            // fall back to the current month when there is no tax data at all.
+            def _anchor = (tLines && tLines[0].lastUpdatedStamp) ? tLines[0].lastUpdatedStamp : now
+            def _am = java.util.Calendar.getInstance(); _am.setTime(_anchor); _am.set(java.util.Calendar.DAY_OF_MONTH,1)
+            def _monStart = sdf.format(_am.getTime())
+            def _ae = (java.util.Calendar) _am.clone(); _ae.add(java.util.Calendar.MONTH,1); _ae.add(java.util.Calendar.DAY_OF_MONTH,-1)
+            def _monEnd = sdf.format(_ae.getTime()); if (_monEnd > todayStr) _monEnd = todayStr
+            if (!dashDate) dashDate = _monStart
+            if (!dashDateTo) dashDateTo = _monEnd
+            if (dashDateTo < dashDate) { def _s = dashDate; dashDate = dashDateTo; dashDateTo = _s }
+            def periodStart = java.sql.Timestamp.valueOf(dashDate + " 00:00:00")
+            def _ce = java.util.Calendar.getInstance(); _ce.setTime(java.sql.Timestamp.valueOf(dashDateTo + " 00:00:00")); _ce.add(java.util.Calendar.DAY_OF_MONTH,1)
+            def periodEndExcl = new java.sql.Timestamp(_ce.getTimeInMillis())
+            long _lenMs = periodEndExcl.getTime() - periodStart.getTime()
+            def priorStart = new java.sql.Timestamp(periodStart.getTime() - _lenMs)
+            rangeLabel = pretty.format(periodStart) + " - " + pretty.format(new java.sql.Timestamp(periodEndExcl.getTime() - 86400000L))
+
+            def inRange = { ts, a, b -> ts != null && !ts.before(a) && ts.before(b) }
+            def periodLines = tLines.findAll { inRange(it.lastUpdatedStamp, periodStart, periodEndExcl) }
+            def priorLines  = tLines.findAll { inRange(it.lastUpdatedStamp, priorStart, periodStart) }
+
+            BigDecimal totBd = 0G; periodLines.each { totBd += (it.taxAmount ?: 0G) }
+            BigDecimal priorBd = 0G; priorLines.each { priorBd += (it.taxAmount ?: 0G) }
+            totalTaxFmt = "₹" + totBd.setScale(2, RoundingMode.HALF_UP).toPlainString()
+            if (priorBd == 0G) { trendPct = null } else { trendPct = ((totBd - priorBd) * 100G / priorBd).setScale(1, RoundingMode.HALF_UP) }
+            trendUp = (trendPct != null && trendPct >= 0G)
+            trendStr = (trendPct == null) ? "—" : ((trendUp ? "+" : "") + trendPct.toPlainString() + "%")
+
+            // by type (parse the taxName prefix: SGST@9% / CGST@9% / IGST@18%)
+            BigDecimal sg = 0G, cg = 0G, ig = 0G, ot = 0G
+            periodLines.each { def n = (it.taxName ?: '').toString().toUpperCase().trim(); def a = (it.taxAmount ?: 0G)
+                if (n.startsWith('SGST') || n.startsWith('UTGST')) sg += a
+                else if (n.startsWith('CGST')) cg += a
+                else if (n.startsWith('IGST')) ig += a
+                else ot += a }
+            BigDecimal byTot = sg + cg + ig + ot
+            byTypeTotalFmt = "₹" + byTot.setScale(2, RoundingMode.HALF_UP).toPlainString()
+            def _pc = { v -> (byTot == 0G) ? "0" : ((v * 100G / byTot).setScale(1, RoundingMode.HALF_UP).toPlainString()) }
+            sgstFmt = "₹" + sg.setScale(2, RoundingMode.HALF_UP).toPlainString(); sgstPct = _pc(sg)
+            cgstFmt = "₹" + cg.setScale(2, RoundingMode.HALF_UP).toPlainString(); cgstPct = _pc(cg)
+            igstFmt = "₹" + ig.setScale(2, RoundingMode.HALF_UP).toPlainString(); igstPct = _pc(ig)
+            byTypeSeries = "[" + sg.setScale(2,RoundingMode.HALF_UP).toPlainString() + "," + cg.setScale(2,RoundingMode.HALF_UP).toPlainString() + "," + ig.setScale(2,RoundingMode.HALF_UP).toPlainString() + "]"
+            byTypeHasData = (byTot > 0G)
+
+            // daily series across the selected range
+            def dsdf = new java.text.SimpleDateFormat("yyyy-MM-dd")
+            def dayMap = [:]
+            periodLines.each { def d = dsdf.format(it.lastUpdatedStamp); dayMap[d] = ((dayMap[d] ?: 0G)) + (it.taxAmount ?: 0G) }
+            def labels = []; def vals = []
+            def dc = java.util.Calendar.getInstance(); dc.setTime(periodStart)
+            def labSdf = new java.text.SimpleDateFormat("dd MMM")
+            int _guard = 0
+            while (dc.getTime().before(periodEndExcl) && _guard < 370) {
+                def ds = dsdf.format(dc.getTime())
+                labels.add("'" + labSdf.format(dc.getTime()) + "'")
+                vals.add(((dayMap[ds] ?: 0G) as BigDecimal).setScale(2, RoundingMode.HALF_UP).toPlainString())
+                dc.add(java.util.Calendar.DAY_OF_MONTH, 1); _guard++
+            }
+            liabLabelsJson = "[" + labels.join(",") + "]"
+            liabValsJson = "[" + vals.join(",") + "]"
+            liabHasData = (periodLines.size() > 0)
+
+            // recent tax lines for the table (within range; fall back to latest tenant lines if the range is empty)
+            def tableSrc = periodLines ? periodLines : tLines
+            recentTaxLines = tableSrc.take(8)
+
+            // ===== Recent Activities (real, from the most-recently-updated tax records) =====
+            def _ago = { ts -> if (!ts) return ''; long ms = now.getTime() - ts.getTime(); if (ms < 0) ms = 0
+                long mins = (long)(ms/60000L); if (mins < 1) return 'just now'; if (mins < 60) return mins + ' min' + (mins==1?'':'s') + ' ago'
+                long hrs = (long)(mins/60L); if (hrs < 24) return hrs + ' hour' + (hrs==1?'':'s') + ' ago'
+                long days = (long)(hrs/24L); if (days < 30) return days + ' day' + (days==1?'':'s') + ' ago'
+                return (long)(days/30L) + ' month' + ((long)(days/30L)==1?'':'s') + ' ago' }
+            def _safe = { v, k -> try { return v?.get(k) } catch (Exception e) { return null } }
+            def acts = []
+            try { def rl = ec.entity.find("zenith.erp.india.IndiaGstSlab").orderBy("-lastUpdatedStamp").limit(1).list()
+                if (rl) { def r = rl[0]; def nm = (_safe(r,'slabName') ?: _safe(r,'gstSlabId') ?: 'Tax rate'); def rt = (_safe(r,'gstRate') ?: _safe(r,'totalRate'))
+                    acts.add([icon:'receipt_long', color:'green', title:'New Tax Rate Added', sub:(nm.toString() + ((rt != null) ? (' - ' + rt + '%') : '')), ts:r.lastUpdatedStamp]) } } catch (Exception e) {}
+            try { def q = ec.entity.find("zenith.erp.tax.TaxExemption"); if (orgId) q.condition("organizationPartyId", orgId)
+                def rl = q.orderBy("-lastUpdatedStamp").limit(1).list()
+                if (rl) { def r = rl[0]; acts.add([icon:'description', color:'red', title:'Tax Exemption Added', sub:(_safe(r,'exemptionNumber') ?: _safe(r,'description') ?: _safe(r,'exemptionId') ?: 'Exemption'), ts:r.lastUpdatedStamp]) } } catch (Exception e) {}
+            try { def q = ec.entity.find("zenith.erp.tax.TaxRegistration"); if (orgId) q.condition("organizationPartyId", orgId)
+                def rl = q.orderBy("-lastUpdatedStamp").limit(1).list()
+                if (rl) { def r = rl[0]; acts.add([icon:'verified', color:'blue', title:'GST Registration Updated', sub:(_safe(r,'registrationNumber') ?: _safe(r,'taxRegistrationId') ?: 'Registration'), ts:r.lastUpdatedStamp]) } } catch (Exception e) {}
+            acts = acts.findAll { it.ts != null }.sort { -it.ts.getTime() }
+            activities = acts.collect { [icon:it.icon, color:it.color, title:it.title, sub:(it.sub != null ? it.sub.toString() : ''), time:_ago(it.ts)] }
         ]]></script>
     </actions>
 
     <widgets>
-        <container style="q-mb-lg">
-            <label text="Tax Overview" type="h3" style="text-primary text-weight-bold q-my-none"/>
-            <label text="Manage tax authorities, rates, exemptions, and registrations across your organization." type="p" style="text-grey-7 q-mt-sm q-mb-none"/>
-        </container>
+        <!-- ===== Page header: title + subtitle + date-range pill + Export ===== -->
+        <render-mode><text type="html,qvt,vuet" template="true"><![CDATA[
+            <div style="display:flex;flex-wrap:wrap;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:22px">
+                <div>
+                    <div style="font-size:24px;font-weight:700;line-height:1.2;color:var(--z-text-main,#111827)">Tax Overview</div>
+                    <div style="font-size:13px;margin-top:5px;color:var(--z-text-muted,#6B7280)">Manage tax authorities, rates, exemptions, and registrations across your organization.</div>
+                </div>
+                <div style="display:flex;align-items:center;gap:10px">
+                    <details class="zdash-dr" style="position:relative">
+                        <summary class="zdash-dr-sum" style="gap:8px;height:40px;padding:0 14px;border:1px solid var(--z-border,#E5E7EB);border-radius:8px;background:var(--z-bg-card,#fff);color:var(--z-text-main,#111827);font-size:13px"><span class="material-icons" style="font-size:18px;color:#6B7280">calendar_today</span>${rangeLabel}<span class="material-icons" style="font-size:18px;color:#9CA3AF">expand_more</span></summary>
+                        <form method="get" action="." class="zdash-dr-pop" style="right:0;left:auto">
+                            <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px"><span style="width:38px;font-size:12px;color:#6B7280">From</span><input type="date" name="dashDate" value="${dashDate}" style="flex:1;height:34px;border:1px solid #E5E7EB;border-radius:7px;padding:0 8px;font-size:13px"/></div>
+                            <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px"><span style="width:38px;font-size:12px;color:#6B7280">To</span><input type="date" name="dashDateTo" value="${dashDateTo}" style="flex:1;height:34px;border:1px solid #E5E7EB;border-radius:7px;padding:0 8px;font-size:13px"/></div>
+                            <button type="submit" style="width:100%;height:36px;background:#7C3AED;color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer">Apply</button>
+                        </form>
+                    </details>
+                    <a href="${appBase}/zenith/tax/TaxDashboard/exportTaxLines?dashDate=${dashDate}&amp;dashDateTo=${dashDateTo}" style="display:inline-flex;align-items:center;gap:7px;height:40px;padding:0 16px;background:var(--z-text-main,#111827);color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:600;text-decoration:none"><span class="material-icons" style="font-size:18px">file_download</span>Export</a>
+                </div>
+            </div>
+        ]]></text></render-mode>
 
-        <!-- Metrics Row -->
+        <!-- ===== 5 stat cards ===== -->
+        <render-mode><text type="html,qvt,vuet" template="true"><![CDATA[
+            <#assign cards = [
+                {"lbl":"Tax Authorities","val":"${totalAuthorities!0}","sub":"Active authorities","ico":"account_balance","bg":"rgba(124,58,237,.12)","fg":"#7C3AED"},
+                {"lbl":"Tax Rates","val":"${totalRates!0}","sub":"Total tax rates","ico":"percent","bg":"rgba(16,185,129,.14)","fg":"#0E9F6E"},
+                {"lbl":"Tax Categories","val":"${totalCategories!0}","sub":"Total categories","ico":"grid_view","bg":"#FEF3C7","fg":"#B45309"},
+                {"lbl":"Tax Exemptions","val":"${totalExemptions!0}","sub":"Active exemptions","ico":"description","bg":"#FEE2E2","fg":"#DC2626"},
+                {"lbl":"Tax Registrations","val":"${totalRegistrations!0}","sub":"Active registrations","ico":"verified_user","bg":"#DBEAFE","fg":"#2563EB"}]/>
+            <div style="display:flex;flex-wrap:wrap;gap:16px;margin-bottom:20px">
+                <#list cards as c>
+                <div style="flex:1 1 180px;min-width:180px;background:var(--z-bg-card,#fff);border:1px solid var(--z-border,#E5E7EB);border-radius:12px;padding:18px 20px;box-shadow:0 1px 2px rgba(0,0,0,.04)">
+                    <div style="display:flex;align-items:flex-start;gap:12px">
+                        <div style="width:44px;height:44px;flex:0 0 auto;border-radius:8px;display:flex;align-items:center;justify-content:center;background:${c.bg}"><span class="material-icons" style="font-size:23px;color:${c.fg}">${c.ico}</span></div>
+                        <div style="min-width:0">
+                            <div style="font-size:13px;font-weight:500;color:var(--z-text-main,#111827)">${c.lbl}</div>
+                            <div style="font-size:26px;font-weight:700;line-height:1.15;color:var(--z-text-main,#111827);margin-top:2px">${c.val}</div>
+                            <div style="font-size:12px;color:var(--z-text-muted,#6B7280);margin-top:2px">${c.sub}</div>
+                        </div>
+                    </div>
+                </div>
+                </#list>
+            </div>
+        ]]></text></render-mode>
+
+        <!-- ===== Middle row: Tax Liability (chart) | Tax by Type (donut) | Recent Activities ===== -->
         <container-row>
-            <row-col lg="3" md="6" sm="12">
-                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-md">
-                    <container style="row items-center justify-between">
-                        <container>
-                            <label text="Tax Authorities" type="p" style="text-grey-7 text-uppercase text-weight-bold q-mb-xs"/>
-                            <label text="${totalAuthorities}" type="h4" style="text-dark text-weight-bold q-my-none"/>
-                        </container>
-                        <container style="q-pa-sm bg-blue-1 border-radius-md text-blue-8">
-                            <render-mode><text type="html"><![CDATA[<q-icon name="account_balance" class="text-h4"/>]]></text></render-mode>
-                        </container>
-                    </container>
+            <row-col lg="5" md="12">
+                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-md z-dashpanel">
+                    <render-mode><text type="html,qvt,vuet" template="true"><![CDATA[
+                        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+                            <div style="display:flex;align-items:center;gap:6px;font-size:15px;font-weight:600;color:var(--z-text-main,#111827)">Tax Liability Overview <span class="material-icons" style="font-size:15px;color:#9CA3AF">info</span></div>
+                        </div>
+                        <div style="font-size:12px;color:var(--z-text-muted,#6B7280)">Total Tax (selected range)</div>
+                        <div style="font-size:28px;font-weight:700;color:var(--z-text-main,#111827);margin:2px 0 4px">${totalTaxFmt}</div>
+                        <div style="font-size:12px;color:var(--z-text-muted,#6B7280)">vs prior period <#if trendStr != "—"><span style="color:${trendUp?string('#0E9F6E','#DC2626')};font-weight:600">${trendStr} <#if trendUp>&#8599;<#else>&#8600;</#if></span><#else><span style="color:#9CA3AF">no prior data</span></#if></div>
+                        <div id="taxLiabChart" style="margin-top:6px"></div>
+                        <img alt="" style="display:none" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" onload="zChart(this,function(){(function(){
+                            new ApexCharts(document.querySelector('#taxLiabChart'),{
+                                chart:{type:'area',height:230,toolbar:{show:false},fontFamily:'Inter,sans-serif',sparkline:{enabled:false}},
+                                series:[{name:'Tax',data:${liabValsJson}}],
+                                xaxis:{categories:${liabLabelsJson},tickAmount:6,labels:{style:{colors:'#9CA3AF',fontSize:'11px'}},axisBorder:{show:false},axisTicks:{show:false}},
+                                yaxis:{labels:{style:{colors:'#9CA3AF',fontSize:'11px'},formatter:function(v){return Math.round(v);}}},
+                                stroke:{curve:'smooth',width:2,colors:['#F59E0B']},
+                                fill:{type:'gradient',gradient:{shadeIntensity:1,opacityFrom:.35,opacityTo:.02,stops:[0,100]},colors:['#F59E0B']},
+                                colors:['#F59E0B'],
+                                grid:{borderColor:'#EEF0F4',strokeDashArray:4,xaxis:{lines:{show:false}}},
+                                dataLabels:{enabled:false},
+                                tooltip:{y:{formatter:function(v){return '₹'+Number(v).toFixed(2);}}}
+                            }).render();
+                        })();})"/>
+                    ]]></text></render-mode>
                 </container>
             </row-col>
-
-            <row-col lg="3" md="6" sm="12">
-                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-md">
-                    <container style="row items-center justify-between">
-                        <container>
-                            <label text="Tax Rates" type="p" style="text-grey-7 text-uppercase text-weight-bold q-mb-xs"/>
-                            <label text="${totalRates}" type="h4" style="text-dark text-weight-bold q-my-none"/>
-                        </container>
-                        <container style="q-pa-sm bg-green-1 border-radius-md text-green-8">
-                            <render-mode><text type="html"><![CDATA[<q-icon name="percent" class="text-h4"/>]]></text></render-mode>
-                        </container>
-                    </container>
+            <row-col lg="4" md="6">
+                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-md z-dashpanel">
+                    <render-mode><text type="html,qvt,vuet" template="true"><![CDATA[
+                        <div style="font-size:15px;font-weight:600;color:var(--z-text-main,#111827);margin-bottom:6px">Tax by Type</div>
+                        <#if byTypeHasData>
+                        <div id="taxTypeChart"></div>
+                        <img alt="" style="display:none" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" onload="zChart(this,function(){(function(){
+                            new ApexCharts(document.querySelector('#taxTypeChart'),{
+                                chart:{type:'donut',height:210,fontFamily:'Inter,sans-serif'},
+                                series:${byTypeSeries},
+                                labels:['SGST','CGST','IGST'],
+                                colors:['#7C3AED','#2563EB','#10B981'],
+                                stroke:{width:0},
+                                legend:{show:false},
+                                dataLabels:{enabled:false},
+                                plotOptions:{pie:{donut:{size:'70%',labels:{show:true,value:{fontSize:'18px',fontWeight:700,color:'#111827',formatter:function(){return '${byTypeTotalFmt}';}},total:{show:true,label:'Total',fontSize:'11px',color:'#6B7280',formatter:function(){return '${byTypeTotalFmt}';}}}}}},
+                                tooltip:{y:{formatter:function(v){return '₹'+Number(v).toFixed(2);}}}
+                            }).render();
+                        })();})"/>
+                        <div style="margin-top:10px">
+                            <div style="display:flex;align-items:center;gap:8px;font-size:12px;margin-bottom:6px"><span style="width:9px;height:9px;border-radius:50%;background:#7C3AED"></span><span style="color:var(--z-text-main,#111827)">SGST</span><span style="margin-left:auto;color:var(--z-text-main,#111827);font-weight:600">${sgstFmt}</span><span style="color:var(--z-text-muted,#6B7280)">(${sgstPct}%)</span></div>
+                            <div style="display:flex;align-items:center;gap:8px;font-size:12px;margin-bottom:6px"><span style="width:9px;height:9px;border-radius:50%;background:#2563EB"></span><span style="color:var(--z-text-main,#111827)">CGST</span><span style="margin-left:auto;color:var(--z-text-main,#111827);font-weight:600">${cgstFmt}</span><span style="color:var(--z-text-muted,#6B7280)">(${cgstPct}%)</span></div>
+                            <div style="display:flex;align-items:center;gap:8px;font-size:12px"><span style="width:9px;height:9px;border-radius:50%;background:#10B981"></span><span style="color:var(--z-text-main,#111827)">IGST</span><span style="margin-left:auto;color:var(--z-text-main,#111827);font-weight:600">${igstFmt}</span><span style="color:var(--z-text-muted,#6B7280)">(${igstPct}%)</span></div>
+                        </div>
+                        <#else>
+                        <div style="padding:40px 10px;text-align:center;color:#9CA3AF;font-size:13px">No tax collected in this range.</div>
+                        </#if>
+                    ]]></text></render-mode>
                 </container>
             </row-col>
-
-            <row-col lg="3" md="6" sm="12">
-                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-md">
-                    <container style="row items-center justify-between">
-                        <container>
-                            <label text="Tax Categories" type="p" style="text-grey-7 text-uppercase text-weight-bold q-mb-xs"/>
-                            <label text="${totalCategories}" type="h4" style="text-dark text-weight-bold q-my-none"/>
-                        </container>
-                        <container style="q-pa-sm bg-orange-1 border-radius-md text-orange-8">
-                            <render-mode><text type="html"><![CDATA[<q-icon name="category" class="text-h4"/>]]></text></render-mode>
-                        </container>
-                    </container>
-                </container>
-            </row-col>
-
-            <row-col lg="3" md="6" sm="12">
-                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-md">
-                    <container style="row items-center justify-between">
-                        <container>
-                            <label text="Exemptions" type="p" style="text-grey-7 text-uppercase text-weight-bold q-mb-xs"/>
-                            <label text="${totalExemptions}" type="h4" style="text-dark text-weight-bold q-my-none"/>
-                        </container>
-                        <container style="q-pa-sm bg-red-1 border-radius-md text-red-8">
-                            <render-mode><text type="html"><![CDATA[<q-icon name="block" class="text-h4"/>]]></text></render-mode>
-                        </container>
-                    </container>
+            <row-col lg="3" md="6">
+                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-md z-dashpanel">
+                    <render-mode><text type="html,qvt,vuet" template="true"><![CDATA[
+                        <#assign actColors = {"green":{"bg":"rgba(16,185,129,.14)","fg":"#0E9F6E"},"red":{"bg":"#FEE2E2","fg":"#DC2626"},"blue":{"bg":"#DBEAFE","fg":"#2563EB"}}/>
+                        <div style="font-size:15px;font-weight:600;color:var(--z-text-main,#111827);margin-bottom:14px">Recent Activities</div>
+                        <#list (activities![]) as a>
+                        <div style="display:flex;align-items:flex-start;gap:10px;margin-bottom:14px">
+                            <#assign ac = actColors[a.color]!{"bg":"#F3F4F6","fg":"#6B7280"}/>
+                            <div style="width:32px;height:32px;flex:0 0 auto;border-radius:8px;display:flex;align-items:center;justify-content:center;background:${ac.bg}"><span class="material-icons" style="font-size:17px;color:${ac.fg}">${a.icon}</span></div>
+                            <div style="min-width:0;flex:1">
+                                <div style="font-size:12.5px;font-weight:600;color:var(--z-text-main,#111827)">${a.title}</div>
+                                <div style="font-size:12px;color:var(--z-text-muted,#6B7280);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${a.sub?html}</div>
+                            </div>
+                            <div style="font-size:11px;color:#9CA3AF;white-space:nowrap">${a.time}</div>
+                        </div>
+                        <#else>
+                        <div style="padding:24px 4px;text-align:center;color:#9CA3AF;font-size:12.5px">No recent tax activity.</div>
+                        </#list>
+                        <a href="${appBase}/zenith/tax/FindTaxRate" style="font-size:12.5px;font-weight:600;color:#7C3AED;text-decoration:none">View all activities &#8594;</a>
+                    ]]></text></render-mode>
                 </container>
             </row-col>
         </container-row>
 
-        <container-row>
-            <row-col lg="3" md="6" sm="12">
-                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-md">
-                    <container style="row items-center justify-between">
-                        <container>
-                            <label text="Registrations" type="p" style="text-grey-7 text-uppercase text-weight-bold q-mb-xs"/>
-                            <label text="${totalRegistrations}" type="h4" style="text-dark text-weight-bold q-my-none"/>
-                        </container>
-                        <container style="q-pa-sm bg-purple-1 border-radius-md text-purple-8">
-                            <render-mode><text type="html"><![CDATA[<q-icon name="how_to_reg" class="text-h4"/>]]></text></render-mode>
-                        </container>
-                    </container>
-                </container>
-            </row-col>
-        </container-row>
-
-        <!-- Recent Tax Line Details -->
-        <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mt-md">
-            <container style="row items-center justify-between q-mb-md">
-                <label text="Recent Tax Line Details" type="h5" style="text-weight-bold q-my-none"/>
-            </container>
-            <form-list name="RecentTaxLines" list="recentTaxLines" skip-form="true">
-                <field name="taxLineDetailId"><default-field title="ID">
-                    <display/></default-field></field>
-                <field name="referenceType"><default-field title="Ref Type">
-                    <display/></default-field></field>
-                <field name="referenceId"><default-field title="Ref ID">
-                    <display/></default-field></field>
-                <field name="taxName"><default-field title="Tax">
-                    <display/></default-field></field>
-                <field name="taxRate"><default-field title="Rate">
-                    <display format="#0.##"/></default-field></field>
-                <field name="taxableAmount"><default-field title="Taxable Amount">
-                    <display format="₹#,##0.00"/></default-field></field>
-                <field name="taxAmount"><default-field title="Tax Amount">
-                    <display format="₹#,##0.00"/></default-field></field>
-                <field name="currencyUomId"><default-field title="Currency">
-                    <display/></default-field></field>
+        <!-- ===== Recent Tax Line Details ===== -->
+        <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mt-md z-txntable">
+            <render-mode><text type="html,qvt,vuet" template="true"><![CDATA[
+                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+                    <div style="font-size:15px;font-weight:600;color:var(--z-text-main,#111827)">Recent Tax Line Details</div>
+                    <a href="${appBase}/zenith/tax/FindTaxRate" style="font-size:12.5px;font-weight:600;color:#7C3AED;text-decoration:none">View all &#8594;</a>
+                </div>
+            ]]></text></render-mode>
+            <form-list name="RecentTaxLines" list="recentTaxLines" list-entry="tl" skip-form="true">
+                <row-actions><script><![CDATA[
+                    def n = (tl.taxName ?: '').toString().toUpperCase().trim()
+                    taxBadge = (n.startsWith('SGST') || n.startsWith('UTGST')) ? 'success' : (n.startsWith('CGST') ? 'info' : (n.startsWith('IGST') ? 'primary' : 'grey'))
+                    taxShort = (n.startsWith('SGST')) ? 'SGST' : (n.startsWith('CGST') ? 'CGST' : (n.startsWith('IGST') ? 'IGST' : (n.startsWith('UTGST') ? 'UTGST' : (tl.taxName ?: '—'))))
+                    rateStr = (tl.taxRate != null) ? ec.l10n.format(tl.taxRate, '#0.##') : '—'
+                    dateStr = (tl.lastUpdatedStamp != null) ? ec.l10n.format(tl.lastUpdatedStamp, 'dd MMM yyyy') : ''
+                ]]></script></row-actions>
+                <field name="taxLineDetailId"><header-field title="ID"/>
+                    <default-field title="ID"><label text="${tl.taxLineDetailId}" type="span" style="z-vtext"/></default-field></field>
+                <field name="referenceType"><header-field title="Ref Type"/>
+                    <default-field title="Ref Type"><label text="${tl.referenceType ?: '—'}" type="span" style="text-dark"/></default-field></field>
+                <field name="referenceId"><header-field title="Ref ID"/>
+                    <default-field title="Ref ID"><label text="${tl.referenceId ?: '—'}" type="span" style="z-vtext"/></default-field></field>
+                <field name="taxName"><header-field title="Tax"/>
+                    <default-field title="Tax"><label text="${taxShort}" type="span" style="zenith-badge nd ${taxBadge}"/></default-field></field>
+                <field name="taxRate"><header-field title="Rate (%)"/>
+                    <default-field title="Rate (%)"><label text="${rateStr}" type="span" style="text-dark"/></default-field></field>
+                <field name="taxableAmount"><header-field title="Taxable Amount"/>
+                    <default-field title="Taxable Amount"><label text="₹${ec.l10n.format(tl.taxableAmount ?: 0, '#,##0.00')}" type="span" style="z-amt-green"/></default-field></field>
+                <field name="taxAmount"><header-field title="Tax Amount"/>
+                    <default-field title="Tax Amount"><label text="₹${ec.l10n.format(tl.taxAmount ?: 0, '#,##0.00')}" type="span" style="z-amt-orange"/></default-field></field>
+                <field name="currencyUomId"><header-field title="Currency"/>
+                    <default-field title="Currency"><label text="${tl.currencyUomId ?: 'INR'}" type="span" style="text-grey-7"/></default-field></field>
+                <field name="dateCol"><header-field title="Date"/>
+                    <default-field title="Date"><label text="${dateStr}" type="span" style="text-grey-7"/></default-field></field>
+                <field name="rowMenu"><default-field title="">
+                    <label text="&#8942;" type="span" style="z-kebab-static"/></default-field></field>
             </form-list>
         </container>
     </widgets>
