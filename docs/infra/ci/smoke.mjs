@@ -32,9 +32,11 @@ const PATHS = [
   '/apps/zenith/Contacts/ContactsDashboard',
   '/apps/zenith/Contacts/FindContact',
   '/apps/zenith/Dashboard',
+  '/apps/zenith/Inventory/InventoryDashboard',
   '/qapps/zenith',
   '/qapps/zenith/Contacts/ContactsDashboard',
   '/qapps/zenith/Contacts/FindContact',
+  '/qapps/zenith/Inventory/InventoryDashboard',
 ];
 
 const ERR_SIG = /(java\.lang\.|groovy\.lang\.|org\.moqui\.\w+Exception|freemarker\.core|ScreenRenderException|Error rendering|500 Internal Server Error|HTTP Status 500)/i;
