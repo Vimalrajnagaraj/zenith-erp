@@ -67,24 +67,26 @@ jobs:
             docker cp "docs/infra/ci/base-overrides/$f" "$CID:/opt/moqui/runtime/base-component/webroot/screen/webroot/$f"
           done
 
-      - name: Load seed + demo data, then CI isolation fixtures
+      - name: Load seed + demo data (CI fixtures auto-discovered in ONE pass)
         # Exploded Moqui runtime: java -cp . MoquiStart from /opt/moqui; java at /opt/java/openjdk/bin/java.
-        # TWO separate invocations ON PURPOSE:
-        #   1) demo data via types=  -> creates john.doe / EX_JOHN_DOE, the _NA_ owner party, demo orgs.
-        #      A `location=` arg SUPPRESSES types= (Moqui then loads ONLY the location), so demo must be
-        #      its own call — passing both loads only the fixture and login breaks (proven: 0 users).
-        #   2) the isolation fixture via location=. It depends on step 1 (Party.ownerPartyId defaults to
-        #      _NA_, and the fixture references EX_JOHN_DOE), so it MUST run after demo.
-        # ES is disabled in the compose (elasticsearch_url empty) so the 2nd load's Party index-on-save
-        # is a no-op instead of throwing against the absent OpenSearch host (which killed earlier runs).
+        # ONE load JVM ON PURPOSE. Two hard lessons are baked in here:
+        #   * A MoquiStart `load` with BOTH types= and location= loads ONLY the location (suppresses
+        #     types) -> demo never loads -> login 302. And a SECOND back-to-back `load` JVM collides
+        #     with the first on the Bitronix tx-log lock (btm1.tlog is locked -> cannot open disk journal).
+        #   So instead of a second load, we docker-cp the fixture into a component's data/ dir and let
+        #   the single types-based load AUTO-DISCOVER it (Moqui scans every component/<name>/data/*.xml
+        #   by type). It's type="demo", and zenith-erp-* load after mantle/PopCommerce, so it lands in
+        #   the demo phase AFTER EX_JOHN_DOE and AFTER the seed phase (OrgInternal / PrtAgent) it needs.
+        # ES is disabled in the compose (elasticsearch_url empty) so Party index-on-save is a no-op
+        # rather than throwing against the absent OpenSearch host.
         run: |
           set -x
           CID=$(docker compose -f "$COMPOSE" ps -q moqui)
+          docker exec "$CID" sh -lc 'mkdir -p /opt/moqui/runtime/component/zenith-erp-contacts/data'
+          docker cp docs/infra/ci/seed/isolation.xml \
+            "$CID:/opt/moqui/runtime/component/zenith-erp-contacts/data/CITestIsolationDemoData.xml"
           docker exec "$CID" sh -lc 'cd /opt/moqui && /opt/java/openjdk/bin/java -cp . MoquiStart load types=seed,seed-initial,demo' \
-            || echo "::warning::demo load reported errors — see logs (loader skips bad files)"
-          docker cp docs/infra/ci/seed/isolation.xml "$CID:/tmp/isolation.xml"
-          docker exec "$CID" sh -lc 'cd /opt/moqui && /opt/java/openjdk/bin/java -cp . MoquiStart load location=/tmp/isolation.xml' \
-            || echo "::warning::isolation fixture load reported errors — see logs"
+            || echo "::warning::data load reported errors — see logs (loader skips bad files)"
 
       - name: Restart Moqui (pick up overlaid code + loaded data, fresh caches)
         run: docker compose -f "$COMPOSE" restart moqui
