@@ -2,28 +2,50 @@
 <screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
         xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
         default-menu-title="Update Commission" default-menu-include="false" require-authentication="true">
+    <always-actions>
+        <service-call name="zenith.sales.SalesAccessServices.get#AuthorizedActiveOrganization" out-map="_salesScope"/>
+        <set field="_salesOrgId" from="_salesScope.activeOrgId"/>
+    </always-actions>
+
 
     <!-- SL-084 f/u: edit an existing commission structure's rate/validity. Org-guarded on BOTH the view
          (below) and the update transition so a user can't read or change another tenant's structure. -->
     <transition name="updateStructure">
+        <parameter name="rate" type="BigDecimal"/>
+        <parameter name="validFrom" type="Date"/>
+        <parameter name="validTo" type="Date"/>
         <actions>
             <entity-find-one entity-name="zenith.erp.sales.CommissionStructure" value-field="_cs"><field-map field-name="commissionId"/></entity-find-one>
-            <set field="_org" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-            <if condition="_cs == null || (_org &amp;&amp; _cs.organizationPartyId != _org &amp;&amp; !ec.user.isInGroup('ADMIN'))">
+            <set field="_org" from="_salesOrgId"/>
+            <if condition="_cs == null || ((!_org || _cs.organizationPartyId != _org) &amp;&amp; !ec.user.isInGroup('ADMIN'))">
                 <return error="true" message="Commission structure not found for your account."/>
             </if>
-            <service-call name="update#zenith.erp.sales.CommissionStructure"
-                          in-map="[commissionId:commissionId, rate:rate, validFrom:validFrom, validTo:validTo, isActive:isActive]"/>
+            <script><![CDATA[
+                if (!rate?.toString()?.trim()) { ec.message.addError('Enter a commission rate.'); return }
+                def percent=_cs.commissionTypeEnumId in ['CmtPercentage','CmtTiered']
+                def input=ec.service.sync().name('zenith.sales.SalesLineServices.validate#LineInput').parameters([quantity:1,unitAmount:rate,discountPercent:(percent ? rate : 0)]).call()
+                if (!input?.valid) return
+                def from, to
+                try {
+                    from=validFrom?.toString()?.trim() ? java.sql.Date.valueOf(validFrom.toString().trim()) : null
+                    to=validTo?.toString()?.trim() ? java.sql.Date.valueOf(validTo.toString().trim()) : null
+                } catch (IllegalArgumentException ignored) { ec.message.addError('Enter valid commission dates.'); return }
+                if ((from != null && to != null && to < from) || (isActive && !(isActive in ['Y','N']))) {
+                    ec.message.addError('Enter a valid commission date range and active setting.'); return
+                }
+                ec.service.sync().name('update#zenith.erp.sales.CommissionStructure').parameters([commissionId:commissionId,rate:input.unitAmountValue,validFrom:from,validTo:to,isActive:isActive]).call()
+            ]]></script>
             <return message="Commission structure updated."/>
         </actions>
         <default-response url="../Commissions"/>
+        <error-response url="."/>
     </transition>
 
     <actions>
         <entity-find-one entity-name="zenith.erp.sales.CommissionStructure" value-field="structure"/>
-        <set field="_org" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+        <set field="_org" from="_salesOrgId"/>
         <!-- deny cross-tenant read: blank out the structure so the form never renders another org's data -->
-        <if condition="structure != null &amp;&amp; _org &amp;&amp; structure.organizationPartyId != _org &amp;&amp; !ec.user.isInGroup('ADMIN')">
+        <if condition="structure != null &amp;&amp; (!_org || structure.organizationPartyId != _org) &amp;&amp; !ec.user.isInGroup('ADMIN')">
             <set field="structure" from="null"/>
         </if>
         <entity-find-one entity-name="mantle.party.PartyDetail" value-field="_pd"><field-map field-name="partyId" from="structure?.partyId"/></entity-find-one>

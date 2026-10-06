@@ -23,14 +23,25 @@
         </in-parameters>
         <out-parameters><parameter name="deliveryChallanId"/></out-parameters>
         <actions>
+            <service-call name="zenith.sales.SalesAccessServices.get#AuthorizedActiveOrganization" out-map="scope"/>
+            <if condition="!scope.activeOrgId"><return error="true" message="Select an organization before creating a delivery challan."/></if>
+            <service-call name="zenith.sales.SalesAccessServices.assert#RecordOrgAccess" out-map="customerAccess" in-map="[entityName:'mantle.party.Party', idField:'partyId', idValue:customerPartyId, orgField:'ownerPartyId']"/>
+            <if condition="!customerAccess.allowed"><return error="true" message="Select a customer from your organization."/></if>
+            <iterate list="items" entry="item">
+                <service-call name="zenith.sales.SalesLineServices.validate#LineInput" out-map="line" in-map="[quantity:item.quantity,unitAmount:item.unitPrice]"/>
+                <if condition="!line.valid"><return/></if>
+                <service-call name="zenith.sales.SalesAccessServices.assert#RecordOrgAccess" out-map="productAccess" in-map="[entityName:'mantle.product.Product',idField:'productId',idValue:item.productId,orgField:'ownerPartyId']"/>
+                <if condition="!productAccess.allowed"><return error="true" message="Select a product from your organization."/></if>
+            </iterate>
             <service-call name="create#zenith.erp.sales.DeliveryChallan"
-                          in-map="context + [statusId:'DcDraft', challanDate:challanDate]" out-map="context"/>
+                          in-map="context + [organizationPartyId:scope.activeOrgId, statusId:'DcDraft', challanDate:challanDate]" out-map="created"/>
+            <set field="deliveryChallanId" from="created.challanId"/>
             <if condition="items">
                 <set field="seqNum" from="0" type="Integer"/>
                 <iterate list="items" entry="item">
                     <set field="seqNum" from="seqNum + 1"/>
                     <service-call name="create#zenith.erp.sales.DeliveryChallanItem"
-                                  in-map="[deliveryChallanId:deliveryChallanId,
+                                  in-map="[challanId:deliveryChallanId,
                                            challanItemSeqId:String.format('%05d', seqNum),
                                            productId:item.productId, quantity:item.quantity,
                                            unitPrice:item.unitPrice, batchNumber:item.batchNumber]"/>
@@ -43,32 +54,59 @@
     <service verb="issue" noun="DeliveryChallan">
         <in-parameters><parameter name="deliveryChallanId" required="true"/></in-parameters>
         <actions>
-            <service-call name="update#zenith.erp.sales.DeliveryChallan"
-                          in-map="[deliveryChallanId:deliveryChallanId, statusId:'DcIssued']"/>
+            <service-call name="zenith.sales.SalesAccessServices.get#AuthorizedActiveOrganization" out-map="scope"/>
+            <service-call name="zenith.sales.SalesAccessServices.assert#RecordOrgAccess" out-map="access" in-map="[entityName:'zenith.erp.sales.DeliveryChallan', idField:'challanId', idValue:deliveryChallanId, orgField:'organizationPartyId']"/>
+            <if condition="!access.allowed"><return error="true" message="Delivery challan not found for your account."/></if>
+            <entity-find-one entity-name="zenith.erp.sales.DeliveryChallan" value-field="dc" for-update="true"><field-map field-name="challanId" from="deliveryChallanId"/></entity-find-one>
+            <if condition="dc == null || dc.convertedToInvoiceId || !(dc.statusId in ['DcDraft','ChallanDraft'])"><return error="true" message="Only a draft challan can be issued."/></if>
+            <if condition="dc.statusId == 'ChallanDraft'">
+                <service-call name="update#zenith.erp.sales.DeliveryChallan" in-map="[challanId:deliveryChallanId,statusId:'DcDraft']"/>
+            </if>
+            <service-call name="update#zenith.erp.sales.DeliveryChallan" in-map="[challanId:deliveryChallanId,statusId:'DcIssued']"/>
         </actions>
     </service>
 
-    <!-- Convert Delivery Challan to Invoice -->
+    <!-- Convert a Sales challan once; serialize competing requests on its owning header. -->
     <service verb="convert" noun="ChallanToInvoice">
         <in-parameters><parameter name="deliveryChallanId" required="true"/></in-parameters>
         <out-parameters><parameter name="invoiceId"/></out-parameters>
         <actions>
-            <entity-find-one entity-name="zenith.erp.sales.DeliveryChallan" value-field="dc"/>
+            <service-call name="zenith.sales.SalesAccessServices.get#AuthorizedActiveOrganization" out-map="scope"/>
+            <entity-find-one entity-name="zenith.erp.sales.DeliveryChallan" value-field="dc" for-update="true">
+                <field-map field-name="challanId" from="deliveryChallanId"/>
+            </entity-find-one>
+            <if condition="dc == null || ((!scope.activeOrgId || dc.organizationPartyId != scope.activeOrgId) &amp;&amp; !ec.user.isInGroup('ADMIN'))">
+                <return error="true" message="Delivery challan not found for your account."/>
+            </if>
+            <if condition="dc.convertedToInvoiceId"><set field="invoiceId" from="dc.convertedToInvoiceId"/><return/></if>
+            <if condition="dc.statusId in ['DcCancelled','ChallanCancelled','DcReturned','ChallanReturned']"><return error="true" message="A cancelled or returned challan cannot be invoiced."/></if>
+            <if condition="dc.statusId in ['DcConverted','ChallanConverted']"><return error="true" message="This challan is marked converted but has no invoice link; ask an administrator to reconcile it."/></if>
+            <script><![CDATA[
+                def aliases=[ChallanDraft:'DcDraft',ChallanDispatched:'DcIssued',ChallanDelivered:'DcDelivered']
+                if(aliases[dc.statusId]) ec.service.sync().name('update#zenith.erp.sales.DeliveryChallan').parameters([challanId:deliveryChallanId,statusId:aliases[dc.statusId]]).call()
+            ]]></script>
+            <if condition="!dc.customerPartyId"><return error="true" message="Select a customer before converting this challan."/></if>
             <entity-find entity-name="zenith.erp.sales.DeliveryChallanItem" list="dcItems">
-                <econdition field-name="deliveryChallanId"/></entity-find>
-            <!-- Create sales invoice from DC items -->
-            <set field="invoiceItems" from="[]"/>
-            <iterate list="dcItems" entry="di">
-                <set field="invoiceItems" from="invoiceItems + [[productId:di.productId,
-                    quantity:di.quantity, unitPrice:di.unitPrice ?: 0]]"/>
-            </iterate>
-            <service-call name="zenith.sales.SalesInvoiceServices.create#SalesInvoice"
-                          in-map="[customerPartyId:dc.customerPartyId, items:invoiceItems]"
-                          out-map="invoiceResult"/>
-            <set field="invoiceId" from="invoiceResult.invoiceId"/>
-            <service-call name="update#zenith.erp.sales.DeliveryChallan"
-                          in-map="[deliveryChallanId:deliveryChallanId,
-                                   statusId:'DcConverted', convertedToInvoiceId:invoiceId]"/>
+                <econdition field-name="challanId" from="deliveryChallanId"/><order-by field-name="challanItemSeqId"/>
+            </entity-find>
+            <if condition="!dcItems"><return error="true" message="Add at least one goods item before converting this challan."/></if>
+            <script><![CDATA[
+                def invoiceItems = []
+                for (item in dcItems) {
+                    if (item.quantity == null || item.quantity <= 0) { ec.message.addError('Challan quantities must be greater than zero.'); return }
+                    def price = item.unitPrice != null ? item.unitPrice :
+                        ((item.estimatedValue ?: 0) as BigDecimal).divide(item.quantity as BigDecimal, 5, java.math.RoundingMode.HALF_UP)
+                    invoiceItems.add([productId:item.productId, itemDescription:item.description ?: item.remarks,
+                        quantity:item.quantity, unitAmount:price, productTaxCode:item.hsnSacCode])
+                }
+                def result=ec.service.sync().name('zenith.sales.SalesInvoiceServices.create#SalesInvoice').parameters([
+                    organizationPartyId:dc.organizationPartyId, customerPartyId:dc.customerPartyId,
+                    currencyUomId:'INR', items:invoiceItems]).call()
+                if (ec.message.hasError() || !result?.invoiceId) return
+                invoiceId=result.invoiceId
+                ec.service.sync().name('update#zenith.erp.sales.DeliveryChallan').parameters([
+                    challanId:deliveryChallanId, statusId:'DcConverted', convertedToInvoiceId:invoiceId]).call()
+            ]]></script>
         </actions>
     </service>
 
@@ -86,6 +124,9 @@
         </in-parameters>
         <out-parameters><parameter name="warrantyPolicyId"/></out-parameters>
         <actions>
+            <service-call name="zenith.sales.SalesAccessServices.get#AuthorizedActiveOrganization" out-map="scope"/>
+            <if condition="!scope.activeOrgId"><return error="true" message="Select an organization before creating a warranty policy."/></if>
+            <if condition="durationMonths &lt;= 0"><return error="true" message="Warranty duration must be greater than zero."/></if>
             <!-- ZE-SALES-025 (SL-085): Extended months/cost only apply to an EXTENDABLE policy. If it isn't
                  extendable, drop any values the form carried so the stored policy stays consistent (the UI also
                  disables/clears them, but enforce it server-side so the data is correct regardless). -->
@@ -94,7 +135,7 @@
                 <set field="extendedCost" from="null"/>
             </if>
             <!-- ZE-SALES-037: stamp the owning tenant so the policies list (org-scoped) shows it back. -->
-            <set field="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <set field="organizationPartyId" from="scope.activeOrgId"/>
             <service-call name="create#zenith.erp.sales.WarrantyPolicy" in-map="context" out-map="context"/>
         </actions>
     </service>
@@ -111,19 +152,23 @@
         </in-parameters>
         <out-parameters><parameter name="warrantyRegId"/></out-parameters>
         <actions>
+            <service-call name="zenith.sales.SalesAccessServices.get#AuthorizedActiveOrganization" out-map="scope"/>
             <!-- ZE-SB-013 (Tier 1 tail): the customer and product on a warranty registration must belong to this org. -->
-            <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" out-map="_ca"
+            <service-call name="zenith.sales.SalesAccessServices.assert#RecordOrgAccess" out-map="_ca"
                           in-map="[entityName:'mantle.party.Party', idField:'partyId', idValue:customerPartyId, orgField:'ownerPartyId']"/>
             <if condition="!_ca.allowed"><return error="true" message="That customer isn't part of your organization."/></if>
-            <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" out-map="_pa"
+            <service-call name="zenith.sales.SalesAccessServices.assert#RecordOrgAccess" out-map="_pa"
                           in-map="[entityName:'mantle.product.Product', idField:'productId', idValue:productId, orgField:'ownerPartyId']"/>
             <if condition="!_pa.allowed"><return error="true" message="Please select a valid product from your account."/></if>
             <entity-find-one entity-name="zenith.erp.sales.WarrantyPolicy" value-field="policy"/>
+            <service-call name="zenith.sales.SalesAccessServices.assert#RecordOrgAccess" out-map="policyAccess" in-map="[entityName:'zenith.erp.sales.WarrantyPolicy', idField:'warrantyPolicyId', idValue:warrantyPolicyId, orgField:'organizationPartyId']"/>
+            <if condition="policy == null || !policyAccess.allowed"><return error="true" message="Select a warranty policy from your organization."/></if>
+            <if condition="policy.durationMonths == null || policy.durationMonths &lt;= 0"><return error="true" message="Warranty duration must be greater than zero."/></if>
             <set field="warrantyStartDate" from="purchaseDate"/>
             <script><![CDATA[
                 def cal = Calendar.getInstance()
                 cal.time = java.sql.Date.valueOf(purchaseDate.toString())
-                cal.add(Calendar.MONTH, policy.durationMonths ?: 12)
+                cal.add(Calendar.MONTH, policy.durationMonths)
                 warrantyEndDate = new java.sql.Date(cal.timeInMillis)
             ]]></script>
             <service-call name="create#zenith.erp.sales.WarrantyRegistration"
@@ -142,13 +187,19 @@
         </in-parameters>
         <out-parameters><parameter name="warrantyClaimId"/></out-parameters>
         <actions>
+            <service-call name="zenith.sales.SalesAccessServices.get#AuthorizedActiveOrganization" out-map="scope"/>
             <entity-find-one entity-name="zenith.erp.sales.WarrantyRegistration" value-field="reg"/>
-            <if condition="reg.statusId != 'WrActive'">
+            <if condition="reg == null"><return error="true" message="Warranty registration not found."/></if>
+            <service-call name="zenith.sales.SalesAccessServices.assert#RecordOrgAccess" out-map="customerAccess" in-map="[entityName:'mantle.party.Party', idField:'partyId', idValue:reg.customerPartyId, orgField:'ownerPartyId']"/>
+            <if condition="!customerAccess.allowed"><return error="true" message="Warranty registration not found for your account."/></if>
+            <set field="today" from="java.sql.Date.valueOf(ec.l10n.format(ec.user.nowTimestamp, 'yyyy-MM-dd'))"/>
+            <if condition="reg.statusId != 'WrActive' || reg.warrantyStartDate == null || reg.warrantyEndDate == null || reg.warrantyStartDate &gt; today || reg.warrantyEndDate &lt; today">
                 <return error="true" message="Warranty is not active"/>
             </if>
             <service-call name="create#zenith.erp.sales.WarrantyClaim"
                           in-map="context + [claimDate:ec.user.nowTimestamp, statusId:'WcFiled']"
-                          out-map="context"/>
+                          out-map="claimResult"/>
+            <set field="warrantyClaimId" from="claimResult.claimId"/>
         </actions>
     </service>
 
@@ -161,8 +212,16 @@
             <parameter name="serviceCost" type="BigDecimal" default-value="0"/>
         </in-parameters>
         <actions>
+            <service-call name="zenith.sales.SalesAccessServices.get#AuthorizedActiveOrganization" out-map="scope"/>
+            <entity-find-one entity-name="zenith.erp.sales.WarrantyClaim" value-field="claim"><field-map field-name="claimId" from="warrantyClaimId"/></entity-find-one>
+            <if condition="claim == null"><return error="true" message="Warranty claim not found."/></if>
+            <entity-find-one entity-name="zenith.erp.sales.WarrantyRegistration" value-field="registration"><field-map field-name="warrantyRegId" from="claim.warrantyRegId"/></entity-find-one>
+            <if condition="registration == null"><return error="true" message="Warranty registration not found."/></if>
+            <service-call name="zenith.sales.SalesAccessServices.assert#RecordOrgAccess" out-map="access" in-map="[entityName:'mantle.party.Party',idField:'partyId',idValue:registration.customerPartyId,orgField:'ownerPartyId']"/>
+            <if condition="!access.allowed"><return error="true" message="Warranty claim not found for your account."/></if>
+            <if condition="serviceCost &lt; 0"><return error="true" message="Service cost cannot be negative."/></if>
             <service-call name="update#zenith.erp.sales.WarrantyClaim"
-                          in-map="[warrantyClaimId:warrantyClaimId, statusId:'WcResolved',
+                          in-map="[claimId:warrantyClaimId, statusId:'WcResolved',
                                    resolutionEnumId:resolutionEnumId, resolutionNotes:resolutionNotes,
                                    serviceCost:serviceCost, resolvedDate:ec.user.nowTimestamp]"/>
         </actions>

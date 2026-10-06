@@ -2,6 +2,11 @@
 <screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
         xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
         default-menu-title="Tax Invoice" default-menu-include="false">
+    <always-actions>
+        <service-call name="zenith.sales.SalesAccessServices.get#AuthorizedActiveOrganization" out-map="_salesScope"/>
+        <set field="_salesOrgId" from="_salesScope.activeOrgId"/>
+    </always-actions>
+
 
     <parameter name="invoiceId" required="true"/>
 
@@ -10,15 +15,17 @@
     <transition name="updateInvoice">
         <actions>
             <!-- Org-isolation: re-check ownership by PK before update (block cross-tenant IDOR). Sales invoice org = fromPartyId. -->
-            <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-            <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="curInv"/>
-            <if condition="curInv == null || (activeOrg &amp;&amp; curInv.fromPartyId != activeOrg &amp;&amp; !ec.user.isInGroup('ADMIN'))">
+            <set field="activeOrg" from="_salesOrgId"/>
+            <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="curInv" for-update="true"/>
+            <if condition="curInv == null || ((!activeOrg || curInv.fromPartyId != activeOrg) &amp;&amp; !ec.user.isInGroup('ADMIN'))">
                 <return error="true" message="Invoice not found for your account."/>
             </if>
             <!-- ZE-SALES-007 f/u: don't let an item-less invoice be finalized/issued (mantle auto-marks a
                  zero-balance invoice "Payment Received" on finalize). Only fires on an actual change TO an
                  issued status; draft edits and Cancel stay allowed. Mirrors the EditCreditNote guard. -->
             <set field="_newStatus" from="ec.web.parameters.statusId"/>
+            <if condition="curInv.statusId != 'InvoiceInProcess' &amp;&amp; _newStatus == 'InvoiceInProcess'"><return error="true" message="An issued invoice cannot be returned to draft."/></if>
+            <if condition="_newStatus == 'InvoicePmtRecvd' &amp;&amp; curInv.statusId != 'InvoicePmtRecvd'"><return error="true" message="Record a payment to settle this invoice."/></if>
             <if condition="_newStatus &amp;&amp; _newStatus != curInv.statusId &amp;&amp; _newStatus != 'InvoiceInProcess' &amp;&amp; _newStatus != 'InvoiceCancelled'">
                 <entity-find-count entity-name="mantle.account.invoice.InvoiceItem" count-field="_itemCnt">
                     <econdition field-name="invoiceId"/>
@@ -27,9 +34,23 @@
                     <return error="true" message="Add at least one item before finalizing or issuing this invoice."/>
                 </if>
             </if>
-            <service-call name="update#mantle.account.invoice.Invoice" in-map="context"/>
+            <script><![CDATA[
+                def forbidden=['fromPartyId','toPartyId','gstInvoiceNumber','customInvoiceNumber','originalInvoiceId','invoiceTotal','totalTaxableAmount','totalTaxAmount','totalCgst','totalSgst','totalIgst','appliedPaymentsTotal','unpaidTotal','invoiceDate']
+                if (forbidden.any { ec.web.parameters.containsKey(it) }) { ec.message.addError('Use the Sales form controls; ownership, numbering and stored totals cannot be changed here.'); return }
+                def fields=['statusId', 'buyerGstin', 'supplierGstin', 'placeOfSupplyStateCode', 'isExport', 'lutBondNumber', 'shippingBillNumber', 'shippingBillDate', 'einvoiceId', 'ewayBillId', 'transporterId', 'vehicleNumber', 'lrNumber', 'invoiceMessage']
+                def taxFields=['buyerGstin', 'supplierGstin', 'placeOfSupplyStateCode', 'isExport', 'lutBondNumber', 'shippingBillNumber', 'shippingBillDate', 'invoiceMessage']
+                if (curInv.statusId != 'InvoiceInProcess' && taxFields.any { ec.web.parameters.containsKey(it) && (ec.web.parameters[it]?.toString() ?: '') != (curInv.get(it)?.toString() ?: '') }) {
+                    ec.message.addError('Issued invoice tax details cannot be changed. Raise a credit or debit note instead.'); return
+                }
+                def updates=[invoiceId:invoiceId]
+                fields.each { if (ec.web.parameters.containsKey(it)) updates[it]=ec.web.parameters[it] }
+                ec.service.sync().name('update#mantle.account.invoice.Invoice').parameters(updates).call()
+                if (!ec.message.hasError() && curInv.statusId=='InvoiceInProcess' && ['buyerGstin','supplierGstin','placeOfSupplyStateCode','isExport'].any { updates.containsKey(it) })
+                    ec.service.sync().name('zenith.sales.SalesLineServices.refresh#DraftInvoiceTaxes').parameters([invoiceId:invoiceId]).call()
+            ]]></script>
         </actions>
         <default-response url="."/>
+        <error-response url="."/>
     </transition>
 
     <transition name="markPaidCash">
@@ -40,9 +61,9 @@
                  this instance tracks invoices by status, not double-entry GL) and settles the invoice to Payment
                  Received. Mirrors the proven PaymentGatewayServices flow; a direct entity-update is used because
                  update#Invoice's status flow rejects ->PmtRecvd while unpaidTotal != 0. Org-scoped; draft + items only. -->
-            <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-            <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="curInv"/>
-            <if condition="curInv == null || (activeOrg &amp;&amp; curInv.fromPartyId != activeOrg &amp;&amp; !ec.user.isInGroup('ADMIN'))">
+            <set field="activeOrg" from="_salesOrgId"/>
+            <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="curInv" for-update="true"/>
+            <if condition="curInv == null || ((!activeOrg || curInv.fromPartyId != activeOrg) &amp;&amp; !ec.user.isInGroup('ADMIN'))">
                 <return error="true" message="Invoice not found for your account."/>
             </if>
             <if condition="!(curInv.statusId in ['InvoiceInProcess','InvoiceFinalized','InvoiceSent','InvoiceAcked'])">
@@ -53,33 +74,37 @@
                 <return error="true" message="Add at least one item before marking this invoice paid."/>
             </if>
             <script><![CDATA[
-                def _grand = ((curInv.invoiceTotal ?: 0) + (curInv.totalCgst ?: 0) + (curInv.totalSgst ?: 0) + (curInv.totalIgst ?: 0)) as BigDecimal
+                def _due = ec.service.sync().name('zenith.sales.SalesLineServices.get#InvoicePayable').parameters([invoiceId:invoiceId]).call()
+                if (ec.message.hasError()) return
+                def _grand = _due.payableAmount
+                if (_grand <= 0) { ec.message.addError('This invoice has no payable balance.'); return }
                 ec.service.sync().name("create#mantle.account.payment.Payment").parameters([
                     fromPartyId: curInv.toPartyId, toPartyId: curInv.fromPartyId, forInvoiceId: curInv.invoiceId,
                     paymentTypeEnumId: 'PtInvoicePayment', paymentInstrumentEnumId: 'PiCash',
                     amount: _grand, amountUomId: curInv.currencyUomId, effectiveDate: ec.user.nowTimestamp,
                     statusId: 'PmntPromised']).call()
                 def _iu = ec.entity.find("mantle.account.invoice.Invoice").condition("invoiceId", invoiceId).one()
-                _iu.statusId = 'InvoicePmtRecvd'; _iu.appliedPaymentsTotal = _grand; _iu.unpaidTotal = 0
+                _iu.statusId = 'InvoicePmtRecvd'; _iu.appliedPaymentsTotal = (curInv.appliedPaymentsTotal ?: 0) + _grand; _iu.unpaidTotal = 0
                 _iu.update()
                 ec.message.addMessage("Invoice marked as paid by cash (₹" + _grand + ").")
             ]]></script>
         </actions>
         <default-response url="."/>
+        <error-response url="."/>
     </transition>
 
     <transition name="addItem">
         <actions>
             <!-- ZE-SB-013 (Tier 2): the line-item product must belong to this org (the parent invoice is guarded below). -->
             <if condition="ec.web.parameters.productId">
-                <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" out-map="_pa"
+                <service-call name="zenith.sales.SalesAccessServices.assert#RecordOrgAccess" out-map="_pa"
                               in-map="[entityName:'mantle.product.Product', idField:'productId', idValue:ec.web.parameters.productId, orgField:'ownerPartyId']"/>
                 <if condition="!_pa.allowed"><return error="true" message="Please select a valid product from your account."/></if>
             </if>
             <!-- Org-isolation: re-check ownership by PK before mutating (block cross-tenant IDOR). Sales invoice org = fromPartyId. -->
-            <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-            <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="curInv"/>
-            <if condition="curInv == null || (activeOrg &amp;&amp; curInv.fromPartyId != activeOrg &amp;&amp; !ec.user.isInGroup('ADMIN'))">
+            <set field="activeOrg" from="_salesOrgId"/>
+            <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="curInv" for-update="true"/>
+            <if condition="curInv == null || ((!activeOrg || curInv.fromPartyId != activeOrg) &amp;&amp; !ec.user.isInGroup('ADMIN'))">
                 <return error="true" message="Invoice not found for your account."/>
             </if>
             <!-- Issued-invoice immutability: a tax invoice is only editable while it is a draft (In-Process).
@@ -123,10 +148,13 @@
                     isInterstate = true
                 }
 
-                def qty = new BigDecimal(quantity ?: 0)
-                def price = new BigDecimal(amount ?: 0)
+                def _line = ec.service.sync().name("zenith.sales.SalesLineServices.validate#LineInput")
+                    .parameters([quantity:quantity, unitAmount:amount, discountPercent:(discountPercent), taxPercentage:taxPercentage]).call()
+                if (!_line?.valid) return
+                def qty = _line.quantityValue
+                def price = _line.unitAmountValue
                 // Sync price with Inventory and Pricing: auto-fill when the user leaves Unit Price blank
-                if (price.signum() == 0 &amp;&amp; productId) {
+                if ((amount == null || amount.toString().trim() == '') &amp;&amp; productId) {
                     try {
                         def _pr = ec.service.sync().name("zenith.pricing.PricingServices.calculate#Price")
                                     .parameters([productId:productId, quantity:(qty.signum()>0?qty:1), organizationPartyId:curInv.fromPartyId, customerPartyId:curInv.toPartyId]).call()
@@ -139,10 +167,10 @@
                 }
                 // ZE-SALES-020 (SL-042): line discount — GST is charged on the DISCOUNTED taxable value.
                 def gross = qty.multiply(price)
-                def discPct = new BigDecimal(discountPercent ?: 0)
+                def discPct = _line.discountPercentValue
                 def discAmt = gross.multiply(discPct).divide(new BigDecimal(100), 2, java.math.RoundingMode.HALF_UP)
                 def taxableVal = gross.subtract(discAmt)
-                def taxPct = new BigDecimal(taxPercentage ?: 0)
+                def taxPct = _line.taxPercentageValue
 
                 def igstRate = 0.0
                 def cgstRate = 0.0
@@ -176,46 +204,32 @@
 
                 // Call standard create item service but pass extended fields
                 def inMap = context + [
+                    quantity: qty,
                     description: _finalDesc,
                     itemTypeEnumId: 'ItemSales',
                     amount: price,
                     taxableAmount: taxableVal,
                     discountPercent: discPct, discountAmount: discAmt,
                     igstRate: igstRate, igstAmount: igstAmount,
+                    totalTaxAmount:cgstAmount+sgstAmount+igstAmount,
                     cgstRate: cgstRate, cgstAmount: cgstAmount,
                     sgstRate: sgstRate, sgstAmount: sgstAmount
                 ]
                 ec.service.sync().name("create#mantle.account.invoice.InvoiceItem").parameters(inMap).call()
 
                 // Refresh the header grand total (invoiceTotal/unpaidTotal) from the items.
-                ec.service.sync().name("mantle.account.InvoiceServices.update#InvoiceTotals").parameters([invoiceId:invoiceId]).call()
-
-                // Aggregate Indian GST totals onto the invoice header (custom fields).
-                def invItems = ec.entity.find("mantle.account.invoice.InvoiceItem").condition("invoiceId", invoiceId).list()
-                def tCgst = 0.0, tSgst = 0.0, tIgst = 0.0, tTaxable = 0.0
-                for (def it : invItems) {
-                    tCgst += (it.cgstAmount ?: 0.0)
-                    tSgst += (it.sgstAmount ?: 0.0)
-                    tIgst += (it.igstAmount ?: 0.0)
-                    tTaxable += (it.taxableAmount ?: ((it.quantity?:1)*(it.amount?:0)))
-                }
-                // ZE-SALES-020 (SL-042): invoiceTotal is the pre-tax subtotal the print adds tax to; keep it =
-                // the discounted taxable (update#InvoiceTotals sums gross line amounts, ignoring the discount).
-                ec.service.sync().name("update#mantle.account.invoice.Invoice").parameters([
-                    invoiceId: invoiceId,
-                    invoiceTotal: tTaxable, unpaidTotal: tTaxable,
-                    totalCgst: tCgst, totalSgst: tSgst, totalIgst: tIgst, totalTaxableAmount: tTaxable
-                ]).call()
+                ec.service.sync().name("zenith.sales.SalesLineServices.refresh#DraftInvoiceTotals").parameters([invoiceId:invoiceId]).call()
             </script>
         </actions>
         <default-response url="."/>
+        <error-response url="."/>
     </transition>
 
     <transition name="setReverseCharge">
         <actions>
-            <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-            <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="curInv"/>
-            <if condition="curInv == null || (activeOrg &amp;&amp; curInv.fromPartyId != activeOrg &amp;&amp; !ec.user.isInGroup('ADMIN'))">
+            <set field="activeOrg" from="_salesOrgId"/>
+            <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="curInv" for-update="true"/>
+            <if condition="curInv == null || ((!activeOrg || curInv.fromPartyId != activeOrg) &amp;&amp; !ec.user.isInGroup('ADMIN'))">
                 <return error="true" message="Invoice not found for your account."/>
             </if>
             <!-- The reverse-charge flag is a tax attribute of the bill; lock it once the invoice is issued. -->
@@ -228,7 +242,7 @@
                 // Re-tax every line: RCM on -> collect zero; RCM off -> restore the amount from the stored rate.
                 def invItems = ec.entity.find("mantle.account.invoice.InvoiceItem").condition("invoiceId", invoiceId).list()
                 for (def it : invItems) {
-                    def taxable = (it.taxableAmount ?: ((it.quantity?:1)*(it.amount?:0))) as BigDecimal
+                    def taxable = (it.taxableAmount != null ? it.taxableAmount : ((it.quantity != null ? it.quantity : 1)*(it.amount ?: 0))) as BigDecimal
                     def cA = new BigDecimal(0), sA = new BigDecimal(0), iA = new BigDecimal(0)
                     if (rcm != 'Y') {
                         cA = taxable.multiply((it.cgstRate ?: 0.0) as BigDecimal).divide(new BigDecimal(100), 2, java.math.RoundingMode.HALF_UP)
@@ -237,28 +251,21 @@
                     }
                     ec.service.sync().name("update#mantle.account.invoice.InvoiceItem").parameters([
                         invoiceId:invoiceId, invoiceItemSeqId:it.invoiceItemSeqId,
-                        cgstAmount:cA, sgstAmount:sA, igstAmount:iA]).call()
+                        cgstAmount:cA, sgstAmount:sA, igstAmount:iA, totalTaxAmount:cA+sA+iA]).call()
                 }
-                ec.service.sync().name("mantle.account.InvoiceServices.update#InvoiceTotals").parameters([invoiceId:invoiceId]).call()
-                def items2 = ec.entity.find("mantle.account.invoice.InvoiceItem").condition("invoiceId", invoiceId).list()
-                def tCgst = 0.0, tSgst = 0.0, tIgst = 0.0, tTaxable = 0.0
-                for (def it : items2) {
-                    tCgst += (it.cgstAmount ?: 0.0); tSgst += (it.sgstAmount ?: 0.0); tIgst += (it.igstAmount ?: 0.0)
-                    tTaxable += (it.taxableAmount ?: ((it.quantity?:1)*(it.amount?:0)))
-                }
-                ec.service.sync().name("update#mantle.account.invoice.Invoice").parameters([
-                    invoiceId:invoiceId, invoiceTotal:tTaxable, unpaidTotal:tTaxable, totalCgst:tCgst, totalSgst:tSgst, totalIgst:tIgst, totalTaxableAmount:tTaxable]).call()
+                ec.service.sync().name("zenith.sales.SalesLineServices.refresh#DraftInvoiceTotals").parameters([invoiceId:invoiceId]).call()
             </script>
         </actions>
         <default-response url="."/>
+        <error-response url="."/>
     </transition>
 
     <transition name="deleteItem">
         <actions>
             <!-- Org-isolation: re-check ownership by PK before delete (block cross-tenant IDOR). Sales invoice org = fromPartyId. -->
-            <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-            <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="curInv"/>
-            <if condition="curInv == null || (activeOrg &amp;&amp; curInv.fromPartyId != activeOrg &amp;&amp; !ec.user.isInGroup('ADMIN'))">
+            <set field="activeOrg" from="_salesOrgId"/>
+            <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="curInv" for-update="true"/>
+            <if condition="curInv == null || ((!activeOrg || curInv.fromPartyId != activeOrg) &amp;&amp; !ec.user.isInGroup('ADMIN'))">
                 <return error="true" message="Invoice not found for your account."/>
             </if>
             <!-- Issued-invoice immutability: items can only be removed while the invoice is a draft (In-Process). -->
@@ -267,24 +274,11 @@
             </if>
             <service-call name="delete#mantle.account.invoice.InvoiceItem" in-map="context"/>
         <script>
-            ec.service.sync().name("mantle.account.InvoiceServices.update#InvoiceTotals").parameters([invoiceId:invoiceId]).call()
-
-            // Re-aggregate GST values
-            def invItems = ec.entity.find("mantle.account.invoice.InvoiceItem").condition("invoiceId", invoiceId).list()
-            def tCgst = 0.0, tSgst = 0.0, tIgst = 0.0, tTaxable = 0.0
-            for (def it : invItems) {
-                tCgst += (it.cgstAmount ?: 0.0)
-                tSgst += (it.sgstAmount ?: 0.0)
-                tIgst += (it.igstAmount ?: 0.0)
-                tTaxable += (it.taxableAmount ?: ((it.quantity?:1)*(it.amount?:0)))
-            }
-            ec.service.sync().name("update#mantle.account.invoice.Invoice").parameters([
-                invoiceId: invoiceId,
-                totalCgst: tCgst, totalSgst: tSgst, totalIgst: tIgst, totalTaxableAmount: tTaxable
-            ]).call()
-        </script>
+            ec.service.sync().name("zenith.sales.SalesLineServices.refresh#DraftInvoiceTotals").parameters([invoiceId:invoiceId]).call()
+            </script>
         </actions>
         <default-response url="."/>
+        <error-response url="."/>
     </transition>
 
     <!-- ZE-SALES-002 (SL-051): edit a line's quantity / unit price. Same guards as add/delete (org-isolation +
@@ -292,9 +286,9 @@
          rates (mirrors the reverse-charge re-tax), then refresh the invoice + Indian-GST totals. -->
     <transition name="updateItem">
         <actions>
-            <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-            <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="curInv"/>
-            <if condition="curInv == null || (activeOrg &amp;&amp; curInv.fromPartyId != activeOrg &amp;&amp; !ec.user.isInGroup('ADMIN'))">
+            <set field="activeOrg" from="_salesOrgId"/>
+            <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="curInv" for-update="true"/>
+            <if condition="curInv == null || ((!activeOrg || curInv.fromPartyId != activeOrg) &amp;&amp; !ec.user.isInGroup('ADMIN'))">
                 <return error="true" message="Invoice not found for your account."/>
             </if>
             <if condition="curInv.statusId != 'InvoiceInProcess'">
@@ -310,13 +304,16 @@
                     ec.message.addError("Quantity, Unit Price and Discount must be numbers (letters aren't allowed).")
                     return
                 }
-                def qty = new BigDecimal(quantity ?: 0)
-                def price = new BigDecimal(amount ?: 0)
+                def _line = ec.service.sync().name("zenith.sales.SalesLineServices.validate#LineInput")
+                    .parameters([quantity:quantity, unitAmount:amount, discountPercent:(ec.web.parameters.containsKey('discountPercent') ? ec.web.parameters.discountPercent : item.discountPercent), taxPercentage:null]).call()
+                if (!_line?.valid) return
+                def qty = _line.quantityValue
+                def price = _line.unitAmountValue
                 if (qty.signum() <= 0) { ec.message.addError("Quantity must be greater than zero."); return }
                 if (price.signum() < 0) { ec.message.addError("Unit price cannot be negative."); return }
                 // ZE-SALES-020 (SL-042): keep the line discount when qty/price is edited (posted value if the
                 // edit form changed it, else the stored one); GST stays on the discounted value.
-                def discPct = new BigDecimal(discountPercent ?: (item.discountPercent ?: 0))
+                def discPct = _line.discountPercentValue
                 def gross = qty.multiply(price)
                 def discAmt = gross.multiply(discPct).divide(new BigDecimal(100), 2, java.math.RoundingMode.HALF_UP)
                 def taxableVal = gross.subtract(discAmt)
@@ -331,19 +328,12 @@
                     invoiceId:invoiceId, invoiceItemSeqId:invoiceItemSeqId,
                     quantity:qty, amount:price, taxableAmount:taxableVal,
                     discountPercent:discPct, discountAmount:discAmt,
-                    cgstAmount:cgstAmount, sgstAmount:sgstAmount, igstAmount:igstAmount]).call()
-                ec.service.sync().name("mantle.account.InvoiceServices.update#InvoiceTotals").parameters([invoiceId:invoiceId]).call()
-                def invItems = ec.entity.find("mantle.account.invoice.InvoiceItem").condition("invoiceId", invoiceId).list()
-                def tCgst = 0.0, tSgst = 0.0, tIgst = 0.0, tTaxable = 0.0
-                for (def it : invItems) {
-                    tCgst += (it.cgstAmount ?: 0.0); tSgst += (it.sgstAmount ?: 0.0); tIgst += (it.igstAmount ?: 0.0)
-                    tTaxable += (it.taxableAmount ?: ((it.quantity?:1)*(it.amount?:0)))
-                }
-                ec.service.sync().name("update#mantle.account.invoice.Invoice").parameters([
-                    invoiceId:invoiceId, invoiceTotal:tTaxable, unpaidTotal:tTaxable, totalCgst:tCgst, totalSgst:tSgst, totalIgst:tIgst, totalTaxableAmount:tTaxable]).call()
+                    cgstAmount:cgstAmount, sgstAmount:sgstAmount, igstAmount:igstAmount, totalTaxAmount:cgstAmount+sgstAmount+igstAmount]).call()
+                ec.service.sync().name("zenith.sales.SalesLineServices.refresh#DraftInvoiceTotals").parameters([invoiceId:invoiceId]).call()
             ]]></script>
         </actions>
         <default-response url="."/>
+        <error-response url="."/>
     </transition>
 
     <transition name="printInvoice" read-only="true">
@@ -358,8 +348,8 @@
         <!-- ZE-SALES-017 (SL-071): explicit org guard on the DISPLAY load — the MANTLE_ACTIVE_ORG authz filter
              is bypassed in a standalone/CSV render, so a crafted invoiceId could otherwise dump another
              tenant's items + change-history. Null a foreign invoice; super-admin/ADMIN (no active org) see all. -->
-        <set field="_dispOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-        <if condition="invoice != null &amp;&amp; _dispOrg &amp;&amp; invoice.fromPartyId != _dispOrg &amp;&amp; !ec.user.isInGroup('ADMIN')">
+        <set field="_dispOrg" from="_salesOrgId"/>
+        <if condition="invoice != null &amp;&amp; (!_dispOrg || invoice.fromPartyId != _dispOrg) &amp;&amp; !ec.user.isInGroup('ADMIN')">
             <set field="invoice" from="null"/>
         </if>
         <!-- ZE-SALES-002 (SL-051): a tax invoice is editable only while it is a draft (In-Process). Gate the
@@ -417,16 +407,16 @@
 
         <entity-find entity-name="mantle.party.PartyDetailAndRole" list="transporterList">
             <econdition field-name="roleTypeId" value="Carrier"/>
-            <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+            <econdition field-name="ownerPartyId" from="_salesOrgId ?: '__NO_SALES_ORGANIZATION__'"/>
         </entity-find>
         
-        <set field="docTitle" from="invoice.documentType ?: 'Tax Invoice'"/>
+        <set field="docTitle" from="invoice?.documentType ?: 'Tax Invoice'"/>
 
         <!-- If this invoice originated from a POS counter sale, load how it was paid (Cash/UPI/Card, incl.
              split tenders) and when the sale was started/closed, to show a POS panel below. -->
         <script><![CDATA[
-            posTxn = ec.entity.find("zenith.erp.pos.PosTransaction")
-                .condition("linkedInvoiceId", invoiceId).list().find { true }
+            posTxn = invoice != null ? ec.entity.find("zenith.erp.pos.PosTransaction")
+                .condition("linkedInvoiceId", invoiceId).list().find { true } : null
             posPayList = []
             posSaleStarted = null; posSaleClosed = null; posPayMethods = ''
             if (posTxn) {
@@ -577,10 +567,6 @@
                         <field name="supplierGstin"><default-field title="Supplier GSTIN"><text-line size="20"/></default-field></field>
                         <field name="placeOfSupplyStateCode"><default-field title="Place of Supply (State Code)"><text-line size="4"/></default-field></field>
                         
-                        <field name="isReverseCharge"><default-field title="Reverse Charge (RCM)?">
-                            <drop-down no-current-selected-key="N"><option key="Y" text="Yes"/><option key="N" text="No"/></drop-down>
-                        </default-field></field>
-                        
                         <field name="isExport"><default-field title="Export Supply?">
                             <drop-down no-current-selected-key="N"><option key="Y" text="Yes"/><option key="N" text="No"/></drop-down>
                         </default-field></field>
@@ -666,7 +652,7 @@
                         <field name="productId"><default-field title="Product">
                             <drop-down allow-empty="true">
                                 <entity-options key="${productId}" text="${pseudoId} - ${productName}">
-                                    <entity-find entity-name="mantle.product.Product"><econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/><order-by field-name="productName"/></entity-find>
+                                    <entity-find entity-name="mantle.product.Product"><econdition field-name="ownerPartyId" from="_salesOrgId ?: '__NO_SALES_ORGANIZATION__'"/><order-by field-name="productName"/></entity-find>
                                 </entity-options>
                             </drop-down>
                         </default-field></field>
@@ -696,7 +682,8 @@
                 </fail-widgets></section>
             </container>
 
-            <form-list name="InvoiceItemsForm" list="invoiceItems" skip-form="true" header-dialog="true" show-csv-button="true" show-xlsx-button="true" show-page-size="true">
+            <container style="z-sales-table">
+<form-list name="InvoiceItemsForm" list="invoiceItems" skip-form="true" header-dialog="true" show-csv-button="true" show-xlsx-button="true" show-page-size="true">
                 <field name="invoiceItemSeqId"><default-field title="#"><label text="${invoiceItemSeqId}" type="span" style="text-grey-7"/></default-field></field>
                 <field name="description"><default-field title="Description"><label text="${description ?: 'N/A'}" type="strong" style="text-dark"/></default-field></field>
                 <field name="hsnSacCode"><default-field title="HSN/SAC"><label text="${hsnSacCode ?: '-'}" type="span" style="zenith-badge grey"/></default-field></field>
@@ -745,13 +732,15 @@
                 </default-field></field>
                 <field name="findButton"><header-field title="Find"><submit/></header-field></field>
                 </form-list>
+</container>
         </container>
 
         <!-- ZE-SALES-017 (SL-071): Change History / audit trail for this invoice -->
         <container style="zenith-card bg-white shadow-1 border-radius-lg q-pa-lg q-mt-lg">
             <label text="Change History" type="h5" style="text-primary text-weight-bold q-my-none"/>
             <label text="Every edit to this invoice is recorded automatically — who changed it, when, and the old and new value." type="p" style="text-grey-7 q-mt-xs q-mb-md"/>
-            <form-list name="InvoiceHistoryForm" list="noteHistory" skip-form="true">
+            <container style="z-sales-table">
+<form-list name="InvoiceHistoryForm" list="noteHistory" skip-form="true">
                 <row-actions>
                     <entity-find-one entity-name="moqui.security.UserAccount" value-field="_hu"><field-map field-name="userId" from="changedByUserId"/></entity-find-one>
                     <set field="whoChanged" from="_hu?.username ?: (changedByUserId ?: 'System')"/>
@@ -765,43 +754,9 @@
                 <field name="oldCol"><header-field title="Old Value"/><default-field><display text="${oldVal}" style="text-grey-7"/></default-field></field>
                 <field name="newCol"><header-field title="New Value"/><default-field><display text="${newVal}" style="text-weight-bold text-primary"/></default-field></field>
             </form-list>
+</container>
             <label text="No changes recorded yet." type="p" style="text-grey-6 q-pa-md text-center" condition="!noteHistory"/>
         </container>
-
-        <!-- ZE-SALES-001 (SL-032/SL-046): make the Add/Edit Item Quantity, Unit Price and Discount boxes
-             numeric-only in the browser so letters are rejected immediately, IN THE MODAL, before submit
-             (the server-side check in addItem/updateItem is the backstop). Two mechanisms because the
-             surfaces differ:
-               (a) /apps renders <script>, so promote the inputs to type="number" (native numeric keyboard
-                   + spinner + min=0).
-               (b) /qapps and /vapps STRIP <script> AND drop a plain type="html" block entirely — that trap
-                   (type="html"+<script>) was exactly why Safari/Quasar still accepted letters here, the same
-                   bug fixed for the CompanySetup phone field. So ALSO install a delegated keypress/input
-                   numeric filter via an <img onload> inline IIFE in a type="html,vuet,qvt" block, which
-                   survives the /qapps script-strip and blocks letters as-you-type on EVERY surface. The
-                   listeners are on document (capture) so they also cover the per-row Edit dialog, whose
-                   inputs share the same names and are added lazily when the dialog opens. -->
-        <render-mode><text type="html,vuet,qvt"><![CDATA[
-<script>
-(function(){
-  function makeNumeric(){
-    var sel = 'input[name="quantity"],input[name="amount"],input[name="discountPercent"]';
-    // NOTE: use forEach, NOT a for(k<n) loop — a bare '<' in an inline render-mode <script>
-    // is mis-parsed as markup on /qapps + /vapps (qvt/vuet) and the whole script is dropped there.
-    Array.prototype.forEach.call(document.querySelectorAll(sel), function(i){
-      if (i.getAttribute('type') !== 'number'){
-        i.setAttribute('type','number'); i.setAttribute('step','any');
-        i.setAttribute('min','0'); i.setAttribute('inputmode','decimal');
-      }
-    });
-  }
-  if (document.readyState !== 'loading'){ makeNumeric(); }
-  else { document.addEventListener('DOMContentLoaded', makeNumeric); }
-  document.addEventListener('click', function(){ setTimeout(makeNumeric, 250); }, true);
-})();
-</script>
-<img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" alt="" style="display:none" onload="if(!window._zInvNumFilter){window._zInvNumFilter=1;var _n={quantity:1,amount:1,discountPercent:1};document.addEventListener('keypress',function(e){var t=e.target;if(t&&_n[t.name]&&e.key&&e.key.length===1&&!/[0-9.]/.test(e.key))e.preventDefault();},true);document.addEventListener('input',function(e){var t=e.target;if(t&&_n[t.name]){var c=t.value.replace(/[^0-9.]/g,'');if(c!==t.value){var p=t.selectionStart;t.value=c;try{t.setSelectionRange(p,p);}catch(_){}}}},true);}">
-]]></text></render-mode>
 
     </widgets>
 </screen>

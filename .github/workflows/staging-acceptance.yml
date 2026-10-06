@@ -17,11 +17,11 @@ on:
         required: false
         type: string
       contacts_profile:
-        description: Additional synthetic Contacts verification
+        description: Additional synthetic Contacts or Sales verification
         required: true
         default: none
         type: choice
-        options: [none, ui, security]
+        options: [none, ui, security, sales]
   pull_request:
     branches: [master]
   push:                 # on-merge runs: re-check the merged result on master (no PR comment on push)
@@ -89,11 +89,11 @@ jobs:
       - name: Validate optional verification inputs
         run: |
           set -euo pipefail
-          case "$CONTACTS_PROFILE" in none|ui|security) ;; *) echo "::error::Unknown Contacts verification profile"; exit 1;; esac
+          case "$CONTACTS_PROFILE" in none|ui|security|sales) ;; *) echo "::error::Unknown verification profile"; exit 1;; esac
           if [ -n "$CANDIDATE_SHA" ]; then
             [[ "$CANDIDATE_SHA" =~ ^[a-f0-9]{40}$ ]] || { echo "::error::Candidate must be an exact commit SHA"; exit 1; }
           elif [ "$CONTACTS_PROFILE" != none ]; then
-            echo "::error::A Contacts profile requires an exact candidate SHA"; exit 1
+            echo "::error::A verification profile requires an exact candidate SHA"; exit 1
           fi
 
       - name: Checkout pinned candidate
@@ -201,7 +201,7 @@ jobs:
           docker cp docs/infra/ci/seed/billing.xml "$CID:/opt/moqui/runtime/component/ci-billing-fixtures/data/CiBillingDemoData.xml"
 
       - name: Install requested Contacts profile fixture
-        if: github.event_name == 'workflow_dispatch' && inputs.contacts_profile != 'none'
+        if: github.event_name == 'workflow_dispatch' && (inputs.contacts_profile == 'ui' || inputs.contacts_profile == 'security')
         run: |
           set -euo pipefail
           case "$CONTACTS_PROFILE" in
@@ -222,6 +222,27 @@ jobs:
             docker cp "$CONTACTS_QA_SOURCE_DIR/$QA_DIR/qa-service-screen.xml" "$CID:/opt/moqui/runtime/component/zenith-erp-contacts/screen/zenith/contacts/Contacts/ContactsQaAcceptance.xml"
           fi
           echo "CONTACTS_QA_DIR=$CONTACTS_QA_SOURCE_DIR/$QA_DIR" >> "$GITHUB_ENV"
+
+      - name: Install disposable Sales verification helper
+        if: github.event_name == 'workflow_dispatch' && inputs.contacts_profile == 'sales'
+        run: |
+          set -euo pipefail
+          QA_DIR="$CONTACTS_QA_SOURCE_DIR/docs/qa/sales-runtime"
+          test -f "$QA_DIR/verify-runtime.cjs"
+          CID=$(docker compose -f "$COMPOSE" ps -q moqui)
+          docker cp "$QA_DIR/fixture.xml" "$CID:/opt/moqui/runtime/component/zenith-erp-sales/SalesQaFixture.xml"
+          docker cp "$QA_DIR/qa-screen.xml" "$CID:/opt/moqui/runtime/component/zenith-erp-sales/screen/zenith/sales/SalesQaAcceptance.xml"
+          docker cp "$CID:/opt/moqui/runtime/component/zenith-erp-sales/screen/zenith/sales.xml" "$RUNNER_TEMP/sales-parent.xml"
+          python3 - "$RUNNER_TEMP/sales-parent.xml" <<'PY'
+          import sys
+          from pathlib import Path
+          p=Path(sys.argv[1]);s=p.read_text()
+          old='<subscreens default-item="SalesDashboard">'
+          assert old in s
+          s=s.replace(old,old+'<subscreens-item name="SalesQaAcceptance" location="component://zenith-erp-sales/screen/zenith/sales/SalesQaAcceptance.xml" menu-include="false"/>',1)
+          p.write_text(s)
+          PY
+          docker cp "$RUNNER_TEMP/sales-parent.xml" "$CID:/opt/moqui/runtime/component/zenith-erp-sales/screen/zenith/sales.xml"
 
       - name: Load discovered seed, demo and isolation fixtures in one invocation
         # Exploded Moqui runtime: java -cp . MoquiStart from /opt/moqui; java at /opt/java/openjdk/bin/java.
@@ -347,7 +368,7 @@ jobs:
           node docs/infra/ci/smoke.mjs http://localhost:8080 | tee "$RUNNER_TEMP/smoke.txt"
 
       - name: Run requested Contacts verification
-        if: github.event_name == 'workflow_dispatch' && inputs.contacts_profile != 'none'
+        if: github.event_name == 'workflow_dispatch' && (inputs.contacts_profile == 'ui' || inputs.contacts_profile == 'security')
         env:
           CONTACTS_QA_BASE_URL: http://127.0.0.1:8080
           CONTACTS_QA_DB_MODE: postgres
@@ -365,7 +386,7 @@ jobs:
           node "$CONTACTS_QA_DIR/verify-runtime.cjs"
 
       - name: Save Contacts verification evidence
-        if: always() && github.event_name == 'workflow_dispatch' && inputs.contacts_profile != 'none'
+        if: always() && github.event_name == 'workflow_dispatch' && (inputs.contacts_profile == 'ui' || inputs.contacts_profile == 'security')
         uses: actions/upload-artifact@v4
         with:
           name: contacts-${{ inputs.contacts_profile }}-${{ inputs.candidate_sha }}
@@ -419,6 +440,26 @@ jobs:
           chk "D split tenders (2 rows summing 118.00)" "SELECT ((SELECT count(*) FROM pos_payment WHERE transaction_id='$D')=2 AND (SELECT sum(amount) FROM pos_payment WHERE transaction_id='$D')=118.00);"
           [ "$FAILED" = "0" ] && echo "OK — billing math matches golden baseline (modes RETAIL/WHOLESALE/EMPLOYEE, slabs 5/12/18%, whole-rupee rounding, split reconcile)" || { echo "::error::one or more billing math asserts failed"; exit 1; }
 
+      - name: Verify Sales functions, isolation and responsive UI
+        if: github.event_name == 'workflow_dispatch' && inputs.contacts_profile == 'sales'
+        env:
+          SALES_QA_BASE: http://localhost:8080
+          SALES_QA_OUT: ${{ runner.temp }}/sales-profile
+        run: |
+          set -euo pipefail
+          export NODE_PATH="$GITHUB_WORKSPACE/node_modules"
+          export SALES_QA_CHROME=$(node -e 'process.stdout.write(require("puppeteer").executablePath())')
+          node "$CONTACTS_QA_SOURCE_DIR/docs/qa/sales-runtime/verify-runtime.cjs"
+
+      - name: Save Sales verification evidence
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.contacts_profile == 'sales'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sales-${{ inputs.candidate_sha }}
+          path: ${{ runner.temp }}/sales-profile
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Dump Moqui logs on failure
         if: failure()
         run: docker compose -f "$COMPOSE" logs --tail=200 moqui || true
@@ -455,3 +496,23 @@ jobs:
       - name: Tear down
         if: always()
         run: docker compose -f "$COMPOSE" down -v || true
+
+
+      - name: Assert Sales disposable database teardown
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.contacts_profile == 'sales'
+        run: |
+          set -euo pipefail
+          PROJECT=$(docker compose -f "$COMPOSE" config --format json | python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])')
+          test -z "$(docker ps -aq --filter "label=com.docker.compose.project=$PROJECT")"
+          test -z "$(docker volume ls -q --filter "label=com.docker.compose.project=$PROJECT")"
+          mkdir -p "$RUNNER_TEMP/sales-cleanup"
+          printf '{"candidate":"%s","containersRemaining":0,"volumesRemaining":0,"databaseStorage":"removed with disposable tmpfs container"}\n' "$CANDIDATE_SHA" > "$RUNNER_TEMP/sales-cleanup/teardown.json"
+
+      - name: Save Sales teardown proof
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.contacts_profile == 'sales'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sales-teardown-${{ inputs.candidate_sha }}
+          path: ${{ runner.temp }}/sales-cleanup
+          if-no-files-found: error
+          retention-days: 14

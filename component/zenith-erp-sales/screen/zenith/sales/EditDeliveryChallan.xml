@@ -2,6 +2,11 @@
 <screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
         xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
         default-menu-title="Delivery Challan" default-menu-include="false">
+    <always-actions>
+        <service-call name="zenith.sales.SalesAccessServices.get#AuthorizedActiveOrganization" out-map="_salesScope"/>
+        <set field="_salesOrgId" from="_salesScope.activeOrgId"/>
+    </always-actions>
+
 
     <parameter name="challanId" required="true"/>
 
@@ -9,37 +14,62 @@
     
     <transition name="updateChallan">
         <actions>
-            <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" in-map="[entityName:'zenith.erp.sales.DeliveryChallan', idField:'challanId', idValue:challanId, orgField:'organizationPartyId']" out-map="_acc"/>
+            <service-call name="zenith.sales.SalesAccessServices.assert#RecordOrgAccess" in-map="[entityName:'zenith.erp.sales.DeliveryChallan', idField:'challanId', idValue:challanId, orgField:'organizationPartyId']" out-map="_acc"/>
             <if condition="!_acc.allowed"><return error="true" message="You do not have access to this record."/></if>
-            <service-call name="update#zenith.erp.sales.DeliveryChallan" in-map="context"/>
+            <entity-find-one entity-name="zenith.erp.sales.DeliveryChallan" value-field="locked" for-update="true"/>
+            <if condition="ec.web.parameters.statusId &amp;&amp; (locked.convertedToInvoiceId || locked.statusId in ['DcCancelled','ChallanCancelled']) &amp;&amp; ec.web.parameters.statusId != locked.statusId"><return error="true" message="A converted or cancelled challan cannot change status."/></if>
+            <if condition="ec.web.parameters.statusId &amp;&amp; !(ec.web.parameters.statusId in ['DcDraft','DcIssued','DcDelivered','DcReturned','DcCancelled']) &amp;&amp; ec.web.parameters.statusId != locked.statusId"><return error="true" message="Select a valid challan status."/></if>
+            <script><![CDATA[
+                def aliases=[ChallanDraft:'DcDraft',ChallanDispatched:'DcIssued',ChallanDelivered:'DcDelivered',ChallanReturned:'DcReturned',ChallanCancelled:'DcCancelled']
+                if (ec.web.parameters.statusId && aliases[locked.statusId]) ec.service.sync().name('update#zenith.erp.sales.DeliveryChallan').parameters([challanId:challanId,statusId:aliases[locked.statusId]]).call()
+                def updates=[challanId:challanId]
+                ['statusId','ewayBillId','vehicleNumber','transporterId'].each { if (ec.web.parameters.containsKey(it)) updates[it]=ec.web.parameters[it] }
+                ec.service.sync().name('update#zenith.erp.sales.DeliveryChallan').parameters(updates).call()
+            ]]></script>
         </actions>
         <default-response url="."/>
+        <error-response url="."/>
     </transition>
 
     <transition name="addItem">
         <actions>
             <!-- ZE-SB-013 (Tier 2): the line-item product must belong to this org. -->
             <if condition="ec.web.parameters.productId">
-                <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" out-map="_pa"
+                <service-call name="zenith.sales.SalesAccessServices.assert#RecordOrgAccess" out-map="_pa"
                               in-map="[entityName:'mantle.product.Product', idField:'productId', idValue:ec.web.parameters.productId, orgField:'ownerPartyId']"/>
                 <if condition="!_pa.allowed"><return error="true" message="Please select a valid product from your account."/></if>
             </if>
-            <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" in-map="[entityName:'zenith.erp.sales.DeliveryChallan', idField:'challanId', idValue:challanId, orgField:'organizationPartyId']" out-map="_acc"/>
+            <service-call name="zenith.sales.SalesAccessServices.assert#RecordOrgAccess" in-map="[entityName:'zenith.erp.sales.DeliveryChallan', idField:'challanId', idValue:challanId, orgField:'organizationPartyId']" out-map="_acc"/>
             <if condition="!_acc.allowed"><return error="true" message="You do not have access to this record."/></if>
-            <service-call name="create#zenith.erp.sales.DeliveryChallanItem" in-map="context"/>
+            <entity-find-one entity-name="zenith.erp.sales.DeliveryChallan" value-field="_dc" for-update="true"/>
+            <if condition="_dc.statusId in ['DcConverted','ChallanConverted','DcCancelled','ChallanCancelled'] || _dc.convertedToInvoiceId"><return error="true" message="This challan has already been invoiced; its goods cannot be changed."/></if>
+            <service-call name="zenith.sales.SalesLineServices.validate#LineInput" out-map="_line" in-map="[quantity:quantity, unitAmount:estimatedValue]"/>
+            <if condition="!_line.valid"><return/></if>
+            <service-call name="create#zenith.erp.sales.DeliveryChallanItem" in-map="context + [quantity:_line.quantityValue, estimatedValue:_line.unitAmountValue]"/>
         </actions>
         <default-response url="."/>
+        <error-response url="."/>
     </transition>
 
     <transition name="deleteItem">
         <actions>
-            <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" in-map="[entityName:'zenith.erp.sales.DeliveryChallan', idField:'challanId', idValue:challanId, orgField:'organizationPartyId']" out-map="_acc"/>
+            <service-call name="zenith.sales.SalesAccessServices.assert#RecordOrgAccess" in-map="[entityName:'zenith.erp.sales.DeliveryChallan', idField:'challanId', idValue:challanId, orgField:'organizationPartyId']" out-map="_acc"/>
             <if condition="!_acc.allowed"><return error="true" message="You do not have access to this record."/></if>
+            <entity-find-one entity-name="zenith.erp.sales.DeliveryChallan" value-field="_dc" for-update="true"/>
+            <if condition="_dc.statusId in ['DcConverted','ChallanConverted','DcCancelled','ChallanCancelled'] || _dc.convertedToInvoiceId"><return error="true" message="This challan has already been invoiced; its goods cannot be changed."/></if>
             <service-call name="delete#zenith.erp.sales.DeliveryChallanItem" in-map="context"/>
         </actions>
         <default-response url="."/>
+        <error-response url="."/>
     </transition>
 
+    <transition name="convertToInvoice">
+        <actions>
+            <service-call name="zenith.sales.DeliveryChallanServices.convert#ChallanToInvoice" in-map="[deliveryChallanId:challanId]" out-map="_converted"/>
+        </actions>
+        <default-response url="../EditInvoice"><parameter name="invoiceId" value="${_converted.invoiceId}"/></default-response>
+        <error-response url="."/>
+    </transition>
     <transition name="printChallan" read-only="true">
         <default-response url="${ec.web.getWebappRootUrl(false, null)}/fop/apps/zenith/sales/ChallanPrint" url-type="plain">
             <parameter name="challanId"/>
@@ -51,27 +81,27 @@
         <!-- ZE-SALES cross-tenant IDOR render guard: only the owning org (super-admins exempt) may open this
              challan. Deterministic org check. Load NOTHING when blocked; widgets show a plain no-access panel
              instead of another tenant's challan / sender / receiver data. -->
-        <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" in-map="[entityName:'zenith.erp.sales.DeliveryChallan', idField:'challanId', idValue:challanId, orgField:'organizationPartyId']" out-map="_acc"/>
+        <service-call name="zenith.sales.SalesAccessServices.assert#RecordOrgAccess" in-map="[entityName:'zenith.erp.sales.DeliveryChallan', idField:'challanId', idValue:challanId, orgField:'organizationPartyId']" out-map="_acc"/>
         <set field="noAccess" from="!_acc.allowed"/>
         <if condition="_acc.allowed">
         <entity-find-one entity-name="zenith.erp.sales.DeliveryChallan" value-field="challan"/>
 
         <entity-find entity-name="zenith.erp.sales.DeliveryChallanItem" list="challanItems">
             <econdition field-name="challanId"/>
-            <order-by field-name="itemSeqId"/>
+            <order-by field-name="challanItemSeqId"/>
         </entity-find>
 
         <entity-find-one entity-name="mantle.party.PartyDetail" value-field="fromParty">
             <field-map field-name="partyId" from="challan?.organizationPartyId"/>
         </entity-find-one>
         <entity-find-one entity-name="mantle.party.PartyDetail" value-field="toParty">
-            <field-map field-name="partyId" from="challan?.toPartyId"/>
+            <field-map field-name="partyId" from="challan?.customerPartyId"/>
         </entity-find-one>
         
         <!-- Get Transporter List -->
         <entity-find entity-name="mantle.party.PartyDetailAndRole" list="transporterList">
             <econdition field-name="roleTypeId" value="Carrier"/>
-            <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+            <econdition field-name="ownerPartyId" from="_salesOrgId ?: '__NO_SALES_ORGANIZATION__'"/>
         </entity-find>
         </if>
     </actions>
@@ -113,15 +143,15 @@
                         <field name="challanId"><default-field><hidden/></default-field></field>
                         <field name="statusId"><default-field title="">
                             <drop-down current="selected">
-                                <option key="ChallanDraft" text="Draft"/>
-                                <option key="ChallanDispatched" text="Dispatched"/>
-                                <option key="ChallanDelivered" text="Delivered"/>
-                                <option key="ChallanReturned" text="Returned"/>
-                                <option key="ChallanCancelled" text="Cancelled"/>
+                                <option key="DcDraft" text="Draft"/>
+                                <option key="DcIssued" text="Dispatched"/>
+                                <option key="DcDelivered" text="Delivered"/>
+                                <option key="DcReturned" text="Returned"/>
+                                <option key="DcCancelled" text="Cancelled"/><option key="DcConverted" text="Converted"/>
                             </drop-down>
                         </default-field></field>
                         <field name="submitButton">
-                            <conditional-field name="challanStatus_write" condition="modCanWrite" title=""><submit text="Update Status" style="q-btn q-btn--flat bg-primary text-white border-radius-sm"/></conditional-field>
+                            <conditional-field name="challanStatus_write" condition="modCanWrite &amp;&amp; !challan.convertedToInvoiceId &amp;&amp; !(challan.statusId in ['DcCancelled','ChallanCancelled','DcReturned','ChallanReturned'])" title=""><submit text="Update Status" style="q-btn q-btn--flat bg-primary text-white border-radius-sm"/></conditional-field>
                             <default-field title=""><label text="You have view-only access — changes are disabled." type="span" style="text-grey-7"/></default-field>
                         </field>
                         <field-layout><field-row><field-ref name="statusId"/><field-ref name="submitButton"/></field-row></field-layout>
@@ -130,6 +160,9 @@
             </container>
             
             <container style="row items-center q-mt-md justify-end q-gutter-sm">
+                <section name="ConvertChallan" condition="modCanWrite &amp;&amp; !(challan.statusId in ['DcCancelled','ChallanCancelled','DcReturned','ChallanReturned'])"><widgets>
+                    <link url="convertToInvoice" text="${challan.convertedToInvoiceId ? 'View Invoice' : 'Convert to Invoice'}" parameter-map="[challanId:challanId]" style="z-solid z-sales-convert q-btn bg-primary text-white"/>
+                </widgets></section>
                 <link url="printChallan" text="Print Delivery Note" parameter-map="[challanId:challanId]" target-window="_blank"
                       icon="fa fa-print" class="q-btn q-btn-item non-selectable no-outline q-btn--standard q-btn--rectangle bg-indigo-8 text-white q-btn--actionable q-focusable q-hoverable"/>
             </container>
@@ -184,7 +217,7 @@
                         <field name="productId"><default-field title="Product">
                             <drop-down allow-empty="true">
                                 <entity-options key="${productId}" text="${pseudoId} - ${productName}">
-                                    <entity-find entity-name="mantle.product.Product"><econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/><order-by field-name="productName"/></entity-find>
+                                    <entity-find entity-name="mantle.product.Product"><econdition field-name="ownerPartyId" from="_salesOrgId ?: '__NO_SALES_ORGANIZATION__'"/><order-by field-name="productName"/></entity-find>
                                 </entity-options>
                             </drop-down>
                         </default-field></field>
@@ -206,11 +239,12 @@
                 </widgets></section>
             </container>
 
-            <form-list name="ChallanItemsForm" list="challanItems" skip-form="true" header-dialog="true" show-csv-button="true" show-xlsx-button="true" show-page-size="true">
+            <container style="z-sales-table">
+<form-list name="ChallanItemsForm" list="challanItems" skip-form="true" header-dialog="true" show-csv-button="true" show-xlsx-button="true" show-page-size="true">
                 <row-actions>
                     <entity-find-one entity-name="moqui.basic.Uom" value-field="uom"/>
                 </row-actions>
-                <field name="itemSeqId"><default-field title="#"><label text="${itemSeqId}" type="span" style="text-grey-7"/></default-field></field>
+                <field name="challanItemSeqId"><default-field title="#"><label text="${challanItemSeqId}" type="span" style="text-grey-7"/></default-field></field>
                 <field name="description"><default-field title="Description"><label text="${description ?: 'N/A'}" type="strong" style="text-dark"/></default-field></field>
                 <field name="hsnSacCode"><default-field title="HSN/SAC"><label text="${hsnSacCode ?: '-'}" type="span" style="zenith-badge grey"/></default-field></field>
                 <field name="quantity"><default-field><label text="${quantity} ${uom?.description ?: ''}" type="span" style="text-dark"/></default-field></field>
@@ -218,12 +252,13 @@
                 
                 <field name="deleteItem">
                     <conditional-field name="delChallan_write" condition="modCanWrite" title=" ">
-                        <link url="deleteItem" parameter-map="[challanId:challanId, itemSeqId:itemSeqId]" icon="delete" style="text-danger" confirmation="Remove item?"/>
+                        <link url="deleteItem" parameter-map="[challanId:challanId, challanItemSeqId:challanItemSeqId]" icon="delete" style="text-danger" confirmation="Remove item?"/>
                     </conditional-field>
                     <default-field title=" "><label text="" type="span"/></default-field>
                 </field>
                 <field name="findButton"><header-field title="Find"><submit/></header-field></field>
                 </form-list>
+</container>
         </container>
         </widgets>
         </section>

@@ -1,0 +1,141 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+    <service verb="validate" noun="LineInput" authenticate="true">
+        <description>Normalize draft Sales line input before pricing, tax calculation or persistence.</description>
+        <in-parameters>
+            <parameter name="quantity"/>
+            <parameter name="unitAmount"/>
+            <parameter name="discountPercent"/>
+            <parameter name="taxPercentage"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="valid" type="Boolean"/>
+            <parameter name="quantityValue" type="BigDecimal"/>
+            <parameter name="unitAmountValue" type="BigDecimal"/>
+            <parameter name="discountPercentValue" type="BigDecimal"/>
+            <parameter name="taxPercentageValue" type="BigDecimal"/>
+        </out-parameters>
+        <actions><script><![CDATA[
+            valid = false
+            def parse = { value ->
+                def text = value == null ? '' : value.toString().trim()
+                if (!text) return BigDecimal.ZERO
+                if (!(text ==~ /-?\d*\.?\d+/)) throw new NumberFormatException()
+                return new BigDecimal(text)
+            }
+            try {
+                quantityValue = parse(quantity)
+                unitAmountValue = parse(unitAmount)
+                discountPercentValue = parse(discountPercent)
+                taxPercentageValue = parse(taxPercentage)
+            } catch (NumberFormatException ignored) {
+                ec.message.addError('Quantity, Unit Price, Discount and GST Rate must be numbers.')
+                return
+            }
+            if (quantityValue.signum() <= 0) { ec.message.addError('Quantity must be greater than zero.'); return }
+            if (unitAmountValue.signum() < 0) { ec.message.addError('Unit price cannot be negative.'); return }
+            if (discountPercentValue < 0 || discountPercentValue > 100) {
+                ec.message.addError('Discount must be between 0 and 100 percent.'); return
+            }
+            if (taxPercentageValue.signum() < 0) { ec.message.addError('GST rate cannot be negative.'); return }
+            // Zero price and a full discount remain valid for existing free-item workflows.
+            valid = true
+        ]]></script></actions>
+    </service>
+    <service verb="refresh" noun="DraftInvoiceTotals" authenticate="true">
+        <in-parameters><parameter name="invoiceId" required="true"/></in-parameters>
+        <actions>
+            <service-call name="zenith.sales.SalesAccessServices.get#AuthorizedActiveOrganization" out-map="scope"/>
+            <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="invoice" for-update="true"/>
+            <if condition="invoice == null || ((!scope.activeOrgId || invoice.fromPartyId != scope.activeOrgId) &amp;&amp; !ec.user.isInGroup('ADMIN'))">
+                <return error="true" message="Invoice not found for your account."/>
+            </if>
+            <if condition="invoice.statusId != 'InvoiceInProcess'">
+                <return error="true" message="Issued invoice totals cannot be changed. Raise a credit or debit note instead."/>
+            </if>
+            <service-call name="mantle.account.InvoiceServices.update#InvoiceTotals" in-map="[invoiceId:invoiceId]"/>
+            <script><![CDATA[
+                def items = ec.entity.find('mantle.account.invoice.InvoiceItem').condition('invoiceId',invoiceId).list()
+                def taxable = BigDecimal.ZERO, cgst = BigDecimal.ZERO, sgst = BigDecimal.ZERO, igst = BigDecimal.ZERO, tax = BigDecimal.ZERO
+                for (item in items) {
+                    // A full discount stores a real zero; it must never fall back to the gross line value.
+                    taxable += (item.taxableAmount != null ? item.taxableAmount : ((item.quantity != null ? item.quantity : 1)*(item.amount ?: 0))) as BigDecimal
+                    cgst += (item.cgstAmount ?: 0) as BigDecimal
+                    sgst += (item.sgstAmount ?: 0) as BigDecimal
+                    igst += (item.igstAmount ?: 0) as BigDecimal
+                    if (item.cgstAmount != null || item.sgstAmount != null || item.igstAmount != null) {
+                        def prior=ec.entity.find('zenith.erp.tax.TaxLineDetail').condition('referenceType','InvoiceItem').condition('referenceId',invoiceId).condition('referenceSeqId',item.invoiceItemSeqId).list()
+                        def breakdowns=prior.findAll { !(it.taxName in ['CGST','SGST','IGST']) }.collect { it.getMap() }
+                        ['CGST','SGST','IGST'].each { name ->
+                            def rate=(item.get(name.toLowerCase()+'Rate') ?: 0) as BigDecimal
+                            if (rate > 0) breakdowns.add([taxName:name,taxRate:rate,taxableAmount:item.taxableAmount,taxAmount:(item.get(name.toLowerCase()+'Amount') ?: 0),countryGeoId:'IND',isIncludedInPrice:(item.isTaxInclusive ?: 'N')])
+                        }
+                        ec.service.sync().name('zenith.tax.TaxServices.store#TaxLineDetails').parameters([referenceType:'InvoiceItem',referenceId:invoiceId,referenceSeqId:item.invoiceItemSeqId,currencyUomId:invoice.currencyUomId,taxBreakdowns:breakdowns]).call()
+                    }
+                    tax += (item.totalTaxAmount != null ? item.totalTaxAmount : ((item.cgstAmount ?: 0)+(item.sgstAmount ?: 0)+(item.igstAmount ?: 0))) as BigDecimal
+                }
+                def grand=taxable+tax
+                def roundOff=invoice.currencyUomId == 'INR' ? grand.setScale(0,java.math.RoundingMode.HALF_UP)-grand : BigDecimal.ZERO
+                def words=invoice.currencyUomId == 'INR' ? ec.service.sync().name('zenith.base.LocalizationServices.convert#AmountToWords').parameters([amount:grand+roundOff,organizationPartyId:invoice.fromPartyId]).call()?.amountInWords : invoice.amountInWords
+                ec.service.sync().name('update#mantle.account.invoice.Invoice').parameters([
+                    invoiceId:invoiceId, invoiceTotal:taxable, unpaidTotal:taxable,
+                    totalTaxableAmount:taxable, totalCgst:cgst, totalSgst:sgst, totalIgst:igst,
+                    totalTaxAmount:tax, roundOffAmount:roundOff, amountInWords:words]).call()
+            ]]></script>
+        </actions>
+    </service>
+    <service verb="get" noun="InvoicePayable" authenticate="true">
+        <in-parameters><parameter name="invoiceId" required="true"/></in-parameters>
+        <out-parameters><parameter name="payableAmount" type="BigDecimal"/></out-parameters>
+        <actions>
+            <service-call name="zenith.sales.SalesAccessServices.get#AuthorizedActiveOrganization" out-map="scope"/>
+            <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="invoice"/>
+            <if condition="invoice == null || ((!scope.activeOrgId || invoice.fromPartyId != scope.activeOrgId) &amp;&amp; !ec.user.isInGroup('ADMIN'))">
+                <return error="true" message="Invoice not found for your account."/>
+            </if>
+            <if condition="invoice.invoiceTypeEnumId == 'InvoiceSalesReturn' || invoice.documentType == 'Credit Note'">
+                <return error="true" message="A credit note reduces the customer's balance; it cannot collect a payment."/>
+            </if>
+            <script><![CDATA[
+                // Same stored-header convention as InvoicePrint: invoiceTotal is the pre-tax value.
+                def tax=invoice.totalTaxAmount != null ? invoice.totalTaxAmount :
+                    ((invoice.totalCgst ?: 0)+(invoice.totalSgst ?: 0)+(invoice.totalIgst ?: 0))
+                payableAmount=((invoice.invoiceTotal ?: 0)+tax+(invoice.roundOffAmount ?: 0)-
+                    (invoice.appliedPaymentsTotal ?: 0)).setScale(2,java.math.RoundingMode.HALF_UP)
+            ]]></script>
+        </actions>
+    </service>
+    <service verb="refresh" noun="DraftInvoiceTaxes" authenticate="true">
+        <in-parameters><parameter name="invoiceId" required="true"/></in-parameters>
+        <actions>
+            <service-call name="zenith.sales.SalesAccessServices.get#AuthorizedActiveOrganization" out-map="scope"/>
+            <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="invoice" for-update="true"/>
+            <if condition="invoice == null || ((!scope.activeOrgId || invoice.fromPartyId != scope.activeOrgId) &amp;&amp; !ec.user.isInGroup('ADMIN'))"><return error="true" message="Invoice not found for your account."/></if>
+            <if condition="invoice.statusId != 'InvoiceInProcess'"><return error="true" message="Issued invoice tax details cannot be changed."/></if>
+            <script><![CDATA[
+                def seller=invoice.fromPartyId ? ec.service.sync().name('zenith.tax.TaxServices.get#PartyTaxRegistration').parameters([partyId:invoice.fromPartyId]).call() : null
+                def buyer=invoice.toPartyId ? ec.service.sync().name('zenith.tax.TaxServices.get#PartyTaxRegistration').parameters([partyId:invoice.toPartyId]).call() : null
+                def prefix={ value -> def text=value?.toString()?.trim(); text && text.length()>=2 && text.substring(0,2)==~/[0-9]{2}/ ? text.substring(0,2) : null }
+                def state={ value -> def text=value?.toString()?.trim(); text && text==~/[0-9]{2}/ ? text : null }
+                def sellerState=prefix(invoice.supplierGstin) ?: state(invoice.supplierStateCode) ?: state(seller?.regionGeoId) ?: prefix(seller?.registrationNumber)
+                def buyerState=prefix(invoice.buyerGstin) ?: state(invoice.placeOfSupplyStateCode) ?: state(buyer?.regionGeoId) ?: prefix(buyer?.registrationNumber)
+                boolean interstate=(sellerState && buyerState && sellerState != buyerState) || invoice.isExport=='Y' || invoice.isSezSupply=='Y'
+                boolean zero=invoice.isReverseCharge=='Y' || ((invoice.isExport=='Y' || invoice.isSezSupply=='Y') && invoice.isWithPayment!='Y')
+                for (item in ec.entity.find('mantle.account.invoice.InvoiceItem').condition('invoiceId',invoiceId).list()) {
+                    def taxable=(item.taxableAmount != null ? item.taxableAmount : ((item.quantity != null ? item.quantity : 1)*(item.amount ?: 0))) as BigDecimal
+                    def rate=((item.cgstRate ?: 0)+(item.sgstRate ?: 0)+(item.igstRate ?: 0)) as BigDecimal
+                    def cr=interstate ? BigDecimal.ZERO : rate.divide(new BigDecimal(2),5,java.math.RoundingMode.HALF_UP)
+                    def sr=cr, ir=interstate ? rate : BigDecimal.ZERO
+                    def ca=zero ? BigDecimal.ZERO : (taxable*cr/100).setScale(2,java.math.RoundingMode.HALF_UP)
+                    def sa=zero ? BigDecimal.ZERO : (taxable*sr/100).setScale(2,java.math.RoundingMode.HALF_UP)
+                    def ia=zero ? BigDecimal.ZERO : (taxable*ir/100).setScale(2,java.math.RoundingMode.HALF_UP)
+                    def priorGst=(item.cgstAmount ?: 0)+(item.sgstAmount ?: 0)+(item.igstAmount ?: 0)
+                    def otherTax=zero ? BigDecimal.ZERO : (item.totalTaxAmount != null ? item.totalTaxAmount-priorGst : BigDecimal.ZERO)
+                    ec.service.sync().name('update#mantle.account.invoice.InvoiceItem').parameters([invoiceId:invoiceId,invoiceItemSeqId:item.invoiceItemSeqId,cgstRate:cr,sgstRate:sr,igstRate:ir,cgstAmount:ca,sgstAmount:sa,igstAmount:ia,totalTaxAmount:ca+sa+ia+otherTax]).call()
+                }
+            ]]></script>
+            <service-call name="zenith.sales.SalesLineServices.refresh#DraftInvoiceTotals" in-map="[invoiceId:invoiceId]"/>
+        </actions>
+    </service>
+</services>

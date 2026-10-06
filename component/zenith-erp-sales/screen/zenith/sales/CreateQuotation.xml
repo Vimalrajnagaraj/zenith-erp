@@ -2,26 +2,32 @@
 <screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
         xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
         default-menu-title="New Quote" default-menu-include="false">
+    <always-actions>
+        <service-call name="zenith.sales.SalesAccessServices.get#AuthorizedActiveOrganization" out-map="_salesScope"/>
+        <set field="_salesOrgId" from="_salesScope.activeOrgId"/>
+    </always-actions>
+
 
     <parameter name="customerPartyId"/>
 
     <transition name="createQuotation">
         <actions>
+            <if condition="!_salesOrgId"><return error="true" message="Select an organization before creating a Sales document."/></if>
             <!-- ZE-SB-013 (Tier 1): customer must belong to this org (mirror CreateInvoice); guard only when supplied. -->
             <if condition="ec.web.parameters.customerPartyId">
-                <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" out-map="_ca"
+                <service-call name="zenith.sales.SalesAccessServices.assert#RecordOrgAccess" out-map="_ca"
                               in-map="[entityName:'mantle.party.Party', idField:'partyId', idValue:ec.web.parameters.customerPartyId, orgField:'ownerPartyId']"/>
                 <if condition="!_ca.allowed"><return error="true" message="Please select a valid customer from your account."/></if>
             </if>
             <!-- ZE-SALES: set currencyUomId explicitly (mantle's create#Order otherwise defaults to USD; this is an
                  India-only ERP, so quotes/orders/invoices are all INR — matches CreateInvoice/CreateCreditNote). -->
-            <service-call name="mantle.order.OrderServices.create#Order" in-map="[orderName:'New Quotation', entryDate:orderDate, statusId:'OrderProposed', currencyUomId:'INR', vendorPartyId:ec.user.getPreference('ACTIVE_ORGANIZATION'), customerPartyId:customerPartyId]" out-map="createOut"/>
+            <service-call name="mantle.order.OrderServices.create#Order" in-map="[orderName:'New Quotation', entryDate:orderDate, statusId:'OrderProposed', currencyUomId:'INR', vendorPartyId:_salesOrgId, customerPartyId:customerPartyId]" out-map="createOut"/>
             <!-- ZE-SALES: assign a formatted per-org, financial-year quotation number (QTN/26-27/00001) via the
                  shared sequence service, stored on the order so the print/screen show it. Fail-open: if the org
                  has no QUOTATION sequence, the print falls back to the order id and quote creation never breaks. -->
             <script><![CDATA[
                 try {
-                    def _org = ec.user.getPreference('ACTIVE_ORGANIZATION')
+                    def _org = _salesOrgId
                     // Only call get#NextSequence when the org actually has this sequence configured: for a missing
                     // sequence it RETURNS AN ERROR (not an exception, so the try/catch misses it) which would roll
                     // back the whole quote. The doc number is best-effort — quote creation must never break.
@@ -43,6 +49,7 @@
         <default-response url="../EditQuotation">
             <parameter name="orderId" from="createOut.orderId"/>
         </default-response>
+    <error-response url="."/>
     </transition>
     <transition name="findQuotation"><default-response url="../FindQuotation"/></transition>
     <transition name="getCustomers" read-only="true">
@@ -50,7 +57,7 @@
         <actions>
             <entity-find entity-name="mantle.party.PartyDetailAndRole" list="partyList" limit="20" distinct="true">
                 <econdition field-name="roleTypeId" value="Customer"/>
-                <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+                <econdition field-name="ownerPartyId" from="_salesOrgId ?: '__NO_SALES_ORGANIZATION__'"/>
                 <econditions combine="or">
                     <econdition field-name="partyId" operator="like" value="%${term}%" ignore-case="true"/>
                     <econdition field-name="organizationName" operator="like" value="%${term}%" ignore-case="true"/>
@@ -66,9 +73,9 @@
                 if (customerPartyId) {
                     // Org isolation (ZE-SEC-JSON): scope the re-display lookup to the active org too (mirror the
                     // search above) so a forged partyId can't echo another tenant's customer name.
-                    def _reAo = ec.user.getPreference('ACTIVE_ORGANIZATION')
+                    def _reAo = _salesOrgId
                     def _reF = ec.entity.find("mantle.party.PartyDetailAndRole").condition("partyId", customerPartyId)
-                    if (_reAo) _reF.condition("ownerPartyId", _reAo)
+                    _reF.condition("ownerPartyId", _reAo ?: "__NO_SALES_ORGANIZATION__")
                     def existing = _reF.one()
                     if (existing) {
                         outList.add(0, [value:existing.partyId, label:existing.organizationName ?: ((existing.firstName?:'') + ' ' + (existing.lastName?:'')).trim() + ' [' + existing.partyId + ']'])
@@ -81,7 +88,7 @@
     </transition>
 
     <actions>
-        <set field="activeOrgId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+        <set field="activeOrgId" from="_salesOrgId"/>
         <entity-find-one entity-name="mantle.party.Organization" value-field="activeOrg">
             <field-map field-name="partyId" from="activeOrgId"/>
         </entity-find-one>
@@ -119,7 +126,7 @@
                                 <entity-options key="${partyId}" text="${(organizationName ?: ((firstName?:'') + ' ' + (lastName?:'')).trim()) ?: partyId} [${partyId}]">
                                     <entity-find entity-name="mantle.party.PartyDetailAndRole" distinct="true">
                                         <econdition field-name="roleTypeId" value="Customer"/>
-                                        <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+                                        <econdition field-name="ownerPartyId" from="_salesOrgId ?: '__NO_SALES_ORGANIZATION__'"/>
                                         <order-by field-name="organizationName,firstName,lastName"/>
                                     </entity-find>
                                 </entity-options>
