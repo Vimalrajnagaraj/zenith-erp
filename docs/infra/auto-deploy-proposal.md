@@ -173,6 +173,14 @@ PR ──► merge to master  (CI: lint guards + review + secret/customer-data s
        earlier checks, which had been winning the race by luck.)
 - **Phase 2 — auto-deploy the trivial tier.** docs/CSS/presentation auto-deploy after green staging;
   one-click approve for everything else. This is a comfortable place to sit for a long time.
+  - **Groundwork done (report-only):** the risk classifier that this tiering needs is built and runs
+    on every PR/push — [`ci/classify-risk.sh`](ci/classify-risk.sh), surfaced in the run's job summary
+    by the `Classify change risk` step. It labels a change `trivial` (only docs / CI / presentation
+    assets — nothing that ships to the container) or `sensitive` (any component code, service, entity,
+    script, or billing/auth/tax/isolation path), erring toward `sensitive`. It **only reports** — no
+    deploy job exists yet. Standing up the actual prod-deploy half still needs owner decisions (the
+    *Open decisions* below): a deploy runner with scoped prod access, where the QZ key / deploy
+    credentials live, the approvers, and the `CODEOWNERS` map. Nothing touches prod until those are set.
 - **Phase 3 — widen the auto tiers** as confidence grows; add monitoring-driven auto-rollback.
 
 ## The honest tradeoff
