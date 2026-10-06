@@ -94,12 +94,11 @@ PR ──► merge to master  (CI: lint guards + review + secret/customer-data s
     small **dedicated staging VM** for headroom.
   - *Avoid:* a second compose project on the prod host — it shares RAM and failure domain with
     production.
-- **A controlled copy of the app image.** The upstream base `ghcr.io/moqui/moqui-framework` is
-  **403-blocked for anonymous / cross-org pulls** (confirmed both in CI and on a teammate's machine),
-  so a *from-scratch* build fails anywhere but the prod host, which has it cached. So staging/CI uses
-  the repo's own **sanitized prebuilt image** (the `staging-image-v1` release asset) + an overlay of
-  the checked-out components — never the upstream pull. For the eventual full pipeline's per-`<sha>`
-  build, **mirror the base once into our own GHCR namespace** and build from the mirror.
+- **A controlled staging image.** Earlier anonymous/cross-org GHCR pulls returned 403. CI now uses
+  the audited `staging-image-clean-v1` release asset, assembled from public dependencies and an
+  allowlisted runtime with the matching framework JAR. Its checksum is verified before loading;
+  no production image layers, environment, database or signing keys are reused. The old
+  `staging-image-v1` archive is refused. See [runtime provenance and checks](../qa/ci-staging-repair/README.md).
 - **Versioned seed fixtures** — a demo tenant + a **MARUTHI-shaped** tenant (synthetic plan/pricing;
   never prod data), kept in the repo under `docs/infra/ci/seed/`.
 - **A deploy runner with scoped prod access** — a GitHub Actions self-hosted runner, or a hosted
@@ -118,25 +117,43 @@ PR ──► merge to master  (CI: lint guards + review + secret/customer-data s
 
 ## Phased rollout (earn the trust)
 
-- **Phase 1 — report-only staging acceptance.** Load the repo's sanitized **prebuilt** app image
-  (published as the `staging-image-v1` release asset — see the base-image note below), overlay the
+- **Phase 1 — report-only staging acceptance.** Load the pinned clean staging runtime
+  (published as the `staging-image-clean-v1` release asset), overlay the
   checked-out component tree, boot the ephemeral stack, and run the render smoke on demand (and
   later on every merge), **reporting** pass/fail. No auto-deploy. Prove the gate catches real
   problems for a few weeks. *(Starter workflow:
   [`../../.github/workflows/staging-acceptance.yml`](../../.github/workflows/staging-acceptance.yml),
   staging stack [`ci/docker-compose.staging.yml`](ci/docker-compose.staging.yml), smoke
   [`ci/smoke.mjs`](ci/smoke.mjs).)*
-  - **Status: implemented & green — 7/7 screens on /apps AND /qapps.** Trigger is
-    `workflow_dispatch` (manual) until the owner opts into `pull_request`/`push` (a billed-minutes
-    call). Three things it took to get there, so nobody re-discovers them:
-    1. **GHCR base is 403** → don't build from scratch; load the sanitized prebuilt release image +
-       overlay the checked-out components.
+  - **Status: implemented — 7 screens on /apps AND /qapps.** Runs on master pull requests,
+    master pushes and manual dispatch; assess the result for the exact tested commit. Three
+    requirements keep staging reproducible:
+    1. **Pinned clean image** → verify its audited checksum before loading and overlay the
+       checked-out application components.
     2. **The image lacks the container-only base overrides** `Login.xml`/`Login.ftl`/`qapps.xml`
        (prod bind-mounts them; `docker commit` doesn't capture mounts) → overlay the snapshots in
        `ci/base-overrides/`, or stock `/qapps` redirect-loops.
     3. **Login/data** = Moqui's `demo` load via `java -cp . MoquiStart` (exploded runtime, java at
        `/opt/java/openjdk/bin/java`) gives `john.doe`/`moqui`; a per-screen **retry** absorbs a
        transient Moqui session race on the /qapps SPA (`Invalid for read` → `Response is committed`).
+  - **Deeper acceptance — org-isolation: implemented & green.** Beyond "does it render", the workflow
+    now seeds two throwaway tenants (`docs/infra/ci/seed/isolation.xml`), makes `john.doe` an internal
+    agent of Tenant A, and asserts the live contacts page shows Tenant A's contact and **not** Tenant
+    B's — real active-org scoping, gated on DB ground truth so a load failure or a stripped pref fails
+    precisely. Four more gotchas surfaced building it (all in the workflow comments):
+    1. **CI has no OpenSearch** → keep `elasticsearch_url` empty and indexing disabled. The clean
+       runtime also disables external SMTP and automatic jobs; CI requires no production secrets.
+    2. **`MoquiStart load` with both `types=` and `location=` loads ONLY the location** (suppresses
+       types) → demo never loads, login 302. Use one normal types-based discovery invocation.
+    3. **A concurrent HTTP JVM owns the loader's Bitronix journal/schema.** Keep HTTP idle until
+       overlays, the single discovery loader and required-record assertions finish. The temporary
+       fixture component depends on contacts and uses `type="demo"`; one bad row rolls back its file.
+    4. The framework seed creates the `john.doe` **UserAccount but no mantle Party** → create the
+       person party + link it, or the party-based org membership FK-fails.
+  - **Next deeper check (not built):** a **MARUTHI-shaped billing no-op smoke** — a synthetic
+    MARUTHI-shaped tenant (tax-exclusive pricing + GST, POS modes; synthetic values, never prod
+    GSTIN/HSN/prices), a cash/card/split sale that mints a bill, and pricing/tax asserted against a
+    golden baseline. This is what proves "no-op-safe for MARUTHI" without touching MARUTHI's data.
 - **Phase 2 — auto-deploy the trivial tier.** docs/CSS/presentation auto-deploy after green staging;
   one-click approve for everything else. This is a comfortable place to sit for a long time.
 - **Phase 3 — widen the auto tiers** as confidence grows; add monitoring-driven auto-rollback.

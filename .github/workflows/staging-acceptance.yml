@@ -1,15 +1,27 @@
 # Phase-1 of the auto-deploy proposal (docs/infra/auto-deploy-proposal.md): REPORT-ONLY.
 #
-# Boots an ephemeral staging stack from the repo's OWN prebuilt, sanitized app image (the
-# `staging-image-v1` release asset — the upstream GHCR base is 403-blocked), overlays the checked-out
+# Boots an ephemeral staging stack from a clean runtime image assembled without production
+# image layers (`staging-image-clean-v1`), verifies its pinned checksum, overlays the checked-out
 # component tree (as a prod deploy does), seeds demo data, and renders a smoke set on /apps + /qapps.
 # NEVER touches production and has no prod credentials. Red = this change doesn't boot/render cleanly.
 #
-# workflow_dispatch (manual) ON PURPOSE while being tuned. Enable pull_request/push once green.
+# Runs for PRs and master, with manual dispatch available for diagnosis.
 name: staging-acceptance
+run-name: staging ${{ github.event.inputs.contacts_profile || 'none' }} · ${{ github.event.inputs.candidate_sha || github.sha }}
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      candidate_sha:
+        description: Optional same-repository commit to overlay and verify
+        required: false
+        type: string
+      contacts_profile:
+        description: Additional synthetic Contacts verification
+        required: true
+        default: none
+        type: choice
+        options: [none, ui, security]
   pull_request:
     branches: [master]
   push:                 # on-merge runs: re-check the merged result on master (no PR comment on push)
@@ -20,14 +32,17 @@ permissions:
   pull-requests: write      # to post/update the sticky PR comment on failure (same-repo PRs)
 
 concurrency:
-  group: staging-${{ github.ref }}
+  group: staging-${{ github.ref }}-${{ github.event.inputs.candidate_sha || github.sha }}-${{ github.event.inputs.contacts_profile || 'none' }}
   cancel-in-progress: true
 
 env:
   GH_TOKEN: ${{ github.token }}
-  IMAGE_RELEASE: staging-image-v1
-  IMAGE_ASSET: zetaerp-moqui-local.tar.gz
+  IMAGE_RELEASE: staging-image-clean-v1
+  IMAGE_ASSET: zetaerp-moqui-clean.tar.gz
+  IMAGE_SHA256: 0305b2d2f7124781c41de04eb8aa8a7847ee5116ee01f09dc52d7f12dc513b93
   COMPOSE: docs/infra/ci/docker-compose.staging.yml
+  CANDIDATE_SHA: ${{ github.event.inputs.candidate_sha || '' }}
+  CONTACTS_PROFILE: ${{ github.event.inputs.contacts_profile || 'none' }}
 
 jobs:
   acceptance:
@@ -37,24 +52,67 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download the sanitized staging image
+      - name: Validate optional verification inputs
+        run: |
+          set -euo pipefail
+          case "$CONTACTS_PROFILE" in none|ui|security) ;; *) echo "::error::Unknown Contacts verification profile"; exit 1;; esac
+          if [ -n "$CANDIDATE_SHA" ]; then
+            [[ "$CANDIDATE_SHA" =~ ^[a-f0-9]{40}$ ]] || { echo "::error::Candidate must be an exact commit SHA"; exit 1; }
+          elif [ "$CONTACTS_PROFILE" != none ]; then
+            echo "::error::A Contacts profile requires an exact candidate SHA"; exit 1
+          fi
+
+      - name: Checkout pinned candidate
+        if: github.event_name == 'workflow_dispatch' && inputs.candidate_sha != ''
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.candidate_sha }}
+          path: candidate
+          persist-credentials: false
+
+      - name: Select application source
+        run: |
+          set -euo pipefail
+          SOURCE="$GITHUB_WORKSPACE"
+          if [ -n "$CANDIDATE_SHA" ]; then
+            SOURCE="$GITHUB_WORKSPACE/candidate"
+            [ "$(git -C "$SOURCE" rev-parse HEAD)" = "$CANDIDATE_SHA" ] || { echo "::error::Candidate checkout differs from requested SHA"; exit 1; }
+          fi
+          test -d "$SOURCE/component"
+          echo "CONTACTS_QA_SOURCE_DIR=$SOURCE" >> "$GITHUB_ENV"
+
+      - name: Download the clean staging image
         run: gh release download "$IMAGE_RELEASE" --repo "$GITHUB_REPOSITORY" --pattern "$IMAGE_ASSET" --dir "$RUNNER_TEMP"
+
+      - name: Verify the clean image before loading
+        run: |
+          set -euo pipefail
+          [[ "$IMAGE_SHA256" =~ ^[a-f0-9]{64}$ ]] || { echo "::error::Clean image checksum is not pinned"; exit 1; }
+          actual=$(sha256sum "$RUNNER_TEMP/$IMAGE_ASSET" | cut -d ' ' -f 1)
+          if [ "$actual" = "2da7d916054bf4fccf9c6d32e97b2b2afa0d9ae3531d2a004a4bd87dcf59b18c" ]; then
+            echo "::error::Refusing the known unsafe original image archive"; exit 1
+          fi
+          printf '%s  %s\n' "$IMAGE_SHA256" "$RUNNER_TEMP/$IMAGE_ASSET" | sha256sum --check --strict -
 
       - name: Load the image
         run: |
           set -euo pipefail
-          loaded=$(docker load -i "$RUNNER_TEMP/$IMAGE_ASSET" | sed -n 's/^Loaded image: //p' | head -1)
+          docker load -i "$RUNNER_TEMP/$IMAGE_ASSET" > "$RUNNER_TEMP/image-load.txt"
+          loaded=$(sed -n 's/^Loaded image: //p' "$RUNNER_TEMP/image-load.txt")
+          [ "$loaded" = "zetaerp-moqui:clean-staging" ] || { echo "::error::Unexpected clean runtime image tag"; exit 1; }
           echo "loaded: $loaded"
           docker tag "$loaded" zetaerp-moqui:staging
 
       - name: Boot stack
+        # The CI-only compose command keeps HTTP idle until overlays and the loader finish.
         run: docker compose -f "$COMPOSE" up -d
 
       - name: Overlay the checked-out component tree
         run: |
           set -euo pipefail
           CID=$(docker compose -f "$COMPOSE" ps -q moqui)
-          tar czf - component | docker exec -i "$CID" sh -c 'cd /opt/moqui/runtime/component && tar xzf - --strip-components=1'
+          docker exec "$CID" sh -c 'rm -rf /opt/moqui/runtime/component/zenith-erp-*'
+          tar -C "$CONTACTS_QA_SOURCE_DIR" -czf - component | docker exec -i "$CID" sh -c 'cd /opt/moqui/runtime/component && tar xzf - --strip-components=1'
 
       - name: Overlay base-component webroot overrides
         # Login.xml / Login.ftl / qapps.xml are ZetaERP's base-component customizations that prod
@@ -67,19 +125,106 @@ jobs:
             docker cp "docs/infra/ci/base-overrides/$f" "$CID:/opt/moqui/runtime/base-component/webroot/screen/webroot/$f"
           done
 
-      - name: Load seed + demo data (+ CI isolation fixtures)
-        # Exploded Moqui runtime: java -cp . MoquiStart from /opt/moqui; java at /opt/java/openjdk/bin/java.
-        # ONE invocation (types + location together) = a single context init. A *second* MoquiStart
-        # init fails trying to reach the absent OpenSearch (20 retries -> throw); the first tolerates it.
+      - name: Overlay repository runtime classes and framework patches
+        # The clean runtime has no application-specific classes or production-derived patches.
+        # Apply this checkout's versions before loading data and restarting for render checks.
         run: |
-          set -x
+          set -euo pipefail
           CID=$(docker compose -f "$COMPOSE" ps -q moqui)
-          docker cp docs/infra/ci/seed/isolation.xml "$CID:/tmp/isolation.xml"
-          docker exec "$CID" sh -lc 'cd /opt/moqui && /opt/java/openjdk/bin/java -cp . MoquiStart load types=seed,seed-initial,demo location=/tmp/isolation.xml' \
-            || echo "::warning::seed/fixture load reported errors — see logs (loader skips bad files)"
+          docker cp docs/infra/zenith-classes/. "$CID:/opt/moqui/runtime/classes/"
+          docker cp docs/infra/framework-patches "$CID:/tmp/ci-framework-patches"
+          docker exec "$CID" sh -c '
+            set -eu
+            P=/tmp/ci-framework-patches
+            sh "$P/patch-webroot-nav.sh"
+            sh "$P/patch-webroot-breadcrumb.sh"
+            sh "$P/patch-webroot-qavatar.sh"
+            sh "$P/patch-log4j2-authzfilter.sh"
+            for asset in WebrootVue.qvt.js WebrootVue.qvt.min.js; do
+              F=/opt/moqui/runtime/base-component/webroot/screen/webroot/js/$asset
+              sh "$P/patch-webroot-lazy-rules.sh" "$F"
+              sh "$P/patch-webroot-inr-grid.sh" "$F"
+            done
+            for surface in html vuet qvt; do
+              sh "$P/patch-macro-inr.sh" "/opt/moqui/runtime/template/screen-macro/DefaultScreenMacros.$surface.ftl"
+            done
+          '
 
-      - name: Restart Moqui (pick up overlaid code + loaded data, fresh caches)
-        run: docker compose -f "$COMPOSE" restart moqui
+      - name: Install the CI-only isolation fixture component
+        run: |
+          set -euo pipefail
+          CID=$(docker compose -f "$COMPOSE" ps -q moqui)
+          docker exec "$CID" mkdir -p /opt/moqui/runtime/component/ci-staging-fixtures/data
+          docker cp docs/infra/ci/seed/component.xml "$CID:/opt/moqui/runtime/component/ci-staging-fixtures/component.xml"
+          docker cp docs/infra/ci/seed/isolation.xml "$CID:/opt/moqui/runtime/component/ci-staging-fixtures/data/CiIsolationDemoData.xml"
+
+      - name: Install requested Contacts profile fixture
+        if: github.event_name == 'workflow_dispatch' && inputs.contacts_profile != 'none'
+        run: |
+          set -euo pipefail
+          case "$CONTACTS_PROFILE" in
+            ui) QA_DIR=docs/qa/contacts-ui-runtime ;;
+            security) QA_DIR=docs/qa/contacts-security-runtime ;;
+            *) exit 1 ;;
+          esac
+          test -f "$CONTACTS_QA_SOURCE_DIR/$QA_DIR/fixture.xml"
+          test -f "$CONTACTS_QA_SOURCE_DIR/$QA_DIR/verify-runtime.cjs"
+          CID=$(docker compose -f "$COMPOSE" ps -q moqui)
+          docker exec "$CID" mkdir -p /opt/moqui/runtime/component/ci-contacts-profile-fixtures/data
+          printf '%s\n' '<component name="ci-contacts-profile-fixtures" version="1.0.0"><depends-on name="ci-staging-fixtures"/></component>' |
+            docker exec -i "$CID" sh -c 'cat > /opt/moqui/runtime/component/ci-contacts-profile-fixtures/component.xml'
+          docker cp "$CONTACTS_QA_SOURCE_DIR/$QA_DIR/fixture.xml" "$CID:/opt/moqui/runtime/component/ci-contacts-profile-fixtures/data/ContactsProfileDemoData.xml"
+          if [ "$CONTACTS_PROFILE" = security ]; then
+            # Authenticated, synthetic-fixture-restricted QA routes exist only in this disposable stack.
+            test -f "$CONTACTS_QA_SOURCE_DIR/$QA_DIR/qa-service-screen.xml"
+            docker cp "$CONTACTS_QA_SOURCE_DIR/$QA_DIR/qa-service-screen.xml" "$CID:/opt/moqui/runtime/component/zenith-erp-contacts/screen/zenith/contacts/Contacts/ContactsQaAcceptance.xml"
+          fi
+          echo "CONTACTS_QA_DIR=$CONTACTS_QA_SOURCE_DIR/$QA_DIR" >> "$GITHUB_ENV"
+
+      - name: Load discovered seed, demo and isolation fixtures in one invocation
+        # Exploded Moqui runtime: java -cp . MoquiStart from /opt/moqui; java at /opt/java/openjdk/bin/java.
+        # An explicit location bypasses normal component/framework data discovery, even with types.
+        # The temporary component depends on contacts, so its demo fixture loads after prerequisites.
+        # The loader can skip individual unrelated files; required records are asserted below.
+        run: |
+          set -euo pipefail
+          CID=$(docker compose -f "$COMPOSE" ps -q moqui)
+          docker exec "$CID" sh -lc 'cd /opt/moqui && /opt/java/openjdk/bin/java -cp . MoquiStart load types=seed,seed-initial,demo no-run-es' \
+            2>&1 | tee "$RUNNER_TEMP/seed.txt"
+
+      - name: Assert required seed and tenant records in the fresh database
+        run: |
+          set -euo pipefail
+          DBID=$(docker compose -f "$COMPOSE" ps -q db)
+          docker exec -i "$DBID" psql -U moqui -d moqui -v ON_ERROR_STOP=1 <<'SQL'
+          DO $$
+          BEGIN
+            IF NOT EXISTS (SELECT 1 FROM user_account WHERE user_id='EX_JOHN_DOE' AND username='john.doe' AND disabled='N' AND party_id='EX_JOHN_DOE') THEN
+              RAISE EXCEPTION 'Required active demo login or synthetic party association is missing';
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM user_group_member WHERE user_id='EX_JOHN_DOE' AND user_group_id IN ('ADMIN','ZENITH_ADMIN') AND (thru_date IS NULL OR thru_date>CURRENT_TIMESTAMP)) THEN
+              RAISE EXCEPTION 'Required demo admin module access is missing';
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM user_preference WHERE user_id='EX_JOHN_DOE' AND preference_key='ACTIVE_ORGANIZATION' AND preference_value='CITEST_ORG_A') THEN
+              RAISE EXCEPTION 'Required active synthetic organization preference is missing';
+            END IF;
+            IF (SELECT COUNT(*) FROM party_role WHERE party_id IN ('CITEST_ORG_A','CITEST_ORG_B') AND role_type_id='OrgInternal')<>2 THEN
+              RAISE EXCEPTION 'Synthetic internal organization roles are missing';
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM party_relationship WHERE party_relationship_id='CITEST_REL_JD_A' AND from_party_id='EX_JOHN_DOE' AND to_party_id='CITEST_ORG_A' AND relationship_type_enum_id='PrtAgent' AND to_role_type_id='OrgInternal') THEN
+              RAISE EXCEPTION 'Synthetic organization agent relationship is missing';
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM party p JOIN person n ON n.party_id=p.party_id WHERE p.party_id='CITEST_A_CUST' AND p.owner_party_id='CITEST_ORG_A' AND n.last_name='CITestOnlyInTenantA')
+              OR NOT EXISTS (SELECT 1 FROM party p JOIN person n ON n.party_id=p.party_id WHERE p.party_id='CITEST_B_CUST' AND p.owner_party_id='CITEST_ORG_B' AND n.last_name='CITestOnlyInTenantB') THEN
+              RAISE EXCEPTION 'Required tenant-owned synthetic contacts are missing';
+            END IF;
+          END $$;
+          SQL
+          echo "Required login, organization and contact fixture records are present"
+
+      - name: Start Moqui after overlays and verified seed data
+        # One JVM owns the Bitronix journal/schema at a time; the loader has exited now.
+        run: docker compose -f "$COMPOSE" exec -T moqui touch /tmp/ci-start-moqui
 
       - name: Wait for Moqui to respond
         run: |
@@ -110,6 +255,27 @@ jobs:
           code=$(curl -s -o /dev/null -w '%{http_code}' -u john.doe:moqui http://localhost:8080/apps/zenith || true)
           [ "$code" = "200" ] || { echo "::error::login/module access not 200 (got $code) — see diagnostics"; exit 1; }
 
+      - name: Assert fixtures loaded (DB ground truth)
+        # Prove the demo load AND the isolation fixture actually landed, and the active-org pref stuck,
+        # BEFORE the render assert — so a silent load failure or a stripped pref fails HERE with a
+        # precise message instead of looking like an isolation leak in the next step.
+        run: |
+          DBID=$(docker compose -f "$COMPOSE" ps -q db)
+          g(){ docker exec "$DBID" psql -U moqui -d moqui -tAc "$1" 2>/dev/null | tr -d '[:space:]'; }
+          echo "--- CITEST ground truth ---"
+          docker exec "$DBID" psql -U moqui -d moqui -P pager=off -c \
+            "SELECT party_id, party_type_enum_id, owner_party_id, disabled FROM party WHERE party_id LIKE 'CITEST%' ORDER BY party_id;" 2>&1 || true
+          docker exec "$DBID" psql -U moqui -d moqui -P pager=off -c \
+            "SELECT party_relationship_id, from_party_id, to_party_id, to_role_type_id, from_date, thru_date FROM party_relationship WHERE party_relationship_id='CITEST_REL_JD_A';" 2>&1 || true
+          ACT=$(g "SELECT preference_value FROM user_preference WHERE user_id='EX_JOHN_DOE' AND preference_key='ACTIVE_ORGANIZATION';")
+          echo "active-org pref = '${ACT}'"
+          [ "$(g "SELECT count(*) FROM user_account WHERE username='john.doe';")" = "1" ] || { echo "::error::demo load failed — john.doe missing"; exit 1; }
+          [ "$(g "SELECT count(*) FROM person WHERE party_id='CITEST_A_CUST';")" = "1" ] || { echo "::error::fixture load failed — CITEST_A_CUST missing"; exit 1; }
+          [ "$(g "SELECT count(*) FROM person WHERE party_id='CITEST_B_CUST';")" = "1" ] || { echo "::error::fixture load failed — CITEST_B_CUST missing"; exit 1; }
+          [ "$(g "SELECT count(*) FROM party_relationship WHERE party_relationship_id='CITEST_REL_JD_A';")" = "1" ] || { echo "::error::fixture load failed — membership relationship missing"; exit 1; }
+          [ "$ACT" = "CITEST_ORG_A" ] || { echo "::error::active-org pref is '${ACT}', expected CITEST_ORG_A (stripped? membership not recognized?) — the render isolation assert would false-positive, so failing here"; exit 1; }
+          echo "OK — demo + fixtures loaded, john.doe active org = CITEST_ORG_A"
+
       - name: Org-isolation assert
         # As john.doe (active org = CI Tenant A), the contacts list must show Tenant A's contact and
         # NOT Tenant B's — validates live active-org scoping (catches a gross isolation regression).
@@ -127,12 +293,43 @@ jobs:
           node-version: '20'
 
       - name: Install Puppeteer
-        run: npm init -y >/dev/null 2>&1 && npm i puppeteer@23 --no-save
+        run: |
+          set -euo pipefail
+          npm init -y >/dev/null 2>&1
+          if [ "$CONTACTS_PROFILE" = none ]; then npm i puppeteer@23 --no-save
+          else npm i puppeteer@23 playwright@1.62.1 --no-save; fi
 
       - name: Render smoke (both surfaces)
         run: |
           set -o pipefail
           node docs/infra/ci/smoke.mjs http://localhost:8080 | tee "$RUNNER_TEMP/smoke.txt"
+
+      - name: Run requested Contacts verification
+        if: github.event_name == 'workflow_dispatch' && inputs.contacts_profile != 'none'
+        env:
+          CONTACTS_QA_BASE_URL: http://127.0.0.1:8080
+          CONTACTS_QA_DB_MODE: postgres
+          # Public demo login, only for this new disposable database.
+          CONTACTS_QA_USERNAME: john.doe
+          CONTACTS_QA_PASSWORD: moqui
+        run: |
+          set -euo pipefail
+          export CONTACTS_QA_DB_CONTAINER=$(docker compose -f "$COMPOSE" ps -q db)
+          export CONTACTS_QA_APP_CONTAINER=$(docker compose -f "$COMPOSE" ps -q moqui)
+          export CONTACTS_QA_CHROME=$(node -e 'process.stdout.write(require("puppeteer").executablePath())')
+          if [ "$CONTACTS_PROFILE" = ui ]; then export CONTACTS_QA_REQUIRE_MOBILE_HEADER=1; fi
+          export CONTACTS_QA_OUTPUT_DIR="$RUNNER_TEMP/contacts-profile"
+          mkdir -p "$CONTACTS_QA_OUTPUT_DIR"
+          node "$CONTACTS_QA_DIR/verify-runtime.cjs"
+
+      - name: Save Contacts verification evidence
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.contacts_profile != 'none'
+        uses: actions/upload-artifact@v4
+        with:
+          name: contacts-${{ inputs.contacts_profile }}-${{ inputs.candidate_sha }}
+          path: ${{ runner.temp }}/contacts-profile
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Dump Moqui logs on failure
         if: failure()
