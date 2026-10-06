@@ -1,0 +1,125 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
+        default-menu-title="Dashboard Details" default-menu-include="false">
+    <parameter name="listType"/>
+    <parameter name="dashFacilityId"/>
+    <parameter name="pageIndex"/>
+    <parameter name="dashDate"/>
+    <parameter name="dashDateTo"/>
+    <parameter name="dateMode"/>
+    <actions>
+        <script><![CDATA[
+            import org.moqui.entity.EntityCondition
+            def ef = ec.entity
+            def org = ec.user.getPreference('ACTIVE_ORGANIZATION') ?: '__none__'
+            def shop = null
+            try { shop = ec.service.sync().name('zenith.base.ShopServices.get#ActiveShopScope').call()?.activeShopId } catch (Exception ignored) {}
+            def facilities = ef.find('mantle.facility.Facility').condition('ownerPartyId', org).list()
+            dashFacilityId = (dashFacilityId ?: '').toString()
+            if (!facilities.any { it.facilityId == dashFacilityId } || (shop && shop != dashFacilityId)) dashFacilityId = ''
+            def facility = dashFacilityId ?: shop
+            scopeLabel = facility ? (facilities.find { it.facilityId == facility }?.facilityName ?: 'Current shop') : 'All Warehouses'
+            listType = ['movements','lowstock','products'].contains(listType) ? listType : 'movements'
+            pageTitle = [movements:'Stock Transactions', lowstock:'Low Stock Alerts', products:'Products Needing Details'][listType]
+            int index = 0
+            try { index = Math.max(0, Integer.parseInt((pageIndex ?: '0').toString())) } catch (NumberFormatException ignored) {}
+            int size = 50
+            rows = []; totalRows = 0L
+            def assetsQuery = ef.find('mantle.product.asset.Asset').condition('ownerPartyId', org)
+            if (facility) assetsQuery.condition('facilityId', facility)
+            def assets = assetsQuery.list()
+            def assetsById = assets.collectEntries { [(it.assetId):it] }
+            def assetIds = assetsById.keySet() as List
+            def products = ef.find('mantle.product.Product').condition('ownerPartyId', org).orderBy('productName,productId').list()
+            def productsById = products.collectEntries { [(it.productId):it] }
+            if (listType == 'movements') {
+                def query = ef.find('mantle.product.asset.AssetDetail').condition('assetId', EntityCondition.IN, assetIds ?: ['__none__'])
+                    .condition('quantityOnHandDiff', EntityCondition.NOT_EQUAL, 0G)
+                totalRows = query.count()
+                index = Math.min(index, (int)Math.max(0L, (totalRows - 1L).intdiv(size)))
+                query.orderBy('-effectiveDate,assetDetailId').offset(index * size).limit(size).list().each { r ->
+                    def a = assetsById[r.assetId]; def p = productsById[a?.productId]
+                    def qty = (r.quantityOnHandDiff ?: 0G) as BigDecimal
+                    def rate = (a?.valuationRate ?: a?.acquireCost ?: 0G) as BigDecimal
+                    rows.add([productId:a?.productId ?: '', name:p?.productName ?: a?.productId ?: '—',
+                        date:r.effectiveDate ? ec.l10n.format(r.effectiveDate, 'dd MMM yyyy, HH:mm') : '—',
+                        type:qty > 0G ? 'Stock In' : 'Stock Out', qty:ec.l10n.format(qty, '#,##0.##'),
+                        amount:'₹' + ec.l10n.format(qty.abs() * rate, '#,##,##0.00')])
+                }
+            } else {
+                def fullRows = []
+                if (listType == 'lowstock') {
+                    def qoh = [:]
+                    assets.findAll { it.assetTypeEnumId == 'AstTpInventory' }.each { a -> qoh[a.productId] = (qoh[a.productId] ?: 0G) + (a.quantityOnHandTotal ?: 0G) }
+                    if (!facility) ef.find('zenith.erp.inventory.ProductStockView').condition('ownerPartyId', org).list().each { r -> qoh[r.productId] = r.totalQoh ?: 0G }
+                    products.findAll { it.inventoryTracked == 'Y' }.each { p ->
+                        if (facility && !qoh.containsKey(p.productId)) return
+                        def qty = qoh[p.productId] ?: 0G; def min = p.reorderPoint ?: 0G
+                        if (min > 0G && qty <= min) fullRows.add([productId:p.productId, name:p.productName ?: p.productId,
+                            quantity:qty, qty:ec.l10n.format(qty, '#,##0.##'), minimum:ec.l10n.format(min, '#,##0.##')])
+                    }
+                    fullRows.sort { a,b -> (a.quantity <=> b.quantity) ?: (a.productId <=> b.productId) }
+                } else {
+                    // Catalog completeness is organization-wide, just like the dashboard card.
+                    scopeLabel = 'Organization catalog'
+                    def ids = productsById.keySet() as List
+                    def barcodeIds = ef.find('mantle.product.ProductIdentification').condition('productId', EntityCondition.IN, ids ?: ['__none__']).list()*.productId as Set
+                    def categoryIds = ef.find('mantle.product.category.ProductCategoryMember').condition('productId', EntityCondition.IN, ids ?: ['__none__']).list()*.productId as Set
+                    products.each { p ->
+                        def missing = []
+                        if (p.mrpAmount == null || p.mrpAmount <= 0G) missing.add('Selling price')
+                        if (!p.hsnCode) missing.add('Tax code (HSN/SAC)')
+                        if (!barcodeIds.contains(p.productId)) missing.add('Barcode')
+                        if (!categoryIds.contains(p.productId)) missing.add('Category')
+                        if (!p.description) missing.add('Description')
+                        if (missing) fullRows.add([productId:p.productId, name:p.productName ?: p.productId, sku:p.pseudoId ?: '', missing:missing.join(', ')])
+                    }
+                }
+                totalRows = fullRows.size()
+                index = Math.min(index, (int)Math.max(0L, (totalRows - 1L).intdiv(size)))
+                rows = fullRows.drop(index * size).take(size)
+            }
+            def parent = (ec.web.request.requestURI ?: '').replaceAll('/+$','').replaceAll('/[^/]+$','')
+            def scope = '?dashFacilityId=' + java.net.URLEncoder.encode(dashFacilityId, 'UTF-8')
+            ['dashDate','dashDateTo','dateMode'].each { key -> if (context[key]) scope += '&' + key + '=' + java.net.URLEncoder.encode(context[key].toString(), 'UTF-8') }
+            backUrl = parent + '/InventoryDashboard' + scope
+            def listUrl = parent + '/DashboardDetails' + scope + '&listType=' + listType + '&pageIndex='
+            previousUrl = index > 0 ? listUrl + (index - 1) : ''
+            nextUrl = (index + 1L) * size < totalRows ? listUrl + (index + 1) : ''
+            pageNumber = index + 1
+            pageCount = Math.max(1L, (totalRows + size - 1L).intdiv(size))
+            rows.each { it.editUrl = parent + '/EditProduct?productId=' + java.net.URLEncoder.encode(it.productId, 'UTF-8') }
+        ]]></script>
+    </actions>
+    <widgets>
+        <container-box>
+            <box-header title="${pageTitle}"/>
+            <box-body>
+                <render-mode><text type="html,vuet,qvt" template="true"><![CDATA[
+<div class="inv-detail-content">
+<p>${scopeLabel?html} · ${totalRows} records</p>
+<p><a href="${backUrl?html}">Back to dashboard</a></p>
+<div class="inv-table-wrap">
+<table class="table table-striped">
+<thead><tr>
+<#if listType == 'movements'><th>Date &amp; Time</th><th>Item</th><th>Type</th><th>Qty</th><th>Amount</th>
+<#elseif listType == 'lowstock'><th>Item</th><th>Available</th><th>Min. Required</th>
+<#else><th>Item</th><th>SKU</th><th>Missing Details</th></#if>
+</tr></thead>
+<tbody><#list rows as r><tr>
+<#if listType == 'movements'><td>${r.date?html}</td><td>${r.name?html}</td><td>${r.type}</td><td>${r.qty}</td><td>${r.amount}</td>
+<#elseif listType == 'lowstock'><td>${r.name?html}</td><td>${r.qty}</td><td>${r.minimum}</td>
+<#else><td><a href="${r.editUrl?html}">${r.name?html}</a></td><td>${r.sku?html}</td><td>${r.missing?html}</td></#if>
+</tr><#else><tr><td colspan="5">No matching records.</td></tr></#list></tbody>
+</table></div>
+<p>Page ${pageNumber} of ${pageCount}
+<#if previousUrl?has_content> · <a href="${previousUrl?html}">Previous</a></#if>
+<#if nextUrl?has_content> · <a href="${nextUrl?html}">Next</a></#if></p>
+<img alt="" style="display:none" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" onload="(function(img){var m=location.pathname.match(/^(.*\/Inventory)\//);if(!m)return;img.parentNode.querySelectorAll('a').forEach(function(a){var n=(a.getAttribute('href')||'').match(/\/Inventory\/(.*)$/);if(n)a.href=m[1]+'/'+n[1];});})(this)"/>
+</div>
+                ]]></text></render-mode>
+            </box-body>
+        </container-box>
+    </widgets>
+</screen>

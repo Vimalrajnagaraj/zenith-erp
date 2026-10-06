@@ -33,10 +33,18 @@ const PATHS = [
   '/apps/zenith/Contacts/FindContact',
   '/apps/zenith/Dashboard',
   '/apps/zenith/Inventory/InventoryDashboard',
+  '/apps/zenith/Inventory/InventoryDashboard?dateMode=all',
+  '/apps/zenith/Inventory/DashboardDetails?listType=movements',
+  '/apps/zenith/Inventory/DashboardDetails?listType=lowstock',
+  '/apps/zenith/Inventory/DashboardDetails?listType=products',
   '/qapps/zenith',
   '/qapps/zenith/Contacts/ContactsDashboard',
   '/qapps/zenith/Contacts/FindContact',
   '/qapps/zenith/Inventory/InventoryDashboard',
+  '/qapps/zenith/Inventory/InventoryDashboard?dateMode=all',
+  '/qapps/zenith/Inventory/DashboardDetails?listType=movements',
+  '/qapps/zenith/Inventory/DashboardDetails?listType=lowstock',
+  '/qapps/zenith/Inventory/DashboardDetails?listType=products',
 ];
 
 const ERR_SIG = /(java\.lang\.|groovy\.lang\.|org\.moqui\.\w+Exception|freemarker\.core|ScreenRenderException|Error rendering|500 Internal Server Error|HTTP Status 500)/i;
