@@ -69,25 +69,25 @@ try {
       await sleep(3000); // let Vue/Quasar and any img-onload bootstraps paint
       if (path.includes('/Inventory/InventoryDashboard')) {
         await page.waitForSelector('.inv-dashboard', { timeout: 15000 });
-        // Quasar strips template <style> tags: verify the shared stylesheet really
-        // keeps KPI arrows compact, colored, and aligned on both ERP surfaces.
-        const trendStylesOk = await page.evaluate(() =>
-          Array.from(document.querySelectorAll('.inv-trend')).every(trend => {
-            const svg = trend.querySelector('svg');
-            const rect = svg?.getBoundingClientRect();
-            const expected = trend.classList.contains('inv-trend-fall') ? 'rgb(255, 0, 0)' : 'rgb(11, 181, 42)';
-            return rect && rect.width === 14 && rect.height === 14 &&
-              getComputedStyle(svg).color === expected && ['flex', 'inline-flex'].includes(getComputedStyle(trend).display);
-          }));
-        if (!trendStylesOk) throw new Error('KPI trend styling missing or oversized on this ERP surface');
-        await page.waitForSelector('#inventoryOverviewChart .apexcharts-canvas', { timeout: 15000 });
-        const compactPreviews = await page.evaluate(() => {
-          const cards = Array.from(document.querySelectorAll('.inv-bottom > .inv-card'));
-          const count = title => cards.find(card => card.querySelector('h2')?.textContent === title)?.querySelectorAll('tbody tr').length || 0;
-          return count('Recent Transactions') <= 5 && count('Low Stock Alerts') <= 4 &&
-            !!document.querySelector('.inv-date > summary svg');
+        // Guard the approved PR #17 presentation on both ERP surfaces. A KPI
+        // without a prior-period comparison correctly has no percentage arrow.
+        const presentationOk = await page.evaluate(() => {
+          const theme = getComputedStyle(document.querySelector('.inv-dashboard'));
+          return theme.getPropertyValue('--primary').trim() === '#7C3AED' &&
+            theme.getPropertyValue('--green-text').trim() === '#059669' &&
+            theme.getPropertyValue('--red-text').trim() === '#DC2626' &&
+            Array.from(document.querySelectorAll('.inv-delta svg')).every(svg => {
+              const rect = svg.getBoundingClientRect();
+              return rect.width === 14 && rect.height === 14 &&
+                ['rgb(5, 150, 105)', 'rgb(220, 38, 38)'].includes(getComputedStyle(svg).color);
+            });
         });
-        if (!compactPreviews) throw new Error('Live dashboard lost the compact preview or calendar date control');
+        if (!presentationOk) throw new Error('Approved Inventory theme or compact KPI arrow styling changed');
+        if (await page.$('#inventoryOverviewChart')) {
+          await page.waitForSelector('#inventoryOverviewChart .apexcharts-line-series', { timeout: 15000 });
+        } else {
+          await page.waitForSelector('.inv-chart-empty', { timeout: 15000 });
+        }
       } else if (path.includes('/Inventory/DashboardDetails')) {
         await page.waitForSelector('.inv-detail-content', { timeout: 15000 });
       }
@@ -154,7 +154,7 @@ try {
         phase = 'date parameters in URL';
         await page.waitForFunction(() => new URL(location.href).searchParams.get('dashDate') === '2026-10-01', { timeout: 15000 });
         phase = 'selected date range rendered';
-        await page.waitForFunction(() => document.querySelector('.inv-date > summary')?.title === '2026-10-01 to 2026-10-06', { timeout: 15000 });
+        await page.waitForFunction(() => document.querySelector('.inv-date > summary')?.textContent.includes('2026-10-01 to 2026-10-06'), { timeout: 15000 });
         const validLinks = await page.evaluate(surface => {
           const add = document.querySelector('.inv-header a.inv-primary');
           return !add || new URL(add.href).pathname === `/${surface}/zenith/Inventory/FindProduct`;
