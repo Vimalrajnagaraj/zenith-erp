@@ -1,5 +1,7 @@
 # Contacts Dashboard runtime verification — 5 October 2026
 
+**Historical report:** this 5 October run used a source-built framework jar with a different production hash. The [6 October owner-image follow-up](exact-image.md) records the supplied image, declared overlays, actual narrow/wide viewports and final runtime acceptance; final CI/readiness and cleanup are tracked there.
+
 Follow-up to PR #11. These screenshots are from a running local Moqui application and a fresh PostgreSQL database, not the standalone preview or the mocked action test.
 
 ## Changes and scope
