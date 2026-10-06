@@ -1,0 +1,52 @@
+# Ephemeral STAGING stack for CI acceptance (Phase 1). NOT production.
+# Throwaway passwords, fresh volume, torn down after each run. OpenSearch is omitted to keep the
+# runner light; search-backed screens are therefore out of the render-smoke scope for now.
+#
+# The fresh clean runtime is published as `zetaerp-moqui-clean.tar.gz` in the
+# `staging-image-clean-v1` release. The workflow verifies its pinned SHA256 before loading
+# and tagging it zetaerp-moqui:staging, then overlays the checked-out component tree.
+# The container waits until overlays, the single seed loader, and DB assertions finish:
+# this prevents the HTTP JVM and loader from sharing the Bitronix journal/schema concurrently.
+# Up with:
+#   docker compose -f docs/infra/ci/docker-compose.staging.yml up -d
+# After completing the same overlays/seed/assertions as staging-acceptance.yml, start HTTP with:
+#   docker compose -f docs/infra/ci/docker-compose.staging.yml exec moqui touch /tmp/ci-start-moqui
+services:
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: moqui
+      POSTGRES_USER: moqui
+      POSTGRES_PASSWORD: staging_only   # throwaway; must match entity_ds_password below
+      TZ: Asia/Kolkata
+    # no named volume: the container's own layer is fine for a disposable stack
+    tmpfs:
+      - /var/lib/postgresql/data        # RAM-backed → fast + nothing to clean up
+    mem_limit: 1g
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U moqui -d moqui"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  moqui:
+    image: zetaerp-moqui:staging         # clean runtime loaded by the workflow
+    command: ["sh", "-c", "until [ -f /tmp/ci-start-moqui ]; do sleep 1; done; exec /opt/java/openjdk/bin/java -cp . MoquiStart port=8080 no-run-es"]
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      - TZ=Asia/Kolkata
+      - entity_ds_db_conf=postgres
+      - entity_ds_host=db
+      - entity_ds_port=5432
+      - entity_ds_database=moqui
+      - entity_ds_user=moqui
+      - entity_ds_password=staging_only  # must match db POSTGRES_PASSWORD
+      # CI does not provision OpenSearch. Disable its client explicitly for the loader and HTTP JVM;
+      # search-backed screens stay outside the render-smoke scope.
+      - elasticsearch_url=
+      - JAVA_TOOL_OPTIONS=-Xms512m -Xmx1792m -Dbitronix.tm.serverId=zetaerp-staging -Duser.timezone=Asia/Kolkata -Ddefault_time_zone=Asia/Kolkata
+    ports:
+      - "8080:8080"
+    mem_limit: 2560m
