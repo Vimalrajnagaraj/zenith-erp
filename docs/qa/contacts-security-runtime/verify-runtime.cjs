@@ -99,7 +99,11 @@ async function browserMatrix(){
   const contexts={};
   async function userContext(user){
    if(contexts[user])return contexts[user];
-   const context=await browser.newContext({viewport:{width:1440,height:900},extraHTTPHeaders:{Authorization:'Basic '+Buffer.from(user+':'+password).toString('base64')}});
+   const context=await browser.newContext({viewport:{width:1440,height:900}});
+   // Basic login creates a new Moqui session on every request. Authenticate once, then use cookies
+   // so concurrent Quasar requests cannot invalidate one another's sessions.
+   const login=await context.request.get(base+'/apps/zenith/Contacts/CustomerGroups',{headers:{Authorization:'Basic '+Buffer.from(user+':'+password).toString('base64')}});
+   check(user+': one-shot authenticated session established',login.status()===200&&(await context.cookies(base)).some(c=>c.name==='JSESSIONID'));
    const page=await context.newPage();page.on('pageerror',e=>errors.push(e.message));
    // A normal rendered page supplies the session CSRF token without disabling security.
    await page.goto(base+'/apps/zenith/Contacts/CustomerGroups',{waitUntil:'domcontentloaded',timeout:90000});await page.locator('.cust-title').first().waitFor({timeout:60000});
@@ -152,7 +156,8 @@ async function browserMatrix(){
    const {page}=await userContext('contacts.qa.a');
    for(const width of [320,390,800,1440])for(const screen of ['FindContact','Customers','Vendors','CustomerGroups']){
     await page.setViewportSize({width,height:900});await page.goto(`${base}/${shell}/zenith/Contacts/${screen}`,{waitUntil:'domcontentloaded',timeout:90000});
-    await page.waitForFunction(expected=>document.body.innerText.includes(expected),screen==='CustomerGroups'?'P14QA Owned Alpha':'P14QA Alpha',{timeout:60000});await page.waitForTimeout(500);
+    // Navigation can briefly replace the document before its new body exists; keep polling then.
+    await page.waitForFunction(expected=>document.body?.innerText?.includes(expected),screen==='CustomerGroups'?'P14QA Owned Alpha':'P14QA Alpha',{timeout:60000});await page.waitForTimeout(500);
     const shape=await page.evaluate(()=>({title:(document.querySelector('.cust-title,.box-header,.panel-heading')?.textContent||'').trim(),own:document.body.innerText.includes('P14QA Alpha'),foreign:document.body.innerText.includes('P14QA Foreign Bravo')||document.body.innerText.includes('P14QA Global Unowned'),tables:[...document.querySelectorAll('table')].filter(t=>t.getBoundingClientRect().width>0).length,bodyWidth:document.body.clientWidth,scrollWidth:document.body.scrollWidth}));
     check(`${shell} ${screen} ${width}: real responsive screen renders scoped data`,!shape.foreign&&(screen==='CustomerGroups'||shape.own),shape);
     const screenshot=(screen==='FindContact'||screen==='CustomerGroups')?`${shell}-${screen}-${width}.png`:null;if(screenshot)await page.screenshot({path:path.join(out,screenshot),fullPage:true});report.viewports.push({shell,screen,width,screenshot,...shape});
@@ -164,4 +169,4 @@ async function browserMatrix(){
   report.databaseFinalState=after;report.pageErrors=errors;check('Both real browser shells have no JavaScript page errors',errors.length===0,errors);
  }finally{if(browser)await browser.close();}
 }
-(async()=>{try{await reproduce();if(process.argv.includes('--reproduce'))return;provenance();if(!process.argv.includes('--browser-only'))await scopeMatrix();if(!process.argv.includes('--scope-only'))await browserMatrix();}catch(error){report.error=error.message;process.exitCode=1;}finally{report.completedAt=new Date().toISOString();report.passed=report.checks.filter(c=>c.pass).length;report.failed=report.checks.filter(c=>!c.pass).length;fs.writeFileSync(path.join(out,'verification.json'),JSON.stringify(report,null,2));console.log(JSON.stringify({passed:report.passed,failed:report.failed,reproduction:report.reproduction,error:report.error},null,2));}})();
+(async()=>{try{if(process.argv.includes('--organization-only')){provenance();await require('./verify-organization.cjs')({query,check,report,base,password,exportRows});return;}await reproduce();if(process.argv.includes('--reproduce'))return;provenance();if(!process.argv.includes('--browser-only'))await scopeMatrix();if(!process.argv.includes('--scope-only'))await browserMatrix();if(!process.argv.includes('--scope-only')&&!process.argv.includes('--browser-only'))await require('./verify-organization.cjs')({query,check,report,base,password,exportRows});}catch(error){report.error=error.message;process.exitCode=1;}finally{report.completedAt=new Date().toISOString();report.passed=report.checks.filter(c=>c.pass).length;report.failed=report.checks.filter(c=>!c.pass).length;fs.writeFileSync(path.join(out,'verification.json'),JSON.stringify(report,null,2));console.log(JSON.stringify({passed:report.passed,failed:report.failed,reproduction:report.reproduction,error:report.error},null,2));}})();
