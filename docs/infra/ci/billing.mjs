@@ -18,12 +18,12 @@
 
 import puppeteer from 'puppeteer';
 import { writeFileSync } from 'fs';
+import { establishSession } from './session.mjs';
 
 const BASE = (process.argv[2] || 'http://localhost:8080').replace(/\/+$/, '');
 const OUT  = process.env.BILLING_OUT || process.argv[3] || 'billing_txns.env';
 const USER = process.env.SMOKE_USER || 'john.doe';
 const PASS = process.env.SMOKE_PASS || 'moqui';
-const AUTH = 'Basic ' + Buffer.from(`${USER}:${PASS}`).toString('base64');
 const SESS = 'CITEST_A_SESS';            // the data-loaded open session
 
 const browser = await puppeteer.launch({
@@ -35,10 +35,10 @@ function fail(msg) { console.error('BILLING DRIVER FAIL: ' + msg); }
 
 try {
   const page = await browser.newPage();
-  await page.setExtraHTTPHeaders({ Authorization: AUTH });
+  await establishSession(page, BASE, USER, PASS);
   await page.setViewport({ width: 1400, height: 1000 });
 
-  // Load the terminal once: establishes the authenticated session cookie + the CSRF token.
+  // Load the terminal using the established cookie, then capture its actual CSRF token.
   await page.goto(BASE + '/apps/zenith/pos/Terminal', { waitUntil: 'networkidle2', timeout: 60000 });
   await page.waitForFunction(
     () => !!((window.moqui && window.moqui.webrootVue && window.moqui.webrootVue.moquiSessionToken) ||
@@ -51,7 +51,7 @@ try {
   if (!token) { fail('no moquiSessionToken on the Terminal page (login/session failed?)'); await browser.close(); process.exit(1); }
   console.log('moquiSessionToken acquired (len ' + token.length + ')');
 
-  // POST a transition from the page context: same-origin cookies + Basic-auth header are sent.
+  // POST a transition from the page context using the session cookie and actual CSRF token.
   async function post(path, fields) {
     return await page.evaluate(async (base, path, fields) => {
       const body = new URLSearchParams(fields).toString();

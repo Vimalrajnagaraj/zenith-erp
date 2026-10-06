@@ -19,6 +19,7 @@
 //     whole-rupee rounding, and split-tender reconciliation against a golden baseline via psql.
 
 import puppeteer from 'puppeteer';
+import { establishSession } from './session.mjs';
 
 const BASE = (process.argv[2] || 'http://localhost:8080').replace(/\/+$/, '');
 const USER = process.env.SMOKE_USER || 'john.doe';
@@ -37,7 +38,6 @@ const PATHS = [
 ];
 
 const ERR_SIG = /(java\.lang\.|groovy\.lang\.|org\.moqui\.\w+Exception|freemarker\.core|ScreenRenderException|Error rendering|500 Internal Server Error|HTTP Status 500)/i;
-const AUTH = 'Basic ' + Buffer.from(`${USER}:${PASS}`).toString('base64');
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 const browser = await puppeteer.launch({
@@ -48,7 +48,7 @@ const browser = await puppeteer.launch({
 let failures = 0;
 try {
   const page = await browser.newPage();
-  await page.setExtraHTTPHeaders({ Authorization: AUTH });
+  await establishSession(page, BASE, USER, PASS);
   await page.setViewport({ width: 1400, height: 1000 });
 
   async function checkOnce(path) {
@@ -72,9 +72,7 @@ try {
   }
 
   for (const path of PATHS) {
-    // Retry once: a real render bug fails both times; a transient Moqui session race on the SPA's
-    // concurrent sub-requests (IllegalStateException "Invalid for read" / "Response is committed")
-    // clears on a second try. Only a consistent failure is a real FAIL.
+    // Retain one retry for transient navigation failures; the final attempt must satisfy every gate.
     let r = await checkOnce(path);
     if (!r.ok) { await sleep(4000); r = await checkOnce(path); }
     if (!r.ok) failures++;
