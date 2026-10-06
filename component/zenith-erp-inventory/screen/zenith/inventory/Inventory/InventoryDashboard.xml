@@ -7,6 +7,7 @@
     <parameter name="dashDate"/>
     <parameter name="dashDateTo"/>
     <parameter name="dateMode"/>
+    <parameter name="dashFacilityId"/>
 
     <!-- ZE-DASH: switchable widgets + drag-reorder + a date-range filter that drives the Stock Movements time series -->
     <transition name="saveDashLayout">
@@ -56,6 +57,22 @@
             // ZE-SHOP: when a shop is selected globally, scope the STOCK figures (units/value/expiring) to its
             // facility (null = All Shops). Product/category counts stay org-wide (products belong to the org).
             def _activeShop = null; try { def _sc = ec.service.sync().name("zenith.base.ShopServices.get#ActiveShopScope").call(); _activeShop = _sc?.activeShopId } catch (Exception _e) {}
+
+            // Warehouse choices never expand the current organization or global shop scope.
+            def _fq = ef.find("mantle.facility.Facility").condition("ownerPartyId", orgId).orderBy("facilityName")
+            if (_activeShop) _fq.condition("facilityId", _activeShop)
+            warehouseOptions = _fq.list()
+            dashFacilityId = (dashFacilityId ?: '').toString()
+            if (dashFacilityId && !warehouseOptions.any { it.facilityId == dashFacilityId }) dashFacilityId = ''
+            if (dashFacilityId) _activeShop = dashFacilityId
+            warehouseScopeLabel = _activeShop ? (warehouseOptions.find { it.facilityId == _activeShop }?.facilityName ?: 'Current shop') : 'All Warehouses'
+            def _scopeQoh = [:]
+            if (_activeShop) {
+                ef.find("mantle.product.asset.Asset").condition("ownerPartyId", orgId).condition("facilityId", _activeShop)
+                  .condition("assetTypeEnumId", "AstTpInventory").list().each { a ->
+                    _scopeQoh[a.productId] = (_scopeQoh[a.productId] ?: 0G) + (a.quantityOnHandTotal ?: 0G)
+                }
+            }
 
             // ----- Stock value + units in hand (across ALL of the org's inventory) -----
             // ZE-INV-001/IV-001: sum per ASSET (not the by-facility view). Two fixes:
@@ -130,7 +147,8 @@
             if (trackedCount > 0) {
                 def psv = ef.find("zenith.erp.inventory.ProductStockView").condition("ownerPartyId", orgId).list()
                 for (r in psv) {
-                    def q = (r.totalQoh ?: 0G); def rp = (r.reorderPoint ?: 0G)
+                    if (_activeShop && !_scopeQoh.containsKey(r.productId)) continue
+                    def q = _activeShop ? (_scopeQoh[r.productId] ?: 0G) : (r.totalQoh ?: 0G); def rp = (r.reorderPoint ?: 0G)
                     if (rp > 0G && q <= rp) {
                         lowStockCnt++
                         _lowAll.add([name: (r.productName ?: r.productId), sku: (r.pseudoId ?: ''), q: q,
@@ -283,7 +301,9 @@
             def _trfs = ef.find("zenith.erp.inventory.StockTransfer").condition("organizationPartyId", orgId).condition("transferDate", EntityCondition.GREATER_THAN_EQUAL_TO, _mvStart).condition("transferDate", EntityCondition.LESS_THAN, _mvEnd).selectField("transferDate").list()
             // ZE-INV §7: Stock In/Out FLOW from the AssetDetail ledger (org-scoped; AssetDetail is small). Positive
             // quantityOnHandDiff = stock in, negative = stock out. Real data — no fabrication.
-            def _ioAssetIds = ef.find("mantle.product.asset.Asset").condition("ownerPartyId", orgId).selectField("assetId").list()*.assetId as HashSet
+            def _ioAssetQuery = ef.find("mantle.product.asset.Asset").condition("ownerPartyId", orgId)
+            if (_activeShop) _ioAssetQuery.condition("facilityId", _activeShop)
+            def _ioAssetIds = _ioAssetQuery.selectField("assetId").list()*.assetId as HashSet
             def _ioLedger = ef.find("mantle.product.asset.AssetDetail").condition("effectiveDate", EntityCondition.GREATER_THAN_EQUAL_TO, _mvStart).condition("effectiveDate", EntityCondition.LESS_THAN, _mvEnd).selectField("assetId").selectField("effectiveDate").selectField("quantityOnHandDiff").list().findAll { _ioAssetIds.contains(it.assetId) }
             def _keys = []; def _labelByKey = [:]; def _adjBy = [:]; def _trfBy = [:]; def _ioInBy = [:]; def _ioOutBy = [:]
             def _bc = java.util.Calendar.getInstance(); _bc.setTime(_mvStart); def _bendMs = _mvEnd.getTime(); int _guard = 0
@@ -301,7 +321,7 @@
             mvInJson = "["+_mIn.join(",")+"]"; mvOutJson = "["+_mOut.join(",")+"]"
             def _ioInTot = 0G; def _ioOutTot = 0G; _ioInBy.values().each { _ioInTot += it }; _ioOutBy.values().each { _ioOutTot += it }
             mvInTotalDisp = ec.l10n.format(_ioInTot, '#,##0.##'); mvOutTotalDisp = ec.l10n.format(_ioOutTot, '#,##0.##')
-            mvAdjCount = _adjs.size(); mvTrfCount = _trfs.size(); mvHasData = (_adjs.size() + _trfs.size() + _ioLedger.size()) > 0
+            mvAdjCount = _adjs.size(); mvTrfCount = _trfs.size(); mvHasData = _activeShop ? !_ioLedger.isEmpty() : ((_adjs.size() + _trfs.size() + _ioLedger.size()) > 0)
             mvRangeLabel = dashDate ? (dashDate == dashDateTo ? dashDate : (dashDate + " to " + dashDateTo)) : "last 6 months"
             // ZE-INV §5: week-over-week units delta = net AssetDetail movement in the last 7 days (org-scoped) — real.
             def _ioWc7 = java.util.Calendar.getInstance(); _ioWc7.setTime(_now); _ioWc7.add(java.util.Calendar.DAY_OF_MONTH, -7); def _ioWkAgo = new java.sql.Timestamp(_ioWc7.getTimeInMillis())
@@ -367,7 +387,7 @@
 
             // §9 Recent Transactions as ITEM-LEVEL movements from the ledger (newest first) — real.
             def _rMoves = []; def _pNameCache = [:]
-            def _rlRows = ef.find("mantle.product.asset.AssetDetail").orderBy("-effectiveDate").limit(50).list()
+            def _rlRows = ef.find("mantle.product.asset.AssetDetail").condition("assetId", EntityCondition.IN, _ioAssetIds ? (_ioAssetIds as List) : ['__none__']).orderBy("-effectiveDate").limit(50).list()
             for (r in _rlRows) {
                 if (!_ioAssetIds.contains(r.assetId)) continue
                 def _d = (r.quantityOnHandDiff ?: 0G) as BigDecimal
@@ -416,6 +436,10 @@
             qaFacility = _qaParent + '/FindFacility'; qaEditProduct = _qaParent + '/EditProduct'
             qaProducts = _qaParent + '/FindProduct'; qaReceive = _qaParent + '/FindReceipt'; qaTransfer = _qaParent + '/StockTransfers'
             qaAdjust = _qaParent + '/StockAdjustments'; qaLevels = _qaParent + '/StockLevels'; qaForecast = _qaParent + '/DemandForecast'
+            if (dashFacilityId) {
+                def _warehouseParam = '&dashFacilityId=' + java.net.URLEncoder.encode(dashFacilityId, 'UTF-8')
+                ['urlAll','urlToday','urlWeek','urlMonth','url30','urlYear','urlCustom','urlSettings'].each { k -> context[k] = context[k] + _warehouseParam }
+            }
         ]]></script>
     </actions>
 
@@ -427,13 +451,18 @@
 <p>Real-time overview of your inventory operations</p>
 </div>
 <div class="inv-filters">
-<a class="inv-control" href="${qaFacility}">
-<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true">
-<path d="m12 3 9 5-9 5-9-5 9-5ZM3 8v9l9 5 9-5V8M12 13v9"/>
-</svg>Warehouses</a>
+<form class="inv-warehouse-filter" method="get" action=".">
+<label class="inv-control" style="margin:0">
+<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="m12 3 9 5-9 5-9-5 9-5ZM3 8v9l9 5 9-5V8M12 13v9"/></svg>
+<select name="dashFacilityId" aria-label="Warehouse" onchange="this.form.submit()" style="border:0;background:transparent;color:inherit;font:inherit;max-width:210px;padding:0;appearance:none">
+<option value="">All Warehouses</option>
+<#list warehouseOptions as w><option value="${w.facilityId?html}" <#if dashFacilityId == w.facilityId>selected</#if>>${w.facilityName?html}</option></#list>
+</select><span aria-hidden="true">▾</span>
+</label><input type="hidden" name="dashDate" value="${dashDate}"/><input type="hidden" name="dashDateTo" value="${dashDateTo}"/>
+</form>
 <details class="inv-date">
 <summary class="inv-control">${mvRangeLabel} ▾</summary>
-<form method="get" action=".">
+<form method="get" action="."><input type="hidden" name="dashFacilityId" value="${dashFacilityId?html}"/>
 <label>From<input type="date" name="dashDate" value="${dashDate}" required>
 </label>
 <label>To<input type="date" name="dashDateTo" value="${dashDateTo}" required>
@@ -470,7 +499,7 @@
 <div>
 <span class="inv-stat-label">Total Stock Value</span>
 <strong>₹${stockValueDispK}</strong>
-<span class="inv-stat-caption">Current shop scope</span>
+<span class="inv-stat-caption">${warehouseScopeLabel?html}</span>
 </div>
 <div class="inv-delta"><#if kpiValSub?contains('%')><span style="color:${kpiValColor};font-weight:600;display:inline-flex;align-items:center;gap:8px"><#if kpiValColor == '#DC2626'><svg viewBox="0 0 24 24" width="14" height="14" style="width:14px;height:14px;vertical-align:middle" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14m-6-6 6 6 6-6"/></svg><#else><svg viewBox="0 0 24 24" width="14" height="14" style="width:14px;height:14px;vertical-align:middle" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5m-6 6 6-6 6 6"/></svg></#if>${kpiValSub?keep_before('%')?replace('▲','')?replace('▼','')?replace('+','')?replace('−','')?replace('-','')?trim}%</span><span style="margin-left:20px">${kpiValSub?keep_after('%')}</span><#else>${kpiValSub}</#if></div>
 </article>
@@ -530,7 +559,7 @@
 <#if mvHasData>
 <div id="inventoryOverviewChart">
 </div>
-<img alt="" style="display:none" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" onload="zChart(this,function(){var el=document.getElementById('inventoryOverviewChart');if(!el||el.dataset.ready)return;el.dataset.ready='true';var s=getComputedStyle(el.closest('.inv-dashboard'));new ApexCharts(el,{chart:{type:'area',height:230,toolbar:{show:false},fontFamily:'Inter, sans-serif'},series:[{name:'Stock In',data:${mvInJson}},{name:'Stock Out',data:${mvOutJson}}],xaxis:{categories:${mvLabelsJson}},colors:[s.getPropertyValue('--green').trim(),s.getPropertyValue('--orange').trim()],stroke:{curve:'smooth',width:2},markers:{size:4},fill:{type:'gradient',gradient:{opacityFrom:0.25,opacityTo:0}},dataLabels:{enabled:false},legend:{position:'top',horizontalAlign:'left'},yaxis:{min:0},grid:{borderColor:s.getPropertyValue('--border').trim()}}).render();})"/>
+<img alt="" style="display:none" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" onload="zChart(this,function(){var el=document.getElementById('inventoryOverviewChart');if(!el||el.dataset.ready)return;el.dataset.ready='true';var s=getComputedStyle(el.closest('.inv-dashboard'));new ApexCharts(el,{chart:{type:'area',height:230,toolbar:{show:false},fontFamily:'Inter, sans-serif'},series:[{name:'Stock In',data:${mvInJson}},{name:'Stock Out',data:${mvOutJson}}],xaxis:{categories:${mvLabelsJson}},colors:[s.getPropertyValue('--green').trim(),s.getPropertyValue('--orange').trim()],stroke:{curve:'smooth',width:2},markers:{size:4},fill:{opacity:0},dataLabels:{enabled:false},legend:{position:'top',horizontalAlign:'left'},yaxis:{min:0},grid:{show:false},tooltip:{theme:'light'}}).render();})"/>
 <#else>
 <div class="inv-chart-empty">
 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true">
@@ -684,7 +713,7 @@
 </table>
 </article>
 </div>
-<img alt="" style="display:none" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" onload="(function(img){var root=img.parentNode;var m=location.pathname.match(/^(.*\/Inventory)\//);if(!m)return;root.querySelectorAll('a').forEach(function(a){var h=a.getAttribute('href');var n=h&amp;&amp;h.match(/\/Inventory\/(.*)$/);if(n)a.href=m[1]+'/'+n[1];});var f=root.querySelector('.inv-date form');if(f)f.action=location.pathname;})(this)"/>
+<img alt="" style="display:none" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" onload="(function(img){var root=img.parentNode;var m=location.pathname.match(/^(.*\/Inventory)\//);if(!m)return;root.querySelectorAll('a').forEach(function(a){var h=a.getAttribute('href');var n=h&amp;&amp;h.match(/\/Inventory\/(.*)$/);if(n)a.href=m[1]+'/'+n[1];});var f=root.querySelector('.inv-date form');if(f)f.action=location.pathname;var wf=root.querySelector('.inv-warehouse-filter');if(wf)wf.action=location.pathname;})(this)"/>
 </div>]]>
 </text></render-mode>
         <render-mode><text type="html,vuet,qvt"><![CDATA[<details class="inv-additional"><summary>Customize dashboard and additional insights</summary>]]></text></render-mode>
