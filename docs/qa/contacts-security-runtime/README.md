@@ -33,6 +33,8 @@ Native mode additionally requires `CONTACTS_QA_RUNTIME_DIR`, `CONTACTS_QA_JAVA`,
 
 The runner verifies real CSV and OOXML workbook rows, server-side organization scoping, forged search parameters, null/empty/`_NA_` organization preferences, filtered exports across pages, inactive/phone filters, group guards and DB persistence, the deliberate ADMIN bypass, and both browser shells at widths 320, 390, 800 and 1440. It compares six installed application files with their source SHA256 hashes. A failing assertion exits nonzero.
 
+Membership removal reuses the exact instant returned by the guarded member service, including its fractional seconds. Raw SQL timestamp text can use a different calendar from the application JVM; it is retained only as read-only diagnostic evidence and is never reinterpreted as a service key. Removal assertions retain the captured DB/service keys and before/after own-member rows, while keeping denial and persistence checks strict.
+
 For regression reproduction, `--reproduce` requests direct exports after proving the `_NA_` preference in the database. Before the fix, rendering a normal page cleared that preference, masking the direct-export leak. `--browser-only` is a local diagnostic shortcut; full acceptance runs without it.
 
 After preserving evidence, stop the task-owned runtime and remove its whole fresh database and transaction journals, or tear down the disposable CI compose volumes. The runner restores the original own-group name and expires memberships it adds, and checks foreign/global groups and memberships remain unchanged. Evidence must contain no raw server logs, credentials, tokens, personal paths, or real tenant records.

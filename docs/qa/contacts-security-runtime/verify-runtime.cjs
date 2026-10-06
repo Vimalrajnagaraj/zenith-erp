@@ -118,23 +118,35 @@ async function browserMatrix(){
   for(const shell of ['apps','qapps']){
    let r=await operation(shell,'contacts.qa.a','guard','CITEST_P14_GROUP_A');check(`${shell}: own group guard allows`,r.allowed===true&&!r.denied);
    r=await operation(shell,'contacts.qa.a','members','CITEST_P14_GROUP_A');check(`${shell}: own member read succeeds`,!r.denied&&r.memberIds.includes('CITEST_P14_A_01'));
+   const capturedMemberKeys={[ 'CITEST_P14_GROUP_A' ]:r.memberKeys};
+   for(const id of ['CITEST_P14_GROUP_B','CITEST_P14_GROUP_NA']){
+    const metadata=await operation(shell,'john.doe','members',id);
+    check(`${shell} ${id}: authorized fixture metadata supplies exact membership instant`,!metadata.denied&&metadata.memberKeys.length===1,metadata.memberKeys);
+    capturedMemberKeys[id]=metadata.memberKeys;
+   }
    const name='P14QA Verified '+shell;
    r=await operation(shell,'contacts.qa.a','update','CITEST_P14_GROUP_A',{groupName:name});check(`${shell}: own group update succeeds`,!r.denied&&state().groups.find(g=>g.customer_group_id==='CITEST_P14_GROUP_A').group_name===name);
    r=await operation(shell,'contacts.qa.a','assign','CITEST_P14_GROUP_A',{partyId:'CITEST_P14_A_02'});let own=state().members.filter(m=>m.customer_group_id==='CITEST_P14_GROUP_A'&&m.party_id==='CITEST_P14_A_02'&&!m.thru_date);check(`${shell}: own member added in DB`,!r.denied&&own.length===1);
-   r=await operation(shell,'contacts.qa.a','remove','CITEST_P14_GROUP_A',{partyId:'CITEST_P14_A_02',fromDate:own[0].from_date});check(`${shell}: own member expiration persists in DB`,!r.denied&&state().members.filter(m=>m.customer_group_id==='CITEST_P14_GROUP_A'&&m.party_id==='CITEST_P14_A_02'&&!m.thru_date).length===0);
+   const readAdded=await operation(shell,'contacts.qa.a','members','CITEST_P14_GROUP_A');
+   const addedKeys=readAdded.memberKeys.filter(m=>m.partyId==='CITEST_P14_A_02');
+   check(`${shell}: guarded member service returns one exact added key`,!readAdded.denied&&addedKeys.length===1,addedKeys);
+   const beforeRemove=state().members.filter(m=>m.customer_group_id==='CITEST_P14_GROUP_A'&&m.party_id==='CITEST_P14_A_02');
+   r=await operation(shell,'contacts.qa.a','remove','CITEST_P14_GROUP_A',{partyId:'CITEST_P14_A_02',fromDateInstant:addedKeys[0].fromDateInstant});
+   const afterRemove=state().members.filter(m=>m.customer_group_id==='CITEST_P14_GROUP_A'&&m.party_id==='CITEST_P14_A_02');
+   check(`${shell}: own member expiration persists in DB`,!r.denied&&afterRemove.filter(m=>!m.thru_date).length===0,{denied:r.denied,messages:r.messages||null,capturedDbKey:own[0],capturedServiceKey:addedKeys[0],before:beforeRemove,after:afterRemove});
    await operation(shell,'contacts.qa.a','update','CITEST_P14_GROUP_A',{groupName:original.group_name});
    for(const user of ['contacts.qa.a','contacts.qa.null','contacts.qa.empty','contacts.qa.na']){
     const ids=user==='contacts.qa.a'?['CITEST_P14_GROUP_B','CITEST_P14_GROUP_NA','CITEST_P14_GROUP_MISSING']:['CITEST_P14_GROUP_A','CITEST_P14_GROUP_NA'];
     for(const id of ids)for(const op of ['guard','members','update','assign','remove']){
-     const member=before.members.find(m=>m.customer_group_id===id)||before.members[0];
-     const result=await operation(shell,user,op,id,{groupName:'P14QA Must Never Persist',partyId:member.party_id,fromDate:member.from_date});
+     const member=(capturedMemberKeys[id]||capturedMemberKeys.CITEST_P14_GROUP_A)[0];
+     const result=await operation(shell,user,op,id,{groupName:'P14QA Must Never Persist',partyId:member.partyId,fromDateInstant:member.fromDateInstant});
      check(`${shell} ${user} ${op} ${id}: foreign/no-org/missing access denied`,result.denied===true&&(op!=='members'||result.memberIds.length===0),result);
     }
     for(const id of ids){const page=await request(shell,'EditCustomerGroup',{customerGroupId:id},user);check(`${shell} ${user} ${id}: editor redirects without foreign data`,!page.text.includes('P14QA Foreign Bravo')&&!page.text.includes('P14QA Global Unowned')&&!page.text.includes('name="GroupForm"'));}
    }
    for(const op of ['assign','remove']){
-    const member=before.members.find(m=>m.customer_group_id==='CITEST_P14_GROUP_B');
-    const r=await operation(shell,'contacts.qa.a',op,'CITEST_P14_GROUP_A',{partyId:'CITEST_P14_B_01',fromDate:member.from_date});check(`${shell}: own group rejects foreign member ${op}`,r.denied===true);
+    const member=capturedMemberKeys.CITEST_P14_GROUP_B[0];
+    const r=await operation(shell,'contacts.qa.a',op,'CITEST_P14_GROUP_A',{partyId:'CITEST_P14_B_01',fromDateInstant:member.fromDateInstant});check(`${shell}: own group rejects foreign member ${op}`,r.denied===true);
    }
    const admin=await operation(shell,'john.doe','guard','CITEST_P14_GROUP_B');check(`${shell}: intentional ADMIN group bypass retained`,admin.allowed===true&&!admin.denied);
    const {page}=await userContext('contacts.qa.a');
