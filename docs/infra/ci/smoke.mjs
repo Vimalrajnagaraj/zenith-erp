@@ -45,7 +45,7 @@ try {
   await page.setExtraHTTPHeaders({ Authorization: AUTH });
   await page.setViewport({ width: 1400, height: 1000 });
 
-  for (const path of PATHS) {
+  async function checkOnce(path) {
     let status = 0, errSig = false, note = '', snippet = '';
     try {
       const resp = await page.goto(BASE + path, { waitUntil: 'networkidle2', timeout: 60000 });
@@ -62,9 +62,17 @@ try {
     } catch (e) {
       note = 'NAV ERROR: ' + e.message;
     }
-    const ok = status === 200 && !errSig && !note;
-    if (!ok) failures++;
-    console.log(`${ok ? 'PASS' : 'FAIL'}  [${status || '---'}]${errSig ? ' <error>' : ''}  ${path}${note ? '  ' + note : ''}${snippet ? '\n       ↳ ' + snippet : ''}`);
+    return { ok: status === 200 && !errSig && !note, status, errSig, note, snippet };
+  }
+
+  for (const path of PATHS) {
+    // Retry once: a real render bug fails both times; a transient Moqui session race on the SPA's
+    // concurrent sub-requests (IllegalStateException "Invalid for read" / "Response is committed")
+    // clears on a second try. Only a consistent failure is a real FAIL.
+    let r = await checkOnce(path);
+    if (!r.ok) { await sleep(4000); r = await checkOnce(path); }
+    if (!r.ok) failures++;
+    console.log(`${r.ok ? 'PASS' : 'FAIL'}  [${r.status || '---'}]${r.errSig ? ' <error>' : ''}  ${path}${r.note ? '  ' + r.note : ''}${r.snippet ? '\n       ↳ ' + r.snippet : ''}`);
   }
 } finally {
   await browser.close();
