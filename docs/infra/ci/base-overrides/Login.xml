@@ -1,0 +1,546 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+This software is in the public domain under CC0 1.0 Universal plus a
+Grant of Patent License.
+
+To the extent possible under law, the author(s) have dedicated all
+copyright and related and neighboring rights to this software to the
+public domain worldwide. This software is distributed without any
+warranty.
+
+You should have received a copy of the CC0 Public Domain Dedication
+along with this software (see the LICENSE.md file). If not, see
+<http://creativecommons.org/publicdomain/zero/1.0/>.
+-->
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
+        default-menu-include="false" require-authentication="false" history="false">
+
+    <parameter name="initialTab"/>
+    <parameter name="returnTo"/>
+
+    <always-actions>
+        <set field="html_title" value="ZetaERP Login"/>
+    </always-actions>
+
+    <!-- partial list of scenarios:
+      x basic login
+        - login username + password success
+        - next screen 2nd factor
+      x login with password change required
+        - login username + password but require password change
+        - next screen change password
+          - go to directly with anchor in URL or something
+          - if password was correct and authc code required for user allow instead of pw on change password
+          - login after change password, don't require login again
+      x cold change password
+        - start on change password tab, enter username, password, new password + confirm
+        - if 2nd factor required go to SecondFactor screen - instead go back to Login#change and get code + new password/verify
+      - reset password
+        - given username send email to UserAccount.emailAddress with separate reset password
+        - in email link to change password tab on login screen with username and reset password filled in
+        - if 2nd factor required for user also require
+      - change user after pre-auth
+    -->
+
+    <transition name="login" require-session-token="false">
+        <actions>
+            <if condition="ec.web?.sessionAttributes?.moquiPreAuthcUsername"><then>
+                <!-- already pre-auth'ed, verify code below -->
+                <set field="username" from="ec.web?.sessionAttributes?.moquiPreAuthcUsername"/>
+            </then><else>
+                <!-- no pre-auth, try logging in (pre-auth if 2nd factor required) -->
+                <set field="loggedIn" from="ec.user.loginUser(username, password)"/>
+            </else></if>
+
+            <if condition="ec.web.sessionAttributes.moquiAuthcFactorRequired">
+                <!-- ZE-AUTH-022: only a COMPLETED (needs_validation='N') factor enforces 2FA. Moqui's loginUser sets
+                     moquiAuthcFactorRequired for ANY factor row, including a pending/unverified enrollment — which
+                     would lock out a user who started but never finished 2FA setup (and, for a solo-admin shop, with
+                     no one to reset them). So if the pre-auth user has NO validated factor, log them in with the
+                     password alone. A user with a validated factor still gets the full code prompt below.
+                     MARUTHI-safe: this branch only runs when the user HAS a factor; no MARUTHI user does. -->
+                <set field="_preU" from="ec.web.sessionAttributes.moquiPreAuthcUsername ?: username"/>
+                <script><![CDATA[
+                    boolean _dz = ec.artifactExecution.disableAuthz()
+                    context._twoFaActive = false
+                    try {
+                        def _ua = _preU ? ec.entity.find("moqui.security.UserAccount").condition("username", _preU).one() : null
+                        if (_ua?.userId) context._twoFaActive = ec.entity.find("moqui.security.UserAuthcFactor")
+                                .condition("userId", _ua.userId).condition("needsValidation", "N")
+                                .conditionDate("fromDate", "thruDate", ec.user.nowTimestamp).count() > 0
+                    } finally { if (!_dz) ec.artifactExecution.enableAuthz() }
+                ]]></script>
+                <if condition="!_twoFaActive"><then>
+                    <!-- incomplete/abandoned enrollment: complete login with the password only, and clear the
+                         pre-auth so the request proceeds to normal org validation below. -->
+                    <script>ec.user.internalLoginUser(_preU)
+                        ec.web.sessionAttributes.remove("moquiAuthcFactorRequired")
+                        ec.web.sessionAttributes.remove("moquiPreAuthcUsername")</script>
+                </then><else>
+                    <!-- validated 2FA — require and verify the code -->
+                    <if condition="code"><then>
+                        <service-call name="org.moqui.impl.UserServices.validate#ExternalUserAuthcCode"
+                                in-map="[code:code]" out-map="validateOut"/>
+                        <if condition="validateOut.verified"><then>
+                            <script>ec.user.internalLoginUser(validateOut.username)</script>
+                            <return/>
+                        </then><else>
+                            <message error="true" public="true">Authentication code is not valid</message>
+                        </else></if>
+                    </then><else>
+                        <message error="true" public="true">Authentication code required for user ${username}</message>
+                    </else></if>
+                </else></if>
+            </if>
+
+            <!-- SECURITY (ZE-AUTH-002 / LOGIN-020): ec.user.loginUser sets DIFFERENT messages for
+                 "no such user" vs "wrong password" (and disabled/locked), which lets an attacker
+                 enumerate valid usernames. When a fresh credential attempt failed and no 2nd factor is
+                 pending, collapse whatever it produced into one generic message so the response is
+                 identical whether or not the username exists. -->
+            <if condition="!ec.user.userId &amp;&amp; !ec.web.sessionAttributes.moquiAuthcFactorRequired &amp;&amp; !ec.web?.sessionAttributes?.moquiPreAuthcUsername">
+                <script><![CDATA[
+                    ec.message.clearAll()
+                    ec.message.addError("The username or password you entered is incorrect.")
+                    // ZE-ROLE-002: if the credentials are actually correct but the account is DISABLED, tell
+                    // the user clearly instead of the misleading generic message. We verify the password
+                    // first so this never becomes a username-enumeration oracle — only someone who knows the
+                    // account's password (the legitimate owner) ever sees the "disabled" message.
+                    boolean _dz = ec.artifactExecution.disableAuthz()
+                    try {
+                        def ua = username ? ec.entity.find("moqui.security.UserAccount").condition("username", username).one() : null
+                        if (ua?.disabled == "Y" && ua.currentPassword && password) {
+                            def token = new org.apache.shiro.authc.UsernamePasswordToken((String) ua.username, (String) password)
+                            def info = new org.apache.shiro.authc.SimpleAuthenticationInfo((String) ua.username, (String) ua.currentPassword,
+                                    new org.apache.shiro.lang.util.SimpleByteSource((String) (ua.passwordSalt ?: "")), "moquiRealm")
+                            if (ec.ecfi.getCredentialsMatcher(ua.passwordHashType, "Y".equals(ua.passwordBase64)).doCredentialsMatch(token, info)) {
+                                ec.message.clearAll()
+                                ec.message.addError("Your account has been disabled. Please contact your administrator.")
+                            }
+                        }
+                    } finally { if (!_dz) ec.artifactExecution.enableAuthz() }
+                ]]></script>
+            </if>
+
+            <!-- ZE-ONB-002: email-verification hard gate. Block login until a NEW email/password signup verifies
+                 its email. Only such signups get EMAIL_VERIFIED='N' (Google is pre-verified); existing accounts
+                 have no such preference so they are NEVER gated (backward-compatible). On block, log the user
+                 back out, stash their email, and route them to the "verify your email" page (with a resend). -->
+            <if condition="ec.user.userId &amp;&amp; !ec.web.sessionAttributes.moquiAuthcFactorRequired">
+                <script><![CDATA[
+                    boolean adDis = ec.artifactExecution.disableAuthz()
+                    try {
+                        def ev = ec.entity.find("moqui.security.UserPreference")
+                            .condition("userId", ec.user.userId).condition("preferenceKey", "EMAIL_VERIFIED").one()
+                        if (ev?.preferenceValue == "N") {
+                            emailUnverified = true
+                            def ua = ec.entity.find("moqui.security.UserAccount").condition("userId", ec.user.userId).one()
+                            if (ua?.username) ec.web.session.setAttribute("pendingVerifyEmail", ua.username)
+                        }
+                    } finally { if (!adDis) ec.artifactExecution.enableAuthz() }
+                ]]></script>
+                <if condition="emailUnverified"><script>ec.user.logoutUser()</script></if>
+            </if>
+
+            <!-- Validate Organization ID after successful login -->
+            <if condition="ec.user.userId &amp;&amp; organizationId">
+                <script><![CDATA[
+                    boolean alreadyDisabled = ec.artifactExecution.disableAuthz()
+                    try {
+                        // IMPORTANT: no early `return` in this block. Moqui does NOT sync context
+                        // variables back across an early return in an inline <script>, so a `return`
+                        // here would silently drop orgValidationFailed and let the login through
+                        // (the D-1 gate-bypass bug). Use structured if/else so the script completes
+                        // normally and the flag reliably reaches the <if> below.
+                        if (ec.user.isInGroup("ADMIN")) {
+                            // Platform super-admins operate across tenants and are exempt from the
+                            // per-tenant org gate (matches the central module gate in ZenithApp).
+                            // Do NOT pin an active organization for a cross-tenant admin.
+                        } else {
+                            // Organization IDs are stored uppercase (= subdomain.toUpperCase()); idValue
+                            // is encrypted so matching is exact-ciphertext — try as typed, then uppercased,
+                            // so a user typing lower/mixed case is not wrongly rejected.
+                            def orgIdInput = organizationId?.trim()
+                            def orgIdList = ec.entity.find("mantle.party.PartyIdentification")
+                                    .condition("partyIdTypeEnumId", "PtidOrgCode")
+                                    .condition("idValue", orgIdInput).list()
+                            if (!orgIdList && orgIdInput) {
+                                orgIdList = ec.entity.find("mantle.party.PartyIdentification")
+                                    .condition("partyIdTypeEnumId", "PtidOrgCode")
+                                    .condition("idValue", orgIdInput.toUpperCase()).list()
+                            }
+                            if (!orgIdList) {
+                                // Generic (no org enumeration): don't reveal whether the org exists vs the
+                                // user simply isn't a member — same message as the not-a-member case below.
+                                orgValidationError = "That Organization ID is invalid, or your account doesn't have access to it."
+                                orgValidationFailed = true
+                            } else {
+                                def orgPartyId = orgIdList[0].partyId
+                                def userAcct = ec.entity.find("moqui.security.UserAccount")
+                                        .condition("userId", ec.user.userId).one()
+                                if (!userAcct?.partyId) {
+                                    orgValidationError = "That Organization ID is invalid, or your account doesn't have access to it."
+                                    orgValidationFailed = true
+                                } else {
+                                    // ZE-ROLE-002: org membership is stored as PrtEmployee OR PrtAgent (and
+                                    // future PrtMember) relationships to the org — not only PrtEmployee. The
+                                    // narrow check wrongly rejected valid PrtAgent members with "Organization
+                                    // ID is invalid". Match the same relationship types setup#UserOrganizationInfo does.
+                                    def relList = ec.entity.find("mantle.party.PartyRelationship")
+                                            .condition("fromPartyId", userAcct.partyId)
+                                            .condition("toPartyId", orgPartyId)
+                                            .condition("relationshipTypeEnumId", "in", ["PrtEmployee", "PrtAgent", "PrtMember"])
+                                            .conditionDate("fromDate", "thruDate", ec.user.nowTimestamp).list()
+                                    if (!relList) {
+                                        orgValidationError = "That Organization ID is invalid, or your account doesn't have access to it."
+                                        orgValidationFailed = true
+                                    } else {
+                                        // Member of this org: bind the active organization.
+                                        ec.web.sessionAttributes.put("organizationPartyId", orgPartyId)
+                                        ec.user.setPreference("ACTIVE_ORGANIZATION", orgPartyId)
+                                    }
+                                }
+                            }
+                        }
+                    } finally {
+                        if (!alreadyDisabled) ec.artifactExecution.enableAuthz()
+                    }
+                ]]></script>
+                <if condition="orgValidationFailed">
+                    <script>
+                        ec.user.logoutUser()
+                        ec.message.addError(orgValidationError)
+                    </script>
+                    <set field="orgLoginFailed" value="true"/>
+                </if>
+            </if>
+            <!-- ZE-ROLE-002: platform super-admins (ADMIN) are cross-tenant and are already exempt from the
+                 org-validation block above, so they must NOT be forced to supply an Organization ID here
+                 either — otherwise a valid admin is blocked from logging in with correct credentials. -->
+            <if condition="ec.user.userId &amp;&amp; !organizationId &amp;&amp; !ec.user.isInGroup('ADMIN')">
+                <script>
+                    ec.user.logoutUser()
+                    ec.message.addError("Organization ID is required")
+                </script>
+                <set field="orgLoginFailed" value="true"/>
+            </if>
+
+            <!-- Remember Me: set login key cookie after successful login -->
+            <if condition="ec.user.userId &amp;&amp; !orgLoginFailed &amp;&amp; rememberMe == 'true'">
+                <script><![CDATA[
+                    def loginKey = ec.user.getLoginKey(720)
+                    def cookie = new jakarta.servlet.http.Cookie("moquiLoginKey", loginKey)
+                    cookie.maxAge = 30 * 24 * 60 * 60
+                    cookie.path = "/"
+                    cookie.httpOnly = true
+                    ec.web.response.addCookie(cookie)
+                ]]></script>
+            </if>
+        </actions>
+        <conditional-response url="/signup-success" parameter-map="[verify:'1']"><condition>
+            <expression>emailUnverified</expression></condition></conditional-response>
+        <conditional-response url="."><condition>
+            <expression>orgLoginFailed</expression></condition></conditional-response>
+        <!-- no longer using SecondFactor screen, now built into Login screen to better support more scenarios:
+        <conditional-response url="../SecondFactor"><condition>
+            <expression>ec.web.sessionAttributes.moquiAuthcFactorRequired</expression></condition></conditional-response>
+        -->
+        <default-response url="/qapps/zenith/Dashboard"/>
+        <error-response url="."/>
+    </transition>
+    <transition name="logout">
+        <actions><script>
+            ec.user.logoutUser()
+            def cookie = new jakarta.servlet.http.Cookie("moquiLoginKey", "")
+            cookie.maxAge = 0
+            cookie.path = "/"
+            cookie.httpOnly = true
+            ec.web.response.addCookie(cookie)
+        </script></actions>
+        <default-response url="/"/>
+        <error-response url="."/>
+    </transition>
+    <transition name="removePreAuth">
+        <actions><script>
+            ec.web.sessionAttributes.remove("moquiPreAuthcUsername")
+            ec.web.sessionAttributes.remove("moquiAuthcFactorRequired")
+            ec.web.sessionAttributes.remove("moquiPasswordChangeRequired")
+            ec.web.sessionAttributes.remove("moquiExpiredCredentials")
+        </script></actions>
+        <default-response url="."/>
+    </transition>
+    <transition name="resetPassword">
+        <parameter name="username" from="ec.web?.sessionAttributes?.moquiPreAuthcUsername ?: username"/>
+        <actions>
+            <!-- SECURITY (ZE-AUTH-011 / LOGIN-053): Moqui's reset#Password, when it can't deliver the
+                 email, falls back to printing the plain-text reset password on screen ("Please use this
+                 reset password ..."), and even on success its message names the username ("sent to the
+                 email of username X") — both are leaks (account takeover + username enumeration). Run the
+                 reset, then discard EVERY message it produced (password, username, or "no account found")
+                 and show one generic confirmation. The DB reset + the email itself are unaffected. -->
+            <service-call name="org.moqui.impl.UserServices.reset#Password" in-map="[username:username]" ignore-error="true"/>
+            <script>
+                ec.message.clearAll()
+                ec.message.addMessage("If an account matches that username, a password reset has been sent to its registered email address.")
+            </script>
+        </actions>
+        <default-response url="."/>
+    </transition>
+    <!-- ZE-ONB-002: consume an email-verification token (clicked from the verify email). GET link, no CSRF
+         token. Marks EMAIL_VERIFIED=Y, deletes the one-time token, logs the user in, -> dashboard. -->
+    <transition name="verifyEmail" require-session-token="false" read-only="true">
+        <actions>
+            <script><![CDATA[
+                ec.artifactExecution.disableAuthz()
+                verifyOk = false
+                if (token) {
+                    def tp = ec.entity.find("moqui.security.UserPreference")
+                        .condition("preferenceKey", "EMAIL_VERIFY_TOKEN").condition("preferenceValue", token).disableAuthz().list()
+                    if (tp) {
+                        def uid = tp[0].userId
+                        ec.entity.makeValue("moqui.security.UserPreference")
+                            .setAll([userId:uid, preferenceKey:"EMAIL_VERIFIED", preferenceValue:"Y"]).createOrUpdate()
+                        def tv = ec.entity.find("moqui.security.UserPreference").condition("userId", uid)
+                            .condition("preferenceKey", "EMAIL_VERIFY_TOKEN").disableAuthz().one()
+                        if (tv != null) tv.delete()
+                        def ua = ec.entity.find("moqui.security.UserAccount").condition("userId", uid).disableAuthz().one()
+                        if (ua?.username) { ec.user.internalLoginUser(ua.username); ec.web.session.removeAttribute("pendingVerifyEmail") }
+                        verifyOk = true
+                    }
+                }
+                if (!verifyOk) ec.message.addError("This verification link is invalid or has already been used. Please sign in, or sign up again.")
+            ]]></script>
+        </actions>
+        <conditional-response url="/apps/zenith"><condition><expression>verifyOk</expression></condition></conditional-response>
+        <default-response url="."/>
+    </transition>
+    <!-- ZE-ONB-002: resend the verification link to the pending signup email (kept in session at signup / at the
+         login gate). Generic message (no account enumeration). -->
+    <transition name="resendVerification" require-session-token="false" read-only="true">
+        <actions>
+            <script><![CDATA[
+                ec.artifactExecution.disableAuthz()
+                def em = ec.web.session.getAttribute("pendingVerifyEmail")
+                if (em) {
+                    ec.service.sync().name("zenith.saas.SaasServices.send#SignupVerification")
+                        .parameters([email:em]).disableAuthz().call()
+                }
+                ec.message.addMessage("If your email still needs verifying, we've sent a fresh link. Please check your inbox and spam folder.")
+            ]]></script>
+        </actions>
+        <default-response url="/signup-success" parameter-map="[verify:'1']"/>
+    </transition>
+    <transition name="changePassword">
+        <parameter name="username" from="ec.web?.sessionAttributes?.moquiPreAuthcUsername ?: username"/>
+        <service-call name="org.moqui.impl.UserServices.update#Password"/>
+        <actions>
+            <!-- password change success, login the user -->
+            <if condition="updateSuccessful">
+                <set field="loginSuccess" from="ec.user.internalLoginUser(username)"/></if>
+        </actions>
+        <conditional-response type="screen-last"><condition><expression>updateSuccessful</expression></condition></conditional-response>
+        <default-response url="." parameter-map="[initialTab:'#change']"/>
+    </transition>
+    <transition name="createInitialAdminAccount">
+        <service-call name="org.moqui.impl.UserServices.create#InitialAdminAccount"/>
+        <default-response url="../Login"/>
+        <error-response url="."/>
+    </transition>
+    <transition name="sendOtp">
+        <service-call name="org.moqui.impl.UserServices.send#ExternalAuthcCode" in-map="[factorId:factorId]"/>
+        <default-response url="."/>
+    </transition>
+    <!-- Zenith: Continue with Google. Verifies the Google id_token server-side and logs in (GOOGLE_SUB-bound accounts)
+         or routes new users to /get-started onboarding. Additive; the password/2FA/reset flows above are unchanged. -->
+    <transition name="googleAuth" require-session-token="false">
+        <actions>
+            <script><![CDATA[
+                ec.artifactExecution.disableAuthz()
+                try {
+                    def ga = ec.service.sync().name("zenith.saas.SaasServices.authenticate#GoogleUser")
+                        .parameter("idToken", credential).disableAuthz().call()
+                    if (ec.message.hasError()) {
+                        def em = ec.message.errorsString; ec.message.clearErrors()
+                        ec.web.sendJsonResponse([action:'error', error:em])
+                    } else {
+                        ec.web.sendJsonResponse([action:ga.action, redirectUrl:ga.redirectUrl])
+                    }
+                } catch (Exception e) {
+                    ec.message.clearErrors()
+                    ec.web.sendJsonResponse([action:'error', error:'Google sign-in failed. Please try again.'])
+                }
+            ]]></script>
+        </actions>
+        <default-response type="none"/>
+    </transition>
+
+    <pre-actions><script><![CDATA[
+        // if user already logged in redirect to root
+        if (ec.user.userId) { sri.sendRedirectAndStopRender('/qapps/zenith/Dashboard'); return }
+
+        // auto-login from Remember Me cookie
+        def cookies = ec.web.request.cookies
+        if (cookies) {
+            def loginKeyCookie = cookies.find { it.name == 'moquiLoginKey' && it.value }
+            if (loginKeyCookie) {
+                boolean loggedIn = ec.user.loginUserKey(loginKeyCookie.value)
+                if (loggedIn) {
+                    // restore org preference for the remembered user
+                    boolean alreadyDisabled = ec.artifactExecution.disableAuthz()
+                    try {
+                        def pref = ec.entity.find("moqui.security.UserPreference")
+                                .condition("userId", ec.user.userId)
+                                .condition("preferenceKey", "ACTIVE_ORGANIZATION").one()
+                        if (pref?.preferenceValue) {
+                            ec.user.setPreference("ACTIVE_ORGANIZATION", pref.preferenceValue)
+                        }
+                    } finally { if (!alreadyDisabled) ec.artifactExecution.enableAuthz() }
+                    sri.sendRedirectAndStopRender('/qapps/zenith/Dashboard')
+                    return
+                } else {
+                    // invalid/expired key, clear cookie
+                    def expCookie = new jakarta.servlet.http.Cookie("moquiLoginKey", "")
+                    expCookie.maxAge = 0
+                    expCookie.path = "/"
+                    expCookie.httpOnly = true
+                    ec.web.response.addCookie(expCookie)
+                }
+            }
+        }
+
+        // jQuery/UI
+        html_scripts.add('/libs/jquery/jquery.min.js')
+        // Bootstrap
+        html_scripts.add('/libs/twitter-bootstrap/js/bootstrap.min.js')
+        // Moqui webroot layout
+        html_stylesheets.add('/css/webroot-layout.css')
+        // ZetaERP: /Login enhancements — double-submit guard (ZE-AUTH-008), password reveal (BUG-001)
+        // and the Continue-with-Google bootstrap. External so the JS isn't constrained by the inline
+        // onload attribute (no double-quotes / no '<'). /zenithstatic resolves on /Login unauthenticated.
+        html_scripts.add('/zenithstatic/js/login-enhance.js?v=1')
+    ]]></script></pre-actions>
+    <actions>
+        <!-- handle returnTo parameter, and general handling for when the Login screen is reached directly
+            (as opposed to redirect following attempted request to screen that requires authz) -->
+        <if condition="returnTo"><then>
+            <log message="setting last path to ${returnTo}"/>
+            <script>ec.web.session.setAttribute('moqui.screen.last.path', returnTo)</script>
+        </then><else>
+            <if condition="!ec.web.session.getAttribute('moqui.screen.last.path')">
+                <set field="referrer" from="ec.web.request.getHeader('Referer')"/>
+                <if condition="referrer"><script>ec.web.session.setAttribute('moqui.screen.last.path', referrer)</script></if>
+            </if>
+        </else></if>
+
+        <set field="passwordChangeRequired" from="ec.web.sessionAttributes.moquiPasswordChangeRequired ?: 'false'" type="Boolean"/>
+        <set field="expiredCredentials" from="ec.web.sessionAttributes.moquiExpiredCredentials ?: 'false'" type="Boolean"/>
+        <if condition="passwordChangeRequired || expiredCredentials">
+            <set field="initialTab" value="#change"/></if>
+        <if condition="initialTab &amp;&amp; !initialTab.startsWith('#')"><set field="initialTab" from="'#' + initialTab"/></if>
+
+        <set field="secondFactorRequired" from="false"/>
+        <if condition="ec.web.sessionAttributes.moquiPreAuthcUsername"><then>
+            <set field="username" from="ec.web.sessionAttributes.moquiPreAuthcUsername"/>
+            <service-call name="org.moqui.impl.UserServices.get#ExternalUserAuthcFactorInfo" out-map="context"/>
+        </then><else>
+            <set field="username" from="ec.web.errorParameters?.username ?: ''"/>
+        </else></if>
+
+        <set field="passwordNode" from="ec.ecfi.confXmlRoot.first('user-facade').first('password')"/>
+        <set field="minLength" from="passwordNode.attribute('min-length')" default-value="8" type="Integer"/>
+        <set field="minDigits" from="passwordNode.attribute('min-digits')" default-value="1" type="Integer"/>
+        <set field="minOthers" from="passwordNode.attribute('min-others')" default-value="1" type="Integer"/>
+
+        <!-- Zenith: load the platform Google OAuth Client ID (public-safe) for the "Continue with Google" button -->
+        <set field="googleClientId" from="ec.entity.find('zenith.erp.base.CompanySettings').condition('organizationPartyId','ZETAERP').condition('settingKey','GOOGLE_CLIENT_ID').disableAuthz().one()?.settingValue ?: ''"/>
+    </actions>
+    <widgets>
+        <!-- NOTE: this screen is not under the apps screen, but uses similar header/footer/etc -->
+        <container id="content" style="Login"><container style="inner"><container style="container-fluid">
+            <section-iterate name="headerSavedMessages" list="ec.web?.savedMessages" entry="message"><widgets>
+                <render-mode><text type="html"><![CDATA[<div class="alert alert-success fade in" role="alert"><button type="button" class="close" data-dismiss="alert"><span aria-hidden="true">&times;</span><span class="sr-only">Close</span></button>]]></text></render-mode>
+                <label text="${message}" type="h4"/>
+                <render-mode><text type="html"><![CDATA[</div>]]></text></render-mode>
+            </widgets></section-iterate>
+            <section-iterate name="headerSavedErrors" list="ec.web?.savedErrors" entry="errorMessage"><widgets>
+                <render-mode><text type="html"><![CDATA[<div class="alert alert-danger fade in" role="alert"><button type="button" class="close" data-dismiss="alert"><span aria-hidden="true">&times;</span><span class="sr-only">Close</span></button>]]></text></render-mode>
+                <label text="${errorMessage}" type="h4"/>
+                <render-mode><text type="html"><![CDATA[</div>]]></text></render-mode>
+            </widgets></section-iterate>
+            <section-iterate name="headerSavedValidationErrors" list="ec.web?.savedValidationErrors" entry="validationError"><widgets>
+                <!-- TODO: put these by fields instead of in header -->
+                <render-mode><text type="html"><![CDATA[<div class="alert alert-danger fade in" role="alert"><button type="button" class="close" data-dismiss="alert"><span aria-hidden="true">&times;</span><span class="sr-only">Close</span></button>]]></text></render-mode>
+                <label text="${validationError.message} (for field ${validationError.field})" type="h4"/>
+                <render-mode><text type="html"><![CDATA[</div>]]></text></render-mode>
+            </widgets></section-iterate>
+
+            <section name="NeedsSetupSection" condition="ec.entity.find('moqui.security.UserAccount').disableAuthz().count() > 1"><widgets>
+                <!-- primary scenario, main login screen -->
+                <render-mode><text type="html" template="true" location="component://webroot/screen/webroot/Login.ftl"/></render-mode>
+            </widgets><fail-widgets>
+                <!-- if there are no user accounts, other than the _NA_ UserAccount which is in seed data, show form to create admin account -->
+                <render-mode><text type="html"><![CDATA[
+    <div class="text-center">
+        <h3>Welcome to your new system</h3>
+        <form method="post" action="${sri.buildUrl("createInitialAdminAccount").url}" class="form-signin" id="InitialAdminForm">
+            <p class="text-muted text-center">There are no user accounts, get started by creating an initial administrator account</p>
+            <input type="hidden" name="moquiSessionToken" value="${ec.web.sessionToken}">
+            <input type="text" name="username" value="${(ec.getWeb().getErrorParameters().get("username"))!""}" placeholder="Username" required="required" class="form-control top">
+            <input type="password" name="newPassword" placeholder="New Password" required="required" class="form-control middle">
+            <input type="password" name="newPasswordVerify" placeholder="New Password Verify" required="required" class="form-control middle">
+            <input type="text" name="userFullName" value="${(ec.getWeb().getErrorParameters().get("userFullName"))!""}" placeholder="User Full Name" required="required" class="form-control middle">
+            <input type="text" name="emailAddress" value="${(ec.getWeb().getErrorParameters().get("emailAddress"))!""}" placeholder="Email Address" required="required" class="form-control bottom">
+            <button class="btn btn-lg btn-primary btn-block" type="submit">Create Initial Admin Account</button>
+        </form>
+    </div>
+                ]]></text></render-mode>
+            </fail-widgets></section>
+
+            <!-- Zenith: "Continue with Google" — shown only once a real Client ID is configured (hidden otherwise, so this is
+                 a safe no-op until configured). Verifies the token server-side via authenticate#GoogleUser; password/2FA/reset
+                 flows above are untouched. -->
+            <section name="GoogleSignInSection">
+                <condition><expression>googleClientId &amp;&amp; googleClientId.endsWith('.apps.googleusercontent.com') &amp;&amp; !googleClientId.startsWith('PLACEHOLDER')</expression></condition>
+                <widgets><render-mode><text type="html"><![CDATA[
+                <div style="max-width:360px;margin:18px auto 0;text-align:center">
+                    <div style="display:flex;align-items:center;color:#9e9e9e;font-size:13px;margin:10px 0">
+                        <span style="flex:1;height:1px;background:#e0e0e0"></span><span style="padding:0 10px">or</span><span style="flex:1;height:1px;background:#e0e0e0"></span>
+                    </div>
+                    <div id="g_id_onload" data-client_id="${googleClientId}" data-callback="zenithGoogleCb" data-auto_prompt="false"></div>
+                    <div class="g_id_signin" data-type="standard" data-size="large" data-width="320" style="display:inline-block"></div>
+                    <!-- ZE-ONB-001: always-visible fallback so a NEW user is never stranded if the Google handshake
+                         silently fails (popup blocked / FedCM / OAuth JS-origin not allowed → callback never fires and
+                         there'd be no message). Gives a clear "Create Account" path regardless of GSI outcome. -->
+                    <div id="zenithGoogleHint" style="font-size:12px;color:#9e9e9e;margin-top:12px">New to ZetaERP? <a href="/get-started" style="color:#7C3AED;font-weight:600;text-decoration:none">Create your account</a></div>
+                </div>
+                <!-- Google bootstrap (GSI loader + zenithGoogleCb) lives in login-enhance.js; it initializes
+                     only when this section rendered (#g_id_onload present). -->
+                ]]></text></render-mode></widgets>
+            </section>
+
+            <!-- BUG-001 / LOGIN-003: password-reveal was inconsistent across browsers — Edge injects its native
+                 ::-ms-reveal eye, Chrome shows none. Provide ONE app-level show/hide toggle on every password
+                 field (identical in all browsers) and suppress the browser-native reveal so there's no double icon. -->
+            <render-mode><text type="html"><![CDATA[
+            <style>
+              input[type="password"]::-ms-reveal, input[type="password"]::-ms-clear { display:none !important; }
+              .pw-toggle-wrap { position:relative; display:block; }
+              .pw-toggle-btn { position:absolute; top:0; right:0; height:100%; width:44px; border:0; background:transparent;
+                 cursor:pointer; color:#64748b; display:flex; align-items:center; justify-content:center; padding:0; z-index:3; }
+              .pw-toggle-btn:hover { color:#2563eb; }
+            </style>
+            <!-- The eye-toggle JS (add one .pw-toggle-btn per input[type=password]) lives in login-enhance.js. -->
+            ]]></text></render-mode>
+
+            <!-- ZE-AUTH-008 / LOGIN-085: the double-submit guard (single submit + "Signing in…" spinner +
+                 disabled button, with a pageshow/bfcache reset) lives in login-enhance.js, applied to every
+                 .form-signin (login/reset/change). Loaded from pre-actions above. -->
+
+            <!-- SECURITY: the stock Moqui TestLoginSection (one-click admin auto-login with hardcoded
+                 default credentials) was REMOVED 2026-06-27. It rendered a public super-admin login
+                 button whenever zenith_admin still had the seed password - a full-platform takeover
+                 vector. Never reintroduce a credential-bearing auto-login on a production login screen. -->
+
+        </container></container></container>
+    </widgets>
+</screen>
