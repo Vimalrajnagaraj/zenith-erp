@@ -152,7 +152,8 @@ async function browserMatrix(){
    const {page}=await userContext('contacts.qa.a');
    for(const width of [320,390,800,1440])for(const screen of ['FindContact','Customers','Vendors','CustomerGroups']){
     await page.setViewportSize({width,height:900});await page.goto(`${base}/${shell}/zenith/Contacts/${screen}`,{waitUntil:'domcontentloaded',timeout:90000});
-    await page.waitForFunction(expected=>document.body.innerText.includes(expected),screen==='CustomerGroups'?'P14QA Owned Alpha':'P14QA Alpha',{timeout:60000});await page.waitForTimeout(500);
+    // Navigation can briefly replace the document before its new body exists; keep polling then.
+    await page.waitForFunction(expected=>document.body?.innerText?.includes(expected),screen==='CustomerGroups'?'P14QA Owned Alpha':'P14QA Alpha',{timeout:60000});await page.waitForTimeout(500);
     const shape=await page.evaluate(()=>({title:(document.querySelector('.cust-title,.box-header,.panel-heading')?.textContent||'').trim(),own:document.body.innerText.includes('P14QA Alpha'),foreign:document.body.innerText.includes('P14QA Foreign Bravo')||document.body.innerText.includes('P14QA Global Unowned'),tables:[...document.querySelectorAll('table')].filter(t=>t.getBoundingClientRect().width>0).length,bodyWidth:document.body.clientWidth,scrollWidth:document.body.scrollWidth}));
     check(`${shell} ${screen} ${width}: real responsive screen renders scoped data`,!shape.foreign&&(screen==='CustomerGroups'||shape.own),shape);
     const screenshot=(screen==='FindContact'||screen==='CustomerGroups')?`${shell}-${screen}-${width}.png`:null;if(screenshot)await page.screenshot({path:path.join(out,screenshot),fullPage:true});report.viewports.push({shell,screen,width,screenshot,...shape});
