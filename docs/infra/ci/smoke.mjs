@@ -46,19 +46,25 @@ try {
   await page.setViewport({ width: 1400, height: 1000 });
 
   for (const path of PATHS) {
-    let status = 0, errSig = false, note = '';
+    let status = 0, errSig = false, note = '', snippet = '';
     try {
       const resp = await page.goto(BASE + path, { waitUntil: 'networkidle2', timeout: 60000 });
       status = resp ? resp.status() : 0;
       await sleep(3000); // let Vue/Quasar and any img-onload bootstraps paint
-      const html = await page.content();
-      errSig = ERR_SIG.test(html);
+      // Check the VISIBLE body text, not the full HTML — the Quasar SPA's JS bundle legitimately
+      // contains exception-class strings and would false-positive against raw HTML.
+      const found = await page.evaluate((src) => {
+        const t = document.body ? document.body.innerText : '';
+        const m = t.match(new RegExp(src, 'i'));
+        return m ? t.slice(Math.max(0, m.index - 60), m.index + 140).replace(/\s+/g, ' ') : null;
+      }, ERR_SIG.source);
+      if (found) { errSig = true; snippet = found; }
     } catch (e) {
       note = 'NAV ERROR: ' + e.message;
     }
     const ok = status === 200 && !errSig && !note;
     if (!ok) failures++;
-    console.log(`${ok ? 'PASS' : 'FAIL'}  [${status || '---'}]${errSig ? ' <error-signature>' : ''}  ${path}${note ? '  ' + note : ''}`);
+    console.log(`${ok ? 'PASS' : 'FAIL'}  [${status || '---'}]${errSig ? ' <error>' : ''}  ${path}${note ? '  ' + note : ''}${snippet ? '\n       ↳ ' + snippet : ''}`);
   }
 } finally {
   await browser.close();
