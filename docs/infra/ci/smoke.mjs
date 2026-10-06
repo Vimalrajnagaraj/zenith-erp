@@ -88,9 +88,44 @@ try {
     if (!r.ok) failures++;
     console.log(`${r.ok ? 'PASS' : 'FAIL'}  [${r.status || '---'}]${r.errSig ? ' <error>' : ''}  ${path}${r.note ? '  ' + r.note : ''}${r.snippet ? '\n       ↳ ' + r.snippet : ''}`);
   }
+
+  // Exercise the two existing date controls, including the legacy form that submits
+  // to the module's default screen. These checks are read-only and need no stock data.
+  for (const surface of ['apps', 'qapps']) {
+    for (const legacy of [false, true]) {
+      const label = `${surface} ${legacy ? 'additional-insights' : 'dashboard'} date Apply`;
+      try {
+        await page.goto(`${BASE}/${surface}/zenith/Inventory/InventoryDashboard`, { waitUntil: 'networkidle2', timeout: 60000 });
+        await page.waitForSelector('.inv-dashboard', { timeout: 15000 });
+        if (legacy) {
+          await page.click('details.inv-additional > summary');
+          await page.click('details.zdash-dr > summary');
+        } else {
+          await page.click('details.inv-date > summary');
+        }
+        const selector = legacy ? 'form.zdash-dr-pop' : '.inv-date form';
+        await page.$eval(selector, form => {
+          form.querySelector('[name="dashDate"]').value = '2026-10-01';
+          form.querySelector('[name="dashDateTo"]').value = '2026-10-06';
+        });
+        await page.click(`${selector} button[type="submit"]`);
+        await page.waitForFunction(() => new URL(location.href).searchParams.get('dashDate') === '2026-10-01', { timeout: 15000 });
+        await page.waitForFunction(() => document.querySelector('.inv-date > summary')?.textContent.includes('2026-10-01 to 2026-10-06'), { timeout: 15000 });
+        const validLinks = await page.evaluate(surface => {
+          const add = document.querySelector('.inv-header a.inv-primary');
+          return !add || new URL(add.href).pathname === `/${surface}/zenith/Inventory/FindProduct`;
+        }, surface);
+        if (!validLinks) throw new Error('Add New loses the Inventory path after applying dates');
+        console.log(`PASS  ${label}`);
+      } catch (error) {
+        failures++;
+        console.log(`FAIL  ${label} — ${error.message}`);
+      }
+    }
+  }
 } finally {
   await browser.close();
 }
 
-console.log(`\n${failures === 0 ? 'SMOKE OK' : 'SMOKE FAILED'} — ${PATHS.length - failures}/${PATHS.length} screens rendered cleanly.`);
+console.log(`\n${failures === 0 ? 'SMOKE OK' : 'SMOKE FAILED'} — ${PATHS.length + 4 - failures}/${PATHS.length + 4} render and date-control checks passed.`);
 process.exit(failures === 0 ? 0 : 1);

@@ -17,6 +17,8 @@ async function page(path) {
 }
 const facility = 'dashFacilityId=AUDIT_INV_A';
 const dashboard = await page('InventoryDashboard?' + facility);
+const defaultRoute = await page('?' + facility);
+assert.match(defaultRoute, /href="[^"]*\/Inventory\/FindProduct"[\s\S]{0,500}Add New/, 'Default Inventory route keeps valid sibling links');
 assert.match(dashboard, /StockLevels\?facilityId=AUDIT_INV_A/);
 assert.match(dashboard, /href="[^"]*FindProduct"[\s\S]{0,500}Add New/);
 assert(!dashboard.includes('No stock movements recorded yet.'), 'Real movements survive 60 newer zero-quantity records');
