@@ -67,16 +67,24 @@ jobs:
             docker cp "docs/infra/ci/base-overrides/$f" "$CID:/opt/moqui/runtime/base-component/webroot/screen/webroot/$f"
           done
 
-      - name: Load seed + demo data (+ CI isolation fixtures)
+      - name: Load seed + demo data, then CI isolation fixtures
         # Exploded Moqui runtime: java -cp . MoquiStart from /opt/moqui; java at /opt/java/openjdk/bin/java.
-        # ONE invocation (types + location together) = a single context init. A *second* MoquiStart
-        # init fails trying to reach the absent OpenSearch (20 retries -> throw); the first tolerates it.
+        # TWO separate invocations ON PURPOSE:
+        #   1) demo data via types=  -> creates john.doe / EX_JOHN_DOE, the _NA_ owner party, demo orgs.
+        #      A `location=` arg SUPPRESSES types= (Moqui then loads ONLY the location), so demo must be
+        #      its own call — passing both loads only the fixture and login breaks (proven: 0 users).
+        #   2) the isolation fixture via location=. It depends on step 1 (Party.ownerPartyId defaults to
+        #      _NA_, and the fixture references EX_JOHN_DOE), so it MUST run after demo.
+        # ES is disabled in the compose (elasticsearch_url empty) so the 2nd load's Party index-on-save
+        # is a no-op instead of throwing against the absent OpenSearch host (which killed earlier runs).
         run: |
           set -x
           CID=$(docker compose -f "$COMPOSE" ps -q moqui)
+          docker exec "$CID" sh -lc 'cd /opt/moqui && /opt/java/openjdk/bin/java -cp . MoquiStart load types=seed,seed-initial,demo' \
+            || echo "::warning::demo load reported errors — see logs (loader skips bad files)"
           docker cp docs/infra/ci/seed/isolation.xml "$CID:/tmp/isolation.xml"
-          docker exec "$CID" sh -lc 'cd /opt/moqui && /opt/java/openjdk/bin/java -cp . MoquiStart load types=seed,seed-initial,demo location=/tmp/isolation.xml' \
-            || echo "::warning::seed/fixture load reported errors — see logs (loader skips bad files)"
+          docker exec "$CID" sh -lc 'cd /opt/moqui && /opt/java/openjdk/bin/java -cp . MoquiStart load location=/tmp/isolation.xml' \
+            || echo "::warning::isolation fixture load reported errors — see logs"
 
       - name: Restart Moqui (pick up overlaid code + loaded data, fresh caches)
         run: docker compose -f "$COMPOSE" restart moqui
@@ -109,6 +117,27 @@ jobs:
         run: |
           code=$(curl -s -o /dev/null -w '%{http_code}' -u john.doe:moqui http://localhost:8080/apps/zenith || true)
           [ "$code" = "200" ] || { echo "::error::login/module access not 200 (got $code) — see diagnostics"; exit 1; }
+
+      - name: Assert fixtures loaded (DB ground truth)
+        # Prove the demo load AND the isolation fixture actually landed, and the active-org pref stuck,
+        # BEFORE the render assert — so a silent load failure or a stripped pref fails HERE with a
+        # precise message instead of looking like an isolation leak in the next step.
+        run: |
+          DBID=$(docker compose -f "$COMPOSE" ps -q db)
+          g(){ docker exec "$DBID" psql -U moqui -d moqui -tAc "$1" 2>/dev/null | tr -d '[:space:]'; }
+          echo "--- CITEST ground truth ---"
+          docker exec "$DBID" psql -U moqui -d moqui -P pager=off -c \
+            "SELECT party_id, party_type_enum_id, owner_party_id, disabled FROM party WHERE party_id LIKE 'CITEST%' ORDER BY party_id;" 2>&1 || true
+          docker exec "$DBID" psql -U moqui -d moqui -P pager=off -c \
+            "SELECT party_relationship_id, from_party_id, to_party_id, to_role_type_id, from_date, thru_date FROM party_relationship WHERE party_relationship_id='CITEST_REL_JD_A';" 2>&1 || true
+          ACT=$(g "SELECT preference_value FROM user_preference WHERE user_id='EX_JOHN_DOE' AND preference_key='ACTIVE_ORGANIZATION';")
+          echo "active-org pref = '${ACT}'"
+          [ "$(g "SELECT count(*) FROM user_account WHERE username='john.doe';")" = "1" ] || { echo "::error::demo load failed — john.doe missing"; exit 1; }
+          [ "$(g "SELECT count(*) FROM person WHERE party_id='CITEST_A_CUST';")" = "1" ] || { echo "::error::fixture load failed — CITEST_A_CUST missing"; exit 1; }
+          [ "$(g "SELECT count(*) FROM person WHERE party_id='CITEST_B_CUST';")" = "1" ] || { echo "::error::fixture load failed — CITEST_B_CUST missing"; exit 1; }
+          [ "$(g "SELECT count(*) FROM party_relationship WHERE party_relationship_id='CITEST_REL_JD_A';")" = "1" ] || { echo "::error::fixture load failed — membership relationship missing"; exit 1; }
+          [ "$ACT" = "CITEST_ORG_A" ] || { echo "::error::active-org pref is '${ACT}', expected CITEST_ORG_A (stripped? membership not recognized?) — the render isolation assert would false-positive, so failing here"; exit 1; }
+          echo "OK — demo + fixtures loaded, john.doe active org = CITEST_ORG_A"
 
       - name: Org-isolation assert
         # As john.doe (active org = CI Tenant A), the contacts list must show Tenant A's contact and
