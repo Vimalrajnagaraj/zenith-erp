@@ -67,6 +67,11 @@ try {
       const resp = await page.goto(BASE + path, { waitUntil: 'networkidle2', timeout: 60000 });
       status = resp ? resp.status() : 0;
       await sleep(3000); // let Vue/Quasar and any img-onload bootstraps paint
+      if (path.includes('/Inventory/InventoryDashboard')) {
+        await page.waitForSelector('.inv-dashboard', { timeout: 15000 });
+      } else if (path.includes('/Inventory/DashboardDetails')) {
+        await page.waitForSelector('.inv-detail-content', { timeout: 15000 });
+      }
       // Check the VISIBLE body text, not the full HTML — the Quasar SPA's JS bundle legitimately
       // contains exception-class strings and would false-positive against raw HTML.
       const found = await page.evaluate((src) => {
