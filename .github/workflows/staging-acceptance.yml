@@ -1,71 +1,77 @@
 # Phase-1 of the auto-deploy proposal (docs/infra/auto-deploy-proposal.md): REPORT-ONLY.
-# Builds the app image, boots an ephemeral staging stack, and renders a smoke set of screens on
-# /apps and /qapps. It NEVER touches production and has no prod credentials. A red run means
-# "this change does not boot/render cleanly on a from-scratch build" — surface it, don't deploy.
+#
+# Boots an ephemeral staging stack from the repo's OWN prebuilt, sanitized app image (published as
+# the `staging-image-v1` release asset — no third-party GHCR pull, which is 403-blocked), overlays
+# the checked-out component tree (exactly how a prod deploy applies changes), and renders a smoke
+# set on /apps and /qapps. It NEVER touches production and has no prod credentials. A red run means
+# "this change does not boot/render cleanly" — surface it, don't deploy.
 #
 # Trigger is workflow_dispatch (manual) ON PURPOSE while this is being tuned, so it can't spam
-# failing required checks. Once it's reliably green, enable the `pull_request` / `push` triggers
-# below to run it on every PR/merge (still report-only).
+# failing required checks. Once reliably green, enable the pull_request / push triggers below.
 name: staging-acceptance
 
 on:
   workflow_dispatch: {}
-  # Enable these once the job is reliably green (see the proposal, Phase 1 -> Phase 2):
+  # Enable once reliably green (proposal Phase 1 -> Phase 2):
   # pull_request:
   #   branches: [master]
   # push:
   #   branches: [master]
 
 permissions:
-  contents: read
+  contents: read            # enough to download the private release asset via GITHUB_TOKEN
 
-concurrency:              # one staging run per ref; a newer push cancels an in-flight run
+concurrency:
   group: staging-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  IMAGE_RELEASE: staging-image-v1
+  IMAGE_ASSET: zetaerp-moqui-local.tar.gz
+  COMPOSE: docs/infra/ci/docker-compose.staging.yml
 
 jobs:
   acceptance:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Assemble the image build context
-        # Mirrors docs/infra/deploy/Dockerfile's expected context: ./zenith-erp (components),
-        # ./framework-patches, ./zenith-classes, ./MoquiDevConf.xml, ./qz-private-key.pem.
-        # The QZ key is a throwaway (receipt signing is irrelevant to rendering) and never a real
-        # secret. MoquiDevConf is a placeholder — runtime datasource comes from entity_ds_* env.
+      - name: Download the sanitized staging image
+        run: gh release download "$IMAGE_RELEASE" --repo "$GITHUB_REPOSITORY" --pattern "$IMAGE_ASSET" --dir "$RUNNER_TEMP"
+
+      - name: Load the image
         run: |
           set -euo pipefail
-          CTX="$RUNNER_TEMP/buildctx"
-          mkdir -p "$CTX"
-          cp -a component "$CTX/zenith-erp"
-          cp -a docs/infra/framework-patches "$CTX/framework-patches"
-          cp -a docs/infra/zenith-classes "$CTX/zenith-classes"
-          openssl genrsa -out "$CTX/qz-private-key.pem" 2048
-          printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
-            '<!-- CI staging placeholder; the real datasource is supplied via entity_ds_* env (production conf). -->' \
-            '<moqui-conf/>' > "$CTX/MoquiDevConf.xml"
-          cp docs/infra/deploy/Dockerfile "$CTX/Dockerfile"
-          echo "CTX=$CTX" >> "$GITHUB_ENV"
-
-      - name: Build staging image
-        run: docker build -t zetaerp-moqui:staging -f "$CTX/Dockerfile" "$CTX"
+          loaded=$(docker load -i "$RUNNER_TEMP/$IMAGE_ASSET" | sed -n 's/^Loaded image: //p' | head -1)
+          echo "loaded: $loaded"
+          docker tag "$loaded" zetaerp-moqui:staging
 
       - name: Boot ephemeral staging stack
-        run: docker compose -f docs/infra/ci/docker-compose.staging.yml up -d
+        run: docker compose -f "$COMPOSE" up -d
+
+      - name: Overlay the checked-out component tree
+        # The baked image is a baseline Moqui+app; overlay the CURRENT repo components so staging runs
+        # exactly this commit's code (merge-overlay — new/changed files win; deletions are not pruned,
+        # which is fine for a render smoke). Then restart so Moqui reloads XML/Groovy.
+        run: |
+          set -euo pipefail
+          CID=$(docker compose -f "$COMPOSE" ps -q moqui)
+          tar czf - component | docker exec -i "$CID" sh -c 'cd /opt/moqui/runtime/component && tar xzf - --strip-components=1'
+          docker compose -f "$COMPOSE" restart moqui
 
       - name: Load seed data
-        # A fresh DB is empty -> no login. Load Moqui's seed+demo so john.doe/moqui exists.
-        # TODO: confirm the exact war name / load invocation for this image, then make this a hard
-        # gate. Kept non-fatal for now so the first runs surface the right command in the logs.
+        # Fresh DB is empty -> no login. Load Moqui seed+demo so john.doe/moqui exists.
+        # TODO: confirm the exact war/jar + load args for this image, then make this a hard gate.
+        # Kept non-fatal so the first runs print the right invocation in the logs.
         run: |
           set -x
-          CID=$(docker compose -f docs/infra/ci/docker-compose.staging.yml ps -q moqui)
+          CID=$(docker compose -f "$COMPOSE" ps -q moqui)
           WAR=$(docker exec "$CID" sh -lc 'ls /opt/moqui/*.war 2>/dev/null | head -1')
-          docker exec "$CID" sh -lc "cd /opt/moqui && java -jar ${WAR:-moqui.war} load types=seed,seed-initial,demo no-run-es=true" || \
-            echo "::warning::seed load needs adjusting for this image — see logs"
+          docker exec "$CID" sh -lc "cd /opt/moqui && java -jar ${WAR:-moqui.war} load types=seed,seed-initial,demo no-run-es=true" \
+            || echo "::warning::seed load needs adjusting for this image — see logs"
 
       - name: Wait for Moqui to be healthy
         run: |
@@ -74,7 +80,7 @@ jobs:
             [ "$code" = "200" ] && { echo "up after $i"; exit 0; }
             sleep 5
           done
-          echo "::error::Moqui did not become healthy"; exit 1
+          echo "::error::Moqui did not become healthy (auth/seed?)"; exit 1
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -87,14 +93,14 @@ jobs:
       - name: Render smoke (both surfaces)
         run: node docs/infra/ci/smoke.mjs http://localhost:8080
 
-      # --- follow-up acceptance (Phase 1 -> next increment), see docs/infra/auto-deploy-proposal.md ---
-      # - name: Org-isolation asserts        # tenant A cannot see tenant B (DB ground truth)
-      # - name: MARUTHI-shaped billing smoke  # cash/card/split sale -> bill mints, pricing/tax == baseline
+      # --- follow-up acceptance (next increment), see docs/infra/auto-deploy-proposal.md ---
+      # - name: Org-isolation asserts         # tenant A cannot see tenant B (DB ground truth)
+      # - name: MARUTHI-shaped billing smoke   # cash/card/split sale -> bill mints, pricing/tax == baseline
 
       - name: Dump Moqui logs on failure
         if: failure()
-        run: docker compose -f docs/infra/ci/docker-compose.staging.yml logs --tail=200 moqui || true
+        run: docker compose -f "$COMPOSE" logs --tail=200 moqui || true
 
       - name: Tear down
         if: always()
-        run: docker compose -f docs/infra/ci/docker-compose.staging.yml down -v || true
+        run: docker compose -f "$COMPOSE" down -v || true

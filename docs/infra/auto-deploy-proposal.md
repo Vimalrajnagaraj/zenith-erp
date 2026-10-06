@@ -94,6 +94,12 @@ PR ──► merge to master  (CI: lint guards + review + secret/customer-data s
     small **dedicated staging VM** for headroom.
   - *Avoid:* a second compose project on the prod host — it shares RAM and failure domain with
     production.
+- **A controlled copy of the app image.** The upstream base `ghcr.io/moqui/moqui-framework` is
+  **403-blocked for anonymous / cross-org pulls** (confirmed both in CI and on a teammate's machine),
+  so a *from-scratch* build fails anywhere but the prod host, which has it cached. So staging/CI uses
+  the repo's own **sanitized prebuilt image** (the `staging-image-v1` release asset) + an overlay of
+  the checked-out components — never the upstream pull. For the eventual full pipeline's per-`<sha>`
+  build, **mirror the base once into our own GHCR namespace** and build from the mirror.
 - **Versioned seed fixtures** — a demo tenant + a **MARUTHI-shaped** tenant (synthetic plan/pricing;
   never prod data), kept in the repo under `docs/infra/ci/seed/`.
 - **A deploy runner with scoped prod access** — a GitHub Actions self-hosted runner, or a hosted
@@ -112,9 +118,11 @@ PR ──► merge to master  (CI: lint guards + review + secret/customer-data s
 
 ## Phased rollout (earn the trust)
 
-- **Phase 1 — report-only staging acceptance.** Build the image and run the ephemeral staging +
-  render smoke on demand (and later on every merge), **reporting** pass/fail. No auto-deploy. Prove
-  the gate catches real problems for a few weeks. *(Starter workflow:
+- **Phase 1 — report-only staging acceptance.** Load the repo's sanitized **prebuilt** app image
+  (published as the `staging-image-v1` release asset — see the base-image note below), overlay the
+  checked-out component tree, boot the ephemeral stack, and run the render smoke on demand (and
+  later on every merge), **reporting** pass/fail. No auto-deploy. Prove the gate catches real
+  problems for a few weeks. *(Starter workflow:
   [`../../.github/workflows/staging-acceptance.yml`](../../.github/workflows/staging-acceptance.yml),
   staging stack [`ci/docker-compose.staging.yml`](ci/docker-compose.staging.yml), smoke
   [`ci/smoke.mjs`](ci/smoke.mjs).)*
