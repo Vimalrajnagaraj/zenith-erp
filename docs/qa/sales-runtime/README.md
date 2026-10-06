@@ -70,7 +70,8 @@ is installed into that disposable container before startup, never into the
 application source or deployment image. Initialization requires the disposable
 JVM flag, a demo platform admin and an absent `SALES_QA_A` fixture. Later calls
 require the dedicated non-platform-admin synthetic user and a fixed service
-allowlist. Output is limited to synthetic identifiers, results and errors.
+allowlist. Date-boundary fixtures use the QA user’s explicit Asia/Kolkata calendar,
+not the initializing demo administrator’s timezone. Output is limited to synthetic identifiers, results and errors.
 
 Evidence is uploaded as `sales-<candidate-sha>` for 14 days. CI always tears down
 the Compose stack; an additional assertion requires zero remaining project
