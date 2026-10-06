@@ -80,6 +80,14 @@ try {
               getComputedStyle(svg).color === expected && ['flex', 'inline-flex'].includes(getComputedStyle(trend).display);
           }));
         if (!trendStylesOk) throw new Error('KPI trend styling missing or oversized on this ERP surface');
+        await page.waitForSelector('#inventoryOverviewChart .apexcharts-canvas', { timeout: 15000 });
+        const compactPreviews = await page.evaluate(() => {
+          const cards = Array.from(document.querySelectorAll('.inv-bottom > .inv-card'));
+          const count = title => cards.find(card => card.querySelector('h2')?.textContent === title)?.querySelectorAll('tbody tr').length || 0;
+          return count('Recent Transactions') <= 5 && count('Low Stock Alerts') <= 4 &&
+            !!document.querySelector('.inv-date > summary svg');
+        });
+        if (!compactPreviews) throw new Error('Live dashboard lost the compact preview or calendar date control');
       } else if (path.includes('/Inventory/DashboardDetails')) {
         await page.waitForSelector('.inv-detail-content', { timeout: 15000 });
       }
@@ -146,7 +154,7 @@ try {
         phase = 'date parameters in URL';
         await page.waitForFunction(() => new URL(location.href).searchParams.get('dashDate') === '2026-10-01', { timeout: 15000 });
         phase = 'selected date range rendered';
-        await page.waitForFunction(() => document.querySelector('.inv-date > summary')?.textContent.includes('2026-10-01 to 2026-10-06'), { timeout: 15000 });
+        await page.waitForFunction(() => document.querySelector('.inv-date > summary')?.title === '2026-10-01 to 2026-10-06', { timeout: 15000 });
         const validLinks = await page.evaluate(surface => {
           const add = document.querySelector('.inv-header a.inv-primary');
           return !add || new URL(add.href).pathname === `/${surface}/zenith/Inventory/FindProduct`;
