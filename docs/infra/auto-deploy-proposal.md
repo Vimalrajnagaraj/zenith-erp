@@ -150,10 +150,23 @@ PR ──► merge to master  (CI: lint guards + review + secret/customer-data s
        fixture component depends on contacts and uses `type="demo"`; one bad row rolls back its file.
     4. The framework seed creates the `john.doe` **UserAccount but no mantle Party** → create the
        person party + link it, or the party-based org membership FK-fails.
-  - **Next deeper check (not built):** a **MARUTHI-shaped billing no-op smoke** — a synthetic
-    MARUTHI-shaped tenant (tax-exclusive pricing + GST, POS modes; synthetic values, never prod
-    GSTIN/HSN/prices), a cash/card/split sale that mints a bill, and pricing/tax asserted against a
-    golden baseline. This is what proves "no-op-safe for MARUTHI" without touching MARUTHI's data.
+  - **Deeper acceptance — MARUTHI-shaped billing no-op smoke: implemented & green.** A synthetic
+    MARUTHI-shaped tenant (tax-exclusive + GST, the three POS modes; synthetic values, never prod
+    GSTIN/HSN/prices — `docs/infra/ci/seed/billing.xml`) plus a headless driver
+    (`docs/infra/ci/billing.mjs`) that replays the /apps mint transitions (there is no REST) for a
+    RETAIL cash, WHOLESALE cash, EMPLOYEE cash, and a split-tender sale. psql then asserts the stored
+    per-mode price, per-slab CGST+SGST, whole-rupee rounding, and split reconciliation against a golden
+    baseline (DB ground truth) — this is what proves "no-op-safe for MARUTHI" without MARUTHI's data.
+    Two more gotchas surfaced:
+    1. **Entity-embedded `<seed-data>` isn't applied by the CI types-load** — the POS price-source
+       enums, sales modes, and status items live in `<seed-data>` blocks inside `PosEntities.xml`, and
+       geo/state data is `type="install"` (skipped), so `PsOpen`/`PosSalesMode`/`IndiaState` are absent
+       and the FKs roll the whole fixture file back (Moqui loads each file in one transaction). Seed
+       what the mint path needs directly in the fixture.
+    2. **Web must not run during the load** — web and the `docker exec` load JVM share one Bitronix
+       tx-log (`/opt/moqui/runtime/txlog/btm*.tlog`); whichever boots first wins the lock, so the
+       container is held (web off) until the load finishes, then released. (This also de-flaked the
+       earlier checks, which had been winning the race by luck.)
 - **Phase 2 — auto-deploy the trivial tier.** docs/CSS/presentation auto-deploy after green staging;
   one-click approve for everything else. This is a comfortable place to sit for a long time.
 - **Phase 3 — widen the auto tiers** as confidence grows; add monitoring-driven auto-rollback.

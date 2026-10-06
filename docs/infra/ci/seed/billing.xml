@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- CI staging ONLY — synthetic MARUTHI-shaped billing fixtures (never prod data).
+     Turns CITEST_ORG_A (the isolation test tenant; john.doe is already active there via isolation.xml)
+     into a billable POS tenant, then the CI mint driver (docs/infra/ci/billing.mjs) rings up
+     cash/card/split sales and the workflow asserts the stored pricing/tax against a golden baseline —
+     proving a billing-path change is no-op-safe for a MARUTHI-shaped tenant WITHOUT MARUTHI's data.
+
+     type="demo" + auto-discovered in the SAME single load as isolation.xml. SELF-SUFFICIENT: re-declares
+     CITEST_ORG_A (idempotent) so it's load-order-independent from isolation.xml.
+
+     IMPORTANT: the POS price-source enums, sales modes, and status items are defined as <seed-data>
+     INSIDE zenith-erp-pos/entity/PosEntities.xml, which the CI `load types=seed,seed-initial,demo`
+     does NOT apply (entity-embedded seed-data isn't loaded by a types-load here). So this file seeds
+     them itself (idempotent upserts if already present); without them the PosSession.statusId and
+     PosProductModePrice.salesModeId FKs fail and roll back the whole file (Moqui = one txn per file).
+     Prices are SYNTHETIC — not real MARUTHI/GSTIN/HSN values. -->
+<entity-facade-xml type="demo">
+
+    <!-- ===== the billing tenant (re-declared, idempotent) ===== -->
+    <mantle.party.Party partyId="CITEST_ORG_A" partyTypeEnumId="PtyOrganization" ownerPartyId="CITEST_ORG_A"/>
+    <mantle.party.Organization partyId="CITEST_ORG_A" organizationName="CI Tenant A"/>
+    <mantle.party.PartyRole partyId="CITEST_ORG_A" roleTypeId="OrgInternal"/>
+
+    <!-- ===== POS enums + sales modes (from PosEntities.xml <seed-data>; not loaded by the CI load) =====
+         RETAIL=MRP source (uses Product.mrpAmount); WHOLESALE/EMPLOYEE=fixed per-product (PosProductModePrice).
+         requireCustomer/minOrderAmount left OFF for CI so no customer/min gate blocks a mint. -->
+    <moqui.basic.EnumerationType enumTypeId="PosPriceSource" description="POS Price Source"/>
+    <moqui.basic.Enumeration enumId="PpsMrp" enumTypeId="PosPriceSource" description="MRP" sequenceNum="1"/>
+    <moqui.basic.Enumeration enumId="PpsFixedProduct" enumTypeId="PosPriceSource" description="Fixed per-product price" sequenceNum="6"/>
+    <zenith.erp.pos.PosSalesMode salesModeId="RETAIL" modeName="Retail" modeCode="RTL"
+        priceSource="PpsMrp" isTaxInclusive="N" requireCustomer="N" isDefault="Y" isActive="Y"/>
+    <zenith.erp.pos.PosSalesMode salesModeId="WHOLESALE" modeName="Wholesale" modeCode="WSL"
+        priceSource="PpsFixedProduct" isTaxInclusive="N" requireCustomer="N" isDefault="N" isActive="Y"/>
+    <zenith.erp.pos.PosSalesMode salesModeId="EMPLOYEE" modeName="Employee" modeCode="EMP"
+        priceSource="PpsFixedProduct" isTaxInclusive="N" requireCustomer="N" isDefault="N" isActive="Y"/>
+
+    <!-- ===== POS status items + flow (from PosEntities.xml <seed-data>) =====
+         PosSession.statusId / PosTransaction.statusId FK these; the mint's status update
+         (PtCreated -> PtCompleted) needs the matching StatusFlowTransition. -->
+    <moqui.basic.StatusFlow statusFlowId="Default" description="Default Status Flow"/>
+    <moqui.basic.StatusType statusTypeId="PosSession" description="POS Session"/>
+    <moqui.basic.StatusItem statusId="PsOpen" statusTypeId="PosSession" description="Open" sequenceNum="1"/>
+    <moqui.basic.StatusItem statusId="PsClosed" statusTypeId="PosSession" description="Closed" sequenceNum="2"/>
+    <moqui.basic.StatusType statusTypeId="PosTransaction" description="POS Transaction"/>
+    <moqui.basic.StatusItem statusId="PtCreated" statusTypeId="PosTransaction" description="Created" sequenceNum="1"/>
+    <moqui.basic.StatusItem statusId="PtCompleted" statusTypeId="PosTransaction" description="Completed" sequenceNum="2"/>
+    <moqui.basic.StatusItem statusId="PtVoided" statusTypeId="PosTransaction" description="Voided" sequenceNum="3"/>
+    <moqui.basic.StatusItem statusId="PtHeld" statusTypeId="PosTransaction" description="Held" sequenceNum="4"/>
+    <moqui.basic.StatusFlowTransition statusFlowId="Default" statusId="PtCreated" toStatusId="PtCompleted" transitionName="Complete"/>
+    <moqui.basic.StatusFlowTransition statusFlowId="Default" statusId="PtCreated" toStatusId="PtVoided" transitionName="Void"/>
+    <moqui.basic.StatusFlowTransition statusFlowId="Default" statusId="PtCreated" toStatusId="PtHeld" transitionName="Hold"/>
+
+    <!-- ===== GST slabs (re-declared idempotently in case the india data file wasn't loaded) =====
+         whole-number percents; engine divides by 100; intra-state splits into CGST+SGST (each half). -->
+    <zenith.erp.india.IndiaGstSlab gstSlabId="GST_5"  slabName="5% GST"  gstRate="5"  cgstRate="2.5" sgstRate="2.5" igstRate="5"  cessRate="0"/>
+    <zenith.erp.india.IndiaGstSlab gstSlabId="GST_12" slabName="12% GST" gstRate="12" cgstRate="6"   sgstRate="6"   igstRate="12" cessRate="0"/>
+    <zenith.erp.india.IndiaGstSlab gstSlabId="GST_18" slabName="18% GST" gstRate="18" cgstRate="9"   sgstRate="9"   igstRate="18" cessRate="0"/>
+
+    <!-- ===== company + tax settings (WITHOUT TAX_CALCULATION_SERVICE, tax computes to ZERO) ===== -->
+    <zenith.erp.base.CompanySettings organizationPartyId="CITEST_ORG_A" settingKey="COUNTRY_GEO_ID" settingValue="IND"/>
+    <zenith.erp.base.CompanySettings organizationPartyId="CITEST_ORG_A" settingKey="CURRENCY_UOM_ID" settingValue="INR"/>
+    <zenith.erp.base.CompanySettings organizationPartyId="CITEST_ORG_A" settingKey="TAX_CALCULATION_SERVICE" settingValue="zenith.india.IndiaTaxServices.calculate#Tax"/>
+    <zenith.erp.base.CompanySettings organizationPartyId="CITEST_ORG_A" settingKey="FY_START_MONTH" settingValue="4"/>
+
+    <!-- NO IndiaGstConfig: its stateCode FKs to IndiaState, which the CI load leaves empty (demo's own
+         ORG_ZINC config fails identically). Not needed: the tax engine takes supplier state from the
+         terminal's regionGeoId ("33"), only falling back to IndiaGstConfig when null, and the
+         composition lookup is null-safe. Supplier "33" == buyer "33" (no customer) -> intra-state. -->
+
+    <!-- ===== terminal + an OPEN session (no Facility: it's optional for the mint, so skip the
+         FcTpRetailStore FK). regionGeoId "33" is the supplier AND buyer state code the tax engine uses. -->
+    <zenith.erp.pos.PosTerminal terminalId="CITEST_A_TERM" terminalName="CI Test Terminal A"
+        organizationPartyId="CITEST_ORG_A" regionGeoId="33" countryGeoId="IND" stateCode="33" isActive="Y"/>
+
+    <zenith.erp.pos.PosSession sessionId="CITEST_A_SESS" terminalId="CITEST_A_TERM"
+        organizationPartyId="CITEST_ORG_A" openDate="2026-10-06 09:00:00" openingCash="0"
+        totalSales="0" totalReturns="0" totalTransactions="0" statusId="PsOpen"/>
+
+    <!-- ===== three products across GST slabs (tax-exclusive; RETAIL uses mrpAmount) =====
+         inventoryTracked=N so the sale never touches stock. gstSlabId set directly = deterministic. -->
+    <mantle.product.Product productId="CITEST_BW5" pseudoId="CITEST_BW5" productName="CI Widget 5pct"
+        productTypeEnumId="PtAsset" ownerPartyId="CITEST_ORG_A" amountUomId="OTH_ea"
+        mrpAmount="100.00" gstSlabId="GST_5" inventoryTracked="N"/>
+    <mantle.product.Product productId="CITEST_BW12" pseudoId="CITEST_BW12" productName="CI Widget 12pct"
+        productTypeEnumId="PtAsset" ownerPartyId="CITEST_ORG_A" amountUomId="OTH_ea"
+        mrpAmount="200.00" gstSlabId="GST_12" inventoryTracked="N"/>
+    <mantle.product.Product productId="CITEST_BW18" pseudoId="CITEST_BW18" productName="CI Widget 18pct"
+        productTypeEnumId="PtAsset" ownerPartyId="CITEST_ORG_A" amountUomId="OTH_ea"
+        mrpAmount="100.00" gstSlabId="GST_18" inventoryTracked="N"/>
+
+    <!-- ===== per-mode prices (RETAIL needs none; WHOLESALE/EMPLOYEE block the add if unset) ===== -->
+    <zenith.erp.pos.PosProductModePrice productId="CITEST_BW5"  salesModeId="WHOLESALE" organizationPartyId="CITEST_ORG_A" price="90.00"/>
+    <zenith.erp.pos.PosProductModePrice productId="CITEST_BW5"  salesModeId="EMPLOYEE"  organizationPartyId="CITEST_ORG_A" price="80.00"/>
+    <zenith.erp.pos.PosProductModePrice productId="CITEST_BW12" salesModeId="WHOLESALE" organizationPartyId="CITEST_ORG_A" price="180.00"/>
+    <zenith.erp.pos.PosProductModePrice productId="CITEST_BW12" salesModeId="EMPLOYEE"  organizationPartyId="CITEST_ORG_A" price="160.00"/>
+    <zenith.erp.pos.PosProductModePrice productId="CITEST_BW18" salesModeId="WHOLESALE" organizationPartyId="CITEST_ORG_A" price="85.00"/>
+    <zenith.erp.pos.PosProductModePrice productId="CITEST_BW18" salesModeId="EMPLOYEE"  organizationPartyId="CITEST_ORG_A" price="90.00"/>
+
+</entity-facade-xml>

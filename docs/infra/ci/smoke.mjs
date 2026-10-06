@@ -13,9 +13,10 @@
 //     contact and NOT Tenant B's (steps "Assert fixtures loaded" + "Org-isolation assert" in
 //     .github/workflows/staging-acceptance.yml; DB ground truth gates it so a load failure or a
 //     stripped active-org pref fails precisely instead of looking like a leak).
-//   • TODO — a MARUTHI-shaped billing no-op smoke: cash/card/split sale on a synthetic MARUTHI-shaped
-//     tenant → bill mints, pricing/tax == a golden baseline. Needs a MARUTHI-shaped seed and is the
-//     next increment (reuses reference_pos-terminal-puppeteer-harness).
+//   • DONE — a MARUTHI-shaped billing no-op smoke (docs/infra/ci/billing.mjs + seed/billing.xml):
+//     rings up RETAIL/WHOLESALE/EMPLOYEE cash sales + a split tender on a synthetic MARUTHI-shaped
+//     tenant (tax-exclusive, GST 5/12/18%) and asserts the stored per-mode price, per-slab CGST+SGST,
+//     whole-rupee rounding, and split-tender reconciliation against a golden baseline via psql.
 
 import puppeteer from 'puppeteer';
 

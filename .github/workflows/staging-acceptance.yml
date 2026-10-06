@@ -158,6 +158,14 @@ jobs:
           docker cp docs/infra/ci/seed/component.xml "$CID:/opt/moqui/runtime/component/ci-staging-fixtures/component.xml"
           docker cp docs/infra/ci/seed/isolation.xml "$CID:/opt/moqui/runtime/component/ci-staging-fixtures/data/CiIsolationDemoData.xml"
 
+      - name: Install the CI-only billing fixture component
+        run: |
+          set -euo pipefail
+          CID=$(docker compose -f "$COMPOSE" ps -q moqui)
+          docker exec "$CID" mkdir -p /opt/moqui/runtime/component/ci-billing-fixtures/data
+          docker cp docs/infra/ci/seed/billing-component.xml "$CID:/opt/moqui/runtime/component/ci-billing-fixtures/component.xml"
+          docker cp docs/infra/ci/seed/billing.xml "$CID:/opt/moqui/runtime/component/ci-billing-fixtures/data/CiBillingDemoData.xml"
+
       - name: Install requested Contacts profile fixture
         if: github.event_name == 'workflow_dispatch' && inputs.contacts_profile != 'none'
         run: |
@@ -330,6 +338,52 @@ jobs:
           path: ${{ runner.temp }}/contacts-profile
           if-no-files-found: warn
           retention-days: 14
+
+      - name: Assert billing fixtures loaded (DB ground truth)
+        # Prove the MARUTHI-shaped billing seed (docs/infra/ci/seed/billing.xml) landed before minting,
+        # so a load failure fails HERE precisely instead of as a confusing mint error.
+        run: |
+          DBID=$(docker compose -f "$COMPOSE" ps -q db)
+          g(){ docker exec "$DBID" psql -U moqui -d moqui -tAc "$1" 2>/dev/null | tr -d '[:space:]'; }
+          docker exec "$DBID" psql -U moqui -d moqui -P pager=off -c \
+            "SELECT product_id, mrp_amount, gst_slab_id FROM product WHERE product_id LIKE 'CITEST_BW%' ORDER BY product_id;" 2>&1 || true
+          [ "$(g "SELECT count(*) FROM pos_terminal WHERE terminal_id='CITEST_A_TERM' AND organization_party_id='CITEST_ORG_A';")" = "1" ] || { echo "::error::billing seed: PosTerminal CITEST_A_TERM missing"; exit 1; }
+          [ "$(g "SELECT count(*) FROM pos_session WHERE session_id='CITEST_A_SESS' AND status_id='PsOpen';")" = "1" ] || { echo "::error::billing seed: open PosSession CITEST_A_SESS missing"; exit 1; }
+          [ "$(g "SELECT count(*) FROM product WHERE product_id LIKE 'CITEST_BW%' AND gst_slab_id IS NOT NULL;")" = "3" ] || { echo "::error::billing seed: expected 3 CITEST_BW products with a gst_slab_id"; exit 1; }
+          [ "$(g "SELECT count(*) FROM pos_product_mode_price WHERE product_id LIKE 'CITEST_BW%';")" = "6" ] || { echo "::error::billing seed: expected 6 PosProductModePrice rows"; exit 1; }
+          [ "$(g "SELECT count(*) FROM company_settings WHERE organization_party_id='CITEST_ORG_A' AND setting_key='TAX_CALCULATION_SERVICE';")" = "1" ] || { echo "::error::billing seed: TAX_CALCULATION_SERVICE missing -> tax would compute to ZERO"; exit 1; }
+          echo "OK — billing fixtures present (terminal, open session, 3 slab products, 6 mode prices, tax service)"
+
+      - name: Mint POS bills (headless driver)
+        # Replays the /apps terminal's mint transitions (no REST) as john.doe on CITEST_ORG_A:
+        # RETAIL/WHOLESALE/EMPLOYEE cash sales + a split tender. Writes <scenario>=<txnId> for the assert.
+        env:
+          BILLING_OUT: ${{ runner.temp }}/billing_txns.env
+        run: node docs/infra/ci/billing.mjs http://localhost:8080
+
+      - name: Assert billing math (DB ground truth vs golden baseline)
+        # Tax-exclusive, intra-state CGST+SGST, each component 2dp HALF_UP, payable = round(grand,0).
+        run: |
+          set -a; . "$RUNNER_TEMP/billing_txns.env"; set +a      # sets A B C D = transaction ids
+          DBID=$(docker compose -f "$COMPOSE" ps -q db)
+          docker exec "$DBID" psql -U moqui -d moqui -P pager=off -c \
+            "SELECT transaction_id, sales_mode_id, subtotal, total_tax_amount, grand_total, payable_amount, round_off, status_id, transaction_number FROM pos_transaction WHERE transaction_id IN ('$A','$B','$C','$D') ORDER BY entry_date;" 2>&1 || true
+          FAILED=0
+          chk(){ r=$(docker exec "$DBID" psql -U moqui -d moqui -tAc "$2" 2>/dev/null | tr -d '[:space:]'); [ "$r" = "t" ] || { echo "::error::billing assert FAILED: $1 (got '$r')"; FAILED=1; }; }
+          # A — RETAIL cash, CITEST_BW18 (mrp 100, GST18): grand 118, CGST 9 + SGST 9
+          chk "A header (grand 118 / tax 18 / sub 100 / payable 118 / completed / bill#)" "SELECT (grand_total=118.00 AND total_tax_amount=18.00 AND subtotal=100.00 AND payable_amount=118 AND status_id='PtCompleted' AND transaction_number IS NOT NULL) FROM pos_transaction WHERE transaction_id='$A';"
+          chk "A line (retail unit_price=100, qty 1)" "SELECT (unit_price=100.00 AND quantity=1) FROM pos_transaction_item WHERE transaction_id='$A';"
+          chk "A CGST=9 + SGST=9 (intra-state)" "SELECT ((SELECT coalesce(sum(tax_amount),0) FROM tax_line_detail WHERE reference_id='$A' AND tax_name='CGST')=9.00 AND (SELECT coalesce(sum(tax_amount),0) FROM tax_line_detail WHERE reference_id='$A' AND tax_name='SGST')=9.00);"
+          # B — WHOLESALE cash, CITEST_BW12 x3 (mode 180, GST12): grand 604.80, payable 605, roundOff 0.20
+          chk "B header (grand 604.80 / tax 64.80 / sub 540 / payable 605 / roundoff 0.20)" "SELECT (grand_total=604.80 AND total_tax_amount=64.80 AND subtotal=540.00 AND payable_amount=605 AND round_off=0.20 AND status_id='PtCompleted') FROM pos_transaction WHERE transaction_id='$B';"
+          chk "B line (wholesale unit_price=180, qty 3)" "SELECT (unit_price=180.00 AND quantity=3) FROM pos_transaction_item WHERE transaction_id='$B';"
+          # C — EMPLOYEE cash, CITEST_BW5 (mode 80, GST5): grand 84
+          chk "C header (grand 84 / tax 4 / sub 80 / payable 84)" "SELECT (grand_total=84.00 AND total_tax_amount=4.00 AND subtotal=80.00 AND payable_amount=84 AND status_id='PtCompleted') FROM pos_transaction WHERE transaction_id='$C';"
+          chk "C line (employee unit_price=80)" "SELECT (unit_price=80.00 AND quantity=1) FROM pos_transaction_item WHERE transaction_id='$C';"
+          # D — RETAIL split, CITEST_BW18: grand 118, two tenders (cash 60 + card 58) reconcile
+          chk "D header (grand 118 / payable 118 / completed)" "SELECT (grand_total=118.00 AND payable_amount=118 AND status_id='PtCompleted') FROM pos_transaction WHERE transaction_id='$D';"
+          chk "D split tenders (2 rows summing 118.00)" "SELECT ((SELECT count(*) FROM pos_payment WHERE transaction_id='$D')=2 AND (SELECT sum(amount) FROM pos_payment WHERE transaction_id='$D')=118.00);"
+          [ "$FAILED" = "0" ] && echo "OK — billing math matches golden baseline (modes RETAIL/WHOLESALE/EMPLOYEE, slabs 5/12/18%, whole-rupee rounding, split reconcile)" || { echo "::error::one or more billing math asserts failed"; exit 1; }
 
       - name: Dump Moqui logs on failure
         if: failure()
