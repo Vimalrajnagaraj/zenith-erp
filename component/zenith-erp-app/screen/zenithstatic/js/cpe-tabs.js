@@ -49,9 +49,11 @@
     // ZE-CG-EDIT: Active toggle — flip the visual switch AND sync the hidden isActive field so the form always submits Y/N.
     var cgTog = tgt && tgt.closest ? tgt.closest('.cg-toggle') : null;
     if (cgTog) {
+      e.preventDefault();
       var cgSw = cgTog.querySelector('.cg-toggle-sw'), cgLbl = cgTog.querySelector('.cg-toggle-lbl');
       var cgOn = cgSw ? cgSw.classList.toggle('on') : false;
       if (cgLbl) cgLbl.textContent = cgOn ? 'Yes' : 'No';
+      cgTog.setAttribute('aria-checked', cgOn ? 'true' : 'false');
       var cgFrm = cgTog.closest('form'), cgHid = cgFrm ? cgFrm.querySelector('[name="isActive"]') : null;
       if (cgHid) { cgHid.value = cgOn ? 'Y' : 'N'; try { cgHid.dispatchEvent(new Event('change', { bubbles: true })); } catch (er) {} }
       return;
@@ -128,7 +130,7 @@
     }
   }
   // ZE-CG-EDIT: on /apps, replace the isActive Y/N <drop-down> with a purple toggle switch synced to the select (the
-  // select stays the REAL submitting control, so Active saves correctly). /qapps keeps the dropdown (safe q-select).
+  // select stays the REAL submitting control, so Active saves correctly). /qapps renders its own Y/N q-toggle.
   function cgActiveToggle() {
     if (!document.getElementById('content')) return;  // /apps only (Bootstrap page)
     var sels = document.querySelectorAll('form[name="GroupForm"] select[name="isActive"]');
@@ -137,13 +139,18 @@
       if (sel.getAttribute('data-cgtog')) continue;
       sel.setAttribute('data-cgtog', '1');
       var on = sel.value !== 'N';
-      var tog = document.createElement('span');
+      var tog = document.createElement('button');
+      tog.type = 'button';
       tog.className = 'cg-toggle';
+      tog.setAttribute('role', 'switch');
+      tog.setAttribute('aria-label', 'Active');
+      tog.setAttribute('aria-checked', on ? 'true' : 'false');
       tog.innerHTML = '<span class="cg-toggle-sw' + (on ? ' on' : '') + '"></span><span class="cg-toggle-lbl">' + (on ? 'Yes' : 'No') + '</span>';
       sel.style.display = 'none';
       var s2 = sel.parentNode.querySelector('.select2-container'); if (s2) s2.style.display = 'none';
       var fg = sel.closest('.form-group'), lb = fg ? fg.querySelector('label') : null; if (lb) lb.style.display = 'none';
       sel.parentNode.appendChild(tog);
+      var activeLabel = sel.parentNode.querySelector('.zecg-active-label'); if (activeLabel) activeLabel.style.display = 'none';
     }
   }
   // ZE-CONTACTS-SEARCH: on any list that ships the custom "Filters" button (currently All Contacts), hide the
