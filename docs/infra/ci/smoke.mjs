@@ -96,6 +96,18 @@ try {
 
   // Exercise the two existing date controls, including the legacy form that submits
   // to the module's default screen. These checks are read-only and need no stock data.
+  async function clickVisibleControl(selector) {
+    // Center the control before clicking: the theme's smooth scroll and the
+    // fixed Quasar footer can otherwise leave below-fold controls covered.
+    await page.$eval(selector, control => control.scrollIntoView({ block: 'center', behavior: 'instant' }));
+    await page.waitForFunction(selector => {
+      const control = document.querySelector(selector);
+      const rect = control.getBoundingClientRect();
+      const hit = document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2);
+      return hit === control || control.contains(hit);
+    }, { timeout: 15000 }, selector);
+    await page.locator(selector).click();
+  }
   for (const surface of ['apps', 'qapps']) {
     for (const legacy of [false, true]) {
       const label = `${surface} ${legacy ? 'additional-insights' : 'dashboard'} date Apply`;
@@ -105,30 +117,21 @@ try {
         await page.waitForSelector('.inv-dashboard', { timeout: 15000 });
         if (legacy) {
           phase = 'open additional insights';
-          await page.locator('details.inv-additional > summary').click();
+          await clickVisibleControl('details.inv-additional > summary');
           phase = 'open additional-insights date picker';
-          await page.locator('details.zdash-dr > summary').click();
+          await clickVisibleControl('details.zdash-dr > summary');
+          await page.waitForSelector('details.zdash-dr[open]', { timeout: 15000 });
         } else {
-          await page.locator('details.inv-date > summary').click();
+          await clickVisibleControl('details.inv-date > summary');
         }
         const selector = legacy ? 'form.zdash-dr-pop' : '.inv-date form';
         phase = 'fill From date';
         await page.locator(`${selector} [name="dashDate"]`).fill('2026-10-01');
         phase = 'fill To date';
         await page.locator(`${selector} [name="dashDateTo"]`).fill('2026-10-06');
-        // The additional-insights control is below the fold. Locator clicks
-        // wait for stable geometry after scrolling, unlike page.click(), which
-        // can click stale coordinates while the theme's smooth scroll runs.
         phase = 'date Apply button hit target';
         const buttonSelector = `${selector} button[type="submit"]`;
-        await page.$eval(buttonSelector, button => button.scrollIntoView({ block: 'center', behavior: 'instant' }));
-        await page.waitForFunction(selector => {
-          const button = document.querySelector(selector);
-          const rect = button.getBoundingClientRect();
-          const hit = document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2);
-          return hit === button || button.contains(hit);
-        }, { timeout: 15000 }, buttonSelector);
-        await page.locator(buttonSelector).click();
+        await clickVisibleControl(buttonSelector);
         phase = 'date parameters in URL';
         await page.waitForFunction(() => new URL(location.href).searchParams.get('dashDate') === '2026-10-01', { timeout: 15000 });
         phase = 'selected date range rendered';
