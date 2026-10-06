@@ -15,6 +15,9 @@ FROM ghcr.io/moqui/moqui-framework@sha256:6bd31bf1123f4871a5831fe35617fe719c4197
 # base's zenith components first so the COPY below is an EXACT reproduction of the current component tree.
 RUN rm -rf /opt/moqui/runtime/component/zenith-erp-*
 COPY ./zenith-erp/ /opt/moqui/runtime/component/
+# Activate the tracked /qapps wrapper at the framework's served screen path. A component copy alone
+# leaves the base image's wrapper active, including its stale redirect for resolved deep routes.
+COPY ./zenith-erp/zenith-erp-saas/framework-overrides/webroot/screen/webroot/qapps.xml /opt/moqui/runtime/base-component/webroot/screen/webroot/qapps.xml
 COPY ./MoquiDevConf.xml /opt/moqui/runtime/conf/MoquiDevConf.xml
 COPY ./qz-private-key.pem /opt/moqui/WEB-INF/classes/qz-private-key.pem
 # ZE-INV-012 (IV-113): patch the /qapps framework left-nav so module submenus collapse. Idempotent +
