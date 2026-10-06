@@ -99,7 +99,12 @@ async function browserMatrix(){
   const contexts={};
   async function userContext(user){
    if(contexts[user])return contexts[user];
-   const context=await browser.newContext({viewport:{width:1440,height:900},extraHTTPHeaders:{Authorization:'Basic '+Buffer.from(user+':'+password).toString('base64')}});
+   const context=await browser.newContext({viewport:{width:1440,height:900}});
+   // Authenticate once; persistent Basic headers rotate Moqui's session during parallel SPA requests.
+   const login=await context.request.get(base+'/apps/zenith/Contacts/CustomerGroups',{headers:{Authorization:'Basic '+Buffer.from(user+':'+password).toString('base64')},timeout:90000});
+   check(user+': one-time session authentication succeeds',login.status()===200,login.status());
+   const hasSessionCookie=(await context.cookies()).some(cookie=>cookie.name==='JSESSIONID'&&!!cookie.value);
+   check(user+': authenticated session cookie exists',hasSessionCookie);
    const page=await context.newPage();page.on('pageerror',e=>errors.push(e.message));
    // A normal rendered page supplies the session CSRF token without disabling security.
    await page.goto(base+'/apps/zenith/Contacts/CustomerGroups',{waitUntil:'domcontentloaded',timeout:90000});await page.locator('.cust-title').first().waitFor({timeout:60000});
