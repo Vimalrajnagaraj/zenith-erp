@@ -5,6 +5,16 @@
    document so it survives the /qapps + /vapps SPA transclude (which strip inline <script>). */
 (function () {
   if (window.__cpeTabs) return; window.__cpeTabs = 1;
+  // All Contacts: Escape closes the custom New Contact menu and returns focus to its trigger.
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== 'Escape') return;
+    var menu = document.querySelector('.zac-page .cust-newcust.open');
+    if (!menu) return;
+    menu.classList.remove('open');
+    var trigger = menu.querySelector('.cust-nc-trigger');
+    if (trigger) { trigger.setAttribute('aria-expanded', 'false'); trigger.focus(); }
+    e.preventDefault();
+  });
   // Native page-size links retain pageIndex, which can put the new page beyond the last record.
   // Reset only All Contacts page-size navigation; keep the framework's search/filter parameters.
   document.addEventListener('click', function (e) {
