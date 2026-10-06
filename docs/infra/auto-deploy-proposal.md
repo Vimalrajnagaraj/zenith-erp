@@ -126,6 +126,17 @@ PR ──► merge to master  (CI: lint guards + review + secret/customer-data s
   [`../../.github/workflows/staging-acceptance.yml`](../../.github/workflows/staging-acceptance.yml),
   staging stack [`ci/docker-compose.staging.yml`](ci/docker-compose.staging.yml), smoke
   [`ci/smoke.mjs`](ci/smoke.mjs).)*
+  - **Status: implemented & green — 7/7 screens on /apps AND /qapps.** Trigger is
+    `workflow_dispatch` (manual) until the owner opts into `pull_request`/`push` (a billed-minutes
+    call). Three things it took to get there, so nobody re-discovers them:
+    1. **GHCR base is 403** → don't build from scratch; load the sanitized prebuilt release image +
+       overlay the checked-out components.
+    2. **The image lacks the container-only base overrides** `Login.xml`/`Login.ftl`/`qapps.xml`
+       (prod bind-mounts them; `docker commit` doesn't capture mounts) → overlay the snapshots in
+       `ci/base-overrides/`, or stock `/qapps` redirect-loops.
+    3. **Login/data** = Moqui's `demo` load via `java -cp . MoquiStart` (exploded runtime, java at
+       `/opt/java/openjdk/bin/java`) gives `john.doe`/`moqui`; a per-screen **retry** absorbs a
+       transient Moqui session race on the /qapps SPA (`Invalid for read` → `Response is committed`).
 - **Phase 2 — auto-deploy the trivial tier.** docs/CSS/presentation auto-deploy after green staging;
   one-click approve for everything else. This is a comfortable place to sit for a long time.
 - **Phase 3 — widen the auto tiers** as confidence grows; add monitoring-driven auto-rollback.
