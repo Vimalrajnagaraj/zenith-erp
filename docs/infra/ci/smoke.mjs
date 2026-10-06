@@ -99,6 +99,7 @@ try {
   for (const surface of ['apps', 'qapps']) {
     for (const legacy of [false, true]) {
       const label = `${surface} ${legacy ? 'additional-insights' : 'dashboard'} date Apply`;
+      let phase = 'initial render';
       try {
         await page.goto(`${BASE}/${surface}/zenith/Inventory/InventoryDashboard`, { waitUntil: 'networkidle2', timeout: 60000 });
         await page.waitForSelector('.inv-dashboard', { timeout: 15000 });
@@ -114,7 +115,9 @@ try {
           form.querySelector('[name="dashDateTo"]').value = '2026-10-06';
         });
         await page.click(`${selector} button[type="submit"]`);
+        phase = 'date parameters in URL';
         await page.waitForFunction(() => new URL(location.href).searchParams.get('dashDate') === '2026-10-01', { timeout: 15000 });
+        phase = 'selected date range rendered';
         await page.waitForFunction(() => document.querySelector('.inv-date > summary')?.textContent.includes('2026-10-01 to 2026-10-06'), { timeout: 15000 });
         const validLinks = await page.evaluate(surface => {
           const add = document.querySelector('.inv-header a.inv-primary');
@@ -124,7 +127,7 @@ try {
         console.log(`PASS  ${label}`);
       } catch (error) {
         failures++;
-        console.log(`FAIL  ${label} — ${error.message}`);
+        console.log(`FAIL  ${label} (${phase}) — ${error.message}; URL=${page.url()}`);
       }
     }
   }
