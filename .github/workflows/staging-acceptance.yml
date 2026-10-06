@@ -1,0 +1,100 @@
+# Phase-1 of the auto-deploy proposal (docs/infra/auto-deploy-proposal.md): REPORT-ONLY.
+# Builds the app image, boots an ephemeral staging stack, and renders a smoke set of screens on
+# /apps and /qapps. It NEVER touches production and has no prod credentials. A red run means
+# "this change does not boot/render cleanly on a from-scratch build" — surface it, don't deploy.
+#
+# Trigger is workflow_dispatch (manual) ON PURPOSE while this is being tuned, so it can't spam
+# failing required checks. Once it's reliably green, enable the `pull_request` / `push` triggers
+# below to run it on every PR/merge (still report-only).
+name: staging-acceptance
+
+on:
+  workflow_dispatch: {}
+  # Enable these once the job is reliably green (see the proposal, Phase 1 -> Phase 2):
+  # pull_request:
+  #   branches: [master]
+  # push:
+  #   branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:              # one staging run per ref; a newer push cancels an in-flight run
+  group: staging-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  acceptance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Assemble the image build context
+        # Mirrors docs/infra/deploy/Dockerfile's expected context: ./zenith-erp (components),
+        # ./framework-patches, ./zenith-classes, ./MoquiDevConf.xml, ./qz-private-key.pem.
+        # The QZ key is a throwaway (receipt signing is irrelevant to rendering) and never a real
+        # secret. MoquiDevConf is a placeholder — runtime datasource comes from entity_ds_* env.
+        run: |
+          set -euo pipefail
+          CTX="$RUNNER_TEMP/buildctx"
+          mkdir -p "$CTX"
+          cp -a component "$CTX/zenith-erp"
+          cp -a docs/infra/framework-patches "$CTX/framework-patches"
+          cp -a docs/infra/zenith-classes "$CTX/zenith-classes"
+          openssl genrsa -out "$CTX/qz-private-key.pem" 2048
+          printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
+            '<!-- CI staging placeholder; the real datasource is supplied via entity_ds_* env (production conf). -->' \
+            '<moqui-conf/>' > "$CTX/MoquiDevConf.xml"
+          cp docs/infra/deploy/Dockerfile "$CTX/Dockerfile"
+          echo "CTX=$CTX" >> "$GITHUB_ENV"
+
+      - name: Build staging image
+        run: docker build -t zetaerp-moqui:staging -f "$CTX/Dockerfile" "$CTX"
+
+      - name: Boot ephemeral staging stack
+        run: docker compose -f docs/infra/ci/docker-compose.staging.yml up -d
+
+      - name: Load seed data
+        # A fresh DB is empty -> no login. Load Moqui's seed+demo so john.doe/moqui exists.
+        # TODO: confirm the exact war name / load invocation for this image, then make this a hard
+        # gate. Kept non-fatal for now so the first runs surface the right command in the logs.
+        run: |
+          set -x
+          CID=$(docker compose -f docs/infra/ci/docker-compose.staging.yml ps -q moqui)
+          WAR=$(docker exec "$CID" sh -lc 'ls /opt/moqui/*.war 2>/dev/null | head -1')
+          docker exec "$CID" sh -lc "cd /opt/moqui && java -jar ${WAR:-moqui.war} load types=seed,seed-initial,demo no-run-es=true" || \
+            echo "::warning::seed load needs adjusting for this image — see logs"
+
+      - name: Wait for Moqui to be healthy
+        run: |
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -u john.doe:moqui http://localhost:8080/apps/zenith || true)
+            [ "$code" = "200" ] && { echo "up after $i"; exit 0; }
+            sleep 5
+          done
+          echo "::error::Moqui did not become healthy"; exit 1
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Puppeteer
+        run: npm init -y >/dev/null 2>&1 && npm i puppeteer@23 --no-save
+
+      - name: Render smoke (both surfaces)
+        run: node docs/infra/ci/smoke.mjs http://localhost:8080
+
+      # --- follow-up acceptance (Phase 1 -> next increment), see docs/infra/auto-deploy-proposal.md ---
+      # - name: Org-isolation asserts        # tenant A cannot see tenant B (DB ground truth)
+      # - name: MARUTHI-shaped billing smoke  # cash/card/split sale -> bill mints, pricing/tax == baseline
+
+      - name: Dump Moqui logs on failure
+        if: failure()
+        run: docker compose -f docs/infra/ci/docker-compose.staging.yml logs --tail=200 moqui || true
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f docs/infra/ci/docker-compose.staging.yml down -v || true
