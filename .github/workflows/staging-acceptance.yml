@@ -52,6 +52,40 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Classify change risk (report-only, Phase-2 groundwork)
+        # Decide whether this change is 'trivial' (docs/CI/presentation -> would auto-deploy in Phase 2)
+        # or 'sensitive' (app behaviour -> a human one-click approve). REPORT-ONLY: nothing here gates
+        # or deploys. The tier goes to the run's job summary; validating it on real PRs for a while is
+        # the groundwork for Phase 2's risk-tiered gate. Never fails the run.
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "### Change risk tier: N/A (manual dispatch — no PR/push diff)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          set +e
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            files=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/${{ github.event.pull_request.number }}/files" --jq '.[].filename' 2>/dev/null)
+          else
+            files=$(gh api "repos/$GITHUB_REPOSITORY/compare/${{ github.event.before }}...${{ github.sha }}" --jq '.files[].filename' 2>/dev/null)
+          fi
+          out=$(printf '%s\n' "$files" | bash docs/infra/ci/classify-risk.sh 2>/dev/null)
+          tier=$(echo "$out" | sed -n 's/^TIER=//p'); tier=${tier:-sensitive}
+          rationale=$(echo "$out" | sed -n 's/^RATIONALE=//p')
+          icon="🟠"; [ "$tier" = "trivial" ] && icon="🟢"
+          {
+            echo "### $icon Change risk tier: \`$tier\`"
+            echo "${rationale:-could not classify; defaulting to sensitive}"
+            echo ""
+            echo "Changed files:"
+            printf '%s\n' "$files" | sed '/^$/d; s/^/- /'
+            echo ""
+            echo "_Report-only (Phase-2 groundwork): in Phase 2 a \`trivial\` change would auto-deploy after a green staging run; a \`sensitive\` one would require a human one-click approve. Nothing is deployed today._"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "risk tier: $tier"
+
       - name: Validate optional verification inputs
         run: |
           set -euo pipefail
