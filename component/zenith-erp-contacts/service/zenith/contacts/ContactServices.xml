@@ -26,6 +26,22 @@
         </actions>
     </service>
 
+    <!-- Group IDs must be checked independently of member party IDs, including on transition reads. -->
+    <service verb="assert" noun="CustomerGroupAccess">
+        <in-parameters><parameter name="customerGroupId" required="true"/></in-parameters>
+        <out-parameters><parameter name="allowed" type="Boolean"/></out-parameters>
+        <actions>
+            <script><![CDATA[
+                def group = ec.entity.find('zenith.erp.contacts.CustomerGroup')
+                        .condition('customerGroupId', customerGroupId).disableAuthz().one()
+                def activeOrg = ec.user.getPreference('ACTIVE_ORGANIZATION')
+                allowed = group != null && (ec.user.isInGroup('ADMIN') ||
+                        (activeOrg && activeOrg != '_NA_' && group.organizationPartyId == activeOrg))
+                if (!allowed) ec.message.addError("You do not have access to this customer group.")
+            ]]></script>
+        </actions>
+    </service>
+
     <!-- Add a GSTIN to a contact the same way signup/provision does: derive the state code from the first
          two digits (the GST standard), validate the 15-char format, prevent duplicates, and store an
          IndiaGstin record (which is what the contact profile's GSTIN list reads). Org-isolation guarded. -->
@@ -688,6 +704,8 @@
             <parameter name="isActive"/>
         </in-parameters>
         <actions>
+            <service-call name="zenith.contacts.ContactServices.assert#CustomerGroupAccess" in-map="[customerGroupId:customerGroupId]" out-map="_groupAccess"/>
+            <if condition="!_groupAccess.allowed"><return/></if>
             <!-- ZE-CONTACTS-022: same 0-100 discount bound on update. -->
             <script><![CDATA[
                 if (defaultDiscountPercent != null && (defaultDiscountPercent < 0 || defaultDiscountPercent > 100))
@@ -705,6 +723,8 @@
             <parameter name="notes"/>
         </in-parameters>
         <actions>
+            <service-call name="zenith.contacts.ContactServices.assert#CustomerGroupAccess" in-map="[customerGroupId:customerGroupId]" out-map="_groupAccess"/>
+            <if condition="!_groupAccess.allowed"><return/></if>
             <!-- ZE-SB-013 (Tier 1): the customer being added must belong to this org (assert#ContactAccess
                  adds its own error message on denial), so a forged partyId can't leak another tenant's party. -->
             <service-call name="zenith.contacts.ContactServices.assert#ContactAccess" in-map="[partyId:partyId]" out-map="_acc"/>
@@ -731,6 +751,8 @@
             <parameter name="fromDate" type="Timestamp" required="true"/>
         </in-parameters>
         <actions>
+            <service-call name="zenith.contacts.ContactServices.assert#CustomerGroupAccess" in-map="[customerGroupId:customerGroupId]" out-map="_groupAccess"/>
+            <if condition="!_groupAccess.allowed"><return/></if>
             <!-- ZE-SB-013 (Tier 1): only touch a membership for one of THIS org's own customers. -->
             <service-call name="zenith.contacts.ContactServices.assert#ContactAccess" in-map="[partyId:partyId]" out-map="_acc"/>
             <if condition="!_acc.allowed"><return/></if>
@@ -760,6 +782,8 @@
             <parameter name="memberCount" type="Integer"/>
         </out-parameters>
         <actions>
+            <service-call name="zenith.contacts.ContactServices.assert#CustomerGroupAccess" in-map="[customerGroupId:customerGroupId]" out-map="_groupAccess"/>
+            <if condition="!_groupAccess.allowed"><set field="members" from="[]"/><set field="memberCount" value="0"/><return/></if>
             <entity-find entity-name="zenith.erp.contacts.CustomerGroupMemberDetail" list="members">
                 <econdition field-name="customerGroupId"/>
                 <date-filter/>
@@ -785,7 +809,8 @@
         <in-parameters>
             <parameter name="sheetName" default-value="Sheet1"/>
             <parameter name="headers" type="java.util.List" required="true"/>
-            <parameter name="rows" type="java.util.List" required="true"/>
+            <!-- Zero matching rows is a valid export; retain the headers. -->
+            <parameter name="rows" type="java.util.List"/>
         </in-parameters>
         <out-parameters>
             <parameter name="xlsxBase64"/>
@@ -810,7 +835,7 @@
                 // Column widths from content (chars + padding), clamped 10..60.
                 int[] widths = new int[nCols]
                 for (int c = 0; c < nCols; c++) widths[c] = Math.max(10, ((headers[c] == null ? '' : headers[c].toString()).length() + 2))
-                for (row in rows) {
+                for (row in (rows ?: [])) {
                     for (int c = 0; c < nCols; c++) {
                         def cell = (c < row.size()) ? row[c] : ''
                         int len = ((cell == null ? '' : cell.toString()).length()) + 2
@@ -892,7 +917,7 @@
                 sx.append("    </row>\n")
 
                 int rowIndex = 2
-                for (row in rows) {
+                for (row in (rows ?: [])) {
                     sx.append("""    <row r="${rowIndex}">\n""")
                     for (int c = 0; c < nCols; c++) {
                         def cell = (c < row.size()) ? row[c] : ''
@@ -924,7 +949,8 @@
     <service verb="build" noun="ListCsv">
         <in-parameters>
             <parameter name="headers" type="java.util.List" required="true"/>
-            <parameter name="rows" type="java.util.List" required="true"/>
+            <!-- Zero matching rows is a valid export; retain the headers. -->
+            <parameter name="rows" type="java.util.List"/>
         </in-parameters>
         <out-parameters>
             <parameter name="csvText"/>
@@ -943,7 +969,7 @@
                 sb.append((char) 0xFEFF)   // UTF-8 BOM -> Excel detects UTF-8
                 sb.append(headers.collect { esc(it) }.join(','))
                 sb.append('\r\n')
-                for (row in rows) {
+                for (row in (rows ?: [])) {
                     def cells = []
                     for (int c = 0; c < nCols; c++) cells.add(esc((c < row.size()) ? row[c] : ''))
                     sb.append(cells.join(','))

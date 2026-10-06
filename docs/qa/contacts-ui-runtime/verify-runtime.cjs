@@ -201,7 +201,7 @@ async function scopedStyles(page,shell) {
     check('selection/filter/UI pass did not change captured DB records',JSON.stringify(truth())===JSON.stringify(before));
     check('no browser page errors',report.pageErrors.length===0,report.pageErrors);
     if(process.env.CONTACTS_QA_SOURCE_DIR&&(process.env.CONTACTS_QA_RUNTIME_DIR||process.env.CONTACTS_QA_APP_CONTAINER)) {
-      const files=['component/zenith-erp-contacts/screen/zenith/contacts/Contacts/FindContact.xml','component/zenith-erp-contacts/screen/zenith/contacts/Contacts.xml','component/zenith-erp-contacts/screen/zenith/contacts/includes/ContactsModuleLinks.html.ftl','component/zenith-erp-app/screen/zenithstatic/css/zenith-theme-v4.css','component/zenith-erp-app/screen/zenithstatic/js/cpe-tabs.js','component/zenith-erp-app/screen/zenith/ZenithApp.xml'];
+      const files=['component/zenith-erp-contacts/screen/zenith/contacts/Contacts/FindContact.xml','component/zenith-erp-contacts/screen/zenith/contacts/Contacts.xml','component/zenith-erp-contacts/screen/zenith/contacts/includes/ContactsModuleLinks.html.ftl','component/zenith-erp-app/screen/zenithstatic/css/zenith-theme-v4.css','component/zenith-erp-app/screen/zenithstatic/js/cpe-tabs.js','component/zenith-erp-app/screen/zenithstatic/js/qapps-nav.js','component/zenith-erp-app/screen/zenith/ZenithApp.xml'];
       let containerHashes=null;
       if(process.env.CONTACTS_QA_APP_CONTAINER){
         if(u.port!=='8080')throw new Error('Container source parity requires isolated staging HTTP8080');

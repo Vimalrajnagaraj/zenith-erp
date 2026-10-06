@@ -1,27 +1,27 @@
 # All Contacts runtime verification
 
-PR13's original UI was checked on a fresh native Moqui runtime using the supplied framework JAR. The check reproduced one introduced keyboard defect: Enter opened the custom New Contact menu, but Escape left it open. The fix closes only the All Contacts menu, resets `aria-expanded` and returns focus to the trigger. The `cpe-tabs.js` cache version advances to 14.
+The final local integration of PR13's UI with PR14's tenant-safe filters, exports and Contacts header correction was checked on a fresh native Moqui runtime using the supplied framework JAR. The check reproduced one introduced keyboard defect: Enter opened the custom New Contact menu, but Escape left it open. The fix closes only the All Contacts menu, resets `aria-expanded` and returns focus to the trigger. The `cpe-tabs.js` cache version advances to 14.
 
-`evidence/checks.json` records **126 passing checks, zero failures and zero browser page errors** after that fix. Four final screenshots show `/apps` and `/qapps` at 1366 × 900 and 390 × 844. Failed exploratory runs and raw DOM/log dumps are excluded.
+`evidence/checks.json` records **145 passing checks, zero failures and zero browser page errors** after that fix. Four final screenshots show `/apps` and `/qapps` at 1366 × 900 and 390 × 844. Failed exploratory runs and raw DOM/log dumps are excluded.
 
 ## What was proved
 
-- Both renderers at widths 1920, 1366, 1024, 768, 390, 360 and 320: no document/page-control overflow, contained table scrolling, one module menu, compact title and hidden Excel link.
+- Both renderers at widths 1920, 1366, 1024, 768, 390, 360 and 320: no document/page-control overflow, contained table scrolling, one module menu, compact title and hidden Excel link. At 390, 360 and 320 pixels, the full visible header also stays in bounds, its regions do not overlap, and each visible control receives the actual topmost pointer hit. These mobile assertions were enabled for this run.
 - Default 20 rows; changing page size from the last page resets index to zero and preserves search. Disabled and empty-result states render correctly.
 - Select-all checks 20 visible rows; clearing one makes the header indeterminate. Selection sends no contact POST. All captured database records remain unchanged after the full run.
-- The last row's action menu is visible and hit-tested; profile/edit URLs retain the captured contact ID. Enter/Escape and focus restoration work in both shells.
+- The last row's action menu is visible and receives the actual topmost pointer hit; profile/edit URLs retain the captured contact ID. Enter/Escape and focus restoration work in both shells.
 - Browser CSV downloads complete. The nine-column file contains exactly 24 active Tenant A rows (23 profile contacts and the foundation contact), with no disabled or Tenant B row. Downloaded files were removed after parsing.
 - Add Person and Add Company dialogs fit mobile width. The actual escaped apostrophe/ampersand name appears literally in its checkbox's accessible name; long names retain their full title and truncate locally.
 - Removing only All Contacts CSS rules in the browser leaves the separate Customers controls' computed styles unchanged.
-- Six changed-source SHA-256 pairs match the running native overlay.
+- Seven source/runtime SHA-256 pairs match the final combined native overlay, including `qapps-nav.js`, `cpe-tabs.js`, both Contacts parent files, `FindContact.xml`, the theme and `ZenithApp.xml`.
 
-The original PR's broader PostgreSQL create/edit/permission evidence remains relevant; this supplementary pass makes no new persisted contact writes. It does not certify the independent PR14's stronger no-active-org, forged-owner or filtered-export hardening. That needs its own profile and combined-source verification.
+This profile makes no persisted contact writes. PR14's hardened conditions, search skips and export behavior are present in the tested source; security-specific no-active-org, forged-owner and foreign-group assertions belong to the separate Contacts security profile. Both profiles must be run against the final staging source.
 
 ## Runtime provenance and limits
 
-The isolated native run used Java 21.0.12.1, Chrome 147.0.7727.56, H2 2.4.240 and Moqui 4.0.0. Framework MD5 **`df7e767ac4dbefdb4aac35fbccb86192`** matches the supplied production framework. The clean runtime's public assets, local loopback launcher and the known safe CI infrastructure overrides were used; exact PR13 application source plus the keyboard fix was overlaid. HTTP and H2 were bound only to loopback on ports 18081 and 19093, with a 1GB maximum heap and external SMTP/search/signing disabled. No original Docker image, production environment, image history, private key or customer database was loaded.
+The isolated native run used Java 21.0.12.1, Chrome 147.0.7727.56, H2 2.4.240 and Moqui 4.0.0. Framework MD5 **`df7e767ac4dbefdb4aac35fbccb86192`** matches the supplied production framework. The clean runtime's public assets, local loopback launcher and the known safe CI infrastructure overrides were used; the final combined PR13 + PR14 application source and keyboard fix were overlaid. HTTP and H2 were bound only to loopback on ports 18081 and 19093, with a 1GB maximum heap and external SMTP/search/signing disabled. No original Docker image, production environment, image history, private key or customer database was loaded.
 
-This proves exact-framework compatibility and native UI behavior. **Linux/Docker/PostgreSQL acceptance is a separate final gate**: run this profile on the clean pinned staging image before treating the original image/runtime gate as discharged. The existing shared Quasar topbar overlaps on small viewports, as the original PR already documented; this page's controls and document bounds remain contained. The screenshots preserve the shared shell.
+This proves exact-framework compatibility and native UI behavior. **Linux/Docker/PostgreSQL acceptance is a separate final gate**: run this profile on the clean pinned staging image before treating the original image/runtime gate as discharged. The inherited Contacts header correction passed the new small-screen bounds, non-overlap and topmost-pointer checks on both shells. The screenshots show the resulting shared shell.
 
 ## Disposable fixture
 
@@ -47,15 +47,15 @@ Install Playwright and Chromium in a disposable Node workspace, or provide an in
 | `CONTACTS_QA_DB_URL`, `CONTACTS_QA_DB_USER`, `CONTACTS_QA_DB_PASSWORD` | Native H2 TCP19093 connection and disposable local credentials; URL includes `IFEXISTS=TRUE` |
 | `CONTACTS_QA_JAVA` | Java 21 executable; defaults to `java` |
 | `CONTACTS_QA_SOURCE_DIR` | Optional checkout root for source parity with the native runtime or staging app container |
-| `CONTACTS_QA_REQUIRE_MOBILE_HEADER` | Set to `1` after the inherited header correction to require mobile header bounds, non-overlap and hit-test assertions |
+| `CONTACTS_QA_REQUIRE_MOBILE_HEADER` | Set to `1` for final combined-source verification; requires mobile header bounds, non-overlap and topmost-pointer assertions |
 | `CONTACTS_QA_HEADER_BASELINE_FILE` | Optional previous actual checks JSON containing header geometry, for before/after comparisons |
 
 Run `node verify-runtime.cjs`. HTTP is restricted to loopback 8080/18081. Native JDBC is restricted to loopback TCP19093 and requires an existing database. `ContactsDbProbe.java` uses only SELECT statements. PostgreSQL uses `docker exec` and a read-only transaction to query the captured IDs. When app-container/source variables are supplied, one `docker exec sha256sum` call compares the checked-out source with the exact files served by that container. Passwords, session tokens, cookies and raw request bodies are not recorded.
 
-Header geometry is recorded in every new viewport entry. The optional mobile header gate adds checks at 390, 360 and 320 pixels on both shells. It is disabled by default so the original isolated PR13 run can document the known shared-header issue without misrepresenting it as a new page failure; enable it for the final inherited-header verification. A before/after comparison is produced only when an actual earlier report contains matching header geometry. The packaged 126-check report predates these new optional checker enhancements and remains the standalone evidence until the coordinated final run replaces it.
+Header geometry is recorded in every viewport entry. Set `CONTACTS_QA_REQUIRE_MOBILE_HEADER=1` for the final combined-source profile, as done for the packaged 145-check report. It adds 18 checks across 390, 360 and 320 pixels on both shells. Hit testing uses `document.elementFromPoint` and accepts only the real topmost target or its descendant. A before/after comparison is produced only when an actual earlier report contains matching header geometry; no baseline is fabricated. Container/source parity supports the subsequent Linux staging run without requiring personal paths or `NODE_PATH`.
 
 ## Cleanup
 
-The standalone native JVM has been stopped. Its verified fresh fixture database is temporarily retained for the coordinated final PR14 + PR13 integration pass; cleanup is pending that final retest. Final review evidence must replace this status with the resulting cleanup confirmation.
+`evidence/cleanup.json` confirms final cleanup after the 145-check integrated run: the owned JVM stopped, loopback ports 18081/19093 closed, both exact fresh H2 database files and both transaction journals were removed, and no database or journal residue remains. All captured synthetic contacts were purged with that disposable database.
 
 Close browsers and JDBC connections, stop the isolated JVM/stack, and remove the entire fresh database. For Docker staging, tear down its disposable Compose volumes. For native H2, first verify the resolved exact database path belongs to the fresh runtime, then remove only the captured database files. Preserve a small cleanup confirmation without credentials or production data. Source fixtures are reproduction instructions; no live test records should remain.
