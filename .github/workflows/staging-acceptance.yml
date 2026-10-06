@@ -17,6 +17,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: write      # to post/update the sticky PR comment on failure (same-repo PRs)
 
 concurrency:
   group: staging-${{ github.ref }}
@@ -115,11 +116,42 @@ jobs:
         run: npm init -y >/dev/null 2>&1 && npm i puppeteer@23 --no-save
 
       - name: Render smoke (both surfaces)
-        run: node docs/infra/ci/smoke.mjs http://localhost:8080
+        run: |
+          set -o pipefail
+          node docs/infra/ci/smoke.mjs http://localhost:8080 | tee "$RUNNER_TEMP/smoke.txt"
 
       - name: Dump Moqui logs on failure
         if: failure()
         run: docker compose -f "$COMPOSE" logs --tail=200 moqui || true
+
+      - name: PR comment — failed (sticky)
+        if: failure() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          MARKER='<!-- staging-acceptance-sticky -->'
+          FAILS=$(grep -E 'FAIL|SMOKE FAILED' "$RUNNER_TEMP/smoke.txt" 2>/dev/null | sed 's/^/- /' || true)
+          BODY=$(printf '%s\n### ❌ staging-acceptance failed\nThis change does not boot/render cleanly on the ephemeral staging stack.\n\n%s\n\n[View the run](%s) · report-only (not a merge gate on this plan).\n' \
+            "$MARKER" "${FAILS:-See the run for details.}" "$RUN_URL")
+          cid=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --jq ".[] | select(.body | contains(\"$MARKER\")) | .id" | head -1)
+          if [ -n "$cid" ]; then gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$cid" -f body="$BODY" >/dev/null && echo "updated $cid";
+          else gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$PR/comments" -f body="$BODY" >/dev/null && echo created; fi || echo "could not comment (token perms — e.g. a fork PR?)"
+
+      - name: PR comment — passed (clear sticky)
+        if: success() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          MARKER='<!-- staging-acceptance-sticky -->'
+          cid=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --jq ".[] | select(.body | contains(\"$MARKER\")) | .id" | head -1)
+          if [ -n "$cid" ]; then
+            BODY=$(printf '%s\n### ✅ staging-acceptance passed\nRenders cleanly on /apps and /qapps.\n\n[View the run](%s)\n' "$MARKER" "$RUN_URL")
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$cid" -f body="$BODY" >/dev/null && echo "flipped $cid to pass" || echo "could not update"
+          else echo "no sticky comment to clear"; fi
 
       - name: Tear down
         if: always()
