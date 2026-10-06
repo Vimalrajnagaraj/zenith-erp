@@ -69,6 +69,17 @@ try {
       await sleep(3000); // let Vue/Quasar and any img-onload bootstraps paint
       if (path.includes('/Inventory/InventoryDashboard')) {
         await page.waitForSelector('.inv-dashboard', { timeout: 15000 });
+        // Quasar strips template <style> tags: verify the shared stylesheet really
+        // keeps KPI arrows compact, colored, and aligned on both ERP surfaces.
+        const trendStylesOk = await page.evaluate(() =>
+          Array.from(document.querySelectorAll('.inv-trend')).every(trend => {
+            const svg = trend.querySelector('svg');
+            const rect = svg?.getBoundingClientRect();
+            const expected = trend.classList.contains('inv-trend-fall') ? 'rgb(255, 0, 0)' : 'rgb(11, 181, 42)';
+            return rect && rect.width === 14 && rect.height === 14 &&
+              getComputedStyle(svg).color === expected && ['flex', 'inline-flex'].includes(getComputedStyle(trend).display);
+          }));
+        if (!trendStylesOk) throw new Error('KPI trend styling missing or oversized on this ERP surface');
       } else if (path.includes('/Inventory/DashboardDetails')) {
         await page.waitForSelector('.inv-detail-content', { timeout: 15000 });
       }
