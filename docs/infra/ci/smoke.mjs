@@ -104,13 +104,17 @@ try {
         await page.goto(`${BASE}/${surface}/zenith/Inventory/InventoryDashboard`, { waitUntil: 'networkidle2', timeout: 60000 });
         await page.waitForSelector('.inv-dashboard', { timeout: 15000 });
         if (legacy) {
+          phase = 'open additional insights';
           await page.locator('details.inv-additional > summary').click();
+          phase = 'open additional-insights date picker';
           await page.locator('details.zdash-dr > summary').click();
         } else {
           await page.locator('details.inv-date > summary').click();
         }
         const selector = legacy ? 'form.zdash-dr-pop' : '.inv-date form';
+        phase = 'fill From date';
         await page.locator(`${selector} [name="dashDate"]`).fill('2026-10-01');
+        phase = 'fill To date';
         await page.locator(`${selector} [name="dashDateTo"]`).fill('2026-10-06');
         // The additional-insights control is below the fold. Locator clicks
         // wait for stable geometry after scrolling, unlike page.click(), which
@@ -138,6 +142,15 @@ try {
       } catch (error) {
         failures++;
         console.log(`FAIL  ${label} (${phase}) — ${error.message}; URL=${page.url()}`);
+        console.log('Date-control DOM:', await page.evaluate(() => ({
+          additional: document.querySelector('details.inv-additional')?.outerHTML.slice(0, 1200),
+          picker: document.querySelector('details.zdash-dr')?.outerHTML,
+          form: document.querySelector('form.zdash-dr-pop')?.outerHTML,
+          button: (() => { const b = document.querySelector('form.zdash-dr-pop button'); if (!b) return null;
+            const r = b.getBoundingClientRect(); return { rect: {x:r.x,y:r.y,width:r.width,height:r.height},
+              hit:document.elementFromPoint(r.x+r.width/2,r.y+r.height/2)?.outerHTML.slice(0,500),
+              form:b.form?.className }; })()
+        })));
       }
     }
   }
