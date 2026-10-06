@@ -1,0 +1,126 @@
+# Phase-1 of the auto-deploy proposal (docs/infra/auto-deploy-proposal.md): REPORT-ONLY.
+#
+# Boots an ephemeral staging stack from the repo's OWN prebuilt, sanitized app image (the
+# `staging-image-v1` release asset — the upstream GHCR base is 403-blocked), overlays the checked-out
+# component tree (as a prod deploy does), seeds demo data, and renders a smoke set on /apps + /qapps.
+# NEVER touches production and has no prod credentials. Red = this change doesn't boot/render cleanly.
+#
+# workflow_dispatch (manual) ON PURPOSE while being tuned. Enable pull_request/push once green.
+name: staging-acceptance
+
+on:
+  workflow_dispatch: {}
+  # pull_request:
+  #   branches: [master]
+  # push:
+  #   branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: staging-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  IMAGE_RELEASE: staging-image-v1
+  IMAGE_ASSET: zetaerp-moqui-local.tar.gz
+  COMPOSE: docs/infra/ci/docker-compose.staging.yml
+
+jobs:
+  acceptance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download the sanitized staging image
+        run: gh release download "$IMAGE_RELEASE" --repo "$GITHUB_REPOSITORY" --pattern "$IMAGE_ASSET" --dir "$RUNNER_TEMP"
+
+      - name: Load the image
+        run: |
+          set -euo pipefail
+          loaded=$(docker load -i "$RUNNER_TEMP/$IMAGE_ASSET" | sed -n 's/^Loaded image: //p' | head -1)
+          echo "loaded: $loaded"
+          docker tag "$loaded" zetaerp-moqui:staging
+
+      - name: Boot stack
+        run: docker compose -f "$COMPOSE" up -d
+
+      - name: Overlay the checked-out component tree
+        run: |
+          set -euo pipefail
+          CID=$(docker compose -f "$COMPOSE" ps -q moqui)
+          tar czf - component | docker exec -i "$CID" sh -c 'cd /opt/moqui/runtime/component && tar xzf - --strip-components=1'
+
+      - name: Overlay base-component webroot overrides
+        # Login.xml / Login.ftl / qapps.xml are ZetaERP's base-component customizations that prod
+        # bind-mounts at runtime, so `docker commit` never baked them into the image -> the stock
+        # /qapps redirects loop. Copy the committed staging snapshots in so staging == prod.
+        run: |
+          set -euo pipefail
+          CID=$(docker compose -f "$COMPOSE" ps -q moqui)
+          for f in Login.xml Login.ftl qapps.xml; do
+            docker cp "docs/infra/ci/base-overrides/$f" "$CID:/opt/moqui/runtime/base-component/webroot/screen/webroot/$f"
+          done
+
+      - name: Load seed + demo data
+        # Exploded Moqui runtime: java -cp . MoquiStart from /opt/moqui; java at /opt/java/openjdk/bin/java.
+        run: |
+          set -x
+          CID=$(docker compose -f "$COMPOSE" ps -q moqui)
+          docker exec "$CID" sh -lc 'cd /opt/moqui && /opt/java/openjdk/bin/java -cp . MoquiStart load types=seed,seed-initial,demo' \
+            || echo "::warning::seed load reported errors — see logs (loader skips bad files)"
+
+      - name: Restart Moqui (pick up overlaid code + loaded data, fresh caches)
+        run: docker compose -f "$COMPOSE" restart moqui
+
+      - name: Wait for Moqui to respond
+        run: |
+          for i in $(seq 1 48); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/Login/login || true)
+            [ -n "$code" ] && [ "$code" != "000" ] && { echo "responding ($code) after $i"; exit 0; }
+            sleep 5
+          done
+          echo "::error::Moqui never responded"; exit 1
+
+      - name: Diagnose login + data state
+        # Non-fatal, always runs: prints exactly what's in the DB and what the login returns, so the
+        # seed fixtures can be built precisely instead of guessing across runs.
+        if: always()
+        run: |
+          DBID=$(docker compose -f "$COMPOSE" ps -q db)
+          q(){ docker exec "$DBID" psql -U moqui -d moqui -P pager=off -c "$1" 2>&1 || true; }
+          echo "=== john.doe UserAccount ==="; q "SELECT user_id,username,disabled,require_password_change,password_hash_type FROM user_account WHERE username='john.doe';"
+          echo "=== john.doe groups ==="; q "SELECT user_group_id FROM user_group_member WHERE user_id='EX_JOHN_DOE';"
+          echo "=== some organizations ==="; q "SELECT party_id FROM party WHERE party_type_enum_id='PtyOrganization' LIMIT 8;"
+          echo "=== parties owned (owner -> count) ==="; q "SELECT owner_party_id, count(*) FROM party WHERE owner_party_id IS NOT NULL GROUP BY owner_party_id ORDER BY 2 DESC LIMIT 8;"
+          echo "=== john.doe active-org pref ==="; q "SELECT preference_value FROM user_preference WHERE user_id='EX_JOHN_DOE' AND preference_key='ACTIVE_ORGANIZATION';"
+          echo "=== GET /apps/zenith (authed) ==="; curl -s -o /dev/null -w 'code=%{http_code} redirect=%{redirect_url}\n' -u john.doe:moqui http://localhost:8080/apps/zenith || true
+          echo "=== body snippet ==="; curl -s -u john.doe:moqui http://localhost:8080/apps/zenith | tr '\n' ' ' | head -c 700; echo
+
+      - name: Assert login works (gate)
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' -u john.doe:moqui http://localhost:8080/apps/zenith || true)
+          [ "$code" = "200" ] || { echo "::error::login/module access not 200 (got $code) — see diagnostics"; exit 1; }
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Puppeteer
+        run: npm init -y >/dev/null 2>&1 && npm i puppeteer@23 --no-save
+
+      - name: Render smoke (both surfaces)
+        run: node docs/infra/ci/smoke.mjs http://localhost:8080
+
+      - name: Dump Moqui logs on failure
+        if: failure()
+        run: docker compose -f "$COMPOSE" logs --tail=200 moqui || true
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f "$COMPOSE" down -v || true
