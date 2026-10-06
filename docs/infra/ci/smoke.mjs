@@ -104,17 +104,27 @@ try {
         await page.goto(`${BASE}/${surface}/zenith/Inventory/InventoryDashboard`, { waitUntil: 'networkidle2', timeout: 60000 });
         await page.waitForSelector('.inv-dashboard', { timeout: 15000 });
         if (legacy) {
-          await page.click('details.inv-additional > summary');
-          await page.click('details.zdash-dr > summary');
+          await page.locator('details.inv-additional > summary').click();
+          await page.locator('details.zdash-dr > summary').click();
         } else {
-          await page.click('details.inv-date > summary');
+          await page.locator('details.inv-date > summary').click();
         }
         const selector = legacy ? 'form.zdash-dr-pop' : '.inv-date form';
-        await page.$eval(selector, form => {
-          form.querySelector('[name="dashDate"]').value = '2026-10-01';
-          form.querySelector('[name="dashDateTo"]').value = '2026-10-06';
-        });
-        await page.click(`${selector} button[type="submit"]`);
+        await page.locator(`${selector} [name="dashDate"]`).fill('2026-10-01');
+        await page.locator(`${selector} [name="dashDateTo"]`).fill('2026-10-06');
+        // The additional-insights control is below the fold. Locator clicks
+        // wait for stable geometry after scrolling, unlike page.click(), which
+        // can click stale coordinates while the theme's smooth scroll runs.
+        phase = 'date Apply button hit target';
+        const buttonSelector = `${selector} button[type="submit"]`;
+        await page.$eval(buttonSelector, button => button.scrollIntoView({ block: 'center', behavior: 'instant' }));
+        await page.waitForFunction(selector => {
+          const button = document.querySelector(selector);
+          const rect = button.getBoundingClientRect();
+          const hit = document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2);
+          return hit === button || button.contains(hit);
+        }, { timeout: 15000 }, buttonSelector);
+        await page.locator(buttonSelector).click();
         phase = 'date parameters in URL';
         await page.waitForFunction(() => new URL(location.href).searchParams.get('dashDate') === '2026-10-01', { timeout: 15000 });
         phase = 'selected date range rendered';
