@@ -21,6 +21,7 @@ Never point it at production or an existing customer database.
 | Convert a delivery challan | Wrong entity field names and unavailable status transitions caused rollback | Persist the real keys, validate status and link one invoice |
 | Open warranty/commission selectors | Inline entity seed definitions were not loaded by this runtime | Load options and status flows from a normal seed data file |
 | Expired/future warranty or commission | Date or eligibility checks were incomplete | Enforce inclusive warranty boundaries and commission dates/minimum |
+| Converted challan goods controls | Locked writes remained offered, with a misleading permission message | Hide Add/Delete Goods and explain the document status lock |
 | Sales mobile header and detail tables | Toolbar overlap, clipped controls and unreadable conversion action | Wrap controls, reserve measured header height and contain table scrolling |
 
 `before-fix.json` records the original discounted header, invalid persisted lines
