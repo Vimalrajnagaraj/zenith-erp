@@ -137,6 +137,27 @@ PR ──► merge to master  (CI: lint guards + review + secret/customer-data s
     3. **Login/data** = Moqui's `demo` load via `java -cp . MoquiStart` (exploded runtime, java at
        `/opt/java/openjdk/bin/java`) gives `john.doe`/`moqui`; a per-screen **retry** absorbs a
        transient Moqui session race on the /qapps SPA (`Invalid for read` → `Response is committed`).
+  - **Deeper acceptance — org-isolation: implemented & green.** Beyond "does it render", the workflow
+    now seeds two throwaway tenants (`docs/infra/ci/seed/isolation.xml`), makes `john.doe` an internal
+    agent of Tenant A, and asserts the live contacts page shows Tenant A's contact and **not** Tenant
+    B's — real active-org scoping, gated on DB ground truth so a load failure or a stripped pref fails
+    precisely. Four more gotchas surfaced building it (all in the workflow comments):
+    1. **ES is baked into the image** (`ENV elasticsearch_url=http://opensearch:9200`; prod has a real
+       OpenSearch, CI doesn't) → override it **empty** so Moqui skips the cluster and entity
+       index-on-save is a no-op. A cold demo load tolerates the dead host (no DataDocuments yet); a
+       later load does not.
+    2. **`MoquiStart load` with both `types=` and `location=` loads ONLY the location** (suppresses
+       types) → demo never loads, login 302. Keep them separate.
+    3. **Two back-to-back `load` JVMs collide on the Bitronix tx-log** (`btm1.tlog is locked`). Avoid a
+       second JVM: **docker-cp the fixture into a component's `data/` dir** so the single types-based
+       load auto-discovers it (`type="demo"`; zenith-erp-\* load after mantle so FKs to `EX_JOHN_DOE`
+       resolve). Moqui loads each file in **one transaction** — one bad row rolls back the whole file.
+    4. The framework seed creates the `john.doe` **UserAccount but no mantle Party** → create the
+       person party + link it, or the party-based org membership FK-fails.
+  - **Next deeper check (not built):** a **MARUTHI-shaped billing no-op smoke** — a synthetic
+    MARUTHI-shaped tenant (tax-exclusive pricing + GST, POS modes; synthetic values, never prod
+    GSTIN/HSN/prices), a cash/card/split sale that mints a bill, and pricing/tax asserted against a
+    golden baseline. This is what proves "no-op-safe for MARUTHI" without touching MARUTHI's data.
 - **Phase 2 — auto-deploy the trivial tier.** docs/CSS/presentation auto-deploy after green staging;
   one-click approve for everything else. This is a comfortable place to sit for a long time.
 - **Phase 3 — widen the auto tiers** as confidence grows; add monitoring-driven auto-rollback.

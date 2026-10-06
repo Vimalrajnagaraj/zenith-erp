@@ -7,10 +7,15 @@
 // Usage:  node docs/infra/ci/smoke.mjs  [baseUrl]
 // Env:    SMOKE_USER (default john.doe), SMOKE_PASS (default moqui)
 //
-// TODO (Phase 1 → later): beyond "does it render", add the real acceptance checks against seeded
-// fixtures — org-isolation asserts (tenant A can't see B, via DB ground truth) and a MARUTHI-shaped
-// billing no-op smoke (cash/card/split sale → bill mints, pricing/tax == golden baseline). Those
-// need docs/infra/ci/seed/ fixtures and are the next increment.
+// Beyond "does it render", the workflow also runs deeper acceptance checks against seeded fixtures
+// (docs/infra/ci/seed/isolation.xml):
+//   • DONE — org-isolation: as john.doe scoped to CI Tenant A, the contacts page shows Tenant A's
+//     contact and NOT Tenant B's (steps "Assert fixtures loaded" + "Org-isolation assert" in
+//     .github/workflows/staging-acceptance.yml; DB ground truth gates it so a load failure or a
+//     stripped active-org pref fails precisely instead of looking like a leak).
+//   • TODO — a MARUTHI-shaped billing no-op smoke: cash/card/split sale on a synthetic MARUTHI-shaped
+//     tenant → bill mints, pricing/tax == a golden baseline. Needs a MARUTHI-shaped seed and is the
+//     next increment (reuses reference_pos-terminal-puppeteer-harness).
 
 import puppeteer from 'puppeteer';
 
