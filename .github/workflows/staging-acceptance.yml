@@ -74,6 +74,10 @@ jobs:
           CID=$(docker compose -f "$COMPOSE" ps -q moqui)
           docker exec "$CID" sh -lc 'cd /opt/moqui && /opt/java/openjdk/bin/java -cp . MoquiStart load types=seed,seed-initial,demo' \
             || echo "::warning::seed load reported errors — see logs (loader skips bad files)"
+          # CI isolation fixtures (two throwaway tenants + john.doe active-org) — loaded by location.
+          docker cp docs/infra/ci/seed/isolation.xml "$CID:/tmp/isolation.xml"
+          docker exec "$CID" sh -lc 'cd /opt/moqui && /opt/java/openjdk/bin/java -cp . MoquiStart load location=/tmp/isolation.xml' \
+            || echo "::warning::isolation fixture load failed — see logs"
 
       - name: Restart Moqui (pick up overlaid code + loaded data, fresh caches)
         run: docker compose -f "$COMPOSE" restart moqui
@@ -106,6 +110,17 @@ jobs:
         run: |
           code=$(curl -s -o /dev/null -w '%{http_code}' -u john.doe:moqui http://localhost:8080/apps/zenith || true)
           [ "$code" = "200" ] || { echo "::error::login/module access not 200 (got $code) — see diagnostics"; exit 1; }
+
+      - name: Org-isolation assert
+        # As john.doe (active org = CI Tenant A), the contacts list must show Tenant A's contact and
+        # NOT Tenant B's — validates live active-org scoping (catches a gross isolation regression).
+        # TODO once #14 is merged: add the stronger no-org-empty + forged-?ownerPartyId asserts that
+        # #14 fixes (they'd red the current pre-#14 master, so they wait).
+        run: |
+          html=$(curl -s -u john.doe:moqui 'http://localhost:8080/apps/zenith/Contacts/FindContact')
+          echo "$html" | grep -q 'CITestOnlyInTenantA' || { echo "::error::isolation: Tenant A's own contact is missing (active-org scoping broken, or the pref was stripped)"; exit 1; }
+          if echo "$html" | grep -q 'CITestOnlyInTenantB'; then echo "::error::ISOLATION LEAK — Tenant B's contact is visible to Tenant A"; exit 1; fi
+          echo "OK — org-isolation holds: Tenant A sees its own contact, not Tenant B's"
 
       - name: Set up Node
         uses: actions/setup-node@v4
