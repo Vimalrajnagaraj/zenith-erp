@@ -8,149 +8,19 @@
     <transition name="findInvoice"><default-response url="../FindPurchaseInvoice"/></transition>
     
     <transition name="updateInvoice">
-        <actions>
-            <!-- ZE-PUR-IDOR: block editing another tenant's vendor bill via a forged POST -->
-            <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" in-map="[entityName:'mantle.account.invoice.Invoice', idField:'invoiceId', idValue:invoiceId, orgField:'toPartyId']" out-map="_acc"/>
-            <if condition="!_acc.allowed"><return error="true" message="You do not have access to this record."/></if>
-            <service-call name="update#mantle.account.invoice.Invoice" in-map="context"/>
-        </actions>
-        <default-response url="."/>
+        <actions><script><![CDATA[
+            def patch=ec.web.parameters.findAll { k,v -> k in ['vendorInvoiceNumber','supplierGstin','isReverseCharge','itcEligible','dueDate','statusId'] }
+            ec.service.sync().name('zenith.purchase.PurchaseInvoiceServices.update#VendorBill').parameters([invoiceId:invoiceId,updates:patch]).call()
+        ]]></script></actions><default-response url="."/><error-response url="."/>
     </transition>
-
-    <transition name="addItem">
-        <actions>
-        <!-- ZE-SB-013 (Tier 2): the line-item product must belong to this org. -->
-        <if condition="ec.web.parameters.productId">
-            <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" out-map="_pa"
-                          in-map="[entityName:'mantle.product.Product', idField:'productId', idValue:ec.web.parameters.productId, orgField:'ownerPartyId']"/>
-            <if condition="!_pa.allowed"><return error="true" message="Please select a valid product from your account."/></if>
-        </if>
-        <!-- ZE-PUR-IDOR: block adding a line to another tenant's vendor bill -->
-        <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" in-map="[entityName:'mantle.account.invoice.Invoice', idField:'invoiceId', idValue:invoiceId, orgField:'toPartyId']" out-map="_acc"/>
-        <if condition="!_acc.allowed"><return error="true" message="You do not have access to this record."/></if>
-        <script>
-            if (!hsnSacCode) {
-                ec.message.addError("HSN/SAC Code is strictly required under Indian GST Law.")
-                return
-            }
-        
-            // Get state codes
-            def invoice = ec.entity.find("mantle.account.invoice.Invoice").condition("invoiceId", invoiceId).one()
-            
-            // Resolve each party's postal-address state via PostalAddress (PartyContactMechInfo has no
-            // stateProvinceGeoId field). Used to pick intra-state CGST/SGST vs inter-state IGST.
-            def vendorPcm = ec.entity.find("mantle.party.contact.PartyContactMechInfo")
-                                .condition("partyId", invoice.fromPartyId)
-                                .condition("contactMechTypeEnumId", "CmtPostalAddress").list().first()
-            def buyerPcm = ec.entity.find("mantle.party.contact.PartyContactMechInfo")
-                                .condition("partyId", invoice.toPartyId)
-                                .condition("contactMechTypeEnumId", "CmtPostalAddress").list().first()
-            def vendorState = vendorPcm ? ec.entity.find("mantle.party.contact.PostalAddress").condition("contactMechId", vendorPcm.contactMechId).one()?.stateProvinceGeoId : null
-            def buyerState = buyerPcm ? ec.entity.find("mantle.party.contact.PostalAddress").condition("contactMechId", buyerPcm.contactMechId).one()?.stateProvinceGeoId : null
-
-            def isInterstate = true
-            if (vendorState &amp;&amp; buyerState &amp;&amp; vendorState == buyerState) {
-                isInterstate = false
-            }
-
-            def qty = new BigDecimal(quantity ?: 0)
-            def price = new BigDecimal(amount ?: 0)
-            def lineGross = qty.multiply(price)
-            // Per-line trade discount (0-100%), applied BEFORE GST so it reduces the taxable value —
-            // the standard Indian GST treatment for a discount shown on the invoice. Optional: a blank
-            // or 0 discount leaves taxableVal = qty x price exactly as before (no-op for existing bills).
-            def discPct = new BigDecimal(discountPercent ?: 0)
-            if (discPct &lt; 0 || discPct &gt; 100) {
-                ec.message.addError("Discount % must be between 0 and 100.")
-                return
-            }
-            def discAmt = lineGross.multiply(discPct).divide(new BigDecimal(100), 2, java.math.RoundingMode.HALF_UP)
-            def taxableVal = lineGross.subtract(discAmt)
-            def taxPct = new BigDecimal(taxPercentage ?: 0)
-
-            def igstRate = 0.0
-            def cgstRate = 0.0
-            def sgstRate = 0.0
-            def igstAmount = 0.0
-            def cgstAmount = 0.0
-            def sgstAmount = 0.0
-
-            if (taxPct > 0) {
-                if (isInterstate) {
-                    igstRate = taxPct
-                    igstAmount = taxableVal.multiply(taxPct).divide(new BigDecimal(100), 2, java.math.RoundingMode.HALF_UP)
-                } else {
-                    cgstRate = taxPct.divide(new BigDecimal(2), 2, java.math.RoundingMode.HALF_UP)
-                    sgstRate = cgstRate
-                    cgstAmount = taxableVal.multiply(cgstRate).divide(new BigDecimal(100), 2, java.math.RoundingMode.HALF_UP)
-                    sgstAmount = cgstAmount
-                }
-            }
-
-            def inMap = context + [
-                itemTypeEnumId: 'ItemInventory',
-                discountPercent: discPct, discountAmount: discAmt,
-                taxableAmount: taxableVal,
-                igstRate: igstRate, igstAmount: igstAmount,
-                cgstRate: cgstRate, cgstAmount: cgstAmount,
-                sgstRate: sgstRate, sgstAmount: sgstAmount
-            ]
-            ec.service.sync().name("create#mantle.account.invoice.InvoiceItem").parameters(inMap).call()
-            // (Invoice totals are set by the aggregation script below — no mantle calculate#InvoiceTotal here.)
-        </script>
-        
-        <!-- Custom script to aggregate Indian GST values -->
-        <script>
-            def invItems = ec.entity.find("mantle.account.invoice.InvoiceItem").condition("invoiceId", invoiceId).list()
-            def tCgst = 0.0, tSgst = 0.0, tIgst = 0.0, tTaxable = 0.0
-            for (def it : invItems) {
-                tCgst += (it.cgstAmount ?: 0.0)
-                tSgst += (it.sgstAmount ?: 0.0)
-                tIgst += (it.igstAmount ?: 0.0)
-                tTaxable += (it.taxableAmount ?: ((it.quantity?:1)*(it.amount?:0)))
-            }
-            ec.service.sync().name("update#mantle.account.invoice.Invoice").parameters([
-                invoiceId: invoiceId,
-                totalCgst: tCgst, totalSgst: tSgst, totalIgst: tIgst, totalTaxableAmount: tTaxable,
-                invoiceTotal: tTaxable
-            ]).call()
-        </script>
-        </actions>
-
-        <default-response url="."/>
-    </transition>
-
-    <transition name="deleteItem">
-        <actions>
-        <!-- ZE-PUR-IDOR: block removing a line from another tenant's vendor bill -->
-        <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" in-map="[entityName:'mantle.account.invoice.Invoice', idField:'invoiceId', idValue:invoiceId, orgField:'toPartyId']" out-map="_acc"/>
-        <if condition="!_acc.allowed"><return error="true" message="You do not have access to this record."/></if>
-        <service-call name="delete#mantle.account.invoice.InvoiceItem" in-map="context"/>
-        <script>
-            // Re-aggregate GST + totals after the delete.
-            def invItems = ec.entity.find("mantle.account.invoice.InvoiceItem").condition("invoiceId", invoiceId).list()
-            def tCgst = 0.0, tSgst = 0.0, tIgst = 0.0, tTaxable = 0.0
-            for (def it : invItems) {
-                tCgst += (it.cgstAmount ?: 0.0)
-                tSgst += (it.sgstAmount ?: 0.0)
-                tIgst += (it.igstAmount ?: 0.0)
-                tTaxable += (it.taxableAmount ?: ((it.quantity?:1)*(it.amount?:0)))
-            }
-            ec.service.sync().name("update#mantle.account.invoice.Invoice").parameters([
-                invoiceId: invoiceId,
-                totalCgst: tCgst, totalSgst: tSgst, totalIgst: tIgst, totalTaxableAmount: tTaxable,
-                invoiceTotal: tTaxable
-            ]).call()
-        </script>
-        </actions>
-        <default-response url="."/>
-    </transition>
+    <transition name="addItem"><service-call name="zenith.purchase.PurchaseInvoiceServices.add#VendorBillLine"/><default-response url="."/><error-response url="."/></transition>
+    <transition name="deleteItem"><service-call name="zenith.purchase.PurchaseInvoiceServices.delete#VendorBillLine"/><default-response url="."/><error-response url="."/></transition>
 
     <actions>
         <!-- ZE-PUR-IDOR: explicit cross-tenant render guard — only the owning org (super-admins exempt) may open
              this vendor bill. Load NOTHING when blocked; widgets show a plain no-access panel instead of
-             another tenant's invoice/vendor/GST data. RENDER guard only (transitions untouched). -->
-        <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" in-map="[entityName:'mantle.account.invoice.Invoice', idField:'invoiceId', idValue:invoiceId, orgField:'toPartyId']" out-map="_acc"/>
+             another tenant's invoice/vendor/GST data. The same stored-record guard protects the typed write paths. -->
+        <service-call name="zenith.purchase.PurchaseInvoiceServices.assert#VendorBillAccess" in-map="[invoiceId:invoiceId,errorOnDenied:false]" out-map="_acc"/>
         <set field="noAccess" from="!_acc.allowed"/>
         <if condition="_acc.allowed">
         <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="invoice"/>
@@ -170,15 +40,29 @@
         <entity-find-one entity-name="zenith.erp.india.IndiaPartyTaxProfile" value-field="taxProfile">
             <field-map field-name="partyId" from="invoice?.fromPartyId"/>
         </entity-find-one>
+        <set field="billEditable" from="invoice.statusId in ['InvoiceIncoming','InvoiceInProcess','InvoiceReceived']"/>
+        <script><![CDATA[
+            def statusFlow=invoice.statusId=='InvoiceInProcess' ? 'Default' : 'InvoicePayable'
+            billStatusOptions=[[statusId:invoice.statusId,description:invoice.statusId.replace('Invoice','')]]
+            if(billEditable) ec.entity.find('moqui.basic.StatusFlowTransition').condition('statusFlowId',statusFlow).condition('statusId',invoice.statusId).list().each { transition ->
+                if(transition.toStatusId in ['InvoiceReceived','InvoiceApproved','InvoiceCancelled'] &&
+                    (!transition.userPermissionId || ec.user.hasPermission(transition.userPermissionId))) {
+                    def status=ec.entity.find('moqui.basic.StatusItem').condition('statusId',transition.toStatusId).one()
+                    billStatusOptions.add([statusId:transition.toStatusId,description:status?.description ?: transition.toStatusId.replace('Invoice','')])
+                }
+            }
+        ]]></script>
+        <set field="currSymbol" from="invoice.currencyUomId == 'INR' ? '₹ ' : invoice.currencyUomId + ' '"/>
+        <set field="payableAmount" from="(invoice.invoiceTotal ?: 0)+(invoice.roundOffAmount ?: 0)-(invoice.appliedPaymentsTotal ?: 0)"/>
         <set field="isMsme" from="taxProfile?.isMsme == 'Y'"/>
-        <set field="msmeDebugText" from="'Now: ' + ec.user.nowTimestamp.time + ' InvDate: ' + invoice?.invoiceDate?.time + ' Diff: ' + (invoice?.invoiceDate ? (ec.user.nowTimestamp.time - invoice.invoiceDate.time) : 'N/A')"/>
-        <set field="isOverdueMsme" from="false"/>
+        <!-- Use the saved due date and payable balance; do not invent a statutory deadline or tax outcome. -->
+        <set field="isOverdueMsme" from="isMsme &amp;&amp; invoice.dueDate != null &amp;&amp; invoice.dueDate.before(ec.user.nowTimestamp) &amp;&amp; payableAmount &gt; 0 &amp;&amp; invoice.statusId != 'InvoiceCancelled'"/>
 
         <set field="statusColorMap" from="[
-            'InvoiceIn-Process': 'grey',
+            'InvoiceInProcess': 'grey', 'InvoiceIncoming': 'grey',
             'InvoiceApproved': 'primary',
             'InvoiceReceived': 'warning',
-            'InvoicePaid': 'success',
+            'InvoicePmtSent': 'success',
             'InvoiceCancelled': 'danger'
         ]"/>
         <set field="statusColor" from="statusColorMap[invoice?.statusId] ?: 'dark'"/>
@@ -187,6 +71,7 @@
     </actions>
 
     <widgets>
+        <container style="zvbill-page">
         <link url="findInvoice" text="Back to Vendor Bills" link-type="anchor"/>
 
         <!-- ZE-PUR-IDOR: cross-tenant / missing invoice — plain notice, never another org's bill data -->
@@ -203,21 +88,24 @@
         <section name="TheRecord">
         <condition><expression>!noAccess</expression></condition>
         <widgets>
-        <container style="bg-negative text-white q-pa-md border-radius-md q-mb-lg" condition="isOverdueMsme">
-            <label text="⚠ MSME PAYMENT OVERDUE! (Sec 43B(h) Violation Risk)" type="h5" style="text-weight-bold q-my-none text-white"/>
-            <label text="This vendor is registered as an MSME${taxProfile?.udyamRegistrationNumber ? ' (Udyam: ' + taxProfile.udyamRegistrationNumber + ')' : ''}. The payment has crossed the 45-day statutory limit. This expense will be disallowed in the Income Tax Audit if not paid before March 31st." type="p" style="q-my-none q-mt-sm text-white"/>
+        <section name="VendorMsmeOverdue"><condition><expression>isOverdueMsme</expression></condition><widgets>
+        <container style="bg-negative text-white q-pa-md border-radius-md q-mb-lg">
+            <label text="MSME payment overdue" type="h5" style="text-weight-bold q-my-none text-white"/>
+            <label text="This vendor is marked as an MSME. The bill's saved payment due date has passed and an outstanding balance remains." type="p" style="q-my-none q-mt-sm text-white"/>
         </container>
 
+        </widgets></section>
         <!-- Profile Banner -->
         <container style="zenith-profile-banner q-pa-lg bg-white shadow-1 border-radius-lg q-mb-lg">
             <container style="row items-center justify-between no-wrap">
-                <container style="row items-center">
-                    <container style="zenith-avatar q-mr-lg text-white; border-radius:12px; background:linear-gradient(135deg, #7C3AED, #463D7A);">
+                <container style="row items-center vbill-identity">
+                    <container style="zenith-avatar q-mr-lg text-white">
                         <label text="BILL" type="span" style="font-weight:bold; font-size:1.2rem;"/>
                     </container>
                     <container style="column">
                         <label text="Vendor Bill: ${invoice?.vendorInvoiceNumber ?: invoiceId}" type="h3" style="text-primary text-weight-bold q-my-none"/>
-                        <label text="Total: ₹ ${zinr.inr(ec.l10n.format(invoice?.invoiceTotal ?: 0, '#,##,##0.00'))} - Date: ${invoice?.invoiceDate ? ec.l10n.format(invoice.invoiceDate, 'dd MMM yyyy') : 'N/A'}" type="p" style="text-grey-7 text-subtitle2 q-mt-xs q-mb-none"/>
+                        <label text="Total: ${currSymbol}${zinr.inr(ec.l10n.format((invoice?.invoiceTotal ?: 0)+(invoice?.roundOffAmount ?: 0), '#,##,##0.00'))} - Date: ${invoice?.invoiceDate ? ec.l10n.format(invoice.invoiceDate, 'dd MMM yyyy') : 'N/A'}" type="p" style="text-grey-7 text-subtitle2 q-mt-xs q-mb-none"/>
+                        <label text="Outstanding: ${currSymbol}${zinr.inr(ec.l10n.format(payableAmount, '#,##0.00'))}" type="p" style="text-grey-7 q-my-none"/>
                     </container>
                 </container>
                 
@@ -226,14 +114,10 @@
                         <field name="invoiceId"><default-field><hidden/></default-field></field>
                         <field name="statusId"><default-field title="">
                             <drop-down current="selected">
-                                <option key="InvoiceIn-Process" text="In Process"/>
-                                <option key="InvoiceApproved" text="Approved"/>
-                                <option key="InvoiceReceived" text="Received"/>
-                                <option key="InvoicePaid" text="Paid"/>
-                                <option key="InvoiceCancelled" text="Cancelled"/>
+                                <list-options list="billStatusOptions" key="${statusId}" text="${description}"/>
                             </drop-down>
                         </default-field></field>
-                        <field name="submitButton"><conditional-field name="save_write" condition="modCanWrite" title="Update Status"><submit/></conditional-field><default-field title="Update Status"><label text="You have view-only access — changes are disabled." type="span" style="text-grey-7"/></default-field></field>
+                        <field name="submitButton"><conditional-field name="save_write" condition="modCanWrite &amp;&amp; billEditable" title="Update Status"><submit/></conditional-field><default-field title="Update Status"><label text="${billEditable ? 'You have view-only access — changes are disabled.' : 'This bill is closed for editing.'}" type="span" style="text-grey-7"/></default-field></field>
                         <field-layout><field-row><field-ref name="statusId"/><field-ref name="submitButton"/></field-row></field-layout>
                     </form-single>
                 </container>
@@ -274,23 +158,24 @@
                         </field>
                         
                         <field name="dueDate">
-                            <default-field title="Payment Due Date (Max 45 Days for MSME)"><date-time type="date"/></default-field>
+                            <default-field title="Payment Due Date"><date-time type="date"/></default-field>
                         </field>
                         
-                        <field name="submitButton"><conditional-field name="save_write" condition="modCanWrite" title="Save Details"><submit/></conditional-field><default-field title="Save Details"><label text="You have view-only access — changes are disabled." type="span" style="text-grey-7"/></default-field></field>
+                        <field name="submitButton"><conditional-field name="save_write" condition="modCanWrite &amp;&amp; billEditable" title="Save Details"><submit/></conditional-field><default-field title="Save Details"><label text="${billEditable ? 'You have view-only access — changes are disabled.' : 'This bill is closed for editing.'}" type="span" style="text-grey-7"/></default-field></field>
                     </form-single>
                 </container>
             </row-col>
             
             <row-col lg="6">
                 <!-- ITC Dashboard -->
-                <container style="zenith-card q-pa-md bg-indigo-9 text-white shadow-1 border-radius-md q-mb-md">
-                    <label text="Input Tax Credit (ITC) Summary" type="h5" style="text-white text-weight-bold q-mb-md border-bottom q-pb-sm"/>
+                <container style="zenith-card vbill-itc-summary q-pa-md bg-indigo-9 text-white shadow-1 border-radius-md q-mb-md">
+                    <label text="Tax &amp; ITC Summary" type="h5" style="text-white text-weight-bold q-mb-md border-bottom q-pb-sm"/>
                     <container style="row q-col-gutter-md text-center">
                         <container style="col-3"><label text="Taxable Base" type="strong" style="text-indigo-2 block"/><label text="${currSymbol}${zinr.inr(ec.l10n.format(invoice.totalTaxableAmount ?: 0, '#,##0.00'))}" type="p" style="q-my-none"/></container>
-                        <container style="col-3"><label text="IGST Paid" type="strong" style="text-indigo-2 block"/><label text="${currSymbol}${zinr.inr(ec.l10n.format(invoice.totalIgst ?: 0, '#,##0.00'))}" type="p" style="q-my-none ${itcColor}"/></container>
-                        <container style="col-3"><label text="CGST Paid" type="strong" style="text-indigo-2 block"/><label text="${currSymbol}${zinr.inr(ec.l10n.format(invoice.totalCgst ?: 0, '#,##0.00'))}" type="p" style="q-my-none ${itcColor}"/></container>
-                        <container style="col-3"><label text="SGST Paid" type="strong" style="text-indigo-2 block"/><label text="${currSymbol}${zinr.inr(ec.l10n.format(invoice.totalSgst ?: 0, '#,##0.00'))}" type="p" style="q-my-none ${itcColor}"/></container>
+                        <container style="col-3"><label text="IGST Charged" type="strong" style="text-indigo-2 block"/><label text="${currSymbol}${zinr.inr(ec.l10n.format(invoice.totalIgst ?: 0, '#,##0.00'))}" type="p" style="q-my-none ${itcColor}"/></container>
+                        <container style="col-3"><label text="CGST Charged" type="strong" style="text-indigo-2 block"/><label text="${currSymbol}${zinr.inr(ec.l10n.format(invoice.totalCgst ?: 0, '#,##0.00'))}" type="p" style="q-my-none ${itcColor}"/></container>
+                        <container style="col-3"><label text="Cess Charged" type="strong" style="text-indigo-2 block"/><label text="${currSymbol}${zinr.inr(ec.l10n.format(invoice.totalCess ?: 0, '#,##0.00'))}" type="p" style="q-my-none ${itcColor}"/></container>
+                        <container style="col-3"><label text="SGST Charged" type="strong" style="text-indigo-2 block"/><label text="${currSymbol}${zinr.inr(ec.l10n.format(invoice.totalSgst ?: 0, '#,##0.00'))}" type="p" style="q-my-none ${itcColor}"/></container>
                     </container>
                 </container>
                 
@@ -299,8 +184,8 @@
                     <label text="GSTR-2B Reconciliation Status" type="h5" style="text-primary text-weight-bold q-mb-md border-bottom q-pb-sm"/>
                     <container style="row items-center justify-between">
                         <label text="${invoice.gstr2bMatchStatus ?: 'Unmatched'}" type="h4" style="text-weight-bold ${invoice.gstr2bMatchStatus == 'Matched' ? 'text-success' : 'text-warning'} q-my-none"/>
-                        <label text="Verified against Government Portal." type="p" style="text-grey-7 q-my-none" condition="invoice.gstr2bMatchStatus == 'Matched'"/>
-                        <label text="Pending portal sync." type="p" style="text-grey-7 q-my-none" condition="invoice.gstr2bMatchStatus != 'Matched'"/>
+                        <label text="Matched reconciliation data." type="p" style="text-grey-7 q-my-none" condition="invoice.gstr2bMatchStatus == 'Matched'"/>
+                        <label text="No matched reconciliation data." type="p" style="text-grey-7 q-my-none" condition="invoice.gstr2bMatchStatus != 'Matched'"/>
                     </container>
                 </container>
             </row-col>
@@ -311,7 +196,7 @@
             <container style="row justify-between items-center q-mb-md border-bottom q-pb-sm">
                 <label text="Bill Items (Expenses/Assets)" type="h5" style="text-primary text-weight-bold q-my-none"/>
                 
-                <section name="VBillAddItem_write"><condition><expression>modCanWrite</expression></condition><widgets>
+                <section name="VBillAddItem_write"><condition><expression>modCanWrite &amp;&amp; billEditable</expression></condition><widgets>
                 <container-dialog id="AddItemDialog" button-text="Add Item" button-class="q-btn--flat bg-primary text-white border-radius-md">
                     <form-single name="AddItemForm" transition="addItem">
                         <field name="invoiceId"><default-field><hidden/></default-field></field>
@@ -319,7 +204,7 @@
                         <field name="productId"><default-field title="Product">
                             <drop-down allow-empty="true">
                                 <entity-options key="${productId}" text="${pseudoId} - ${productName}">
-                                    <entity-find entity-name="mantle.product.Product"><econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/><order-by field-name="productName"/></entity-find>
+                                    <entity-find entity-name="mantle.product.Product"><econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION') ?: '__NO_ORGANIZATION__'"/><order-by field-name="productName"/></entity-find>
                                 </entity-options>
                             </drop-down>
                         </default-field></field>
@@ -378,18 +263,19 @@
 
                 <!-- GST Breakdown -->
                 <field name="gstBreakdown"><default-field title="Tax Paid">
-                    <label text="${igstRate ? ('IGST: ' + igstRate + '% (₹' + igstAmount + ')') : ''}" type="span" style="block text-grey-8 text-caption"/>
-                    <label text="${cgstRate ? ('CGST: ' + cgstRate + '% (₹' + cgstAmount + ')') : ''}" type="span" style="block text-grey-8 text-caption"/>
-                    <label text="${sgstRate ? ('SGST: ' + sgstRate + '% (₹' + sgstAmount + ')') : ''}" type="span" style="block text-grey-8 text-caption"/>
-                    <label text="${!igstRate &amp;&amp; !cgstRate ? '-' : ''}" type="span" style="block text-grey-8 text-caption"/>
+                    <label text="${igstRate ? ('IGST: ' + igstRate + '% (' + currSymbol + igstAmount + ')') : ''}" type="span" style="block text-grey-8 text-caption"/>
+                    <label text="${cgstRate ? ('CGST: ' + cgstRate + '% (' + currSymbol + cgstAmount + ')') : ''}" type="span" style="block text-grey-8 text-caption"/>
+                    <label text="${sgstRate ? ('SGST: ' + sgstRate + '% (' + currSymbol + sgstAmount + ')') : ''}" type="span" style="block text-grey-8 text-caption"/>
+                    <label text="${cessRate ? ('CESS: ' + cessRate + '% (' + currSymbol + cessAmount + ')') : ''}" type="span" style="block text-grey-8 text-caption"/>
+                    <label text="${!igstRate &amp;&amp; !cgstRate &amp;&amp; !cessRate ? '-' : ''}" type="span" style="block text-grey-8 text-caption"/>
                 </default-field></field>
 
                 <field name="total"><default-field title="Total (Inc Tax)">
-                    <label text="${currSymbol}${zinr.inr(ec.l10n.format((taxableAmount ?: ((quantity ?: 0) * (amount ?: 0))) + (igstAmount ?: 0) + (cgstAmount ?: 0) + (sgstAmount ?: 0), '#,##,##0.00'))}" type="span" style="text-weight-bold text-dark"/>
+                    <label text="${currSymbol}${zinr.inr(ec.l10n.format((taxableAmount != null ? taxableAmount : ((quantity ?: 0) * (amount ?: 0))) + (igstAmount ?: 0) + (cgstAmount ?: 0) + (sgstAmount ?: 0) + (cessAmount ?: 0), '#,##,##0.00'))}" type="span" style="text-weight-bold text-dark"/>
                 </default-field></field>
                 
                 <field name="deleteItem">
-                    <conditional-field name="del_write" condition="modCanWrite" title=" ">
+                    <conditional-field name="del_write" condition="modCanWrite &amp;&amp; billEditable" title=" ">
                         <link url="deleteItem" parameter-map="[invoiceId:invoiceId, invoiceItemSeqId:invoiceItemSeqId]" icon="fa fa-trash" style="text-danger" confirmation="Remove item?"/>
                     </conditional-field>
                     <default-field title=" "><label text="" type="span"/></default-field>
@@ -399,5 +285,6 @@
         </widgets>
         </section>
 
+        </container>
     </widgets>
 </screen>

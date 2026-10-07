@@ -37,23 +37,46 @@
             <parameter name="billOfEntryNumber"/>
             <parameter name="billOfEntryDate" type="Date"/>
             <parameter name="portOfImport"/>
+            <parameter name="purchaseOrderNumber"/><parameter name="isReverseCharge" default-value="N"/>
+            <parameter name="isCompositionDealer" default-value="N"/><parameter name="itcEligible" default-value="Y"/>
         </in-parameters>
         <out-parameters>
             <parameter name="invoiceId"/>
         </out-parameters>
         <actions>
-            <!-- ZE-SB-013 (Tier 1): the vendor this bill records a purchase from must belong to the caller's org. -->
-            <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" out-map="_ca"
-                          in-map="[entityName:'mantle.party.Party', idField:'partyId', idValue:vendorPartyId, orgField:'ownerPartyId']"/>
-            <if condition="!_ca.allowed"><return error="true" message="Please select a valid vendor from your account."/></if>
-            <!-- Get company currency -->
-            <entity-find-one entity-name="zenith.erp.base.CompanySettings" value-field="currSetting">
-                <field-map field-name="organizationPartyId"/>
-                <field-map field-name="settingKey" value="CURRENCY_UOM_ID"/>
-            </entity-find-one>
-            <if condition="!currencyUomId">
-                <set field="currencyUomId" from="currSetting?.settingValue ?: 'USD'"/>
-            </if>
+            <script><![CDATA[
+                def active=ec.user.getPreference('ACTIVE_ORGANIZATION')
+                def vendor=ec.entity.find('mantle.party.Party').condition('partyId',vendorPartyId).disableAuthz().one()
+                if(!active || active=='_NA_' || organizationPartyId!=active || !vendor || vendor.ownerPartyId!=active) {
+                    ec.message.addError('Choose a vendor from your active buying organization.');return
+                }
+                ec.service.sync().name('zenith.tax.TaxAccessServices.assert#Organization').parameters([organizationPartyId:active]).call()
+                if(ec.message.hasError()) return
+                if(!ec.entity.find('mantle.party.PartyRole').condition('partyId',vendorPartyId).condition('roleTypeId','Supplier').count()) {
+                    ec.message.addError('Choose a registered supplier for this bill.');return
+                }
+                def settings=ec.entity.find('zenith.erp.base.CompanySettings').condition('organizationPartyId',active).condition('settingKey','CURRENCY_UOM_ID').one()
+                currencyUomId=currencyUomId ?: settings?.settingValue
+                def currency=currencyUomId ? ec.entity.find('moqui.basic.Uom').condition('uomId',currencyUomId).one() : null
+                if(currency?.uomTypeEnumId!='UT_CURRENCY_MEASURE') {ec.message.addError('Choose a valid configured bill currency.');return}
+                if(![isImportPurchase,isReverseCharge,isCompositionDealer,itcEligible].every { it in ['Y','N'] } || (isReverseCharge=='Y' && isCompositionDealer=='Y')) {
+                    ec.message.addError('Choose valid import, supply and ITC settings.');return
+                }
+                if(isCompositionDealer=='Y') itcEligible='N'
+                if(purchaseOrderNumber) {
+                    def order=ec.entity.find('mantle.order.OrderHeader').condition('orderId',purchaseOrderNumber).disableAuthz().one()
+                    def parts=ec.entity.find('mantle.order.OrderPart').condition('orderId',purchaseOrderNumber).disableAuthz().list()
+                    if(!order || order.documentType!='PURCHASE_ORDER' || !(order.statusId in ['OrderApproved','OrderCompleted']) || !parts ||
+                        parts.any { it.customerPartyId!=active } || !parts.any { it.vendorPartyId==vendorPartyId } || order.currencyUomId!=currencyUomId) {
+                        ec.message.addError('Choose an approved purchase order for this organization, vendor and currency.');return
+                    }
+                }
+            ]]></script>
+            <if condition="ec.message.hasError()"><return/></if>
+
+            <service-call name="zenith.purchase.PurchaseInvoiceServices.get#BuyerCompositionScheme"
+                          in-map="[organizationPartyId:organizationPartyId]" out-map="buyerScheme"/>
+            <if condition="buyerScheme.isCompositionBuyer"><set field="itcEligible" value="N"/></if>
 
             <!-- Get financial year prefix -->
             <service-call name="zenith.base.LocalizationServices.get#FinancialYearDates"
@@ -62,11 +85,15 @@
 
             <!-- Create Mantle Invoice (Purchase type: vendor=fromParty, buyer=toParty) -->
             <service-call name="create#mantle.account.invoice.Invoice" out-map="invOut"
-                          in-map="[invoiceTypeEnumId:'InvoiceSales', fromPartyId:vendorPartyId,
+                          in-map="[invoiceTypeEnumId:'InvoicePurchase', fromPartyId:vendorPartyId,
                                    toPartyId:organizationPartyId, invoiceDate:invoiceDate,
                                    statusId:'InvoiceIncoming', currencyUomId:currencyUomId,
                                    vendorInvoiceNumber:vendorInvoiceNumber, vendorInvoiceDate:vendorInvoiceDate,
-                                   financialYearPrefix:fyResult.fyLabel,
+                                   financialYearPrefix:fyResult.fyLabel, purchaseOrderNumber:purchaseOrderNumber,
+                                   isImportPurchase:isImportPurchase, billOfEntryNumber:billOfEntryNumber,
+                                   billOfEntryDate:billOfEntryDate, portOfImport:portOfImport,
+                                   isReverseCharge:isReverseCharge, isCompositionDealer:isCompositionDealer,
+                                   itcEligible:itcEligible, invoiceTotal:0, unpaidTotal:0,
                                    totalTaxableAmount:0, totalTaxAmount:0, roundOffAmount:0]"/>
             <set field="invoiceId" from="invOut.invoiceId"/>
         </actions>
@@ -87,23 +114,13 @@
             <parameter name="invoiceItemSeqId"/>
         </out-parameters>
         <actions>
+            <service-call name="zenith.purchase.PurchaseInvoiceServices.assert#VendorBillAccess" in-map="[invoiceId:invoiceId,editable:true]" out-map="access"/>
+            <if condition="!access.allowed"><return/></if>
             <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="invoice"/>
-            <!-- Org-isolation: re-check ownership by PK before mutating (block cross-tenant IDOR). Purchase invoice org = toPartyId (buyer). -->
-            <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-            <if condition="invoice == null || (activeOrg &amp;&amp; invoice.toPartyId != activeOrg &amp;&amp; !ec.user.isInGroup('ADMIN'))">
-                <return error="true" message="Invoice not found for your account."/>
-            </if>
-            <!-- ZE-SB-013 (Tier 2): the line product must also belong to this org. -->
-            <if condition="productId">
-                <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" out-map="_pa"
-                              in-map="[entityName:'mantle.product.Product', idField:'productId', idValue:productId, orgField:'ownerPartyId']"/>
-                <if condition="!_pa.allowed"><return error="true" message="Please select a valid product from your account."/></if>
-            </if>
-
-            <!-- ZE-CONTACTS-022 f/u: bound the discount to [0,100] so a bad % can't make the line negative. -->
             <script><![CDATA[
-                if (discountPercent != null && discountPercent.toString().trim() && ((discountPercent as BigDecimal) < 0 || (discountPercent as BigDecimal) > 100))
-                    ec.message.addError("Discount % must be between 0 and 100.")
+                if(quantity<=0 || unitAmount<0 || discountPercent<0 || discountPercent>100) {ec.message.addError('Use a positive quantity, nonnegative price and discount from 0 to 100.');return}
+                def product=productId ? ec.entity.find('mantle.product.Product').condition('productId',productId).disableAuthz().one() : null
+                if(productId && (!product || product.ownerPartyId!=invoice.toPartyId)) ec.message.addError('Choose a product from the buying organization.')
             ]]></script>
             <if condition="ec.message.hasError()"><return/></if>
 
@@ -113,9 +130,9 @@
 
             <!-- Get seller/buyer regions for tax engine -->
             <service-call name="zenith.tax.TaxServices.get#PartyTaxRegistration"
-                          in-map="[partyId:invoice.fromPartyId]" out-map="vendorTaxReg" ignore-error="true"/>
+                          in-map="[partyId:invoice.fromPartyId]" out-map="vendorTaxReg"/>
             <service-call name="zenith.tax.TaxServices.get#PartyTaxRegistration"
-                          in-map="[partyId:invoice.toPartyId]" out-map="buyerTaxReg" ignore-error="true"/>
+                          in-map="[partyId:invoice.toPartyId]" out-map="buyerTaxReg"/>
 
             <!-- Get product info if provided -->
             <if condition="productId">
@@ -125,6 +142,9 @@
                 <if condition="!description"><set field="description" from="product?.productName"/></if>
             </if>
 
+            <if condition="invoice.isCompositionDealer == 'Y'">
+                <set field="taxResult" from="[taxedItems:[[taxableAmount:lineAmount-discountAmount,totalTaxAmount:BigDecimal.ZERO,taxBreakdowns:[]]]]"/>
+                <else>
             <!-- Calculate tax via tax engine -->
             <service-call name="zenith.tax.TaxServices.calculate#Tax"
                           in-map="[organizationPartyId:invoice.toPartyId,
@@ -136,13 +156,19 @@
                                    originRegionGeoId:vendorTaxReg?.regionGeoId,
                                    destinationRegionGeoId:buyerTaxReg?.regionGeoId,
                                    currencyUomId:invoice.currencyUomId,
-                                   transactionType:'PURCHASE']"
+                                   transactionDate:invoice.invoiceDate, isReverseCharge:invoice.isReverseCharge ?: 'N', transactionType:'PURCHASE']"
                           out-map="taxResult"/>
+                </else>
+            </if>
             <set field="taxedItem" from="taxResult.taxedItems[0]"/>
             <set field="taxableAmount" from="taxedItem.taxableAmount" type="BigDecimal"/>
             <set field="totalItemTax" from="taxedItem.totalTaxAmount" type="BigDecimal"/>
 
-            <!-- Get next sequence -->
+            <script><![CDATA[
+                gstFields=[:]
+                ['CGST','SGST','IGST','CESS'].each { name -> def row=taxedItem.taxBreakdowns?.find { it.taxName==name };def key=name.toLowerCase();gstFields[key+'Amount']=row?.taxAmount ?: 0;gstFields[key+'Rate']=row?.taxRate ?: 0 }
+            ]]></script>
+            <!-- Get next sequence (the owning draft was locked by the access guard). -->
             <entity-find entity-name="mantle.account.invoice.InvoiceItem" list="existingItems">
                 <econdition field-name="invoiceId"/>
                 <order-by field-name="-invoiceItemSeqId"/>
@@ -154,9 +180,9 @@
                           in-map="[invoiceId:invoiceId, invoiceItemSeqId:invoiceItemSeqId,
                                    itemTypeEnumId:'ItemProduct', productId:productId,
                                    description:description, quantity:quantity, amount:unitAmount,
-                                   productTaxCode:productTaxCode, taxableAmount:taxableAmount,
+                                   productTaxCode:productTaxCode, hsnSacCode:productTaxCode, taxableAmount:taxableAmount,
                                    totalTaxAmount:totalItemTax, discountAmount:discountAmount,
-                                   discountPercent:discountPercent]"/>
+                                   discountPercent:discountPercent] + gstFields"/>
 
             <!-- Store per-line tax breakdown -->
             <if condition="taxedItem.taxBreakdowns">
@@ -167,26 +193,7 @@
                                        taxBreakdowns:taxedItem.taxBreakdowns]"/>
             </if>
 
-            <!-- Recalculate invoice totals -->
-            <entity-find entity-name="mantle.account.invoice.InvoiceItem" list="allItems">
-                <econdition field-name="invoiceId"/></entity-find>
-            <set field="totalTaxable" from="0" type="BigDecimal"/>
-            <set field="totalTax" from="0" type="BigDecimal"/>
-            <iterate list="allItems" entry="item">
-                <set field="totalTaxable" from="totalTaxable + (item.taxableAmount ?: 0)"/>
-                <set field="totalTax" from="totalTax + (item.totalTaxAmount ?: 0)"/>
-            </iterate>
-            <set field="grandTotal" from="totalTaxable + totalTax" type="BigDecimal"/>
-            <set field="roundOff" from="Math.round(grandTotal) - grandTotal" type="BigDecimal"/>
-
-            <service-call name="zenith.base.LocalizationServices.convert#AmountToWords"
-                          in-map="[amount:Math.round(grandTotal), organizationPartyId:invoice.toPartyId]"
-                          out-map="wordsOut" ignore-error="true"/>
-
-            <service-call name="update#mantle.account.invoice.Invoice"
-                          in-map="[invoiceId:invoiceId, invoiceTotal:Math.round(grandTotal),
-                                   totalTaxableAmount:totalTaxable, totalTaxAmount:totalTax,
-                                   roundOffAmount:roundOff, amountInWords:wordsOut?.amountInWords]"/>
+            <service-call name="zenith.purchase.PurchaseInvoiceServices.refresh#VendorBillTotals" in-map="[invoiceId:invoiceId]"/>
         </actions>
     </service>
 
