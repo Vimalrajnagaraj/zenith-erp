@@ -33,8 +33,8 @@ async function submit(id){await Promise.all([page.waitForNavigation({waitUntil:'
   await page.setViewport({width:1366,height:900});
   await record(shell+' registration country-region and native create',async()=>{
    await open(`/${shell}/zenith/tax/FindTaxRegistration`);await clickText('button','New Registration');await page.waitForSelector('#nr-party',{visible:true});
-   await select('#nr-country','AUS');await page.waitForFunction(()=>!document.querySelector('#nr-region').disabled&&document.querySelector('#nr-region').options.length>1);
-   assert(await page.$eval('#nr-region',e=>!Array.from(e.options).some(o=>['27','29'].includes(o.value))),'Old India regions retained');
+   await page.waitForSelector('#nr-country[data-ready="true"]',{timeout:15000});await select('#nr-country','AUS');await page.waitForFunction(()=>!document.querySelector('#nr-region').disabled&&document.querySelector('#nr-region').options.length>1);
+   assert(await page.$eval('#nr-region',e=>!Array.from(e.options).some(o=>['27','29'].includes(o.value))),'Old India regions retained after initialized country change');
    await select('#nr-country','IND');await page.waitForFunction(()=>Array.from(document.querySelector('#nr-region').options).some(o=>o.value==='29'));
    await select('#nr-party','TAX_QA_UI_CUST');await select('#nr-auth','TAX_QA_AUTH');await select('#nr-regtype','TrtGstin');await select('#nr-region','29');await fill('#nr-regnumber','29ABCDE1234F2ZV');
    await page.screenshot({path:out+'/'+shell+'-registration-desktop.png',fullPage:false});await page.setViewport({width:390,height:844});await page.screenshot({path:out+'/'+shell+'-registration-mobile.png',fullPage:false});await page.setViewport({width:1366,height:900});
