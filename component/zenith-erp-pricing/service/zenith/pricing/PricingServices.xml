@@ -546,6 +546,12 @@
         <actions>
             <set field="now" from="orderDate"/>
             <set field="appliedRules" from="[]"/>
+            <if condition="quantity == null || quantity &lt;= 0">
+                <return error="true" message="Quantity must be greater than zero."/>
+            </if>
+            <if condition="!organizationPartyId">
+                <set field="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            </if>
 
             <!-- Get product base price -->
             <entity-find-one entity-name="mantle.product.Product" value-field="product"/>
@@ -563,7 +569,8 @@
             <if condition="!effectivePriceListId &amp;&amp; customerPartyId">
                 <entity-find entity-name="zenith.erp.pricing.CustomerPriceList" list="custPls">
                     <econdition field-name="partyId" from="customerPartyId"/>
-                    <date-filter from-field-name="validFromDate" thru-field-name="validThruDate"/>
+                    <econdition field-name="organizationPartyId" from="organizationPartyId ?: '__NO_ORGANIZATION__'"/>
+                    <date-filter valid-date="now" from-field-name="validFromDate" thru-field-name="validThruDate"/>
                     <order-by field-name="priority"/>
                 </entity-find>
                 <if condition="custPls">
@@ -587,14 +594,14 @@
             <if condition="!effectivePriceListId &amp;&amp; customerPartyId">
                 <entity-find entity-name="zenith.erp.contacts.CustomerGroupMember" list="_cgMems">
                     <econdition field-name="partyId" from="customerPartyId"/>
-                    <date-filter/>
+                    <date-filter valid-date="now"/>
                 </entity-find>
                 <iterate list="_cgMems" entry="_gm">
                     <if condition="!effectivePriceListId">
                         <entity-find-one entity-name="zenith.erp.contacts.CustomerGroup" value-field="_cg">
                             <field-map field-name="customerGroupId" from="_gm.customerGroupId"/>
                         </entity-find-one>
-                        <if condition="_cg?.priceListId">
+                        <if condition="_cg?.priceListId &amp;&amp; _cg.organizationPartyId == organizationPartyId">
                             <entity-find-one entity-name="zenith.erp.pricing.PriceList" value-field="_gpl">
                                 <field-map field-name="priceListId" from="_cg.priceListId"/>
                             </entity-find-one>
@@ -610,7 +617,8 @@
             <if condition="!effectivePriceListId &amp;&amp; customerGroupId">
                 <entity-find entity-name="zenith.erp.pricing.CustomerPriceList" list="groupPls">
                     <econdition field-name="customerGroupId"/>
-                    <date-filter from-field-name="validFromDate" thru-field-name="validThruDate"/>
+                    <econdition field-name="organizationPartyId" from="organizationPartyId ?: '__NO_ORGANIZATION__'"/>
+                    <date-filter valid-date="now" from-field-name="validFromDate" thru-field-name="validThruDate"/>
                     <order-by field-name="priority"/>
                 </entity-find>
                 <if condition="groupPls">
@@ -625,10 +633,26 @@
                     <econdition field-name="priceListTypeEnumId" value="PltSelling"/>
                     <econdition field-name="isDefault" value="Y"/>
                     <econdition field-name="isActive" value="Y"/>
+                    <econdition field-name="currencyUomId" ignore-if-empty="true"/>
+                    <date-filter valid-date="now" from-field-name="validFromDate" thru-field-name="validThruDate"/>
+                    <order-by field-name="priceListId"/>
                 </entity-find>
                 <if condition="defPls">
                     <set field="effectivePriceListId" from="defPls[0].priceListId"/>
                 </if>
+            </if>
+
+            <!-- Check the list header before reading items, volume tiers, parent or rounding metadata.
+                 These services also run with authz disabled by POS/order callers. -->
+            <if condition="effectivePriceListId">
+                <entity-find entity-name="zenith.erp.pricing.PriceList" list="eligibleLists" limit="1">
+                    <econdition field-name="priceListId" from="effectivePriceListId"/>
+                    <econdition field-name="organizationPartyId" from="organizationPartyId ?: '__NO_ORGANIZATION__'"/>
+                    <econdition field-name="isActive" value="Y"/>
+                    <econdition field-name="currencyUomId" ignore-if-empty="true"/>
+                    <date-filter valid-date="now" from-field-name="validFromDate" thru-field-name="validThruDate"/>
+                </entity-find>
+                <if condition="!eligibleLists"><set field="effectivePriceListId" from="null"/></if>
             </if>
 
             <!-- Step 2: Look up price from price list -->
@@ -641,7 +665,7 @@
                         <econdition field-name="maxQuantity" operator="is-null"/>
                         <econdition field-name="maxQuantity" operator="greater-equals" from="quantity"/>
                     </econditions>
-                    <date-filter from-field-name="validFromDate" thru-field-name="validThruDate"/>
+                    <date-filter valid-date="now" from-field-name="validFromDate" thru-field-name="validThruDate"/>
                     <order-by field-name="-minQuantity"/>
                 </entity-find>
                 <if condition="plItems">
@@ -649,7 +673,7 @@
                     <if condition="plItem.priceTypeEnumId == 'PtpFixed'">
                         <set field="unitPrice" from="plItem.unitPrice" type="BigDecimal"/>
                         <set field="priceSource" value="PriceList"/>
-                    <else-if condition="plItem.priceTypeEnumId == 'PtpDiscount' &amp;&amp; plItem.discountPercent">
+                    <else-if condition="plItem.priceTypeEnumId == 'PtpDiscount' &amp;&amp; plItem.discountPercent != null">
                         <set field="unitPrice" from="(listPrice * (100 - plItem.discountPercent) / 100).setScale(2, java.math.RoundingMode.HALF_UP)" type="BigDecimal"/>
                         <set field="priceSource" value="PriceListDiscount"/>
                     </else-if></if>
@@ -679,6 +703,7 @@
                             <service-call name="zenith.pricing.PricingServices.calculate#Price"
                                           in-map="[productId:productId, quantity:quantity,
                                                    priceListId:pl.parentPriceListId, orderDate:orderDate,
+                                                   organizationPartyId:organizationPartyId, currencyUomId:currencyUomId,
                                                    _visitedPriceLists:_seenPls]"
                                           out-map="parentResult"/>
                             <if condition="parentResult.priceSource != 'ProductListPrice'">
@@ -700,15 +725,15 @@
                         <econdition field-name="maxQuantity" operator="is-null"/>
                         <econdition field-name="maxQuantity" operator="greater-equals" from="quantity"/>
                     </econditions>
-                    <date-filter from-field-name="validFromDate" thru-field-name="validThruDate"/>
+                    <date-filter valid-date="now" from-field-name="validFromDate" thru-field-name="validThruDate"/>
                     <order-by field-name="-minQuantity"/>
                 </entity-find>
                 <if condition="volPrices">
                     <set field="vp" from="volPrices[0]"/>
-                    <if condition="vp.unitPrice">
+                    <if condition="vp.unitPrice != null">
                         <set field="unitPrice" from="vp.unitPrice" type="BigDecimal"/>
                         <set field="priceSource" value="VolumePricing"/>
-                    <else-if condition="vp.discountPercent">
+                    <else-if condition="vp.discountPercent != null">
                         <set field="unitPrice" from="(unitPrice * (100 - vp.discountPercent) / 100).setScale(2, java.math.RoundingMode.HALF_UP)" type="BigDecimal"/>
                         <set field="priceSource" value="VolumeDiscount"/>
                     </else-if></if>
@@ -721,12 +746,12 @@
                  a cross-tenant leak that silently discounted other tenants (e.g. a null-org "QA_Discount_10"
                  turned DOODLE's ₹80 volume tier into ₹72, reported as "volume tier ignored"). Now a rule
                  applies only to its own org, and with no org in context NO rules apply (rules stays unset). -->
-            <if condition="organizationPartyId">
+            <if condition="organizationPartyId &amp;&amp; !_visitedPriceLists">
                 <entity-find entity-name="zenith.erp.pricing.PricingRule" list="rules">
                     <econdition field-name="isActive" value="Y"/>
                     <econdition field-name="organizationPartyId" from="organizationPartyId"/>
-                    <date-filter from-field-name="validFromDate" thru-field-name="validThruDate"/>
-                    <order-by field-name="priority"/>
+                    <date-filter valid-date="now" from-field-name="validFromDate" thru-field-name="validThruDate"/>
+                    <order-by field-name="priority,pricingRuleId"/>
                 </entity-find>
             </if>
             <iterate list="rules" entry="rule">
@@ -843,13 +868,13 @@
                     <set field="preBefore" from="unitPrice"/>
                     <if condition="rule.actionType == 'PatDiscountPercent'">
                         <set field="discount" from="(unitPrice * rule.actionValue / 100).setScale(2, java.math.RoundingMode.HALF_UP)"/>
-                        <if condition="rule.maxDiscount &amp;&amp; discount &gt; rule.maxDiscount">
+                        <if condition="rule.maxDiscount != null &amp;&amp; discount &gt; rule.maxDiscount">
                             <set field="discount" from="rule.maxDiscount"/>
                         </if>
                         <set field="unitPrice" from="unitPrice - discount"/>
                     <else-if condition="rule.actionType == 'PatDiscountAmount'">
                         <set field="discAmt" from="rule.actionValue"/>
-                        <if condition="rule.maxDiscount &amp;&amp; discAmt &gt; rule.maxDiscount">
+                        <if condition="rule.maxDiscount != null &amp;&amp; discAmt &gt; rule.maxDiscount">
                             <set field="discAmt" from="rule.maxDiscount"/>
                         </if>
                         <set field="unitPrice" from="unitPrice - discAmt"/>
@@ -858,7 +883,7 @@
                         <set field="unitPrice" from="rule.actionValue" type="BigDecimal"/>
                     </else-if></if>
 
-                    <if condition="rule.minimumPrice &amp;&amp; unitPrice &lt; rule.minimumPrice">
+                    <if condition="rule.minimumPrice != null &amp;&amp; unitPrice &lt; rule.minimumPrice">
                         <set field="unitPrice" from="rule.minimumPrice" type="BigDecimal"/>
                     </if>
                     <if condition="unitPrice &lt; 0">
