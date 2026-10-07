@@ -83,6 +83,7 @@ component/            56 Moqui components (zenith-erp-*), ~770 XML files
   zenith-erp-<module>/  sales, purchase, inventory, accounting, crm, hr, …
 docs/
   SOP-commit-and-deploy.md   the commit → PR → production runbook
+  SOP-production-bug-PR.pdf  how to raise a production-bug PR (reproduce → merge)
   infra/                     deploy scripts, lint guards, git hooks, sync/audit tooling
   qa/  security/  superpowers/
 .github/workflows/    CI guards (lint, no-direct-push, no-force-push)
@@ -142,6 +143,7 @@ Full workflow, gotchas and the safety checklist: [`CONTRIBUTING.md`](CONTRIBUTIN
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Workflow, lint guards, the non-negotiables |
 | [`SECURITY.md`](SECURITY.md) | Reporting, secrets policy, multi-tenant isolation |
 | [`docs/SOP-commit-and-deploy.md`](docs/SOP-commit-and-deploy.md) | Commit → PR → production runbook + rollback |
+| [`docs/SOP-production-bug-PR.pdf`](docs/SOP-production-bug-PR.pdf) | How to raise a production-bug PR that merges on the first pass |
 | [`docs/infra/`](docs/infra) | Deploy scripts, git hooks, live-sync audit, branch-protection prep |
 
 <p align="center"><sub>© 2024–2026 ZetaERP · Proprietary — All Rights Reserved · <strong>Confidential</strong></sub></p>
