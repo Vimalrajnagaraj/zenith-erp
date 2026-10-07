@@ -100,11 +100,10 @@ async function browserMatrix(){
   async function userContext(user){
    if(contexts[user])return contexts[user];
    const context=await browser.newContext({viewport:{width:1440,height:900}});
-   // Authenticate once; persistent Basic headers rotate Moqui's session during parallel SPA requests.
-   const login=await context.request.get(base+'/apps/zenith/Contacts/CustomerGroups',{headers:{Authorization:'Basic '+Buffer.from(user+':'+password).toString('base64')},timeout:90000});
-   check(user+': one-time session authentication succeeds',login.status()===200,login.status());
-   const hasSessionCookie=(await context.cookies()).some(cookie=>cookie.name==='JSESSIONID'&&!!cookie.value);
-   check(user+': authenticated session cookie exists',hasSessionCookie);
+   // Basic login creates a new Moqui session on every request. Authenticate once, then use cookies
+   // so concurrent Quasar requests cannot invalidate one another's sessions.
+   const login=await context.request.get(base+'/apps/zenith/Contacts/CustomerGroups',{headers:{Authorization:'Basic '+Buffer.from(user+':'+password).toString('base64')}});
+   check(user+': one-shot authenticated session established',login.status()===200&&(await context.cookies(base)).some(c=>c.name==='JSESSIONID'));
    const page=await context.newPage();page.on('pageerror',e=>errors.push(e.message));
    // A normal rendered page supplies the session CSRF token without disabling security.
    await page.goto(base+'/apps/zenith/Contacts/CustomerGroups',{waitUntil:'domcontentloaded',timeout:90000});await page.locator('.cust-title').first().waitFor({timeout:60000});
@@ -170,4 +169,4 @@ async function browserMatrix(){
   report.databaseFinalState=after;report.pageErrors=errors;check('Both real browser shells have no JavaScript page errors',errors.length===0,errors);
  }finally{if(browser)await browser.close();}
 }
-(async()=>{try{await reproduce();if(process.argv.includes('--reproduce'))return;provenance();if(!process.argv.includes('--browser-only'))await scopeMatrix();if(!process.argv.includes('--scope-only'))await browserMatrix();}catch(error){report.error=error.message;process.exitCode=1;}finally{report.completedAt=new Date().toISOString();report.passed=report.checks.filter(c=>c.pass).length;report.failed=report.checks.filter(c=>!c.pass).length;fs.writeFileSync(path.join(out,'verification.json'),JSON.stringify(report,null,2));console.log(JSON.stringify({passed:report.passed,failed:report.failed,reproduction:report.reproduction,error:report.error},null,2));}})();
+(async()=>{try{if(process.argv.includes('--organization-only')){provenance();await require('./verify-organization.cjs')({query,check,report,base,password,exportRows});return;}await reproduce();if(process.argv.includes('--reproduce'))return;provenance();if(!process.argv.includes('--browser-only'))await scopeMatrix();if(!process.argv.includes('--scope-only'))await browserMatrix();if(!process.argv.includes('--scope-only')&&!process.argv.includes('--browser-only'))await require('./verify-organization.cjs')({query,check,report,base,password,exportRows});}catch(error){report.error=error.message;process.exitCode=1;}finally{report.completedAt=new Date().toISOString();report.passed=report.checks.filter(c=>c.pass).length;report.failed=report.checks.filter(c=>!c.pass).length;fs.writeFileSync(path.join(out,'verification.json'),JSON.stringify(report,null,2));console.log(JSON.stringify({passed:report.passed,failed:report.failed,reproduction:report.reproduction,error:report.error},null,2));}})();
