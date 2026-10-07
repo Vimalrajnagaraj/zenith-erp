@@ -15,7 +15,11 @@ invoke its fixed service/parameter allowlist. Do not expose this runtime publicl
 `staging-acceptance` selects this profile for POS PRs. It overlays the candidate
 components on the checksum-pinned clean staging image, runs the existing four
 billing goldens unchanged, then this suite. A dispatch can select `pos` with an
-exact candidate SHA. The fixture/helper paths exist only in the disposable runtime.
+exact candidate SHA after the POS workflow is merged. Before merge, follow the
+Production-Bug PR SOP: dispatch **master's** workflow with the exact candidate SHA
+and `contacts_profile=none` (master does not yet offer `pos`). This independently
+uses master's fixtures/asserts; the automatic PR run supplies the additional POS
+suite. Record both run links. The fixture/helper paths exist only in the disposable runtime.
 
 Native testing uses an in-memory H2 database with a loopback, SELECT-only probe.
 CI uses the staging compose tmpfs PostgreSQL database. Evidence consists of
@@ -60,7 +64,8 @@ unverified steps are not recorded as passes.
 
 Merge and deployment are separate. Only Amal deploys, following
 [`SOP-commit-and-deploy.md`](../../SOP-commit-and-deploy.md). This candidate depends
-on latest master `9ca9a96`, including `9ed3612`'s tax-inclusive Sales invoice contract. Deploy the reviewed,
+on refreshed master `5b49021`, retaining the Product Catalog assets and
+`9ed3612`'s tax-inclusive Sales invoice contract. Deploy the reviewed,
 complete component tree in one maintenance operation and restart Moqui so the new
 POS access/services and their callers become available together. Do not copy a
 child screen or JavaScript ahead of its service dependency.
@@ -72,6 +77,15 @@ while POS is quiescent. Do not deploy service callers against an old schema.
 Existing payment rows remain null and are interpreted as legacy original-session
 tenders; no historical payments are rewritten or guessed into a new drawer.
 Do not deploy `docs/qa/pos-runtime`.
+
+**DEPLOY-GATE — billing, schema and authorization.** The owner must capture and
+compare relevant MARUTHI state before/after the controlled no-op reverify required
+by the [Production-Bug PR SOP](../../SOP-production-bug-PR.pdf), and record an
+approved aggregate result or verification-run link. Website navigation and
+synthetic tenant results do not substitute for this proof. No candidate writes
+may be tested on a real tenant. Production database proof is still pending;
+the author's workstation has website access but no configured SSH/database
+connection. Do not mark this requirement passed from a green synthetic CI run.
 
 Before deploying the offline change, preserve any pending legacy
 `ZenithPosOffline` IndexedDB queue on each till. New queues/catalogs are stored in
