@@ -35,7 +35,7 @@ Never point it at production or an existing customer database.
 | Open a foreign invoice/note | Redacted records left blank forms and template errors | Render only the denial panel for missing/foreign records |
 | Mixed-vendor order | Owning one part authorized shared header/other parts | Deny whole-document actions and exclude mixed orders from lists/dashboard/CSV |
 | Denied Sales print | A 403 status still allowed the FO renderer to produce a PDF | Stop rendering with the framework's authorization exception; return 403 without PDF bytes |
-| Invoice/note list and header amounts | A tax-exclusive value was labelled Total | Label the unchanged sortable stored value Taxable, consistent with CSV |
+| Invoice/note list and header amounts | A tax-exclusive value was labelled Total | Restore tax-inclusive stored totals and label them Total, consistent with CSV |
 | Multi-page PDF | A row's description and amount split across pages | Keep each line's table row together within a page |
 | Invoice/note PDF tax columns | Stored GST plus tax-detail GST was counted twice; rounding was unexplained | Use one tax split, reconcile printed GST to the grand total and display round-off |
 | Empty dashboard chart | The all-zero secondary axis displayed Infinity | Bound zero-data axes and keep labels finite |
@@ -152,3 +152,35 @@ while those native files remain.
 - Cash/mock settlement preserves the existing status-based payment convention;
   it does not introduce GL posting or provider integration. Senior review should
   confirm that convention before production deployment.
+
+## Post-merge PR 23 deployment blocker and follow-ups
+
+The senior's read-only MARUTHI audit confirmed the M1 blocker: PR 23 stored
+Sales invoiceTotal/unpaidTotal pre-tax, while Accounting/Home/TCS/GSTR consumers
+expect gross totals. The follow-up chooses **Option B**, one tax-inclusive
+stored convention, with round-off separate. It changes the two Sales writers,
+print/payable readers and their labels; cross-module readers and POS are
+unchanged. Draft unpaid totals include round-off and subtract existing payments.
+No schema flag, historical migration or issued-document rewrite is added.
+
+| Confirmed issue | Fix | Runtime regression |
+| --- | --- | --- |
+| M1: raw financial reports lose newly billed GST | Store taxable + GST; print/payable add only round-off | Header/line SQL goldens, Accounting list/ageing, GSTR-3B and GST PDF |
+| Returned challans accept goods/status mutations | Guard current and legacy aliases; hide controls | Both shells; full header/item snapshots unchanged |
+| Debit-note payment paths reject only credit notes | Shared payable guard rejects both notes | No links or invoice mutations |
+| GST attribution string-sorts 100+ sequences | Retain returned item IDs | 105 varying-price lines and independent GST sums |
+| Equal-date commission choice has no stable order | Ascending commissionId after descending validFrom | Repeated choice and amount checks |
+| CI omitted the PDF parser install | Retain pinned pypdf 6.10.0 | Existing/new PDF semantics |
+
+`verify-postmerge.cjs` runs after the existing SOP suite in the disposable
+runtime. Historical gross and tax-off fixtures have exact unchanged headers;
+foreign invoices cannot enter the scoped GSTR result. Forecast fixtures cover
+both InvoiceFinalized and InvoicePmtRecvd with the same independent daily goldens.
+The senior's production audit is evidence of current MARUTHI history, not a
+post-fix production verification; the senior must rerun the deployment gate
+against this candidate before deployment.
+
+The prior 18 native QA files remain on the other computer. This run uses fresh
+CI containers/volumes with independently asserted teardown. Manual cleanup,
+existing SOP policy deviations and senior billing review remain required.
+No production writes, merge or deployment are performed by this follow-up.

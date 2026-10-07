@@ -34,6 +34,7 @@
         ec.web.response.setStatus(403); ec.web.sendJsonResponse([denied:true]); return
     }
     def calls=[
+        gstr3b:['zenith.india.Gstr2Services.generate#Gstr3bData',['organizationPartyId','returnPeriod']],
         link:['zenith.sales.PaymentGatewayServices.create#PaymentLink',['invoiceId','gatewayType']],
         linkStatus:['zenith.sales.PaymentGatewayServices.check#PaymentStatus',['paymentLinkId']],
         callback:['zenith.sales.PaymentGatewayServices.process#PaymentCallback',['externalLinkId','status','transactionId']],
@@ -51,10 +52,11 @@
     if (!call) { ec.web.response.setStatus(400); ec.web.sendJsonResponse([denied:true]); return }
     def params=[:]
     call[1].each { name -> if(ec.web.parameters.containsKey(name)) params[name]=ec.web.parameters[name] }
+    if(ec.web.parameters.op == 'gstr3b' && params.organizationPartyId != 'SALES_QA_A') { ec.web.response.setStatus(403); ec.web.sendJsonResponse([denied:true]); return }
     if(params.items instanceof String) params.items=new groovy.json.JsonSlurper().parseText(params.items)
     // Only the dedicated synthetic account can call this fixed service allowlist in this disposable JVM.
     def result=ec.service.sync().name(call[0]).parameters(params).call()
-    def allowed=['invoiceId','paymentLinkId','paymentUrl','upiString','warrantyClaimId','warrantyRegId','commissionTxnId','commissionAmount','statusId','amountInWords','historyDays','avgDaily','projectedNext7','projectedHorizon','confidencePct','points','narrative']
+    def allowed=['table31','table4','netTaxPayable','invoiceId','paymentLinkId','paymentUrl','upiString','warrantyClaimId','warrantyRegId','commissionTxnId','commissionAmount','statusId','amountInWords','historyDays','avgDaily','projectedNext7','projectedHorizon','confidencePct','points','narrative']
     def publicResult=[:];allowed.each { if(result?.containsKey(it)) publicResult[it]=result[it] }
     def errors=new ArrayList(ec.message.errors)
     // Capture the rejection for the harness. The service has already marked its transaction
@@ -74,7 +76,7 @@
         ['HISTORY':'InvoiceFinalized','DRAFT':'InvoiceInProcess','CANCEL':'InvoiceCancelled'].each { key, status ->
             ec.entity.makeValue('mantle.account.invoice.Invoice').setAll([
                 invoiceId:'SALES_QA_SOP_'+key+'_'+d,fromPartyId:'SALES_QA_A',toPartyId:'SALES_QA_CUST_A',
-                invoiceTypeEnumId:'InvoiceSales',statusId:status,currencyUomId:'INR',
+                invoiceTypeEnumId:'InvoiceSales',statusId:(key=='HISTORY' && d%2==0 ? 'InvoicePmtRecvd' : status),currencyUomId:'INR',
                 invoiceDate:java.sql.Timestamp.valueOf(today.minusDays(d).atTime(12,0)),
                 totalTaxableAmount:(key=='HISTORY'?100:9999),invoiceTotal:(key=='HISTORY'?100:9999),
                 totalTaxAmount:0,roundOffAmount:0]).create()
@@ -85,6 +87,32 @@
         invoiceTypeEnumId:'InvoiceSalesReturn',statusId:'InvoiceInProcess',currencyUomId:'INR',
         invoiceDate:java.sql.Timestamp.valueOf(today.minusDays(1).atTime(12,0)),
         originalInvoiceId:'SALES_QA_SOP_HISTORY_1',invoiceTotal:9999]).create()
+    ec.web.sendJsonResponse([initialized:true])
+]]></script></actions><default-response type="none"/></transition>
+<transition name="postMergeFixtures"><actions><script><![CDATA[
+    if (System.getProperty('sales.qa.disposable') != 'true' || ec.user.username != 'sales.qa' ||
+            ec.entity.find('mantle.party.Party').condition('partyId','SALES_QA_PM_CUSTOMER').count()) {
+        ec.web.response.setStatus(403); ec.web.sendJsonResponse([denied:true]); return
+    }
+    ec.entity.makeValue('mantle.party.Party').setAll([partyId:'SALES_QA_PM_CUSTOMER',partyTypeEnumId:'PtyOrganization',ownerPartyId:'SALES_QA_A']).create()
+    ec.entity.makeValue('mantle.party.Organization').setAll([partyId:'SALES_QA_PM_CUSTOMER',organizationName:'Disposable Reporting Customer']).create()
+    ['GROSS':1180G,'TAXOFF':1000G].each { name,total ->
+        ec.entity.makeValue('mantle.account.invoice.Invoice').setAll([invoiceId:'SALES_QA_PM_LEGACY_'+name,
+            fromPartyId:'SALES_QA_A',toPartyId:'SALES_QA_CUST_A',invoiceTypeEnumId:'InvoiceSales',statusId:'InvoiceFinalized',
+            invoiceDate:java.sql.Timestamp.valueOf('1999-01-01 12:00:00'),currencyUomId:'INR',invoiceTotal:total,
+            unpaidTotal:0G,totalTaxableAmount:1000G,totalTaxAmount:180G]).create()
+    }
+    ec.entity.makeValue('mantle.account.invoice.Invoice').setAll([invoiceId:'SALES_QA_PM_FOREIGN',fromPartyId:'SALES_QA_B',
+        toPartyId:'SALES_QA_CUST_B',invoiceTypeEnumId:'InvoiceSales',statusId:'InvoiceFinalized',
+        invoiceDate:java.sql.Timestamp.valueOf('1999-01-01 12:00:00'),currencyUomId:'INR',invoiceTotal:99999G,totalTaxableAmount:99999G,totalTaxAmount:99999G]).create()
+    ['A':5G,'Z':9G].each { name,rate ->
+        ec.entity.makeValue('zenith.erp.sales.CommissionStructure').setAll([commissionId:'SALES_QA_PM_TIE_'+name,
+            organizationPartyId:'SALES_QA_A',partyId:'SALES_QA_PM_CUSTOMER',commissionTypeEnumId:'CmtPercentage',
+            rate:rate,isActive:'Y',validFrom:java.sql.Date.valueOf('2024-01-01')]).create()
+    }
+    ec.entity.makeValue('zenith.erp.sales.DeliveryChallan').setAll([challanId:'SALES_QA_PM_RETURNED',
+        organizationPartyId:'SALES_QA_A',customerPartyId:'SALES_QA_CUST_A',statusId:'ChallanReturned',challanNumber:'QA-PM-RETURNED']).create()
+    ec.entity.makeValue('zenith.erp.sales.DeliveryChallanItem').setAll([challanId:'SALES_QA_PM_RETURNED',challanItemSeqId:'01',productId:'SALES_QA_PROD_A',quantity:1G,estimatedValue:100G]).create()
     ec.web.sendJsonResponse([initialized:true])
 ]]></script></actions><default-response type="none"/></transition>
 <transition name="customerState"><actions><script><![CDATA[
