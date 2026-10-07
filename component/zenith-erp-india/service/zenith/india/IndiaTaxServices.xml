@@ -42,6 +42,9 @@
             <parameter name="totalAmount" type="BigDecimal"/>
         </out-parameters>
         <actions>
+            <service-call name="zenith.tax.TaxAccessServices.assert#Organization" in-map="context" out-map="context"/>
+            <service-call name="zenith.tax.TaxAccessServices.assert#Subject" in-map="[organizationPartyId:organizationPartyId,partyId:customerPartyId]"/>
+            <iterate list="items" entry="taxInput"><service-call name="zenith.tax.TaxAccessServices.assert#Subject" in-map="[organizationPartyId:organizationPartyId,productId:taxInput.productId]"/></iterate>
             <!-- Resolve seller state code -->
             <set field="supplierStateCode" from="originRegionGeoId"/>
             <if condition="!supplierStateCode">
@@ -54,12 +57,8 @@
             <!-- Resolve buyer state code -->
             <set field="buyerStateCode" from="destinationRegionGeoId"/>
             <if condition="!buyerStateCode &amp;&amp; customerPartyId">
-                <entity-find entity-name="zenith.erp.india.IndiaGstin" list="buyerGstins" limit="1">
-                    <econdition field-name="partyId" from="customerPartyId"/>
-                </entity-find>
-                <if condition="buyerGstins">
-                    <set field="buyerStateCode" from="buyerGstins[0].gstin?.substring(0,2)"/>
-                </if>
+                <service-call name="zenith.tax.TaxServices.get#PartyTaxRegistration" in-map="[partyId:customerPartyId,countryGeoId:'IND',registrationTypeEnumId:'TrtGstin']" out-map="buyerRegistration"/>
+                <set field="buyerStateCode" from="buyerRegistration.regionGeoId ?: (buyerRegistration.registrationNumber?.length() == 15 ? buyerRegistration.registrationNumber.substring(0,2) : null)"/>
             </if>
             <if condition="!buyerStateCode">
                 <set field="buyerStateCode" from="supplierStateCode"/>
@@ -88,6 +87,10 @@
             <set field="itemIndex" from="0" type="Integer"/>
 
             <iterate list="items" entry="item">
+                <!-- Reject invalid line amounts before any tax is calculated. -->
+                <if condition="item.quantity == null || item.unitAmount == null || item.quantity &lt; 0 || item.unitAmount &lt; 0 || (item.discountAmount ?: 0) &lt; 0 || (item.discountAmount ?: 0) &gt; item.quantity * item.unitAmount">
+                    <return error="true" message="Quantity, price and discount must be non-negative; discount cannot exceed the line amount."/>
+                </if>
                 <!-- Calculate line amount -->
                 <set field="lineAmount" from="((item.quantity ?: 0) as BigDecimal) * ((item.unitAmount ?: 0) as BigDecimal)" type="BigDecimal"/>
                 <set field="lineDiscount" from="(item.discountAmount ?: 0) as BigDecimal"/>
@@ -103,6 +106,11 @@
                     <continue/>
                 </if>
 
+                <!-- The explicit product exemption always wins over caller-supplied slab/HSN. -->
+                <set field="product" from="null"/>
+                <if condition="item.productId">
+                    <entity-find-one entity-name="mantle.product.Product" value-field="product"><field-map field-name="productId" from="item.productId"/></entity-find-one>
+                </if>
                 <!-- Resolve GST slab from productTaxCode (HSN) or taxCategoryId or product -->
                 <set field="gstSlabId" from="item.taxCategoryId"/>
                 <if condition="!gstSlabId &amp;&amp; item.productTaxCode">
@@ -128,6 +136,7 @@
                     </if>
                 </if>
 
+                <if condition="product?.isGstExempt == 'Y'"><set field="gstSlabId" value="GST_EXEMPT"/></if>
                 <if condition="!gstSlabId">
                     <!-- No GST slab found — zero tax -->
                     <script>taxedItems.add([itemIndex:itemIndex, taxableAmount:taxableAmount,
@@ -138,19 +147,14 @@
                     <continue/>
                 </if>
 
-                <!-- Handle tax-inclusive pricing -->
+                <!-- Resolve the actually collected rates, including cess and zero-tax flags. -->
+                <set field="inclusiveAmount" from="taxableAmount"/>
                 <if condition="item.isTaxInclusive == 'Y'">
-                    <service-call name="zenith.india.GstServices.calculate#TaxInclusive"
-                                  in-map="[inclusiveAmount:taxableAmount, gstRate:0]" out-map="inclResult"/>
-                    <entity-find-one entity-name="zenith.erp.india.IndiaGstSlab" value-field="slabForRate">
-                        <field-map field-name="gstSlabId"/>
-                    </entity-find-one>
-                    <if condition="slabForRate">
-                        <service-call name="zenith.india.GstServices.calculate#TaxInclusive"
-                                      in-map="[inclusiveAmount:taxableAmount, gstRate:slabForRate.gstRate]"
-                                      out-map="inclResult"/>
-                        <set field="taxableAmount" from="inclResult.taxableAmount" type="BigDecimal"/>
-                    </if>
+                    <service-call name="zenith.india.GstServices.calculate#Gst"
+                        in-map="[supplierStateCode:supplierStateCode, buyerStateCode:buyerStateCode, gstSlabId:gstSlabId,
+                            taxableAmount:100, isSezSupply:isSezSupply, isExport:isExport,
+                            isWithPayment:isWithPayment, isReverseCharge:isReverseCharge]" out-map="rateResult"/>
+                    <set field="taxableAmount" from="(inclusiveAmount * 100 / (100 + ['cgst','sgst','igst','cess'].sum { rateResult[it + 'Amount'] &gt; 0 ? rateResult[it + 'Rate'] : 0 })).setScale(2, java.math.RoundingMode.HALF_UP)"/>
                 </if>
 
                 <!-- Calculate GST using existing engine -->
@@ -160,6 +164,20 @@
                                        isSezSupply:isSezSupply, isExport:isExport,
                                        isWithPayment:isWithPayment, isReverseCharge:isReverseCharge]"
                               out-map="gstResult"/>
+
+                <if condition="item.isTaxInclusive == 'Y'">
+                    <script><![CDATA[
+                        // Assign the rounding residual to the final collected component. The
+                        // inclusive price is authoritative; never increase/decrease it by a paisa.
+                        def targetTax = inclusiveAmount.setScale(2, java.math.RoundingMode.HALF_UP) - taxableAmount
+                        def collected = ['cgstAmount','sgstAmount','igstAmount','cessAmount'].findAll { gstResult[it] > 0 }
+                        if (collected) {
+                            def last = collected[-1]
+                            gstResult[last] += targetTax - gstResult.totalTaxAmount
+                        }
+                        gstResult.totalTaxAmount = targetTax
+                    ]]></script>
+                </if>
 
                 <!-- Build generic tax breakdowns -->
                 <set field="breakdowns" from="[]"/>
@@ -185,7 +203,7 @@
                     <script>breakdowns.add([taxName:'CESS', taxRate:gstResult.cessRate,
                         taxableAmount:taxableAmount, taxAmount:gstResult.cessAmount,
                         taxAuthorityId:'IND_CENTRAL', countryGeoId:'IND',
-                        isIncludedInPrice:'N'])</script>
+                        isIncludedInPrice:item.isTaxInclusive])</script>
                 </if>
 
                 <set field="itemTotalTax" from="gstResult.totalTaxAmount ?: BigDecimal.ZERO" type="BigDecimal"/>

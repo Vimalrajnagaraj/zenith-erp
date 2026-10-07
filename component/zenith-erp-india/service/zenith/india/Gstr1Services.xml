@@ -2,8 +2,8 @@
 <services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
           xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
 
-    <!-- Real GSTR-1 (outward supplies) generation: aggregates the period's sales invoices into
-         B2B / B2C-Large / B2C-Small / Export / HSN-summary records and a GSTN-schema JSON payload.
+    <!-- Draft GSTR-1 (outward supplies) generation: aggregates the period's sales invoices into
+         B2B / B2C-Large / B2C-Small / Export / HSN-summary records and a JSON payload requiring GSTN schema validation before filing.
          (Replaces the earlier demo stub. Does NOT file with the GSTN portal — that needs API creds.) -->
     <service verb="generate" noun="Gstr1Data">
         <in-parameters>
@@ -16,9 +16,14 @@
             <parameter name="invoiceCount" type="Integer"/>
         </out-parameters>
         <actions>
+            <service-call name="zenith.tax.TaxAccessServices.assert#WriteAccess"/>
+            <service-call name="zenith.tax.TaxAccessServices.assert#Organization" in-map="context" out-map="context"/>
+            <service-call name="zenith.india.GstServices.validate#ReturnPeriod" in-map="context" out-map="periodCheck"/>
             <if condition="!(returnPeriod ==~ /\d{6}/)">
                 <return error="true" message="Return period must be MMYYYY (e.g. 042026)."/>
             </if>
+            <if condition="financialYear &amp;&amp; financialYear != periodCheck.financialYear"><return error="true" message="Financial year does not match the return period."/></if>
+            <set field="financialYear" from="periodCheck.financialYear"/>
             <script><![CDATA[
                 import java.sql.Timestamp
                 import groovy.json.JsonOutput
@@ -63,10 +68,10 @@
                 // --- Pull the period's sales invoices for this org (exclude cancelled) ---
                 def invoices = ec.entity.find("mantle.account.invoice.Invoice")
                     .condition("fromPartyId", organizationPartyId)
-                    .condition("invoiceTypeEnumId", "in", ["InvoiceSales","InvoiceCreditMemo"])
+                    .condition("invoiceTypeEnumId", "in", ["InvoiceSales","InvoiceSalesReturn","InvoiceSalesDebit","InvoiceCreditMemo"])
                     .condition("invoiceDate", ">=", periodStart)
                     .condition("invoiceDate", "<", periodEnd)
-                    .condition("statusId", "!=", "InvoiceCancelled")
+                    .condition("statusId", "in", ["InvoiceFinalized","InvoiceSent","InvoiceAcked","InvoicePmtRecvd","InvoiceWriteOff"])
                     // GSTR-1 reports ISSUED outward supplies only — an InProcess draft is not a supply yet
                     // and must never appear in a return (a test/draft invoice was leaking into the B2B section).
                     .condition("statusId", "!=", "InvoiceInProcess")
@@ -80,9 +85,10 @@
 
                 for (def inv : invoices) {
                     invCount++
-                    def isCdn = (inv.invoiceTypeEnumId == "InvoiceCreditMemo") || (inv.creditDebitNoteType != null)
+                    def isCdn = inv.invoiceTypeEnumId in ["InvoiceCreditMemo","InvoiceSalesReturn","InvoiceSalesDebit"]
+                    def noteSign = inv.invoiceTypeEnumId in ["InvoiceCreditMemo","InvoiceSalesReturn"] ? -1 : 1
                     def buyerGstin = (inv.buyerGstin ?: "").toString().trim()
-                    def pos = inv.placeOfSupplyStateCode ?: (buyerGstin ? buyerGstin.substring(0,2) : null) ?: orgState
+                    def pos = inv.placeOfSupplyStateCode ?: (buyerGstin.length() == 15 ? buyerGstin.substring(0,2) : null) ?: orgState
                     def invNo = inv.gstInvoiceNumber ?: inv.customInvoiceNumber ?: inv.invoiceId
                     def isExport = inv.isExport == "Y"
                     def isRcm = inv.isReverseCharge == "Y"
@@ -96,7 +102,7 @@
                     def rateMap = [:]
                     def invValue = 0.0
                     for (def it : items) {
-                        def taxable = (it.taxableAmount ?: ((it.quantity ?: 1) * (it.amount ?: 0))) as BigDecimal
+                        def taxable = (it.taxableAmount != null ? it.taxableAmount : ((it.quantity != null ? it.quantity : 1) * (it.amount ?: 0))) as BigDecimal
                         def cg = (it.cgstAmount ?: 0.0) as BigDecimal
                         def sg = (it.sgstAmount ?: 0.0) as BigDecimal
                         def ig = (it.igstAmount ?: 0.0) as BigDecimal
@@ -107,19 +113,33 @@
                         a.qty += (it.quantity ?: 0.0)
                         invValue += taxable + cg + sg + ig + cs
                         def hk = (it.hsnSacCode ?: "NA") + "|" + rate
-                        def h = acc(hsnMap, hk); h.taxable += taxable; h.cgst += cg; h.sgst += sg; h.igst += ig; h.cess += cs; h.qty += (it.quantity ?: 0.0)
+                        def h = acc(hsnMap, hk); h.taxable += taxable*noteSign; h.cgst += cg*noteSign; h.sgst += sg*noteSign; h.igst += ig*noteSign; h.cess += cs*noteSign; h.qty += (it.quantity ?: 0.0)*noteSign
                         h.hsn = (it.hsnSacCode ?: "NA"); h.rate = rate
                     }
 
+                    def charged=ec.service.sync().name('zenith.india.GstServices.get#ChargedInvoiceTax').parameters([invoiceId:inv.invoiceId]).call()
+                    if(ec.message.hasError()) return
+                    def itemTax=rateMap.values().sum {it.cgst+it.sgst+it.igst+it.cess} ?: 0G
+                    if((itemTax-(charged.cgst+charged.sgst+charged.igst+charged.cess)).abs() > 0.01G) {
+                        ec.message.addError('Invoice GST lines do not reconcile with charged tax. Reconcile the source document before generating this draft.');return
+                    }
+                    if (inv.invoiceTotal != null) invValue=inv.invoiceTotal
+                    if(isCdn && !buyerGstin) {ec.message.addError('Unregistered credit/debit notes require CDNU reporting; draft generation stopped to avoid an incomplete return.');return}
                     for (def e : rateMap.entrySet()) {
                         def rate = e.key; def a = e.value
-                        if (isExport) {
+                        if (isCdn) {
+                            def r=ec.entity.makeValue('zenith.erp.india.gstr1.Gstr1CdnrRecord');r.setSequencedIdPrimary()
+                            r.filingId=filingId;r.invoiceId=inv.invoiceId;r.buyerGstin=buyerGstin
+                            r.noteNumber=invNo;r.noteDate=inv.invoiceDate;r.noteType=noteSign < 0 ? 'C' : 'D'
+                            r.placeOfSupply=pos;r.noteValue=round2(invValue);r.rate=rate;r.taxableValue=round2(a.taxable)
+                            r.cgstAmount=round2(a.cgst);r.sgstAmount=round2(a.sgst);r.igstAmount=round2(a.igst);r.cessAmount=round2(a.cess);r.create()
+                        } else if (isExport) {
                             def r = ec.entity.makeValue("zenith.erp.india.gstr1.Gstr1ExportRecord"); r.setSequencedIdPrimary()
                             r.filingId = filingId; r.invoiceId = inv.invoiceId
                             r.exportType = (inv.isWithPayment == "Y") ? "WPAY" : "WOPAY"
                             r.invoiceNumber = invNo; r.invoiceDate = inv.invoiceDate; r.invoiceValue = round2(invValue)
                             r.portCode = inv.portCode; r.shippingBillNumber = inv.shippingBillNumber; r.shippingBillDate = inv.shippingBillDate
-                            r.rate = rate; r.taxableValue = round2(a.taxable); r.igstAmount = round2(a.igst); r.create()
+                            r.rate = rate; r.taxableValue = round2(a.taxable); r.igstAmount = round2(a.igst); r.cessAmount=round2(a.cess); r.create()
                         } else if (buyerGstin && buyerGstin.length() == 15 && buyerGstin != orgGstin) {
                             // B2B requires a VALID customer GSTIN (15 chars) that isn't the seller's OWN — a
                             // blank / malformed / self GSTIN is a B2C (unregistered) sale, not B2B.
@@ -130,8 +150,8 @@
                             r.rate = rate; r.taxableValue = round2(a.taxable)
                             r.cgstAmount = round2(a.cgst); r.sgstAmount = round2(a.sgst); r.igstAmount = round2(a.igst); r.cessAmount = round2(a.cess)
                             r.create()
-                        } else if (pos != orgState && invValue > 250000) {
-                            // B2C Large: inter-state, unregistered, invoice value > 2.5L
+                        } else if (pos != orgState && invValue > (yyyy > 2024 || (yyyy == 2024 && mm >= 8) ? 100000 : 250000)) {
+                            // B2C Large threshold changed from 2.5L to 1L in August 2024.
                             def r = ec.entity.makeValue("zenith.erp.india.gstr1.Gstr1B2clRecord"); r.setSequencedIdPrimary()
                             r.filingId = filingId; r.invoiceId = inv.invoiceId; r.invoiceNumber = invNo
                             r.invoiceDate = inv.invoiceDate; r.invoiceValue = round2(invValue); r.placeOfSupply = pos
@@ -182,6 +202,8 @@
         </in-parameters>
         <out-parameters><parameter name="filingId"/><parameter name="invoiceCount" type="Integer"/></out-parameters>
         <actions>
+            <service-call name="zenith.tax.TaxAccessServices.assert#Organization" in-map="context" out-map="context"/>
+            <service-call name="zenith.india.GstServices.validate#ReturnPeriod" in-map="context" out-map="periodCheck"/>
             <service-call name="zenith.india.Gstr1Services.generate#Gstr1Data" in-map="context" out-map="context"/>
         </actions>
     </service>
@@ -193,7 +215,11 @@
             <script><![CDATA[
                 import groovy.json.JsonOutput
                 def filing = ec.entity.find("zenith.erp.india.gstr1.Gstr1Filing").condition("filingId", filingId).one()
+                if (!filing) { ec.message.addError('GST filing not found.'); return }
+                ec.service.sync().name('zenith.tax.TaxAccessServices.assert#Organization').parameters([organizationPartyId:filing.organizationPartyId]).call()
+                if (ec.message.hasError()) return
                 def cfg = filing ? ec.entity.find("zenith.erp.india.IndiaGstConfig").condition("organizationPartyId", filing.organizationPartyId).one() : null
+                def dateText = { d -> d ? new java.text.SimpleDateFormat('dd-MM-yyyy').format(d) : '' }
                 def n2 = { v -> ((v ?: 0.0) as BigDecimal).setScale(2, java.math.RoundingMode.HALF_UP) }
 
                 // B2B: nest invoices under each buyer GSTIN (GSTN schema: ctin -> inv[] -> itms[])
@@ -201,9 +227,9 @@
                 ec.entity.find("zenith.erp.india.gstr1.Gstr1B2bRecord").condition("filingId", filingId).list().each { r ->
                     def ctin = b2bByCtin[r.buyerGstin] ?: (b2bByCtin[r.buyerGstin] = [ctin:r.buyerGstin, inv:[:]])
                     def inv = ctin.inv[r.invoiceNumber] ?: (ctin.inv[r.invoiceNumber] = [
-                        inum:r.invoiceNumber, idt:(r.invoiceDate?.toString() ?: ""), val:n2(r.invoiceValue),
+                        inum:r.invoiceNumber, idt:dateText(r.invoiceDate), val:n2(r.invoiceValue),
                         pos:r.placeOfSupply, rchrg:r.reverseCharge, inv_typ:r.invoiceType, itms:[]])
-                    inv.itms << [rt:r.rate, txval:n2(r.taxableValue), camt:n2(r.cgstAmount), samt:n2(r.sgstAmount), iamt:n2(r.igstAmount), csamt:n2(r.cessAmount)]
+                    inv.itms << [num:inv.itms.size()+1, itm_det:[rt:r.rate, txval:n2(r.taxableValue), camt:n2(r.cgstAmount), samt:n2(r.sgstAmount), iamt:n2(r.igstAmount), csamt:n2(r.cessAmount)]]
                 }
                 def b2b = b2bByCtin.values().collect { c -> [ctin:c.ctin, inv:c.inv.values() as List] }
 
@@ -211,21 +237,36 @@
                     [sply_ty:(r.igstAmount && r.igstAmount > 0 ? "INTER" : "INTRA"), pos:r.placeOfSupply, typ:"OE",
                      rt:r.rate, txval:n2(r.taxableValue), camt:n2(r.cgstAmount), samt:n2(r.sgstAmount), iamt:n2(r.igstAmount), csamt:n2(r.cessAmount)]
                 }
-                def b2cl = ec.entity.find("zenith.erp.india.gstr1.Gstr1B2clRecord").condition("filingId", filingId).list().collect { r ->
-                    [inum:r.invoiceNumber, idt:(r.invoiceDate?.toString() ?: ""), val:n2(r.invoiceValue), pos:r.placeOfSupply,
-                     rt:r.rate, txval:n2(r.taxableValue), iamt:n2(r.igstAmount), csamt:n2(r.cessAmount)]
+                def b2clMap=[:]
+                ec.entity.find('zenith.erp.india.gstr1.Gstr1B2clRecord').condition('filingId',filingId).list().each { r ->
+                    def group=b2clMap[r.placeOfSupply] ?: (b2clMap[r.placeOfSupply]=[pos:r.placeOfSupply,inv:[:]])
+                    def inv=group.inv[r.invoiceId] ?: (group.inv[r.invoiceId]=[inum:r.invoiceNumber,idt:dateText(r.invoiceDate),val:n2(r.invoiceValue),itms:[]])
+                    inv.itms << [num:inv.itms.size()+1,itm_det:[rt:r.rate,txval:n2(r.taxableValue),iamt:n2(r.igstAmount),csamt:n2(r.cessAmount)]]
                 }
-                def exp = ec.entity.find("zenith.erp.india.gstr1.Gstr1ExportRecord").condition("filingId", filingId).list().collect { r ->
-                    [exp_typ:r.exportType, inum:r.invoiceNumber, idt:(r.invoiceDate?.toString() ?: ""), val:n2(r.invoiceValue),
-                     sbnum:r.shippingBillNumber, sbdt:(r.shippingBillDate?.toString() ?: ""), rt:r.rate, txval:n2(r.taxableValue), iamt:n2(r.igstAmount)]
+                def b2cl=b2clMap.values().collect { [pos:it.pos,inv:it.inv.values() as List] }
+                def expMap=[:]
+                ec.entity.find('zenith.erp.india.gstr1.Gstr1ExportRecord').condition('filingId',filingId).list().each { r ->
+                    def group=expMap[r.exportType] ?: (expMap[r.exportType]=[exp_typ:r.exportType,inv:[:]])
+                    def inv=group.inv[r.invoiceId] ?: (group.inv[r.invoiceId]=[inum:r.invoiceNumber,idt:dateText(r.invoiceDate),val:n2(r.invoiceValue),itms:[]])
+                    if(r.portCode) inv.sbpcode=r.portCode
+                    if(r.shippingBillNumber) {inv.sbnum=r.shippingBillNumber;inv.sbdt=dateText(r.shippingBillDate)}
+                    inv.itms << [rt:r.rate,txval:n2(r.taxableValue),iamt:n2(r.igstAmount),csamt:n2(r.cessAmount)]
                 }
+                def exp=expMap.values().collect { [exp_typ:it.exp_typ,inv:it.inv.values() as List] }
+                def cdnrMap=[:]
+                ec.entity.find('zenith.erp.india.gstr1.Gstr1CdnrRecord').condition('filingId',filingId).list().each { r ->
+                    def buyer=cdnrMap[r.buyerGstin] ?: (cdnrMap[r.buyerGstin]=[ctin:r.buyerGstin,nt:[:]])
+                    def note=buyer.nt[r.invoiceId] ?: (buyer.nt[r.invoiceId]=[nt_num:r.noteNumber,nt_dt:dateText(r.noteDate),ntty:r.noteType,val:n2(r.noteValue),pos:r.placeOfSupply,rchrg:'N',inv_typ:'R',itms:[]])
+                    note.itms << [num:note.itms.size()+1,itm_det:[rt:r.rate,txval:n2(r.taxableValue),camt:n2(r.cgstAmount),samt:n2(r.sgstAmount),iamt:n2(r.igstAmount),csamt:n2(r.cessAmount)]]
+                }
+                def cdnr=cdnrMap.values().collect { [ctin:it.ctin,nt:it.nt.values() as List] }
                 def hsn = ec.entity.find("zenith.erp.india.gstr1.Gstr1HsnSummary").condition("filingId", filingId).list().withIndex().collect { r, i ->
                     [num:(i+1), hsn_sc:r.hsnSacCode, rt:r.rate, qty:r.totalQuantity, txval:n2(r.taxableValue),
                      camt:n2(r.cgstAmount), samt:n2(r.sgstAmount), iamt:n2(r.igstAmount), csamt:n2(r.cessAmount)]
                 }
 
                 def payload = [gstin:(cfg?.gstin ?: ""), fp:(filing?.returnPeriod ?: ""), gt:0, cur_gt:0,
-                               b2b:b2b, b2cl:b2cl, b2cs:b2cs, exp:exp, hsn:[data:hsn]]
+                               b2b:b2b, b2cl:b2cl, b2cs:b2cs, cdnr:cdnr, exp:exp, hsn:[data:hsn]]
                 jsonPayload = JsonOutput.prettyPrint(JsonOutput.toJson(payload))
             ]]></script>
         </actions>

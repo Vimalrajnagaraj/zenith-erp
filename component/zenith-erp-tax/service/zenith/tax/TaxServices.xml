@@ -3,6 +3,43 @@
           xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
 
     <!-- ========== MAIN TAX CALCULATION SERVICE (DISPATCHER) ========== -->
+    <service verb="get" noun="DashboardTaxLines">
+        <out-parameters><parameter name="taxLines" type="List"/></out-parameters>
+        <actions>
+            <service-call name="zenith.tax.TaxAccessServices.get#AuthorizedActiveOrganization" out-map="scope"/>
+            <set field="taxLines" from="[]"/>
+            <if condition="!scope.activeOrgId"><return/></if>
+            <script><![CDATA[
+                // Scope the document IDs before reading their lines. Never truncate a global list
+                // and then filter it: another tenant's activity must not hide this org's history.
+                def dates=[:]
+                def txns=ec.entity.find('zenith.erp.pos.PosTransaction').condition('organizationPartyId',scope.activeOrgId)
+                    .condition('statusId','PtCompleted').list()
+                def posIds=txns.collect { it.transactionId }
+                txns.each { dates['PosTransactionItem|'+it.transactionId]=it.completedDate ?: it.entryDate }
+                def invoices=ec.entity.find('mantle.account.invoice.Invoice').condition('fromPartyId',scope.activeOrgId)
+                    .condition('invoiceTypeEnumId','in',['InvoiceSales','InvoiceSalesReturn','InvoiceSalesDebit','InvoiceCreditMemo'])
+                    .condition('statusId','in',['InvoiceFinalized','InvoiceSent','InvoiceAcked','InvoicePmtRecvd','InvoiceWriteOff']).list()
+                // POS-linked invoices carry a second copy of the same tax breakdown.
+                def linked=txns.collect { it.linkedInvoiceId }.findAll { it } as Set
+                invoices=invoices.findAll { !linked.contains(it.invoiceId) }
+                def invIds=invoices.collect { it.invoiceId }
+                def signs=[:]
+                invoices.each { dates['InvoiceItem|'+it.invoiceId]=it.invoiceDate; signs[it.invoiceId]=it.invoiceTypeEnumId in ['InvoiceSalesReturn','InvoiceCreditMemo'] ? -1 : 1 }
+                [['PosTransactionItem',posIds],['InvoiceItem',invIds]].each { pair ->
+                    if (!pair[1]) return
+                    ec.entity.find('zenith.erp.tax.TaxLineDetail').condition('referenceType',pair[0]).condition('referenceId','in',pair[1]).list().each { line ->
+                        def row=new LinkedHashMap(line)
+                        row.documentDate=dates[pair[0]+'|'+line.referenceId]
+                        if(pair[0]=='InvoiceItem') {row.taxAmount=(line.taxAmount ?: 0)*signs[line.referenceId];row.taxableAmount=(line.taxableAmount ?: 0)*signs[line.referenceId]}
+                        taxLines.add(row)
+                    }
+                }
+                taxLines.sort { a,b -> (b.documentDate?.time ?: 0) <=> (a.documentDate?.time ?: 0) }
+            ]]></script>
+        </actions>
+    </service>
+
     <service verb="calculate" noun="Tax">
         <description>Generic tax calculation that dispatches to country-specific tax service.
             Reads TAX_CALCULATION_SERVICE from CompanySettings to find the country plugin.</description>
@@ -58,6 +95,9 @@
             <parameter name="totalAmount" type="BigDecimal"/>
         </out-parameters>
         <actions>
+            <service-call name="zenith.tax.TaxAccessServices.assert#Organization" in-map="context" out-map="context"/>
+            <service-call name="zenith.tax.TaxAccessServices.assert#Subject" in-map="[organizationPartyId:organizationPartyId,partyId:customerPartyId]"/>
+            <iterate list="items" entry="taxInput"><service-call name="zenith.tax.TaxAccessServices.assert#Subject" in-map="[organizationPartyId:organizationPartyId,productId:taxInput.productId]"/></iterate>
             <set field="taxSetting" from="null"/>
             <if condition="organizationPartyId">
                 <entity-find-one entity-name="zenith.erp.base.CompanySettings" value-field="taxSetting">
@@ -110,50 +150,8 @@
             <parameter name="totalTaxAmount" type="BigDecimal"/>
         </out-parameters>
         <actions>
-            <entity-find entity-name="zenith.erp.tax.TaxEngineConfig" list="configs">
-                <econdition field-name="tenantId"/>
-                <econdition field-name="isActive" value="Y"/>
-            </entity-find>
-            
-            <script><![CDATA[
-                import org.slf4j.LoggerFactory
-                def logger = LoggerFactory.getLogger("GlobalTaxServices")
-                
-                taxBreakdowns = []
-                totalTaxAmount = 0.0
-                
-                if (configs) {
-                    def activeConfig = configs[0]
-                    String provider = activeConfig.providerEnumId
-                    
-                    logger.info("Routing Global Tax Calculation via Provider: [${provider}] for Tenant: [${tenantId}]")
-                    
-                    // Mock API Dispatch to Avalara / TaxJar
-                    // In production, this fires a REST request via HTTP client using apiKey/apiSecret
-                    
-                    BigDecimal simulatedTaxRate = 0.085 // e.g. 8.5%
-                    
-                    for (item in items) {
-                        BigDecimal lineAmount = ((item.quantity ?: 1.0) as BigDecimal) * ((item.unitAmount ?: 0.0) as BigDecimal)
-                        BigDecimal itemTax = lineAmount * simulatedTaxRate
-                        
-                        taxBreakdowns.add([
-                            taxName: provider == 'TpAvalara' ? 'AvaTax Sales Tax' : 'TaxJar Sales Tax',
-                            taxRate: simulatedTaxRate,
-                            taxableAmount: lineAmount,
-                            taxAmount: itemTax,
-                            countryGeoId: destinationCountryGeoId,
-                            regionGeoId: destinationRegionGeoId
-                        ])
-                        
-                        totalTaxAmount += itemTax
-                    }
-                    
-                    logger.info("Successfully calculated [${totalTaxAmount}] total tax via ${provider}.")
-                } else {
-                    logger.warn("No active Global Tax Engine configured for Tenant [${tenantId}]. Falling back to local tax engine.")
-                }
-            ]]></script>
+            <service-call name="zenith.tax.TaxAccessServices.assert#Organization" in-map="[organizationPartyId:tenantId]" out-map="taxScope"/>
+            <return error="true" message="External tax provider calculation is unavailable. No provider API is connected; simulated tax cannot be used for billing."/>
         </actions>
     </service>
 
@@ -175,6 +173,9 @@
         </in-parameters>
         <out-parameters><parameter name="configId"/></out-parameters>
         <actions>
+            <service-call name="zenith.tax.TaxAccessServices.assert#WriteAccess" in-map="[allowContacts:'N']"/>
+            <service-call name="zenith.tax.TaxAccessServices.assert#Organization" in-map="[organizationPartyId:tenantId]" out-map="taxScope"/>
+            <set field="tenantId" from="taxScope.organizationPartyId"/>
             <set field="missing" from="[]"/>
             <if condition="!providerEnumId"><script>missing.add('Tax Provider')</script></if>
             <if condition="!apiEndpoint"><script>missing.add('API Endpoint URL')</script></if>
@@ -187,13 +188,17 @@
             <if condition="!(ep.toLowerCase().startsWith('https://') &amp;&amp; ep.length() &gt; 10 &amp;&amp; ep.substring(8).contains('.'))">
                 <return error="true" message="API Endpoint must be a valid https:// URL (e.g. https://rest.avatax.com)."/>
             </if>
-            <set field="host" from="ep.toLowerCase()"/>
-            <if condition="providerEnumId == 'TpAvalara' &amp;&amp; !(host.contains('avatax') || host.contains('avalara'))">
-                <return error="true" message="For Avalara AvaTax the endpoint should be an Avalara URL (e.g. https://rest.avatax.com or https://sandbox-rest.avatax.com)."/>
-            </if>
-            <if condition="providerEnumId == 'TpTaxJar' &amp;&amp; !host.contains('taxjar')">
-                <return error="true" message="For TaxJar the endpoint should be a TaxJar URL (e.g. https://api.taxjar.com)."/>
-            </if>
+            <script><![CDATA[
+                def allowedHosts = [TpAvalara:['rest.avatax.com','sandbox-rest.avatax.com'], TpTaxJar:['api.taxjar.com','api.sandbox.taxjar.com']]
+                try {
+                    def uri = new java.net.URI(ep)
+                    if (!allowedHosts[providerEnumId]?.contains(uri.host?.toLowerCase(java.util.Locale.ROOT)) ||
+                        uri.scheme != 'https' || uri.userInfo || uri.query || uri.fragment || !(uri.port in [-1,443])) {
+                        ec.message.addError('Use the HTTPS endpoint for the selected tax provider.'); return
+                    }
+                } catch (Exception ignored) { ec.message.addError('Invalid provider endpoint.'); return }
+            ]]></script>
+            <if condition="ec.message.hasError()"><return/></if>
             <!-- ZE-TAX-012: one configuration per provider per tenant (no duplicates). -->
             <entity-find-count entity-name="zenith.erp.tax.TaxEngineConfig" count-field="dupCount">
                 <econdition field-name="tenantId"/>
@@ -218,14 +223,10 @@
         <description>Delete a Tax Engine config, enforcing tenant ownership.</description>
         <in-parameters><parameter name="configId" required="true"/></in-parameters>
         <actions>
+            <service-call name="zenith.tax.TaxAccessServices.assert#WriteAccess" in-map="[allowContacts:'N']"/>
             <entity-find-one entity-name="zenith.erp.tax.TaxEngineConfig" value-field="cfg"/>
             <if condition="!cfg"><return error="true" message="Tax engine config not found."/></if>
-            <if condition="!ec.user.isInGroup('ADMIN')">
-                <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-                <if condition="!activeOrg || activeOrg == '_NA_' || cfg.tenantId != activeOrg">
-                    <return error="true" message="You do not have access to this tax engine config."/>
-                </if>
-            </if>
+            <service-call name="zenith.tax.TaxAccessServices.assert#Organization" in-map="[organizationPartyId:cfg.tenantId]" out-map="taxScope"/>
             <entity-delete value-field="cfg"/>
         </actions>
     </service>
@@ -256,6 +257,7 @@
             </parameter>
         </in-parameters>
         <actions>
+            <service-call name="zenith.tax.TaxAccessServices.assert#TaxDocumentAccess" in-map="context"/>
             <entity-delete-by-condition entity-name="zenith.erp.tax.TaxLineDetail">
                 <econdition field-name="referenceType"/>
                 <econdition field-name="referenceId"/>
@@ -293,6 +295,7 @@
             <parameter name="totalTaxAmount" type="BigDecimal"/>
         </out-parameters>
         <actions>
+            <service-call name="zenith.tax.TaxAccessServices.assert#TaxDocumentAccess" in-map="context"/>
             <entity-find entity-name="zenith.erp.tax.TaxLineDetail" list="taxDetails">
                 <econdition field-name="referenceType"/>
                 <econdition field-name="referenceId"/>
@@ -319,6 +322,7 @@
             <parameter name="grandTotalTax" type="BigDecimal"/>
         </out-parameters>
         <actions>
+            <service-call name="zenith.tax.TaxAccessServices.assert#TaxDocumentAccess" in-map="context"/>
             <entity-find entity-name="zenith.erp.tax.TaxLineSummaryView" list="summaryList">
                 <econdition field-name="referenceType"/>
                 <econdition field-name="referenceId"/>
@@ -350,11 +354,15 @@
             <parameter name="taxAuthorityId"/>
         </out-parameters>
         <actions>
+            <service-call name="zenith.tax.TaxAccessServices.assert#Organization" out-map="taxScope"/>
+            <service-call name="zenith.tax.TaxAccessServices.assert#Subject" in-map="[organizationPartyId:taxScope.organizationPartyId,partyId:partyId]"/>
             <entity-find entity-name="zenith.erp.tax.TaxRegistration" list="registrations">
                 <econdition field-name="partyId"/>
                 <econdition field-name="registrationTypeEnumId" ignore-if-empty="true"/>
                 <econdition field-name="isActive" value="Y"/>
-                <order-by field-name="-isDefault,-isPrimary"/>
+                <econditions combine="or"><econdition field-name="effectiveFrom" operator="is-null"/><econdition field-name="effectiveFrom" operator="less-equals" from="ec.user.nowTimestamp"/></econditions>
+                <econditions combine="or"><econdition field-name="effectiveThru" operator="is-null"/><econdition field-name="effectiveThru" operator="greater-equals" from="ec.user.nowTimestamp"/></econditions>
+                <order-by field-name="-isDefault,-isPrimary,-effectiveFrom,registrationId"/>
             </entity-find>
 
             <if condition="countryGeoId &amp;&amp; registrations">
@@ -362,9 +370,12 @@
                     reg.countryGeoId == countryGeoId || (!reg.countryGeoId &amp;&amp;
                         ec.entity.find('zenith.erp.tax.TaxAuthority').condition('taxAuthorityId', reg.taxAuthorityId).one()?.countryGeoId == countryGeoId)
                 }"/>
-                <set field="registrations" from="filtered ?: registrations"/>
+                <set field="registrations" from="filtered"/>
             </if>
 
+            <if condition="!registrationTypeEnumId &amp;&amp; countryGeoId == 'IND' &amp;&amp; registrations.any { it.registrationTypeEnumId == 'TrtGstin' }">
+                <set field="registrations" from="registrations.findAll { it.registrationTypeEnumId == 'TrtGstin' }"/>
+            </if>
             <if condition="registrations">
                 <set field="reg" from="registrations[0]"/>
                 <set field="registrationNumber" from="reg.registrationNumber"/>
@@ -381,7 +392,7 @@
                  so the engine can compare states instead of defaulting everyone to IGST.
                  (a) no TaxRegistration found -> fall back to the party's IndiaGstin (state code + number);
                  (b) a registration whose regionGeoId is blank -> take the registration number's first 2 digits. -->
-            <if condition="!registrationNumber">
+            <if condition="!registrationNumber &amp;&amp; (!countryGeoId || countryGeoId == 'IND') &amp;&amp; (!registrationTypeEnumId || registrationTypeEnumId == 'TrtGstin')">
                 <script><![CDATA[
                     try {
                         def _g = ec.entity.find("zenith.erp.india.IndiaGstin").condition("partyId", partyId)
@@ -390,7 +401,7 @@
                     } catch (Exception e) { /* india component / entity absent -> skip */ }
                 ]]></script>
             </if>
-            <if condition="!regionGeoId &amp;&amp; registrationNumber &amp;&amp; registrationNumber.length() &gt;= 2 &amp;&amp; registrationNumber.substring(0,2) ==~ /[0-9]{2}/">
+            <if condition="!regionGeoId &amp;&amp; (!countryGeoId || countryGeoId == 'IND') &amp;&amp; registrationNumber &amp;&amp; registrationNumber.length() == 15 &amp;&amp; registrationNumber.substring(0,2) ==~ /[0-9]{2}/">
                 <set field="regionGeoId" from="registrationNumber.substring(0,2)"/>
             </if>
         </actions>
@@ -416,15 +427,25 @@
             <parameter name="registrationId"/>
         </out-parameters>
         <actions>
+            <service-call name="zenith.tax.TaxAccessServices.assert#WriteAccess" in-map="[allowContacts:'Y']"/>
             <!-- ZE-TAX-007: reject a malformed GSTIN when the registration type is GSTIN (India);
                  normalise to upper-case. Other registration types are not pattern-checked. -->
             <if condition="registrationTypeEnumId == 'TrtGstin' &amp;&amp; registrationNumber">
                 <set field="registrationNumber" from="registrationNumber.trim().toUpperCase()"/>
-                <if condition="!registrationNumber.matches('[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][0-9A-Z]Z[0-9A-Z]')">
-                    <return error="true" message="That GSTIN doesn't look valid. A GSTIN is 15 characters, e.g. 29ABCDE1234F1Z5."/>
-                </if>
+                <service-call name="zenith.india.GstServices.validate#Gstin" in-map="[gstin:registrationNumber]" out-map="gstinCheck"/>
+                <if condition="!gstinCheck.isValid"><return error="true" message="${gstinCheck.errorMessage}"/></if>
+                <if condition="countryGeoId &amp;&amp; countryGeoId != 'IND'"><return error="true" message="GSTIN registrations must use India."/></if>
+                <if condition="regionGeoId &amp;&amp; regionGeoId != gstinCheck.stateCode"><return error="true" message="GSTIN state does not match the selected region."/></if>
             </if>
-            <set field="organizationPartyId" from="organizationPartyId ?: ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <if condition="effectiveFrom &amp;&amp; effectiveThru &amp;&amp; effectiveThru &lt; effectiveFrom"><return error="true" message="Effective Thru cannot be before Effective From."/></if>
+            <service-call name="zenith.tax.TaxAccessServices.assert#Organization" in-map="context" out-map="context"/>
+            <service-call name="zenith.tax.TaxAccessServices.assert#Subject" in-map="context"/>
+            <script><![CDATA[
+                def duplicate=ec.entity.find('zenith.erp.tax.TaxRegistration').condition('registrationTypeEnumId',registrationTypeEnumId).condition('registrationNumber',registrationNumber).disableAuthz()
+                if (registrationId) duplicate.condition('registrationId','!=',registrationId)
+                if (duplicate.count()) ec.message.addError('This registration number is already registered. Use the existing record or contact your administrator.')
+            ]]></script>
+            <if condition="ec.message.hasError()"><return/></if>
             <service-call name="create#zenith.erp.tax.TaxRegistration" out-map="context"
                           in-map="[organizationPartyId:organizationPartyId, partyId:partyId, taxAuthorityId:taxAuthorityId,
                                    registrationTypeEnumId:registrationTypeEnumId,
@@ -457,14 +478,11 @@
             <parameter name="isActive"/>
         </in-parameters>
         <actions>
+            <service-call name="zenith.tax.TaxAccessServices.assert#WriteAccess" in-map="[allowContacts:'Y']"/>
             <entity-find-one entity-name="zenith.erp.tax.TaxRegistration" value-field="reg"/>
             <if condition="!reg"><return error="true" message="Tax registration not found."/></if>
-            <if condition="!ec.user.isInGroup('ADMIN')">
-                <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-                <if condition="!activeOrg || activeOrg == '_NA_' || reg.organizationPartyId != activeOrg">
-                    <return error="true" message="You do not have access to this tax registration."/>
-                </if>
-            </if>
+            <service-call name="zenith.tax.TaxAccessServices.assert#Organization" in-map="[organizationPartyId:reg.organizationPartyId]" out-map="taxScope"/>
+            <service-call name="zenith.tax.TaxAccessServices.assert#Subject" in-map="[organizationPartyId:reg.organizationPartyId,partyId:partyId]"/>
             <set field="missing" from="[]"/>
             <if condition="!partyId"><script>missing.add('Party')</script></if>
             <if condition="!taxAuthorityId"><script>missing.add('Tax Authority')</script></if>
@@ -476,13 +494,20 @@
             <!-- ZE-TAX-007: GSTIN format check (India) on edit too; normalise to upper-case. -->
             <if condition="registrationTypeEnumId == 'TrtGstin' &amp;&amp; registrationNumber">
                 <set field="registrationNumber" from="registrationNumber.trim().toUpperCase()"/>
-                <if condition="!registrationNumber.matches('[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][0-9A-Z]Z[0-9A-Z]')">
-                    <return error="true" message="That GSTIN doesn't look valid. A GSTIN is 15 characters, e.g. 29ABCDE1234F1Z5."/>
-                </if>
+                <service-call name="zenith.india.GstServices.validate#Gstin" in-map="[gstin:registrationNumber]" out-map="gstinCheck"/>
+                <if condition="!gstinCheck.isValid"><return error="true" message="${gstinCheck.errorMessage}"/></if>
+                <if condition="countryGeoId &amp;&amp; countryGeoId != 'IND'"><return error="true" message="GSTIN registrations must use India."/></if>
+                <if condition="regionGeoId &amp;&amp; regionGeoId != gstinCheck.stateCode"><return error="true" message="GSTIN state does not match the selected region."/></if>
             </if>
             <if condition="effectiveFrom &amp;&amp; effectiveThru &amp;&amp; effectiveThru &lt; effectiveFrom">
                 <return error="true" message="Effective Thru cannot be before Effective From."/>
             </if>
+            <script><![CDATA[
+                def duplicate=ec.entity.find('zenith.erp.tax.TaxRegistration').condition('registrationTypeEnumId',registrationTypeEnumId).condition('registrationNumber',registrationNumber).disableAuthz()
+                if (registrationId) duplicate.condition('registrationId','!=',registrationId)
+                if (duplicate.count()) ec.message.addError('This registration number is already registered. Use the existing record or contact your administrator.')
+            ]]></script>
+            <if condition="ec.message.hasError()"><return/></if>
             <service-call name="update#zenith.erp.tax.TaxRegistration"
                 in-map="[registrationId:registrationId, partyId:partyId, taxAuthorityId:taxAuthorityId,
                          registrationTypeEnumId:registrationTypeEnumId, registrationNumber:registrationNumber,
@@ -497,14 +522,10 @@
         <description>Delete a Tax Registration, enforcing that it belongs to the caller's active org. ADMIN exempt.</description>
         <in-parameters><parameter name="registrationId" required="true"/></in-parameters>
         <actions>
+            <service-call name="zenith.tax.TaxAccessServices.assert#WriteAccess" in-map="[allowContacts:'Y']"/>
             <entity-find-one entity-name="zenith.erp.tax.TaxRegistration" value-field="reg"/>
             <if condition="!reg"><return error="true" message="Tax registration not found."/></if>
-            <if condition="!ec.user.isInGroup('ADMIN')">
-                <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-                <if condition="!activeOrg || activeOrg == '_NA_' || reg.organizationPartyId != activeOrg">
-                    <return error="true" message="You do not have access to this tax registration."/>
-                </if>
-            </if>
+            <service-call name="zenith.tax.TaxAccessServices.assert#Organization" in-map="[organizationPartyId:reg.organizationPartyId]" out-map="taxScope"/>
             <entity-delete value-field="reg"/>
         </actions>
     </service>
@@ -535,6 +556,14 @@
             <parameter name="exemptionId"/>
         </out-parameters>
         <actions>
+            <service-call name="zenith.tax.TaxAccessServices.assert#WriteAccess" in-map="[allowContacts:'N']"/>
+            <if condition="exemptionId">
+                <entity-find-one entity-name="zenith.erp.tax.TaxExemption" value-field="ex"/>
+                <if condition="!ex"><return error="true" message="Tax exemption not found."/></if>
+                <set field="organizationPartyId" from="ex.organizationPartyId"/>
+            </if>
+            <service-call name="zenith.tax.TaxAccessServices.assert#Organization" in-map="[organizationPartyId:organizationPartyId]" out-map="context"/>
+            <service-call name="zenith.tax.TaxAccessServices.assert#Subject" in-map="context"/>
             <set field="missing" from="[]"/>
             <if condition="!taxAuthorityId"><script>missing.add('Tax Authority')</script></if>
             <if condition="!exemptionTypeEnumId"><script>missing.add('Exemption Type')</script></if>
@@ -571,14 +600,10 @@
         <description>Delete a Tax Exemption, enforcing that it belongs to the caller's active org.</description>
         <in-parameters><parameter name="exemptionId" required="true"/></in-parameters>
         <actions>
+            <service-call name="zenith.tax.TaxAccessServices.assert#WriteAccess" in-map="[allowContacts:'N']"/>
             <entity-find-one entity-name="zenith.erp.tax.TaxExemption" value-field="ex"/>
             <if condition="!ex"><return error="true" message="Tax exemption not found."/></if>
-            <if condition="!ec.user.isInGroup('ADMIN')">
-                <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-                <if condition="!activeOrg || activeOrg == '_NA_' || ex.organizationPartyId != activeOrg">
-                    <return error="true" message="You do not have access to this tax exemption."/>
-                </if>
-            </if>
+            <service-call name="zenith.tax.TaxAccessServices.assert#Organization" in-map="[organizationPartyId:ex.organizationPartyId]" out-map="taxScope"/>
             <entity-delete value-field="ex"/>
         </actions>
     </service>
@@ -608,6 +633,17 @@
             <if condition="parentTaxAuthorityId &amp;&amp; parentTaxAuthorityId == taxAuthorityId">
                 <return error="true" message="A tax authority cannot be its own parent."/>
             </if>
+            <script><![CDATA[
+                def seen = [taxAuthorityId] as Set
+                def parent = parentTaxAuthorityId
+                while (parent) {
+                    if (!seen.add(parent)) { ec.message.addError('Tax authority parent hierarchy cannot contain a cycle.'); return }
+                    def record = ec.entity.find('zenith.erp.tax.TaxAuthority').condition('taxAuthorityId',parent).one()
+                    if (!record) { ec.message.addError('Parent tax authority does not exist.'); return }
+                    parent = record.parentTaxAuthorityId
+                }
+            ]]></script>
+            <if condition="ec.message.hasError()"><return/></if>
             <service-call name="store#zenith.erp.tax.TaxAuthority" out-map="context"
                 in-map="[taxAuthorityId:taxAuthorityId, description:description,
                          taxAuthorityTypeEnumId:taxAuthorityTypeEnumId, countryGeoId:countryGeoId,
@@ -667,6 +703,8 @@
             <if condition="effectiveFrom &amp;&amp; effectiveThru &amp;&amp; effectiveThru &lt; effectiveFrom">
                 <return error="true" message="Effective Thru cannot be before Effective From."/>
             </if>
+            <if condition="rate == null || rate &lt; 0 || (rateTypeEnumId == 'TrtPercentage' &amp;&amp; rate &gt; 100)"><return error="true" message="A non-negative rate is required (percentage rates cannot exceed 100)."/></if>
+            <if condition="(minTaxableAmount != null &amp;&amp; minTaxableAmount &lt; 0) || (maxTaxableAmount != null &amp;&amp; maxTaxableAmount &lt; 0) || (minTaxableAmount != null &amp;&amp; maxTaxableAmount != null &amp;&amp; maxTaxableAmount &lt; minTaxableAmount)"><return error="true" message="Taxable amount bounds must be non-negative and ordered."/></if>
             <if condition="taxRateId">
                 <service-call name="update#zenith.erp.tax.TaxRate" in-map="context"/>
                 <else>
@@ -704,36 +742,26 @@
 
     <!-- ========== CHECK TAX EXEMPTION ========== -->
     <service verb="check" noun="TaxExemption">
-        <description>Checks if a party or product has a tax exemption</description>
-        <in-parameters>
-            <parameter name="partyId"/>
-            <parameter name="productId"/>
-            <parameter name="taxAuthorityId"/>
-            <parameter name="transactionDate" type="Date" default="ec.user.nowTimestamp"/>
-        </in-parameters>
-        <out-parameters>
-            <parameter name="isExempt" type="Boolean"/>
-            <parameter name="exemptionType"/>
-            <parameter name="exemption" type="Map"/>
-        </out-parameters>
+        <in-parameters><parameter name="organizationPartyId"/><parameter name="partyId"/><parameter name="productId"/><parameter name="taxAuthorityId"/><parameter name="transactionDate" type="Date" default="ec.user.nowTimestamp"/></in-parameters>
+        <out-parameters><parameter name="isExempt" type="Boolean"/><parameter name="exemptionType"/><parameter name="exemption" type="Map"/></out-parameters>
         <actions>
+            <service-call name="zenith.tax.TaxAccessServices.assert#Organization" in-map="context" out-map="context"/>
+            <service-call name="zenith.tax.TaxAccessServices.assert#Subject" in-map="context"/>
             <set field="isExempt" from="false"/>
-            <entity-find entity-name="zenith.erp.tax.TaxExemption" list="exemptions" limit="1">
-                <econdition field-name="partyId" ignore-if-empty="true"/>
-                <econdition field-name="productId" ignore-if-empty="true"/>
-                <econdition field-name="taxAuthorityId" ignore-if-empty="true"/>
-                <econdition field-name="isActive" value="Y"/>
-                <econdition field-name="effectiveFrom" operator="less-equals" from="transactionDate" ignore-if-empty="true"/>
-                <econditions combine="or">
-                    <econdition field-name="effectiveThru" operator="is-null"/>
-                    <econdition field-name="effectiveThru" operator="greater-equals" from="transactionDate"/>
-                </econditions>
-            </entity-find>
-            <if condition="exemptions">
-                <set field="isExempt" from="true"/>
-                <set field="exemption" from="exemptions[0]"/>
-                <set field="exemptionType" from="exemptions[0].exemptionTypeEnumId"/>
-            </if>
+            <if condition="!partyId &amp;&amp; !productId"><return/></if>
+            <script><![CDATA[
+                def rows = ec.entity.find('zenith.erp.tax.TaxExemption').condition('organizationPartyId',organizationPartyId)
+                    .condition('isActive','Y').orderBy('-effectiveFrom,exemptionId').list()
+                exemption = rows.find { r ->
+                    (!r.partyId || r.partyId == partyId) && (!r.productId || r.productId == productId) &&
+                    (r.partyId || r.productId) && (!taxAuthorityId || r.taxAuthorityId == taxAuthorityId) &&
+                    (!r.effectiveFrom || !r.effectiveFrom.after(transactionDate)) &&
+                    (!r.effectiveThru || !r.effectiveThru.before(transactionDate))
+                }
+                exemptionType = exemption?.exemptionTypeEnumId
+                // Partial exemptions and reverse charge are not blanket zero-tax exemptions.
+                isExempt = exemptionType in ['TexFull','TexZeroRated','TexGovernment','TexNonProfit','TexExport','TexReseller','TexSez']
+            ]]></script>
         </actions>
     </service>
 
@@ -745,6 +773,7 @@
             <parameter name="referenceId" required="true"/>
         </in-parameters>
         <actions>
+            <service-call name="zenith.tax.TaxAccessServices.assert#TaxDocumentAccess" in-map="context"/>
             <entity-delete-by-condition entity-name="zenith.erp.tax.TaxLineDetail">
                 <econdition field-name="referenceType"/>
                 <econdition field-name="referenceId"/>

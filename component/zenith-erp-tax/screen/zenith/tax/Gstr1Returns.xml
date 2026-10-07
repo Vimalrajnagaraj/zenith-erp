@@ -11,7 +11,7 @@
              hit "Field cannot be empty" → 500. Check the prereqs with friendly messages, and wrap
              the call so any other failure is shown gracefully instead of a stack trace. -->
         <actions>
-            <set field="orgId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <set field="orgId" from="ec.service.sync().name('zenith.tax.TaxAccessServices.get#AuthorizedActiveOrganization').call().activeOrgId"/>
             <if condition="!orgId || orgId == '_NA_'">
                 <return error="true" message="Select a company before generating GSTR-1. (Super-admins: switch to a specific tenant first.)"/>
             </if>
@@ -36,6 +36,8 @@
         <parameter name="filingId" required="true"/>
         <actions>
             <entity-find-one entity-name="zenith.erp.india.gstr1.Gstr1Filing" value-field="filing"/>
+            <if condition="!filing"><return error="true" message="GST filing not found."/></if>
+            <service-call name="zenith.tax.TaxAccessServices.assert#Organization" in-map="[organizationPartyId:filing.organizationPartyId]"/>
             <if condition="filing != null &amp;&amp; filing.jsonPayload != null">
                 <script>ec.web.sendTextResponse(filing.jsonPayload, "application/json", "GSTR1_" + filing.returnPeriod + ".json")</script>
             </if>
@@ -44,7 +46,7 @@
     </transition>
 
     <actions>
-        <set field="orgId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+        <set field="orgId" from="ec.service.sync().name('zenith.tax.TaxAccessServices.get#AuthorizedActiveOrganization').call().activeOrgId"/>
         <set field="cal" from="new java.util.GregorianCalendar()"/>
         <set field="yr" from="cal.get(java.util.Calendar.YEAR)"/>
         <set field="mn" from="cal.get(java.util.Calendar.MONTH) + 1"/>
@@ -60,13 +62,16 @@
 
         <set field="b2csList" from="[]"/><set field="b2bRecList" from="[]"/><set field="hsnList" from="[]"/>
         <if condition="filingId">
+            <service-call name="zenith.tax.TaxAccessServices.assert#RecordOrgAccess" in-map="[entityName:'zenith.erp.india.gstr1.Gstr1Filing',idField:'filingId',idValue:filingId,orgField:'organizationPartyId']" out-map="filingAccess"/>
+            <if condition="!filingAccess.allowed"><return error="true" message="GST filing is unavailable for this organization."/></if>
             <entity-find-one entity-name="zenith.erp.india.gstr1.Gstr1Filing" value-field="curFiling"/>
             <entity-find entity-name="zenith.erp.india.gstr1.Gstr1B2csRecord" list="b2csList"><econdition field-name="filingId"/><order-by field-name="rate"/></entity-find>
             <entity-find entity-name="zenith.erp.india.gstr1.Gstr1B2bRecord" list="b2bRecList"><econdition field-name="filingId"/></entity-find>
             <entity-find entity-name="zenith.erp.india.gstr1.Gstr1HsnSummary" list="hsnList"><econdition field-name="filingId"/></entity-find>
             <script>
                 totB2cs = b2csList.sum { ((it.taxableValue ?: 0) as BigDecimal) } ?: 0
-                totTax = (b2csList.sum { (((it.cgstAmount?:0)+(it.sgstAmount?:0)+(it.igstAmount?:0)) as BigDecimal) } ?: 0) + (b2bRecList.sum { (((it.cgstAmount?:0)+(it.sgstAmount?:0)+(it.igstAmount?:0)) as BigDecimal) } ?: 0)
+                def returnRows = ['Gstr1B2csRecord','Gstr1B2bRecord','Gstr1B2clRecord','Gstr1ExportRecord','Gstr1CdnrRecord'].collectMany { ec.entity.find('zenith.erp.india.gstr1.'+it).condition('filingId',filingId).list().collect { value -> def r=value.getMap(); [tax:((r.cgstAmount?:0)+(r.sgstAmount?:0)+(r.igstAmount?:0)+(r.cessAmount?:0)),sign:(it == 'Gstr1CdnrRecord' &amp;&amp; r.noteType == 'C' ? -1 : 1)] } }
+                totTax = returnRows.sum { r -> (r.tax as BigDecimal) * r.sign } ?: 0
             </script>
         </if>
 
@@ -95,7 +100,8 @@
 
     <widgets>
         <render-mode><text type="html,qvt" template="true"><![CDATA[
-        <img src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" alt="" style="display:none" onload="if(window.__gstr1Init){window.__gstr1Init();}else if(!window.__gstr1Boot){window.__gstr1Boot=1;var s=document.createElement('script');s.src='/zenithstatic/js/gstr1-returns.js?v=1';document.body.appendChild(s);}"/>
+        <input id="gstr1-token" type="hidden" value="${(ec.web.sessionToken!'')?html}"/>
+        <img src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" alt="" style="display:none" onload="if(window.__gstr1Init){window.__gstr1Init();}else if(!window.__gstr1Boot){window.__gstr1Boot=1;var s=document.createElement('script');s.src='/zenithstatic/js/gstr1-returns.js?v=3';document.body.appendChild(s);}"/>
         <div style="padding:16px 16px 0;font-family:'Segoe UI',Arial,sans-serif">
             <div style="font-size:12.5px;color:#6B7280;margin-bottom:12px"><a href="${(appBase!'')}/zenith/tax/TaxDashboard" style="color:#6B7280;text-decoration:none">Tax</a> <span style="color:#9CA3AF">&rsaquo;</span> <a href="." style="color:#6B7280;text-decoration:none">GST Returns</a> <span style="color:#9CA3AF">&rsaquo;</span> GSTR-1</div>
 
@@ -112,7 +118,7 @@
 
             <details id="gstr1-guide" style="background:#EEF2FF;border:1px solid #C7D2FE;border-left:5px solid #6366F1;border-radius:10px;padding:10px 16px;margin-bottom:16px">
                 <summary style="cursor:pointer;font-weight:700;font-size:14px;color:#3730A3;outline:none">&#128220; GSTR-1 &mdash; quick guide</summary>
-                <div style="font-size:13px;color:#202124;line-height:1.85;margin-top:8px">GSTR-1 is your monthly/quarterly return of outward supplies (sales). <b>1</b>&nbsp;Pick the <b>Return Period</b> and <b>Financial Year</b>. <b>2</b>&nbsp;Click <b>Generate GSTR-1</b> &mdash; it reads your POS sales and invoices for that period and builds the B2C, B2B and HSN sections. <b>3</b>&nbsp;Open a saved filing to review it, then <b>Download</b> the JSON to upload on the GST portal. Always reconcile against your books before filing.</div>
+                <div style="font-size:13px;color:#202124;line-height:1.85;margin-top:8px">GSTR-1 is your monthly/quarterly return of outward supplies (sales). <b>1</b>&nbsp;Pick the <b>Return Period</b> and <b>Financial Year</b>. <b>2</b>&nbsp;Click <b>Generate GSTR-1</b> &mdash; it reads your POS sales and invoices for that period and builds the B2C, B2B and HSN sections. <b>3</b>&nbsp;Open a saved filing to review it, then <b>Download</b> the draft JSON for reconciliation and schema validation before uploading on the GST portal. Always reconcile against your books before filing.</div>
             </details>
 
             <div style="display:flex;gap:24px;flex-wrap:wrap;align-items:flex-start">
@@ -120,14 +126,14 @@
                 <section style="flex:1 1 340px;min-width:0;background:#fff;border:1px solid #E5E7EB;border-radius:12px;padding:24px;box-shadow:0 1px 3px rgba(17,24,39,.06)">
                     <div style="display:flex;align-items:center;gap:10px;margin-bottom:20px"><span class="z-icobadge primary"><span class="material-icons">description</span></span><span style="font-size:15px;font-weight:700;color:#111827">Generate Return</span></div>
                     <div style="margin-bottom:16px">
-                        <label style="display:block;font-size:12.5px;font-weight:600;color:#6B7280;margin-bottom:6px">Return Period (MM/YYYY)</label>
+                        <label for="gstr1-period" style="display:block;font-size:12.5px;font-weight:600;color:#6B7280;margin-bottom:6px">Return Period (MM/YYYY)</label>
                         <div style="position:relative"><span class="material-icons" style="position:absolute;left:12px;top:50%;transform:translateY(-50%);font-size:18px;color:#9CA3AF;pointer-events:none">calendar_today</span>
                             <select id="gstr1-period" style="width:100%;box-sizing:border-box;height:46px;padding:0 12px 0 40px;border:1px solid #E5E7EB;border-radius:8px;font-size:14px;color:#111827;background:#fff"><#list (periodOpts![]) as p><option value="${(p.val)?html}"<#if (currentPeriod!'') == p.val> selected</#if>>${(p.disp)?html}</option></#list></select></div>
                     </div>
                     <div style="margin-bottom:20px">
-                        <label style="display:block;font-size:12.5px;font-weight:600;color:#6B7280;margin-bottom:6px">Financial Year</label>
+                        <label for="gstr1-fy" style="display:block;font-size:12.5px;font-weight:600;color:#6B7280;margin-bottom:6px">Financial Year</label>
                         <div style="position:relative"><span class="material-icons" style="position:absolute;left:12px;top:50%;transform:translateY(-50%);font-size:18px;color:#9CA3AF;pointer-events:none">calendar_today</span>
-                            <select id="gstr1-fy" style="width:100%;box-sizing:border-box;height:46px;padding:0 12px 0 40px;border:1px solid #E5E7EB;border-radius:8px;font-size:14px;color:#111827;background:#fff"><#list (fyOpts![]) as fy><option value="${(fy.val)?html}"<#if (currentFy!'') == fy.val> selected</#if>>${(fy.disp)?html}</option></#list></select></div>
+                            <select disabled="disabled" id="gstr1-fy" style="width:100%;box-sizing:border-box;height:46px;padding:0 12px 0 40px;border:1px solid #E5E7EB;border-radius:8px;font-size:14px;color:#111827;background:#fff"><#list (fyOpts![]) as fy><option value="${(fy.val)?html}"<#if (currentFy!'') == fy.val> selected</#if>>${(fy.disp)?html}</option></#list></select></div>
                     </div>
                     <#if (modCanWrite!false)>
                     <button type="button" id="gstr1-gen" style="width:100%;display:inline-flex;align-items:center;justify-content:center;gap:8px;height:48px;background:#7C3AED;color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer"><span class="material-icons" style="font-size:18px">auto_awesome</span>Generate GSTR-1</button>
