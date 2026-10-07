@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+    <!-- ACTIVE_ORGANIZATION is an editable preference, not proof of tenant membership. Named
+         transitions skip ZenithApp's render-time Mantle setup, so resolve the current caller here. -->
+    <service verb="get" noun="AuthorizedActiveOrganization">
+        <out-parameters><parameter name="activeOrgId"/></out-parameters>
+        <actions><script><![CDATA[
+            activeOrgId = null
+            if (ec.user.isInGroup('ADMIN')) {
+                def preference = ec.user.getPreference('ACTIVE_ORGANIZATION')
+                activeOrgId = preference && preference != '_NA_' ? preference : null
+                return
+            }
+            // Clear stale derived scope even when this account has no party or resolution fails.
+            ec.user.context.activeOrgId = null
+            ec.user.context.userOrgIds = []
+            ec.user.context.filterOrgIds = []
+            def callerPartyId = ec.user.userAccount?.partyId
+            if (!callerPartyId) return
+            // Only the authoritative relationship lookup bypasses entity filters. Sales
+            // operations keep their normal authorization. Mantle also clears invalid preferences.
+            def orgInfo = ec.service.sync().name('mantle.party.PartyServices.get#PartyOrganizationInfo')
+                    .parameters([partyId:callerPartyId]).disableAuthz().call()
+            if (ec.message.hasError()) return
+            def userOrgIds = orgInfo?.userOrgIds ?: []
+            def resolvedOrg = orgInfo?.activeOrgId
+            activeOrgId = resolvedOrg && resolvedOrg != '_NA_' && userOrgIds.contains(resolvedOrg) ? resolvedOrg : null
+            ec.user.context.activeOrgId = activeOrgId
+            ec.user.context.userOrgIds = userOrgIds
+            ec.user.context.filterOrgIds = activeOrgId ? [activeOrgId] : userOrgIds
+        ]]></script></actions>
+    </service>
+
+    <service verb="get" noun="MixedVendorOrderIds" authenticate="true">
+        <out-parameters><parameter name="mixedOrderIds" type="List"/></out-parameters>
+        <actions>
+            <service-call name="zenith.sales.SalesAccessServices.get#AuthorizedActiveOrganization" out-map="scope"/>
+            <script><![CDATA[
+                mixedOrderIds=[]
+                if (!scope.activeOrgId || ec.user.isInGroup('ADMIN')) return
+                def cf=ec.entity.conditionFactory
+                def mixedFind=ec.entity.find('mantle.order.OrderPart')
+                // Internal dynamic view: do not register an entity that generic REST
+                // could expose as an unscoped list of other organizations' order IDs.
+                mixedFind.makeEntityDynamicView()
+                    .addMemberEntity('OWN','mantle.order.OrderPart',null,null,null)
+                    .addMemberEntity('OTHER','mantle.order.OrderPart','OWN',false,[orderId:'orderId'])
+                    .addAlias('OWN','orderId').addAlias('OWN','vendorPartyId')
+                    .addAlias('OTHER','otherVendorPartyId','vendorPartyId',null)
+                def foreign=cf.makeCondition(
+                    cf.makeCondition('otherVendorPartyId',org.moqui.entity.EntityCondition.NOT_EQUAL,scope.activeOrgId),
+                    org.moqui.entity.EntityCondition.OR,
+                    cf.makeCondition('otherVendorPartyId',org.moqui.entity.EntityCondition.EQUALS,null))
+                // Read only IDs of orders with a part owned by this authorized org.
+                // Authorization metadata must include foreign parts to detect mixed ownership.
+                mixedOrderIds=mixedFind
+                    .condition('vendorPartyId',scope.activeOrgId).condition(foreign)
+                    .selectField('orderId').distinct(true).disableAuthz().list().collect { it.orderId }
+            ]]></script>
+        </actions>
+    </service>
+    <service verb="assert" noun="RecordOrgAccess" authenticate="true">
+        <in-parameters><parameter name="entityName" required="true"/><parameter name="idField" required="true"/><parameter name="idValue" required="true"/><parameter name="orgField" required="true"/></in-parameters>
+        <out-parameters><parameter name="allowed" type="Boolean"/></out-parameters>
+        <actions>
+            <service-call name="zenith.sales.SalesAccessServices.get#AuthorizedActiveOrganization" out-map="scope"/>
+            <set field="allowed" from="false"/>
+            <if condition="scope.activeOrgId || ec.user.isInGroup('ADMIN')">
+                <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" in-map="context" out-map="recordAccess"/>
+                <set field="allowed" from="recordAccess.allowed"/>
+                <if condition="allowed &amp;&amp; !ec.user.isInGroup('ADMIN') &amp;&amp; entityName == 'mantle.order.OrderPart' &amp;&amp; idField == 'orderId' &amp;&amp; orgField == 'vendorPartyId'">
+                    <script><![CDATA[
+                        // These Sales screens display/change a whole order. Owning one part
+                        // cannot authorize another vendor's part or the shared header.
+                        def parts=ec.entity.find('mantle.order.OrderPart').condition('orderId',idValue).disableAuthz().list()
+                        allowed=!parts.isEmpty() && parts.every { it.vendorPartyId == scope.activeOrgId }
+                    ]]></script>
+                </if>
+            </if>
+        </actions>
+    </service>
+</services>

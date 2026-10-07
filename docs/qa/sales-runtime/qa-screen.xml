@@ -1,0 +1,107 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Test-only helper: installed by the harness in a disposable loopback runtime, never deployed. -->
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd" default-menu-include="false">
+<transition name="initialize"><actions><script><![CDATA[
+    if (!ec.user.isInGroup('ADMIN') || System.getProperty('sales.qa.disposable') != 'true') {
+        ec.web.response.setStatus(403); ec.web.sendJsonResponse([denied:true]); return
+    }
+    if (ec.entity.find('mantle.party.Party').condition('partyId','SALES_QA_A').disableAuthz().count() != 0) {
+        ec.web.response.setStatus(409); ec.web.sendJsonResponse([denied:true]); return
+    }
+    ec.entity.makeDataLoader().location('component://zenith-erp-sales/SalesQaFixture.xml').load()
+    def demo=ec.entity.find('moqui.security.UserAccount').condition('userId','EX_JOHN_DOE').one()
+    def qa=ec.entity.find('moqui.security.UserAccount').condition('userId','SALES_QA_USER').one()
+    ['currentPassword','passwordSalt','passwordHashType','passwordBase64'].each { qa.set(it,demo.get(it)) }
+    qa.disabled='N'; qa.requirePasswordChange='N'; qa.update()
+    // Fixtures belong to the QA user's calendar, not the initializing demo admin's timezone.
+    // This matters around midnight: john.doe may still be on the preceding calendar day.
+    def qaToday=java.time.LocalDate.now(java.time.ZoneId.of(qa.timeZone))
+    def today=java.sql.Date.valueOf(qaToday)
+    ['TODAY':today,'EXPIRED':java.sql.Date.valueOf(qaToday.minusDays(1))].each { key,end ->
+        ec.entity.find('zenith.erp.sales.WarrantyRegistration').condition('warrantyRegId','SALES_QA_WR_'+key).one().set('warrantyEndDate',end).update()
+    }
+    ec.entity.find('zenith.erp.sales.WarrantyRegistration').condition('warrantyRegId','SALES_QA_WR_FUTURE').one().set('warrantyStartDate',java.sql.Date.valueOf(qaToday.plusDays(1))).update()
+    // InvoiceItem fixture import invokes Mantle's gross-total ECA and resets applied payments.
+    // Restore this exact synthetic partial-payment scenario after all fixture rows exist.
+    def cash=ec.entity.find('mantle.account.invoice.Invoice').condition('invoiceId','SALES_QA_CASH').one()
+    cash.invoiceTotal=1062; cash.totalTaxableAmount=900; cash.totalTaxAmount=162
+    cash.totalCgst=81; cash.totalSgst=81; cash.totalIgst=0
+    cash.appliedPaymentsTotal=100; cash.unpaidTotal=962; cash.update()
+    ec.web.sendJsonResponse([initialized:true])
+]]></script></actions><default-response type="none"/></transition>
+<transition name="invoke"><actions><script><![CDATA[
+    if (System.getProperty('sales.qa.disposable') != 'true' || ec.user.username != 'sales.qa') {
+        ec.web.response.setStatus(403); ec.web.sendJsonResponse([denied:true]); return
+    }
+    def calls=[
+        link:['zenith.sales.PaymentGatewayServices.create#PaymentLink',['invoiceId','gatewayType']],
+        linkStatus:['zenith.sales.PaymentGatewayServices.check#PaymentStatus',['paymentLinkId']],
+        callback:['zenith.sales.PaymentGatewayServices.process#PaymentCallback',['externalLinkId','status','transactionId']],
+        upi:['zenith.sales.PaymentGatewayServices.generate#UpiPaymentQr',['invoiceId','upiId','merchantName']],
+        invoice:['zenith.sales.SalesInvoiceServices.create#SalesInvoice',['organizationPartyId','customerPartyId','items','isReverseCharge']],
+        claim:['zenith.sales.DeliveryChallanServices.file#WarrantyClaim',['warrantyRegId','issueDescription']],
+        resolve:['zenith.sales.DeliveryChallanServices.resolve#WarrantyClaim',['warrantyClaimId','resolutionEnumId','serviceCost']],
+        commission:['zenith.sales.CommissionServices.calculate#Commission',['orderId','partyId']],
+        words:['zenith.india.GstServices.convert#AmountToIndianWords',['amount']],
+        forecast:['zenith.sales.SalesForecastServices.forecast#Sales',['organizationPartyId','horizonDays','lookbackDays','categoryName']],
+        serviceItem:['zenith.sales.SalesInvoiceServices.add#InvoiceItem',['invoiceId','productId','quantity','unitAmount','discountPercent']],
+        register:['zenith.sales.DeliveryChallanServices.register#Warranty',['warrantyPolicyId','customerPartyId','productId','purchaseDate']]
+    ]
+    def call=calls[ec.web.parameters.op]
+    if (!call) { ec.web.response.setStatus(400); ec.web.sendJsonResponse([denied:true]); return }
+    def params=[:]
+    call[1].each { name -> if(ec.web.parameters.containsKey(name)) params[name]=ec.web.parameters[name] }
+    if(params.items instanceof String) params.items=new groovy.json.JsonSlurper().parseText(params.items)
+    // Only the dedicated synthetic account can call this fixed service allowlist in this disposable JVM.
+    def result=ec.service.sync().name(call[0]).parameters(params).call()
+    def allowed=['invoiceId','paymentLinkId','paymentUrl','upiString','warrantyClaimId','warrantyRegId','commissionTxnId','commissionAmount','statusId','amountInWords','historyDays','avgDaily','projectedNext7','projectedHorizon','confidencePct','points','narrative']
+    def publicResult=[:];allowed.each { if(result?.containsKey(it)) publicResult[it]=result[it] }
+    def errors=new ArrayList(ec.message.errors)
+    // Capture the rejection for the harness. The service has already marked its transaction
+    // rollback-only; clearing display errors does not authorize or commit a rejected write.
+    ec.message.clearErrors()
+    ec.web.sendJsonResponse([result:publicResult,errors:errors])
+]]></script></actions><default-response type="none"/></transition>
+<transition name="sopFixtures"><actions><script><![CDATA[
+    if (System.getProperty('sales.qa.disposable') != 'true' || ec.user.username != 'sales.qa' ||
+            ec.entity.find('mantle.account.invoice.Invoice').condition('invoiceId','SALES_QA_SOP_HISTORY_1').count()) {
+        ec.web.response.setStatus(403); ec.web.sendJsonResponse([denied:true]); return
+    }
+    // Fixed synthetic IDs only. Completed sales have a daily value of 100; drafts and
+    // cancelled documents are large deliberately so accidentally including them is obvious.
+    def today=java.time.LocalDate.now(java.time.ZoneId.of('Asia/Kolkata'))
+    (1..21).each { d ->
+        ['HISTORY':'InvoiceFinalized','DRAFT':'InvoiceInProcess','CANCEL':'InvoiceCancelled'].each { key, status ->
+            ec.entity.makeValue('mantle.account.invoice.Invoice').setAll([
+                invoiceId:'SALES_QA_SOP_'+key+'_'+d,fromPartyId:'SALES_QA_A',toPartyId:'SALES_QA_CUST_A',
+                invoiceTypeEnumId:'InvoiceSales',statusId:status,currencyUomId:'INR',
+                invoiceDate:java.sql.Timestamp.valueOf(today.minusDays(d).atTime(12,0)),
+                totalTaxableAmount:(key=='HISTORY'?100:9999),invoiceTotal:(key=='HISTORY'?100:9999),
+                totalTaxAmount:0,roundOffAmount:0]).create()
+        }
+    }
+    ec.entity.makeValue('mantle.account.invoice.Invoice').setAll([
+        invoiceId:'SALES_QA_SOP_NOTE',fromPartyId:'SALES_QA_A',toPartyId:'SALES_QA_CUST_A',
+        invoiceTypeEnumId:'InvoiceSalesReturn',statusId:'InvoiceInProcess',currencyUomId:'INR',
+        invoiceDate:java.sql.Timestamp.valueOf(today.minusDays(1).atTime(12,0)),
+        originalInvoiceId:'SALES_QA_SOP_HISTORY_1',invoiceTotal:9999]).create()
+    ec.web.sendJsonResponse([initialized:true])
+]]></script></actions><default-response type="none"/></transition>
+<transition name="customerState"><actions><script><![CDATA[
+    if (System.getProperty('sales.qa.disposable') != 'true' || ec.user.username != 'sales.qa' || !(ec.web.parameters.state in ['27','29'])) {
+        ec.web.response.setStatus(403); ec.web.sendJsonResponse([denied:true]); return
+    }
+    ec.entity.find('zenith.erp.tax.TaxRegistration').condition('registrationId','SALES_QA_TAX_INTER').one().set('regionGeoId',ec.web.parameters.state).update()
+    ec.web.sendJsonResponse([changed:true])
+]]></script></actions><default-response type="none"/></transition>
+<transition name="scope"><actions><script><![CDATA[
+    if (System.getProperty('sales.qa.disposable') != 'true' || ec.user.username != 'sales.qa' || !(ec.web.parameters.org in ['SALES_QA_A','SALES_QA_B','_NA_'])) {
+        ec.web.response.setStatus(403);ec.web.sendJsonResponse([denied:true]);return
+    }
+    ec.user.setPreference('ACTIVE_ORGANIZATION',ec.web.parameters.org)
+    ec.user.context.activeOrgId=ec.web.parameters.org
+    ec.user.context.userOrgIds=['SALES_QA_A','SALES_QA_B']
+    ec.user.context.filterOrgIds=['SALES_QA_A','SALES_QA_B']
+    ec.web.sendJsonResponse([changed:true])
+]]></script></actions><default-response type="none"/></transition><widgets/>
+</screen>

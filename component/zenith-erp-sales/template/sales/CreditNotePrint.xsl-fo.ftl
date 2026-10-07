@@ -132,7 +132,7 @@
                     <fo:table-body>
                         <#list invoiceItems as item>
                             <#assign taxable = item.taxableAmount ! ((item.quantity!1)*(item.amount!0))>
-                            <fo:table-row font-size="7.5pt" border-bottom="0.1pt solid gray">
+                            <fo:table-row keep-together.within-page="always" font-size="7.5pt" border-bottom="0.1pt solid gray">
                                 <fo:table-cell padding="2pt" border-right="0.5pt solid black"><fo:block text-align="center">${item_index+1}</fo:block></fo:table-cell>
                                 <fo:table-cell padding="2pt" border-right="0.5pt solid black"><fo:block><@encodeText (item.description)!""/></fo:block><#if (item.discountPercent!0)?number != 0><fo:block font-size="6pt" color="#c0392b">Less ${item.discountPercent}% discount (Rs. <@formatINR item.discountAmount!0/>)</fo:block></#if></fo:table-cell>
                                 <fo:table-cell padding="2pt" border-right="0.5pt solid black"><fo:block text-align="center">${item.hsnSacCode!"-"}</fo:block></fo:table-cell>
@@ -167,6 +167,9 @@
                                 <fo:block font-size="9pt">${amountWords}</fo:block>
                             </fo:table-cell>
                             <fo:table-cell padding="5pt" background-color="#f5f5f5">
+                                <#if (invoice.roundOffAmount!0)?number != 0>
+                                <fo:block font-size="9pt" text-align="right">Round-off (Rs.): <@formatINR invoice.roundOffAmount/></fo:block>
+                                </#if>
                                 <fo:block font-weight="bold" font-size="11pt" text-align="right">Total (Rs.)</fo:block>
                                 <fo:block font-weight="bold" font-size="14pt" text-align="right" margin-top="4pt">
                                     <@formatINR invoice.invoiceTotal!0/>

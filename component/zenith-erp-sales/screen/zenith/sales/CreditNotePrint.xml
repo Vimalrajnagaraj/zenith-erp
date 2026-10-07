@@ -2,13 +2,18 @@
 <screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
         xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
         default-menu-include="false" standalone="true">
+    <always-actions>
+        <service-call name="zenith.sales.SalesAccessServices.get#AuthorizedActiveOrganization" out-map="_salesScope"/>
+        <set field="_salesOrgId" from="_salesScope.activeOrgId"/>
+    </always-actions>
+
 
     <parameter name="invoiceId" required="true"/>
     
     <actions>
-        <set field="activeOrgId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+        <set field="activeOrgId" from="_salesOrgId"/>
         <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="invoice"/>
-        <if condition="activeOrgId &amp;&amp; invoice != null &amp;&amp; invoice.fromPartyId != activeOrgId &amp;&amp; invoice.toPartyId != activeOrgId"><set field="invoice" from="null"/></if>
+        <if condition="invoice != null &amp;&amp; (!activeOrgId || (invoice.fromPartyId != activeOrgId &amp;&amp; invoice.toPartyId != activeOrgId)) &amp;&amp; !ec.user.isInGroup('ADMIN')"><script>throw new org.moqui.context.ArtifactAuthorizationException('Invoice print access denied.')</script><set field="invoice" from="null"/></if>
         
         <set field="invoiceItems" from="[]"/>
         <if condition="invoice != null">
@@ -18,9 +23,9 @@
             </entity-find>
         </if>
 
-        <!-- ZE-POS-009 sweep: same defect as InvoicePrint — the FTL renders item.cgstAmount/sgstAmount/
-             igstAmount and invoice.totalCgst/totalSgst/totalIgst but nothing provided them, and
-             invoice.invoiceTotal (words + Total) excludes tax. Enrich identically (see InvoicePrint.xml). -->
+        <!-- ZE-POS-009 sweep: same as InvoicePrint — the FTL renders item.cgstAmount/sgstAmount/
+             igstAmount and invoice.totalCgst/totalSgst/totalIgst but nothing provided them. Enrich
+             identically (see InvoicePrint.xml). invoice.invoiceTotal is stored tax-INCLUSIVE (grand). -->
         <script><![CDATA[
             if (invoice != null) {
                 def rmode = java.math.RoundingMode.HALF_UP
@@ -32,8 +37,14 @@
                         .condition("referenceType", "InvoiceItem").condition("referenceId", invoice.invoiceId)
                         .condition("referenceSeqId", it0.invoiceItemSeqId).list()
                     // stored totalTaxAmount is authoritative: explicit 0 = tax-off line, ignore stale breakdowns
-                    if (it0.totalTaxAmount != null && ((it0.totalTaxAmount as BigDecimal) == 0)) tlds = null
+                    def storedGst = ((it0.cgstAmount ?: 0) + (it0.sgstAmount ?: 0) + (it0.igstAmount ?: 0)) as BigDecimal
+                    if (it0.totalTaxAmount != null && ((it0.totalTaxAmount as BigDecimal) == 0)) {
+                        tlds = null
+                        m.cgstAmount = 0G; m.sgstAmount = 0G; m.igstAmount = 0G
+                    }
                     if (tlds) {
+                        // Breakdown rows replace the stored split; adding both doubles GST.
+                        m.cgstAmount = 0G; m.sgstAmount = 0G; m.igstAmount = 0G
                         for (tl in tlds) {
                             def nm = (tl.taxName ?: '').toUpperCase()
                             def amt = (tl.taxAmount ?: 0) as BigDecimal
@@ -42,7 +53,10 @@
                             else if (nm.contains('SGST') || nm.contains('UTGST')) { m.sgstAmount = ((m.sgstAmount ?: 0) as BigDecimal) + amt; m.sgstRate = rt }
                             else if (nm.contains('IGST')) { m.igstAmount = ((m.igstAmount ?: 0) as BigDecimal) + amt; m.igstRate = rt }
                         }
-                    } else if (((it0.totalTaxAmount ?: 0) as BigDecimal) > 0) {
+                    } else if (((it0.totalTaxAmount ?: 0) as BigDecimal) > 0 && storedGst != (it0.totalTaxAmount as BigDecimal)) {
+                        // Preserve a complete stored split (including legacy IGST). Infer
+                        // the historical local split only when no complete split exists.
+                        m.cgstAmount = 0G; m.sgstAmount = 0G; m.igstAmount = 0G
                         def itax = (it0.totalTaxAmount ?: 0) as BigDecimal
                         def half = (itax / 2).setScale(2, rmode)
                         m.cgstAmount = half; m.sgstAmount = itax - half
@@ -58,9 +72,10 @@
                 def inv = new LinkedHashMap(invoice)
                 inv.totalCgst = totCgst; inv.totalSgst = totSgst; inv.totalIgst = totIgst
                 def hdrTax = (invoice.totalTaxAmount != null ? invoice.totalTaxAmount : (totCgst + totSgst + totIgst)) as BigDecimal
+                // invoiceTotal is stored tax-INCLUSIVE now (grand); the printed Total adds only round-off.
                 // keep a NULL total NULL (legacy notes render blank words/0 totals exactly as before)
                 if (invoice.invoiceTotal != null || hdrTax != 0G || invoice.roundOffAmount != null)
-                    inv.invoiceTotal = ((invoice.invoiceTotal ?: 0) as BigDecimal) + hdrTax + ((invoice.roundOffAmount ?: 0) as BigDecimal)
+                    inv.invoiceTotal = ((invoice.invoiceTotal ?: 0) as BigDecimal) + ((invoice.roundOffAmount ?: 0) as BigDecimal)
                 // ZE-SETTINGS-001: fill the seller + buyer GSTIN from the party's saved record (org default
                 // TaxRegistration OR active IndiaGstin) so the note shows real GSTINs instead of "Unregistered".
                 // Display-only; no-op if none saved (never fabricated); a genuine stored snapshot still wins.

@@ -2,37 +2,43 @@
 <screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
         xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
         default-menu-title="Warranty" default-menu-index="7">
+    <always-actions>
+        <service-call name="zenith.sales.SalesAccessServices.get#AuthorizedActiveOrganization" out-map="_salesScope"/>
+        <set field="_salesOrgId" from="_salesScope.activeOrgId"/>
+    </always-actions>
+
 
     <transition name="createPolicy">
         <service-call name="zenith.sales.DeliveryChallanServices.create#WarrantyPolicy"/>
         <default-response url="."/>
+        <error-response url="."/>
     </transition>
     <transition name="updatePolicy">
         <actions>
             <!-- ZE-SALES-037: org-guard the write (the list is now org-scoped; block a forged warrantyPolicyId
                  from editing another tenant's policy; super-admin exempt). -->
-            <set field="_org" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-            <entity-find-one entity-name="zenith.erp.sales.WarrantyPolicy" value-field="_pol"/>
-            <if condition="_org &amp;&amp; _pol != null &amp;&amp; _pol.organizationPartyId != _org &amp;&amp; !ec.user.isInGroup('ADMIN')">
-                <then><message error="true">You can only edit your own warranty policies.</message></then>
-                <else><service-call name="update#zenith.erp.sales.WarrantyPolicy" in-map="context"/></else>
-            </if>
+            <service-call name="zenith.sales.SalesAccessServices.assert#RecordOrgAccess" out-map="access" in-map="[entityName:'zenith.erp.sales.WarrantyPolicy',idField:'warrantyPolicyId',idValue:warrantyPolicyId,orgField:'organizationPartyId']"/>
+            <if condition="!access.allowed"><return error="true" message="Warranty policy not found for your account."/></if>
+            <service-call name="update#zenith.erp.sales.WarrantyPolicy" in-map="[warrantyPolicyId:warrantyPolicyId,policyName:policyName]"/>
         </actions>
         <default-response url="."/>
+        <error-response url="."/>
     </transition>
     <transition name="registerWarranty">
         <service-call name="zenith.sales.DeliveryChallanServices.register#Warranty"/>
         <default-response url="."/>
+        <error-response url="."/>
     </transition>
     <transition name="fileClaim">
         <service-call name="zenith.sales.DeliveryChallanServices.file#WarrantyClaim"/>
         <default-response url="."/>
+        <error-response url="."/>
     </transition>
 
     <actions>
         <!-- ZE-SALES-014 f/u (Tier D): scope export to the active org via the owner -->
-        <set field="_expOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-        <set field="_expOwnerIds" from="null"/>
+        <set field="_expOrg" from="_salesOrgId"/>
+        <set field="_expOwnerIds" from="['__NO_SALES_ORGANIZATION__']"/>
         <if condition="_expOrg">
             <entity-find entity-name="mantle.party.Party" list="_expOwnerRows"><econdition field-name="ownerPartyId" from="_expOrg"/><select-field field-name="partyId"/></entity-find>
             <set field="_expOwnerIds" from="_expOwnerRows ? _expOwnerRows.collect{it.partyId} : ['__none__']"/>
@@ -40,21 +46,21 @@
         <entity-find entity-name="zenith.erp.sales.WarrantyPolicy" list="policies">
             <order-by field-name="policyName"/>
             <!-- ZE-SALES-014 f/u: multi-list screen — isolate the policies list too (CSV renders every list) -->
-            <econdition field-name="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+            <econdition field-name="organizationPartyId" from="_salesOrgId ?: '__NO_SALES_ORGANIZATION__'"/>
         </entity-find>
         <entity-find entity-name="zenith.erp.sales.WarrantyRegistration" list="registrations">
-            <search-form-inputs default-order-by="-warrantyStartDate"/>
-            <econdition field-name="customerPartyId" operator="in" from="_expOwnerIds" ignore-if-empty="true"/>
+            <search-form-inputs skip-fields="organizationPartyId,fromPartyId,vendorPartyId,ownerPartyId" default-order-by="-warrantyStartDate"/>
+            <econdition field-name="customerPartyId" operator="in" from="_expOwnerIds"/>
         </entity-find>
         <!-- ZE-SALES-014 f/u (Tier D): scope claims via reg -> customer -> owner (multi-hop; reuses _expOwnerIds) -->
-        <set field="_expClaimRegIds" from="null"/>
+        <set field="_expClaimRegIds" from="['__NO_SALES_ORGANIZATION__']"/>
         <if condition="_expOrg">
             <entity-find entity-name="zenith.erp.sales.WarrantyRegistration" list="_expClaimRegs"><econdition field-name="customerPartyId" operator="in" from="_expOwnerIds"/><select-field field-name="warrantyRegId"/></entity-find>
             <set field="_expClaimRegIds" from="_expClaimRegs ? _expClaimRegs.collect{it.warrantyRegId} : ['__none__']"/>
         </if>
         <entity-find entity-name="zenith.erp.sales.WarrantyClaim" list="claims">
             <order-by field-name="-claimDate"/>
-            <econdition field-name="warrantyRegId" operator="in" from="_expClaimRegIds" ignore-if-empty="true"/>
+            <econdition field-name="warrantyRegId" operator="in" from="_expClaimRegIds"/>
         </entity-find>
     </actions>
 
@@ -114,19 +120,19 @@
                     <field name="warrantyPolicyId"><default-field title="Policy">
                         <drop-down><entity-options key="${warrantyPolicyId}" text="${policyName}">
                             <entity-find entity-name="zenith.erp.sales.WarrantyPolicy">
-                                <econdition field-name="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+                                <econdition field-name="organizationPartyId" from="_salesOrgId ?: '__NO_SALES_ORGANIZATION__'"/>
                             </entity-find>
                         </entity-options></drop-down></default-field></field>
                     <field name="customerPartyId"><default-field title="Customer">
                         <drop-down><entity-options key="${partyId}" text="${organizationName}${firstName ? firstName : ''} ${lastName ? lastName : ''}">
                             <entity-find entity-name="mantle.party.PartyDetail">
-                                <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+                                <econdition field-name="ownerPartyId" from="_salesOrgId ?: '__NO_SALES_ORGANIZATION__'"/>
                             </entity-find>
                         </entity-options></drop-down></default-field></field>
                     <field name="productId"><default-field title="Product">
                         <drop-down><entity-options key="${productId}" text="${productName}">
                             <entity-find entity-name="mantle.product.Product">
-                                <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+                                <econdition field-name="ownerPartyId" from="_salesOrgId ?: '__NO_SALES_ORGANIZATION__'"/>
                             </entity-find>
                         </entity-options></drop-down></default-field></field>
                     <field name="serialNumber"><default-field><text-line size="15"/></default-field></field>
@@ -151,6 +157,18 @@
                 <field name="warrantyStartDate"><default-field title="Start"><display format="dd-MMM-yyyy"/></default-field></field>
                 <field name="warrantyEndDate"><default-field title="End"><display format="dd-MMM-yyyy"/></default-field></field>
                 <field name="statusId"><default-field title="Status"><display text="${ec.entity.find('moqui.basic.StatusItem').condition('statusId', statusId).useCache(true).one()?.description ?: statusId}"/></default-field></field>
+                <field name="fileClaim"><default-field title="Actions">
+                    <section name="FileActiveClaim" condition="modCanWrite &amp;&amp; statusId == 'WrActive' &amp;&amp; warrantyStartDate != null &amp;&amp; warrantyEndDate != null &amp;&amp; warrantyStartDate &lt;= java.sql.Date.valueOf(ec.l10n.format(ec.user.nowTimestamp,'yyyy-MM-dd')) &amp;&amp; warrantyEndDate &gt;= java.sql.Date.valueOf(ec.l10n.format(ec.user.nowTimestamp,'yyyy-MM-dd'))"><widgets>
+                        <container-dialog id="ClaimDialog" button-text="File Claim" button-class="q-btn--flat text-primary">
+                            <form-single name="ClaimForm" transition="fileClaim">
+                                <field name="warrantyRegId"><default-field><hidden default-value="${warrantyRegId}"/></default-field></field>
+                                <field name="issueDescription"><default-field title="Issue"><text-area/></default-field></field>
+                                <field name="submitButton"><default-field><submit text="File Claim"/></default-field></field>
+                            </form-single>
+                        </container-dialog>
+                    </widgets></section>
+                </default-field></field>
+
             </form-list>
         </container>
 
@@ -160,7 +178,7 @@
         </container>
         <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg">
             <form-list name="ClaimsForm" list="claims" skip-form="true" show-csv-button="true">
-                <field name="warrantyClaimId"><default-field title="Claim #"><display/></default-field></field>
+                <field name="claimId"><default-field title="Claim #"><display/></default-field></field>
                 <field name="warrantyRegId"><default-field title="Registration"><display/></default-field></field>
                 <field name="issueDescription"><default-field title="Issue"><display/></default-field></field>
                 <field name="claimDate"><default-field title="Filed"><display format="dd-MMM-yyyy"/></default-field></field>

@@ -17,6 +17,7 @@
             <parameter name="vehicleNumber"/>
             <parameter name="lrNumber"/>
             <parameter name="distanceKm" type="Long"/>
+            <parameter name="isExport" default-value="N"/>
             <parameter name="isReverseCharge" default-value="N"/>
             <parameter name="isSezSupply" default-value="N"/>
             <parameter name="isWithPayment" default-value="N"/>
@@ -40,6 +41,26 @@
             <parameter name="customInvoiceNumber"/>
         </out-parameters>
         <actions>
+            <service-call name="zenith.sales.SalesAccessServices.get#AuthorizedActiveOrganization" out-map="_salesScope"/>
+            <if condition="!organizationPartyId || ((!_salesScope.activeOrgId || organizationPartyId != _salesScope.activeOrgId) &amp;&amp; !ec.user.isInGroup('ADMIN'))">
+                <return error="true" message="Select a valid organization before creating a sales invoice."/>
+            </if>
+            <service-call name="zenith.sales.SalesAccessServices.assert#RecordOrgAccess" out-map="customerAccess" in-map="[entityName:'mantle.party.Party',idField:'partyId',idValue:customerPartyId,orgField:'ownerPartyId']"/>
+            <if condition="!customerAccess.allowed"><return error="true" message="Select a customer from your organization."/></if>
+            <if condition="!items"><return error="true" message="Add at least one billable item before creating an invoice."/></if>
+            <iterate list="items" entry="inputItem">
+                <if condition="inputItem.productId">
+                    <service-call name="zenith.sales.SalesAccessServices.assert#RecordOrgAccess" out-map="productAccess" in-map="[entityName:'mantle.product.Product',idField:'productId',idValue:inputItem.productId,orgField:'ownerPartyId']"/>
+                    <if condition="!productAccess.allowed"><return error="true" message="Select a product from your organization."/></if>
+                </if>
+                <service-call name="zenith.sales.SalesLineServices.validate#LineInput" out-map="_line"
+                    in-map="[quantity:inputItem.quantity, unitAmount:inputItem.unitAmount, discountPercent:inputItem.discountPercent]"/>
+                <if condition="!_line.valid"><return/></if>
+                <if condition="!inputItem.discountPercent &amp;&amp; inputItem.discountAmount != null &amp;&amp; (inputItem.discountAmount &lt; 0 || inputItem.discountAmount &gt; inputItem.quantity * inputItem.unitAmount)">
+                    <return error="true" message="Discount amount must be between zero and the gross line amount."/>
+                </if>
+            </iterate>
+
             <!-- Get company currency -->
             <entity-find-one entity-name="zenith.erp.base.CompanySettings" value-field="currSetting">
                 <field-map field-name="organizationPartyId"/>
@@ -156,16 +177,36 @@
                           in-map="[amount:grandTotal + roundOffAmount, organizationPartyId:organizationPartyId]"
                           out-map="wordsResult" ignore-error="true"/>
 
+            <script><![CDATA[
+                totalCgst=BigDecimal.ZERO; totalSgst=BigDecimal.ZERO; totalIgst=BigDecimal.ZERO
+                // Keep the India line fields and generic persisted tax breakdowns consistent.
+                for (int i=0;i<taxResult.taxedItems.size();i++) {
+                    def taxed=taxResult.taxedItems[i]
+                    def line=ec.entity.find('mantle.account.invoice.InvoiceItem').condition('invoiceId',invoiceId).orderBy('invoiceItemSeqId').list()[i]
+                    def update=[invoiceId:invoiceId,invoiceItemSeqId:line.invoiceItemSeqId]
+                    ['CGST','SGST','IGST'].each { name ->
+                        def parts=(taxed.taxBreakdowns ?: []).findAll { it.taxName?.toUpperCase()?.contains(name) }
+                        def amount=parts.sum { it.taxAmount ?: 0 } ?: BigDecimal.ZERO
+                        def rate=parts.sum { it.taxRate ?: 0 } ?: BigDecimal.ZERO
+                        update[name.toLowerCase()+'Amount']=amount; update[name.toLowerCase()+'Rate']=rate
+                    }
+                    totalCgst+=update.cgstAmount;totalSgst+=update.sgstAmount;totalIgst+=update.igstAmount
+                    ec.service.sync().name('update#mantle.account.invoice.InvoiceItem').parameters(update).call()
+                }
+            ]]></script>
             <!-- Update Invoice header with totals -->
             <service-call name="update#mantle.account.invoice.Invoice"
                           in-map="[invoiceId:invoiceId, customInvoiceNumber:customInvoiceNumber,
                                    financialYearPrefix:financialYearPrefix, documentType:documentType,
+                                   invoiceTotal:grandTotal, unpaidTotal:grandTotal,
                                    totalTaxableAmount:totalTaxableAmount, totalTaxAmount:totalTaxAmount,
+                                   totalCgst:totalCgst, totalSgst:totalSgst, totalIgst:totalIgst,
                                    roundOffAmount:roundOffAmount, amountInWords:wordsResult?.amountInWords,
                                    transporterId:transporterId, transporterName:transporterName,
                                    vehicleNumber:vehicleNumber, lrNumber:lrNumber, distanceKm:distanceKm,
-                                   isReverseCharge:isReverseCharge, isSezSupply:isSezSupply,
+                                   isExport:isExport, isReverseCharge:isReverseCharge, isSezSupply:isSezSupply,
                                    isWithPayment:isWithPayment]"/>
+            <if condition="isExport == 'Y'"><service-call name="zenith.sales.SalesLineServices.refresh#DraftInvoiceTaxes" in-map="[invoiceId:invoiceId]"/></if>
         </actions>
     </service>
 
@@ -184,6 +225,13 @@
             <parameter name="customInvoiceNumber"/>
         </out-parameters>
         <actions>
+            <service-call name="zenith.sales.SalesAccessServices.get#AuthorizedActiveOrganization" out-map="_salesScope"/>
+            <if condition="!organizationPartyId || ((!_salesScope.activeOrgId || organizationPartyId != _salesScope.activeOrgId) &amp;&amp; !ec.user.isInGroup('ADMIN'))">
+                <return error="true" message="Select a valid organization before creating a sales invoice."/>
+            </if>
+
+            <service-call name="zenith.sales.SalesAccessServices.assert#RecordOrgAccess" out-map="customerAccess" in-map="[entityName:'mantle.party.Party',idField:'partyId',idValue:customerPartyId,orgField:'ownerPartyId']"/>
+            <if condition="!customerAccess.allowed"><return error="true" message="Select a customer from your organization."/></if>
             <entity-find-one entity-name="zenith.erp.base.CompanySettings" value-field="currSetting">
                 <field-map field-name="organizationPartyId"/>
                 <field-map field-name="settingKey" value="CURRENCY_UOM_ID"/>
@@ -242,13 +290,27 @@
             <parameter name="invoiceItemSeqId"/>
         </out-parameters>
         <actions>
-            <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="invoice"/>
+            <service-call name="zenith.sales.SalesAccessServices.get#AuthorizedActiveOrganization" out-map="_salesScope"/>
+
+            <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="invoice" for-update="true"/>
             <!-- Org-isolation: re-check ownership by PK before mutating (block cross-tenant IDOR). Sales invoice org = fromPartyId. -->
-            <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-            <if condition="invoice == null || (activeOrg &amp;&amp; invoice.fromPartyId != activeOrg &amp;&amp; !ec.user.isInGroup('ADMIN'))">
+            <set field="activeOrg" from="_salesScope.activeOrgId"/>
+            <if condition="invoice == null || ((!activeOrg || invoice.fromPartyId != activeOrg) &amp;&amp; !ec.user.isInGroup('ADMIN'))">
                 <return error="true" message="Invoice not found for your account."/>
             </if>
 
+            <if condition="invoice.statusId != 'InvoiceInProcess'">
+                <return error="true" message="This invoice has been issued and its line items can no longer be changed."/>
+            </if>
+            <if condition="productId">
+                <service-call name="zenith.sales.SalesAccessServices.assert#RecordOrgAccess" out-map="productAccess" in-map="[entityName:'mantle.product.Product',idField:'productId',idValue:productId,orgField:'ownerPartyId']"/>
+                <if condition="!productAccess.allowed"><return error="true" message="Select a product from your organization."/></if>
+            </if>
+            <service-call name="zenith.sales.SalesLineServices.validate#LineInput" out-map="_line" in-map="[quantity:quantity, unitAmount:unitAmount, discountPercent:discountPercent]"/>
+            <if condition="!_line.valid"><return/></if>
+            <if condition="!discountPercent &amp;&amp; discountAmount != null &amp;&amp; (discountAmount &lt; 0 || discountAmount &gt; quantity * unitAmount)">
+                <return error="true" message="Discount amount must be between zero and the gross line amount."/>
+            </if>
             <set field="lineAmount" from="quantity * unitAmount" type="BigDecimal"/>
             <if condition="discountPercent">
                 <set field="lineDiscount" from="lineAmount * discountPercent / 100" type="BigDecimal"/>
@@ -304,27 +366,16 @@
                                        taxBreakdowns:taxedItem.taxBreakdowns]"/>
             </if>
 
-            <!-- Recalculate invoice totals from all items -->
-            <entity-find entity-name="mantle.account.invoice.InvoiceItem" list="allItems">
-                <econdition field-name="invoiceId"/>
-            </entity-find>
-            <set field="totalTaxableAmount" from="BigDecimal.ZERO" type="BigDecimal"/>
-            <set field="totalTaxAmount" from="BigDecimal.ZERO" type="BigDecimal"/>
-            <iterate list="allItems" entry="ii">
-                <set field="totalTaxableAmount" from="totalTaxableAmount + (ii.taxableAmount ?: BigDecimal.ZERO)"/>
-                <set field="totalTaxAmount" from="totalTaxAmount + (ii.totalTaxAmount ?: BigDecimal.ZERO)"/>
-            </iterate>
-
-            <set field="grandTotal" from="totalTaxableAmount + totalTaxAmount" type="BigDecimal"/>
-            <set field="roundOffAmount" from="grandTotal.setScale(0, java.math.RoundingMode.HALF_UP) - grandTotal" type="BigDecimal"/>
-            <service-call name="zenith.base.LocalizationServices.convert#AmountToWords"
-                          in-map="[amount:grandTotal + roundOffAmount, organizationPartyId:invoice.fromPartyId]"
-                          out-map="wordsResult" ignore-error="true"/>
-
-            <service-call name="update#mantle.account.invoice.Invoice"
-                          in-map="[invoiceId:invoiceId, totalTaxableAmount:totalTaxableAmount,
-                                   totalTaxAmount:totalTaxAmount, roundOffAmount:roundOffAmount,
-                                   amountInWords:wordsResult?.amountInWords]"/>
+            <script><![CDATA[
+                def update=[invoiceId:invoiceId,invoiceItemSeqId:invoiceItemSeqId]
+                ['CGST','SGST','IGST'].each { name ->
+                    def parts=(taxedItem.taxBreakdowns ?: []).findAll { it.taxName==name }
+                    update[name.toLowerCase()+'Amount']=parts.sum { it.taxAmount ?: 0 } ?: BigDecimal.ZERO
+                    update[name.toLowerCase()+'Rate']=parts.sum { it.taxRate ?: 0 } ?: BigDecimal.ZERO
+                }
+                ec.service.sync().name('update#mantle.account.invoice.InvoiceItem').parameters(update).call()
+            ]]></script>
+            <service-call name="zenith.sales.SalesLineServices.refresh#DraftInvoiceTotals" in-map="[invoiceId:invoiceId]"/>
         </actions>
     </service>
 
