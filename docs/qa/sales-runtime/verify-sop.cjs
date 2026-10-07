@@ -30,7 +30,7 @@ module.exports=async function({ctx,p,post,invoke,q,rows,inv,count,check,base,out
    const t=await page(screen+'?'+field+'='+id,shell);check('SOP '+shell+' '+screen+' foreign record hidden',!t.includes(marker)&&/account|access|organization/i.test(t),{status:r.status()});
    await post(screen,'addItem',{[field]:id,productId:'SALES_QA_PROD_A',quantity:'1',unitAmount:'100',amount:'100',taxPercentage:'18'},shell);
    check('SOP '+shell+' '+screen+' foreign write changes no header or line',JSON.stringify(rows(table,where))===before&&count(field==='orderId'?'order_item':'invoice_item',where)===0,{id});
-   const print=field==='orderId'?'OrderPrint':screen==='EditCreditNote'?'CreditNotePrint':'InvoicePrint';const pdf=await ctx.request.get(`${base}/fop/${shell}/zenith/sales/${print}?${field}=${id}`);check('SOP '+shell+' '+print+' foreign print exposes no PDF',pdf.status()>=400||(await pdf.body()).subarray(0,5).toString()!=='%PDF-',{status:pdf.status()});
+   const print=field==='orderId'?'OrderPrint':screen==='EditCreditNote'?'CreditNotePrint':'InvoicePrint';const pdf=await ctx.request.get(`${base}/fop/${shell}/zenith/sales/${print}?${field}=${id}`);check('SOP '+shell+' '+print+' foreign print exposes no PDF',pdf.status()===403&&(await pdf.body()).subarray(0,5).toString()!=='%PDF-',{status:pdf.status()});
   }
   const before=count('invoice',"from_party_id='SALES_QA_A'");await post('CreateCreditNote','createCreditNote',{originalInvoiceId:'SALES_QA_FOREIGN',documentType:'Credit Note'});check('SOP foreign original creates no adjustment',count('invoice',"from_party_id='SALES_QA_A'")===before,{});
  });

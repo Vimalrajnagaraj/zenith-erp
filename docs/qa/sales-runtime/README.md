@@ -34,6 +34,8 @@ Never point it at production or an existing customer database.
 | Register/resolve a warranty | Long month values failed Calendar.add; Filed-to-Resolved was invalid | Use the required integer months and advance through In-Progress |
 | Open a foreign invoice/note | Redacted records left blank forms and template errors | Render only the denial panel for missing/foreign records |
 | Mixed-vendor order | Owning one part authorized shared header/other parts | Deny whole-document actions and exclude mixed orders from lists/dashboard/CSV |
+| Denied Sales print | A 403 status still allowed the FO renderer to produce a PDF | Stop rendering with the framework's authorization exception; return 403 without PDF bytes |
+| Invoice/note list and header amounts | A tax-exclusive value was labelled Total | Label the unchanged sortable stored value Taxable, consistent with CSV |
 | Multi-page PDF | A row's description and amount split across pages | Keep each line's table row together within a page |
 | Invoice/note PDF tax columns | Stored GST plus tax-detail GST was counted twice; rounding was unexplained | Use one tax split, reconcile printed GST to the grand total and display round-off |
 | Empty dashboard chart | The all-zero secondary axis displayed Infinity | Bound zero-data axes and keep labels finite |
