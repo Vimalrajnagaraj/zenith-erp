@@ -16,6 +16,7 @@
     document.querySelectorAll('#zq-subnav a,#z-subnav a').forEach(function(a){var key=new URL(a.href,location.href).pathname.split('/').pop();if(labels[key]&&a.textContent!==labels[key]){a.dataset.catalogOriginalLabel=a.textContent;a.textContent=labels[key];}});
     var input=root.querySelector('input[name="catalogSearch"]');
     if(input){input.placeholder='Search by item code, product name, barcode...'; input.setAttribute('aria-label','Search products by item code, name or barcode');}
+    root.querySelectorAll('.prod-code').forEach(function(a){a.title=a.textContent.trim();});
     var add=root.querySelector('.zc-page-head__actions .q-icon'); if(add&&add.textContent!=='add')add.textContent='add';
     var bootAdd=root.querySelector('#CreateProductDialog-button .fa');if(bootAdd&&!bootAdd.classList.contains('fa-plus'))bootAdd.className='fa fa-plus';
     var card=root.querySelector('.catalog-list'), native=card&&card.querySelector('.form-list-nav-row');
