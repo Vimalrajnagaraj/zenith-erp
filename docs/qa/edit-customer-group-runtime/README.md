@@ -51,3 +51,9 @@ This establishes framework and changed-application-file parity, **not full Linux
 The recorded run's cleanup completed successfully: [cleanup.json](cleanup.json) confirms the task server stopped and both fresh synthetic databases were removed through verified exact file paths. No test records remain in those databases.
 
 Stop the isolated JVM and close its H2 connections. Verify the resolved absolute database target belongs to the disposable runtime prepared for this check, then remove that fresh database's files and any fixture/log files from the external runtime. Do not issue broad prefix deletes against a shared database. The expected IDs are `CITEST_ORG_A`, `CITEST_ORG_B`, `CITEST_A_CUST`, `CITEST_B_CUST`, `CITEST_REL_JD_A`, `CGQA_EMPTY_A`, `CGQA_POPULATED_A` and `CGQA_FOREIGN_B`, plus the fixture's updates to the standard demo account. Removing the entire verified fresh database removes those updates and all seeded records together. Preserve a small cleanup confirmation as review evidence; it must not contain credentials or production data.
+
+## Rebased PostgreSQL verification
+
+The same native browser assertions can use `CGQA_POSTGRES_CONTAINER` instead of H2. The probe accepts only a container labelled `com.docker.compose.project=zenith-pr20-qa`, executes the fixed SELECT-only `postgres-state.sql` for captured synthetic IDs, and requires fixtures before any form actions. HTTP remains restricted to loopback port 18080. Use the clean checksum-pinned staging image with this candidate overlay and the existing fixture in a fresh tmpfs database; remove the entire disposable stack afterwards. Original recorded H2 results remain historical evidence for their named commit. Fresh candidate results are linked in PR #20.
+
+Fresh current-master results: [PostgreSQL rebase verification](POSTGRES-REBASE.md), **199/199 passing**, with zero disposable containers/volumes remaining.

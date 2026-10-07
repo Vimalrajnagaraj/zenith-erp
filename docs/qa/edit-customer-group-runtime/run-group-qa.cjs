@@ -17,6 +17,15 @@ function check(name, ok, detail) {
   if (!ok) throw new Error(name + (detail===undefined?'':': '+JSON.stringify(detail)));
 }
 function queryState() {
+  if (process.env.CGQA_POSTGRES_CONTAINER) {
+    const cid=process.env.CGQA_POSTGRES_CONTAINER;
+    const label=spawnSync('docker',['inspect','--format','{{index .Config.Labels "com.docker.compose.project"}}',cid],{encoding:'utf8',timeout:10000});
+    if(label.status!==0 || label.stdout.trim()!=='zenith-pr20-qa') throw new Error('Disposable PostgreSQL project label required');
+    const sql=fs.readFileSync(path.join(__dirname,'postgres-state.sql'),'utf8');
+    const r=spawnSync('docker',['exec',cid,'psql','-U','moqui','-d','moqui','-v','ON_ERROR_STOP=1','-tAc',sql],{encoding:'utf8',timeout:30000});
+    if(r.status!==0) throw new Error('Read-only PostgreSQL fixture probe failed');
+    return JSON.parse(r.stdout.trim());
+  }
   if (!process.env.CGQA_DB_URL) throw new Error('CGQA_DB_URL is required for database truth before any UI writes');
   if (!process.env.CGQA_H2_JAR && !process.env.CGQA_RUNTIME_DIR) throw new Error('Set CGQA_RUNTIME_DIR or CGQA_H2_JAR for the isolated runtime');
   const h2 = process.env.CGQA_H2_JAR || path.join(process.env.CGQA_RUNTIME_DIR,'WEB-INF','lib','h2-2.4.240.jar');
