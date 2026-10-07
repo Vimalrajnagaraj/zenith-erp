@@ -111,7 +111,7 @@ module.exports=async function({ctx,p,post,invoke,q,rows,inv,count,check,base,out
  await scenario(['SL-033','SL-036','SL-040','SL-041'],'Independent 18% GST goldens and HALF_UP round-off amount words',async()=>{
   for(const [customer,inter] of [['SALES_QA_CUST_A',false],['SALES_QA_CUST_INTER',true]]){
    const id=await createInvoice({toPartyId:customer});await post('EditInvoice','addItem',{invoiceId:id,quantity:'10',amount:'100',taxPercentage:'18'});
-   const h=inv(id);check('SOP '+(inter?'inter':'intra')+' state 18 percent golden',Number(h.total_taxable_amount)===1000&&Number(h.total_cgst)===(inter?0:90)&&Number(h.total_sgst)===(inter?0:90)&&Number(h.total_igst)===(inter?180:0)&&Number(h.invoice_total)+Number(h.total_tax_amount)+Number(h.round_off_amount)===1180,h);
+   const h=inv(id);check('SOP '+(inter?'inter':'intra')+' state 18 percent golden',Number(h.total_taxable_amount)===1000&&Number(h.total_cgst)===(inter?0:90)&&Number(h.total_sgst)===(inter?0:90)&&Number(h.total_igst)===(inter?180:0)&&Number(h.invoice_total)+Number(h.round_off_amount)===1180,h);
    const pdf=await ctx.request.get(`${base}/fop/apps/zenith/sales/InvoicePrint?invoiceId=${id}`),file=path.join(out,'SOP-'+(inter?'IGST':'CGST')+'-invoice.pdf');fs.writeFileSync(file,await pdf.body());
    const text=JSON.parse(cp.execFileSync(process.env.SALES_QA_PYTHON||'python3',[path.join(__dirname,'inspect-pdf.py'),file,'--text'],{encoding:'utf8',windowsHide:true,timeout:30000})).text;
    check('SOP '+(inter?'inter':'intra')+' PDF GST golden',pdf.status()===200&&text.includes('Taxes Rs. 180.00')&&text.includes('Total Rs. 1,180.00')&&(inter?text.includes('Rs. 180.00 (18%)'):text.split('Rs. 90.00 (9%)').length===3),{tax:180,total:1180});
