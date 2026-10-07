@@ -44,7 +44,9 @@ deployment claim. Never reuse a database containing customer records.
 - Concurrent completion numbers and synthetic-only amendment validation, linked
   invoice totals, tax detail and audit. No production issued bill is amended.
 - Tenant service/detail/receipt denial, CSRF, cashier permissions, child report
-  rendering, one search-add POST, active till layouts and both app shells.
+  rendering, one search-add POST, active till layouts and both app shells. Normal
+  and Advanced layouts retain cart height, contain wrapped headers and scroll
+  to both the cart and payment controls at five widths; the fullscreen icon uses SVG.
 
 Render checks do not certify every business operation in a screen. Physical QZ
 printers, scales, handheld scanners, external payment providers and Safari dark

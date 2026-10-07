@@ -91,7 +91,7 @@ hardware, external providers and Safari require the owner's environment.
 | PS-111a / 1 | **Bill History while offline** | Pending: not yet fully exercised |
 | PS-112 / 1 | Reports | All report children render; Payment Wise CSV independently reconciles net cash and distinct bills; net-payment PDF renders (other numeric report assertions pending) |
 | PS-113 / 1 | Bill register / audit | Concurrent numbers and synthetic amendment audit assertions |
-| PS-120 / 1 | Terminal on a real till screen | Active terminal at 1920/1366/800/390/320 and 100 general layout combinations |
+| PS-120 / 1 | Terminal on a real till screen | Active Normal/Advanced terminal at 1920/1366/800/390/320; cart height, header containment, scroll-reachable cart/payment controls and SVG fullscreen icon; 100 general layout combinations. Physical till still needs owner acceptance |
 | PS-121 / 1 | **/qapps bounces to /apps** | qapps Terminal renders rich apps redirect |
 | PS-121a / 1 | **Dashboard "Manage" shortcut tiles open** | Pending: not yet fully exercised |
 | PS-122 / 1 | Keyboard shortcuts | Pending: not yet fully exercised |
