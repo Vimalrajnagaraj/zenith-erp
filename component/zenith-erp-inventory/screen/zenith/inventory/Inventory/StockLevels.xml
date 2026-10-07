@@ -5,18 +5,106 @@
 
     <!-- stock-levels §6b: SKU links to the product (sibling EditProduct screen, same as Product List). -->
     <transition name="editProduct"><default-response url="../EditProduct"/></transition>
+    <!-- The deployed Moqui has no XLSX widget renderer. Adapt this screen's CSV output
+         to a real workbook so both exports use precisely the same stock query/valuation. -->
+    <transition name="exportXlsx" read-only="true" require-session-token="false">
+        <actions><script><![CDATA[
+            def csv = ec.screen.makeRender()
+                .rootScreen('component://zenith-erp-inventory/screen/zenith/inventory/Inventory/StockLevels.xml')
+                .renderMode('csv').render()
+            def records = org.apache.commons.csv.CSVFormat.DEFAULT.parse(new java.io.StringReader(csv)).records
+            def escape = { value -> groovy.xml.XmlUtil.escapeXml(value ?: '') }
+            def sheet = new StringBuilder('<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>')
+            records.eachWithIndex { record, rowIndex ->
+                sheet.append('<row r="').append(rowIndex + 1).append('">')
+                // Nine data columns; the CSV's empty action column has no place in a workbook.
+                for (int column = 0; column < Math.min(record.size(), 9); column++) {
+                    def value = record.get(column)
+                    def ref = ((char)(65 + column)).toString() + (rowIndex + 1)
+                    if (rowIndex > 0 && column in [4,5,6,7] && value) {
+                        sheet.append('<c r="').append(ref).append('" t="n"><v>')
+                            .append(new java.math.BigDecimal(value.replace(',', '')).toPlainString()).append('</v></c>')
+                    } else {
+                        sheet.append('<c r="').append(ref).append('" t="inlineStr"><is><t xml:space="preserve">')
+                            .append(escape(value)).append('</t></is></c>')
+                    }
+                }
+                sheet.append('</row>')
+            }
+            sheet.append('</sheetData></worksheet>')
+            def files = [
+                '[Content_Types].xml':'<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>',
+                '_rels/.rels':'<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>',
+                'xl/workbook.xml':'<?xml version="1.0"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Stock Levels" sheetId="1" r:id="rId1"/></sheets></workbook>',
+                'xl/_rels/workbook.xml.rels':'<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>',
+                'xl/worksheets/sheet1.xml':sheet.toString()
+            ]
+            def bytes = new java.io.ByteArrayOutputStream()
+            def zip = new java.util.zip.ZipOutputStream(bytes)
+            files.each { path, content ->
+                zip.putNextEntry(new java.util.zip.ZipEntry(path))
+                zip.write(content.getBytes('UTF-8'))
+                zip.closeEntry()
+            }
+            zip.close()
+            ec.web.response.setContentType('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+            ec.web.response.setHeader('Content-Disposition', 'attachment; filename="StockLevelForm.xlsx"')
+            ec.web.response.outputStream.write(bytes.toByteArray())
+        ]]></script></actions>
+        <default-response type="none"/>
+    </transition>
 
     <actions>
-        <!-- ZE-SHOP: default the facility filter to the globally-selected shop (an explicit ?facilityId= wins) -->
-        <script>_stockFac = ec.web.getRequest()?.getParameter('facilityId') ?: null; if (!_stockFac) { try { def _sc = ec.service.sync().name("zenith.base.ShopServices.get#ActiveShopScope").call(); _stockFac = _sc?.activeShopId } catch (Exception _e) {} }</script>
+        <script><![CDATA[
+            // An explicitly empty facility means All Warehouses, even with an active shop.
+            _stockOrgId = ec.user.getPreference('ACTIVE_ORGANIZATION') ?: '__NO_ACTIVE_ORG__'
+            _stockExport = sri.renderMode in ['csv', 'xlsx']
+            stockSearchParams = ec.context + [:]
+            if (_stockExport) {
+                stockSearchParams.putAll([pageNoLimit:'true', pageIndex:null, pageSize:null])
+            }
+            _stockFac = null
+            if (ec.web.requestParameters.containsKey('facilityId')) {
+                _stockFac = ec.web.requestParameters.facilityId?.toString()?.trim() ?: null
+            } else {
+                def scope = ec.service.sync().name('zenith.base.ShopServices.get#ActiveShopScope').call()
+                _stockFac = scope?.activeShopId
+            }
+            if (_stockFac == '__ALL_WAREHOUSES__') _stockFac = null
+            // Keep All selected through native search/sort/page links, which drop empty parameters.
+            stockSearchParams.facilityId = _stockFac
+            context.facilityId = _stockFac ?: '__ALL_WAREHOUSES__'
+            stockPagePath = ec.web.request.requestURI.replaceFirst(/\.(qvt|vuet)$/, '')
+            stockFilterParams = [:]
+            for (name in ['pseudoId', 'productName', 'hsnCode', 'orderByField']) {
+                for (key in [name, name + '_op', name + '_ic', name + '_not']) {
+                    def value = ec.web.requestParameters[key]
+                    if (value instanceof Collection) value = key == 'orderByField' ? value.join(',') : value[0]
+                    if (value != null) stockFilterParams[key] = value.toString()
+                }
+            }
+            def exportParams = new LinkedHashMap(stockFilterParams)
+            exportParams.putAll([facilityId:(_stockFac ?: '__ALL_WAREHOUSES__'), renderMode:'csv',
+                saveFilename:'StockLevelForm.csv', pageNoLimit:'true', lastStandalone:'true'])
+            stockExportUrl = stockPagePath + '?' + exportParams.collect { key, value ->
+                java.net.URLEncoder.encode(key, 'UTF-8') + '=' + java.net.URLEncoder.encode(value, 'UTF-8')
+            }.join('&')
+            stockFilterFields = stockFilterParams.collect { key, value -> [paramName:key, paramValue:value] }
+            stockXlsxUrl = stockPagePath + '/exportXlsx?' +
+                (stockFilterParams + [facilityId:(_stockFac ?: '__ALL_WAREHOUSES__')]).collect { key, value ->
+                    java.net.URLEncoder.encode(key, 'UTF-8') + '=' + java.net.URLEncoder.encode(value, 'UTF-8')
+                }.join('&')
+        ]]></script>
         <entity-find entity-name="zenith.erp.inventory.StockByFacilityView" list="stockList">
-            <search-form-inputs default-order-by="productName,facilityName"/>
+            <search-form-inputs input-fields-map="stockSearchParams" default-order-by="productName,facilityName"/>
             <!-- ZE-SALES-014 f/u: org-isolate CSV/XLSX export (standalone render bypasses the MANTLE_ACTIVE_ORG authz filter) -->
-            <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+            <econdition field-name="ownerPartyId" from="_stockOrgId"/>
+            <econdition field-name="assetOwnerPartyId" from="_stockOrgId"/>
+            <econdition field-name="assetTypeEnumId" value="AstTpInventory"/>
             <econdition field-name="facilityId" from="_stockFac" ignore-if-empty="true"/><!-- ZE-SHOP -->
         </entity-find>
         <entity-find entity-name="mantle.facility.Facility" list="facilityList">
-            <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+            <econdition field-name="ownerPartyId" from="_stockOrgId"/>
             <order-by field-name="facilityName"/></entity-find>
         <set field="currSymbol" value="₹"/>
 
@@ -24,13 +112,15 @@
              filter/pagination). Units/SKU/out/recent come from the grouped view; VALUE is computed
              from Assets directly (see below) — bounded by SKU×store count. -->
         <entity-find entity-name="zenith.erp.inventory.StockByFacilityView" list="allStock">
-            <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+            <econdition field-name="ownerPartyId" from="_stockOrgId"/>
+            <econdition field-name="assetOwnerPartyId" from="_stockOrgId"/>
+            <econdition field-name="assetTypeEnumId" value="AstTpInventory"/>
             <econdition field-name="facilityId" from="_stockFac" ignore-if-empty="true"/><!-- ZE-SHOP -->
         </entity-find>
         <script><![CDATA[
             import org.moqui.entity.EntityCondition
             def ef = ec.entity
-            def _orgId = ec.user.getPreference('ACTIVE_ORGANIZATION')
+            def _orgId = _stockOrgId
 
             // ZE-INV-001 f/u: Stock Value now matches the Inventory Dashboard. The by-facility view's
             // totalValue = sum(acquireCost) is 0 for MRP-priced stock (cost never set) AND it's sum-of-
@@ -44,8 +134,11 @@
             def _aq = ef.find("mantle.product.asset.Asset")
                         .condition("assetTypeEnumId", "AstTpInventory")
                         .condition("quantityOnHandTotal", EntityCondition.GREATER_THAN, 0G)
-            if (_orgId) _aq.condition("ownerPartyId", _orgId)   // mirror the list's org-isolation (CSV standalone render bypasses authz)
+                        .condition("ownerPartyId", _orgId)
+            if (_stockFac) _aq.condition("facilityId", _stockFac)
             for (a in _aq.list()) {
+                def product = ef.find("mantle.product.Product").condition("productId", a.productId).useCache(true).one()
+                if (product?.ownerPartyId != _orgId) continue
                 def qoh = (a.quantityOnHandTotal ?: 0G) as java.math.BigDecimal
                 def vr = a.valuationRate ? (a.valuationRate as java.math.BigDecimal) : null
                 def ac = a.acquireCost ? (a.acquireCost as java.math.BigDecimal) : null
@@ -53,8 +146,7 @@
                 if (rate == null) {
                     def mrp = _mrpCache[a.productId]
                     if (mrp == null) {
-                        def p = ef.find("mantle.product.Product").condition("productId", a.productId).one()
-                        mrp = (p?.mrpAmount ?: 0G) as java.math.BigDecimal
+                        mrp = (product.mrpAmount ?: 0G) as java.math.BigDecimal
                         _mrpCache[a.productId] = mrp
                     }
                     rate = mrp
@@ -65,26 +157,33 @@
                 stockValueByRow[k] = (stockValueByRow[k] ?: 0G) + val
             }
 
-            // units / SKU count / out-of-stock / recently-updated — from the grouped view (unchanged)
+            // Count each product once across warehouses/lots; empty lots do not make an
+            // otherwise stocked product out of stock. Summary stays independent of list search/paging.
             sumQoh = 0.0G
             outCount = 0
             recentCount = 0
-            def _skus = new HashSet()
+            def _productUnits = [:]
+            def _recentSkus = new HashSet()
             def _nowMs = ec.user.nowTimestamp.getTime()
             def _weekMs = 604800000L
             for (def r in allStock) {
                 def q = (r.totalQoh ?: 0)
                 sumQoh = sumQoh + q
-                if (r.productId) _skus.add(r.productId)
-                if (q <= 0) outCount = outCount + 1
-                if (r.lastUpdated != null && (_nowMs - r.lastUpdated.getTime()) < _weekMs) recentCount = recentCount + 1
+                if (r.productId) _productUnits[r.productId] = (_productUnits[r.productId] ?: 0G) + q
+                if (r.lastUpdated != null) {
+                    def age = _nowMs - r.lastUpdated.getTime()
+                    if (age >= 0 && age < _weekMs && r.productId) _recentSkus.add(r.productId)
+                }
             }
-            skuCount = _skus.size()
+            skuCount = _productUnits.values().count { it > 0G }
+            outCount = _productUnits.values().count { it <= 0G }
+            recentCount = _recentSkus.size()
             stockLineCount = allStock.size()
         ]]></script>
     </actions>
 
     <widgets>
+        <section name="StockLevelsInteractive" condition="!_stockExport"><widgets>
         <!-- stock-levels §4: page header — title/subtitle (left) + All Warehouses / Filters / Export (right). -->
         <container style="zc-page-head">
             <container style="zc-page-head__titles">
@@ -92,10 +191,9 @@
                 <label text="Real-time overview of stock availability across all warehouses." type="p" style="text-grey-7 q-mt-xs q-mb-none"/>
             </container>
             <container style="zc-page-head__actions">
-                <!-- All Warehouses = a native GET select (filters ?facilityId= on change; the onchange attribute
-                     survives the /qapps strip). Filters proxies the native Find Options (cpe-tabs.js). Export
-                     proxy-clicks the in-card CSV button (wired via img-onload, cross-surface). -->
-                <render-mode><text type="html,qvt,vuet"><![CDATA[<#assign _cf = (_stockFac)!''><form method="get" style="display:inline-flex;gap:8px;align-items:center;flex-wrap:wrap;margin:0"><span style="display:inline-flex;align-items:center;gap:6px;border:1px solid #E5E7EB;border-radius:8px;padding:5px 10px;background:#fff"><span class="material-icons" style="font-size:17px;color:#7C3AED">home</span><select name="facilityId" onchange="this.form.submit()" style="border:none;background:transparent;outline:none;font-size:13px;color:#111827;font-weight:600"><option value=""<#if _cf==''> selected</#if>>All Warehouses</option><#list (facilityList)![] as f><option value="${f.facilityId}"<#if _cf==f.facilityId> selected</#if>>${f.facilityName!f.facilityId}</option></#list></select></span><button type="button" class="sup-filters-btn"><svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M10 18h4v-2h-4zM3 6v2h18V6zm3 7h12v-2H6z"/></svg>Filters</button><a id="sl-hdr-export" style="display:inline-flex;align-items:center;gap:6px;padding:6px 14px;border-radius:8px;background:#7C3AED;color:#fff;font-weight:600;font-size:13px;text-decoration:none;cursor:pointer"><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path fill="currentColor" d="M5 20h14v-2H5v2zM19 9h-4V3H9v6H5l7 7 7-7z"/></svg>Export</a></form><img alt="" style="display:none" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" onload="(function(){var b=document.getElementById('sl-hdr-export');if(b&&!b.zc){b.zc=1;b.addEventListener('click',function(e){e.preventDefault();var c=[].slice.call(document.querySelectorAll('a,button')).filter(function(x){return (x.textContent||'').replace(/\s+/g,' ').trim()==='CSV';})[0];if(c){c.click();}});}})()"/>]]></text></render-mode>
+                <!-- Warehouse changes preserve search and reset paging. Export is a normal filtered CSV link,
+                     so it also works after SPA navigation without an inline image event handler. -->
+                <render-mode><text type="html,qvt,vuet"><![CDATA[<#assign _cf = (_stockFac)!''><form method="get" style="display:inline-flex;gap:8px;align-items:center;flex-wrap:wrap;margin:0"><#list stockFilterFields as param><input type="hidden" name="${param.paramName?html}" value="${param.paramValue?html}"/></#list><span style="display:inline-flex;align-items:center;gap:6px;border:1px solid #E5E7EB;border-radius:8px;padding:5px 10px;background:#fff"><span class="material-icons" style="font-size:17px;color:#7C3AED">home</span><select name="facilityId" onchange="this.form.submit()" style="border:none;background:transparent;outline:none;font-size:13px;color:#111827;font-weight:600"><option value="__ALL_WAREHOUSES__"<#if _cf==''> selected</#if>>All Warehouses</option><#list (facilityList)![] as f><option value="${f.facilityId?html}"<#if _cf==f.facilityId> selected</#if>>${(f.facilityName!f.facilityId)?html}</option></#list></select></span><button type="button" class="sup-filters-btn"><svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M10 18h4v-2h-4zM3 6v2h18V6zm3 7h12v-2H6z"/></svg>Filters</button><a id="sl-hdr-export" href="${stockExportUrl?html}" style="display:inline-flex;align-items:center;gap:6px;padding:6px 14px;border-radius:8px;background:#7C3AED;color:#fff;font-weight:600;font-size:13px;text-decoration:none;cursor:pointer"><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path fill="currentColor" d="M5 20h14v-2H5v2zM19 9h-4V3H9v6H5l7 7 7-7z"/></svg>Export</a><a href="${stockXlsxUrl?html}" class="btn btn-default">XLSX</a></form>]]></text></render-mode>
             </container>
         </container>
         <!-- XF-001: at-a-glance inventory summary across all products. Layout via .xf-summary-*
@@ -140,10 +238,13 @@
             </container>
         </container>
 
+        </widgets></section>
         <container-box><box-header title="How much stock you have (by store)"/><box-body>
+            <section name="StockLevelsHelp" condition="!_stockExport"><widgets>
             <label text="Each row shows one item at one store. &quot;In Stock&quot; is what you physically have; &quot;Free to Sell&quot; is what is not already reserved for an order." type="p" style="text-grey-7 q-pa-sm q-mb-sm"/>
+            </widgets></section>
             <form-list name="StockLevelForm" list="stockList" skip-form="true" header-dialog="true"
-                       show-csv-button="true" show-xlsx-button="true" show-page-size="true">
+                       show-csv-button="true" show-page-size="true">
                 <!-- ZE-INV-001 f/u: per-row Stock Value from the asset-derived map (keyed product|facility|lot,
                      matching this view's group-by). row-actions runs for screen + CSV/XLSX render alike. -->
                 <row-actions>
@@ -151,13 +252,15 @@
                          from="(stockValueByRow[(productId ?: '') + '|' + (facilityId ?: '') + '|' + (lotId ?: '')] ?: 0G) as java.math.BigDecimal"/>
                     <!-- stock-levels §6b: row-end action (edit the product). -->
                     <script><![CDATA[
-                        slActionsHtml = "<a class='sup-act-edit' href='EditProduct?productId=" + (productId ?: '').toString() + "' title='Edit product' aria-label='Edit product'><svg viewBox='0 0 24 24' width='16' height='16' aria-hidden='true'><path fill='currentColor' d='M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z'/></svg></a>"
+                        def editUrl = stockPagePath + '/editProduct?productId=' + java.net.URLEncoder.encode((productId ?: '').toString(), 'UTF-8')
+                        slActionsHtml = !_stockExport && invCanWrite ? "<a class='sup-act-edit' href='" + editUrl + "' title='Edit product' aria-label='Edit product'><svg viewBox='0 0 24 24' width='16' height='16' aria-hidden='true'><path fill='currentColor' d='M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z'/></svg></a>" : ''
                     ]]></script>
                 </row-actions>
                 <field name="pseudoId">
                     <header-field title="SKU" show-order-by="true"><text-find size="15" hide-options="true"/></header-field>
                     <!-- stock-levels §6b: SKU as a primary-coloured semibold link to the product. -->
-                    <default-field><link url="editProduct" text="${pseudoId}" parameter-map="[productId:productId]" link-type="anchor" style="text-primary text-weight-bold text-decoration-none"/></default-field>
+                    <conditional-field condition="_stockExport"><display text="${pseudoId ?: productId}"/></conditional-field>
+                    <default-field><link url="editProduct" text="${pseudoId ?: productId}" parameter-map="[productId:productId]" link-type="anchor" style="text-primary text-weight-bold text-decoration-none"/></default-field>
                 </field>
                 <field name="productName">
                     <header-field title="Product" show-order-by="true"><text-find size="25" hide-options="true"/></header-field>
@@ -169,7 +272,8 @@
                 </field>
                 <field name="facilityId">
                     <header-field title="Store / Warehouse">
-                        <drop-down allow-empty="true">
+                        <drop-down allow-empty="false">
+                            <option key="__ALL_WAREHOUSES__" text="All Warehouses"/>
                             <list-options list="facilityList" key="${facilityId}" text="${facilityName}"/>
                         </drop-down>
                     </header-field>
@@ -202,14 +306,15 @@
                 <!-- XF-001: surface recently-changed stock (received / sold / adjusted in the last 7 days). -->
                 <field name="lastUpdated">
                     <header-field title="Updated"/>
+                    <conditional-field condition="_stockExport"><display format="dd MMM yy"/></conditional-field>
                     <default-field>
                         <label text="${lastUpdated ? ec.l10n.format(lastUpdated,'dd MMM yy') : '—'}" type="span" style="text-caption text-grey-7"/>
                         <label text="Recent" type="span" style="zenith-badge success q-ml-xs"
-                               condition="lastUpdated != null &amp;&amp; (ec.user.nowTimestamp.time - lastUpdated.time) &lt; 604800000"/>
+                               condition="lastUpdated != null &amp;&amp; (ec.user.nowTimestamp.time - lastUpdated.time) &gt;= 0 &amp;&amp; (ec.user.nowTimestamp.time - lastUpdated.time) &lt; 604800000"/>
                     </default-field>
                 </field>
                 <!-- stock-levels §6b: row-end action cell (pencil -> EditProduct). -->
-                <field name="slAction"><header-field title=""/><default-field><display text="${slActionsHtml}" encode="false"/></default-field></field>
+                <field name="slAction"><header-field title=""/><conditional-field condition="_stockExport"><ignored/></conditional-field><default-field><display text="${slActionsHtml}" encode="false"/></default-field></field>
                 <field name="submitButton"><header-field title="Find"><submit/></header-field></field>
             </form-list>
         </box-body></container-box>
