@@ -35,6 +35,8 @@ try{
  await ctx.close();
  r=await admin.request.post(base+'/apps/zenith/pricing/PriceEngineQaAcceptance/cleanup',{form:{moquiSessionToken:token}});const clean=await r.json();check('Fixture cleanup succeeded',r.status()===200&&clean.removed>0,clean);
  for(const [table,id] of [['party','party_id'],['user_account','user_id'],['party_relationship','party_relationship_id'],['product','product_id'],['price_list','price_list_id'],['price_list_item','price_list_item_id'],['volume_pricing','volume_pricing_id'],['pricing_rule','pricing_rule_id'],['pricing_rule_condition','condition_id']])check('Zero fixture residue '+table,q(`SELECT count(*) n FROM ${table} WHERE ${id} LIKE 'PP_QA_%'`)[0].n==='0');
+
+ for(const [table,where] of [['user_group_member',"user_id='PP_QA_USER'"],['user_preference',"user_id='PP_QA_USER'"],['party_role',"party_id LIKE 'PP_QA_%'"],['person',"party_id LIKE 'PP_QA_%'"],['organization',"party_id LIKE 'PP_QA_%'"],['company_settings',"organization_party_id LIKE 'PP_QA_%'"]])check('Zero auxiliary fixture residue '+table,q(`SELECT count(*) n FROM ${table} WHERE ${where}`)[0].n==='0');
  check('All invoices remain unchanged after cleanup',hash(q('SELECT * FROM invoice ORDER BY invoice_id'))===issuedBefore);
  await admin.close();
 }catch(e){report.failures.push(e.message);process.exitCode=1;}finally{await browser.close();fs.writeFileSync(path.join(out,'report.json'),JSON.stringify(report,null,2));console.log(JSON.stringify({checks:report.checks.length,failures:report.failures.length,out}));}
