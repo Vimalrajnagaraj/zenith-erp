@@ -2,11 +2,15 @@
 # Throwaway passwords, fresh volume, torn down after each run. OpenSearch is omitted to keep the
 # runner light; search-backed screens are therefore out of the render-smoke scope for now.
 #
-# The moqui image is NOT built here — it is the repo's sanitized prebuilt app image, published as
-# the `staging-image-v1` release asset and loaded + tagged zetaerp-moqui:staging by the workflow
-# (the upstream GHCR base is 403-blocked, so we build from a copy we control). The workflow then
-# overlays the checked-out component tree onto it. Up with:
+# The fresh clean runtime is published as `zetaerp-moqui-clean.tar.gz` in the
+# `staging-image-clean-v1` release. The workflow verifies its pinned SHA256 before loading
+# and tagging it zetaerp-moqui:staging, then overlays the checked-out component tree.
+# The container waits until overlays, the single seed loader, and DB assertions finish:
+# this prevents the HTTP JVM and loader from sharing the Bitronix journal/schema concurrently.
+# Up with:
 #   docker compose -f docs/infra/ci/docker-compose.staging.yml up -d
+# After completing the same overlays/seed/assertions as staging-acceptance.yml, start HTTP with:
+#   docker compose -f docs/infra/ci/docker-compose.staging.yml exec moqui touch /tmp/ci-start-moqui
 services:
   db:
     image: postgres:15-alpine
@@ -26,23 +30,11 @@ services:
       retries: 20
 
   moqui:
-    image: zetaerp-moqui:staging         # built by the workflow
+    image: zetaerp-moqui:staging         # clean runtime loaded by the workflow
+    command: ["sh", "-c", "until [ -f /tmp/ci-start-moqui ]; do sleep 1; done; exec /opt/java/openjdk/bin/java -cp . MoquiStart port=8080 no-run-es"]
     depends_on:
       db:
         condition: service_healthy
-    # Hold the container up but DO NOT start the web server until the data load is done; the workflow
-    # touches /tmp/ci-start-web to release it. Web and the `docker exec` load JVM share one Bitronix
-    # tx-log (/opt/moqui/runtime/txlog/btm*.tlog); if web boots first it holds the lock and the load
-    # dies at ECF init ("btm*.tlog is locked"). Web then takes over PID1 via `exec` with the image's
-    # real production command, so its logs still reach `docker compose logs`.
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - |
-        cd /opt/moqui
-        echo "CI: container up, web HELD off until data load completes (waiting for /tmp/ci-start-web)"
-        while [ ! -f /tmp/ci-start-web ]; do sleep 1; done
-        echo "CI: sentinel seen -> starting production web"
-        exec /__cacert_entrypoint.sh java -cp . MoquiStart conf=conf/MoquiProductionConf.xml
     environment:
       - TZ=Asia/Kolkata
       - entity_ds_db_conf=postgres
@@ -51,12 +43,8 @@ services:
       - entity_ds_database=moqui
       - entity_ds_user=moqui
       - entity_ds_password=staging_only  # must match db POSTGRES_PASSWORD
-      # DISABLE OpenSearch. The prebuilt image BAKES `ENV elasticsearch_url=http://opensearch:9200`
-      # (prod has a real deploy-opensearch-1); that host doesn't exist in CI. Setting it EMPTY makes
-      # Moqui skip the elastic cluster entirely (no client), so entity index-on-save is a no-op.
-      # Without this the demo load tolerates the unreachable host (no DataDocuments at cold start)
-      # but a SECOND data load does not — saving a Party then tries to index to the dead host and
-      # throws. Empty = disabled is the clean fix; search-backed screens degrade, render is fine.
+      # CI does not provision OpenSearch. Disable its client explicitly for the loader and HTTP JVM;
+      # search-backed screens stay outside the render-smoke scope.
       - elasticsearch_url=
       - JAVA_TOOL_OPTIONS=-Xms512m -Xmx1792m -Dbitronix.tm.serverId=zetaerp-staging -Duser.timezone=Asia/Kolkata -Ddefault_time_zone=Asia/Kolkata
     ports:
