@@ -1,3 +1,10 @@
+// Receipt values are plain text. Clone/escape at the HTML boundary, preserving numbers.
+window._posReceiptTextData=function receiptText(value){
+    if(typeof value==='string')return value.replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});
+    if(Array.isArray(value))return value.map(receiptText);
+    if(value&&typeof value==='object'){var result={};Object.keys(value).forEach(function(k){result[k]=receiptText(value[k]);});return result;}
+    return value;
+};
 // Signals to Terminal.xml's legacy inline cart engine (the 7171 IIFE) that the
 // optimistic engine in THIS file is present, so it stands down — otherwise on /apps
 // both bind a grid-submit handler and every product tap fires TWO addItem POSTs,
@@ -441,6 +448,7 @@ window._posOffline = (function() {
             });
         }
         function buildHistReceipt(d, isTax) {
+            d=window._posReceiptTextData(d);
             var s = d.store || {}, bi = d.bill || {}, sm = d.summary || {};
             function f2(n) { return Number(n||0).toFixed(2); }
             var h = '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Revised Receipt</title><style>'
@@ -465,7 +473,7 @@ window._posOffline = (function() {
                 h += '<tr><td class="c">' + (i+1) + '</td><td>' + hnm + '</td><td class="c">' + (it.qty + (it.uom ? ' ' + it.uom : '')) + '</td><td class="r">' + f2(it.rate) + '</td><td class="r">' + f2(it.total) + '</td></tr>';
             });
             h += '</tbody></table><div class="sep"></div>';
-            h += '<table><tr><td>Subtotal</td><td class="r">' + f2(sm.subtotal) + '</td></tr>';
+            h += '<table><tr><td>Taxable (after discount)</td><td class="r">' + f2(sm.subtotal) + '</td></tr>';
             if (isTax && Number(sm.tax||0) > 0) h += '<tr><td>Tax</td><td class="r">' + f2(sm.tax) + '</td></tr>';
             h += '</table><div class="sep2"></div>';
             h += '<table><tr><td class="tot">' + (isTax ? 'GRAND TOTAL' : 'TOTAL') + '</td><td class="r tot">' + f2(sm.total) + '</td></tr></table>';
@@ -2387,6 +2395,7 @@ window.posToggleFullscreen = function() {
         }, 400);
 
         function buildReceiptHtml(d, isTax, edited) {
+            d=window._posReceiptTextData(d);
             var s = d.store || {}, bi = d.bill || {}, sm2 = d.summary || {};
             var cs2 = '₹';
             function f2(n) { return Number(n||0).toFixed(2); }
@@ -2438,8 +2447,8 @@ window.posToggleFullscreen = function() {
             html += '<div class="sep"></div>';
             html += '<div style="font-size:10px;margin:2px 0">Total Qty: ' + sm2.totalQty + ' | Items: ' + sm2.itemCount + '</div>';
             html += '<table>';
-            html += '<tr><td>Subtotal</td><td class="r">' + cs2 + f2(sm2.subtotal) + '</td></tr>';
-            if (Number(sm2.discount||0) > 0) html += '<tr><td>Discount</td><td class="r">-' + cs2 + f2(sm2.discount) + '</td></tr>';
+            html += '<tr><td>Taxable (after discount)</td><td class="r">' + cs2 + f2(sm2.subtotal) + '</td></tr>';
+            if (Number(sm2.discount||0) > 0) html += '<tr><td>Discount included</td><td class="r">' + cs2 + f2(sm2.discount) + '</td></tr>';
             if (isTax && Number(sm2.tax||0) > 0) {
                 var halfTax = Number(sm2.tax) / 2;
                 html += '<tr><td>CGST</td><td class="r">' + cs2 + f2(halfTax) + '</td></tr>';
