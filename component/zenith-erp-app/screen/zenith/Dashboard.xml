@@ -8,7 +8,7 @@
     <parameter name="dashDateTo"/>
     <parameter name="dateMode"/>
 
-    <!-- ZE-DASH: switchable widgets + drag-reorder + a date-range filter that scopes the Invoices KPI and drives the Business Activity time series -->
+    <!-- Personal widget visibility, order and size, plus a date filter for sales and cash activity. -->
     <transition name="saveDashLayout">
         <actions><script><![CDATA[
             def _wk = ['insights','kpis','snapshot','activity','modules']
@@ -39,15 +39,11 @@
     </transition>
 
     <actions>
-        <!-- Org isolation: every KPI is scoped to the active organization so a tenant sees ONLY their own data.
-             ignore-if-empty keeps the platform admin (no active org) on the global totals. Fields per entity:
-             party.ownerPartyId, invoice.fromPartyId (sales issuer), OrderHeaderAndPart.vendorPartyId (selling org),
-             product.ownerPartyId. -->
+        <!-- Financial sources require an active organization; no selection never falls back to global totals. -->
         <set field="activeOrgId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+        <set field="activeOrgId" from="activeOrgId == '_NA_' ? null : activeOrgId"/>
 
-        <!-- ZE-DASH date range: normalize + compute the exclusive day bounds BEFORE the counts so the Invoices
-             KPI can scope to the range. Default (no range) leaves dayStart/dayEndExcl null -> ignore-if-empty
-             drops the conditions -> cumulative totals are UNCHANGED (MARUTHI-safe). -->
+        <!-- Normalize the date range and use an exclusive next-day bound, preserving fractional seconds. -->
         <script><![CDATA[
             dateError = ''
             def _parseDay = { value ->
@@ -77,7 +73,6 @@
             def EC = org.moqui.entity.EntityCondition
             def _n = ec.user.nowTimestamp
             def _w1 = new java.sql.Timestamp(_n.time - 7L*86400000L)
-            def _w2 = new java.sql.Timestamp(_n.time - 14L*86400000L)
             homeDataErrors = []
             def _read = { label, source ->
                 try { return activeOrgId ? source() : [] }
@@ -273,38 +268,7 @@
             if (dashDate && dashDateTo == _dwToday && dashDate == _dwYearStart) presetActive = 'year'
             showCustom = (((dateMode ?: '') == 'custom') || (presetActive == 'custom'))
             urlCustom = dashDate ? ("?dateMode=custom&dashDate="+dashDate+"&dashDateTo="+dashDateTo) : "?dateMode=custom"
-            def _acStart; def _acEnd
-            if (dayStart) { _acStart = dayStart; _acEnd = dayEndExcl }
-            else {
-                def _c6 = java.util.Calendar.getInstance(); _c6.setTime(_now); _c6.set(java.util.Calendar.DAY_OF_MONTH,1); _c6.add(java.util.Calendar.MONTH,-5); _acStart = new java.sql.Timestamp(_c6.getTimeInMillis())
-                def _ce2 = java.util.Calendar.getInstance(); _ce2.setTime(_now); _ce2.add(java.util.Calendar.DAY_OF_MONTH,1); _acEnd = new java.sql.Timestamp(_ce2.getTimeInMillis())
-            }
-            def _daily = ((_acEnd.getTime() - _acStart.getTime()) / (1000L*60*60*24)) <= 62
-            def _bfmt = _daily ? new java.text.SimpleDateFormat("yyyy-MM-dd") : new java.text.SimpleDateFormat("yyyy-MM")
-            def _lfmt = _daily ? new java.text.SimpleDateFormat("dd MMM") : new java.text.SimpleDateFormat("MMM yy")
-            def _invs = activeOrgId ? ef.find("mantle.account.invoice.Invoice")
-                                        .condition("fromPartyId", activeOrgId)
-                                        .condition("invoiceTypeEnumId", "InvoiceSales")
-                                        .condition("statusId", EntityCondition.NOT_EQUAL, "InvoiceCancelled")
-                                        .condition("invoiceDate", EntityCondition.GREATER_THAN_EQUAL_TO, _acStart)
-                                        .condition("invoiceDate", EntityCondition.LESS_THAN, _acEnd)
-                                        .selectField("invoiceDate").list() : []
-            def _keys = []; def _labelByKey = [:]; def _cntBy = [:]
-            def _bc = java.util.Calendar.getInstance(); _bc.setTime(_acStart); if (!_daily) _bc.set(java.util.Calendar.DAY_OF_MONTH,1); def _bendMs = _acEnd.getTime(); int _guard = 0
-            while (_bc.getTimeInMillis() < _bendMs && _guard < 400) {
-                def _k = _bfmt.format(_bc.getTime())
-                if (!_labelByKey.containsKey(_k)) { _keys.add(_k); _labelByKey[_k] = _lfmt.format(_bc.getTime()); _cntBy[_k] = 0 }
-                _bc.add(_daily ? java.util.Calendar.DAY_OF_MONTH : java.util.Calendar.MONTH, 1); _guard++
-            }
-            _invs.each { def _k = _bfmt.format(it.invoiceDate); if (_cntBy.containsKey(_k)) _cntBy[_k] = _cntBy[_k] + 1 }
-            def _albls=[]; def _avals=[]
-            _keys.each { _k -> _albls.add("'"+_labelByKey[_k]+"'"); _avals.add(_cntBy[_k]) }
-            acLabelsJson = "["+_albls.join(",")+"]"; acValsJson = "["+_avals.join(",")+"]"
-            acInvCount = _invs.size(); acHasData = _invs.size() > 0
-            acRangeLabel = dashDate ? (dashDate == dashDateTo ? dashDate : (dashDate + " to " + dashDateTo)) : "last 6 months"
-            // ZE-DATEPICKER: label shown on the compact date-range pill (the custom range when active, else a prompt)
-            dwLabel = (showCustom && dashDate) ? acRangeLabel : "Date-wise"
-            invKpiScoped = (dashDate != null && dashDate != '')
+            acRangeLabel = dashDate ? (dashDate == dashDateTo ? dashDate : (dashDate + ' to ' + dashDateTo)) : 'All time'
 
             // ZE-DASH SALES ANALYST (2026-08): two client-switchable views — Weekly (sales ₹ per day, current week)
             // and Today Hourly (sales ₹ per hour today). Metric = finalised InvoiceSales invoiceTotal (SAME basis as
@@ -317,12 +281,16 @@
             def _chartEnd = dayEndExcl
             if (_chartEnd == null) { def c=(java.util.Calendar)_wkCal.clone(); c.add(java.util.Calendar.DAY_OF_MONTH,7); _chartEnd=new java.sql.Timestamp(c.timeInMillis) }
             boolean _monthly = (_chartEnd.time-_chartStart.time)>62L*86400000L
+            boolean _yearly = (_chartEnd.time-_chartStart.time)>400L*31*86400000L
+            def _bucketField = _yearly ? java.util.Calendar.YEAR : (_monthly ? java.util.Calendar.MONTH : java.util.Calendar.DAY_OF_MONTH)
+            def _bucketStep = _yearly ? Math.max(1,(int)Math.ceil((_chartEnd.toLocalDateTime().year-_chartStart.toLocalDateTime().year+1)/399.0)) : 1
             def _bucket = java.util.Calendar.getInstance(); _bucket.setTime(_chartStart)
             if (_monthly) _bucket.set(java.util.Calendar.DAY_OF_MONTH,1)
-            def _labelFmt = new java.text.SimpleDateFormat(_monthly ? 'MMM yy' : (dayStart ? 'dd MMM' : 'EEE'))
+            if (_yearly) _bucket.set(java.util.Calendar.MONTH,0)
+            def _labelFmt = new java.text.SimpleDateFormat(_yearly ? 'yyyy' : (_monthly ? 'MMM yy' : (dayStart ? 'dd MMM' : 'EEE')))
             def _labels=[]; def _values=[]; def _total=BigDecimal.ZERO
             while (_bucket.timeInMillis < _chartEnd.time && _labels.size()<400) {
-                def next=(java.util.Calendar)_bucket.clone(); next.add(_monthly ? java.util.Calendar.MONTH : java.util.Calendar.DAY_OF_MONTH,1)
+                def next=(java.util.Calendar)_bucket.clone(); next.add(_bucketField,_bucketStep)
                 def a=new java.sql.Timestamp(Math.max(_bucket.timeInMillis,_chartStart.time))
                 def b=new java.sql.Timestamp(Math.min(next.timeInMillis,_chartEnd.time))
                 def v=_saSum(a,b); _labels.add(_labelFmt.format(_bucket.time)); _values.add(v); _total+=v; _bucket=next
@@ -352,19 +320,16 @@
             def _hiddenSet = ((_pref != null) ? _pref : _roleHidden).split(',').findAll { it }.toSet()
             showInsights = !_hiddenSet.contains('insights'); showSnapshot = !_hiddenSet.contains('snapshot')
             showKpis = !_hiddenSet.contains('kpis'); showActivity = !_hiddenSet.contains('activity')
-            showQuickactions = !_hiddenSet.contains('quickactions'); showModules = !_hiddenSet.contains('modules')
+            showModules = !_hiddenSet.contains('modules')
             w_insights = showInsights ? 'Y' : ''; w_snapshot = showSnapshot ? 'Y' : ''
             w_kpis = showKpis ? 'Y' : ''; w_activity = showActivity ? 'Y' : ''
-            w_quickactions = showQuickactions ? 'Y' : ''; w_modules = showModules ? 'Y' : ''
+            w_modules = showModules ? 'Y' : ''
             dashOrderCsv = (ec.user.getPreference('HOME_DASH_ORDER') ?: '')
             dashSizeCsv = (ec.user.getPreference('HOME_DASH_SIZE') ?: '')
             urlSettings = dashDate ? ("?dashDate="+dashDate+"&dashDateTo="+dashDateTo+"&showSettings=1") : "?showSettings=1"
         ]]></script>
 
-        <!-- ZE-DASH DATA-RICH: compute the four data widgets (AI Insights, Recent Transactions, Business Health,
-             Top Selling Products) from REAL org-scoped data. Each widget is wrapped in its own try/catch so one
-             failing source never blanks the others. Receivables/overdue come from POS credit bills (invoice.unpaidTotal
-             is unreliable for POS cash sales, which finalise without an applied-payment record). Empty for no-org admin. -->
+        <!-- Supplemental panels share organization-scoped balances and avoid counting linked POS invoices twice. -->
         <script><![CDATA[
             def _EC = org.moqui.entity.EntityCondition
             def _bd = { v -> (v ?: 0) as BigDecimal }
@@ -400,7 +365,7 @@
                 def d=(homeBd(it.payableAmount)-homeBd(it.paidAmount)).max(BigDecimal.ZERO)
                 if (d>0) { _recv+=d; _recvCount++; if (it.entryDate != null && it.entryDate.before(_ts15)) { _overdueAmt+=d; _overdueCount++ } }
             }
-            homeCreditInvoices.each { def u=homeUnpaid(it); _recv+=u; _recvCount++; if (it.dueDate != null && it.dueDate.before(_now2)) { _overdueAmt+=u; _overdueCount++ } }
+            homeCreditInvoices.each { def u=homeUnpaid(it); _recv+=u; _recvCount++; if (it.dueDate != null && it.dueDate.toLocalDateTime().toLocalDate().isBefore(_now2.toLocalDateTime().toLocalDate())) { _overdueAmt+=u; _overdueCount++ } }
 
             // low stock (products at/below reorder point) + GST setup completeness
             // low stock: only among INVENTORY-TRACKED products, and only surfaced when the tenant tracks a
@@ -441,17 +406,19 @@
                 def _sdfR = new java.text.SimpleDateFormat("dd MMM, HH:mm")
                 ec.entity.find("mantle.account.invoice.Invoice").condition("fromPartyId",_org2).condition("invoiceTypeEnumId","InvoiceSales")
                     .condition("statusId",_EC.NOT_EQUAL,"InvoiceCancelled").condition("invoiceDate",_EC.GREATER_THAN_EQUAL_TO,dayStart ?: new java.sql.Timestamp(0L)).condition("invoiceDate",_EC.LESS_THAN,dayEndExcl ?: java.sql.Timestamp.valueOf('9999-12-31 00:00:00')).orderBy("-invoiceDate").orderBy("-lastUpdatedStamp").limit(4).list().each { inv ->
-                    def _u = _bd(inv.unpaidTotal); def _ap = _bd(inv.appliedPaymentsTotal); def _dd = inv.dueDate
+                    def _pos = homePos.find { it.linkedInvoiceId == inv.invoiceId }
+                    def _u = _pos ? (homeBd(_pos.payableAmount)-homeBd(_pos.paidAmount)).max(BigDecimal.ZERO) : homeUnpaid(inv)
+                    def _ap = _pos ? homeBd(_pos.paidAmount) : homeBd(inv.appliedPaymentsTotal); def _dd = inv.dueDate
                     def _st; def _cl
-                    if (_dd != null && _dd.before(_now2) && _u > 0) { _st='Overdue'; _cl='od' }
+                    if (inv.statusId == 'InvoiceInProcess') { _st='Draft'; _cl='dr' }
+                    else if (_dd != null && _dd.toLocalDateTime().toLocalDate().isBefore(_now2.toLocalDateTime().toLocalDate()) && _u > 0) { _st='Overdue'; _cl='od' }
                     else if (_u > 0 && _ap > 0) { _st='Partial'; _cl='pt' }
                     else if (_u > 0) { _st='Pending'; _cl='pd' }
-                    else if (inv.statusId == 'InvoicePmtRecvd') { _st='Paid'; _cl='ok' }
-                    else if (inv.statusId == 'InvoiceInProcess') { _st='Draft'; _cl='dr' }
+                    else if (inv.statusId == 'InvoicePmtRecvd' || (_ap > 0 && _u == 0)) { _st='Paid'; _cl='ok' }
                     else { _st='Completed'; _cl='ok' }
                     recentTx.add([no:(inv.customInvoiceNumber ?: (inv.gstInvoiceNumber ?: inv.invoiceId)),
-                        amt:_fmt(inv.invoiceTotal ?: (_bd(inv.totalTaxableAmount)+_bd(inv.totalTaxAmount))), st:_st, cl:_cl,
-                        date:(inv.invoiceDate != null ? _sdfR.format(inv.invoiceDate) : ''), url:('/apps/zenith/sales/EditInvoice?invoiceId='+inv.invoiceId)])
+                        amt:_fmt(homeInvoiceTotal(inv)), st:_st, cl:_cl,
+                        date:(inv.invoiceDate != null ? _sdfR.format(inv.invoiceDate) : ''), url:('/apps/zenith/sales/EditInvoice?invoiceId='+java.net.URLEncoder.encode(inv.invoiceId,'UTF-8'))])
                 }
             } } catch (Exception e) { recentTx = []; homeDataErrors.add('Recent transactions'); ec.logger.warn('Home dashboard: recent transactions unavailable',e) }
             recentTxHas = !recentTx.isEmpty()
@@ -552,12 +519,17 @@
         <script><![CDATA[
             if (!activeOrgId) { bhHasData=false; aiInsights=[]; aiInsightsHas=false }
             if (homeDataErrors.any { it in ['Sales','POS balances'] }) { bhHasData=false; aiInsights=[]; aiInsightsHas=false }
-            def _uri=ec.web.request.requestURI.replaceAll('/+$','')
+            def _uri=ec.web.request.requestURI.replaceAll('/+$','').replaceFirst(/\.(qvt|vuet|html|json)$/, '')
             if (!_uri.endsWith('/Dashboard')) _uri+='/Dashboard'
+            def _hour=java.util.Calendar.getInstance(); _hour.setTime(ec.user.nowTimestamp)
+            homeGreeting=_hour.get(java.util.Calendar.HOUR_OF_DAY)<12?'Good Morning':(_hour.get(java.util.Calendar.HOUR_OF_DAY)<17?'Good Afternoon':'Good Evening')
+            homeOrgName=activeOrgId ? ec.entity.find('mantle.party.Organization').condition('partyId',activeOrgId).disableAuthz().one()?.organizationName : null
+            homeNav=['Z_SALES','Z_PURCHASE','Z_ACCOUNTING','Z_INVENTORY','Z_HR','Z_SETTINGS'].collect { id -> filteredModules.find { it.id==id } }.findAll { it }.collect { [label:it.name,url:it.url] }
+            if (homeNav.any { it.label=='Accounting' }) homeNav.add(Math.max(0,homeNav.size()-1),[label:'Reports',url:'/apps/zenith/Accounting/ProfitAndLoss'])
             homeRoute=_uri
             homeDashConfig=groovy.json.JsonOutput.toJson([
                 saveUrl:_uri+'/saveDashOrder', token:ec.web.sessionToken, order:dashOrderCsv, sizes:dashSizeCsv,
-                redirect:landingRedirect, customize:showSettings=='1',
+                nav:homeNav, redirect:landingRedirect, customize:showSettings=='1',
                 weekly:[cats:new groovy.json.JsonSlurper().parseText(baWeekLabelsJson), series:new groovy.json.JsonSlurper().parseText(baWeekDataJson), total:baWeekTotal, sub:baWeekLabel],
                 hourly:[cats:new groovy.json.JsonSlurper().parseText(baHourLabelsJson), series:new groovy.json.JsonSlurper().parseText(baHourDataJson), total:baHourTotal, sub:'Today']
             ])
@@ -571,30 +543,31 @@
 <#if !activeOrgId?has_content><div class="home-notice" role="status">Select an organization to view its dashboard.</div></#if>
 <#if homeDataErrors?has_content><div class="home-notice" role="alert">Some dashboard data could not be loaded: ${homeDataErrors?join(', ')?html}. Reload to try again.</div></#if>
 ]]></text></render-mode>
-        <!-- Welcome Header -->
-        <container style="row items-center justify-between q-mb-md zdash-welcome-row">
-            <container>
-                <label text="Welcome to ZetaERP" type="h4" style="text-primary text-weight-bold q-my-none"/>
-                <label text="Enterprise Resource Planning System" type="p" style="text-grey-7 q-mt-xs q-mb-none"/>
-            </container>
-            <container style="row q-gutter-sm">
-                <link url="/apps/zenith/sales/CreateOrder" text="New Order" link-type="anchor" icon="fa fa-plus"
-                      btn-type="primary" style="q-mr-sm"/>
-                <link url="/apps/zenith/sales/CreateInvoice" text="New Invoice" link-type="anchor" icon="fa fa-file-text-o"
-                      btn-type="success" style=""/>
-            </container>
-        </container>
-
-        <!-- ZE-DASH: date-range filter (scopes the Invoices KPI + drives Business Activity) + customize gear -->
-        <container style="q-px-lg q-py-md q-mb-md zenith-card bg-white shadow-1 border-radius-lg zdash-daterow">
-            <render-mode><text type="html,vuet,qvt" template="true"><![CDATA[<div style="display:flex;flex-wrap:wrap;align-items:center;gap:6px;font-family:Segoe UI,Arial,sans-serif"><span style="font-size:11px;font-weight:800;color:#5C6B85;letter-spacing:.05em;margin-right:2px">ACTIVITY RANGE</span><details class="zdash-dr"><summary class="zdash-chip zdash-dr-sum${showCustom?string(' on','')}">&#128197; ${dwLabel} &#9662;</summary><form method="get" action="${homeRoute?html}" class="zdash-dr-pop"><input type="hidden" name="dateMode" value="custom"/><div class="zdash-dr-row"><span>From</span><input type="date" name="dashDate" value="${dashDate}"/></div><div class="zdash-dr-row"><span>To</span><input type="date" name="dashDateTo" value="${dashDateTo}"/></div><button type="submit" class="zdash-dr-apply">&#10003; Apply</button></form></details><a href="${urlAll}" class="zdash-chip${(presetActive=='all' && !showCustom)?string(' on','')}">All time</a><a href="${urlToday}" class="zdash-chip${(presetActive=='today')?string(' on','')}">Today</a><a href="${urlWeek}" class="zdash-chip${(presetActive=='week')?string(' on','')}">This Week</a><a href="${urlMonth}" class="zdash-chip${(presetActive=='month')?string(' on','')}">This Month</a><a href="${url30}" class="zdash-chip${(presetActive=='last30')?string(' on','')}">Last 30 Days</a><a href="${urlYear}" class="zdash-chip${(presetActive=='year')?string(' on','')}">This Year</a><a href="${urlSettings}" title="Customize dashboard widgets" style="margin-left:auto;color:#9C93B4;font-size:16px;line-height:1;text-decoration:none;padding:2px 5px">&#9881;</a></div>]]></text></render-mode>
-            <!-- ZE-DATEPICKER: the old bulky From/To <form-single> is replaced by the compact <details> date-range
-                 pill in the chip row above (native date pickers + GET Apply; floats, so consumes no dashboard height). -->
-        </container>
+        <render-mode><text type="html,vuet,qvt" template="true"><![CDATA[
+<header class="home-page-header">
+  <div class="home-title"><h1>${homeGreeting}, <span aria-hidden="true">👋</span></h1><p>${(homeOrgName!'Select an organization')?html} · Business overview</p></div>
+  <div class="home-header-controls">
+    <a href="${urlSettings?html}" class="home-outline"><span class="material-icons" aria-hidden="true">tune</span>Customize</a>
+    <details class="zdash-dr"><summary class="home-outline"><span class="material-icons" aria-hidden="true">calendar_today</span>${(dashDate?has_content)?string(acRangeLabel,'All time')}<span aria-hidden="true">⌄</span></summary>
+      <form method="get" action="${homeRoute?html}" class="zdash-dr-pop">
+        <input type="hidden" name="dateMode" value="custom"/>
+        <label class="zdash-dr-row">From<input type="date" name="dashDate" value="${dashDate}" required="required"/></label>
+        <label class="zdash-dr-row">To<input type="date" name="dashDateTo" value="${dashDateTo}" required="required"/></label>
+        <button type="submit" class="zdash-dr-apply">Apply range</button>
+      </form>
+    </details>
+    <nav class="home-periods" aria-label="Dashboard date range">
+      <#list [{'key':'all','label':'All time','url':urlAll},{'key':'today','label':'Today','url':urlToday},{'key':'week','label':'This Week','url':urlWeek},{'key':'month','label':'This Month','url':urlMonth},{'key':'year','label':'This Year','url':urlYear}] as period>
+      <a href="${period.url?html}" class="home-period${(presetActive==period.key)?string(' on','')}"<#if presetActive==period.key> aria-current="date"</#if>>${period.label}</a>
+      </#list>
+    </nav>
+  </div>
+</header>
+]]></text></render-mode>
         <section name="DashSettings" condition="showSettings == '1'">
             <widgets>
                 <container style="q-px-lg q-py-md q-mb-md zenith-card bg-white shadow-1 border-radius-lg">
-                    <render-mode><text type="html,vuet,qvt"><![CDATA[<div style="font-size:12.5px;font-weight:800;color:#463D7A;letter-spacing:.04em;margin-bottom:2px">&#9881; CUSTOMIZE DASHBOARD</div><div style="font-size:12px;color:#5C6B85;margin-bottom:8px">Tick the sections you want to see &mdash; saved to your account. Drag the handle on any card to reorder.</div>]]></text></render-mode>
+                    <render-mode><text type="html,vuet,qvt"><![CDATA[<div style="font-size:12.5px;font-weight:800;color:#463D7A;letter-spacing:.04em;margin-bottom:2px">&#9881; CUSTOMIZE DASHBOARD</div><div style="font-size:12px;color:#5C6B85;margin-bottom:8px">Tick the sections you want to see &mdash; saved to your account. Use Move up, Move down or Resize on a section to arrange it.</div>]]></text></render-mode>
                     <form-single name="DashLayoutForm" transition="saveDashLayout">
                         <field name="w_insights"><default-field title="AI Insights (overdue, sales trend, stock, GST)"><check><option key="Y" text=" "/></check></default-field></field>
                         <field name="w_kpis"><default-field title="Financial summary (sales, payables, receivables, cash)"><check><option key="Y" text=" "/></check></default-field></field>
@@ -617,14 +590,14 @@
 <render-mode><text type="html,vuet,qvt" template="true"><![CDATA[
 <div class="zsc-row">
   <#list kpiCards as c>
-  <a class="zsc" href="${c.url}">
+  <#if c.lab=='Total Receivable'><div class="zsc"><#else><a class="zsc" href="${c.url}"></#if>
     <div class="zsc-top">
       <span class="zsc-lab">${c.lab}</span>
       <span class="material-icons zsc-ic" style="background:${c.tintBg};color:${c.tintFg}">${c.icon}</span>
     </div>
     <div class="zsc-num"><#if c.available>&#8377;${c.disp}<#else>Unavailable</#if></div>
     <div class="zsc-sub"><#if c.trend??><span class="zsc-chip ${(c.trend.dir=='up')?string('zsc-up','zsc-dn')}">${(c.trend.dir=='up')?string('&#9650; +','&#9660; ')}${c.trend.pct}%</span><span style="color:#9CA3AF">vs previous period</span><#else><span class="zsc-more">${c.extra?html}</span></#if></div>
-  </a>
+  <#if c.lab=='Total Receivable'><div class="home-receivable-links"><a href="/apps/zenith/sales/FindInvoice">Sales invoices</a><span> · </span><a href="/apps/zenith/pos/CreditBills">POS credits</a></div></div><#else></a></#if>
   </#list>
 </div>
 ]]></text></render-mode>
@@ -664,14 +637,13 @@
         <render-mode><text type="html,vuet,qvt" template="true"><![CDATA[
 <div class="zdh-snap">
   <div class="zdh-card">
-    <div class="zdh-card-h"><span class="zdh-ttl">Recent Transactions</span><a href="/apps/zenith/sales/FindInvoice">View all</a></div>
+    <div class="zdh-card-h"><span class="zdh-ttl">Recent Transactions</span><a href="/apps/zenith/sales/FindInvoice">View All →</a></div>
     <#if recentTxHas>
     <div class="zdh-tx">
       <#list recentTx as tx>
       <a class="zdh-row" href="${tx.url?html}">
-        <div style="flex:1;min-width:0"><div class="zdh-no">${tx.no?html}</div><div class="zdh-dt">${tx.date?html}</div></div>
-        <div class="zdh-amt">${tx.amt?html}</div>
-        <span class="zdh-pill ${tx.cl}">${tx.st}</span>
+        <span class="material-icons home-txn-icon" aria-hidden="true">description</span><div style="flex:1;min-width:0"><div class="zdh-no">${tx.no?html}</div><div class="zdh-dt">${tx.date?html}</div></div>
+        <div class="home-txn-right"><div class="zdh-amt">${tx.amt?html}</div><span class="zdh-pill ${tx.cl}">${tx.st}</span></div>
       </a>
       </#list>
     </div>
@@ -680,7 +652,7 @@
   <div class="zdh-card">
     <div class="zdh-card-h"><span class="zdh-ttl">Business Health</span><#if bhHasData><span class="bh-score"><b>${bhScore}</b>/100</span></#if></div>
     <#if bhHasData>
-    <div class="bh-status" style="background:${bhBg!'#EEF0F5'};color:${bhColor}"><span>${bhLabel}</span><span class="bh-chev">&#9662;</span></div>
+    <div class="bh-status" style="background:${bhBg!'#EEF0F5'};color:${bhColor}"><span>${bhLabel}</span></div>
     <#list bhMetrics as m>
       <div class="bh-row"><span class="bh-mn">${m.name}</span><span class="bh-mv" style="color:${m.fg}"><#if m.sev=='na'>&#8211;<#elseif m.name=='GST' && m.sev!='bad'>&#10003;<#elseif m.sev=='good'>&#9650;<#else>&#9660;</#if> ${m.status}</span></div>
     </#list>
@@ -693,16 +665,16 @@
     <div class="zdh-top">
       <#list topSell as t>
       <div class="zdh-trow">
-        <span class="zdh-rank">${t.rank}</span>
-        <div class="zdh-tmid"><div class="zdh-tn">${t.name?html}</div><div class="zdh-bar"><span style="width:${t.pct}%"></span></div></div>
-        <div class="zdh-tval"><div class="zdh-tv">${t.val?html}</div><div class="zdh-tu">${t.units?html} units</div></div>
+        <span class="zdh-rank">#${t.rank}</span>
+        <div class="zdh-tmid"><div class="zdh-tn">${t.name?html}</div><div class="zdh-tu">${t.units?html} units</div></div>
+        <div class="zdh-tval"><div class="zdh-tv">${t.val?html}</div></div>
       </div>
       </#list>
     </div>
     <#else><div class="zdh-empty">No sales recorded yet.</div></#if>
   </div>
   <div class="zdh-card">
-    <div class="zdh-card-h"><span class="zdh-ttl">Pending Vendor Bills</span><a href="/apps/zenith/Purchase/PurchaseInvoices" style="margin-right:38px">All</a></div>
+    <div class="zdh-card-h"><span class="zdh-ttl">Pending Vendor Bills</span><a href="/apps/zenith/Purchase/PurchaseInvoices" >View All →</a></div>
     <#if homePendingHas>
     <div class="zdh-tx">
       <#list homePendingBills as b>
@@ -727,24 +699,24 @@
 <div class="zdh-orow">
   <div class="zdh-ocard">
     <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:4px">
-      <div style="min-width:0;display:flex;align-items:baseline;gap:9px">
-        <span style="font-size:15px;font-weight:800;color:#2A2340;letter-spacing:.01em">Sales Analyst</span>
-        <span id="baHead" style="font-size:20px;font-weight:800;color:#2563EB;line-height:1">&#8377;0</span>
+      <div class="home-chart-heading">
+        <span class="home-card-title" data-chart-title="true">Sales Analyst</span>
+        <span id="baHead">&#8377;0</span>
       </div>
       <div class="ba-seg" role="group" aria-label="Business activity view">
         <button type="button" class="ba-seg-btn on" aria-pressed="true" data-t="weekly">Weekly</button>
         <button type="button" class="ba-seg-btn" aria-pressed="false" data-t="hourly">Today Hourly</button>
       </div>
     </div>
-    <div id="baSub" style="font-size:11.5px;color:#8A96AB;margin-bottom:6px">This week</div>
+    <div id="baSub">This week</div>
     <div id="homeActivityChart" role="img" aria-label="Sales chart"><p class="zdh-empty">Loading sales chart…</p></div>
   </div>
   <div class="zdh-ocard">
-    <div style="font-size:15px;font-weight:800;color:#2A2340;letter-spacing:.01em;margin-bottom:12px">Quick Actions</div>
+    <div class="home-card-title">Quick Actions</div>
     <div class="zdh-qa">
       <#if !homeTiles?has_content><div class="zdh-empty">No quick actions available for your role and plan.</div></#if>
       <#list homeTiles as t>
-      <a class="zdh-qc" href="${t.url?html}"><span class="material-icons qic">${t.icon}</span>${t.label}</a>
+      <a class="zdh-qc qa-${t.icon}" href="${t.url?html}"><span class="material-icons qic" aria-hidden="true">${t.icon}</span>${t.label}</a>
       </#list>
     </div>
     <#if showModules><a class="zdh-more" href="#dashAllModules">More actions &#8594;</a></#if>
@@ -757,7 +729,7 @@
         <!-- All Modules Grid — RBAC-filtered -->
         <section name="wModules" condition="showModules"><widgets>
         <render-mode><text type="html,vuet,qvt"><![CDATA[<div class="dash-widget" data-wkey="modules"><div class="dash-handle" title="Drag to reorder">&#8942;&#8942;</div>]]></text></render-mode>
-        <container id="dashAllModules" style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg">
+        <container id="dashAllModules" style="home-modules">
             <label text="All Modules" type="h5" style="text-dark text-weight-bold q-mb-md"/>
             <container style="row q-col-gutter-md">
                 <section-iterate name="ModuleGrid" list="filteredModules" entry="mod">

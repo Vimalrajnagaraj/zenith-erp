@@ -2,12 +2,33 @@
 (function () {
   'use strict';
   var initialized = new WeakSet();
+  var navRoot;
+  function chrome(root) {
+    var nav = document.getElementById('homePrimaryNav');
+    if (nav && navRoot !== root) { nav.remove(); nav = null; }
+    if (!root) { if (nav) nav.remove(); return; }
+    if (nav) return;
+    var search = document.getElementById('zq-search') || document.getElementById('z-search');
+    if (!search) return;
+    var cfg;
+    try { cfg = JSON.parse(root.dataset.config); } catch (error) { return; }
+    nav = document.createElement('nav'); nav.id = 'homePrimaryNav'; nav.setAttribute('aria-label', 'Primary modules');
+    [{ label: 'Dashboard', url: '/apps/zenith/Dashboard' }].concat(cfg.nav || []).forEach(function (item, index) {
+      var link = document.createElement('a'); link.textContent = item.label;
+      link.href = item.url.replace('/apps/', location.pathname.startsWith('/qapps/') ? '/qapps/' : '/apps/');
+      if (index === 0) link.setAttribute('aria-current', 'page');
+      nav.appendChild(link);
+    });
+    search.before(nav);
+    navRoot = root;
+  }
   function boot() {
     var root = document.getElementById('homeDashboard');
+    chrome(root);
     if (!root || initialized.has(root)) return;
     var chart = root.querySelector('#homeActivityChart');
     var status = root.querySelector('#homeLayoutStatus');
-    if (!status || !chart) return; // Wait for the complete SPA fragment.
+    if (!status) return; // Wait for the complete SPA fragment, including when the chart is hidden.
     initialized.add(root);
     var config;
     try { config = JSON.parse(root.dataset.config); } catch (error) { status.textContent = 'Dashboard settings could not be loaded.'; return; }
@@ -45,10 +66,18 @@
         }
       });
       if (!hourly && points.length) {
-        var path = points.map(function (p, index) { return (index ? 'L' : 'M') + p.join(','); }).join(' ');
-        svg.appendChild(svgNode('path', { d: path + ' L' + points[points.length - 1][0] + ',200 L' + points[0][0] + ',200 Z', fill: '#3B82F6', 'fill-opacity': 0.08 }));
+        var path = points.map(function (p, index) {
+          if (!index) return 'M' + p.join(',');
+          var previous = points[index - 1], middle = (previous[0] + p[0]) / 2;
+          return 'C' + middle + ',' + previous[1] + ' ' + middle + ',' + p[1] + ' ' + p.join(',');
+        }).join(' ');
+        var defs = svgNode('defs', {}), gradient = svgNode('linearGradient', { id: 'homeSalesGradient', x1: 0, y1: 0, x2: 0, y2: 1 });
+        gradient.appendChild(svgNode('stop', { offset: '0%', 'stop-color': '#3B82F6', 'stop-opacity': 0.12 }));
+        gradient.appendChild(svgNode('stop', { offset: '100%', 'stop-color': '#3B82F6', 'stop-opacity': 0.01 }));
+        defs.appendChild(gradient); svg.appendChild(defs);
+        svg.appendChild(svgNode('path', { d: path + ' L' + points[points.length - 1][0] + ',200 L' + points[0][0] + ',200 Z', fill: 'url(#homeSalesGradient)' }));
         svg.appendChild(svgNode('path', { d: path, fill: 'none', stroke: '#2563EB', 'stroke-width': 3, 'stroke-linejoin': 'round' }));
-        points.forEach(function (p) { svg.appendChild(svgNode('circle', { cx: p[0], cy: p[1], r: 4, fill: '#2563EB', stroke: 'white', 'stroke-width': 2.5 })); });
+        points.forEach(function (p) { svg.appendChild(svgNode('circle', { cx: p[0], cy: p[1], r: 5, fill: '#2563EB', stroke: 'white', 'stroke-width': 2.5 })); });
       }
       chart.replaceChildren(svg);
       chart.setAttribute('aria-label', svg.getAttribute('aria-label'));
@@ -59,12 +88,24 @@
       root.querySelectorAll('.ba-seg-btn').forEach(function (button) { var active = button.dataset.t === view; button.classList.toggle('on', active); button.setAttribute('aria-pressed', String(active)); });
     }
     root.querySelectorAll('.ba-seg-btn').forEach(function (button) { button.addEventListener('click', function () { draw(button.dataset.t); }); });
-    draw('weekly');
+    if (chart) draw('weekly');
     // Keep raw HTML links on the current mount; the POS terminal intentionally uses /apps.
     if (location.pathname.startsWith('/qapps/')) root.querySelectorAll('a[href^="/apps/"]').forEach(function (link) {
       if (!link.pathname.endsWith('/pos/Terminal')) link.setAttribute('href', link.getAttribute('href').replace('/apps/', '/qapps/'));
     });
+    if (location.pathname.startsWith('/qapps/')) {
+      config.saveUrl = config.saveUrl.replace('/apps/', '/qapps/');
+      root.querySelectorAll('form[action^="/apps/"]').forEach(function (form) { form.action = form.getAttribute('action').replace('/apps/', '/qapps/'); });
+    }
+    // Moqui can carry same-named dashboard parameters into module links. They belong to this page.
+    root.querySelectorAll('a[href]').forEach(function (link) {
+      var target = new URL(link.href, location.href);
+      if (target.origin !== location.origin || /\/zenith(?:\/Dashboard)?\/?$/.test(target.pathname)) return;
+      ['showSettings', 'dashDate', 'dashDateTo', 'dateMode'].forEach(function (key) { target.searchParams.delete(key); });
+      link.href = target.pathname + target.search + target.hash;
+    });
     var widgets = Array.from(root.querySelectorAll('.dash-widget'));
+    if (!widgets.length) status.textContent = 'All dashboard sections are hidden. Use Customize to show them again.';
     var wrap = document.createElement('div'); wrap.className = 'home-widgets';
     if (widgets.length) widgets[0].before(wrap);
     var order = (config.order || 'kpis,activity,snapshot,insights,modules').split(',');
