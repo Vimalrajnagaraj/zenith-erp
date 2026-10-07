@@ -26,7 +26,7 @@ function check(name,ok,evidence){report.checks.push({name,passed:!!ok,evidence})
 function rows(table,where){return q(`SELECT * FROM ${table} WHERE ${where}`)}
 function count(table,where){return Number(q(`SELECT count(*) AS n FROM ${table} WHERE ${where}`)[0].n)}
 function inv(id){return rows('invoice',`invoice_id='${id}'`)[0]}
-function totals(name,id,taxable,cgst,sgst,igst){const i=inv(id);check(name,Number(i.invoice_total)===taxable&&Number(i.total_taxable_amount)===taxable&&Number(i.total_cgst)===cgst&&Number(i.total_sgst)===sgst&&Number(i.total_igst)===igst&&Number(i.total_tax_amount)===cgst+sgst+igst,{invoiceTotal:i.invoice_total,taxable:i.total_taxable_amount,cgst:i.total_cgst,sgst:i.total_sgst,igst:i.total_igst,tax:i.total_tax_amount});}
+function totals(name,id,taxable,cgst,sgst,igst){const i=inv(id);check(name,Number(i.invoice_total)===taxable+cgst+sgst+igst&&Number(i.total_taxable_amount)===taxable&&Number(i.total_cgst)===cgst&&Number(i.total_sgst)===sgst&&Number(i.total_igst)===igst&&Number(i.total_tax_amount)===cgst+sgst+igst,{invoiceTotal:i.invoice_total,taxable:i.total_taxable_amount,cgst:i.total_cgst,sgst:i.total_sgst,igst:i.total_igst,tax:i.total_tax_amount});}
 (async()=>{
  const executable=process.env.SALES_QA_CHROME||'C:/Program Files/Google/Chrome/Application/chrome.exe';
  for(let attempt=0;;attempt++){
@@ -65,7 +65,7 @@ function totals(name,id,taxable,cgst,sgst,igst){const i=inv(id);check(name,Numbe
    await post('EditOrder','addItem',{orderId:'SALES_QA_FREE_ORDER',productId:'SALES_QA_PROD_A',quantity:'1',unitAmount:'0'},shell);
    const free=rows('order_item',"order_id='SALES_QA_FREE_ORDER'");check(shell+' order explicit zero price remains free',free.length>0&&free.every(x=>Number(x.unit_amount)===0),free.map(x=>({quantity:x.quantity,amount:x.unit_amount})));
   }
-  const partial=inv('SALES_QA_CASH');check('synthetic partial-payment baseline is consistent',Number(partial.invoice_total)===900&&Number(partial.total_tax_amount)===162&&Number(partial.applied_payments_total)===100&&count('payment',"for_invoice_id='SALES_QA_CASH'")===1,{taxable:partial.invoice_total,tax:partial.total_tax_amount,applied:partial.applied_payments_total});
+  const partial=inv('SALES_QA_CASH');check('synthetic partial-payment baseline is consistent',Number(partial.invoice_total)===1062&&Number(partial.total_tax_amount)===162&&Number(partial.applied_payments_total)===100&&count('payment',"for_invoice_id='SALES_QA_CASH'")===1,{taxable:partial.invoice_total,tax:partial.total_tax_amount,applied:partial.applied_payments_total});
   await post('EditInvoice','markPaidCash',{invoiceId:'SALES_QA_CASH'});
   await post('EditInvoice','markPaidCash',{invoiceId:'SALES_QA_CASH'},'qapps');
   const cash=inv('SALES_QA_CASH'),cashRows=rows('payment',"for_invoice_id='SALES_QA_CASH'");
