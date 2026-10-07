@@ -2,26 +2,33 @@
 <screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
         xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
         default-menu-title="Quotation" default-menu-include="false">
+    <always-actions>
+        <service-call name="zenith.sales.SalesAccessServices.get#AuthorizedActiveOrganization" out-map="_salesScope"/>
+        <set field="_salesOrgId" from="_salesScope.activeOrgId"/>
+    </always-actions>
+
 
     <parameter name="orderId" required="true"/>
 
     <transition name="findQuotation"><default-response url="../FindQuotation"/></transition>
     <transition name="updateStatus">
         <actions>
-            <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" in-map="[entityName:'mantle.order.OrderPart', idField:'orderId', idValue:orderId, orgField:'vendorPartyId']" out-map="_acc"/>
+            <service-call name="zenith.sales.SalesAccessServices.assert#RecordOrgAccess" in-map="[entityName:'mantle.order.OrderPart', idField:'orderId', idValue:orderId, orgField:'vendorPartyId']" out-map="_acc"/>
             <if condition="!_acc.allowed"><return error="true" message="You do not have access to this record."/></if>
-            <service-call name="update#mantle.order.OrderHeader" in-map="context"/>
+            <service-call name="update#mantle.order.OrderHeader" in-map="[orderId:orderId,statusId:statusId]"/>
         </actions>
         <default-response url="."/>
+        <error-response url="."/>
     </transition>
 
     <transition name="updateTerms">
         <actions>
-            <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" in-map="[entityName:'mantle.order.OrderPart', idField:'orderId', idValue:orderId, orgField:'vendorPartyId']" out-map="_acc"/>
+            <service-call name="zenith.sales.SalesAccessServices.assert#RecordOrgAccess" in-map="[entityName:'mantle.order.OrderPart', idField:'orderId', idValue:orderId, orgField:'vendorPartyId']" out-map="_acc"/>
             <if condition="!_acc.allowed"><return error="true" message="You do not have access to this record."/></if>
-            <service-call name="update#mantle.order.OrderPart" in-map="context"/>
+            <service-call name="update#mantle.order.OrderPart" in-map="[orderId:orderId,orderPartSeqId:orderPartSeqId,validThruDate:validThruDate,tradeTermEnumId:tradeTermEnumId,settlementTermId:settlementTermId]"/>
         </actions>
         <default-response url="."/>
+        <error-response url="."/>
     </transition>
 
     <transition name="addItem">
@@ -31,11 +38,11 @@
         <actions>
             <!-- ZE-SB-013 (Tier 2): the line-item product must belong to this org. -->
             <if condition="ec.web.parameters.productId">
-                <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" out-map="_pa"
+                <service-call name="zenith.sales.SalesAccessServices.assert#RecordOrgAccess" out-map="_pa"
                               in-map="[entityName:'mantle.product.Product', idField:'productId', idValue:ec.web.parameters.productId, orgField:'ownerPartyId']"/>
                 <if condition="!_pa.allowed"><return error="true" message="Please select a valid product from your account."/></if>
             </if>
-            <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" in-map="[entityName:'mantle.order.OrderPart', idField:'orderId', idValue:orderId, orgField:'vendorPartyId']" out-map="_acc"/>
+            <service-call name="zenith.sales.SalesAccessServices.assert#RecordOrgAccess" in-map="[entityName:'mantle.order.OrderPart', idField:'orderId', idValue:orderId, orgField:'vendorPartyId']" out-map="_acc"/>
             <if condition="!_acc.allowed"><return error="true" message="You do not have access to this record."/></if>
         <script>
             // Get addresses to determine IGST vs CGST/SGST
@@ -67,10 +74,13 @@
                 isInterstate = true
             }
 
-            def qty = new BigDecimal(quantity ?: 0)
-            def price = new BigDecimal(unitAmount ?: 0)
+            def _line = ec.service.sync().name("zenith.sales.SalesLineServices.validate#LineInput")
+                    .parameters([quantity:quantity, unitAmount:unitAmount, discountPercent:(discountPercent), taxPercentage:taxPercentage]).call()
+                if (!_line?.valid) return
+                def qty = _line.quantityValue
+                def price = _line.unitAmountValue
             // Sync price with Inventory and Pricing: auto-fill when the user leaves Unit Price blank
-            if (price.signum() == 0 &amp;&amp; productId) {
+            if ((unitAmount == null || unitAmount.toString().trim() == '') &amp;&amp; productId) {
                 try {
                     def _pr = ec.service.sync().name("zenith.pricing.PricingServices.calculate#Price")
                                 .parameters([productId:productId, quantity:(qty.signum()>0?qty:1), organizationPartyId:orderPart.vendorPartyId, customerPartyId:orderPart.customerPartyId]).call()
@@ -83,10 +93,10 @@
             }
             // ZE-SALES-020 f/u (SL-042): line discount — GST is charged on the DISCOUNTED taxable value.
             def gross = qty.multiply(price)
-            def discPct = new BigDecimal(discountPercent ?: 0)
+            def discPct = _line.discountPercentValue
             def discAmt = gross.multiply(discPct).divide(new BigDecimal(100), 2, java.math.RoundingMode.HALF_UP)
             def taxableVal = gross.subtract(discAmt)
-            def taxPct = new BigDecimal(taxPercentage ?: 0)
+            def taxPct = _line.taxPercentageValue
 
             def igstRate = 0.0
             def cgstRate = 0.0
@@ -95,7 +105,7 @@
             def cgstAmount = 0.0
             def sgstAmount = 0.0
 
-            if (taxPct > 0) {
+            if (taxPct > 0 &amp;&amp; orderHeader?.isReverseCharge != 'Y' &amp;&amp; orderHeader?.isExport != 'Y') {
                 if (isInterstate) {
                     igstRate = taxPct
                     igstAmount = taxableVal.multiply(taxPct).divide(new BigDecimal(100), 2, java.math.RoundingMode.HALF_UP)
@@ -109,24 +119,28 @@
 
             // Call standard create item service
             def inMap = context + [
+                    quantity: qty,
                 orderPartSeqId: orderPart.orderPartSeqId,
                 unitAmount: price,
                 taxableAmount: taxableVal,
                 discountPercent: discPct, discountAmount: discAmt,
                 igstRate: igstRate, igstAmount: igstAmount,
-                cgstRate: cgstRate, cgstAmount: cgstAmount,
+                totalTaxAmount:cgstAmount+sgstAmount+igstAmount,
+                    cgstRate: cgstRate, cgstAmount: cgstAmount,
                 sgstRate: sgstRate, sgstAmount: sgstAmount
             ]
             ec.service.sync().name("mantle.order.OrderServices.create#OrderItem").parameters(inMap).call()
         </script>
         </actions>
         <default-response url="."/>
+        <error-response url="."/>
     </transition>
     
     <transition name="createRevision">
         <actions>
+            <if condition="!_salesOrgId"><return error="true" message="Select an organization before creating a Sales document."/></if>
         <!-- Clone the current order -->
-        <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" in-map="[entityName:'mantle.order.OrderPart', idField:'orderId', idValue:orderId, orgField:'vendorPartyId']" out-map="_acc"/>
+        <service-call name="zenith.sales.SalesAccessServices.assert#RecordOrgAccess" in-map="[entityName:'mantle.order.OrderPart', idField:'orderId', idValue:orderId, orgField:'vendorPartyId']" out-map="_acc"/>
         <if condition="!_acc.allowed"><return error="true" message="You do not have access to this record."/></if>
         <service-call name="mantle.order.OrderServices.clone#Order" in-map="[baseOrderId:orderId]" out-map="cloneOut"/>
         <script>
@@ -144,6 +158,7 @@
         </script>
         </actions>
         <default-response url="." parameter-map="[orderId:cloneOut.orderId]"/>
+    <error-response url="."/>
     </transition>
 
     <transition name="printQuotation" read-only="true">
@@ -164,14 +179,18 @@
 
     <transition name="convertToOrder">
         <actions>
+            <service-call name="zenith.sales.SalesAccessServices.assert#RecordOrgAccess" in-map="[entityName:'mantle.order.OrderPart', idField:'orderId', idValue:orderId, orgField:'vendorPartyId']" out-map="_acc"/>
+            <if condition="!_acc.allowed"><return error="true" message="Quote not found for your account."/></if>
+            <entity-find-one entity-name="mantle.order.OrderHeader" value-field="_lockedQuote" for-update="true"/>
+            <if condition="_lockedQuote == null || !(_lockedQuote.statusId in ['OrderProposed','OrderPlaced'])"><return error="true" message="Only an active quotation can be converted."/></if>
             <!-- ZE-SALES-0307 (SL-016/SL-024): block an ITEM-LESS quote gracefully instead of converting it into
                  an empty order (and guarding against the "Cannot invoke method minus() on null object" crash if the
                  place/total logic ever runs on a null total). Mirrors EditOrder's convertToInvoice guard; also
                  org-scoped so a user can't convert another tenant's quote. -->
-            <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <set field="activeOrg" from="_salesOrgId"/>
             <entity-find entity-name="mantle.order.OrderPart" list="_parts"><econdition field-name="orderId"/></entity-find>
             <set field="_ovendor" from="_parts ? _parts[0].vendorPartyId : null"/>
-            <if condition="!_parts || (activeOrg &amp;&amp; _ovendor &amp;&amp; _ovendor != activeOrg &amp;&amp; !ec.user.isInGroup('ADMIN'))">
+            <if condition="!_parts || ((!activeOrg || _ovendor != activeOrg) &amp;&amp; !ec.user.isInGroup('ADMIN'))">
                 <return error="true" message="Quote not found for your account."/>
             </if>
             <entity-find-count entity-name="mantle.order.OrderItem" count-field="_itemCnt"><econdition field-name="orderId"/></entity-find-count>
@@ -209,7 +228,7 @@
         <!-- ZE-SALES cross-tenant IDOR render guard: only the owning org (super-admins exempt) may open this quote.
              Deterministic org check (not the racy entity filter). Load NOTHING when blocked; widgets show a plain
              no-access panel instead of another tenant's quotation/customer/amount data. -->
-        <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" in-map="[entityName:'mantle.order.OrderPart', idField:'orderId', idValue:orderId, orgField:'vendorPartyId']" out-map="_acc"/>
+        <service-call name="zenith.sales.SalesAccessServices.assert#RecordOrgAccess" in-map="[entityName:'mantle.order.OrderPart', idField:'orderId', idValue:orderId, orgField:'vendorPartyId']" out-map="_acc"/>
         <set field="noAccess" from="!_acc.allowed"/>
         <if condition="_acc.allowed">
         <entity-find-one entity-name="mantle.order.OrderHeader" value-field="order"/>
@@ -381,7 +400,7 @@
                             <field name="productId"><default-field title="Product">
                                 <drop-down allow-empty="true">
                                     <entity-options key="${productId}" text="${pseudoId} - ${productName}">
-                                        <entity-find entity-name="mantle.product.Product"><econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/><order-by field-name="productName"/></entity-find>
+                                        <entity-find entity-name="mantle.product.Product"><econdition field-name="ownerPartyId" from="_salesOrgId ?: '__NO_SALES_ORGANIZATION__'"/><order-by field-name="productName"/></entity-find>
                                     </entity-options>
                                 </drop-down>
                             </default-field></field>
@@ -408,7 +427,8 @@
                 </container>
                 </widgets></section>
             </container>
-            <form-list name="OrderItemsForm" list="orderItems" skip-form="true" header-dialog="true" show-csv-button="true" show-xlsx-button="true" show-page-size="true">
+            <container style="z-sales-table">
+<form-list name="OrderItemsForm" list="orderItems" skip-form="true" header-dialog="true" show-csv-button="true" show-xlsx-button="true" show-page-size="true">
                 <field name="orderItemSeqId"><default-field title="#"><label text="${orderItemSeqId}" type="span" style="text-grey-7"/></default-field></field>
                 <field name="itemDescription"><default-field title="Description"><label text="${itemDescription ?: 'N/A'}" type="strong" style="text-dark"/></default-field></field>
                 <field name="hsnSacCode"><default-field title="HSN/SAC"><label text="${hsnSacCode ?: '-'}" type="span" style="zenith-badge grey"/></default-field></field>
@@ -432,6 +452,7 @@
                 </default-field></field>
                 <field name="findButton"><header-field title="Find"><submit/></header-field></field>
                 </form-list>
+</container>
         </container>
         </widgets>
         </section>

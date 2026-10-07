@@ -219,7 +219,7 @@
                         <#list invoiceItems as item>
                             <#assign taxable = (item.taxableAmount)!(((item.quantity)!1) * ((item.amount)!0))>
                             <#assign totalItem = taxable + (item.cgstAmount!0) + (item.sgstAmount!0) + (item.igstAmount!0)>
-                            <fo:table-row font-size="7.5pt" border-bottom="0.5pt solid ${colorBg}">
+                            <fo:table-row keep-together.within-page="always" font-size="7.5pt" border-bottom="0.5pt solid ${colorBg}">
                                 <fo:table-cell padding="4pt"><fo:block text-align="center">${item_index+1}</fo:block></fo:table-cell>
                                 <fo:table-cell padding="4pt"><fo:block><@encodeText (item.description)!""/></fo:block><#if (item.discountPercent!0)?number != 0><fo:block font-size="6pt" color="#c0392b">Less ${item.discountPercent}% discount (Rs. <@formatINR item.discountAmount!0/>)</fo:block></#if></fo:table-cell>
                                 <fo:table-cell padding="4pt"><fo:block text-align="center">${item.hsnSacCode!"-"}</fo:block></fo:table-cell>
@@ -295,6 +295,12 @@
                                         <fo:table-cell padding="4pt"><fo:block font-weight="bold">Taxes</fo:block></fo:table-cell>
                                         <fo:table-cell padding="4pt" text-align="right"><fo:block>Rs. <@formatINR totalTaxes/></fo:block></fo:table-cell>
                                     </fo:table-row>
+                                    <#if (invoice.roundOffAmount!0)?number != 0>
+                                    <fo:table-row>
+                                        <fo:table-cell padding="4pt"><fo:block font-weight="bold">Round-off</fo:block></fo:table-cell>
+                                        <fo:table-cell padding="4pt" text-align="right"><fo:block>Rs. <@formatINR invoice.roundOffAmount/></fo:block></fo:table-cell>
+                                    </fo:table-row>
+                                    </#if>
                                     <fo:table-row>
                                         <fo:table-cell padding="4pt"><fo:block font-weight="bold">Total</fo:block></fo:table-cell>
                                         <fo:table-cell padding="4pt" text-align="right"><fo:block font-weight="bold" text-decoration="underline">Rs. <@formatINR invoice.invoiceTotal!0/></fo:block></fo:table-cell>

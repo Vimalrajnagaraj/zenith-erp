@@ -1,145 +1,70 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
-
-    <service verb="create" noun="PaymentLink">
-        <description>Generates a mock payment link for an invoice via Razorpay/CCAvenue</description>
-        <in-parameters>
-            <parameter name="invoiceId" required="true"/>
-            <parameter name="gatewayType" default-value="RAZORPAY"/>
-        </in-parameters>
-        <out-parameters>
-            <parameter name="paymentLinkId"/>
-            <parameter name="paymentUrl"/>
-        </out-parameters>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+    <!-- Existing mock gateway only; these services do not contact a payment provider. -->
+    <service verb="create" noun="PaymentLink" authenticate="true">
+        <in-parameters><parameter name="invoiceId" required="true"/><parameter name="gatewayType" default-value="RAZORPAY"/></in-parameters>
+        <out-parameters><parameter name="paymentLinkId"/><parameter name="paymentUrl"/></out-parameters>
         <actions>
-            <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="invoice"/>
-            <if condition="!invoice">
-                <return error="true" message="Invoice ${invoiceId} not found."/>
+            <service-call name="zenith.sales.SalesLineServices.get#InvoicePayable" in-map="[invoiceId:invoiceId]" out-map="due"/>
+            <if condition="ec.message.hasError()"><return/></if>
+            <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="invoice" for-update="true"/>
+            <if condition="!(invoice.statusId in ['InvoiceInProcess','InvoiceFinalized','InvoiceApproved','InvoiceSent','InvoiceAcked']) || due.payableAmount &lt;= 0">
+                <return error="true" message="This invoice has no payable balance."/>
             </if>
-            <!-- ZE-SB-013: a payment link exposes the invoice total and mints a payable link — only for THIS
-                 org's own (sales) invoices. The seller org is fromPartyId. Super-admin exempt. -->
-            <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" out-map="_ia"
-                          in-map="[entityName:'mantle.account.invoice.Invoice', idField:'invoiceId', idValue:invoiceId, orgField:'fromPartyId']"/>
-            <if condition="!_ia.allowed"><return error="true" message="You do not have access to that invoice."/></if>
-            <set field="amount" from="invoice.invoiceTotal"/>
-            
-            <!-- Generate a mock external link ID and URL -->
-            <set field="externalLinkId" value="plink_${ec.l10n.format(ec.user.nowTimestamp, 'yyyyMMddHHmmss')}"/>
+            <if condition="!(gatewayType in ['RAZORPAY','CCAVENUE'])"><return error="true" message="Select a supported mock payment gateway."/></if>
+            <set field="externalLinkId" from="'plink_' + java.util.UUID.randomUUID().toString()"/>
             <set field="paymentUrl" value="https://checkout.${gatewayType.toLowerCase()}.com/pay/${externalLinkId}"/>
-
-            <!-- Create PaymentLink record via the auto CrUD service so the sequenced primary key is
-                 generated (a raw entity-create left paymentLinkId null → not-null violation). -->
-            <service-call name="create#zenith.erp.sales.PaymentLink" out-map="plCreate"
-                in-map="[invoiceId:invoiceId, externalLinkId:externalLinkId, paymentUrl:paymentUrl,
-                         amount:amount, statusId:'CREATED', expiryDate:(ec.user.nowTimestamp + 30)]"/>
-            <set field="paymentLinkId" from="plCreate.paymentLinkId"/>
-
-            <!-- In a real scenario, an HTTP request to the gateway API would be placed here -->
-            <message>Mock Payment Link Generated: ${paymentUrl}</message>
+            <service-call name="create#zenith.erp.sales.PaymentLink" out-map="created" in-map="[invoiceId:invoiceId,externalLinkId:externalLinkId,paymentUrl:paymentUrl,amount:due.payableAmount,statusId:'CREATED',expiryDate:(ec.user.nowTimestamp + 30)]"/>
+            <set field="paymentLinkId" from="created.paymentLinkId"/>
         </actions>
     </service>
-
-    <service verb="check" noun="PaymentStatus">
-        <in-parameters>
-            <parameter name="paymentLinkId" required="true"/>
-        </in-parameters>
-        <out-parameters>
-            <parameter name="statusId"/>
-        </out-parameters>
+    <service verb="check" noun="PaymentStatus" authenticate="true">
+        <in-parameters><parameter name="paymentLinkId" required="true"/></in-parameters>
+        <out-parameters><parameter name="statusId"/></out-parameters>
         <actions>
             <entity-find-one entity-name="zenith.erp.sales.PaymentLink" value-field="plink"/>
-            <if condition="!plink">
-                <return error="true" message="Payment Link ${paymentLinkId} not found."/>
-            </if>
-
-            <!-- Mock API check -->
-            <!-- Typically we'd query Razorpay here to get the status. We just return the DB status. -->
+            <if condition="plink == null"><return error="true" message="Payment link not found."/></if>
+            <service-call name="zenith.sales.SalesLineServices.get#InvoicePayable" in-map="[invoiceId:plink.invoiceId]" out-map="due"/>
+            <if condition="ec.message.hasError()"><return/></if>
             <set field="statusId" from="plink.statusId"/>
         </actions>
     </service>
-
-    <service verb="process" noun="PaymentCallback">
-        <in-parameters>
-            <parameter name="externalLinkId" required="true"/>
-            <parameter name="status" required="true"/> <!-- e.g., 'paid', 'failed' -->
-            <parameter name="transactionId"/>
-        </in-parameters>
+    <service verb="process" noun="PaymentCallback" authenticate="true">
+        <in-parameters><parameter name="externalLinkId" required="true"/><parameter name="status" required="true"/><parameter name="transactionId"/></in-parameters>
         <actions>
-            <entity-find entity-name="zenith.erp.sales.PaymentLink" list="links">
-                <econdition field-name="externalLinkId"/>
-            </entity-find>
-            <set field="plink" from="links?.first()"/>
-            <if condition="!plink">
-                <return error="true" message="Payment link not found for ${externalLinkId}"/>
+            <script>plink=ec.entity.find('zenith.erp.sales.PaymentLink').condition('externalLinkId',externalLinkId).forUpdate(true).one()</script>
+            <if condition="plink == null"><return error="true" message="Payment link not found."/></if>
+            <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="invoice" for-update="true"><field-map field-name="invoiceId" from="plink.invoiceId"/></entity-find-one>
+            <service-call name="zenith.sales.SalesLineServices.get#InvoicePayable" in-map="[invoiceId:plink.invoiceId]" out-map="due"/>
+            <if condition="ec.message.hasError()"><return/></if>
+            <!-- Lock the link and invoice before deciding to settle. Retries and late failures are harmless. -->
+            <if condition="plink.statusId == 'PAID'"><return/></if>
+            <if condition="status == 'failed'"><set field="plink.statusId" value="CANCELLED"/><entity-update value-field="plink"/><return/></if>
+            <if condition="status != 'paid'"><return error="true" message="Unsupported mock payment status."/></if>
+            <if condition="invoice.statusId == 'InvoicePmtRecvd'"><return/></if>
+            <if condition="!(invoice.statusId in ['InvoiceInProcess','InvoiceFinalized','InvoiceApproved','InvoiceSent','InvoiceAcked']) || plink.amount != due.payableAmount || due.payableAmount &lt;= 0">
+                <return error="true" message="The invoice balance has changed; create a new payment link."/>
             </if>
-
-            <if condition="status == 'paid'">
-                <!-- Idempotency: settle the invoice only once, even if the gateway retries the callback. -->
-                <if condition="plink.statusId != 'PAID'">
-                    <set field="plink.statusId" value="PAID"/>
-                    <entity-update value-field="plink"/>
-
-                    <!-- Record the payment and mark the invoice paid. Previously this was only a comment, so the
-                         link flipped to PAID but the invoice stayed unpaid and no Payment was recorded.
-                         We record a Payment linked to the invoice (fromParty=customer, toParty=organization) for
-                         the audit trail, then set the invoice to InvoicePmtRecvd. The Payment is kept at
-                         PmntPromised so it does NOT trigger Mantle's GL-posting/auto-apply cascade: this instance
-                         tracks invoices by status, not double-entry ledger (the revenue control account is a
-                         non-postable summary account, so full GL posting is not used here). -->
-                    <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="inv">
-                        <field-map field-name="invoiceId" from="plink.invoiceId"/>
-                    </entity-find-one>
-                    <if condition="inv != null &amp;&amp; inv.statusId != 'InvoicePmtRecvd' &amp;&amp; inv.statusId != 'InvoiceCancelled' &amp;&amp; inv.statusId != 'InvoiceWriteOff'">
-                        <!-- Record a Payment linked to the invoice for the audit trail. Kept at PmntPromised so it
-                             does not trigger Mantle's GL-posting/auto-apply cascade. -->
-                        <service-call name="create#mantle.account.payment.Payment" out-map="payOut"
-                            in-map="[fromPartyId:inv.toPartyId, toPartyId:inv.fromPartyId, forInvoiceId:inv.invoiceId,
-                                     paymentTypeEnumId:'PtInvoicePayment', paymentInstrumentEnumId:'PiWireTransfer',
-                                     amount:plink.amount, amountUomId:inv.currencyUomId, effectiveDate:ec.user.nowTimestamp,
-                                     paymentRefNum:transactionId, statusId:'PmntPromised']"/>
-                        <!-- Mark the invoice paid. A direct entity-update is used (not update#Invoice) because this
-                             instance tracks invoices by status rather than Mantle double-entry GL: the revenue
-                             control account is a non-postable summary account, so the Payment cannot be applied
-                             through the ledger, and the update#Invoice service's status flow rejects
-                             ->InvoicePmtRecvd while unpaidTotal is non-zero ("Invoice not fully paid"). We settle
-                             the header fields directly to reflect the gateway payment. -->
-                        <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="invUpd">
-                            <field-map field-name="invoiceId" from="plink.invoiceId"/>
-                        </entity-find-one>
-                        <set field="invUpd.statusId" value="InvoicePmtRecvd"/>
-                        <set field="invUpd.appliedPaymentsTotal" from="inv.invoiceTotal ?: plink.amount"/>
-                        <set field="invUpd.unpaidTotal" from="0"/>
-                        <entity-update value-field="invUpd"/>
-                    </if>
-                </if>
-            </if>
-            <if condition="status == 'failed'">
-                <set field="plink.statusId" value="CANCELLED"/>
-                <entity-update value-field="plink"/>
-            </if>
+            <!-- Preserve this instance's existing status-based settlement; do not introduce GL posting. -->
+            <service-call name="create#mantle.account.payment.Payment" out-map="payment" in-map="[fromPartyId:invoice.toPartyId,toPartyId:invoice.fromPartyId,forInvoiceId:invoice.invoiceId,paymentTypeEnumId:'PtInvoicePayment',paymentInstrumentEnumId:'PiWireTransfer',amount:plink.amount,amountUomId:invoice.currencyUomId,effectiveDate:ec.user.nowTimestamp,paymentRefNum:transactionId,statusId:'PmntPromised']"/>
+            <if condition="ec.message.hasError()"><return/></if>
+            <set field="invoice.appliedPaymentsTotal" from="(invoice.appliedPaymentsTotal ?: 0) + plink.amount"/>
+            <set field="invoice.unpaidTotal" from="0"/><set field="invoice.statusId" value="InvoicePmtRecvd"/><entity-update value-field="invoice"/>
+            <set field="plink.statusId" value="PAID"/><entity-update value-field="plink"/>
         </actions>
     </service>
-
-    <service verb="generate" noun="UpiPaymentQr">
-        <description>Generates a dynamic UPI QR code string for the invoice.
-            UPI is India-specific; for the full implementation see zenith.india.IndiaPosServices.generate#UpiQrString</description>
-        <in-parameters>
-            <parameter name="invoiceId" required="true"/>
-            <parameter name="upiId" required="true"/>
-            <parameter name="merchantName" required="true"/>
-            <parameter name="currencyCode" default-value="INR"/>
-        </in-parameters>
-        <out-parameters>
-            <parameter name="upiString"/>
-        </out-parameters>
+    <service verb="generate" noun="UpiPaymentQr" authenticate="true">
+        <in-parameters><parameter name="invoiceId" required="true"/><parameter name="upiId" required="true"/><parameter name="merchantName" required="true"/><parameter name="currencyCode" default-value="INR"/></in-parameters>
+        <out-parameters><parameter name="upiString"/></out-parameters>
         <actions>
+            <service-call name="zenith.sales.SalesLineServices.get#InvoicePayable" in-map="[invoiceId:invoiceId]" out-map="due"/>
+            <if condition="ec.message.hasError()"><return/></if>
+            <if condition="due.payableAmount &lt;= 0"><return error="true" message="This invoice has no payable balance."/></if>
             <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="invoice"/>
-            <set field="amount" from="ec.l10n.format(invoice.invoiceTotal, '0.00')"/>
-            <set field="orderId" from="invoice.customInvoiceNumber ?: invoice.invoiceId"/>
-
-            <set field="upiString" value="upi://pay?pa=${upiId}&amp;pn=${merchantName}&amp;tr=${orderId}&amp;am=${amount}&amp;cu=${currencyCode}"/>
+            <script><![CDATA[
+                def values=[pa:upiId,pn:merchantName,tr:(invoice.customInvoiceNumber ?: invoice.invoiceId),am:due.payableAmount.toPlainString(),cu:currencyCode]
+                upiString='upi://pay?' + values.collect { key,value -> key+'='+java.net.URLEncoder.encode(value.toString(),'UTF-8') }.join('&')
+            ]]></script>
         </actions>
     </service>
-
 </services>

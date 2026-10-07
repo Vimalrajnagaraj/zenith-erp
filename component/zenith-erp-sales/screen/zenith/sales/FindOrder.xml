@@ -2,12 +2,21 @@
 <screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
         xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
         default-menu-title="Orders" default-menu-index="2">
+    <always-actions>
+        <service-call name="zenith.sales.SalesAccessServices.get#AuthorizedActiveOrganization" out-map="_salesScope"/>
+        <set field="_salesOrgId" from="_salesScope.activeOrgId"/>
+    </always-actions>
+
+
+    <parameter name="orderNoSearch"/>
+    <parameter name="customerSearch"/>
 
     <transition name="findOrder"><default-response url="."/></transition>
     <transition name="editOrder"><default-response url="../EditOrder"/></transition>
     <transition name="createOrder"><default-response url="../CreateOrder"/></transition>
 
     <actions>
+        <service-call name="zenith.sales.SalesAccessServices.get#MixedVendorOrderIds" out-map="_mixedOrders"/>
         <!-- ZE-SALES-0308 (same as FindQuotation): the Customer box is a free-text NAME search, but customerPartyId
              holds a party id, so a typed name never matched. Resolve the name to matching customer party ids first. -->
         <set field="customerSearch" from="ec.context.customerSearch"/>
@@ -15,7 +24,7 @@
             <set field="_likeVal" from="'%' + customerSearch.toString().trim() + '%'"/>
             <entity-find entity-name="mantle.party.PartyDetail" list="_custMatches" distinct="true">
                 <select-field field-name="partyId"/>
-                <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+                <econdition field-name="ownerPartyId" from="_salesOrgId ?: '__NO_SALES_ORGANIZATION__'"/>
                 <econditions combine="or">
                     <econdition field-name="organizationName" operator="like" from="_likeVal" ignore-case="true"/>
                     <econdition field-name="firstName" operator="like" from="_likeVal" ignore-case="true"/>
@@ -38,11 +47,12 @@
         </entity-find>
         <set field="_deadQuoteIds" from="_deadQuotes.collect{ it.orderId } ?: ['__NONE__']"/>
         <entity-find entity-name="mantle.order.OrderHeaderAndPart" list="orderList">
-            <search-form-inputs default-order-by="-entryDate"/>
+            <search-form-inputs skip-fields="organizationPartyId,fromPartyId,vendorPartyId,ownerPartyId" default-order-by="-entryDate"/>
 <!-- ZE-SALES-014 f/u (cross-tenant CSV leak): source the active org DIRECTLY, not via the parent-set
                  activeOrgId var, which is empty in the CSV/standalone render -> ignore-if-empty then skipped the
                  filter and the CSV dumped every tenant's orders (incl. MARUTHI). -->
-            <econdition field-name="vendorPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+            <econdition field-name="vendorPartyId" from="_salesOrgId ?: '__NO_SALES_ORGANIZATION__'"/>
+            <econdition field-name="orderId" operator="not-in" from="_mixedOrders.mixedOrderIds ?: ['__NO_MIXED_SALES_ORDER__']"/>
             <econdition field-name="statusId" operator="not-in" value="OrderProposed,OrderRejected"/>
             <econdition field-name="orderId" operator="not-in" from="_deadQuoteIds"/>
             <econdition field-name="customerPartyId" operator="in" from="_custIds" ignore-if-empty="true"/>
@@ -125,6 +135,7 @@
         </widgets></section>
         <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-none z-listchrome">
             <render-mode><text type="html,qvt"><![CDATA[<span class="zlc-ph" data-ph="Search orders..." style="display:none"></span>]]></text></render-mode>
+            <section name="SalesHtmlList" condition="!isCsv"><widgets>
             <form-list name="OrderListForm" list="orderList" header-dialog="true"
                        show-csv-button="true" show-page-size="true" show-xlsx-button="true">
                 <row-actions>
@@ -195,6 +206,23 @@
                     </default-field>
                 </field>
             </form-list>
+            </widgets></section>
         </container>
+
+        <!-- CSV uses plain display fields on the already filtered/scoped list. HTML
+             links/icons and the shell's zinr formatter are unavailable in CSV mode. -->
+        <section name="SalesCsvExport" condition="isCsv"><widgets>
+            <form-list name="FindOrderCsv" list="orderList">
+                <row-actions>
+                    <entity-find-one entity-name="mantle.party.PartyDetail" value-field="_csvParty"><field-map field-name="partyId" from="customerPartyId"/></entity-find-one>
+                    <set field="_csvCustomer" from="_csvParty?.organizationName ?: ((_csvParty?.firstName ?: '') + ' ' + (_csvParty?.lastName ?: '')).trim()"/>
+                </row-actions>
+                <field name="orderId"><header-field title="Order No."/><default-field><display text="${displayId ?: orderId}"/></default-field></field>
+                <field name="entryDate"><header-field title="Date"/><default-field><display text="${ec.l10n.format(entryDate, 'yyyy-MM-dd')}"/></default-field></field>
+                <field name="customerPartyId"><header-field title="Customer"/><default-field><display text="${_csvCustomer}"/></default-field></field>
+                <field name="grandTotal"><header-field title="Total (INR)"/><default-field><display text="${grandTotal ?: 0}"/></default-field></field>
+                <field name="statusId"><header-field title="Status"/><default-field><display text="${statusId}"/></default-field></field>
+            </form-list>
+        </widgets></section>
     </widgets>
 </screen>

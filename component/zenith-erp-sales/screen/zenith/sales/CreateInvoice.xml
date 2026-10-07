@@ -2,12 +2,19 @@
 <screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
         xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
         default-menu-title="Create Invoice" default-menu-include="false">
+    <always-actions>
+        <service-call name="zenith.sales.SalesAccessServices.get#AuthorizedActiveOrganization" out-map="_salesScope"/>
+        <set field="_salesOrgId" from="_salesScope.activeOrgId"/>
+    </always-actions>
+
 
     <parameter name="partyId"/>
 
     <transition name="createInvoice">
         <actions>
-            <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <if condition="!_salesOrgId"><return error="true" message="Select an organization before creating a Sales document."/></if>
+            <entity-find-one entity-name="mantle.party.Party" value-field="_numberOrg" for-update="true"><field-map field-name="partyId" from="_salesOrgId"/></entity-find-one>
+            <set field="activeOrg" from="_salesOrgId"/>
             <!-- Trim the optional manual number; blank/whitespace becomes null (Groovy truthiness). -->
             <set field="manualNum" from="ec.web.parameters.gstInvoiceNumber?.trim()"/>
 
@@ -47,15 +54,15 @@
                 <if condition="_shopf == null || _shopf.facilityTypeEnumId != 'FcTpRetailStore' || (activeOrg &amp;&amp; _shopf.ownerPartyId != activeOrg)"><set field="shopFac" from="null"/></if>
             </if>
             <service-call name="create#mantle.account.invoice.Invoice" out-map="createOut"
-                in-map="[fromPartyId:activeOrg, toPartyId:buyerId, invoiceDate:ec.web.parameters.invoiceDate, currencyUomId:'INR', invoiceTypeEnumId:'InvoiceSales', statusId:'InvoiceInProcess', documentType:docType]"/>
+                in-map="[fromPartyId:activeOrg, toPartyId:buyerId, invoiceDate:(ec.web.parameters.invoiceDate ?: ec.user.nowTimestamp), currencyUomId:'INR', invoiceTypeEnumId:'InvoiceSales', statusId:'InvoiceInProcess', documentType:docType, isExport:(docType == 'Export Invoice' ? 'Y' : 'N')]"/>
 
             <if condition="manualNum">
                 <!-- Honor the user-supplied invoice number (it was previously dropped entirely). -->
                 <service-call name="update#mantle.account.invoice.Invoice" in-map="[invoiceId:createOut.invoiceId, gstInvoiceNumber:manualNum]"/>
             <else>
                 <!-- Auto-generate a unique GST invoice number: INV/<FY>/<invoiceId>. -->
-                <set field="__yy" from="Integer.parseInt(ec.l10n.format(ec.user.nowTimestamp, 'yy'))"/>
-                <set field="__fy" from="ec.l10n.format(ec.user.nowTimestamp, 'yy') + '-' + (__yy + 1)"/>
+                <service-call name="zenith.base.LocalizationServices.get#FinancialYearDates" out-map="_fy" in-map="[organizationPartyId:_salesOrgId, referenceDate:(ec.web.parameters.invoiceDate ?: ec.user.nowTimestamp)]"/>
+                <set field="__fy" from="ec.l10n.format(_fy.fyStartDate, 'yy') + (ec.l10n.format(_fy.fyStartDate, 'yy') != ec.l10n.format(_fy.fyEndDate, 'yy') ? '-' + ec.l10n.format(_fy.fyEndDate, 'yy') : '')"/>
                 <service-call name="update#mantle.account.invoice.Invoice" in-map="[invoiceId:createOut.invoiceId, gstInvoiceNumber:('INV/' + __fy + '/' + createOut.invoiceId), financialYearPrefix:__fy]"/>
             </else>
             </if>
@@ -81,7 +88,7 @@
         <actions>
             <entity-find entity-name="mantle.party.PartyDetailAndRole" list="partyList" limit="20" distinct="true">
                 <econdition field-name="roleTypeId" value="Customer"/>
-                <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+                <econdition field-name="ownerPartyId" from="_salesOrgId ?: '__NO_SALES_ORGANIZATION__'"/>
                 <econditions combine="or">
                     <econdition field-name="partyId" operator="like" value="%${term}%" ignore-case="true"/>
                     <econdition field-name="organizationName" operator="like" value="%${term}%" ignore-case="true"/>
@@ -97,9 +104,9 @@
                 if (partyId) {
                     // Org isolation (ZE-SEC-JSON): scope the re-display lookup to the active org too (mirror the
                     // search above) so a forged partyId can't echo another tenant's customer name.
-                    def _reAo = ec.user.getPreference('ACTIVE_ORGANIZATION')
+                    def _reAo = _salesOrgId
                     def _reF = ec.entity.find("mantle.party.PartyDetailAndRole").condition("partyId", partyId)
-                    if (_reAo) _reF.condition("ownerPartyId", _reAo)
+                    _reF.condition("ownerPartyId", _reAo ?: "__NO_SALES_ORGANIZATION__")
                     def existing = _reF.one()
                     if (existing) outList.add(0, [value:existing.partyId, label:existing.organizationName ?: ((existing.firstName?:'') + ' ' + (existing.lastName?:'')).trim() + ' [' + existing.partyId + ']'])
                 }
@@ -110,7 +117,7 @@
     </transition>
 
     <actions>
-        <set field="activeOrgId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+        <set field="activeOrgId" from="_salesOrgId"/>
         <entity-find-one entity-name="mantle.party.Organization" value-field="activeOrg">
             <field-map field-name="partyId" from="activeOrgId"/>
         </entity-find-one>
@@ -155,7 +162,7 @@
                                     <entity-options key="${partyId}" text="${(organizationName ?: ((firstName?:'') + ' ' + (lastName?:'')).trim()) ?: partyId} [${partyId}]">
                                         <entity-find entity-name="mantle.party.PartyDetailAndRole" distinct="true">
                                             <econdition field-name="roleTypeId" value="Customer"/>
-                                            <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+                                            <econdition field-name="ownerPartyId" from="_salesOrgId ?: '__NO_SALES_ORGANIZATION__'"/>
                                             <order-by field-name="organizationName,firstName,lastName"/>
                                         </entity-find>
                                     </entity-options>
