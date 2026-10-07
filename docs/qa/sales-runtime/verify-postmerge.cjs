@@ -35,7 +35,7 @@ module.exports=async function({ctx,p,post,invoke,q,rows,inv,count,check,base,out
  }
  const returned=report.created.find(x=>x.type==='SOP challan').id;
  for(const challanId of [returned,'SALES_QA_PM_RETURNED'])for(const shell of ['apps','qapps']){
-  const snapshot=()=>JSON.stringify({h:rows('zenith_delivery_challan',`challan_id='${challanId}'`),i:rows('zenith_delivery_challan_item',`challan_id='${challanId}'`)}),before=snapshot();
+  const snapshot=()=>JSON.stringify({h:rows('zenith_delivery_challan',`challan_id='${challanId}'`),i:rows('zenith_dlvry_challan_item',`challan_id='${challanId}'`)}),before=snapshot();
   await post('EditDeliveryChallan','addItem',{challanId,productId:'SALES_QA_PROD_A',quantity:'1',estimatedValue:'100'},shell);
   await post('EditDeliveryChallan','deleteItem',{challanId,challanItemSeqId:'01'},shell);
   await post('EditDeliveryChallan','updateChallan',{challanId,statusId:'DcDraft'},shell);
