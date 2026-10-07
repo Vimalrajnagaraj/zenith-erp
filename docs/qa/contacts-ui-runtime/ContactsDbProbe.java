@@ -14,7 +14,12 @@ public class ContactsDbProbe {
             c.setReadOnly(true);
             StringBuilder out = new StringBuilder("[");
             boolean first = true;
-            try (PreparedStatement p = c.prepareStatement("SELECT P.PARTY_ID,P.OWNER_PARTY_ID,P.DISABLED,N.FIRST_NAME,N.LAST_NAME FROM PARTY P JOIN PERSON N ON N.PARTY_ID=P.PARTY_ID WHERE P.PARTY_ID LIKE 'PR13QA_A_%' OR P.PARTY_ID LIKE 'PR13QA_B_%' ORDER BY P.PARTY_ID"); ResultSet r = p.executeQuery()) {
+            if (args.length > 1 || (args.length == 1 && !"export".equals(args[0])))
+                throw new IllegalArgumentException("Unknown disposable probe mode");
+            String where = args.length == 1
+                    ? "P.OWNER_PARTY_ID='CITEST_ORG_A' AND (P.DISABLED IS NULL OR P.DISABLED<>'Y')"
+                    : "P.PARTY_ID LIKE 'PR13QA_A_%' OR P.PARTY_ID LIKE 'PR13QA_B_%'";
+            try (PreparedStatement p = c.prepareStatement("SELECT P.PARTY_ID,P.OWNER_PARTY_ID,P.DISABLED,N.FIRST_NAME,N.LAST_NAME FROM PARTY P LEFT JOIN PERSON N ON N.PARTY_ID=P.PARTY_ID WHERE " + where + " ORDER BY P.PARTY_ID"); ResultSet r = p.executeQuery()) {
                 while (r.next()) {
                     if (!first) out.append(','); first = false;
                     out.append("{\"id\":").append(json(r.getString(1))).append(",\"owner\":").append(json(r.getString(2)))

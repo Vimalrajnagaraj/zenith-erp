@@ -23,19 +23,20 @@ function check(name, pass, detail) {
   report.checks.push({name, pass:!!pass, ...(detail===undefined?{}:{detail})});
   if (!pass) throw new Error(name+': '+JSON.stringify(detail));
 }
-function truth() {
+function truth(exportScope=false) {
   const mode = process.env.CONTACTS_QA_DB_MODE || 'native';
   let r;
   if (mode==='postgres') {
     if (u.port!=='8080') throw new Error('PostgreSQL profile requires isolated staging HTTP8080');
     const container = containerId('CONTACTS_QA_DB_CONTAINER');
-    const sql = `BEGIN READ ONLY; SELECT COALESCE(json_agg(row_to_json(x)), '[]'::json) FROM (SELECT p.party_id AS id,p.owner_party_id AS owner,p.disabled,n.first_name,n.last_name FROM party p JOIN person n ON n.party_id=p.party_id WHERE p.party_id IN (${ids.map(id=>"'"+id+"'").join(',')}) ORDER BY p.party_id) x; ROLLBACK;`;
+    const where = exportScope ? "p.owner_party_id='CITEST_ORG_A' AND (p.disabled IS NULL OR p.disabled<>'Y')" : `p.party_id IN (${ids.map(id=>"'"+id+"'").join(',')})`;
+    const sql = `BEGIN READ ONLY; SELECT COALESCE(json_agg(row_to_json(x)), '[]'::json) FROM (SELECT p.party_id AS id,p.owner_party_id AS owner,p.disabled,n.first_name,n.last_name FROM party p LEFT JOIN person n ON n.party_id=p.party_id WHERE ${where} ORDER BY p.party_id) x; ROLLBACK;`;
     r = spawnSync('docker',['exec','-i',container,'psql','-U','moqui','-d','moqui','-qAt','-v','ON_ERROR_STOP=1'],{input:sql,encoding:'utf8',timeout:30000,windowsHide:true});
   } else if (mode==='native') {
     const runtime = process.env.CONTACTS_QA_RUNTIME_DIR;
     const h2 = process.env.CONTACTS_QA_H2_JAR || (runtime && path.join(runtime,'WEB-INF/lib/h2-2.4.240.jar'));
     if (!h2 || !process.env.CONTACTS_QA_DB_URL) throw new Error('Native runtime/H2 and isolated DB environment are required');
-    r = spawnSync(process.env.CONTACTS_QA_JAVA || 'java',['-cp',h2,path.join(__dirname,'ContactsDbProbe.java')],{encoding:'utf8',timeout:30000,windowsHide:true});
+    r = spawnSync(process.env.CONTACTS_QA_JAVA || 'java',['-cp',h2,path.join(__dirname,'ContactsDbProbe.java'),...(exportScope?['export']:[])],{encoding:'utf8',timeout:30000,windowsHide:true});
   } else throw new Error('Unknown database mode');
   if (r.status!==0) throw new Error('Read-only disposable fixture probe failed');
   return JSON.parse(r.stdout.trim());
@@ -131,6 +132,9 @@ async function scopedStyles(page,shell) {
 (async()=>{
   try {
     const before=truth();
+    // Foundation fixtures also contribute contacts (the billing fixture owns its own org).
+    // Compare exports with independent DB ownership/active-state truth, not a fixed row count.
+    const expectedExportIds=truth(true).map(c=>c.id).sort();
     check('fixture: 26 captured contacts exist',before.length===26,before.length);
     check('fixture: captured owners and disabled state',before.every(c=>ids.includes(c.id)&&c.owner===('CITEST_ORG_'+c.id.split('_')[1]))&&before.filter(c=>c.disabled==='Y').map(c=>c.id).join()==='PR13QA_A_24');
     if(process.env.CONTACTS_QA_CHROME&&!fs.existsSync(process.env.CONTACTS_QA_CHROME))throw new Error('Configured disposable browser executable is missing');
@@ -184,7 +188,8 @@ async function scopedStyles(page,shell) {
       const csvPromise=page.waitForEvent('download',{timeout:30000});await page.locator('.cust-export').click();const download=await csvPromise;
       check(`${shell}: CSV browser download completed`,await download.failure()===null,download.suggestedFilename());
       const file=await download.path();const rows=parseCsv(fs.readFileSync(file,'utf8').replace(/^\uFEFF/,''));
-      check(`${shell}: CSV headers/owned active rows`,rows[0].length===9&&rows.length===25&&rows.slice(1).every(r=>r[0]==='CITEST_A_CUST'||/^PR13QA_A_(0[1-9]|1[0-9]|2[0-3])$/.test(r[0])),{columns:rows[0].length,dataRows:rows.length-1});
+      const exportedIds=rows.slice(1).map(r=>r[0]).sort();
+      check(`${shell}: CSV headers/owned active rows`,rows[0].length===9&&JSON.stringify(exportedIds)===JSON.stringify(expectedExportIds),{columns:rows[0].length,dataRows:exportedIds.length,exportedIds,expectedExportIds});
       fs.unlinkSync(file);
       await page.setViewportSize({width:390,height:844});await open(page,shell);
       for(const kind of ['Add Person','Add Company']) {

@@ -7,6 +7,7 @@
     <parameter name="dashDate"/>
     <parameter name="dashDateTo"/>
     <parameter name="dateMode"/>
+    <parameter name="growthYear"/>
 
     <transition name="createPerson">
         <service-call name="zenith.contacts.ContactServices.create#Contact"
@@ -27,16 +28,16 @@
             def _wk = ['metrics','activity','topcust']
             ec.user.setPreference('CONTACT_DASH_HIDDEN', _wk.findAll { !context.get('w_' + it) }.join(','))
         ]]></script></actions>
-        <default-response url="." parameter-map="[dashDate:dashDate, dashDateTo:dashDateTo]"/>
+        <default-response url="." parameter-map="[dashDate:dashDate, dashDateTo:dashDateTo, dateMode:dateMode, growthYear:growthYear]"/>
     </transition>
     <transition name="resetDashLayout">
         <actions><script>ec.user.setPreference('CONTACT_DASH_HIDDEN', null); ec.user.setPreference('CONTACT_DASH_ORDER', null); ec.user.setPreference('CONTACT_DASH_SIZE', null)</script></actions>
-        <default-response url="." parameter-map="[dashDate:dashDate, dashDateTo:dashDateTo]"/>
+        <default-response url="." parameter-map="[dashDate:dashDate, dashDateTo:dashDateTo, dateMode:dateMode, growthYear:growthYear]"/>
     </transition>
-    <transition name="changeDashDate"><default-response url="." parameter-map="[dashDate:dashDate, dashDateTo:dashDateTo, dateMode:'custom']"/></transition>
+    <transition name="changeDashDate"><default-response url="." parameter-map="[dashDate:dashDate, dashDateTo:dashDateTo, dateMode:'custom', growthYear:growthYear]"/></transition>
     <transition name="saveDashOrder" require-session-token="false">
         <actions><script><![CDATA[
-            def _valid = ['metrics','growth','activity','topcust']
+            def _valid = ['activity','topcust']
             def _clean = ((context.order ?: '').toString().split(',') as List).findAll { _valid.contains(it) }
             ec.user.setPreference('CONTACT_DASH_ORDER', _clean.join(','))
             // widget width presets ('half'/'third'; 'full' is the default and not stored) — validated + bounded
@@ -60,20 +61,26 @@
         <set field="orgId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
         <set field="currSymbol" value="₹"/>
 
+        <set field="customerList" from="[]"/>
+        <set field="vendorList" from="[]"/>
+        <if condition="orgId">
         <!-- Aggregate Customers (current directory count — snapshot) -->
         <entity-find entity-name="mantle.party.PartyDetailAndRole" list="customerList">
             <econdition field-name="roleTypeId" operator="in" value="Customer,CustomerBillTo"/>
-            <econdition field-name="ownerPartyId" from="orgId" ignore-if-empty="true"/>
+            <econdition field-name="ownerPartyId" from="orgId"/>
         </entity-find>
         <set field="totalCustomers" from="customerList?.size() ?: 0"/>
 
         <!-- Aggregate Vendors (current directory count — snapshot) -->
         <entity-find entity-name="mantle.party.PartyDetailAndRole" list="vendorList">
             <econdition field-name="roleTypeId" operator="in" value="Supplier,Vendor"/>
-            <econdition field-name="ownerPartyId" from="orgId" ignore-if-empty="true"/>
+            <econdition field-name="ownerPartyId" from="orgId"/>
         </entity-find>
         <set field="totalVendors" from="vendorList?.size() ?: 0"/>
 
+        </if>
+        <set field="totalCustomers" from="customerList.size()"/>
+        <set field="totalVendors" from="vendorList.size()"/>
         <script><![CDATA[
             import org.moqui.entity.EntityCondition
             def ef = ec.entity
@@ -88,39 +95,61 @@
             def _sdf = new java.text.SimpleDateFormat("yyyy-MM-dd")
             def _now = ec.user.nowTimestamp
             def _todayStr = _sdf.format(_now)
-            if (!dashDate) dashDate = ''
-            if (!dashDateTo) dashDateTo = ''
+            def _today = java.time.LocalDate.parse(_todayStr)
+            def _weekStart = _today.minusDays(_today.dayOfWeek.value % 7)
+            def _monthStart = _today.withDayOfMonth(1)
+            def _yearStart = _today.withDayOfYear(1)
+            def _currentYear = _today.year
+            growthYear = growthYear?.toString() == (_currentYear - 1).toString() ? _currentYear - 1 : _currentYear
+            def _growthParam = '&growthYear=' + growthYear
+            dashDate = (dashDate ?: '').toString().trim()
+            dashDateTo = (dashDateTo ?: '').toString().trim()
+            dateError = ''
+            if (!dashDate && dateMode != 'all' && dateMode != 'custom') {
+                dashDate = _weekStart.toString(); dashDateTo = _todayStr; dateMode = 'week'
+            }
             dayStart = null; dayEndExcl = null
             if (dashDate) {
-                if (!dashDateTo) dashDateTo = dashDate
-                if (dashDateTo < dashDate) { def _s = dashDate; dashDate = dashDateTo; dashDateTo = _s }
-                dayStart = java.sql.Timestamp.valueOf(dashDate + " 00:00:00")
-                def _ce = java.util.Calendar.getInstance(); _ce.setTime(java.sql.Timestamp.valueOf(dashDateTo + " 00:00:00")); _ce.add(java.util.Calendar.DAY_OF_MONTH, 1)
-                dayEndExcl = new java.sql.Timestamp(_ce.getTimeInMillis())
-            }
-            def _cw = java.util.Calendar.getInstance(); _cw.setTime(_now); _cw.set(java.util.Calendar.DAY_OF_WEEK, _cw.getFirstDayOfWeek()); def _weekStartStr = _sdf.format(_cw.getTime())
-            def _cm = java.util.Calendar.getInstance(); _cm.setTime(_now); _cm.set(java.util.Calendar.DAY_OF_MONTH,1); def _monthStartStr = _sdf.format(_cm.getTime())
-            def _c30 = java.util.Calendar.getInstance(); _c30.setTime(_now); _c30.add(java.util.Calendar.DAY_OF_MONTH,-29); def _last30Str = _sdf.format(_c30.getTime())
-            def _ycal = java.util.Calendar.getInstance(); _ycal.setTime(_now); _ycal.set(java.util.Calendar.MONTH,0); _ycal.set(java.util.Calendar.DAY_OF_MONTH,1); def _yearStartStr = _sdf.format(_ycal.getTime())
-            urlAll = "?"; urlToday = "?dashDate="+_todayStr+"&dashDateTo="+_todayStr
-            urlWeek = "?dashDate="+_weekStartStr+"&dashDateTo="+_todayStr
-            urlMonth = "?dashDate="+_monthStartStr+"&dashDateTo="+_todayStr
-            url30 = "?dashDate="+_last30Str+"&dashDateTo="+_todayStr
-            urlYear = "?dashDate="+_yearStartStr+"&dashDateTo="+_todayStr
-            presetActive = 'all'
-            if (dashDate) {
-                presetActive = 'custom'
-                if (dashDateTo == _todayStr) {
-                    if (dashDate == _todayStr) presetActive='today'
-                    else if (dashDate == _weekStartStr) presetActive='week'
-                    else if (dashDate == _monthStartStr) presetActive='month'
-                    else if (dashDate == _last30Str) presetActive='last30'
-                    else if (dashDate == _yearStartStr) presetActive='year'
+                try {
+                    def _first = java.time.LocalDate.parse(dashDate)
+                    def _last = java.time.LocalDate.parse(dashDateTo ?: dashDate)
+                    if (_last.isBefore(_first)) { def _swap = _first; _first = _last; _last = _swap }
+                    if (_first.year < 1900 || _last.year > 9998) throw new IllegalArgumentException('Date outside supported range')
+                    dashDate = _first.toString(); dashDateTo = _last.toString()
+                    dayStart = java.sql.Timestamp.valueOf(_first.atStartOfDay())
+                    dayEndExcl = java.sql.Timestamp.valueOf(_last.plusDays(1).atStartOfDay())
+                } catch (IllegalArgumentException | java.time.DateTimeException e) {
+                    dashDate = ''; dashDateTo = ''; dateMode = 'custom'
+                    dateError = 'Enter a valid date range. Showing the last 6 months until a valid range is applied.'
                 }
             }
-            // ZE-DATEWISE: "Date-wise" custom-range tab reveals the From/To only when chosen (or a custom range is active)
-            showCustom = (((dateMode ?: '') == 'custom') || (presetActive == 'custom'))
-            urlCustom = dashDate ? ("?dateMode=custom&dashDate="+dashDate+"&dashDateTo="+dashDateTo) : "?dateMode=custom"
+            urlAll = '?dateMode=all' + _growthParam
+            urlToday = '?dateMode=today&dashDate=' + _todayStr + '&dashDateTo=' + _todayStr + _growthParam
+            urlWeek = '?dateMode=week&dashDate=' + _weekStart + '&dashDateTo=' + _todayStr + _growthParam
+            urlMonth = '?dateMode=month&dashDate=' + _monthStart + '&dashDateTo=' + _todayStr + _growthParam
+            url30 = '?dateMode=last30&dashDate=' + _today.minusDays(29) + '&dashDateTo=' + _todayStr + _growthParam
+            urlYear = '?dateMode=year&dashDate=' + _yearStart + '&dashDateTo=' + _todayStr + _growthParam
+            def _displayDate = java.time.format.DateTimeFormatter.ofPattern('d MMM yyyy', java.util.Locale.ENGLISH)
+            dashRangeLabel = dashDate ? (java.time.LocalDate.parse(dashDate).format(_displayDate) + (dashDateTo != dashDate ? ' – ' + java.time.LocalDate.parse(dashDateTo).format(_displayDate) : '')) : 'Last 6 Months'
+            presetActive = dashDate ? 'custom' : 'all'
+            if (dashDateTo == _todayStr) {
+                def _presets = [today:_todayStr, week:_weekStart.toString(), month:_monthStart.toString(), last30:_today.minusDays(29).toString(), year:_yearStart.toString()]
+                presetActive = _presets[dateMode] == dashDate ? dateMode : (_presets.find { it.value == dashDate }?.key ?: 'custom')
+            }
+            urlPrev = ''
+            if (dashDate) {
+                def _first = java.time.LocalDate.parse(dashDate)
+                def _last = java.time.LocalDate.parse(dashDateTo)
+                def _prevEnd = _first.minusDays(1)
+                def _prevStart = presetActive == 'week' ? _first.minusWeeks(1) : (presetActive == 'month' ? _first.minusMonths(1) : (presetActive == 'year' ? _first.minusYears(1) : _first.minusDays(java.time.temporal.ChronoUnit.DAYS.between(_first, _last) + 1L)))
+                urlPrev = '?dateMode=custom&dashDate=' + _prevStart + '&dashDateTo=' + _prevEnd + _growthParam
+            }
+            showCustom = dateMode == 'custom' || presetActive == 'custom'
+            urlCustom = '?dateMode=custom&dashDate=' + dashDate + '&dashDateTo=' + dashDateTo + _growthParam
+            def _rangeParams = '?dateMode=' + presetActive + '&dashDate=' + dashDate + '&dashDateTo=' + dashDateTo
+            urlGrowthCurrent = _rangeParams + '&growthYear=' + _currentYear
+            urlGrowthPrevious = _rangeParams + '&growthYear=' + (_currentYear - 1)
+            growthPeriodLabel = growthYear == _currentYear ? 'This Year' : 'Last Year'
             // window = selected range, else last 6 months
             def _acStart; def _acEnd
             if (dayStart) { _acStart = dayStart; _acEnd = dayEndExcl }
@@ -161,8 +190,8 @@
                 _custTotal[it.toPartyId] = (_custTotal[it.toPartyId] ?: 0G) + _amt
             }
             def _aclbls=[]; def _acvals=[]
-            _keys.each { _k -> _aclbls.add("'"+_labelByKey[_k]+"'"); _acvals.add(_setBy[_k].size()) }
-            acLabelsJson = "["+_aclbls.join(",")+"]"
+            _keys.each { _k -> _aclbls.add(_labelByKey[_k]); _acvals.add(_setBy[_k].size()) }
+            acLabelsJson = groovy.json.JsonOutput.toJson(_aclbls)
             acValsJson   = "["+_acvals.join(",")+"]"
             acActiveInRange = _allCust.size()
             acInvCount = _invs.size()
@@ -180,12 +209,12 @@
                 if (_org) _nm = _org.organizationName
                 if (!_nm) { def _per = ef.find("mantle.party.Person").condition("partyId", e.key).one(); if (_per) _nm = ((_per.firstName ?: '') + ' ' + (_per.lastName ?: '')).trim() }
                 if (!_nm) _nm = e.key
-                _nm = _nm.toString().replace("'", " ").replace("\"", " ")
+                _nm = _nm.toString()
                 if (_nm.length() > 26) _nm = _nm.substring(0, 26)
-                _tclbls.add("'" + _nm + "'")
+                _tclbls.add(_nm)
                 _tcvals.add(((e.value ?: 0G) as java.math.BigDecimal).setScale(0, java.math.RoundingMode.HALF_UP).toPlainString())
             }
-            tcLabelsJson = "[" + _tclbls.join(",") + "]"
+            tcLabelsJson = groovy.json.JsonOutput.toJson(_tclbls)
             tcValsJson   = "[" + _tcvals.join(",") + "]"
             tcHasData    = (_tcvals.size() > 0)
 
@@ -228,10 +257,12 @@
                 _bills.add([out:_out, days:_days, cust:it.customerPartyId, no:it.transactionNumber])
             } } catch (Exception e) {}
             def _tt = totalReceivable > 0 ? totalReceivable.doubleValue() : 1.0
-            def _ageLbls = ['0 &ndash; 30 Days','31 &ndash; 60 Days','61 &ndash; 90 Days','90+ Days']; def _ageDot = ['#10B981','#F59E0B','#F97316','#EF4444']
+            def _ageLbls = ['0 &ndash; 30 Days','31 &ndash; 60 Days','61 &ndash; 90 Days','90+ Days']; def _ageDot = ['#10B981','#F59E0B','#3B82F6','#EF4444']
             ageRows = []
             _ageLbls.eachWithIndex { lbl, i -> ageRows.add([label:lbl, amt:zinr.inr(ec.l10n.format(_ageAmt[i],'#,##,##0')), pct:(int)Math.round(_ageAmt[i].doubleValue()*100.0/_tt), dot:_ageDot[i]]) }
             fmtReceivable = zinr.inr(ec.l10n.format(totalReceivable,'#,##,##0')); fmtOverdue = zinr.inr(ec.l10n.format(_overdue,'#,##,##0')); creditHasData = totalReceivable > 0
+            // Only bills older than the same 30-day threshold used by the overdue summary belong in this card.
+            _bills = _bills.findAll { it.days > 30 }
             _bills.sort { a, b -> (b.out <=> a.out) }
             overdueBills = []
             _bills.take(5).each { bl ->
@@ -240,15 +271,15 @@
                     if(!_nm){def _p=ef.find("mantle.party.Person").condition("partyId",bl.cust).one(); if(_p)_nm=((_p.firstName?:'')+' '+(_p.lastName?:'')).trim()} }
                 if (!_nm || _nm.toString().trim()=='') _nm = 'Walk-in / Cash'
                 def _pri = bl.out >= 50000 ? 'High' : (bl.out >= 20000 ? 'Medium' : 'Low')
-                def _pc = (_pri=='High') ? ['#FEE2E2','#991B1B'] : ((_pri=='Medium') ? ['#FEF3C7','#92400E'] : ['#DBEAFE','#1E40AF'])
+                def _pc = (_pri=='High') ? ['#FEE2E2','#DC2626'] : ((_pri=='Medium') ? ['#FEF3C7','#D97706'] : ['#DBEAFE','#3B82F6'])
                 overdueBills.add([name:_nm.toString(), no:(bl.no ?: ''), amt:zinr.inr(ec.l10n.format(bl.out,'#,##,##0')), days:bl.days, pri:_pri, pillBg:_pc[0], pillFg:_pc[1]])
             }
 
-            // Business Health composite (honest; same 5 metrics as the POS/Owner dashboards) + contact health metrics
-            healthMetrics = []; healthScore = 0; healthLabel = '—'; healthHasData = false; healthColor = '#9e9e9e'
+            // Business Health composite uses the existing five operational metrics.
+            healthMetrics = []; healthScore = 0; healthLabel = '—'; healthHasData = false; healthColor = '#9e9e9e'; healthBg = '#F3F4F6'
             try {
                 def _colr = { s -> s >= 80 ? 'good' : (s >= 55 ? 'warn' : 'bad') }
-                def _pill = [good:['#DCFCE7','#059669'], warn:['#FEF3C7','#92400E'], bad:['#FEE2E2','#991B1B'], na:['#EEF0F5','#64748B']]
+                def _pill = [good:['#ECFDF5','#059669'], warn:['#FFFBEB','#D97706'], bad:['#FEF2F2','#DC2626'], na:['#F3F4F6','#9CA3AF']]
                 def _addm = { name, avail, score, status, ck -> def p=_pill[ck]?:_pill.na; healthMetrics.add([name:name, avail:avail, score:score, status:status, pillBg:p[0], pillFg:p[1]]) }
                 if (_s30 <= 0 && _sp30 <= 0) { _addm('Sales', false, 0, 'No recent sales', 'na') }
                 else { double _g = _sp30>0 ? ((_s30.doubleValue()-_sp30.doubleValue())*100.0/_sp30.doubleValue()) : (_s30>0?100.0:-100.0)
@@ -257,7 +288,8 @@
                 if (_s30 <= 0) { _addm('Cash Flow', false, 0, 'No recent sales', 'na') }
                 else { def _outv=0G; try { ef.find("zenith.erp.pos.PosExpense").condition("organizationPartyId",orgId).condition("expenseDate",EntityCondition.GREATER_THAN_EQUAL_TO,new java.sql.Timestamp(_n30)).list().each{_outv+=((it.amount?:0G) as BigDecimal)} } catch(Exception e){}
                     double _r=_outv.doubleValue()*100.0/_s30.doubleValue(); def _sc=_r<5?95:(_r<15?80:(_r<30?60:35)); def _st=_r<5?'Strong':(_r<15?'Healthy':(_r<30?'Watch':'Tight')); _addm('Cash Flow', true, _sc, _st, _colr(_sc)) }
-                if (totalReceivable <= 0) { _addm('Receivables', true, 100, 'Nothing outstanding', 'good') }
+                if (!orgId) { _addm('Receivables', false, 0, 'No organization selected', 'na') }
+                else if (totalReceivable <= 0) { _addm('Receivables', true, 100, 'Nothing outstanding', 'good') }
                 else { double _r=_s90>0?(totalReceivable.doubleValue()/_s90.doubleValue()):1.0; def _sc=_r<0.02?95:(_r<0.10?80:(_r<0.25?55:30)); def _st=_r<0.02?'Healthy':(_r<0.10?'OK':(_r<0.25?'Needs Attention':'High')); _addm('Receivables', true, _sc, _st, _colr(_sc)) }
                 def _prodTot = orgId ? ef.find("mantle.product.Product").condition("ownerPartyId",orgId).count() : 0
                 if (_prodTot > 0) {
@@ -268,19 +300,20 @@
                     def _cf=ec.entity.conditionFactory; def _gc=_cf.makeCondition([_cf.makeCondition("gstSlabId",EntityCondition.IS_NOT_NULL,null),_cf.makeCondition("isGstExempt",EntityCondition.EQUALS,"Y"),_cf.makeCondition("hsnCode",EntityCondition.IS_NOT_NULL,null)],EntityCondition.OR)
                     def _go=ef.find("mantle.product.Product").condition("ownerPartyId",orgId).condition(_gc).count(); double _r=_go*1.0/_prodTot; def _sc=_r>=0.95?95:(_r>=0.80?80:(_r>=0.50?55:30)); def _st=_r>=0.95?'Compliant':(_r>=0.80?'Mostly set':(_r>=0.50?'Partial':'Needs setup')); _addm('GST', true, _sc, _st, _colr(_sc))
                 }
+                if (_prodTot == 0) { _addm('Inventory', false, 0, 'No products yet', 'na'); _addm('GST', false, 0, 'No products yet', 'na') }
                 def _av = healthMetrics.findAll { it.avail }; healthHasData = (_av.size() > 0)
                 healthScore = healthHasData ? (int) Math.round(_av.sum { it.score } / _av.size()) : 0
                 healthLabel = healthScore>=85?'Excellent':(healthScore>=70?'Good':(healthScore>=55?'Fair':'Needs Work'))
-                healthColor = healthScore>=85?'#10B981':(healthScore>=70?'#059669':(healthScore>=55?'#D97706':'#DC2626'))
-            } catch (Exception e) { healthMetrics=[]; healthScore=0; healthLabel='—'; healthHasData=false; healthColor='#9e9e9e' }
-            healthDash = healthScore*3.6
+                healthColor = healthScore>=70?'#059669':(healthScore>=55?'#D97706':'#DC2626')
+                healthBg = healthScore>=70?'#ECFDF5':(healthScore>=55?'#FFFBEB':'#FEF2F2')
+            } catch (Exception e) { healthMetrics=[]; healthScore=0; healthLabel='—'; healthHasData=false; healthColor='#9e9e9e'; healthBg='#F3F4F6' }
 
             // ---- Contact Map: customers plotted on an inline SVG India map (server-rendered → works on /apps AND /qapps).
             // Aggregate by city (fallback state) from the address on file; equirectangular projection to the viewBox. ----
             def _cc = [bhavani:[11.45,77.68],erode:[11.34,77.72],coimbatore:[11.02,76.96],salem:[11.66,78.15],tiruppur:[11.11,77.34],tirupur:[11.11,77.34],karur:[10.96,78.08],namakkal:[11.22,78.17],dindigul:[10.36,77.98],chennai:[13.08,80.27],madurai:[9.93,78.12],trichy:[10.79,78.70],tiruchirappalli:[10.79,78.70],thanjavur:[10.79,79.14],vellore:[12.92,79.13],tirunelveli:[8.71,77.76],pondicherry:[11.94,79.83],puducherry:[11.94,79.83],bangalore:[12.97,77.59],bengaluru:[12.97,77.59],mysore:[12.30,76.64],mangalore:[12.91,74.86],hyderabad:[17.38,78.49],mumbai:[19.08,72.88],delhi:[28.61,77.21],kolkata:[22.57,88.36],pune:[18.52,73.86],ahmedabad:[23.03,72.58],jaipur:[26.91,75.79],kochi:[9.93,76.27],cochin:[9.93,76.27],trivandrum:[8.52,76.94],thiruvananthapuram:[8.52,76.94],vijayawada:[16.51,80.65],visakhapatnam:[17.69,83.22],nagpur:[21.15,79.09],lucknow:[26.85,80.95],surat:[21.17,72.83],vadodara:[22.31,73.19],indore:[22.72,75.86],bhopal:[23.26,77.41],patna:[25.59,85.14],guwahati:[26.14,91.74],bhubaneswar:[20.30,85.82],chandigarh:[30.73,76.78],ludhiana:[30.90,75.86],rajkot:[22.30,70.80],nashik:[19.99,73.78],goa:[15.30,74.12]]
             def _sc = ['IND_TN':[10.9,78.3],'IND_KA':[14.5,76.0],'IND_KL':[10.3,76.5],'IND_AP':[15.5,79.5],'IND_TG':[17.9,79.0],'IND_MH':[19.4,76.5],'IND_GJ':[22.7,71.8],'IND_RJ':[26.8,73.8],'IND_UP':[27.0,80.5],'IND_MP':[23.7,78.5],'IND_WB':[23.5,87.8],'IND_DL':[28.6,77.2],'IND_PB':[31.0,75.4],'IND_HR':[29.2,76.3],'IND_BR':[25.7,85.5],'IND_OD':[20.7,85.0],'IND_OR':[20.7,85.0],'IND_JH':[23.6,85.3],'IND_CG':[21.3,82.0],'IND_AS':[26.3,92.8],'IND_UT':[30.0,79.2],'IND_HP':[31.8,77.3],'IND_GA':[15.4,74.0]]
             def _px = { lng -> (int)Math.round((((lng as double) - 67.0) / 31.0) * 448.0 + 16.0) }
-            def _py = { lat -> (int)Math.round(((37.5 - (lat as double)) / 31.5) * 488.0 + 16.0) }
+            def _py = { lat -> (int)Math.round(((37.5 - (lat as double)) / 31.5) * 288.0 + 16.0) }
             def _wp = [[35.5,77.0],[34.0,74.2],[32.7,74.5],[30.5,74.0],[28.0,70.5],[24.5,71.0],[23.7,68.4],[22.5,69.2],[21.0,72.6],[19.0,72.8],[15.5,73.7],[12.8,74.8],[10.0,76.2],[8.1,77.5],[9.2,78.8],[10.3,79.9],[13.1,80.3],[15.9,80.3],[17.7,83.3],[19.3,84.8],[20.3,86.6],[21.6,87.5],[22.0,88.9],[24.2,88.2],[25.2,89.9],[24.3,91.8],[23.0,93.2],[24.5,94.2],[27.2,95.3],[28.3,96.5],[29.0,94.5],[27.7,92.0],[27.2,88.9],[28.0,84.0],[30.3,81.0],[31.2,79.0],[32.6,78.7],[34.0,78.5]]
             def _pb = new StringBuilder(); _wp.eachWithIndex { p, i -> _pb.append((i==0?'M':'L') + _px(p[1]) + ' ' + _py(p[0]) + ' ') }; _pb.append('Z'); indiaPath = _pb.toString()
             def _matchLoc = { c, s -> def _cty = c?.toString()?.trim()?.toLowerCase()
@@ -318,14 +351,9 @@
             mapPoints = []
             _mpts.take(12).each { p -> def _r = 9 + (int)Math.round(13.0 * Math.sqrt((p.n as double)/_maxN)); mapPoints.add([name:p.name, cx:_px(p.lng), cy:_py(p.lat), r:_r, n:p.n]) }
             mapHasData = (mapPoints.size() > 0 || mapHome != null)
-            // real-lat/lng markers for the interactive Leaflet map; names sanitized so the JSON attribute is safe
-            def _san = { s -> (s ?: '').toString().replace('\\',' ').replace('"',' ').replace("'",' ').replace('\n',' ') }
-            mapMarkersJson = '[' + _mpts.take(12).collect { '{"lat":'+it.lat+',"lng":'+it.lng+',"n":'+it.n+',"name":"'+_san(it.name)+'"}' }.join(',') + ']'
-            mapHomeJson = (mapHome != null && mapHome.lat != null) ? ('{"lat":'+mapHome.lat+',"lng":'+mapHome.lng+',"name":"'+_san(mapHome.name)+'"}') : 'null'
-
             // ===== Customer Growth: NEW customers by their FIRST finalised-sale month + running total.
             // Honest acquisition trend from real invoice dates (contacts have no reliable created-date — party.last_updated_stamp
-            // is the MarG import batch). Inline SVG (bars = new that month, line = cumulative) → renders on /apps AND /qapps. =====
+            // is the MarG import batch). Inline SVG line = cumulative customers; renders on /apps and /qapps. =====
             def _acq = [:]  // partyId -> earliest finalised-sale timestamp
             if (orgId) {
                 ef.find("mantle.account.invoice.Invoice")
@@ -338,11 +366,9 @@
             }
             def _gmf = new java.text.SimpleDateFormat("yyyy-MM"); def _gml = new java.text.SimpleDateFormat("MMM yy")
             def _newBy = [:]; _acq.each { pid, dt -> def _k = _gmf.format(dt); _newBy[_k] = (_newBy[_k] ?: 0) + 1 }
-            growthHasData = (_acq.size() > 0); growthTotal = _acq.size(); growthBars = []; growthDots = []; growthXLabels = []; growthLine = ''
+            growthHasData = (_acq.size() > 0); growthTotal = _acq.size(); growthDots = []; growthXLabels = []; growthLine = ''; growthArea = ''; growthTicks = []; growthEnd = null
             if (growthHasData) {
-                def _cur = _gmf.format(_now); def _sorted = _newBy.keySet().toList().sort()
-                def _capC = java.util.Calendar.getInstance(); _capC.setTime(_now); _capC.set(java.util.Calendar.DAY_OF_MONTH,1); _capC.add(java.util.Calendar.MONTH,-14)
-                def _capKey = _gmf.format(_capC.getTime()); def _startKey = (_sorted[0] < _capKey) ? _capKey : _sorted[0]
+                def _cur = growthYear == _currentYear ? _gmf.format(_now) : growthYear + '-12'; def _startKey = growthYear + '-01'
                 def _before = 0; _acq.each { pid, dt -> if (_gmf.format(dt) < _startKey) _before++ }
                 def _mkeys = []; def _mlabels = []
                 def _it = java.util.Calendar.getInstance(); _it.setTime(_gmf.parse(_startKey))
@@ -350,63 +376,22 @@
                 while (!_it.getTime().after(_endC.getTime()) && _g2 < 24) { _mkeys.add(_gmf.format(_it.getTime())); _mlabels.add(_gml.format(_it.getTime())); _it.add(java.util.Calendar.MONTH,1); _g2++ }
                 def _newArr = _mkeys.collect { _newBy[it] ?: 0 }
                 def _cumArr = []; def _run = _before; _newArr.each { _run += it; _cumArr.add(_run) }
-                def _nMax = Math.max(1, (_newArr.max() ?: 0)); def _cMax = Math.max(1, (_cumArr.max() ?: 0))
-                double _x0=30, _x1=570, _yb=238, _yt=24; int _n=_mkeys.size(); double _slot=(_x1-_x0)/_n
+                def _cMax = Math.max(4, (int)(Math.ceil((_cumArr.max() ?: 0) / 4.0) * 4))
+                double _x0=55, _x1=570, _yb=220, _yt=20; int _n=_mkeys.size(); double _slot=(_x1-_x0)/_n
                 def _lb = new StringBuilder()
                 for (int i=0;i<_n;i++) {
-                    double _cx = _x0 + _slot*i + _slot/2; double _bw = Math.min(40.0, _slot*0.52); double _bh = (_newArr[i]/(double)_nMax)*(_yb-_yt)
-                    growthBars.add([x:(int)Math.round(_cx-_bw/2), y:(int)Math.round(_yb-_bh), w:(int)Math.round(_bw), h:(int)Math.round(_bh), n:_newArr[i], lx:(int)Math.round(_cx)])
+                    double _cx = _x0 + _slot*i + _slot/2
                     double _cy = _yb - (_cumArr[i]/(double)_cMax)*(_yb-_yt)
                     _lb.append((i==0?'':' ') + ((int)Math.round(_cx)) + ',' + ((int)Math.round(_cy)))
                     growthDots.add([cx:(int)Math.round(_cx), cy:(int)Math.round(_cy), n:_cumArr[i]])
                     growthXLabels.add([x:(int)Math.round(_cx), t:_mlabels[i]])
                 }
                 growthLine = _lb.toString()
+                growthArea = growthLine + ' ' + growthDots[-1].cx + ',220 ' + growthDots[0].cx + ',220'
+                growthEnd = growthDots[-1]
+                growthTotal = growthEnd.n
+                [0,1,2,3,4].each { i -> growthTicks.add([y:20+i*50, label:(int)Math.round(_cMax*(4-i)/4.0)]) }
             }
-
-            // ===== ZE-CONTACTS-DASH: CONTACT-focused Business Health composite (report 'Business Health Content' fix).
-            // Replaces the operational Sales/Cash-Flow/… list with contact-relevant metrics. Every value is REAL,
-            // derived from data already computed above — NO fabricated 'Response Rate'/'Conversion Rate' figures. =====
-            contactMetrics = []; chScore = 0; chLabel = '—'; chHasData = false; chColor = '#9e9e9e'; chBg = '#EEF0F5'
-            try {
-                def _txCust = _lastBy.size()   // customers with at least one finalised sale (real transacting base)
-                def _colrc = { s -> s >= 80 ? 'good' : (s >= 55 ? 'warn' : 'bad') }
-                def _fgc = [good:'#059669', warn:'#92400E', bad:'#991B1B', na:'#64748B']
-                def _addcm = { name, avail, score, status, ck -> contactMetrics.add([name:name, avail:avail, score:score, status:status, sev:ck, fg:(_fgc[ck]?:_fgc.na)]) }
-
-                // 1) Contacts Quality — share of contacts with a complete, reachable profile (address on file)
-                if (totalContacts > 0) { double _r = mapLocatedCount*1.0/totalContacts
-                    def _s=_r>=0.80?95:(_r>=0.60?80:(_r>=0.40?55:35)); def _t=_r>=0.80?'Strong':(_r>=0.60?'Good':(_r>=0.40?'Fair':'Needs Attention')); _addcm('Contacts Quality', true, _s, _t, _colrc(_s)) }
-                else _addcm('Contacts Quality', false, 0, 'No contacts yet', 'na')
-
-                // 2) Retention Rate — customers active in the last 90 days out of all who have ever bought
-                if (_txCust > 0) { double _r = activeCust*1.0/_txCust
-                    def _s=_r>=0.60?95:(_r>=0.40?80:(_r>=0.25?55:35)); def _t=_r>=0.60?'Strong':(_r>=0.40?'Good':(_r>=0.25?'Fair':'Needs Attention')); _addcm('Retention Rate', true, _s, _t, _colrc(_s)) }
-                else _addcm('Retention Rate', false, 0, 'No sales yet', 'na')
-
-                // 3) Follow Up Score — how much of what's owed is overdue (pending follow-ups)
-                if (totalReceivable > 0) { double _r = _overdue.doubleValue()/totalReceivable.doubleValue()
-                    def _s=_r<0.10?95:(_r<0.30?80:(_r<0.50?55:35)); def _t=_r<0.10?'Healthy':(_r<0.30?'Good':(_r<0.50?'Watch':'Needs Attention')); _addcm('Follow Up Score', true, _s, _t, _colrc(_s)) }
-                else _addcm('Follow Up Score', true, 100, 'Nothing pending', 'good')
-
-                // 4) High-Value Share — customers spending above your average, out of the transacting base
-                if (_txCust > 0) { double _r = highValueCust*1.0/_txCust
-                    def _s=_r>=0.30?90:(_r>=0.20?78:(_r>=0.10?58:42)); def _t=_r>=0.30?'Strong':(_r>=0.20?'Good':(_r>=0.10?'Fair':'Building')); _addcm('High-Value Share', true, _s, _t, _colrc(_s)) }
-                else _addcm('High-Value Share', false, 0, 'No sales yet', 'na')
-
-                // 5) Growth Trend — new customers acquired in the last 30 days vs the prior 30 (from first-sale dates)
-                def _new30 = _acq.values().count { it.getTime() >= _n30 }
-                def _newPrev = _acq.values().count { it.getTime() >= _n60 && it.getTime() < _n30 }
-                if (_new30 > 0 || _newPrev > 0) { double _g = _newPrev>0 ? ((_new30-_newPrev)*100.0/_newPrev) : (_new30>0?100.0:0.0)
-                    def _s=_g>=10?95:(_g>=0?80:(_g>=-25?55:35)); def _t=_g>=10?'Healthy':(_g>=0?'Steady':(_g>=-25?'Slowing':'Declining')); _addcm('Growth Trend', true, _s, _t, _colrc(_s)) }
-                else _addcm('Growth Trend', false, 0, 'No new customers yet', 'na')
-
-                def _avc = contactMetrics.findAll { it.avail }; chHasData = (_avc.size() > 0)
-                chScore = chHasData ? (int) Math.round(_avc.sum { it.score } / _avc.size()) : 0
-                chLabel = chScore>=85?'Excellent':(chScore>=70?'Good':(chScore>=55?'Fair':'Needs Work'))
-                chColor = chScore>=85?'#10B981':(chScore>=70?'#059669':(chScore>=55?'#D97706':'#DC2626'))
-                chBg    = chScore>=85?'#DCFCE7':(chScore>=70?'#ECFCCB':(chScore>=55?'#FEF3C7':'#FEE2E2'))
-            } catch (Exception e) { contactMetrics=[]; chScore=0; chLabel='—'; chHasData=false; chColor='#9e9e9e'; chBg='#EEF0F5' }
 
             // ZE-DASH layout: switchable widgets (+ cashier role default) + saved drag order
             def _roleHidden = ''
@@ -421,20 +406,216 @@
             showMetrics = !_hiddenSet.contains('metrics'); showActivity = !_hiddenSet.contains('activity'); showTopcust = !_hiddenSet.contains('topcust')
             w_metrics = showMetrics ? 'Y' : ''; w_activity = showActivity ? 'Y' : ''; w_topcust = showTopcust ? 'Y' : ''
             dashOrderCsv = (ec.user.getPreference('CONTACT_DASH_ORDER') ?: '')
-            // default = the three trend widgets share one compact row (Customer Growth | Activity | Top Customers);
-            // a saved pref (any customization) overrides; Reset restores this 3-column default.
-            dashSizeCsv = (ec.user.getPreference('CONTACT_DASH_SIZE') ?: 'growth:third,activity:third,topcust:third')
-            urlSettings = dashDate ? ("?dashDate="+dashDate+"&dashDateTo="+dashDateTo+"&showSettings=1") : "?showSettings=1"
+            // Activity and Top Customers remain optional, draggable widgets below the specified core dashboard.
+            dashSizeCsv = (ec.user.getPreference('CONTACT_DASH_SIZE') ?: 'activity:half,topcust:half')
+            urlSettings = _rangeParams + _growthParam + "&showSettings=1"
         ]]></script>
     </actions>
 
     <widgets>
         <!-- Freshness: reload if restored from the back/forward cache so the counts reflect newly-added contacts. -->
         <render-mode><text type="html"><![CDATA[<script>window.addEventListener('pageshow',function(e){if(e.persisted){location.reload();}});</script>]]></text></render-mode>
-        <container style="row items-center justify-between q-mb-lg">
+        <render-mode><text type="html,vuet,qvt" template="true"><![CDATA[
+        <div class="zc-dashboard-page">
+        <div class="zc-dashboard-controls">
+          <span></span>
+          <div class="zc-control-actions">
+            <a class="zc-outline" href="${urlSettings}"><span class="material-icons" aria-hidden="true">settings</span>Customize</a>
+            <details class="zc-range"><summary class="zc-outline"><span class="material-icons" aria-hidden="true">event</span>${dashRangeLabel}<span aria-hidden="true">&#9662;</span></summary>
+              <form method="get" action="" class="zc-range-pop"><input type="hidden" name="dateMode" value="custom"/><input type="hidden" name="growthYear" value="${growthYear?c}"/><label>From <input type="date" name="dashDate" value="${dashDate}"/></label><label>To <input type="date" name="dashDateTo" value="${dashDateTo}"/></label><button type="submit">Apply</button><a href="${urlAll}">Last 6 Months</a><a href="${url30}">Last 30 Days</a></form>
+            </details>
+            <#if urlPrev?has_content><a class="zc-nav-arrow" href="${urlPrev}" aria-label="Previous period">&#9664;</a><#else><span class="zc-nav-arrow" aria-hidden="true">&#9664;</span></#if>
+            <div class="zc-periods"><a href="${urlToday}" class="${(presetActive=='today')?string('on','')}">Today</a><a href="${urlWeek}" class="${(presetActive=='week')?string('on','')}">This Week</a><a href="${urlMonth}" class="${(presetActive=='month')?string('on','')}">This Month</a><a href="${urlYear}" class="${(presetActive=='year')?string('on','')}">This Year</a></div>
+          </div>
+        </div>
+        <#if dateError?has_content><p class="zc-date-error" role="alert">${dateError?html}</p></#if>
+        ]]></text></render-mode>
+        <section name="DashSettings" condition="showSettings == '1'">
+            <widgets>
+                <container style="q-px-lg q-py-md q-mb-md zenith-card bg-white shadow-1 border-radius-lg">
+                    <render-mode><text type="html"><![CDATA[<div style="font-size:12.5px;font-weight:800;color:#463D7A;letter-spacing:.04em;margin-bottom:2px">&#9881; CUSTOMIZE DASHBOARD</div><div style="font-size:12px;color:#5C6B85;margin-bottom:8px">Tick the sections you want to see &mdash; saved to your account. Drag the handle on any card to reorder.</div>]]></text></render-mode>
+                    <form-single name="DashLayoutForm" transition="saveDashLayout">
+                        <field name="dashDate"><default-field><hidden/></default-field></field>
+                        <field name="dashDateTo"><default-field><hidden/></default-field></field>
+                        <field name="dateMode"><default-field><hidden/></default-field></field>
+                        <field name="growthYear"><default-field><hidden/></default-field></field>
+                        <field name="w_metrics"><default-field title="Directory totals (customers, suppliers, active in range)"><check><option key="Y" text=" "/></check></default-field></field>
+                        <field name="w_activity"><default-field title="Customer Activity chart (over the selected range)"><check><option key="Y" text=" "/></check></default-field></field>
+                        <field name="w_topcust"><default-field title="Top Customers by sales (over the selected range)"><check><option key="Y" text=" "/></check></default-field></field>
+                        <field name="saveBtn"><default-field title=""><submit text="Save Layout" icon="fa fa-check"/></default-field></field>
+                    </form-single>
+                    <container style="row q-gutter-sm q-mt-sm">
+                        <link url="resetDashLayout" text="Reset to Default" icon="fa fa-undo" btn-type="warning"/>
+                        <link url="." text="Close" btn-type="flat"><parameter name="showSettings" value="0"/></link>
+                    </container>
+                </container>
+            </widgets>
+        </section>
+
+        <!-- Contacts Dashboard: the specified core layout, using existing org-scoped values. -->
+        <render-mode><text type="html,vuet,qvt" template="true"><![CDATA[
+        <main class="zc-dashboard" aria-label="Contacts Dashboard">
+          <#if showMetrics>
+          <div class="zc-stats">
+            <article class="zc-stat"><span class="zc-stat-label">Total Contacts</span><strong class="zc-stat-value">${totalContacts}</strong><span class="zc-stat-note">Lost Customers: ${lostCust}</span><span class="zc-stat-icon zc-icon-violet material-icons" aria-hidden="true">groups</span></article>
+            <article class="zc-stat"><span class="zc-stat-label">Customers (Active)</span><strong class="zc-stat-value">${activeCust}</strong><span class="zc-stat-note">Bought in the last 90 days</span><span class="zc-stat-icon zc-icon-green material-icons" aria-hidden="true">people</span></article>
+            <article class="zc-stat"><span class="zc-stat-label">Suppliers (Active)</span><strong class="zc-stat-value">${totalVendors}</strong><span class="zc-stat-note">Current supplier directory</span><span class="zc-stat-icon zc-icon-orange material-icons" aria-hidden="true">local_shipping</span></article>
+            <article class="zc-stat"><span class="zc-stat-label">Warehouses</span><strong class="zc-stat-value">${warehouseCount}</strong><span class="zc-stat-note">Stock-holding facilities</span><span class="zc-stat-icon zc-icon-blue material-icons" aria-hidden="true">warehouse</span></article>
+          </div>
+          </#if>
+
+          <div class="zc-viz-row">
+            <section class="zc-panel zc-growth" aria-label="Contact Growth">
+              <div class="zc-panel-head"><h2>Contact Growth</h2><details class="zc-growth-period"><summary class="zc-filter">${growthPeriodLabel} &#9662;</summary><div><a href="${urlGrowthCurrent}">This Year</a><a href="${urlGrowthPrevious}">Last Year</a></div></details></div>
+              <#if growthHasData>
+              <svg viewBox="0 0 620 260" role="img" aria-label="Cumulative named customers by first finalised sale" preserveAspectRatio="xMidYMid meet">
+                <defs><linearGradient id="zc-growth-fill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#10B981" stop-opacity=".15"/><stop offset="100%" stop-color="#10B981" stop-opacity=".01"/></linearGradient></defs>
+                <#list growthTicks as tick><line x1="55" y1="${tick.y}" x2="585" y2="${tick.y}" stroke="#E5E7EB" stroke-width="1" stroke-dasharray="4,4"/><text x="46" y="${tick.y + 4}" text-anchor="end" fill="#9CA3AF" font-size="11">${tick.label}</text></#list>
+                <line x1="55" y1="220" x2="585" y2="220" stroke="#9CA3AF" stroke-width="1"/>
+                <polygon points="${growthArea}" fill="url(#zc-growth-fill)"/>
+                <polyline points="${growthLine}" fill="none" stroke="#10B981" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+                <#list growthDots as dot><circle cx="${dot.cx}" cy="${dot.cy}" r="5" fill="#10B981" stroke="#fff" stroke-width="2.5"><title>${dot.n} customers</title></circle></#list>
+                <#list growthXLabels as xl><text x="${xl.x}" y="249" text-anchor="middle" fill="#6B7280" font-size="11">${xl.t}</text></#list>
+                <rect x="${growthEnd.cx - 31}" y="${growthEnd.cy + 10}" width="62" height="22" rx="10" fill="#059669"/><text x="${growthEnd.cx}" y="${growthEnd.cy + 25}" text-anchor="middle" fill="#fff" font-size="11" font-weight="600">${growthTotal}</text>
+              </svg>
+              <p class="zc-chart-note">New named customers by first sale. Walk-in sales are excluded.</p>
+              <#else><p class="zc-empty">No named-customer sales yet. The growth chart will appear after a customer is attached to a finalised sale.</p></#if>
+            </section>
+
+            <section class="zc-panel zc-map" aria-label="Contact Map">
+              <div class="zc-panel-head"><h2>Contact Map</h2><span class="zc-map-count">${mapLocatedCount} of ${totalContacts} located</span></div>
+              <#if mapHasData>
+              <div class="zc-map-body">
+                <svg viewBox="0 0 500 320" role="img" aria-label="Map of India with customer clusters and business location">
+                  <rect width="500" height="320" fill="#EFF6FF"/>
+                  <path d="${indiaPath}" fill="#E5E7EB" stroke="#E5E7EB" stroke-width="1.5"/>
+                  <ellipse cx="262" cy="308" rx="4" ry="8" fill="#E5E7EB" stroke="#E5E7EB"/>
+                  <g fill="#9CA3AF" font-size="9"><text x="28" y="103">Pakistan</text><text x="276" y="51">Nepal</text><text x="332" y="65">Bhutan</text><text x="357" y="132">Bangladesh</text><text x="32" y="232">Arabian Sea</text><text x="350" y="244">Bay of Bengal</text></g>
+                  <text x="215" y="152" fill="#6B7280" font-size="13" font-weight="600">India</text>
+                  <g fill="#6B7280" font-size="8"><text x="171" y="88">New Delhi</text><text x="190" y="202">Hyderabad</text><text x="177" y="243">Bengaluru</text></g>
+                  <#list mapPoints as p><g><circle cx="${p.cx}" cy="${p.cy}" r="16" fill="#7C3AED" fill-opacity=".9"><title>${p.name?html}: ${p.n} customers</title></circle><text x="${p.cx}" y="${p.cy + 4}" text-anchor="middle" fill="#fff" font-size="11" font-weight="700" pointer-events="none">${p.n}</text></g></#list>
+                  <#if mapHome??><g transform="translate(${mapHome.cx},${mapHome.cy})"><path d="M0 -14 C8 -14 12 -9 12 -3 C12 5 0 17 0 17 C0 17 -12 5 -12 -3 C-12 -9 -8 -14 0 -14Z" fill="#10B981" stroke="#fff" stroke-width="2"/><circle cy="-3" r="3" fill="#fff"/><title>${mapHome.name?html}: your business</title></g></#if>
+                </svg>
+                <div class="zc-map-zoom"><button type="button" aria-label="Zoom in" onclick="var s=this.closest('.zc-map-body').querySelector('svg');var n=Math.min(2,Number(s.dataset.zoom||1)+.2);s.dataset.zoom=n;s.style.transform='scale('+n+')'">+</button><button type="button" aria-label="Zoom out" onclick="var s=this.closest('.zc-map-body').querySelector('svg');var n=Math.max(1,Number(s.dataset.zoom||1)-.2);s.dataset.zoom=n;s.style.transform='scale('+n+')'">&#8722;</button></div>
+                <button class="zc-map-full" type="button" aria-label="Fullscreen map" onclick="var m=this.closest('.zc-map-body');var d=m.ownerDocument;var f,r;if(d.fullscreenElement||d.webkitFullscreenElement){f=d.exitFullscreen||d.webkitExitFullscreen;r=f.call(d);}else{f=m.requestFullscreen||m.webkitRequestFullscreen;if(f){r=f.call(m);}else{m.classList.toggle('zc-map-expanded');}}if(r&&r.catch)r.catch(function(){});">&#x26F6;</button>
+                <div class="zc-map-legend"><span><i class="zc-legend-green"></i>Shop Location</span><span><i class="zc-legend-violet"></i>Cluster</span></div>
+              </div>
+              <#else><p class="zc-empty">No mappable location on file yet. Add a city or state to your business or customer addresses to see locations here.</p></#if>
+            </section>
+          </div>
+
+          <div class="zc-bottom-row">
+            <section class="zc-panel zc-health" aria-label="Business Health">
+              <div class="zc-panel-head"><h2>Business Health</h2><#if healthHasData><span class="zc-health-score"><strong>${healthScore}</strong><span>/100</span></span></#if></div>
+              <#if healthHasData>
+              <div class="zc-health-pill" style="color:${healthColor};background:${healthBg}"><span class="material-icons" aria-hidden="true">check_circle</span>${healthLabel}</div>
+              <div class="zc-health-items"><#list healthMetrics as m><div><span>${m.name}</span><span style="color:${m.pillFg}"><span class="material-icons" aria-hidden="true">${(!m.avail)?string('remove_circle_outline',(m.score gte 80)?string('check_circle','error_outline'))}</span>${m.status?html}</span></div></#list></div>
+              <a class="zc-view-link" href="/apps/zenith/pos/OwnerDashboard">View Full Report <span aria-hidden="true">&#8594;</span></a>
+              <#else><p class="zc-empty">Not enough activity yet to score business health.</p></#if>
+            </section>
+
+            <section class="zc-panel zc-followups" aria-label="Pending Follow Ups">
+              <div class="zc-panel-head"><h2>Pending Follow Ups <small>(Overdue Credit Bills)</small></h2><a class="zc-view-link" href="/apps/zenith/pos/CreditBills">View All <span aria-hidden="true">&#8594;</span></a></div>
+              <#if overdueBills?size gt 0><div class="zc-follow-list"><#list overdueBills as b>
+                <div class="zc-follow-row"><span class="zc-priority" style="background:${b.pillBg};color:${b.pillFg}">${b.pri}</span><span class="zc-follow-icon material-icons" aria-hidden="true">description</span><div class="zc-follow-person"><strong>${b.name?html}</strong><small><#if b.no?has_content>Bill ${b.no?html}<#else>Credit bill</#if></small></div><div class="zc-follow-amount"><strong>&#8377;${b.amt}</strong><small>Overdue ${b.days}d</small></div></div>
+              </#list></div><#else><p class="zc-empty">No overdue credit bills.</p></#if>
+            </section>
+
+            <section class="zc-panel zc-credit" aria-label="Credit and Collection Summary">
+              <div class="zc-panel-head"><h2>Credit &amp; Collection Summary</h2><a class="zc-view-link" href="/apps/zenith/pos/CreditBills">View All <span aria-hidden="true">&#8594;</span></a></div>
+              <div class="zc-credit-top"><span class="zc-credit-icon material-icons" aria-hidden="true">groups</span><div><small>Total Receivables</small><strong>&#8377;${fmtReceivable}</strong></div><div><small>Overdue Amount</small><strong class="zc-red">&#8377;${fmtOverdue}</strong></div></div>
+              <div class="zc-credit-ages"><#list ageRows as a><div><i style="background:${a.dot}"></i><span>${a.label}</span><strong>&#8377;${a.amt}</strong><b>${a.pct}%</b></div></#list></div>
+              <#if !creditHasData><p class="zc-credit-note">No outstanding credit bills right now.</p></#if>
+            </section>
+          </div>
+
+          <details class="zc-contact-health"><summary>Contact Health</summary><div><span>In Good Standing</span><strong>${goodStandingCust}</strong></div><div><span>At Risk</span><strong>${atRiskCust}</strong></div><div><span>Inactive / Lost</span><strong>${inactiveCust}</strong></div><div><span>High Value</span><strong>${highValueCust}</strong></div></details>
+        </main>
+        ]]></text></render-mode>
+
+        <!-- Customer Activity time series (driven by the date range) -->
+        <section name="wActivity" condition="showActivity"><widgets>
+        <render-mode><text type="html"><![CDATA[<div class="dash-widget" data-wkey="activity"><div class="dash-handle" title="Drag to reorder">&#8942;&#8942;</div>]]></text></render-mode>
+        <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md q-mb-md">
+            <container style="row items-center justify-between q-mb-sm">
+                <label text="Customer Activity — ${acRangeLabel}" type="h6" style="text-primary text-weight-bold q-my-none"/>
+                <label text="${acActiveInRange} active customers · ${acInvCount} bills" type="p" style="text-grey-6 text-caption q-mb-none"/>
+            </container>
+            <section name="AcHasData">
+                <condition><expression>acHasData</expression></condition>
+                <widgets>
+                    <render-mode><text type="html,vuet,qvt" template="true"><![CDATA[
+                        <div id="contactsActivityChart"></div>
+                        <img alt="" style="display:none" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" onload="zChart(this,function(){(function(){
+                            new ApexCharts(document.querySelector(&quot;#contactsActivityChart&quot;), {
+                                chart: { type:'area', height: 200, toolbar:{show:false}, fontFamily:'Roboto, sans-serif' },
+                                series: [ { name:'Active customers', data: ${acValsJson} } ],
+                                xaxis: { categories: ${acLabelsJson?html} },
+                                colors: ['#7C3AED'],
+                                stroke: { curve:'smooth', width:2 },
+                                fill: { type:'gradient', gradient:{ shadeIntensity:0.4, opacityFrom:0.4, opacityTo:0.05 } },
+                                dataLabels: { enabled:false },
+                                yaxis: { title:{ text:'Customers who bought' }, labels:{ formatter:function(v){ return Math.round(v); } } }
+                            }).render();
+                        })();})"/>
+                    ]]></text></render-mode>
+                </widgets>
+            </section>
+            <section name="AcNoData">
+                <condition><expression>!acHasData</expression></condition>
+                <widgets>
+                    <container style="bg-blue-1 q-pa-md border-radius-md text-center">
+                        <label text="No finalised sales in this period, so there's no customer activity to show. Pick a wider range, or record some sales." type="p" style="text-blue-9 q-mb-none"/>
+                    </container>
+                </widgets>
+            </section>
+        </container>
+        <render-mode><text type="html"><![CDATA[</div>]]></text></render-mode>
+        </widgets></section>
+
+        <!-- Top Customers by sales (driven by the date range) -->
+        <section name="wTopcust" condition="showTopcust"><widgets>
+        <render-mode><text type="html"><![CDATA[<div class="dash-widget" data-wkey="topcust"><div class="dash-handle" title="Drag to reorder">&#8942;&#8942;</div>]]></text></render-mode>
+        <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md q-mb-md">
+            <label text="Top Customers — ${acRangeLabel}" type="h6" style="text-primary text-weight-bold q-mb-md"/>
+            <section name="TcHasData">
+                <condition><expression>tcHasData</expression></condition>
+                <widgets>
+                    <render-mode><text type="html,vuet,qvt" template="true"><![CDATA[
+                        <div id="contactsTopCustChart"></div>
+                        <img alt="" style="display:none" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" onload="zChart(this,function(){(function(){
+                            var labels = ${tcLabelsJson?html};
+                            var data = ${tcValsJson}.map(Number);
+                            new ApexCharts(document.querySelector(&quot;#contactsTopCustChart&quot;), {
+                                chart: { type:'bar', height: 230, toolbar:{show:false}, fontFamily:'Roboto, sans-serif' },
+                                series: [{ name:'Sales (₹)', data: data }],
+                                plotOptions: { bar: { horizontal:true, borderRadius:4, distributed:true, barHeight:'70%' } },
+                                xaxis: { categories: labels },
+                                legend: { show:false },
+                                colors: ['#7C3AED','#B98BE0','#A78BFA','#26A69A','#66BB6A','#FFA726','#FF7043','#EF5350'],
+                                dataLabels: { enabled:true, formatter:function(v){ return '₹' + Number(v).toLocaleString('en-IN'); } },
+                                tooltip: { y: { formatter:function(v){ return '₹' + Number(v).toLocaleString('en-IN'); } } }
+                            }).render();
+                        })();})"/>
+                    ]]></text></render-mode>
+                </widgets>
+            </section>
+            <section name="TcNoData">
+                <condition><expression>!tcHasData</expression></condition>
+                <widgets>
+                    <container style="bg-blue-1 q-pa-md border-radius-md text-center">
+                        <label text="No finalised sales in this period yet. Once you bill some customers they'll appear here, ranked by value." type="p" style="text-blue-9 q-mb-none"/>
+                    </container>
+                </widgets>
+            </section>
+        </container>
+        <render-mode><text type="html"><![CDATA[</div>]]></text></render-mode>
+        </widgets></section>
+        <!-- Existing directory actions remain available below the dashboard. -->
+        <container style="row items-center justify-between q-mb-lg zc-directory-actions">
             <container>
-                <label text="Contacts Dashboard" type="h3" style="text-primary text-weight-bold q-my-none"/>
-                <label text="Everyone you do business with — the people and companies you sell to (customers) and buy from (suppliers), all in one place." type="p" style="text-grey-7 q-mt-sm q-mb-none"/>
+                <label text="Directory Actions" type="h3" style="text-primary text-weight-bold q-my-none"/>
+                <label text="Add a person or company to the contacts directory." type="p" style="text-grey-7 q-mt-sm q-mb-none"/>
             </container>
             <section name="ContactsDashboard_write">
               <condition><expression>modCanWrite</expression></condition>
@@ -503,340 +684,6 @@
             </section>
         </container>
 
-        <!-- ZE-DASH: date-range filter (drives Customer Activity + Top Customers) + customize gear -->
-        <container style="q-px-lg q-py-md q-mb-md zenith-card bg-white shadow-1 border-radius-lg">
-            <render-mode><text type="html,vuet,qvt" template="true"><![CDATA[<div style="display:flex;flex-wrap:wrap;align-items:center;gap:8px;font-family:Segoe UI,Arial,sans-serif;margin-bottom:8px"><span style="font-size:11.5px;font-weight:800;color:#5C6B85;letter-spacing:.06em;margin-right:4px">ACTIVITY RANGE</span><details class="zdash-dr"><summary class="zdash-chip zdash-dr-sum${showCustom?string(' on','')}">&#128197; <#if (showCustom!false) && (dashDate!'')?has_content>${dashDate}<#if (dashDateTo!'')?has_content && dashDateTo != dashDate> to ${dashDateTo}</#if><#else>Date-wise</#if> &#9662;</summary><form method="get" action="." class="zdash-dr-pop"><input type="hidden" name="dateMode" value="custom"/><div class="zdash-dr-row"><span>From</span><input type="date" name="dashDate" value="${dashDate}"/></div><div class="zdash-dr-row"><span>To</span><input type="date" name="dashDateTo" value="${dashDateTo}"/></div><button type="submit" class="zdash-dr-apply">&#10003; Apply</button></form></details><a href="${urlAll}" class="zdash-chip${(presetActive=='all' && !showCustom)?string(' on','')}">All time</a><a href="${urlToday}" class="zdash-chip${(presetActive=='today')?string(' on','')}">Today</a><a href="${urlWeek}" class="zdash-chip${(presetActive=='week')?string(' on','')}">This Week</a><a href="${urlMonth}" class="zdash-chip${(presetActive=='month')?string(' on','')}">This Month</a><a href="${url30}" class="zdash-chip${(presetActive=='last30')?string(' on','')}">Last 30 Days</a><a href="${urlYear}" class="zdash-chip${(presetActive=='year')?string(' on','')}">This Year</a><a href="${urlSettings}" title="Customize dashboard widgets" style="margin-left:auto;color:#9C93B4;font-size:18px;line-height:1;text-decoration:none;padding:2px 6px">&#9881;</a></div><div style="font-size:11px;color:#8A96AB">Pick <b>Date-wise</b> for a custom From&ndash;To range, or a quick period. This range drives the <b>Customer Activity</b> chart and <b>Top Customers</b>; your <b>Customers</b> / <b>Suppliers</b> totals always show the current directory.</div>]]></text></render-mode>
-            <!-- ZE-DATEPICKER: superseded by the compact <details> date-range pill in the chip row; keep the
-                 form defined but never render it (condition false) so the bulky From/To panel can't reappear. -->
-            <section name="wDateCustom">
-                <condition><expression>false</expression></condition>
-                <widgets>
-                    <form-single name="DateForm" transition="changeDashDate">
-                        <field name="dashDate"><default-field title="From"><date-time type="date" default-value="${dashDate}"/></default-field></field>
-                        <field name="dashDateTo"><default-field title="To"><date-time type="date" default-value="${dashDateTo}"/></default-field></field>
-                        <field name="goBtn"><default-field title=""><submit text="Apply" icon="fa fa-check"/></default-field></field>
-                    </form-single>
-                </widgets>
-            </section>
-        </container>
-        <section name="DashSettings" condition="showSettings == '1'">
-            <widgets>
-                <container style="q-px-lg q-py-md q-mb-md zenith-card bg-white shadow-1 border-radius-lg">
-                    <render-mode><text type="html"><![CDATA[<div style="font-size:12.5px;font-weight:800;color:#463D7A;letter-spacing:.04em;margin-bottom:2px">&#9881; CUSTOMIZE DASHBOARD</div><div style="font-size:12px;color:#5C6B85;margin-bottom:8px">Tick the sections you want to see &mdash; saved to your account. Drag the handle on any card to reorder.</div>]]></text></render-mode>
-                    <form-single name="DashLayoutForm" transition="saveDashLayout">
-                        <field name="w_metrics"><default-field title="Directory totals (customers, suppliers, active in range)"><check><option key="Y" text=" "/></check></default-field></field>
-                        <field name="w_activity"><default-field title="Customer Activity chart (over the selected range)"><check><option key="Y" text=" "/></check></default-field></field>
-                        <field name="w_topcust"><default-field title="Top Customers by sales (over the selected range)"><check><option key="Y" text=" "/></check></default-field></field>
-                        <field name="saveBtn"><default-field title=""><submit text="Save Layout" icon="fa fa-check"/></default-field></field>
-                    </form-single>
-                    <container style="row q-gutter-sm q-mt-sm">
-                        <link url="resetDashLayout" text="Reset to Default" icon="fa fa-undo" btn-type="warning"/>
-                        <link url="." text="Close" btn-type="flat"/>
-                    </container>
-                </container>
-            </widgets>
-        </section>
-
-        <!-- Metrics row -->
-        <section name="wMetrics" condition="showMetrics"><widgets>
-        <render-mode><text type="html"><![CDATA[<div class="dash-widget" data-wkey="metrics"><div class="dash-handle" title="Drag to reorder">&#8942;&#8942;</div>]]></text></render-mode>
-        <container-row>
-            <row-col lg="3" md="6" sm="12">
-                <!-- Total Contacts (distinct customers + suppliers, current directory) -->
-                <container style="zenith-card q-pa-lg bg-white shadow-1 border-radius-lg border-left border-primary q-mb-md">
-                    <container style="row items-center justify-between">
-                        <container>
-                            <label text="Total Contacts" type="h6" style="text-grey-7 q-my-none"/>
-                            <label text="${totalContacts}" type="h3" style="text-primary text-weight-bold q-my-none q-mt-sm"/>
-                            <label text="customers + suppliers" type="p" style="text-grey-6 text-caption q-mb-none q-mt-xs"/>
-                        </container>
-                        <container style="zenith-avatar text-primary bg-indigo-1" type="div">
-                            <render-mode><text type="html"><![CDATA[<q-icon name="groups" class="text-h3"/>]]></text></render-mode>
-                        </container>
-                    </container>
-                    <container style="q-mt-md">
-                        <link url="../FindContact" text="View All" style="q-btn q-btn--flat text-primary text-weight-bold"/>
-                    </container>
-                </container>
-            </row-col>
-
-            <row-col lg="3" md="6" sm="12">
-                <!-- Active Customers (bought in last 90 days) with Lost count -->
-                <container style="zenith-card q-pa-lg bg-white shadow-1 border-radius-lg border-left border-info q-mb-md">
-                    <container style="row items-center justify-between">
-                        <container>
-                            <label text="Customers (Active)" type="h6" style="text-grey-7 q-my-none"/>
-                            <label text="${activeCust}" type="h3" style="text-info text-weight-bold q-my-none q-mt-sm"/>
-                            <label text="bought in last 90 days · Lost: ${lostCust}" type="p" style="text-grey-6 text-caption q-mb-none q-mt-xs"/>
-                        </container>
-                        <container style="zenith-avatar text-info bg-cyan-1" type="div">
-                            <render-mode><text type="html"><![CDATA[<q-icon name="shopping_bag" class="text-h3"/>]]></text></render-mode>
-                        </container>
-                    </container>
-                    <container style="q-mt-md">
-                        <link url="../Customers" text="View Customers" style="q-btn q-btn--flat text-info text-weight-bold"/>
-                    </container>
-                </container>
-            </row-col>
-
-            <row-col lg="3" md="6" sm="12">
-                <!-- Suppliers (current directory) -->
-                <container style="zenith-card q-pa-lg bg-white shadow-1 border-radius-lg border-left border-warning q-mb-md">
-                    <container style="row items-center justify-between">
-                        <container>
-                            <label text="Suppliers (Active)" type="h6" style="text-grey-7 q-my-none"/>
-                            <label text="${totalVendors}" type="h3" style="text-warning text-weight-bold q-my-none q-mt-sm"/>
-                            <label text="companies you buy from" type="p" style="text-grey-6 text-caption q-mb-none q-mt-xs"/>
-                        </container>
-                        <container style="zenith-avatar text-warning bg-orange-1" type="div">
-                            <render-mode><text type="html"><![CDATA[<q-icon name="local_shipping" class="text-h3"/>]]></text></render-mode>
-                        </container>
-                    </container>
-                    <container style="q-mt-md">
-                        <link url="../Vendors" text="View Suppliers" style="q-btn q-btn--flat text-warning text-weight-bold"/>
-                    </container>
-                </container>
-            </row-col>
-
-            <row-col lg="3" md="6" sm="12">
-                <!-- Warehouses (real facility count) -->
-                <container style="zenith-card q-pa-lg bg-white shadow-1 border-radius-lg border-left border-positive q-mb-md">
-                    <container style="row items-center justify-between">
-                        <container>
-                            <label text="Warehouses" type="h6" style="text-grey-7 q-my-none"/>
-                            <label text="${warehouseCount}" type="h3" style="text-positive text-weight-bold q-my-none q-mt-sm"/>
-                            <label text="stock-holding facilities" type="p" style="text-grey-6 text-caption q-mb-none q-mt-xs"/>
-                        </container>
-                        <container style="zenith-avatar text-positive bg-green-1" type="div">
-                            <render-mode><text type="html"><![CDATA[<q-icon name="warehouse" class="text-h3"/>]]></text></render-mode>
-                        </container>
-                    </container>
-                    <container style="q-mt-md">
-                        <link url="/apps/zenith/Inventory/FindFacility" text="Manage Facilities" style="q-btn q-btn--flat text-positive text-weight-bold"/>
-                    </container>
-                </container>
-            </row-col>
-        </container-row>
-        <render-mode><text type="html"><![CDATA[</div>]]></text></render-mode>
-        </widgets></section>
-
-        <!-- ===== ZE-CONTACTS-DASH v2.1.0 (report Fig 3.3 "Contact Growth"): Customer Growth — new customers by first
-             finalised-sale month + running total. Real acquisition trend. Inline SVG → renders on /apps AND /qapps. ===== -->
-        <render-mode><text type="qvt"><![CDATA[<div class="zc-3col">]]></text></render-mode>
-        <render-mode><text type="html"><![CDATA[<div class="dash-widget" data-wkey="growth"><div class="dash-handle" title="Drag to reorder">&#8942;&#8942;</div>]]></text></render-mode>
-        <render-mode><text type="html,vuet,qvt" template="true"><![CDATA[
-        <div style="background:#fff;border-radius:14px;box-shadow:0 1px 3px rgba(70,61,122,.08);padding:15px 18px;margin-bottom:16px;font-family:Segoe UI,Arial,sans-serif;height:100%">
-          <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px">
-            <span style="font-size:15px;font-weight:800;color:#463D7A">Customer Growth</span>
-            <#if growthHasData><span style="font-size:12.5px;color:#7C3AED;font-weight:800">${growthTotal} total</span></#if>
-          </div>
-          <#if growthHasData>
-          <svg viewBox="0 0 600 300" style="width:100%;height:auto;max-height:240px;display:block">
-            <line x1="30" y1="238" x2="570" y2="238" stroke="#E4DFF3" stroke-width="1.5"></line>
-            <#list growthXLabels as xl>
-              <text x="${xl.x}" y="266" text-anchor="middle" font-size="12" font-weight="600" fill="#8983A0">${xl.t}</text>
-            </#list>
-            <polyline points="${growthLine}" fill="none" stroke="#7C3AED" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"></polyline>
-            <#list growthDots as d>
-              <circle cx="${d.cx}" cy="${d.cy}" r="4.5" fill="#7C3AED" stroke="#ffffff" stroke-width="1.5"></circle>
-            </#list>
-          </svg>
-          <div style="font-size:10.5px;color:#9AA3B2;margin-top:5px">New customers by first sale &middot; walk-in / cash sales excluded.</div>
-          <#else>
-          <div style="background:#EEF2FF;color:#3730A3;padding:14px;border-radius:8px;font-size:13px">No named-customer sales yet, so there's no growth trend to show. Attach a customer to a bill and, over time, you'll see how your base grows.</div>
-          </#if>
-        </div>
-        ]]></text></render-mode>
-        <render-mode><text type="html"><![CDATA[</div>]]></text></render-mode>
-
-        <!-- Customer Activity time series (driven by the date range) -->
-        <section name="wActivity" condition="showActivity"><widgets>
-        <render-mode><text type="html"><![CDATA[<div class="dash-widget" data-wkey="activity"><div class="dash-handle" title="Drag to reorder">&#8942;&#8942;</div>]]></text></render-mode>
-        <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md q-mb-md">
-            <container style="row items-center justify-between q-mb-sm">
-                <label text="Customer Activity — ${acRangeLabel}" type="h6" style="text-primary text-weight-bold q-my-none"/>
-                <label text="${acActiveInRange} active customers · ${acInvCount} bills" type="p" style="text-grey-6 text-caption q-mb-none"/>
-            </container>
-            <section name="AcHasData">
-                <condition><expression>acHasData</expression></condition>
-                <widgets>
-                    <render-mode><text type="html,vuet,qvt" template="true"><![CDATA[
-                        <div id="contactsActivityChart"></div>
-                        <img alt="" style="display:none" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" onload="zChart(this,function(){(function(){
-                            new ApexCharts(document.querySelector(&quot;#contactsActivityChart&quot;), {
-                                chart: { type:'area', height: 200, toolbar:{show:false}, fontFamily:'Roboto, sans-serif' },
-                                series: [ { name:'Active customers', data: ${acValsJson} } ],
-                                xaxis: { categories: ${acLabelsJson} },
-                                colors: ['#7C3AED'],
-                                stroke: { curve:'smooth', width:2 },
-                                fill: { type:'gradient', gradient:{ shadeIntensity:0.4, opacityFrom:0.4, opacityTo:0.05 } },
-                                dataLabels: { enabled:false },
-                                yaxis: { title:{ text:'Customers who bought' }, labels:{ formatter:function(v){ return Math.round(v); } } }
-                            }).render();
-                        })();})"/>
-                    ]]></text></render-mode>
-                </widgets>
-            </section>
-            <section name="AcNoData">
-                <condition><expression>!acHasData</expression></condition>
-                <widgets>
-                    <container style="bg-blue-1 q-pa-md border-radius-md text-center">
-                        <label text="No finalised sales in this period, so there's no customer activity to show. Pick a wider range, or record some sales." type="p" style="text-blue-9 q-mb-none"/>
-                    </container>
-                </widgets>
-            </section>
-        </container>
-        <render-mode><text type="html"><![CDATA[</div>]]></text></render-mode>
-        </widgets></section>
-
-        <!-- Top Customers by sales (driven by the date range) -->
-        <section name="wTopcust" condition="showTopcust"><widgets>
-        <render-mode><text type="html"><![CDATA[<div class="dash-widget" data-wkey="topcust"><div class="dash-handle" title="Drag to reorder">&#8942;&#8942;</div>]]></text></render-mode>
-        <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md q-mb-md">
-            <label text="Top Customers — ${acRangeLabel}" type="h6" style="text-primary text-weight-bold q-mb-md"/>
-            <section name="TcHasData">
-                <condition><expression>tcHasData</expression></condition>
-                <widgets>
-                    <render-mode><text type="html,vuet,qvt" template="true"><![CDATA[
-                        <div id="contactsTopCustChart"></div>
-                        <img alt="" style="display:none" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" onload="zChart(this,function(){(function(){
-                            var labels = ${tcLabelsJson};
-                            var data = ${tcValsJson}.map(Number);
-                            new ApexCharts(document.querySelector(&quot;#contactsTopCustChart&quot;), {
-                                chart: { type:'bar', height: 230, toolbar:{show:false}, fontFamily:'Roboto, sans-serif' },
-                                series: [{ name:'Sales (₹)', data: data }],
-                                plotOptions: { bar: { horizontal:true, borderRadius:4, distributed:true, barHeight:'70%' } },
-                                xaxis: { categories: labels },
-                                legend: { show:false },
-                                colors: ['#7C3AED','#B98BE0','#A78BFA','#26A69A','#66BB6A','#FFA726','#FF7043','#EF5350'],
-                                dataLabels: { enabled:true, formatter:function(v){ return '₹' + Number(v).toLocaleString('en-IN'); } },
-                                tooltip: { y: { formatter:function(v){ return '₹' + Number(v).toLocaleString('en-IN'); } } }
-                            }).render();
-                        })();})"/>
-                    ]]></text></render-mode>
-                </widgets>
-            </section>
-            <section name="TcNoData">
-                <condition><expression>!tcHasData</expression></condition>
-                <widgets>
-                    <container style="bg-blue-1 q-pa-md border-radius-md text-center">
-                        <label text="No finalised sales in this period yet. Once you bill some customers they'll appear here, ranked by value." type="p" style="text-blue-9 q-mb-none"/>
-                    </container>
-                </widgets>
-            </section>
-        </container>
-        <render-mode><text type="html"><![CDATA[</div>]]></text></render-mode>
-        </widgets></section>
-        <render-mode><text type="qvt"><![CDATA[</div>]]></text></render-mode>
-
-        <!-- ===== ZE-CONTACTS-DASH v2.1.0 (report Fig 3.4): Contact Map — inline SVG India map, server-rendered bubbles.
-             No external map library/CDN → renders identically on /apps and /qapps. All points are REAL contacts. ===== -->
-        <render-mode><text type="html,vuet,qvt" template="true"><![CDATA[
-        <div style="background:#fff;border-radius:14px;box-shadow:0 1px 3px rgba(70,61,122,.08);padding:16px;margin-bottom:16px;font-family:Segoe UI,Arial,sans-serif;max-width:600px">
-          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:3px">
-            <span style="font-size:15px;font-weight:800;color:#463D7A">Contact Map</span>
-            <span style="font-size:11px;font-weight:700;color:#8983A0">${mapLocatedCount} of ${totalContacts} located</span>
-          </div>
-          <div style="font-size:10.5px;color:#9AA3B2;margin-bottom:10px">Your business &amp; customers, plotted from the city / state on file.</div>
-          <#if mapHasData>
-          <div data-cmap>
-            <div class="z-cmap" data-markers='${mapMarkersJson}' data-home='${mapHomeJson}' style="height:320px;border-radius:10px;background:#EEF0F5"></div>
-            <img alt="" style="display:none" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" onload="zContactMap(this)"/>
-          </div>
-          <div style="display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin-top:8px;font-size:10.5px;color:#5C6B85">
-            <#if mapHome??><span style="display:flex;align-items:center;gap:6px"><span style="width:11px;height:11px;background:#B833EC;transform:rotate(45deg);flex:0 0 auto"></span> Your business</span></#if>
-            <span style="display:flex;align-items:center;gap:6px"><span style="width:11px;height:11px;border-radius:50%;background:#7C3AED;flex:0 0 auto"></span> Customer location (bubble = count)</span>
-            <span style="color:#9AA3B2;margin-left:auto"><#if (mapPoints?size == 0)>Add a city / state to customers to plot them. <#else>Walk-in / address-less contacts aren't shown.</#if></span>
-          </div>
-          <#else>
-          <div style="background:#EEF2FF;color:#3730A3;padding:12px;border-radius:8px;font-size:12px">No mappable location on file yet. Add a <b>city</b> or <b>state</b> to your business address or your customers' addresses and they'll appear here.</div>
-          </#if>
-        </div>
-        ]]></text></render-mode>
-
-        <!-- ===== ZE-CONTACTS-DASH (report 'Business Health Content & Widget Structure'): compact CONTACT-focused
-             Business Health card (no donut) + a SEPARATE Contact Health card. Inline styles → /apps + /qapps. All REAL. ===== -->
-        <container-row>
-          <row-col lg="7" md="12" sm="12">
-            <render-mode><text type="html,vuet,qvt" template="true"><![CDATA[
-            <div style="background:#fff;border-radius:14px;box-shadow:0 1px 3px rgba(70,61,122,.08);padding:20px;margin-bottom:16px;font-family:Segoe UI,Arial,sans-serif;height:100%">
-              <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
-                <span style="font-size:16px;font-weight:800;color:#463D7A">Business Health</span>
-                <#if chHasData><span style="font-size:14px;color:#8983A0"><b style="font-size:24px;color:#7C3AED">${chScore}</b>/100</span></#if>
-              </div>
-              <#if chHasData>
-              <div style="display:flex;align-items:center;justify-content:space-between;background:${chBg};padding:9px 14px;border-radius:10px;margin-bottom:4px">
-                <span style="font-size:14px;font-weight:800;color:${chColor}">${chLabel}</span>
-                <span style="font-size:12px;color:${chColor}">&#9662;</span>
-              </div>
-              <#list contactMetrics as m>
-                <div style="display:flex;align-items:center;justify-content:space-between;padding:9px 2px;border-bottom:1px solid #F1EEFA">
-                  <span style="font-size:13.5px;color:#3F3A57;font-weight:600">${m.name}</span>
-                  <span style="font-size:13px;font-weight:700;color:${m.fg}"><#if m.sev=='good'>&#9650;<#elseif m.sev=='bad'>&#9660;<#else>&#8211;</#if> ${m.status}</span>
-                </div>
-              </#list>
-              <a href="/apps/zenith/pos/OwnerDashboard" style="display:inline-block;margin-top:12px;font-size:13px;color:#7C3AED;text-decoration:none;font-weight:800">View Full Report &rarr;</a>
-              <#else>
-              <div style="background:#EEF2FF;color:#3730A3;padding:14px;border-radius:8px;font-size:13px">Not enough contact or sales activity yet to score business health &mdash; add customers and record some sales to see it here.</div>
-              </#if>
-            </div>
-            ]]></text></render-mode>
-          </row-col>
-          <row-col lg="5" md="12" sm="12">
-            <render-mode><text type="html,vuet,qvt" template="true"><![CDATA[
-            <div style="background:#fff;border-radius:14px;box-shadow:0 1px 3px rgba(70,61,122,.08);padding:20px;margin-bottom:16px;font-family:Segoe UI,Arial,sans-serif;height:100%">
-              <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
-                <span style="font-size:16px;font-weight:800;color:#463D7A">Contact Health</span>
-                <a href="/apps/zenith/Contacts/FindContact" style="font-size:12.5px;color:#7C3AED;text-decoration:none;font-weight:700">All Contacts &rarr;</a>
-              </div>
-              <div style="display:flex;justify-content:space-between;align-items:center;font-size:13.5px;padding:9px 0;border-bottom:1px solid #F1EEFA"><span style="color:#5C6B85">In Good Standing</span><b style="color:#10B981">${goodStandingCust}</b></div>
-              <div style="display:flex;justify-content:space-between;align-items:center;font-size:13.5px;padding:9px 0;border-bottom:1px solid #F1EEFA"><span style="color:#5C6B85">At Risk</span><b style="color:#D97706">${atRiskCust}</b></div>
-              <div style="display:flex;justify-content:space-between;align-items:center;font-size:13.5px;padding:9px 0;border-bottom:1px solid #F1EEFA"><span style="color:#5C6B85">Inactive / Lost</span><b style="color:#DC2626">${inactiveCust}</b></div>
-              <div style="display:flex;justify-content:space-between;align-items:center;font-size:13.5px;padding:9px 0"><span style="color:#5C6B85">High Value</span><b style="color:#7C3AED">${highValueCust}</b></div>
-            </div>
-            ]]></text></render-mode>
-          </row-col>
-        </container-row>
-        <container-row>
-          <row-col lg="7" md="12" sm="12">
-            <render-mode><text type="html,vuet,qvt" template="true"><![CDATA[
-            <div style="background:#fff;border-radius:14px;box-shadow:0 1px 3px rgba(70,61,122,.08);padding:18px;margin-bottom:16px;font-family:Segoe UI,Arial,sans-serif;height:100%">
-              <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
-                <span style="font-size:15px;font-weight:800;color:#7C3AED">Pending Follow-ups &mdash; Overdue Credit Bills</span>
-                <a href="/apps/zenith/pos/CreditBills" style="font-size:12px;color:#7C3AED;text-decoration:none;font-weight:700">View All &rarr;</a>
-              </div>
-              <#if (overdueBills?size > 0)>
-              <#list overdueBills as b>
-                <div style="display:flex;align-items:center;gap:12px;padding:9px 0;border-bottom:1px solid #F1EEFA">
-                  <span style="font-size:10.5px;font-weight:800;padding:3px 9px;border-radius:12px;background:${b.pillBg};color:${b.pillFg};flex:0 0 auto;width:52px;text-align:center">${b.pri}</span>
-                  <div style="flex:1 1 auto;min-width:0"><div style="font-size:13.5px;font-weight:700;color:#2C2A3F;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${b.name}</div><#if b.no?has_content><div style="font-size:11px;color:#8983A0">Bill ${b.no}</div></#if></div>
-                  <div style="flex:0 0 auto;text-align:right"><div style="font-size:13.5px;font-weight:800;color:#2C2A3F">&#8377;${b.amt}</div><div style="font-size:11px;color:#DC2626">Overdue by ${b.days} days</div></div>
-                </div>
-              </#list>
-              <#else>
-              <div style="background:#DCFCE7;color:#059669;padding:18px;border-radius:8px;font-size:13px;text-align:center">No overdue credit bills &mdash; every credit sale is settled. &#127881;</div>
-              </#if>
-            </div>
-            ]]></text></render-mode>
-          </row-col>
-          <row-col lg="5" md="12" sm="12">
-            <render-mode><text type="html,vuet,qvt" template="true"><![CDATA[
-            <div style="background:#fff;border-radius:14px;box-shadow:0 1px 3px rgba(70,61,122,.08);padding:18px;margin-bottom:16px;font-family:Segoe UI,Arial,sans-serif;height:100%">
-              <div style="font-size:15px;font-weight:800;color:#7C3AED;margin-bottom:12px">Credit &amp; Collection Summary</div>
-              <div style="display:flex;gap:12px;margin-bottom:14px">
-                <div style="flex:1;background:#F0FDF4;border:1px solid #BBF7D0;border-radius:10px;padding:12px"><div style="font-size:11px;color:#5C6B85">Total Receivables</div><div style="font-size:19px;font-weight:800;color:#10B981">&#8377;${fmtReceivable}</div></div>
-                <div style="flex:1;background:#FEF2F2;border:1px solid #FECACA;border-radius:10px;padding:12px"><div style="font-size:11px;color:#5C6B85">Overdue (&gt;30d)</div><div style="font-size:19px;font-weight:800;color:#DC2626">&#8377;${fmtOverdue}</div></div>
-              </div>
-              <div style="font-size:12px;font-weight:800;color:#463D7A;margin-bottom:6px">Ageing Breakdown</div>
-              <#list ageRows as a>
-                <div style="display:flex;align-items:center;gap:8px;padding:5px 0"><span style="width:9px;height:9px;border-radius:50%;background:${a.dot};flex:0 0 auto"></span><span style="flex:1;font-size:12.5px;color:#3F3A57">${a.label}</span><span style="font-size:12.5px;font-weight:700;color:#2C2A3F">&#8377;${a.amt}</span><span style="font-size:12px;font-weight:800;color:${a.dot};width:38px;text-align:right">${a.pct}%</span></div>
-              </#list>
-              <#if !creditHasData><div style="font-size:12px;color:#8983A0;margin-top:6px">No outstanding credit bills right now.</div></#if>
-            </div>
-            ]]></text></render-mode>
-          </row-col>
-        </container-row>
-
         <render-mode><text type="html"><![CDATA[<div id="dashExtras">]]></text></render-mode>
         <container-row>
             <row-col lg="12">
@@ -848,6 +695,8 @@
             </row-col>
         </container-row>
         <render-mode><text type="html"><![CDATA[</div>]]></text></render-mode>
+
+        <render-mode><text type="html,vuet,qvt"><![CDATA[</div>]]></text></render-mode>
 
         <render-mode><text type="html" template="true"><![CDATA[<script>window.__dashLayout={saveUrl:(("${ec.web.request.requestURI}").replace(/\/+$/,''))+'/saveDashOrder',order:"${dashOrderCsv}",sizes:"${dashSizeCsv}"};</script><script src="/zenithstatic/js/dash-layout.js?v=6"></script>]]></text></render-mode>
     </widgets>

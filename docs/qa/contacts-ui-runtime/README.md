@@ -17,6 +17,12 @@ The final local integration of PR13's UI with PR14's tenant-safe filters, export
 
 This profile makes no persisted contact writes. PR14's hardened conditions, search skips and export behavior are present in the tested source; security-specific no-active-org, forged-owner and foreign-group assertions belong to the separate Contacts security profile. Both profiles must be run against the final staging source.
 
+## CI fixture compatibility — 7 October 2026
+
+The original CSV assertion expected 24 active Tenant A contacts. The current staging billing foundation also sets `CITEST_ORG_A.ownerPartyId=CITEST_ORG_A`, so that organization is a legitimate additional directory/export row. The [integrated UI run](https://github.com/amalnathkp13-boop/zenith-erp/actions/runs/37568109707) stopped at the stale assertion after 65 successful checks, with nine CSV columns and 25 data rows.
+
+The portable profile now compares the complete sorted CSV ID list with an independent SELECT-only query of active Tenant A parties, on both PostgreSQL and native H2. Exact list equality rejects missing IDs, duplicates, disabled contacts and foreign-owner rows. This changes verification code only; directory/export behavior and foundation fixtures are unchanged. The 145-check report above remains historical evidence from its original fixture set. Current final-head CI results are linked in the dashboard PR.
+
 ## Runtime provenance and limits
 
 The isolated native run used Java 21.0.12.1, Chrome 147.0.7727.56, H2 2.4.240 and Moqui 4.0.0. Framework MD5 **`df7e767ac4dbefdb4aac35fbccb86192`** matches the supplied production framework. The clean runtime's public assets, local loopback launcher and the known safe CI infrastructure overrides were used; the final combined PR13 + PR14 application source and keyboard fix were overlaid. HTTP and H2 were bound only to loopback on ports 18081 and 19093, with a 1GB maximum heap and external SMTP/search/signing disabled. No original Docker image, production environment, image history, private key or customer database was loaded.
