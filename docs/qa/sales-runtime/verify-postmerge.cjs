@@ -12,7 +12,10 @@ module.exports=async function({ctx,p,post,invoke,q,rows,inv,count,check,base,out
  await post('EditInvoice','updateInvoice',{invoiceId:id,statusId:'InvoiceFinalized'});
  for(const shell of ['apps','qapps'])for(const screen of ['Invoices?invoiceId='+id,'AgingReport']){
   const r=await p.goto(`${base}/${shell}/zenith/Accounting/${screen}`,{waitUntil:'networkidle'}),text=await p.locator('body').innerText();
-  check('Post-merge '+shell+' accounting '+screen+' renders correct gross balance',r.status()===200&&!/Error rendering|Template Error|ScreenRenderException/.test(text)&&text.includes('Disposable Reporting Customer')&&/118\.00/.test(text),{status:r.status()});
+  const row=p.locator('tr').filter({hasText:'Disposable Reporting Customer'});
+  const amount=screen==='AgingReport'&&await row.count() ? (await row.first().locator('td').last().innerText()).replace(/[^0-9.-]/g,'') : null;
+  const correct=screen==='AgingReport' ? Number(amount)===118 : /118\.00/.test(text);
+  check('Post-merge '+shell+' accounting '+screen+' renders correct gross balance',r.status()===200&&!/Error rendering|Template Error|ScreenRenderException/.test(text)&&text.includes('Disposable Reporting Customer')&&correct,{status:r.status(),ageingAmount:amount});
  }
  const gst=await invoke('gstr3b',{organizationPartyId:'SALES_QA_A',returnPeriod:'011999'});
  check('Post-merge GSTR-3B charged tax reconciles new plus legacy, excludes foreign',Number(gst.table31.taxableValue)===2100.30&&Number(gst.table31.cgst)===99.03&&Number(gst.table31.sgst)===99.03&&Number(gst.table31.igst)===0,gst);
