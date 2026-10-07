@@ -341,13 +341,16 @@ jobs:
           DBID=$(docker compose -f "$COMPOSE" ps -q db)
           # The fixture creates citest.a without a password; give it the demo 'moqui' password by
           # copying john.doe's hash columns (ephemeral CI user, synthetic — 'moqui' is the demo password).
-          docker exec "$DBID" psql -U moqui -d moqui -c \
-            "UPDATE user_account ua SET current_password=jd.current_password, password_hash_type=jd.password_hash_type, password_salt=jd.password_salt, password_base64=jd.password_base64, require_password_change='N', disabled='N' FROM user_account jd WHERE jd.username='john.doe' AND ua.user_id='CITEST_U_A';" 2>&1 | tail -1
+          echo "password copy: $(docker exec "$DBID" psql -U moqui -d moqui -tAc "UPDATE user_account ua SET current_password=jd.current_password, password_hash_type=jd.password_hash_type, password_salt=jd.password_salt, password_base64=jd.password_base64, require_password_change='N', disabled='N' FROM user_account jd WHERE jd.username='john.doe' AND ua.user_id='CITEST_U_A';" 2>&1)"
           g(){ docker exec "$DBID" psql -U moqui -d moqui -tAc "$1" 2>/dev/null | tr -d '[:space:]'; }
           [ "$(g "SELECT count(*) FROM user_account WHERE user_id='CITEST_U_A';")" = "1" ] || { echo "::error::fixture: citest.a user missing"; exit 1; }
+          echo "citest.a username in DB: '$(g "SELECT username FROM user_account WHERE user_id='CITEST_U_A';")'  pw-matches-john: $(g "SELECT (ua.current_password=jd.current_password AND ua.password_salt IS NOT DISTINCT FROM jd.password_salt) FROM user_account ua, user_account jd WHERE ua.user_id='CITEST_U_A' AND jd.username='john.doe';")"
           [ "$(g "SELECT count(*) FROM user_group_member WHERE user_id='CITEST_U_A' AND user_group_id='ADMIN';")" = "0" ] || { echo "::error::test setup: citest.a must NOT be ADMIN (else it skips the non-admin path)"; exit 1; }
+          echo "--- diagnostic: citest.a auth + redirect target ---"
+          curl -s -o /dev/null -w 'root: code=%{http_code} redirect=%{redirect_url}\n' -u citest.a:moqui 'http://localhost:8080/apps/zenith' || true
+          curl -s -D - -o /dev/null -u citest.a:moqui 'http://localhost:8080/apps/zenith/Contacts/FindContact' | grep -iE '^(HTTP/|location:)' || true
           code=$(curl -s -o /dev/null -w '%{http_code}' -u citest.a:moqui 'http://localhost:8080/apps/zenith/Contacts/FindContact')
-          [ "$code" = "200" ] || { echo "::error::non-admin member citest.a got HTTP $code on FindContact (login failed, or a gate blocked a legit member)"; exit 1; }
+          [ "$code" = "200" ] || { echo "::error::non-admin member citest.a got HTTP $code on FindContact (login failed, or a gate blocked a legit member) — see diagnostic above"; exit 1; }
           html=$(curl -s -u citest.a:moqui 'http://localhost:8080/apps/zenith/Contacts/FindContact')
           echo "$html" | grep -q 'CITestOnlyInTenantA' || { echo "::error::LOCKOUT: a non-admin MEMBER of Tenant A cannot see Tenant A's own contact — the active-org resolver did not recognize its membership (MARUTHI tenant-user lockout risk)"; exit 1; }
           if echo "$html" | grep -q 'CITestOnlyInTenantB'; then echo "::error::ISOLATION LEAK — non-admin member of A sees Tenant B's contact"; exit 1; fi
