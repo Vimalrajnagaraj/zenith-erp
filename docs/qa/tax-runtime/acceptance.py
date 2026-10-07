@@ -81,6 +81,7 @@ check('Sales caller creates tax-inclusive GST invoice','sales',{'organizationPar
 purchase=post('purchase',{'organizationPartyId':'TAX_QA_A','vendorPartyId':'TAX_QA_CUST','currencyUomId':'INR','vendorInvoiceNumber':'TAX_QA_CROSS_PURCHASE'})
 results.append({'case':'Purchase caller creates draft','passed':not purchase.get('errors') and bool(purchase.get('result',{}).get('invoiceId')),'response':purchase})
 purchase_id=purchase.get('result',{}).get('invoiceId')
+if purchase_id:check('Current vendor bill skips discontinued legacy TCS','autoTcs',{'invoiceId':purchase_id},lambda r:True)
 if purchase_id:check('Purchase caller taxes item with document ownership','purchaseItem',{'invoiceId':purchase_id,'productId':'TAX_QA_P18','quantity':1,'unitAmount':100},lambda r:bool(r.get('invoiceItemSeqId')))
 check('external provider mock prohibited','globalTax',{'tenantId':'TAX_QA_A','items':[{'quantity':1,'unitAmount':100}]},lambda r:False,error=True)
 check('provider hostname lookalike denied','engine',{'tenantId':'TAX_QA_A','providerEnumId':'TpAvalara','apiEndpoint':'https://avatax.attacker.invalid','apiKey':'synthetic','apiSecret':'synthetic'},lambda r:False,error=True)
