@@ -3,12 +3,38 @@
         xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
         default-menu-title="Product Catalog" default-menu-index="1" default-menu-include="false">
 
+    <parameter name="catalogSearch"/>
+
     <transition name="editProduct"><default-response url="../EditProduct"/></transition>
     
-    <transition name="createProduct">
+    <transition name="createProduct" method="post">
         <parameter name="openingStock"/>
         <parameter name="expiryDate"/>
         <actions>
+            <script><![CDATA[
+                _createOrg = ec.user.getPreference('ACTIVE_ORGANIZATION')
+                productName = (productName ?: '').toString().trim()
+                pseudoId = (pseudoId ?: '').toString().trim()
+                _createError = null
+                if (!_createOrg || _createOrg == '_NA_') _createError = 'Select an organization before creating a product.'
+                else if (!productName) _createError = 'Product Name is required.'
+                else if (!(productTypeEnumId in ['PtAsset','PtService','PtDigitalAsset'])) _createError = 'Choose a valid product type.'
+                else if (enableBatchTracking && !(enableBatchTracking in ['Y','N'])) _createError = 'Choose Yes or No for batch tracking.'
+                else if (isGstExempt && !(isGstExempt in ['Y','N'])) _createError = 'Choose a valid tax-free option.'
+                if (!_createError && pseudoId) {
+                    def _clash = ec.entity.find('mantle.product.Product').condition('ownerPartyId',_createOrg).condition('pseudoId',pseudoId).disableAuthz().count()
+                    def _barcode = ec.entity.find('zenith.erp.barcode.ProductBarcode').condition('organizationPartyId',_createOrg).condition('barcodeValue',pseudoId).disableAuthz().count()
+                    if (_clash || _barcode) _createError = 'This item code or barcode is already used by another product.'
+                }
+                ['mrpAmount','reorderPoint'].each { key ->
+                    def raw = context.get(key)
+                    if (raw != null && raw.toString().trim()) {
+                        try { def number = new BigDecimal(raw.toString().trim()); if (number.signum()<0) throw new IllegalArgumentException(); context.put(key,number) }
+                        catch (Exception ignored) { _createError = (key=='mrpAmount'?'Selling Price / MRP':'Reorder Point')+' must be 0 or a positive number.' }
+                    }
+                }
+            ]]></script>
+            <if condition="_createError"><return error="true" message="${_createError}"/></if>
             <!-- ZE-INV-001 f/u: reject a negative selling price at entry (a -10 typo would make stock value
                  negative everywhere). Blank stays allowed; non-numeric falls through to framework coercion. -->
             <script><![CDATA[
@@ -37,8 +63,11 @@
             <if condition="_openBad || (_openQty != null &amp;&amp; _openQty.signum() &lt; 0)">
                 <return error="true" message="Opening Stock must be 0 or a positive number."/>
             </if>
+            <if condition="_openQty != null &amp;&amp; _openQty.signum() &gt; 0 &amp;&amp; productTypeEnumId != 'PtAsset'">
+                <return error="true" message="Opening Stock is only available for physical products."/>
+            </if>
             <service-call name="create#mantle.product.Product" out-map="createOut"
-                          in-map="[productName:productName, pseudoId:pseudoId, productTypeEnumId:productTypeEnumId, description:description, hsnCode:hsnSacCode, gstSlabId:gstSlabId, uqcEnumId:uqcEnumId, isGstExempt:isGstExempt, mrpAmount:mrpAmount, reorderPoint:reorderPoint, ownerPartyId:ec.user.getPreference('ACTIVE_ORGANIZATION')]"/>
+                          in-map="[productName:productName, pseudoId:pseudoId, productTypeEnumId:productTypeEnumId, description:description, hsnCode:(productTypeEnumId=='PtService'?null:hsnSacCode), sacCode:(productTypeEnumId=='PtService'?hsnSacCode:null), gstSlabId:gstSlabId, uqcEnumId:uqcEnumId, isGstExempt:isGstExempt, enableBatchTracking:enableBatchTracking, mrpAmount:mrpAmount, reorderPoint:reorderPoint, ownerPartyId:_createOrg]"/>
             <!-- IV-012: only POSITIVE opening stock creates the asset + marks the product inventory-tracked.
                  0/blank => the product exists but is untracked and absent from Stock Levels (the reported fix). -->
             <if condition="_openQty != null &amp;&amp; _openQty.signum() &gt; 0">
@@ -60,6 +89,33 @@
             <parameter name="productId" value="${createOut.productId}"/>
         </default-response>
     </transition>
+
+    <actions>
+        <script><![CDATA[
+            catalogOrgId = ec.user.getPreference('ACTIVE_ORGANIZATION')
+            if (!catalogOrgId || catalogOrgId=='_NA_') catalogOrgId = '__NO_ORGANIZATION__'
+            catalogSearch = (catalogSearch ?: '').toString().trim()
+            catalogSearchCondition = null
+            if (catalogSearch && catalogOrgId!='__NO_ORGANIZATION__') {
+                def _cf=ec.entity.conditionFactory; def _EC=org.moqui.entity.EntityCondition
+                def _like='%'+catalogSearch.replace('\\','\\\\').replace('%','\\%').replace('_','\\_')+'%'
+                def _barcodeIds=ec.entity.find('zenith.erp.barcode.ProductBarcode').condition('organizationPartyId',catalogOrgId)
+                    .condition('isActive','Y').condition(_cf.makeCondition('barcodeValue',_EC.LIKE,_like).ignoreCase()).selectField('productId').disableAuthz().list()*.productId
+                def _parts=['pseudoId','productName','productId'].collect { _cf.makeCondition(it,_EC.LIKE,_like).ignoreCase() }
+                if (_barcodeIds) _parts.add(_cf.makeCondition('productId',_EC.IN,_barcodeIds))
+                catalogSearchCondition=_cf.makeCondition(_parts,_EC.OR)
+            }
+            catalogInputs = new HashMap(context)
+            def _sorts=['pseudoId','productName','productId','description','catalogTaxCode','gstRate','uqcEnumId','isGstExempt','mrpAmount','totalQoh','reorderPoint','enableBatchTracking','productTypeEnumId'] as Set
+            if (orderByField && !orderByField.toString().split(',').every { _sorts.contains(it.replaceFirst('^-','')) }) catalogInputs.orderByField='productName,pseudoId,productId'
+            ['pageIndex':0,'pageSize':20].each { key, fallback ->
+                try { def raw=ec.web?.parameters?.get(key); def number=raw ? Integer.parseInt(raw.toString()) : fallback
+                    catalogInputs[key]=(key=='pageSize' ? (number>0 && number<=200 ? number : fallback) : Math.max(0,number)) }
+                catch (Exception ignored) { catalogInputs[key]=fallback }
+            }
+            if (ec.web?.parameters?.renderMode=='csv') { catalogInputs.pageIndex=null; catalogInputs.pageSize=null; catalogInputs.pageNoLimit=true }
+        ]]></script>
+    </actions>
 
     <widgets>
         <render-mode><text type="html"><![CDATA[
@@ -154,6 +210,9 @@
                         </default-field>
                     </field>
 
+                    <field name="enableBatchTracking"><default-field title="Enable Batch Tracking">
+                        <drop-down no-current-selected-key="N"><option key="N" text="No"/><option key="Y" text="Yes"/></drop-down>
+                    </default-field></field>
                     <field name="mrpAmount"><default-field title="Selling Price / MRP (₹) *"><text-line size="10"/>
                         <label text="Required. The price shown and charged at the POS — enter 0 for a free item. You can change it anytime on the product page." style="text-grey-6 text-caption" type="p"/></default-field></field>
                     <field name="openingStock"><default-field title="Opening Stock (qty)"><text-line size="10"/>
@@ -176,16 +235,16 @@
         <container style="prod-fastscan">
             <label text="FAST SCAN" type="strong" style="prod-fastscan-label"/>
             <container style="col-grow">
-                <form-single name="BarcodeScannerForm" transition="." pass-through-parameters="true" focus-field="pseudoId">
+                <form-single name="BarcodeScannerForm" transition="." focus-field="catalogSearch">
                     <field-layout>
                         <field-row>
-                            <field-ref name="pseudoId"/>
+                            <field-ref name="catalogSearch"/>
                             <field-ref name="submitButton"/>
                         </field-row>
                     </field-layout>
-                    <field name="pseudoId">
+                    <field name="catalogSearch">
                         <default-field title="">
-                            <text-line size="40" placeholder="Search by item code or barcode..."/>
+                            <text-line size="40" placeholder="Search by item code, product name, barcode..."/>
                         </default-field>
                     </field>
                     <field name="submitButton"><default-field title="Search"><submit/></default-field></field>
@@ -200,13 +259,13 @@
 
 
 
-        <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md sup-compact z-listchrome">
-            <render-mode><text type="html,qvt"><![CDATA[<span class="zlc-ph" data-ph="Search products..." style="display:none"></span>]]></text></render-mode>
+        <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md sup-compact catalog-list">
             <form-list name="FindProductList" list="productList" skip-form="true" header-dialog="true" show-csv-button="true">
-                <entity-find entity-name="zenith.erp.inventory.ProductStockView" list="productList">
-                    <search-form-inputs default-order-by="productName,pseudoId"/>
+                <entity-find entity-name="zenith.erp.inventory.ProductCatalogStockView" list="productList">
+                    <search-form-inputs skip-fields="ownerPartyId" input-fields-map="catalogInputs" default-order-by="productName,pseudoId,productId"/>
                     <!-- ZE-SALES-014 f/u: org-isolate CSV/XLSX export (standalone render bypasses the MANTLE_ACTIVE_ORG authz filter) -->
-                    <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+                    <econdition field-name="ownerPartyId" from="catalogOrgId"/>
+                    <econdition-object field="catalogSearchCondition"/>
                 </entity-find>
 
                 <field name="productId"><default-field><hidden/></default-field></field>
@@ -242,14 +301,14 @@
                     <default-field><label text="${description ?: '-'}" type="span" style="text-grey-8"/></default-field>
                 </field>
 
-                <field name="hsnCode">
+                <field name="catalogTaxCode">
                     <header-field title="Tax Code" show-order-by="true"><text-find/></header-field>
                     <conditional-field condition="ec.web.parameters.renderMode == 'csv'">
-                        <display text="${hsnCode ?: sacCode ?: ''}"/>
+                        <display text="${catalogTaxCode ?: ''}"/>
                     </conditional-field>
                     <!-- products-list §7: Tax Code is plain secondary text (not a badge — the mockup reserves the
                          only row badge for Batch Tracking). -->
-                    <default-field><label text="${hsnCode ?: sacCode ?: '-'}" type="span" style="text-grey-7"/></default-field>
+                    <default-field><label text="${catalogTaxCode ?: '-'}" type="span" style="text-grey-7"/></default-field>
                 </field>
 
                 <field name="gstRate">
@@ -287,9 +346,9 @@
                 <field name="mrpAmount">
                     <header-field title="MRP (${currSymbol})" show-order-by="true"><range-find/></header-field>
                     <conditional-field condition="ec.web.parameters.renderMode == 'csv'">
-                        <display text="${mrpAmount ?: ''}"/>
+                        <display text="${mrpAmount != null ? mrpAmount : ''}"/>
                     </conditional-field>
-                    <default-field><label text="${mrpAmount ? zinr.inr(ec.l10n.format(mrpAmount, '#,##0.00')) : '-'}" type="span"/></default-field>
+                    <default-field><label text="${mrpAmount != null ? zinr.inr(ec.l10n.format(mrpAmount, '#,##0.00')) : '-'}" type="span"/></default-field>
                 </field>
 
                 <field name="totalQoh">
@@ -310,7 +369,7 @@
                     <conditional-field condition="ec.web.parameters.renderMode == 'csv'">
                         <display text="${reorderPoint ?: 0}"/>
                     </conditional-field>
-                    <default-field><label text="${reorderPoint ?: '-'}" type="span" style="text-grey-7"/></default-field>
+                    <default-field><label text="${reorderPoint != null ? reorderPoint : '-'}" type="span" style="text-grey-7"/></default-field>
                 </field>
 
                 <field name="enableBatchTracking">
