@@ -5,18 +5,29 @@
   var state = { page: 1, perPage: 10 };
 
   function appBase() { var p = location.pathname || ''; var i = p.indexOf('/zenith/'); return i > 0 ? p.substring(0, i) : ''; }
-  function tok() { try { return window.moqui.webrootVue.moquiSessionToken; } catch (e) { return ''; } }
-
+  function syncYear() {
+    var period = document.getElementById('gstr1-period'), year = document.getElementById('gstr1-fy');
+    if (!period || !year) return;
+    var value = period.value, start = Number(value.slice(2)) - (Number(value.slice(0,2)) < 4 ? 1 : 0);
+    var fy = start + '-' + (start + 1);
+    if (!Array.from(year.options).some(function (option) { return option.value === fy; })) year.add(new Option(fy, fy));
+    year.value = fy;
+  }
   function generate() {
-    var per = (document.getElementById('gstr1-period') || {}).value || '';
-    var fy = (document.getElementById('gstr1-fy') || {}).value || '';
-    if (!per) { alert('Select a return period first.'); return; }
-    ['gstr1-gen', 'gstr1-gen-hdr'].forEach(function (id) { var b = document.getElementById(id); if (b) { b.disabled = true; } });
-    var g = document.getElementById('gstr1-gen'); if (g) g.textContent = 'Generating...';
-    var body = new URLSearchParams({ returnPeriod: per, financialYear: fy, moquiSessionToken: tok() });
-    fetch(appBase() + '/zenith/tax/Gstr1Returns/generateGstr1', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: body, credentials: 'same-origin' })
-      .then(function () { location.reload(); })
-      .catch(function () { location.reload(); });
+    syncYear();
+    var period = document.getElementById('gstr1-period'), fy = document.getElementById('gstr1-fy');
+    if (!period || !period.value) return;
+    var token = document.getElementById('gstr1-token');
+    if (!token || !token.value) { alert('Your session is unavailable. Sign in and try again.'); return; }
+    // Use the normal form navigation: Moqui renders validation errors and preserves the
+    // generated filing redirect. Fetch+reload previously discarded both in Bootstrap.
+    var form = document.createElement('form'); form.method = 'post';
+    form.action = appBase() + '/zenith/tax/Gstr1Returns/generateGstr1';
+    [['returnPeriod',period.value],['financialYear',fy.value],['moquiSessionToken',token.value]].forEach(function (pair) {
+      var field=document.createElement('input'); field.type='hidden'; field.name=pair[0]; field.value=pair[1]; form.appendChild(field);
+    });
+    ['gstr1-gen','gstr1-gen-hdr'].forEach(function (id) { var button=document.getElementById(id); if(button) button.disabled=true; });
+    document.body.appendChild(form); form.submit();
   }
 
   function rows() { return Array.prototype.slice.call(document.querySelectorAll('#gstr1-tbody .gstr1-row')); }
@@ -34,6 +45,7 @@
       b.style.cssText = 'min-width:32px;height:32px;padding:0 8px;border-radius:8px;font-size:13px;cursor:pointer;'
         + (active ? 'background:#7C3AED;color:#fff;border:1px solid #7C3AED;' : 'background:#fff;color:#6B7280;border:1px solid #E5E7EB;')
         + (disabled ? 'opacity:.4;cursor:default;' : '');
+      b.disabled = disabled;
       if (!disabled && !active && go != null) b.addEventListener('click', function () { state.page = go; paginate(); });
       return b;
     }
@@ -45,6 +57,9 @@
   }
 
   function init() {
+    var period=document.getElementById('gstr1-period');
+    if(period && !period.dataset.ready) {period.dataset.ready='true';period.addEventListener('change',syncYear);}
+    syncYear();
     ['gstr1-gen', 'gstr1-gen-hdr'].forEach(function (id) { var b = document.getElementById(id); if (b && !b.__w) { b.__w = 1; b.addEventListener('click', generate); } });
     var gb = document.getElementById('gstr1-guide-btn');
     if (gb && !gb.__w) { gb.__w = 1; gb.addEventListener('click', function () { var d = document.getElementById('gstr1-guide'); if (d) { d.open = !d.open; if (d.open) d.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); } }); }

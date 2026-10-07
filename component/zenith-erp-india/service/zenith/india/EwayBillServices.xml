@@ -11,21 +11,7 @@
             <parameter name="authToken"/>
             <parameter name="sek"/>
         </out-parameters>
-        <actions>
-            <entity-find-one entity-name="zenith.erp.india.IndiaApiConfig" value-field="apiConfig">
-                <field-map field-name="configId"/>
-            </entity-find-one>
-            <if condition="!apiConfig"><return error="true" message="API Config not found"/></if>
-            
-            <set field="authToken" value="mock-auth-token-ewaybill"/>
-            <set field="sek" value="mock-session-encryption-key-ewaybill"/>
-            
-            <set field="apiConfig.currentToken" from="authToken"/>
-            <set field="cal" from="new java.util.GregorianCalendar()"/>
-            <script>cal.add(java.util.Calendar.HOUR, 6)</script>
-            <set field="apiConfig.tokenExpiry" from="new java.sql.Timestamp(cal.getTimeInMillis())"/>
-            <entity-update value-field="apiConfig"/>
-        </actions>
+        <actions><return error="true" message="Government API integration is unavailable. No statutory document or token has been generated or changed."/></actions>
     </service>
 
     <service verb="generate" noun="EwayBill">
@@ -43,87 +29,7 @@
             <parameter name="ewayBillNumber"/>
             <parameter name="validUpto" type="Timestamp"/>
         </out-parameters>
-        <actions>
-            <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="invoice"/>
-            <if condition="!invoice"><return error="true" message="Invoice ${invoiceId} not found"/></if>
-
-            <entity-find entity-name="mantle.account.invoice.InvoiceItem" list="items">
-                <econdition field-name="invoiceId"/>
-            </entity-find>
-
-            <!-- Real registered trader names + a safe buyer state code (Invoice has no buyerStateCode field;
-                 derive it from the place of supply, else the buyer GSTIN, else the seller state). -->
-            <entity-find-one entity-name="mantle.party.PartyDetail" value-field="sellerP"><field-map field-name="partyId" from="invoice.fromPartyId"/></entity-find-one>
-            <entity-find-one entity-name="mantle.party.PartyDetail" value-field="buyerP"><field-map field-name="partyId" from="invoice.toPartyId"/></entity-find-one>
-            <set field="sellerName" from="sellerP?.organizationName ?: ((sellerP?.firstName ?: '') + ' ' + (sellerP?.lastName ?: '')).trim()"/>
-            <set field="buyerName" from="buyerP?.organizationName ?: ((buyerP?.firstName ?: '') + ' ' + (buyerP?.lastName ?: '')).trim()"/>
-            <set field="buyerStateCode" from="invoice.placeOfSupplyStateCode ?: (invoice.buyerGstin ? invoice.buyerGstin.substring(0,2) : invoice.supplierStateCode)"/>
-
-            <script><![CDATA[
-                def toInt = { s -> (s != null && s.toString().isInteger()) ? (s.toString() as Integer) : 0 }
-                def payload = [
-                    supplyType: "O", // Outward (sales)
-                    subSupplyType: invoice.isExport == 'Y' ? 3 : (invoice.isSezSupply == 'Y' ? 2 : 1), // 1-Supply, 2-SEZ, 3-Export
-                    docType: invoice.documentType == 'TAX_INVOICE' ? "INV" : (invoice.documentType == 'BILL_OF_SUPPLY' ? "BIL" : "CHL"),
-                    docNo: invoice.gstInvoiceNumber ?: invoice.invoiceId,
-                    docDate: ec.l10n.format(invoice.invoiceDate, "dd/MM/yyyy"),
-                    fromGstin: invoice.supplierGstin,
-                    fromTrdName: sellerName ?: invoice.supplierGstin,
-                    fromStateCode: toInt(invoice.supplierStateCode),
-                    toGstin: invoice.buyerGstin ?: "URP",
-                    toTrdName: buyerName ?: (invoice.buyerGstin ?: "URP"),
-                    toStateCode: toInt(buyerStateCode),
-                    totalValue: invoice.totalTaxableAmount ?: 0.0,
-                    cgstValue: invoice.totalCgst ?: 0.0,
-                    sgstValue: invoice.totalSgst ?: 0.0,
-                    igstValue: invoice.totalIgst ?: 0.0,
-                    cessValue: invoice.totalCess ?: 0.0,
-                    transMode: transportMode,
-                    transDistance: distanceKm ?: invoice.distanceKm ?: 100,
-                    transporterName: transporterName ?: invoice.transporterName,
-                    transporterId: transporterId ?: invoice.transporterId,
-                    vehicleNo: vehicleNumber ?: invoice.vehicleNumber,
-                    itemList: []
-                ]
-
-                for (item in items) {
-                    payload.itemList.add([
-                        productName: item.description ?: "Product",
-                        hsnCode: (item.hsnSacCode != null && item.hsnSacCode.isInteger()) ? (item.hsnSacCode as Integer) : (item.hsnSacCode ?: ""),
-                        quantity: item.quantity ?: 1.0,
-                        qtyUnit: "NOS",
-                        taxableAmount: item.taxableAmount ?: 0.0,
-                        cgstRate: item.cgstRate ?: 0.0,
-                        sgstRate: item.sgstRate ?: 0.0,
-                        igstRate: item.igstRate ?: 0.0,
-                        cessRate: item.cessRate ?: 0.0
-                    ])
-                }
-
-                jsonPayloadStr = groovy.json.JsonOutput.toJson(payload)
-                
-                // MOCK API CALL
-                ewbNumberMock = "EWB" + Math.abs(new java.util.Random().nextLong()).toString().substring(0, 10)
-                
-                // Calculate Mock Validity (1 day per 200 km)
-                def cal = new java.util.GregorianCalendar()
-                long dist = payload.transDistance as Long
-                int days = Math.max(1, (int) Math.ceil(dist / 200.0))
-                cal.add(java.util.Calendar.DATE, days)
-                validUptoMock = new java.sql.Timestamp(cal.getTimeInMillis())
-            ]]></script>
-
-            <!-- Auto-CrUD create# generates the sequenced PK (a bare entity-create left ewayBillId null). -->
-            <service-call name="create#zenith.erp.india.IndiaEwayBill" out-map="ewbOut"
-                in-map="[invoiceId:invoiceId, ewayBillNumber:ewbNumberMock, supplyType:payload.supplyType,
-                         docType:payload.docType, fromStateCode:invoice.supplierStateCode, toStateCode:buyerStateCode,
-                         transportMode:transportMode, transporterId:(transporterId ?: invoice.transporterId),
-                         vehicleNumber:(vehicleNumber ?: invoice.vehicleNumber), validFrom:ec.user.nowTimestamp,
-                         validUpto:validUptoMock, statusId:'GENERATED', jsonPayload:jsonPayloadStr]"/>
-            <set field="ewayBillId" from="ewbOut.ewayBillId"/>
-            <set field="ewayBillNumber" from="ewbNumberMock"/>
-            <set field="validUpto" from="validUptoMock"/>
-        </actions>
+        <actions><return error="true" message="Government API integration is unavailable. No statutory document or token has been generated or changed."/></actions>
     </service>
 
     <service verb="update" noun="EwayBillPartB">
@@ -132,15 +38,7 @@
             <parameter name="vehicleNumber" required="true"/>
             <parameter name="transporterId"/>
         </in-parameters>
-        <actions>
-            <entity-find-one entity-name="zenith.erp.india.IndiaEwayBill" value-field="ewayBill">
-                <field-map field-name="ewayBillNumber"/>
-            </entity-find-one>
-            <if condition="!ewayBill"><return error="true" message="E-Way Bill not found"/></if>
-            <set field="ewayBill.vehicleNumber" from="vehicleNumber"/>
-            <if condition="transporterId"><set field="ewayBill.transporterId" from="transporterId"/></if>
-            <entity-update value-field="ewayBill"/>
-        </actions>
+        <actions><return error="true" message="Government API integration is unavailable. No statutory document or token has been generated or changed."/></actions>
     </service>
 
     <service verb="cancel" noun="EwayBill">
@@ -148,14 +46,7 @@
             <parameter name="ewayBillNumber" required="true"/>
             <parameter name="cancelReason" required="true"/>
         </in-parameters>
-        <actions>
-            <entity-find-one entity-name="zenith.erp.india.IndiaEwayBill" value-field="ewayBill">
-                <field-map field-name="ewayBillNumber"/>
-            </entity-find-one>
-            <if condition="!ewayBill"><return error="true" message="E-Way Bill not found"/></if>
-            <set field="ewayBill.statusId" value="CANCELLED"/>
-            <entity-update value-field="ewayBill"/>
-        </actions>
+        <actions><return error="true" message="Government API integration is unavailable. No statutory document or token has been generated or changed."/></actions>
     </service>
 
     <service verb="extend" noun="EwayBillValidity">
@@ -164,22 +55,7 @@
             <parameter name="extendReason" required="true"/>
             <parameter name="remainingDistance" type="Long" required="true"/>
         </in-parameters>
-        <actions>
-            <entity-find-one entity-name="zenith.erp.india.IndiaEwayBill" value-field="ewayBill">
-                <field-map field-name="ewayBillNumber"/>
-            </entity-find-one>
-            <if condition="!ewayBill"><return error="true" message="E-Way Bill not found"/></if>
-            
-            <script><![CDATA[
-                def cal = new java.util.GregorianCalendar()
-                cal.setTime(ewayBill.validUpto)
-                int days = Math.max(1, (int) Math.ceil(remainingDistance / 200.0))
-                cal.add(java.util.Calendar.DATE, days)
-                validUptoNew = new java.sql.Timestamp(cal.getTimeInMillis())
-            ]]></script>
-            <set field="ewayBill.validUpto" from="validUptoNew"/>
-            <entity-update value-field="ewayBill"/>
-        </actions>
+        <actions><return error="true" message="Government API integration is unavailable. No statutory document or token has been generated or changed."/></actions>
     </service>
 
     <service verb="calculate" noun="EwayBillDistance">
@@ -190,15 +66,7 @@
         <out-parameters>
             <parameter name="distanceKm" type="Long"/>
         </out-parameters>
-        <actions>
-            <!-- Mock PIN-to-PIN calculation -->
-            <script><![CDATA[
-                // Fake distance calculation logic for sandbox
-                long p1 = fromPincode as Long
-                long p2 = toPincode as Long
-                distanceKm = Math.abs(p1 - p2) % 1000 + 50 // Ensures non-zero positive mock distance
-            ]]></script>
-        </actions>
+        <actions><return error="true" message="PIN-to-PIN distance integration is unavailable. Enter a verified transport distance."/></actions>
     </service>
 
     <service verb="check" noun="EwayBillRequired">
@@ -210,9 +78,11 @@
         </out-parameters>
         <actions>
             <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="invoice"/>
-            <set field="total" from="(invoice.totalTaxableAmount ?: 0.0) + (invoice.totalCgst ?: 0.0) + (invoice.totalSgst ?: 0.0) + (invoice.totalIgst ?: 0.0) + (invoice.totalCess ?: 0.0)"/>
+            <if condition="!invoice"><return error="true" message="Invoice not found."/></if>
+            <service-call name="zenith.india.GstServices.get#ChargedInvoiceTax" in-map="context" out-map="invoiceTax"/>
+            <set field="total" from="invoiceTax.taxable + invoiceTax.cgst + invoiceTax.sgst + invoiceTax.igst + invoiceTax.cess"/>
             <script>
-                isRequired = total >= 50000 ? "Y" : "N"
+                isRequired = total > 50000 ? "Y" : "N"
             </script>
         </actions>
     </service>

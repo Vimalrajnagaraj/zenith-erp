@@ -17,11 +17,11 @@ on:
         required: false
         type: string
       contacts_profile:
-        description: Additional synthetic Contacts or Sales verification
+        description: Additional synthetic Contacts, Sales or Tax verification
         required: true
         default: none
         type: choice
-        options: [none, ui, security, sales]
+        options: [none, ui, security, sales, tax]
   pull_request:
     branches: [master]
   push:                 # on-merge runs: re-check the merged result on master (no PR comment on push)
@@ -89,7 +89,7 @@ jobs:
       - name: Validate optional verification inputs
         run: |
           set -euo pipefail
-          case "$CONTACTS_PROFILE" in none|ui|security|sales) ;; *) echo "::error::Unknown verification profile"; exit 1;; esac
+          case "$CONTACTS_PROFILE" in none|ui|security|sales|tax) ;; *) echo "::error::Unknown verification profile"; exit 1;; esac
           if [ -n "$CANDIDATE_SHA" ]; then
             [[ "$CANDIDATE_SHA" =~ ^[a-f0-9]{40}$ ]] || { echo "::error::Candidate must be an exact commit SHA"; exit 1; }
           elif [ "$CONTACTS_PROFILE" != none ]; then
@@ -136,6 +136,21 @@ jobs:
           [ "$loaded" = "zetaerp-moqui:clean-staging" ] || { echo "::error::Unexpected clean runtime image tag"; exit 1; }
           echo "loaded: $loaded"
           docker tag "$loaded" zetaerp-moqui:staging
+
+      - name: Enable guarded disposable Tax harness
+        if: github.event_name == 'workflow_dispatch' && inputs.contacts_profile == 'tax'
+        run: |
+          python3 - "$COMPOSE" "$RUNNER_TEMP/tax-compose.yml" <<'PY'
+          import sys
+          from pathlib import Path
+          text=Path(sys.argv[1]).read_text()
+          lines=text.splitlines()
+          matches=[i for i,line in enumerate(lines) if 'JAVA_TOOL_OPTIONS=' in line]
+          assert len(matches)==1
+          lines[matches[0]] += ' -Dtax.qa.disposable=true'
+          Path(sys.argv[2]).write_text('\n'.join(lines)+'\n')
+          PY
+          echo "COMPOSE=$RUNNER_TEMP/tax-compose.yml" >> "$GITHUB_ENV"
 
       - name: Boot stack
         # The CI-only compose command keeps HTTP idle until overlays and the loader finish.
@@ -247,6 +262,24 @@ jobs:
           p.write_text(s)
           PY
           docker cp "$RUNNER_TEMP/sales-parent.xml" "$CID:/opt/moqui/runtime/component/zenith-erp-sales/screen/zenith/sales.xml"
+
+      - name: Install disposable Tax verification helper
+        if: github.event_name == 'workflow_dispatch' && inputs.contacts_profile == 'tax'
+        run: |
+          set -euo pipefail
+          QA_DIR="$CONTACTS_QA_SOURCE_DIR/docs/qa/tax-runtime"
+          CID=$(docker compose -f "$COMPOSE" ps -q moqui)
+          docker cp "$QA_DIR/fixture.xml" "$CID:/opt/moqui/runtime/component/zenith-erp-tax/TaxQaFixture.xml"
+          docker cp "$QA_DIR/qa-screen.xml" "$CID:/opt/moqui/runtime/component/zenith-erp-tax/screen/zenith/tax/TaxQaAcceptance.xml"
+          docker cp "$CID:/opt/moqui/runtime/component/zenith-erp-tax/screen/zenith/tax.xml" "$RUNNER_TEMP/tax-parent.xml"
+          python3 - "$RUNNER_TEMP/tax-parent.xml" <<'PY'
+          import sys
+          from pathlib import Path
+          p=Path(sys.argv[1]);s=p.read_text();old='<subscreens default-item="TaxDashboard">'
+          assert old in s
+          p.write_text(s.replace(old,old+'<subscreens-item name="TaxQaAcceptance" location="component://zenith-erp-tax/screen/zenith/tax/TaxQaAcceptance.xml" menu-include="false"/>',1))
+          PY
+          docker cp "$RUNNER_TEMP/tax-parent.xml" "$CID:/opt/moqui/runtime/component/zenith-erp-tax/screen/zenith/tax.xml"
 
       - name: Load discovered seed, demo and isolation fixtures in one invocation
         # Exploded Moqui runtime: java -cp . MoquiStart from /opt/moqui; java at /opt/java/openjdk/bin/java.
@@ -495,6 +528,29 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      - name: Verify Tax services, persistence, isolation and both UI shells
+        if: github.event_name == 'workflow_dispatch' && inputs.contacts_profile == 'tax'
+        env:
+          TAX_QA_BASE: http://localhost:8080
+          TAX_QA_OUT: ${{ runner.temp }}/tax-profile
+        run: |
+          set -euo pipefail
+          export NODE_PATH="$GITHUB_WORKSPACE/node_modules"
+          export PUPPETEER_EXECUTABLE_PATH=$(node -e 'process.stdout.write(require("puppeteer").executablePath())')
+          python3 "$CONTACTS_QA_SOURCE_DIR/docs/qa/tax-runtime/acceptance.py"
+          node "$CONTACTS_QA_SOURCE_DIR/docs/qa/tax-runtime/ui.cjs"
+          DBID=$(docker compose -f "$COMPOSE" ps -q db)
+          docker exec -i "$DBID" psql -U moqui -d moqui -v ON_ERROR_STOP=1 < "$CONTACTS_QA_SOURCE_DIR/docs/qa/tax-runtime/assert.sql"
+
+      - name: Save Tax verification evidence
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.contacts_profile == 'tax'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tax-${{ inputs.candidate_sha }}
+          path: ${{ runner.temp }}/tax-profile
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Dump Moqui logs on failure
         if: failure()
         run: docker compose -f "$COMPOSE" logs --tail=200 moqui || true
@@ -550,5 +606,24 @@ jobs:
         with:
           name: sales-teardown-${{ inputs.candidate_sha }}
           path: ${{ runner.temp }}/sales-cleanup
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Assert Tax disposable teardown
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.contacts_profile == 'tax'
+        run: |
+          set -euo pipefail
+          PROJECT=$(docker compose -f "$COMPOSE" config --format json | python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])')
+          test -z "$(docker ps -aq --filter "label=com.docker.compose.project=$PROJECT")"
+          test -z "$(docker volume ls -q --filter "label=com.docker.compose.project=$PROJECT")"
+          mkdir -p "$RUNNER_TEMP/tax-cleanup"
+          printf '{"candidate":"%s","containersRemaining":0,"volumesRemaining":0}\n' "$CANDIDATE_SHA" > "$RUNNER_TEMP/tax-cleanup/teardown.json"
+
+      - name: Save Tax teardown proof
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.contacts_profile == 'tax'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tax-teardown-${{ inputs.candidate_sha }}
+          path: ${{ runner.temp }}/tax-cleanup
           if-no-files-found: error
           retention-days: 14

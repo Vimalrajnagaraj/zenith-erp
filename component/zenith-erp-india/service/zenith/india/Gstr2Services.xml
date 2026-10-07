@@ -30,6 +30,8 @@
             <parameter name="reportData" type="List"/>
         </out-parameters>
         <actions>
+            <service-call name="zenith.tax.TaxAccessServices.assert#Organization" in-map="context" out-map="context"/>
+            <service-call name="zenith.india.GstServices.validate#ReturnPeriod" in-map="context" out-map="periodCheck"/>
             <script><![CDATA[
                 def BD = { v -> (v ?: 0) as java.math.BigDecimal }
                 def half = { v -> BD(v).divide(new java.math.BigDecimal('2'), 2, java.math.RoundingMode.HALF_UP) }
@@ -40,10 +42,10 @@
 
                 def invoices = ec.entity.find('mantle.account.invoice.Invoice')
                     .condition('toPartyId', organizationPartyId)
-                    .condition('invoiceTypeEnumId', 'in', ['InvoicePurchase','InvoicePurchaseReturn'])
+                    .condition('invoiceTypeEnumId', 'in', ['InvoicePurchase','InvoicePurchaseReturn','InvoiceSales','InvoiceSalesReturn','InvoiceCreditMemo'])
                     .condition('invoiceDate', '>=', new java.sql.Timestamp(fromD.time))
                     .condition('invoiceDate', '<', new java.sql.Timestamp(toD.time))
-                    .condition('statusId', org.moqui.entity.EntityCondition.NOT_EQUAL, 'InvoiceCancelled').disableAuthz().list()
+                    .condition('statusId','in',['InvoiceFinalized','InvoiceSent','InvoiceAcked','InvoicePmtRecvd','InvoiceWriteOff','InvoiceReceived','InvoiceApproved','InvoicePmtSent']).disableAuthz().list()
 
                 def tTaxable = BD(0), tIgst = BD(0), tCgst = BD(0), tSgst = BD(0), tCess = BD(0)
                 int matched = 0, unmatched = 0
@@ -54,23 +56,20 @@
 
                 invoices.each { inv ->
                     def sign = (inv.invoiceTypeEnumId == 'InvoicePurchaseReturn') ? BD(-1) : BD(1)
-                    def taxable = BD(inv.totalTaxableAmount)
-                    def charged = BD(inv.invoiceTotal) - taxable
-                    if (charged.signum() < 0) charged = BD(0)
-                    def buyState = stateOf(inv.supplierGstin)     // supplier (vendor) state on a purchase
-                    boolean inter = (buyState != null && supState != null && buyState != supState) || (inv.isImportPurchase == 'Y')
-                    def iCgst = BD(0), iSgst = BD(0), iIgst = BD(0)
-                    if (inter) { iIgst = charged } else { iCgst = half(charged); iSgst = charged - iCgst }
-                    tTaxable += taxable * sign; tIgst += iIgst * sign; tCgst += iCgst * sign; tSgst += iSgst * sign
+                    def tax = ec.service.sync().name('zenith.india.GstServices.get#ChargedInvoiceTax').parameters([invoiceId:inv.invoiceId]).call()
+                    if (ec.message.hasError()) return
+                    def taxable=tax.taxable, iCgst=tax.cgst, iSgst=tax.sgst, iIgst=tax.igst, iCess=tax.cess
+                    tTaxable += taxable*sign; tIgst += iIgst*sign; tCgst += iCgst*sign; tSgst += iSgst*sign; tCess += iCess*sign
 
                     def m2b = ec.entity.find('zenith.erp.india.Gstr2bRecord')
+                        .condition('organizationPartyId',organizationPartyId).condition('returnPeriod',returnPeriod)
                         .condition('supplierGstin', inv.supplierGstin)
                         .condition('invoiceNumber', inv.vendorInvoiceNumber).disableAuthz().list()
-                    boolean isM = m2b ? true : false
+                    boolean isM = m2b.any { it.matchStatus == 'Matched' && it.matchedInvoiceId == inv.invoiceId }
                     if (isM) matched++ else unmatched++
                     rows.add([invoiceId: inv.invoiceId, vendorName: inv.fromPartyId, invoiceNumber: inv.vendorInvoiceNumber,
-                              invoiceDate: inv.invoiceDate, taxableValue: taxable, igst: iIgst, cgst: iCgst, sgst: iSgst,
-                              cess: BD(0), matched: isM])
+                              invoiceDate: inv.invoiceDate, taxableValue: taxable*sign, igst: iIgst*sign, cgst: iCgst*sign, sgst: iSgst*sign,
+                              cess: iCess*sign, matched: isM])
                 }
                 totalInvoices = invoices.size()
                 totalTaxableValue = tTaxable; totalIgst = tIgst; totalCgst = tCgst; totalSgst = tSgst; totalCess = tCess
@@ -94,6 +93,8 @@
             <parameter name="netTaxPayable" type="Map"/>
         </out-parameters>
         <actions>
+            <service-call name="zenith.tax.TaxAccessServices.assert#Organization" in-map="context" out-map="context"/>
+            <service-call name="zenith.india.GstServices.validate#ReturnPeriod" in-map="context" out-map="periodCheck"/>
             <script><![CDATA[
                 def BD = { v -> (v ?: 0) as java.math.BigDecimal }
                 def half = { v -> BD(v).divide(new java.math.BigDecimal('2'), 2, java.math.RoundingMode.HALF_UP) }
@@ -107,37 +108,33 @@
 
                 // Aggregate charged tax over a set of invoices; direction: 'out' uses buyerGstin state, 'in' uses supplierGstin state.
                 def agg = { typeList, orgField, counterpartyGstinField ->
-                    def res = [taxable: BD(0), cgst: BD(0), sgst: BD(0), igst: BD(0)]
+                    def res = [taxable: BD(0), cgst: BD(0), sgst: BD(0), igst: BD(0), cess:BD(0)]
                     def list = ec.entity.find('mantle.account.invoice.Invoice')
                         .condition(orgField, organizationPartyId)
                         .condition('invoiceTypeEnumId', 'in', typeList)
                         .condition('invoiceDate', '>=', fromTs).condition('invoiceDate', '<', toTs)
-                        .condition('statusId', org.moqui.entity.EntityCondition.NOT_EQUAL, 'InvoiceCancelled').disableAuthz().list()
+                        .condition('statusId','in',['InvoiceFinalized','InvoiceSent','InvoiceAcked','InvoicePmtRecvd','InvoiceWriteOff','InvoiceReceived','InvoiceApproved','InvoicePmtSent']).disableAuthz().list()
                     list.each { inv ->
-                        boolean isReturn = inv.invoiceTypeEnumId?.toString()?.contains('Return')
+                        boolean isReturn = inv.invoiceTypeEnumId in ['InvoiceSalesReturn','InvoicePurchaseReturn','InvoiceCreditMemo']
                         def sign = isReturn ? BD(-1) : BD(1)
-                        def taxable = BD(inv.totalTaxableAmount)
-                        def charged = BD(inv.invoiceTotal) - taxable
-                        if (charged.signum() < 0) charged = BD(0)
-                        def cpState = stateOf(inv.get(counterpartyGstinField))
-                        boolean inter = (cpState != null && supState != null && cpState != supState) || (inv.isImportPurchase == 'Y')
-                        res.taxable += taxable * sign
-                        if (inter) { res.igst += charged * sign }
-                        else { def c = half(charged); res.cgst += c * sign; res.sgst += (charged - c) * sign }
+                        def tax=ec.service.sync().name('zenith.india.GstServices.get#ChargedInvoiceTax').parameters([invoiceId:inv.invoiceId]).call()
+                        if (ec.message.hasError()) return
+                        res.taxable += tax.taxable*sign
+                        ['cgst','sgst','igst','cess'].each { res[it] += tax[it]*sign }
                     }
                     return res
                 }
 
                 // 3.1 outward = sales invoices (POS sales already create linked InvoiceSales, so no double count).
-                def out = agg(['InvoiceSales','InvoiceSalesReturn','InvoiceSalesDebit'], 'fromPartyId', 'buyerGstin')
+                def out = agg(['InvoiceSales','InvoiceSalesReturn','InvoiceSalesDebit','InvoiceCreditMemo'], 'fromPartyId', 'buyerGstin')
                 // 4 ITC = purchase invoices.
-                def itc = agg(['InvoicePurchase','InvoicePurchaseReturn'], 'toPartyId', 'supplierGstin')
+                def itc = agg(['InvoicePurchase','InvoicePurchaseReturn','InvoiceSales','InvoiceSalesReturn','InvoiceCreditMemo'], 'toPartyId', 'supplierGstin')
 
-                table31 = [taxableValue: out.taxable, igst: out.igst, cgst: out.cgst, sgst: out.sgst, cess: BD(0)]
+                table31 = [taxableValue: out.taxable, igst: out.igst, cgst: out.cgst, sgst: out.sgst, cess: out.cess]
                 table32 = [igst: BD(0), cgst: BD(0), sgst: BD(0), cess: BD(0)]
-                table4 = [igst: itc.igst, cgst: itc.cgst, sgst: itc.sgst, cess: BD(0)]
+                table4 = [igst: itc.igst, cgst: itc.cgst, sgst: itc.sgst, cess: itc.cess]
                 table5 = [interState: BD(0), intraState: BD(0)]
-                netTaxPayable = [igst: out.igst - itc.igst, cgst: out.cgst - itc.cgst, sgst: out.sgst - itc.sgst, cess: BD(0)]
+                netTaxPayable = [igst: out.igst - itc.igst, cgst: out.cgst - itc.cgst, sgst: out.sgst - itc.sgst, cess: out.cess-itc.cess]
             ]]></script>
         </actions>
     </service>
@@ -155,57 +152,54 @@
             <parameter name="missingInBooksCount" type="Integer"/>
         </out-parameters>
         <actions>
+            <service-call name="zenith.tax.TaxAccessServices.assert#WriteAccess"/>
+            <service-call name="zenith.tax.TaxAccessServices.assert#Organization" in-map="context" out-map="context"/>
+            <service-call name="zenith.india.GstServices.validate#ReturnPeriod" in-map="context" out-map="periodCheck"/>
             <script><![CDATA[
-                int matched = 0, unmatched = 0, missingInBooks = 0
-                String fileContent = ""
-                if (gstr2bJsonFile) {
-                    try { fileContent = new String(gstr2bJsonFile.get(), "UTF-8") }
-                    catch (Exception e) { fileContent = "" }
-                }
-                if (!fileContent) {
-                    ec.message.addMessage("No file uploaded or file is empty. Please upload a valid GSTR-2B JSON.", "warning")
-                    matchedCount = 0; unmatchedCount = 0; missingInBooksCount = 0
-                    return
+                matchedCount=0; unmatchedCount=0; missingInBooksCount=0
+                if (!gstr2bJsonFile || gstr2bJsonFile.size == 0 || gstr2bJsonFile.size > 5*1024*1024) {
+                    ec.message.addError('Upload a non-empty GSTR-2B JSON file of at most 5 MB.'); return
                 }
                 try {
-                    def jsonSlurper = new groovy.json.JsonSlurper()
-                    def gstr2b = jsonSlurper.parseText(fileContent)
-                    def b2b = gstr2b?.data?.docdata?.b2b ?: gstr2b?.b2b ?: []
-                    for (supplier in b2b) {
-                        String supplierGstin = supplier.ctin ?: supplier.gstin ?: ""
-                        def invoices = supplier.inv ?: []
-                        for (inv in invoices) {
-                            String invNum = inv.inum ?: inv.val?.toString() ?: ""
-                            BigDecimal taxable = (inv.val ?: 0) as BigDecimal
-                            BigDecimal igst = 0, cgst = 0, sgst = 0
-                            for (item in (inv.items ?: inv.itms ?: [])) {
-                                def det = item.itm_det ?: item
-                                igst += (det.iamt ?: 0) as BigDecimal
-                                cgst += (det.camt ?: 0) as BigDecimal
-                                sgst += (det.samt ?: 0) as BigDecimal
-                                taxable = (det.txval ?: taxable) as BigDecimal
-                            }
-                            def existing = ec.entity.find("zenith.erp.india.Gstr2bRecord")
-                                .condition("supplierGstin", supplierGstin)
-                                .condition("invoiceNumber", invNum).one()
-                            if (!existing) {
-                                ec.entity.makeValue("zenith.erp.india.Gstr2bRecord").setAll([
-                                    supplierGstin:supplierGstin, invoiceNumber:invNum,
-                                    taxableAmount:taxable, igstAmount:igst, cgstAmount:cgst, sgstAmount:sgst,
-                                    returnPeriod:returnPeriod, matchStatus:"MissingInBooks"
-                                ]).setSequencedIdPrimary().create()
-                                missingInBooks++
-                            } else {
-                                if (existing.matchStatus == "Matched") matched++
-                                else unmatched++
-                            }
+                    def payload=new groovy.json.JsonSlurper().parseText(new String(gstr2bJsonFile.get(),'UTF-8'))
+                    def data=payload.data ?: payload
+                    def cfg=ec.entity.find('zenith.erp.india.IndiaGstConfig').condition('organizationPartyId',organizationPartyId).one()
+                    if (!cfg?.gstin || data.gstin != cfg.gstin || (data.rtnprd ?: data.fp) != returnPeriod) throw new IllegalArgumentException('GSTIN and period must match the selected organization and return period.')
+                    def suppliers=data.docdata?.b2b ?: data.b2b
+                    if (!(suppliers instanceof List)) throw new IllegalArgumentException('B2B invoice data is missing.')
+                    def bd={ v -> (v == null ? 0 : v) as BigDecimal }
+                    for (supplier in suppliers) for (inv in (supplier.inv ?: [])) {
+                        def gstin=supplier.ctin ?: supplier.gstin, number=inv.inum
+                        if (!gstin || !number) throw new IllegalArgumentException('Supplier GSTIN and invoice number are required.')
+                        def sums=[taxableAmount:0G,igstAmount:0G,cgstAmount:0G,sgstAmount:0G,cessAmount:0G]
+                        for (item in (inv.items ?: inv.itms ?: [])) {
+                            def det=item.itm_det ?: item
+                            [taxableAmount:'txval',igstAmount:'iamt',cgstAmount:'camt',sgstAmount:'samt',cessAmount:'csamt'].each { k,v -> sums[k]+=bd(det[v]) }
                         }
+                        def book=ec.entity.find('mantle.account.invoice.Invoice').condition('toPartyId',organizationPartyId)
+                            .condition('invoiceTypeEnumId','InvoicePurchase').condition('supplierGstin',gstin)
+                            .condition('vendorInvoiceNumber',number).condition('statusId','in',['InvoiceFinalized','InvoiceSent','InvoiceAcked','InvoicePmtRecvd','InvoiceWriteOff','InvoiceReceived','InvoiceApproved','InvoicePmtSent']).list()
+                        def reason=null, status='MissingInBooks', matchedId=null
+                        if (book.size()==1) {
+                            def tax=ec.service.sync().name('zenith.india.GstServices.get#ChargedInvoiceTax').parameters([invoiceId:book[0].invoiceId]).call()
+                            if(ec.message.hasError()) throw new IllegalArgumentException('Book invoice does not reconcile.')
+                            boolean matches=[taxableAmount:'taxable',igstAmount:'igst',cgstAmount:'cgst',sgstAmount:'sgst',cessAmount:'cess'].every { k,v -> (sums[k]-bd(tax[v])).abs() <= 0.01G }
+                            status=matches ? 'Matched' : 'Mismatch'; reason=matches ? null : 'Taxable value or tax components differ from books.'; matchedId=book[0].invoiceId
+                        } else if(book.size()>1) {status='Mismatch';reason='Multiple book invoices have this supplier and number.'}
+                        def existing=ec.entity.find('zenith.erp.india.Gstr2bRecord').condition('organizationPartyId',organizationPartyId)
+                            .condition('returnPeriod',returnPeriod).condition('supplierGstin',gstin).condition('invoiceNumber',number).one()
+                        def values=sums+[organizationPartyId:organizationPartyId,returnPeriod:returnPeriod,supplierGstin:gstin,invoiceNumber:number,totalAmount:bd(inv.val),matchStatus:status,matchedInvoiceId:matchedId,mismatchReasons:reason,matchDate:ec.user.nowTimestamp]
+                        if(existing) {existing.setAll(values);existing.update()}
+                        else ec.entity.makeValue('zenith.erp.india.Gstr2bRecord').setAll(values).setSequencedIdPrimary().create()
+                        if(status=='Matched') matchedCount++
+                        else if(status=='MissingInBooks') missingInBooksCount++
+                        else unmatchedCount++
                     }
-                } catch (Exception e) {
-                    ec.message.addError("Error parsing GSTR-2B JSON: " + e.message)
+                } catch(Exception ignored) {
+                    ec.transaction.setRollbackOnly('Invalid GSTR-2B input',null)
+                    ec.message.addError('GSTR-2B import failed validation. No records were saved. Check GSTIN, period and invoice data.')
+                    matchedCount=0; unmatchedCount=0; missingInBooksCount=0
                 }
-                matchedCount = matched; unmatchedCount = unmatched; missingInBooksCount = missingInBooks
-                ec.message.addMessage("GSTR-2B reconciliation complete: ${matched} matched, ${unmatched} unmatched, ${missingInBooks} missing in books.", "success")
             ]]></script>
         </actions>
     </service>

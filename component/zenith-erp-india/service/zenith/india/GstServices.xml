@@ -2,6 +2,50 @@
 <services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
           xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
 
+    <service verb="get" noun="ChargedInvoiceTax">
+        <in-parameters><parameter name="invoiceId" required="true"/></in-parameters>
+        <out-parameters><parameter name="taxable" type="BigDecimal"/><parameter name="cgst" type="BigDecimal"/><parameter name="sgst" type="BigDecimal"/><parameter name="igst" type="BigDecimal"/><parameter name="cess" type="BigDecimal"/><parameter name="reconciled" type="Boolean"/></out-parameters>
+        <actions>
+            <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="invoice"/>
+            <if condition="!invoice"><return error="true" message="Invoice not found."/></if>
+            <service-call name="zenith.tax.TaxAccessServices.get#AuthorizedActiveOrganization" out-map="invoiceScope"/>
+            <if condition="!ec.user.isInGroup('ADMIN') &amp;&amp; !(invoiceScope.activeOrgId in [invoice.fromPartyId,invoice.toPartyId])"><return error="true" message="You do not have access to this invoice."/></if>
+            <if condition="!ec.user.isInGroup('ADMIN')"><service-call name="zenith.tax.TaxAccessServices.assert#Organization" in-map="[organizationPartyId:invoiceScope.activeOrgId]"/></if>
+            <script><![CDATA[
+                def bd = { v -> (v == null ? 0 : v) as BigDecimal }
+                taxable = bd(invoice.totalTaxableAmount)
+                def charged = (bd(invoice.invoiceTotal) - taxable - bd(invoice.roundOffAmount)).setScale(2,java.math.RoundingMode.HALF_UP)
+                if (charged < 0) { ec.message.addError('Invoice total does not reconcile with its taxable value and round-off.'); return }
+                cgst=bd(invoice.totalCgst); sgst=bd(invoice.totalSgst); igst=bd(invoice.totalIgst); cess=bd(invoice.totalCess)
+                reconciled=(cgst+sgst+igst+cess).setScale(2,java.math.RoundingMode.HALF_UP) == charged
+                if (!reconciled) {
+                    // Legacy invoices can contain computed-but-not-collected GST. Keep the charged
+                    // delta authoritative. Unknown cess cannot be invented from a mismatched header.
+                    cess=0G; cgst=0G; sgst=0G; igst=0G
+                    def seller=invoice.supplierStateCode ?: (invoice.supplierGstin?.size() == 15 ? invoice.supplierGstin.substring(0,2) : null)
+                    def buyer=invoice.placeOfSupplyStateCode ?: (invoice.buyerGstin?.size() == 15 ? invoice.buyerGstin.substring(0,2) : null)
+                    if (invoice.isImportPurchase == 'Y' || invoice.isExport == 'Y' || invoice.isSezSupply == 'Y' || (seller && buyer && seller != buyer)) igst=charged
+                    else { cgst=(charged/2).setScale(2,java.math.RoundingMode.HALF_UP); sgst=charged-cgst }
+                }
+            ]]></script>
+        </actions>
+    </service>
+
+    <service verb="validate" noun="ReturnPeriod">
+        <in-parameters><parameter name="returnPeriod" required="true"/></in-parameters>
+        <out-parameters><parameter name="financialYear"/></out-parameters>
+        <actions><script><![CDATA[
+            try {
+                if (!(returnPeriod ==~ /[0-9]{6}/)) throw new IllegalArgumentException()
+                int year = returnPeriod.substring(2).toInteger(), month = returnPeriod.substring(0,2).toInteger()
+                if (year < 1900 || year > 9998) throw new IllegalArgumentException()
+                def period = java.time.YearMonth.of(year,month)
+                int fy = month >= 4 ? year : year - 1
+                financialYear = fy.toString() + '-' + (fy+1).toString()
+            } catch (Exception ignored) { ec.message.addError('Return period must be a valid month in MMYYYY format.'); return }
+        ]]></script></actions>
+    </service>
+
     <service verb="create" noun="GstConfig">
         <in-parameters>
             <parameter name="organizationPartyId" required="true"/>
@@ -13,11 +57,14 @@
             <parameter name="compositionRate" type="BigDecimal"/>
         </in-parameters>
         <actions>
+            <service-call name="zenith.tax.TaxAccessServices.assert#Organization" in-map="context" out-map="context"/>
             <service-call name="zenith.india.GstServices.validate#Gstin" in-map="[gstin:gstin]" out-map="valOut"/>
             <if condition="!valOut.isValid">
                 <return error="true" message="Invalid GSTIN format: ${gstin}"/>
             </if>
 
+            <set field="gstin" from="gstin.trim().toUpperCase(java.util.Locale.ROOT)"/>
+            <if condition="stateCode &amp;&amp; stateCode != valOut.stateCode"><return error="true" message="GSTIN state code does not match the selected state."/></if>
             <set field="derivedStateCode" from="gstin.substring(0, 2)"/>
             <if condition="!stateCode"><set field="stateCode" from="derivedStateCode"/></if>
 
@@ -45,12 +92,12 @@
         <actions>
             <set field="isValid" from="false"/>
 
-            <if condition="!gstin || gstin.length() != 15">
+            <if condition="!gstin || gstin.trim().length() != 15">
                 <set field="errorMessage" value="GSTIN must be exactly 15 characters"/>
                 <return/>
             </if>
 
-            <set field="gstinUpper" from="gstin.toUpperCase()"/>
+            <set field="gstinUpper" from="gstin.trim().toUpperCase(java.util.Locale.ROOT)"/>
             <set field="pattern" from="'^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}[Z]{1}[0-9A-Z]{1}$'"/>
             <if condition="!gstinUpper.matches(pattern)">
                 <set field="errorMessage" value="GSTIN format invalid. Expected: 2 digits + 5 letters + 4 digits + 1 letter + 1 alphanumeric + Z + 1 checksum"/>
@@ -66,6 +113,19 @@
                 <return/>
             </if>
 
+            <script><![CDATA[
+                String alphabet = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+                int sum = 0, factor = 2
+                for (int i = 13; i >= 0; i--) {
+                    int value = alphabet.indexOf(gstinUpper.charAt(i).toString()) * factor
+                    sum += value.intdiv(36) + value % 36
+                    factor = factor == 2 ? 1 : 2
+                }
+                if (gstinUpper.charAt(14) != alphabet.charAt((36 - sum % 36) % 36)) {
+                    errorMessage = 'GSTIN checksum is invalid'; return
+                }
+            ]]></script>
+            <if condition="errorMessage"><return/></if>
             <set field="panNumber" from="gstinUpper.substring(2, 12)"/>
             <set field="isValid" from="true"/>
         </actions>
@@ -100,10 +160,11 @@
         </out-parameters>
         <actions>
             <entity-find-one entity-name="zenith.erp.india.IndiaGstSlab" value-field="slab"/>
-            <if condition="!slab">
+            <if condition="!slab || slab.isActive == 'N'">
                 <return error="true" message="GST slab ${gstSlabId} not found"/>
             </if>
 
+            <if condition="(slab.cessRate ?: 0) &gt; 0 &amp;&amp; slab.cessType != 'PERCENTAGE'"><return error="true" message="This cess type requires quantity-based assessment and is not supported by this calculator."/></if>
             <entity-find-one entity-name="zenith.erp.india.IndiaState" value-field="supplierState">
                 <field-map field-name="stateCode" from="supplierStateCode"/>
             </entity-find-one>
@@ -111,6 +172,9 @@
                 <field-map field-name="stateCode" from="buyerStateCode"/>
             </entity-find-one>
 
+            <if condition="taxableAmount &lt; 0 || !supplierState || (!buyerState &amp;&amp; isExport != 'Y')">
+                <return error="true" message="A non-negative taxable amount and valid supply states are required."/>
+            </if>
             <set field="isIntraState" from="supplierStateCode == buyerStateCode"/>
             <set field="isUtSupply" from="supplierState?.isUnionTerritory == 'Y' || buyerState?.isUnionTerritory == 'Y'"/>
 
@@ -158,8 +222,8 @@
             </if>
 
             <set field="cessRate" from="slab.cessRate ?: 0"/>
-            <!-- Compensation cess is not collected on zero-rated (export/SEZ) supplies. -->
-            <if condition="cessRate &gt; 0 &amp;&amp; slab.cessType == 'PERCENTAGE' &amp;&amp; isExport != 'Y' &amp;&amp; isSezSupply != 'Y'">
+            <!-- Cess is collected with payment; LUT/bond supplies collect none. -->
+            <if condition="cessRate &gt; 0 &amp;&amp; slab.cessType == 'PERCENTAGE' &amp;&amp; ((isExport != 'Y' &amp;&amp; isSezSupply != 'Y') || isWithPayment == 'Y')">
                 <then>
                     <set field="cessAmount" from="(taxableAmount * cessRate / 100).setScale(2, java.math.RoundingMode.HALF_UP)"/>
                 </then>
@@ -193,6 +257,7 @@
             <parameter name="amountInWords"/>
         </out-parameters>
         <actions>
+            <if condition="amount &lt; 0 || amount &gt;= 10000000000"><return error="true" message="Amount must be between zero and 999,99,99,999.99."/></if>
             <set field="amt" from="amount.setScale(2, java.math.RoundingMode.HALF_UP)"/>
             <set field="rupees" from="amt.longValue()"/>
             <set field="paise" from="((amt - rupees) * 100).intValue()"/>
@@ -356,9 +421,17 @@
             <parameter name="tcsAmount" type="BigDecimal"/>
         </out-parameters>
         <actions>
+            <service-call name="zenith.tax.TaxAccessServices.assert#Organization" in-map="context" out-map="context"/>
+            <service-call name="zenith.tax.TaxAccessServices.assert#Subject" in-map="[organizationPartyId:organizationPartyId,partyId:customerPartyId]"/>
+            <if condition="invoiceAmount &lt; 0"><return error="true" message="Invoice amount cannot be negative."/></if>
             <set field="tcsApplicable" value="N"/>
             <set field="tcsAmount" from="0" type="BigDecimal"/>
 
+            <if condition="!(financialYear ==~ /[0-9]{4}-[0-9]{4}/) || financialYear.substring(5).toInteger() != financialYear.substring(0,4).toInteger() + 1">
+                <return error="true" message="Financial year must be YYYY-YYYY (consecutive years)."/>
+            </if>
+            <!-- Section 206C(1H) was omitted effective 1 April 2025. -->
+            <if condition="financialYear.substring(0,4).toInteger() &gt;= 2025"><return/></if>
             <entity-find-one entity-name="zenith.erp.india.TcsCumulativeTracker" value-field="tracker">
                 <field-map field-name="organizationPartyId"/>
                 <field-map field-name="customerPartyId"/>
@@ -367,7 +440,7 @@
 
             <set field="cumulativeSalesAmount" from="tracker?.cumulativeSalesAmount ?: 0.0" type="BigDecimal"/>
             <set field="limit" from="5000000" type="BigDecimal"/>
-            
+
             <script><![CDATA[
                 BigDecimal newTotal = cumulativeSalesAmount + invoiceAmount
                 if (newTotal > limit) {
@@ -415,6 +488,7 @@
             <parameter name="taxAmount" type="BigDecimal"/>
         </out-parameters>
         <actions>
+            <if condition="inclusiveAmount &lt; 0 || gstRate &lt; 0"><return error="true" message="Inclusive amount and GST rate must be non-negative."/></if>
             <script><![CDATA[
                 taxableAmount = (inclusiveAmount * 100 / (100 + gstRate)).setScale(2, java.math.RoundingMode.HALF_UP)
                 taxAmount = inclusiveAmount - taxableAmount
@@ -430,12 +504,15 @@
             <parameter name="invoiceAmount" type="BigDecimal" required="true"/>
         </in-parameters>
         <actions>
+            <service-call name="zenith.tax.TaxAccessServices.assert#Organization" in-map="context" out-map="context"/>
+            <service-call name="zenith.tax.TaxAccessServices.assert#Subject" in-map="[organizationPartyId:organizationPartyId,partyId:customerPartyId]"/>
+            <if condition="invoiceAmount &lt; 0"><return error="true" message="Invoice amount cannot be negative."/></if>
             <entity-find-one entity-name="zenith.erp.india.TcsCumulativeTracker" value-field="tracker" for-update="true">
                 <field-map field-name="organizationPartyId"/>
                 <field-map field-name="customerPartyId"/>
                 <field-map field-name="financialYear"/>
             </entity-find-one>
-            
+
             <if condition="tracker">
                 <then>
                     <set field="tracker.cumulativeSalesAmount" from="(tracker.cumulativeSalesAmount ?: 0.0) + invoiceAmount"/>

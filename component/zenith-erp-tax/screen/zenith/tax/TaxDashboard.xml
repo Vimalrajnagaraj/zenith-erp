@@ -11,19 +11,25 @@
         <actions><script><![CDATA[
             def dashDate = ec.web.parameters.dashDate
             def dashDateTo = ec.web.parameters.dashDateTo
-            def orgId = ec.user.getPreference('ACTIVE_ORGANIZATION')
-            def txIds = [] as Set
-            if (orgId) { try { txIds = (ec.entity.find("zenith.erp.pos.PosTransaction").condition("organizationPartyId", orgId).selectField("transactionId").list()*.transactionId) as Set } catch (Exception e) {} }
-            def rawLines = ec.entity.find("zenith.erp.tax.TaxLineDetail").orderBy("-taxLineDetailId").limit(4000).list()
-            def tLines = orgId ? rawLines.findAll { txIds.contains(it.referenceId) } : rawLines
+            def orgId = ec.service.sync().name('zenith.tax.TaxAccessServices.get#AuthorizedActiveOrganization').call().activeOrgId
+            def tLines=ec.service.sync().name('zenith.tax.TaxServices.get#DashboardTaxLines').call().taxLines ?: []
+            if (!dashDate) dashDate=java.time.LocalDate.now().withDayOfMonth(1).toString()
+            if (!dashDateTo) dashDateTo=java.time.LocalDate.now().toString()
+            try {
+                def from=java.time.LocalDate.parse(dashDate), to=java.time.LocalDate.parse(dashDateTo)
+                if(from.year < 1900 || to.year > 9998 || to.isBefore(from) || java.time.temporal.ChronoUnit.DAYS.between(from,to) > 366) throw new IllegalArgumentException()
+            } catch(Exception ignored) {
+                ec.web.response.setStatus(400)
+                ec.web.sendTextResponse('Select valid ordered dates spanning at most one year.','text/plain',null); return
+            }
             def ps = dashDate ? java.sql.Timestamp.valueOf(dashDate + " 00:00:00") : null
             def pe = null
             if (dashDateTo) { def _c = java.util.Calendar.getInstance(); _c.setTime(java.sql.Timestamp.valueOf(dashDateTo + " 00:00:00")); _c.add(java.util.Calendar.DAY_OF_MONTH,1); pe = new java.sql.Timestamp(_c.getTimeInMillis()) }
-            def lines = (ps && pe) ? tLines.findAll { it.lastUpdatedStamp != null && !it.lastUpdatedStamp.before(ps) && it.lastUpdatedStamp.before(pe) } : tLines
+            def lines = (ps && pe) ? tLines.findAll { it.documentDate != null && !it.documentDate.before(ps) && it.documentDate.before(pe) } : tLines
             def df = new java.text.SimpleDateFormat("yyyy-MM-dd")
-            def esc = { v -> def s = (v == null) ? '' : v.toString(); (s.contains(',') || s.contains('"') || s.contains("\n")) ? ('"' + s.replace('"','""') + '"') : s }
+            def esc = { v -> def s = (v == null) ? '' : v.toString(); if (v instanceof CharSequence && s ==~ /(?s)^[=+@\-\t\r].*/) s = "'" + s; (s.contains(',') || s.contains('"') || s.contains("\n")) ? ('"' + s.replace('"','""') + '"') : s }
             def sb = new StringBuilder("ID,Ref Type,Ref ID,Tax,Rate,Taxable Amount,Tax Amount,Currency,Date\n")
-            lines.each { sb.append([esc(it.taxLineDetailId), esc(it.referenceType), esc(it.referenceId), esc(it.taxName), esc(it.taxRate), esc(it.taxableAmount), esc(it.taxAmount), esc(it.currencyUomId ?: 'INR'), esc(it.lastUpdatedStamp != null ? df.format(it.lastUpdatedStamp) : '')].join(',')).append("\n") }
+            lines.each { sb.append([esc(it.taxLineDetailId), esc(it.referenceType), esc(it.referenceId), esc(it.taxName), esc(it.taxRate), esc(it.taxableAmount), esc(it.taxAmount), esc(it.currencyUomId ?: 'INR'), esc(it.documentDate != null ? df.format(it.documentDate) : '')].join(',')).append("\n") }
             ec.web.sendTextResponse(sb.toString(), "text/csv", "TaxLines.csv")
         ]]></script></actions>
         <default-response type="none"/>
@@ -41,10 +47,10 @@
         <set field="totalRates" from="0"/>
         <script>try { totalRates = ec.entity.find("zenith.erp.india.IndiaGstSlab").condition("isActive","Y").count() as int } catch (Exception e) { try { totalRates = ec.entity.find("zenith.erp.tax.TaxRate").condition("isActive","Y").count() as int } catch (Exception e2) {} }</script>
         <entity-find-count entity-name="zenith.erp.tax.TaxCategory" count-field="totalCategories"/>
-        <entity-find-count entity-name="zenith.erp.tax.TaxExemption" count-field="totalExemptions">
+        <entity-find-count entity-name="zenith.erp.tax.TaxExemption" count-field="totalExemptions"><econdition field-name="organizationPartyId" from="ec.service.sync().name('zenith.tax.TaxAccessServices.get#AuthorizedActiveOrganization').call().activeOrgId ?: '_NA_'"/>
             <econdition field-name="isActive" value="Y"/>
         </entity-find-count>
-        <entity-find-count entity-name="zenith.erp.tax.TaxRegistration" count-field="totalRegistrations">
+        <entity-find-count entity-name="zenith.erp.tax.TaxRegistration" count-field="totalRegistrations"><econdition field-name="organizationPartyId" from="ec.service.sync().name('zenith.tax.TaxAccessServices.get#AuthorizedActiveOrganization').call().activeOrgId ?: '_NA_'"/>
             <econdition field-name="isActive" value="Y"/>
         </entity-find-count>
 
@@ -59,22 +65,26 @@
             def now = ec.user.nowTimestamp
             def todayStr = sdf.format(now)
 
-            def orgId = ec.user.getPreference('ACTIVE_ORGANIZATION')
-            def txIds = [] as Set
-            if (orgId) { try { txIds = (ec.entity.find("zenith.erp.pos.PosTransaction").condition("organizationPartyId", orgId).selectField("transactionId").list()*.transactionId) as Set } catch (Exception e) {} }
-            def rawLines = ec.entity.find("zenith.erp.tax.TaxLineDetail").orderBy("-taxLineDetailId").limit(4000).list()
-            def tLines = orgId ? rawLines.findAll { txIds.contains(it.referenceId) } : rawLines
+            def orgId = ec.service.sync().name('zenith.tax.TaxAccessServices.get#AuthorizedActiveOrganization').call().activeOrgId
+            def tLines=ec.service.sync().name('zenith.tax.TaxServices.get#DashboardTaxLines').call().taxLines ?: []
 
             // default the range to the month containing the most recent tax line (so the dashboard opens populated);
             // fall back to the current month when there is no tax data at all.
-            def _anchor = (tLines && tLines[0].lastUpdatedStamp) ? tLines[0].lastUpdatedStamp : now
+            def _anchor = now
             def _am = java.util.Calendar.getInstance(); _am.setTime(_anchor); _am.set(java.util.Calendar.DAY_OF_MONTH,1)
             def _monStart = sdf.format(_am.getTime())
             def _ae = (java.util.Calendar) _am.clone(); _ae.add(java.util.Calendar.MONTH,1); _ae.add(java.util.Calendar.DAY_OF_MONTH,-1)
             def _monEnd = sdf.format(_ae.getTime()); if (_monEnd > todayStr) _monEnd = todayStr
             if (!dashDate) dashDate = _monStart
             if (!dashDateTo) dashDateTo = _monEnd
-            if (dashDateTo < dashDate) { def _s = dashDate; dashDate = dashDateTo; dashDateTo = _s }
+            try {
+                def from=java.time.LocalDate.parse(dashDate), to=java.time.LocalDate.parse(dashDateTo)
+                if(from.year < 1900 || to.year > 9998 || to.isBefore(from) || java.time.temporal.ChronoUnit.DAYS.between(from,to) > 366) throw new IllegalArgumentException()
+            } catch(Exception ignored) {
+                ec.web.response.setStatus(400)
+                ec.web.sendTextResponse('Select valid ordered dates spanning at most one year.','text/plain',null); return
+            }
+
             def periodStart = java.sql.Timestamp.valueOf(dashDate + " 00:00:00")
             def _ce = java.util.Calendar.getInstance(); _ce.setTime(java.sql.Timestamp.valueOf(dashDateTo + " 00:00:00")); _ce.add(java.util.Calendar.DAY_OF_MONTH,1)
             def periodEndExcl = new java.sql.Timestamp(_ce.getTimeInMillis())
@@ -83,8 +93,8 @@
             rangeLabel = pretty.format(periodStart) + " - " + pretty.format(new java.sql.Timestamp(periodEndExcl.getTime() - 86400000L))
 
             def inRange = { ts, a, b -> ts != null && !ts.before(a) && ts.before(b) }
-            def periodLines = tLines.findAll { inRange(it.lastUpdatedStamp, periodStart, periodEndExcl) }
-            def priorLines  = tLines.findAll { inRange(it.lastUpdatedStamp, priorStart, periodStart) }
+            def periodLines = tLines.findAll { inRange(it.documentDate, periodStart, periodEndExcl) }
+            def priorLines  = tLines.findAll { inRange(it.documentDate, priorStart, periodStart) }
 
             BigDecimal totBd = 0G; periodLines.each { totBd += (it.taxAmount ?: 0G) }
             BigDecimal priorBd = 0G; priorLines.each { priorBd += (it.taxAmount ?: 0G) }
@@ -106,18 +116,18 @@
             sgstFmt = "₹" + sg.setScale(2, RoundingMode.HALF_UP).toPlainString(); sgstPct = _pc(sg)
             cgstFmt = "₹" + cg.setScale(2, RoundingMode.HALF_UP).toPlainString(); cgstPct = _pc(cg)
             igstFmt = "₹" + ig.setScale(2, RoundingMode.HALF_UP).toPlainString(); igstPct = _pc(ig)
-            byTypeSeries = "[" + sg.setScale(2,RoundingMode.HALF_UP).toPlainString() + "," + cg.setScale(2,RoundingMode.HALF_UP).toPlainString() + "," + ig.setScale(2,RoundingMode.HALF_UP).toPlainString() + "]"
+            byTypeSeries = "[" + sg.setScale(2,RoundingMode.HALF_UP).toPlainString() + "," + cg.setScale(2,RoundingMode.HALF_UP).toPlainString() + "," + ig.setScale(2,RoundingMode.HALF_UP).toPlainString() + "," + ot.setScale(2,RoundingMode.HALF_UP).toPlainString() + "]"
             byTypeHasData = (byTot > 0G)
 
             // daily series across the selected range
             def dsdf = new java.text.SimpleDateFormat("yyyy-MM-dd")
             def dayMap = [:]
-            periodLines.each { def d = dsdf.format(it.lastUpdatedStamp); dayMap[d] = ((dayMap[d] ?: 0G)) + (it.taxAmount ?: 0G) }
+            periodLines.each { def d = dsdf.format(it.documentDate); dayMap[d] = ((dayMap[d] ?: 0G)) + (it.taxAmount ?: 0G) }
             def labels = []; def vals = []
             def dc = java.util.Calendar.getInstance(); dc.setTime(periodStart)
             def labSdf = new java.text.SimpleDateFormat("dd MMM")
             int _guard = 0
-            while (dc.getTime().before(periodEndExcl) && _guard < 370) {
+            while (dc.getTime().before(periodEndExcl)) {
                 def ds = dsdf.format(dc.getTime())
                 labels.add("'" + labSdf.format(dc.getTime()) + "'")
                 vals.add(((dayMap[ds] ?: 0G) as BigDecimal).setScale(2, RoundingMode.HALF_UP).toPlainString())
@@ -128,7 +138,7 @@
             liabHasData = (periodLines.size() > 0)
 
             // recent tax lines for the table (within range; fall back to latest tenant lines if the range is empty)
-            def tableSrc = periodLines ? periodLines : tLines
+            def tableSrc = periodLines
             recentTaxLines = tableSrc.take(8)
 
             // ===== Recent Activities (real, from the most-recently-updated tax records) =====
@@ -141,13 +151,13 @@
             def acts = []
             try { def rl = ec.entity.find("zenith.erp.india.IndiaGstSlab").orderBy("-lastUpdatedStamp").limit(1).list()
                 if (rl) { def r = rl[0]; def nm = (_safe(r,'slabName') ?: _safe(r,'gstSlabId') ?: 'Tax rate'); def rt = (_safe(r,'gstRate') ?: _safe(r,'totalRate'))
-                    acts.add([icon:'receipt_long', color:'green', title:'New Tax Rate Added', sub:(nm.toString() + ((rt != null) ? (' - ' + rt + '%') : '')), ts:r.lastUpdatedStamp]) } } catch (Exception e) {}
-            try { def q = ec.entity.find("zenith.erp.tax.TaxExemption"); if (orgId) q.condition("organizationPartyId", orgId)
+                    acts.add([icon:'receipt_long', color:'green', title:'Tax Rate Updated', sub:(nm.toString() + ((rt != null) ? (' - ' + rt + '%') : '')), ts:r.lastUpdatedStamp]) } } catch (Exception e) {}
+            try { def q = ec.entity.find("zenith.erp.tax.TaxExemption"); q.condition("organizationPartyId", orgId ?: '_NA_')
                 def rl = q.orderBy("-lastUpdatedStamp").limit(1).list()
-                if (rl) { def r = rl[0]; acts.add([icon:'description', color:'red', title:'Tax Exemption Added', sub:(_safe(r,'exemptionNumber') ?: _safe(r,'description') ?: _safe(r,'exemptionId') ?: 'Exemption'), ts:r.lastUpdatedStamp]) } } catch (Exception e) {}
-            try { def q = ec.entity.find("zenith.erp.tax.TaxRegistration"); if (orgId) q.condition("organizationPartyId", orgId)
+                if (rl) { def r = rl[0]; acts.add([icon:'description', color:'red', title:'Tax Exemption Updated', sub:(_safe(r,'exemptionNumber') ?: _safe(r,'description') ?: _safe(r,'exemptionId') ?: 'Exemption'), ts:r.lastUpdatedStamp]) } } catch (Exception e) {}
+            try { def q = ec.entity.find("zenith.erp.tax.TaxRegistration"); q.condition("organizationPartyId", orgId ?: '_NA_')
                 def rl = q.orderBy("-lastUpdatedStamp").limit(1).list()
-                if (rl) { def r = rl[0]; acts.add([icon:'verified', color:'blue', title:'GST Registration Updated', sub:(_safe(r,'registrationNumber') ?: _safe(r,'taxRegistrationId') ?: 'Registration'), ts:r.lastUpdatedStamp]) } } catch (Exception e) {}
+                if (rl) { def r = rl[0]; acts.add([icon:'verified', color:'blue', title:'GST Registration Updated', sub:(_safe(r,'registrationNumber') ?: _safe(r,'registrationId') ?: 'Registration'), ts:r.lastUpdatedStamp]) } } catch (Exception e) {}
             acts = acts.findAll { it.ts != null }.sort { -it.ts.getTime() }
             activities = acts.collect { [icon:it.icon, color:it.color, title:it.title, sub:(it.sub != null ? it.sub.toString() : ''), time:_ago(it.ts)] }
         ]]></script>
@@ -165,8 +175,8 @@
                     <details class="zdash-dr" style="position:relative">
                         <summary class="zdash-dr-sum" style="gap:8px;height:40px;padding:0 14px;border:1px solid var(--z-border,#E5E7EB);border-radius:8px;background:var(--z-bg-card,#fff);color:var(--z-text-main,#111827);font-size:13px"><span class="material-icons" style="font-size:18px;color:#6B7280">calendar_today</span>${rangeLabel}<span class="material-icons" style="font-size:18px;color:#9CA3AF">expand_more</span></summary>
                         <form method="get" action="." class="zdash-dr-pop" style="right:0;left:auto">
-                            <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px"><span style="width:38px;font-size:12px;color:#6B7280">From</span><input type="date" name="dashDate" value="${dashDate}" style="flex:1;height:34px;border:1px solid #E5E7EB;border-radius:7px;padding:0 8px;font-size:13px"/></div>
-                            <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px"><span style="width:38px;font-size:12px;color:#6B7280">To</span><input type="date" name="dashDateTo" value="${dashDateTo}" style="flex:1;height:34px;border:1px solid #E5E7EB;border-radius:7px;padding:0 8px;font-size:13px"/></div>
+                            <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px"><span style="width:38px;font-size:12px;color:#6B7280">From</span><input type="date" name="dashDate" value="${dashDate?html}" style="flex:1;height:34px;border:1px solid #E5E7EB;border-radius:7px;padding:0 8px;font-size:13px"/></div>
+                            <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px"><span style="width:38px;font-size:12px;color:#6B7280">To</span><input type="date" name="dashDateTo" value="${dashDateTo?html}" style="flex:1;height:34px;border:1px solid #E5E7EB;border-radius:7px;padding:0 8px;font-size:13px"/></div>
                             <button type="submit" style="width:100%;height:36px;background:#7C3AED;color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer">Apply</button>
                         </form>
                     </details>
@@ -199,13 +209,13 @@
             </div>
         ]]></text></render-mode>
 
-        <!-- ===== Middle row: Tax Liability (chart) | Tax by Type (donut) | Recent Activities ===== -->
+        <!-- ===== Middle row: Recorded Outward Tax (chart) | Tax by Type (donut) | Recent Activities ===== -->
         <container-row>
             <row-col lg="5" md="12">
                 <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-md z-dashpanel">
                     <render-mode><text type="html,qvt,vuet" template="true"><![CDATA[
                         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
-                            <div style="display:flex;align-items:center;gap:6px;font-size:15px;font-weight:600;color:var(--z-text-main,#111827)">Tax Liability Overview <span class="material-icons" style="font-size:15px;color:#9CA3AF">info</span></div>
+                            <div style="display:flex;align-items:center;gap:6px;font-size:15px;font-weight:600;color:var(--z-text-main,#111827)">Recorded Outward Tax Overview <span class="material-icons" style="font-size:15px;color:#9CA3AF">info</span></div>
                         </div>
                         <div style="font-size:12px;color:var(--z-text-muted,#6B7280)">Total Tax (selected range)</div>
                         <div style="font-size:28px;font-weight:700;color:var(--z-text-main,#111827);margin:2px 0 4px">${totalTaxFmt}</div>
@@ -238,7 +248,7 @@
                             new ApexCharts(document.querySelector('#taxTypeChart'),{
                                 chart:{type:'donut',height:210,fontFamily:'Inter,sans-serif'},
                                 series:${byTypeSeries},
-                                labels:['SGST','CGST','IGST'],
+                                labels:['SGST','CGST','IGST','Other / Cess'],
                                 colors:['#7C3AED','#2563EB','#10B981'],
                                 stroke:{width:0},
                                 legend:{show:false},
@@ -276,18 +286,18 @@
                         <#else>
                         <div style="padding:24px 4px;text-align:center;color:#9CA3AF;font-size:12.5px">No recent tax activity.</div>
                         </#list>
-                        <a href="${appBase}/zenith/tax/FindTaxRate" style="font-size:12.5px;font-weight:600;color:#7C3AED;text-decoration:none">View all activities &#8594;</a>
+                        <a href="${appBase}/zenith/tax/TaxDashboard/exportTaxLines?dashDate=${dashDate?url('UTF-8')}&amp;dashDateTo=${dashDateTo?url('UTF-8')}" style="font-size:12.5px;font-weight:600;color:#7C3AED;text-decoration:none">Export all activities &#8594;</a>
                     ]]></text></render-mode>
                 </container>
             </row-col>
         </container-row>
 
-        <!-- ===== Recent Tax Line Details ===== -->
+        <!-- ===== Recorded Outward Tax Lines ===== -->
         <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mt-md z-txntable">
             <render-mode><text type="html,qvt,vuet" template="true"><![CDATA[
                 <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
-                    <div style="font-size:15px;font-weight:600;color:var(--z-text-main,#111827)">Recent Tax Line Details</div>
-                    <a href="${appBase}/zenith/tax/FindTaxRate" style="font-size:12.5px;font-weight:600;color:#7C3AED;text-decoration:none">View all &#8594;</a>
+                    <div style="font-size:15px;font-weight:600;color:var(--z-text-main,#111827)">Recorded Outward Tax Lines</div>
+                    <a href="${appBase}/zenith/tax/TaxDashboard/exportTaxLines?dashDate=${dashDate?url('UTF-8')}&amp;dashDateTo=${dashDateTo?url('UTF-8')}" style="font-size:12.5px;font-weight:600;color:#7C3AED;text-decoration:none">Export all &#8594;</a>
                 </div>
             ]]></text></render-mode>
             <form-list name="RecentTaxLines" list="recentTaxLines" list-entry="tl" skip-form="true">
@@ -296,7 +306,7 @@
                     taxBadge = (n.startsWith('SGST') || n.startsWith('UTGST')) ? 'success' : (n.startsWith('CGST') ? 'info' : (n.startsWith('IGST') ? 'primary' : 'grey'))
                     taxShort = (n.startsWith('SGST')) ? 'SGST' : (n.startsWith('CGST') ? 'CGST' : (n.startsWith('IGST') ? 'IGST' : (n.startsWith('UTGST') ? 'UTGST' : (tl.taxName ?: '—'))))
                     rateStr = (tl.taxRate != null) ? ec.l10n.format(tl.taxRate, '#0.##') : '—'
-                    dateStr = (tl.lastUpdatedStamp != null) ? ec.l10n.format(tl.lastUpdatedStamp, 'dd MMM yyyy') : ''
+                    dateStr = (tl.documentDate != null) ? ec.l10n.format(tl.documentDate, 'dd MMM yyyy') : ''
                 ]]></script></row-actions>
                 <field name="taxLineDetailId"><header-field title="ID"/>
                     <default-field title="ID"><label text="${tl.taxLineDetailId}" type="span" style="z-vtext"/></default-field></field>
