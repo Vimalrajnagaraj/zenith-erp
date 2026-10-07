@@ -13,7 +13,7 @@
     <actions>
         <set field="activeOrgId" from="_salesOrgId"/>
         <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="invoice"/>
-        <if condition="invoice != null &amp;&amp; (!activeOrgId || (invoice.fromPartyId != activeOrgId &amp;&amp; invoice.toPartyId != activeOrgId)) &amp;&amp; !ec.user.isInGroup('ADMIN')"><set field="invoice" from="null"/></if>
+        <if condition="invoice != null &amp;&amp; (!activeOrgId || (invoice.fromPartyId != activeOrgId &amp;&amp; invoice.toPartyId != activeOrgId)) &amp;&amp; !ec.user.isInGroup('ADMIN')"><script>ec.web.response.setStatus(403)</script><set field="invoice" from="null"/></if>
         
         <set field="invoiceItems" from="[]"/>
         <if condition="invoice != null">
@@ -37,8 +37,14 @@
                         .condition("referenceType", "InvoiceItem").condition("referenceId", invoice.invoiceId)
                         .condition("referenceSeqId", it0.invoiceItemSeqId).list()
                     // stored totalTaxAmount is authoritative: explicit 0 = tax-off line, ignore stale breakdowns
-                    if (it0.totalTaxAmount != null && ((it0.totalTaxAmount as BigDecimal) == 0)) tlds = null
+                    def storedGst = ((it0.cgstAmount ?: 0) + (it0.sgstAmount ?: 0) + (it0.igstAmount ?: 0)) as BigDecimal
+                    if (it0.totalTaxAmount != null && ((it0.totalTaxAmount as BigDecimal) == 0)) {
+                        tlds = null
+                        m.cgstAmount = 0G; m.sgstAmount = 0G; m.igstAmount = 0G
+                    }
                     if (tlds) {
+                        // Breakdown rows replace the stored split; adding both doubles GST.
+                        m.cgstAmount = 0G; m.sgstAmount = 0G; m.igstAmount = 0G
                         for (tl in tlds) {
                             def nm = (tl.taxName ?: '').toUpperCase()
                             def amt = (tl.taxAmount ?: 0) as BigDecimal
@@ -47,7 +53,10 @@
                             else if (nm.contains('SGST') || nm.contains('UTGST')) { m.sgstAmount = ((m.sgstAmount ?: 0) as BigDecimal) + amt; m.sgstRate = rt }
                             else if (nm.contains('IGST')) { m.igstAmount = ((m.igstAmount ?: 0) as BigDecimal) + amt; m.igstRate = rt }
                         }
-                    } else if (((it0.totalTaxAmount ?: 0) as BigDecimal) > 0) {
+                    } else if (((it0.totalTaxAmount ?: 0) as BigDecimal) > 0 && storedGst != (it0.totalTaxAmount as BigDecimal)) {
+                        // Preserve a complete stored split (including legacy IGST). Infer
+                        // the historical local split only when no complete split exists.
+                        m.cgstAmount = 0G; m.sgstAmount = 0G; m.igstAmount = 0G
                         def itax = (it0.totalTaxAmount ?: 0) as BigDecimal
                         def half = (itax / 2).setScale(2, rmode)
                         m.cgstAmount = half; m.sgstAmount = itax - half

@@ -6,11 +6,16 @@ if(!/^http:\/\/(127\.0\.0\.1|localhost):\d+$/.test(base))throw Error('Disposable
 const out=process.env.SALES_QA_OUT||path.resolve(__dirname,'../../../../../sales-runtime/verified');
 fs.mkdirSync(out,{recursive:true});
 const nativeRoot=process.env.SALES_QA_NATIVE_ROOT;
+let probeClasses;
+if(nativeRoot){
+ probeClasses=path.join(out,'db-probe');fs.mkdirSync(probeClasses,{recursive:true});
+ cp.execFileSync(path.join(path.dirname(process.env.SALES_QA_JAVA),'javac.exe'),['-d',probeClasses,path.join(__dirname,'SalesDbProbe.java')],{windowsHide:true,timeout:30000});
+}
 function q(sql){
  if(!/^SELECT /i.test(sql))throw Error('Read-only queries required');
  if(nativeRoot){
-  process.env.SALES_QA_DB_URL='jdbc:h2:tcp://127.0.0.1:19095/'+path.join(nativeRoot,'runtime/db/h2/'+(process.env.SALES_QA_DATABASE||'sales-qa-final')).replaceAll('\\','/')+';IFEXISTS=TRUE';
-  return JSON.parse(cp.execFileSync(process.env.SALES_QA_JAVA,['--class-path',path.join(nativeRoot,'WEB-INF/lib/h2-2.4.240.jar'),path.join(__dirname,'SalesDbProbe.java')],{input:sql,encoding:'utf8',windowsHide:true,timeout:30000}));
+  process.env.SALES_QA_DB_URL=process.env.SALES_QA_MEMORY==='true'?'jdbc:h2:tcp://127.0.0.1:19095/mem:sales-qa-sop;IFEXISTS=TRUE':'jdbc:h2:tcp://127.0.0.1:19095/'+path.join(nativeRoot,'runtime/db/h2/'+(process.env.SALES_QA_DATABASE||'sales-qa-final')).replaceAll('\\','/')+';IFEXISTS=TRUE';
+  return JSON.parse(cp.execFileSync(process.env.SALES_QA_JAVA,['--class-path',path.join(nativeRoot,'WEB-INF/lib/h2-2.4.240.jar')+path.delimiter+probeClasses,'SalesDbProbe'],{input:sql,encoding:'utf8',windowsHide:true,timeout:30000}));
  }
  const db=cp.execFileSync('docker',['compose','-f',process.env.COMPOSE,'ps','-q','db'],{encoding:'utf8'}).trim();
  if(!db)throw Error('Disposable CI database missing');
@@ -29,21 +34,33 @@ function totals(name,id,taxable,cgst,sgst,igst){const i=inv(id);check(name,Numbe
   if(attempt>=30)throw Error('Disposable Sales runtime did not become ready');
   await new Promise(resolve=>setTimeout(resolve,1000));
  }
- const browser=await chromium.launch({headless:true,executablePath:executable,args:['--no-sandbox','--disable-dev-shm-usage']});
+  const browser=await chromium.launch({headless:true,executablePath:executable,args:['--no-sandbox','--disable-dev-shm-usage']});
  try{
   const admin=await browser.newContext();let r=await admin.request.get(base+'/apps/zenith',{headers:{Authorization:'Basic '+Buffer.from('john.doe:moqui').toString('base64')}});check('fresh demo admin login',r.status()===200,{status:r.status()});
-  const adminPage=await admin.newPage();await adminPage.goto(base+'/apps/zenith/sales/CreateInvoice',{waitUntil:'networkidle'});
+  const adminPage=await admin.newPage();adminPage.setDefaultNavigationTimeout(60000);await adminPage.goto(base+'/apps/zenith/sales/CreateInvoice',{waitUntil:'networkidle'});
   const adminToken=await adminPage.locator('[name=moquiSessionToken]').first().inputValue();
   r=await admin.request.post(base+'/apps/zenith/sales/SalesQaAcceptance/initialize',{form:{moquiSessionToken:adminToken}});let init;try{init=await r.json()}catch{throw Error('Fixture initialization returned HTTP '+r.status())}
   check('fresh synthetic fixtures initialized once',init.initialized===true,init);await admin.close();
   const ctx=await browser.newContext({viewport:{width:1440,height:1000}});
   r=await ctx.request.get(base+'/apps/zenith/sales/FindInvoice',{headers:{Authorization:'Basic '+Buffer.from('sales.qa:moqui').toString('base64')}});check('tenant-scoped QA account login',r.status()===200,{status:r.status()});
-  const p=await ctx.newPage();await p.goto(base+'/apps/zenith/sales/EditInvoice?invoiceId=SALES_QA_INV',{waitUntil:'networkidle'});
+  const p=await ctx.newPage();p.setDefaultNavigationTimeout(60000);await p.goto(base+'/apps/zenith/sales/EditInvoice?invoiceId=SALES_QA_INV',{waitUntil:'networkidle'});
   const token=await p.locator('[name=moquiSessionToken]').first().inputValue();
   async function post(screen,transition,data={},shell='apps',csrf=true){const res=await ctx.request.post(`${base}/${shell}/zenith/sales/${screen}/${transition}`,{form:{...(csrf?{moquiSessionToken:token}:{}),...data},maxRedirects:0});check(`${shell} ${screen}/${transition} responds without server failure`,res.status()<500,{status:res.status()});return res;}
   async function invoke(op,data={},expectedError=false){const res=await post('SalesQaAcceptance','invoke',{op,...data});let body;try{body=await res.json()}catch{throw Error(op+' did not return JSON: HTTP '+res.status())};check(op+(expectedError?' is rejected':' succeeds'),expectedError?body.errors?.length>0:!body.errors?.length,{result:body.result,errors:body.errors});return body.result||{};}
   check('Sales seed supplies warranty and commission options',count('enumeration',"enum_type_id='WarrantyType'")===4&&count('enumeration',"enum_type_id='CommissionType'")===4,{});
   check('Sales seed supplies validated challan conversion',count('status_flow_transition',"status_id='DcDraft' AND to_status_id='DcConverted'")===1,{});
+  // Exercise the internal mixed-vendor query before billing mutations so runtime
+  // API incompatibilities fail immediately instead of hiding in a later list.
+  for(const shell of ['apps','qapps'])for(const screen of ['FindOrder','SalesDashboard']){
+   const response=await p.goto(`${base}/${shell}/zenith/sales/${screen}`,{waitUntil:'networkidle'});
+   const body=await p.locator('body').innerText();
+   check(shell+' '+screen+' internal scope query renders cleanly',response.status()===200&&!/Error rendering|ScreenRenderException|HTTP Status 500|No entity found|Ambiguous method|Template Error/.test(body)&&!body.includes('SALES_QA_MIXED_PRIVATE_HEADER'),{status:response.status()});
+  }
+  const mixedBefore=JSON.stringify(rows('order_header',"order_id='SALES_QA_MIXED_OWN_FIRST'"));
+  for(const shell of ['apps','qapps']){
+   await post('EditQuotation','convertToOrder',{orderId:'SALES_QA_MIXED_OWN_FIRST'},shell);
+   check(shell+' own-first mixed quotation conversion changes no header',JSON.stringify(rows('order_header',"order_id='SALES_QA_MIXED_OWN_FIRST'"))===mixedBefore,{});
+  }
   for(const shell of ['apps','qapps']){
    await post('EditOrder','addItem',{orderId:'SALES_QA_FREE_ORDER',productId:'SALES_QA_PROD_A',quantity:'1',unitAmount:'0'},shell);
    const free=rows('order_item',"order_id='SALES_QA_FREE_ORDER'");check(shell+' order explicit zero price remains free',free.length>0&&free.every(x=>Number(x.unit_amount)===0),free.map(x=>({quantity:x.quantity,amount:x.unit_amount})));
@@ -164,6 +181,10 @@ function totals(name,id,taxable,cgst,sgst,igst){const i=inv(id);check(name,Numbe
    check(screen+' generates a PDF for the synthetic document',pdf.status()===200&&bytes.subarray(0,5).toString()==='%PDF-',{status:pdf.status(),bytes:bytes.length});
    fs.writeFileSync(path.join(out,screen+'.pdf'),bytes);
   }
+  const printText=screen=>JSON.parse(cp.execFileSync(process.env.SALES_QA_PYTHON||'python3',[path.join(__dirname,'inspect-pdf.py'),path.join(out,screen+'.pdf'),'--text'],{encoding:'utf8',windowsHide:true,timeout:30000})).text;
+  const invoicePrintText=printText('InvoicePrint'),creditPrintText=printText('CreditNotePrint');
+  check('InvoicePrint discounted GST and grand total reconcile',invoicePrintText.split('Rs. 81.00 (9%)').length===3&&invoicePrintText.includes('Taxes Rs. 162.00')&&invoicePrintText.includes('Total Rs. 1,062.00')&&!invoicePrintText.includes('1,224.00'),{cgst:81,sgst:81,tax:162,total:1062});
+  check('CreditNotePrint discounted GST and round-off reconcile',creditPrintText.split('9% 20.25').length===3&&/TOTALS\s+225\.00\s+20\.25\s+20\.25\s+0\.00/.test(creditPrintText)&&creditPrintText.includes('Round-off (Rs.): 0.50')&&creditPrintText.includes('Total (Rs.) 266.00'),{cgst:20.25,sgst:20.25,roundOff:0.5,total:266});
   const consoleErrors=[];p.on('pageerror',e=>consoleErrors.push(e.message));
   const screens=['PosSalesRegister','EditCommission?commissionId=SALES_QA_COMM_VALID','SalesDashboard','FindQuotation','FindOrder','FindInvoice','FindCreditNote','FindDeliveryChallan','CreateQuotation','CreateOrder','CreateInvoice','CreateCreditNote','CreateDeliveryChallan','WarrantyPolicies','Commissions','SalesForecast','EditInvoice?invoiceId=SALES_QA_INV','EditCreditNote?invoiceId=SALES_QA_CN','EditQuotation?orderId=SALES_QA_QUOTE','EditOrder?orderId=SALES_QA_ORDER','EditDeliveryChallan?challanId=SALES_QA_DC_A'];
   for(const shell of ['apps','qapps'])for(const screen of screens){
@@ -205,6 +226,8 @@ function totals(name,id,taxable,cgst,sgst,igst){const i=inv(id);check(name,Numbe
   }
   check('no browser JavaScript errors',consoleErrors.length===0,consoleErrors);report.consoleErrors=consoleErrors;
   report.syntheticDocuments=q("SELECT invoice_id,status_id FROM invoice WHERE from_party_id LIKE 'SALES_QA_%' ORDER BY invoice_id");
+  await require('./verify-sop.cjs')({ctx,p,post,invoke,q,rows,inv,count,check,base,out,report});
+  check('no browser JavaScript errors including supplemental SOP cases',consoleErrors.length===0,consoleErrors);report.consoleErrors=consoleErrors;
   await ctx.close();
  }catch(e){report.failures.push(e.message);throw e}finally{await browser.close();fs.writeFileSync(path.join(out,'report.json'),JSON.stringify(report,null,2));}
  console.log(JSON.stringify({checks:report.checks.length,pages:report.pages.length,viewports:report.viewports.length,failures:report.failures,output:out}));

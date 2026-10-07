@@ -23,6 +23,20 @@ Never point it at production or an existing customer database.
 | Expired/future warranty or commission | Date or eligibility checks were incomplete | Enforce inclusive warranty boundaries and commission dates/minimum |
 | Converted challan goods controls | Locked writes remained offered, with a misleading permission message | Hide Add/Delete Goods and explain the document status lock |
 | Sales mobile header and detail tables | Toolbar overlap, clipped controls and unreadable conversion action | Wrap controls, reserve measured header height and contain table scrolling |
+| Create an order and add stock products | No facility was supplied to reservation, so Add Item rolled back | Select/validate an org-owned facility and carry it into the order/invoice |
+| Add a 0% GST invoice line | An empty required tax-breakdown list rolled the entire line back | Clear only that draft line's old tax rows when it has no breakdowns |
+| Export/SEZ line edits or conversion | Flags were dropped or the next edit restored seller GST | Carry header flags and consistently retax new/edited draft lines |
+| Search a quotation/order number | Undeclared custom parameters were ignored | Declare the actual form parameters and check matching/nonmatching results |
+| Download Sales CSV | HTML links/icons produced blank numbers; the shell formatter failed | Render plain export fields from the same filtered, scoped lists |
+| Save challan transport details | LR number was dropped | Whitelist and persist the existing LR field |
+| Forecast on issued/draft/cancelled history | Large drafts inflated completed-sales forecasts | Use the same issued/paid status set as the dashboard |
+| Dashboard dates and invoice count | Invalid dates crashed; notes were counted as sales invoices | Validate date ranges and restrict sales-invoice metrics |
+| Register/resolve a warranty | Long month values failed Calendar.add; Filed-to-Resolved was invalid | Use the required integer months and advance through In-Progress |
+| Open a foreign invoice/note | Redacted records left blank forms and template errors | Render only the denial panel for missing/foreign records |
+| Mixed-vendor order | Owning one part authorized shared header/other parts | Deny whole-document actions and exclude mixed orders from lists/dashboard/CSV |
+| Multi-page PDF | A row's description and amount split across pages | Keep each line's table row together within a page |
+| Invoice/note PDF tax columns | Stored GST plus tax-detail GST was counted twice; rounding was unexplained | Use one tax split, reconcile printed GST to the grand total and display round-off |
+| Empty dashboard chart | The all-zero secondary axis displayed Infinity | Bound zero-data axes and keep labels finite |
 
 `before-fix.json` records the original discounted header, invalid persisted lines
 and invoice filter mismatch on synthetic fixtures. `verify-runtime.cjs` asserts
@@ -53,9 +67,26 @@ successful write.
 
 This is a bounded regression pass, not a claim that every Sales behavior is free
 of defects. Real payment-provider integration, email delivery, e-invoice/e-way
-bill integrations, OpenSearch, accounting GL reconciliation and other browsers
-are outside this profile. Payment callbacks remain the existing authenticated
+bill integrations, OpenSearch and accounting GL reconciliation are outside this
+profile. CI uses Chrome; `verify-browsers.cjs` provides optional local browser
+spot checks. Chrome and Edge are supported by the current Windows QA setup;
+Firefox and WebKit launch could not be verified on this host. Payment callbacks remain the existing authenticated
 mock implementation; no provider is contacted.
+
+`verify-sop.cjs` expands the original regression suite with actual creation,
+status/search/export, mixed-slab and large-decimal GST, RCM/export conversion,
+claim resolution, month-end warranty, quick links, empty/no-org views, keyboard
+Enter and rapid double-click, stored XSS, and a 75-line multi-page PDF. It checks
+all create/edit/list screens at 1920/1366/360 pixels in both shells. PDF text is
+checked with pinned `pypdf==6.10.0`; rendered pages still require visual review.
+`sop-coverage.cjs` produces `sop-run-sheet.json` with evidence for all 88 case IDs;
+missing/failed evidence fails the suite. Three legacy SOP differences remain
+explicit: SL-017/025 retain cancelled document history for audit, and SL-045
+uses master's existing local missing-state fallback with a visible editor note
+and an explicit place-of-supply override. These are recorded as deviations,
+never silently relabelled as matching the SOP. Senior review must confirm the
+fallback policy before deployment. XLSX is not offered by this clean runtime's
+render modes, so XLSX contents are not claimed verified.
 
 ## CI invocation
 
@@ -90,7 +121,10 @@ layers, configuration, credentials and customer data are excluded.
 
 Native verification uses the same framework and candidate component sources,
 Chrome, H2 on loopback and a fresh database per full attempt. The probe permits
-only SELECT queries against the task's disposable `sales-qa*` database path.
+only SELECT queries against the task's disposable `sales-qa*` database path or
+the fixed `sales-qa-sop` in-memory H2 endpoint. Set `SALES_QA_MEMORY=true` for the
+latter; this creates no new persistent business database. The native probe is
+compiled once per run, then queries through the loopback H2 TCP endpoint.
 The dedicated runtime is stopped after verification.
 
 Automatic approval review rejected both recursive and individual test database
@@ -104,9 +138,9 @@ while those native files remain.
 ## Reviewer/deployment notes
 
 - This change touches billing and tenant access; it requires senior review.
-  It does not merge a PR or deploy production. PR #19 supplies the safe staging
-  foundation; its commits are included so this PR can target `master` per SOP.
-  Merge/reconcile #19 first so its infrastructure diff drops out here.
+  It does not merge a PR or deploy production. The branch incorporates master's
+  merged clean staging foundation and Contacts updates; the remaining PR diff
+  contains Sales behavior, its scoped presentation and verification support.
 - Sales statuses/enums moved to `data/ZenithSalesSeedData.xml`. Deployment must
   load that normal seed file before enabling the changed challan/status UI.
   Definitions are additive/upserted; no existing tenant document is renumbered,

@@ -7,7 +7,7 @@ public class SalesDbProbe {
     }
     public static void main(String[] args) throws Exception {
         String url=System.getenv("SALES_QA_DB_URL");
-        if (url == null || !url.startsWith("jdbc:h2:tcp://127.0.0.1:19095/") || !url.contains("/sales-runtime/runtime/db/h2/sales-qa") || !url.toUpperCase().contains("IFEXISTS=TRUE")) throw new IllegalArgumentException("Existing disposable loopback Sales DB required");
+        if (url == null || !url.startsWith("jdbc:h2:tcp://127.0.0.1:19095/") || (!url.contains("/sales-runtime/runtime/db/h2/sales-qa") && !url.startsWith("jdbc:h2:tcp://127.0.0.1:19095/mem:sales-qa-sop;")) || !url.toUpperCase().contains("IFEXISTS=TRUE")) throw new IllegalArgumentException("Existing disposable loopback Sales DB required");
         String sql=new String(System.in.readAllBytes(),StandardCharsets.UTF_8).trim();
         if (!sql.toUpperCase().startsWith("SELECT ")) throw new IllegalArgumentException("Read-only SELECT only");
         try (var c=DriverManager.getConnection(url,"sa", "")) {

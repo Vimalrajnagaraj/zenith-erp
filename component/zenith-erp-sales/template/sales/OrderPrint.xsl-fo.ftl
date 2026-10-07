@@ -135,7 +135,7 @@
                             <#assign gstTotal = (orderItem.igstAmount!0) + (orderItem.cgstAmount!0) + (orderItem.sgstAmount!0)>
                             <#assign itemAmount = taxableAmount + gstTotal>
                             <#assign totalAmount = totalAmount + itemAmount>
-                            <fo:table-row font-size="8pt" border-bottom="0.1pt solid gray">
+                            <fo:table-row keep-together.within-page="always" font-size="8pt" border-bottom="0.1pt solid gray">
                                 <fo:table-cell padding="3pt" border-right="0.5pt solid black"><fo:block text-align="center">${orderItem_index+1}</fo:block></fo:table-cell>
                                 <fo:table-cell padding="3pt" border-right="0.5pt solid black"><fo:block font-weight="bold"><@encodeText (orderItem.itemDescription)!""/></fo:block><#if (orderItem.discountPercent!0)?number != 0><fo:block font-size="6pt" color="#c0392b">Less ${orderItem.discountPercent}% discount (<@formatINR orderItem.discountAmount!0/>)</fo:block></#if></fo:table-cell>
                                 <fo:table-cell padding="3pt" border-right="0.5pt solid black"><fo:block text-align="center">${orderItem.hsnSacCode!"-"}</fo:block></fo:table-cell>

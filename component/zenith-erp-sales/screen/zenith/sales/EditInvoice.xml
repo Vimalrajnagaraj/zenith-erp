@@ -37,15 +37,16 @@
             <script><![CDATA[
                 def forbidden=['fromPartyId','toPartyId','gstInvoiceNumber','customInvoiceNumber','originalInvoiceId','invoiceTotal','totalTaxableAmount','totalTaxAmount','totalCgst','totalSgst','totalIgst','appliedPaymentsTotal','unpaidTotal','invoiceDate']
                 if (forbidden.any { ec.web.parameters.containsKey(it) }) { ec.message.addError('Use the Sales form controls; ownership, numbering and stored totals cannot be changed here.'); return }
-                def fields=['statusId', 'buyerGstin', 'supplierGstin', 'placeOfSupplyStateCode', 'isExport', 'lutBondNumber', 'shippingBillNumber', 'shippingBillDate', 'einvoiceId', 'ewayBillId', 'transporterId', 'vehicleNumber', 'lrNumber', 'invoiceMessage']
-                def taxFields=['buyerGstin', 'supplierGstin', 'placeOfSupplyStateCode', 'isExport', 'lutBondNumber', 'shippingBillNumber', 'shippingBillDate', 'invoiceMessage']
+                def fields=['statusId', 'buyerGstin', 'supplierGstin', 'placeOfSupplyStateCode', 'isExport', 'isSezSupply', 'isWithPayment', 'lutBondNumber', 'shippingBillNumber', 'shippingBillDate', 'einvoiceId', 'ewayBillId', 'transporterId', 'vehicleNumber', 'lrNumber', 'invoiceMessage']
+                def taxFields=['buyerGstin', 'supplierGstin', 'placeOfSupplyStateCode', 'isExport', 'isSezSupply', 'isWithPayment', 'lutBondNumber', 'shippingBillNumber', 'shippingBillDate', 'invoiceMessage']
                 if (curInv.statusId != 'InvoiceInProcess' && taxFields.any { ec.web.parameters.containsKey(it) && (ec.web.parameters[it]?.toString() ?: '') != (curInv.get(it)?.toString() ?: '') }) {
                     ec.message.addError('Issued invoice tax details cannot be changed. Raise a credit or debit note instead.'); return
                 }
+                if (['isExport','isSezSupply','isWithPayment'].any { ec.web.parameters[it] && !(ec.web.parameters[it] in ['Y','N']) }) { ec.message.addError('Select Yes or No for the tax options.'); return }
                 def updates=[invoiceId:invoiceId]
                 fields.each { if (ec.web.parameters.containsKey(it)) updates[it]=ec.web.parameters[it] }
                 ec.service.sync().name('update#mantle.account.invoice.Invoice').parameters(updates).call()
-                if (!ec.message.hasError() && curInv.statusId=='InvoiceInProcess' && ['buyerGstin','supplierGstin','placeOfSupplyStateCode','isExport'].any { updates.containsKey(it) })
+                if (!ec.message.hasError() && curInv.statusId=='InvoiceInProcess' && ['buyerGstin','supplierGstin','placeOfSupplyStateCode','isExport','isSezSupply','isWithPayment'].any { updates.containsKey(it) })
                     ec.service.sync().name('zenith.sales.SalesLineServices.refresh#DraftInvoiceTaxes').parameters([invoiceId:invoiceId]).call()
             ]]></script>
         </actions>
@@ -218,7 +219,7 @@
                 ec.service.sync().name("create#mantle.account.invoice.InvoiceItem").parameters(inMap).call()
 
                 // Refresh the header grand total (invoiceTotal/unpaidTotal) from the items.
-                ec.service.sync().name("zenith.sales.SalesLineServices.refresh#DraftInvoiceTotals").parameters([invoiceId:invoiceId]).call()
+                ec.service.sync().name("zenith.sales.SalesLineServices.refresh#DraftInvoiceTaxes").parameters([invoiceId:invoiceId]).call()
             </script>
         </actions>
         <default-response url="."/>
@@ -239,21 +240,7 @@
             <script>
                 def rcm = (isReverseCharge == 'Y') ? 'Y' : 'N'
                 ec.service.sync().name("update#mantle.account.invoice.Invoice").parameters([invoiceId:invoiceId, isReverseCharge:rcm]).call()
-                // Re-tax every line: RCM on -> collect zero; RCM off -> restore the amount from the stored rate.
-                def invItems = ec.entity.find("mantle.account.invoice.InvoiceItem").condition("invoiceId", invoiceId).list()
-                for (def it : invItems) {
-                    def taxable = (it.taxableAmount != null ? it.taxableAmount : ((it.quantity != null ? it.quantity : 1)*(it.amount ?: 0))) as BigDecimal
-                    def cA = new BigDecimal(0), sA = new BigDecimal(0), iA = new BigDecimal(0)
-                    if (rcm != 'Y') {
-                        cA = taxable.multiply((it.cgstRate ?: 0.0) as BigDecimal).divide(new BigDecimal(100), 2, java.math.RoundingMode.HALF_UP)
-                        sA = taxable.multiply((it.sgstRate ?: 0.0) as BigDecimal).divide(new BigDecimal(100), 2, java.math.RoundingMode.HALF_UP)
-                        iA = taxable.multiply((it.igstRate ?: 0.0) as BigDecimal).divide(new BigDecimal(100), 2, java.math.RoundingMode.HALF_UP)
-                    }
-                    ec.service.sync().name("update#mantle.account.invoice.InvoiceItem").parameters([
-                        invoiceId:invoiceId, invoiceItemSeqId:it.invoiceItemSeqId,
-                        cgstAmount:cA, sgstAmount:sA, igstAmount:iA, totalTaxAmount:cA+sA+iA]).call()
-                }
-                ec.service.sync().name("zenith.sales.SalesLineServices.refresh#DraftInvoiceTotals").parameters([invoiceId:invoiceId]).call()
+                ec.service.sync().name("zenith.sales.SalesLineServices.refresh#DraftInvoiceTaxes").parameters([invoiceId:invoiceId]).call()
             </script>
         </actions>
         <default-response url="."/>
@@ -274,7 +261,7 @@
             </if>
             <service-call name="delete#mantle.account.invoice.InvoiceItem" in-map="context"/>
         <script>
-            ec.service.sync().name("zenith.sales.SalesLineServices.refresh#DraftInvoiceTotals").parameters([invoiceId:invoiceId]).call()
+            ec.service.sync().name("zenith.sales.SalesLineServices.refresh#DraftInvoiceTaxes").parameters([invoiceId:invoiceId]).call()
             </script>
         </actions>
         <default-response url="."/>
@@ -329,7 +316,7 @@
                     quantity:qty, amount:price, taxableAmount:taxableVal,
                     discountPercent:discPct, discountAmount:discAmt,
                     cgstAmount:cgstAmount, sgstAmount:sgstAmount, igstAmount:igstAmount, totalTaxAmount:cgstAmount+sgstAmount+igstAmount]).call()
-                ec.service.sync().name("zenith.sales.SalesLineServices.refresh#DraftInvoiceTotals").parameters([invoiceId:invoiceId]).call()
+                ec.service.sync().name("zenith.sales.SalesLineServices.refresh#DraftInvoiceTaxes").parameters([invoiceId:invoiceId]).call()
             ]]></script>
         </actions>
         <default-response url="."/>
@@ -387,11 +374,9 @@
             <field-map field-name="partyId" from="invoice?.toPartyId"/>
         </entity-find-one>
 
-        <!-- ZE-SALES-023 (SL-045): communicate the place-of-supply fallback for a buyer with no state. A B2C /
-             unregistered buyer (no GSTIN) is legitimate; GST law then sets the place of supply to the seller's
-             state -> intra-state CGST+SGST (exactly what addItem applies). Surface a non-blocking note so the
-             applied rule is COMMUNICATED during editing — WITHOUT forcing a state, which would block MARUTHI's
-             walk-in/cash B2C sales. Mirrors addItem's state derivation; the tax-reg lookups are null-guarded. -->
+        <!-- Communicate the existing missing-state fallback without asserting that a missing
+             registration determines the delivery destination. Users can supply the actual
+             place-of-supply state; tax-registration lookups remain null-guarded. -->
         <script><![CDATA[
             def _st2 = { s -> (s && s.toString().trim().length() >= 2 && (s.toString().trim().substring(0,2) ==~ /[0-9]{2}/)) ? s.toString().trim().substring(0,2) : null }
             def _c2 = { s -> (s && s.toString().trim() ==~ /[0-9]{2}/) ? s.toString().trim() : null }
@@ -449,6 +434,11 @@
     </actions>
 
     <widgets>
+        <section name="InvoiceDenied" condition="invoice == null"><widgets>
+            <label text="Invoice not found for your account." type="p" style="text-grey-7"/>
+            <link url="findInvoice" text="Back to Invoices"/>
+        </widgets></section>
+        <section name="InvoiceDetails" condition="invoice != null"><widgets>
         <container style="q-mb-md">
             <link url="findInvoice" text="Back to Invoices" icon="fa fa-arrow-left" style="q-btn bg-grey-2 text-dark border-radius-md q-px-md glossy"/>
         </container>
@@ -557,7 +547,7 @@
                     <!-- ZE-SALES-023 (SL-045): non-blocking note communicating the place-of-supply fallback. -->
                     <section name="BuyerStateFallbackNote" condition="isDraft &amp;&amp; buyerStateMissing"><widgets>
                         <container style="bg-blue-1 text-blue-10 q-pa-sm border-radius-sm q-mb-md">
-                            <label text="Buyer has no GSTIN or Place of Supply — that's fine for an unregistered (B2C) customer. Place of supply defaults to the seller's state (${fallbackStateLabel}), so GST is charged intra-state (CGST + SGST). To bill inter-state (IGST) instead, enter the buyer's GSTIN or a Place of Supply state code below." type="p" style="q-my-none text-caption"/>
+                            <label text="Buyer state is missing. The current calculation uses the seller's state (${fallbackStateLabel}) and CGST + SGST. Confirm the actual Place of Supply before issuing this invoice; enter a different state code below when applicable." type="p" style="q-my-none text-caption"/>
                         </container>
                     </widgets></section>
                     <form-single name="StatutoryForm" transition="updateInvoice" map="invoice">
@@ -571,6 +561,8 @@
                             <drop-down no-current-selected-key="N"><option key="Y" text="Yes"/><option key="N" text="No"/></drop-down>
                         </default-field></field>
                         
+                        <field name="isSezSupply"><default-field title="SEZ Supply?"><drop-down no-current-selected-key="N"><option key="Y" text="Yes"/><option key="N" text="No"/></drop-down></default-field></field>
+                        <field name="isWithPayment"><default-field title="Export/SEZ with payment of GST?"><drop-down no-current-selected-key="N"><option key="Y" text="Yes"/><option key="N" text="No (LUT/Bond)"/></drop-down></default-field></field>
                         <field name="lutBondNumber"><default-field title="LUT / Bond No. (For Exports)"><text-line/></default-field></field>
                         <field name="shippingBillNumber"><default-field title="Shipping Bill No. (For Exports)"><text-line/></default-field></field>
 
@@ -758,5 +750,6 @@
             <label text="No changes recorded yet." type="p" style="text-grey-6 q-pa-md text-center" condition="!noteHistory"/>
         </container>
 
+        </widgets></section>
     </widgets>
 </screen>
