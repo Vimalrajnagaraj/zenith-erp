@@ -56,7 +56,15 @@ try{
        check(shell+' organization picker includes active org',await p.locator('[name=organizationPartyId] option[value=PP_QA_A]').count()===1);
        if(shell==='qapps')await p.locator('[role=dialog] button').filter({hasText:/^close$/}).click();
      }
-     for(const width of [1920,1366,768,390,360]){await p.setViewportSize({width,height:900});await p.waitForFunction(()=>[...document.querySelectorAll('#z-sidebar,#zq-sidebar')].every(e=>e.getAnimations().every(a=>a.playState!=='running')));const size=await p.evaluate(()=>({client:document.documentElement.clientWidth,scroll:document.documentElement.scrollWidth}));check(shell+' '+screen+' fits '+width,size.scroll<=size.client+2,size);}
+     for(const width of [1920,1366,768,390,360]){
+       await p.setViewportSize({width,height:900});await p.waitForFunction(()=>[...document.querySelectorAll('#z-sidebar,#zq-sidebar')].every(e=>e.getAnimations().every(a=>a.playState!=='running')));
+       const size=await p.evaluate(()=>({client:document.documentElement.clientWidth,scroll:document.documentElement.scrollWidth}));check(shell+' '+screen+' fits '+width,size.scroll<=size.client+2,size);
+       if(shell==='qapps'){
+         await p.waitForFunction(()=>{const h=document.querySelector('.q-header');return h&&Math.abs(h.offsetHeight-parseFloat(getComputedStyle(document.body).getPropertyValue('--zq-rfq-header-height')))<2});
+         const layout=await p.evaluate(()=>{const nodes=[...document.querySelectorAll('.q-header .q-toolbar>button,#zq-ownerview,#zq-search,#zq-toolbtns')].filter(e=>getComputedStyle(e).display!=='none'&&e.getBoundingClientRect().width>0).map(e=>e.getBoundingClientRect());let overlaps=0;for(let i=0;i<nodes.length;i++)for(let j=i+1;j<nodes.length;j++)if(Math.min(nodes[i].right,nodes[j].right)-Math.max(nodes[i].left,nodes[j].left)>1&&Math.min(nodes[i].bottom,nodes[j].bottom)-Math.max(nodes[i].top,nodes[j].top)>1)overlaps++;return{overlaps,headingTop:document.querySelector('.zrfq-page h3').getBoundingClientRect().top,navBottom:document.querySelector('#zq-subnav').getBoundingClientRect().bottom}});
+         check(shell+' '+screen+' header controls do not overlap at '+width,layout.overlaps===0,layout);check(shell+' '+screen+' heading clears navigation at '+width,layout.headingTop>=layout.navBottom-2,layout);
+       }
+     }
      await p.screenshot({path:path.join(out,`${shell}-${screen.split('?')[0]}-360.png`),fullPage:true});
    }
    await post('EditRfq','updateVendorResponse',{...a,rfqResponseId:'PP_QA_RESPONSE_B',totalAmount:'2'},shell);
