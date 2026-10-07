@@ -1,4 +1,5 @@
-// Read-only local regression. CATALOG_QA_FIXTURE=1 requires the disposable CATALOG_QA_* records.
+// Read-only local regression. Optional fixture: fixtures/product-catalog.sql, on local Docker only.
+// Run CATALOG_QA_FIXTURE=1 with that fixture, then apply fixtures/product-catalog-cleanup.sql.
 import assert from 'node:assert/strict';
 const base=process.env.CATALOG_URL || 'http://localhost:8080';
 assert(['localhost','127.0.0.1'].includes(new URL(base).hostname),'Local verification only');
@@ -12,16 +13,19 @@ async function read(query='',suffix='') {
 }
 const anonymous=await fetch(base+route,{redirect:'manual'});
 assert([302,303].includes(anonymous.status),'Authentication required');
-for(const query of ['', '?pageIndex=-1&pageSize=0','?pageIndex=oops&pageSize=oops','?orderByField=invalidField','?catalogSearch=%22%3E%3Cscript%3E']) await read(query);
+for(const query of ['', '?pageIndex=-1&pageSize=0','?pageIndex=oops&pageSize=oops','?orderByField=invalidField','?mrpAmount_from=oops','?catalogSearch=%22%3E%3Cscript%3E']) await read(query);
 await read('','.qvt');
 const csv=await read('?renderMode=csv&lastStandalone=true&pageNoLimit=true');
-assert(csv.includes('Item Code') && csv.includes('Product Name'),'CSV headers');
+assert(csv.startsWith('Item Code,Product Name'),'CSV starts with clean headers, without page chrome');
+assert(!csv.includes('MRP (null)'),'Currency header is defined in standalone CSV');
 if(process.env.CATALOG_QA_FIXTURE==='1') {
   const query='?catalogSearch=A%20Catalog%20test&pageSize=10';
   const first=await read(query),second=await read(query+'&pageIndex=1'),third=await read(query+'&pageIndex=2');
   assert(first.includes('CATQA-01')&&!first.includes('CATQA-11'),'First page');
   assert(second.includes('CATQA-11')&&!second.includes('CATQA-01'),'Second page');
   assert(third.includes('CATQA-25')&&!third.includes('CATQA-01'),'Third page');
+  const sorted=await read('?catalogSearch=A%20Catalog%20test&orderByField=-mrpAmount&orderByField=productName&pageSize=1');
+  assert(sorted.includes('CATQA-25')&&!sorted.includes('CATQA-01'),'Multi-column sort from Find Options is honored');
   const name=await read('?catalogSearch=a%20catalog%20TEST%2025');
   assert(name.includes('CATQA-25')&&!name.includes('CATQA-01'),'Case-insensitive name search across pages');
   assert((await read('?catalogSearch=CATQA-SECONDARY')).includes('CATQA-25'),'Secondary active barcode');
