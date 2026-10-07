@@ -67,7 +67,7 @@ async function submit(id){await Promise.all([page.waitForNavigation({waitUntil:'
  for(const shell of ['apps','qapps']) {
   for(const [screen,label] of [['Gstr2Report','Tax Summary'],['Gstr3bReport','Table 3.1']]) await record(shell+' '+screen+' results survive redirect',async()=>{
    const response=await page.goto(base+`/${shell}/zenith/Accounting/${screen}/generate${screen==='Gstr2Report'?'Gstr2':'Gstr3b'}?organizationPartyId=TAX_QA_A&returnPeriod=072026`,{waitUntil:'networkidle2',timeout:60000});
-   const text=await page.$eval('body',e=>e.innerText);assert(response.status()===200&&!text.includes('Internal Server Error'),'Report render');assert(text.includes(label)&&text.includes('12.00'),'Expected result and CESS absent after redirect');
+   await page.waitForFunction(label=>document.body.innerText.includes(label)&&document.body.innerText.includes('12.00'),{timeout:15000},label);const text=await page.$eval('body',e=>e.innerText);assert(response.status()===200&&!text.includes('Internal Server Error'),'Report render');assert(text.includes(label)&&text.includes('12.00'),'Expected result and CESS absent after redirect');
   });
   await record(shell+' saved GSTR1 detail and scoped download',async()=>{
    await open(`/${shell}/zenith/tax/Gstr1Returns`);await select('#gstr1-period','072026');assert(await page.$eval('#gstr1-fy',e=>e.disabled&&e.value==='2026-2027'),'Derived financial year');await submit('#gstr1-gen');
