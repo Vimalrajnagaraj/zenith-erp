@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+    <service verb="assert" noun="ListSettings">
+        <in-parameters>
+            <parameter name="priceListTypeEnumId" required="true"/><parameter name="currencyUomId" required="true"/>
+            <parameter name="isDefault" default-value="N"/><parameter name="isActive" default-value="Y"/>
+            <parameter name="roundingMode" default-value="HALF_UP"/><parameter name="roundingPrecision" type="Integer" default-value="2"/>
+        </in-parameters>
+        <out-parameters><parameter name="valid" type="Boolean"/></out-parameters>
+        <actions><script><![CDATA[
+            def type=ec.entity.find('moqui.basic.Enumeration').condition('enumId',priceListTypeEnumId).one()
+            def currency=ec.entity.find('moqui.basic.Uom').condition('uomId',currencyUomId).one()
+            valid=type?.enumTypeId=='PriceListType' && currency?.uomTypeEnumId=='UT_CURRENCY_MEASURE' &&
+                ['Y','N'].contains(isDefault) && ['Y','N'].contains(isActive) &&
+                ['HALF_UP','HALF_DOWN','HALF_EVEN','UP','DOWN','CEILING','FLOOR'].contains(roundingMode) && roundingPrecision>=0 && roundingPrecision<=4
+            if(!valid) ec.message.addError('Choose a valid list type, currency, status and rounding setting.')
+        ]]></script></actions>
+    </service>
+    <service verb="update" noun="PriceList">
+        <in-parameters>
+            <parameter name="priceListId" required="true"/><parameter name="priceListName" required="true" allow-html="any"/>
+            <parameter name="description"/><parameter name="priceListTypeEnumId" required="true"/><parameter name="currencyUomId" required="true"/>
+            <parameter name="parentPriceListId"/><parameter name="isDefault" default-value="N"/><parameter name="isActive" default-value="Y"/>
+            <parameter name="validFromDate" type="Timestamp"/><parameter name="validThruDate" type="Timestamp"/>
+            <parameter name="roundingMode" default-value="HALF_UP"/><parameter name="roundingPrecision" type="Integer" default-value="2"/>
+        </in-parameters>
+        <actions>
+            <service-call name="zenith.pricing.PricingServices.assert#PriceListAccess" in-map="[priceListId:priceListId]" out-map="access"/>
+            <if condition="!access.allowed"><return/></if>
+            <entity-find-one entity-name="zenith.erp.pricing.PriceList" value-field="priceList"/>
+            <service-call name="zenith.pricing.PriceListServices.assert#ListSettings" in-map="context" out-map="settings"/>
+            <service-call name="zenith.pricing.PricingServices.assert#ValidDateRange" in-map="context" out-map="dates"/>
+            <service-call name="zenith.pricing.PricingServices.assert#ValidPriceListParent" in-map="[priceListId:priceListId,parentPriceListId:parentPriceListId,organizationPartyId:priceList.organizationPartyId]" out-map="parent"/>
+            <if condition="!settings.valid || !dates.valid || !parent.valid"><return/></if>
+            <if condition="isDefault == 'Y'">
+                <service-call name="zenith.pricing.PricingServices.clear#OtherDefaultPriceLists" in-map="[organizationPartyId:priceList.organizationPartyId,priceListTypeEnumId:priceListTypeEnumId,currencyUomId:currencyUomId,excludePriceListId:priceListId]"/>
+            </if>
+            <service-call name="update#zenith.erp.pricing.PriceList" in-map="[priceListId:priceListId,priceListName:priceListName,description:description,priceListTypeEnumId:priceListTypeEnumId,currencyUomId:currencyUomId,parentPriceListId:parentPriceListId,isDefault:isDefault,isActive:isActive,validFromDate:validFromDate,validThruDate:validThruDate,roundingMode:roundingMode,roundingPrecision:roundingPrecision]"/>
+        </actions>
+    </service>
+    <service verb="duplicate" noun="PriceList">
+        <in-parameters><parameter name="priceListId" required="true"/></in-parameters>
+        <out-parameters><parameter name="newPriceListId"/></out-parameters>
+        <actions>
+            <service-call name="zenith.pricing.PricingServices.assert#PriceListAccess" in-map="[priceListId:priceListId]" out-map="access"/>
+            <if condition="!access.allowed"><return/></if>
+            <script><![CDATA[
+                def source=ec.entity.find('zenith.erp.pricing.PriceList').condition('priceListId',priceListId).one()
+                def copy=ec.entity.makeValue('zenith.erp.pricing.PriceList').setAll(source)
+                copy.setSequencedIdPrimary();copy.priceListName=source.priceListName+' (copy)';copy.isDefault='N';copy.isActive='N';copy.create();newPriceListId=copy.priceListId
+                ['PriceListItem','VolumePricing'].each { name ->
+                    ec.entity.find('zenith.erp.pricing.'+name).condition('priceListId',priceListId).list().each { row ->
+                        def item=ec.entity.makeValue('zenith.erp.pricing.'+name).setAll(row)
+                        item.setSequencedIdPrimary();item.priceListId=newPriceListId;item.create()
+                    }
+                }
+            ]]></script>
+        </actions>
+    </service>
+    <service verb="delete" noun="PriceList">
+        <in-parameters><parameter name="priceListId" required="true"/></in-parameters>
+        <actions>
+            <service-call name="zenith.pricing.PricingServices.assert#PriceListAccess" in-map="[priceListId:priceListId]" out-map="access"/>
+            <if condition="!access.allowed"><return/></if>
+            <script><![CDATA[
+                def referenced=ec.entity.find('zenith.erp.pricing.PriceChangeLog').condition('priceListId',priceListId).disableAuthz().count() ||
+                    ec.entity.find('zenith.erp.pricing.CustomerPriceList').condition('priceListId',priceListId).disableAuthz().count() ||
+                    ec.entity.find('zenith.erp.pricing.PriceList').condition('parentPriceListId',priceListId).disableAuthz().count() ||
+                    ec.entity.find('zenith.erp.contacts.CustomerGroup').condition('priceListId',priceListId).disableAuthz().count() ||
+                    ec.entity.find('mantle.party.Party').condition('priceListId',priceListId).disableAuthz().count()
+                if(referenced){ec.message.addError('This price list is referenced or has price history. Set its status to Inactive instead.');return}
+                ['PriceListItem','VolumePricing'].each { name -> ec.entity.find('zenith.erp.pricing.'+name).condition('priceListId',priceListId).list().each { it.delete() } }
+                ec.entity.find('zenith.erp.pricing.PriceList').condition('priceListId',priceListId).one().delete()
+            ]]></script>
+        </actions>
+    </service>
+</services>

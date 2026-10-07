@@ -1,0 +1,9 @@
+# Price List regression
+
+Use a fresh disposable runtime with the candidate's complete components, committed staging base overrides/framework UI patches, loopback HTTP 127.0.0.1:18085 and in-memory H2 purchase-pricing-qa bound at 127.0.0.1:19097. Disable jobs, SMTP and external search; set -Dpurchase.pricing.qa.disposable=true. Never deploy the helper.
+
+Copy fixture.xml to runtime/component/zenith-erp-pricing/PriceListQaFixture.xml and qa-screen.xml to runtime/component/zenith-erp-pricing/screen/zenith/pricing/PriceListQaAcceptance.xml before boot. The fixtures use synthetic parties, products and explicitly mechanical arithmetic price/quantity cases allowed by the SOP; no business defaults or legal registrations. No invoices are seeded.
+
+Set LIST_QA_RUNTIME, LIST_QA_JAVA (JDK21/bin/java.exe) and LIST_QA_OUT; run node docs/qa/pricing-price-lists/verify.cjs with Playwright/Chromium. Positive fixture and active membership checks precede real screen/service mutations. Independent JDBC SELECTs verify valid persistence, rejected invalid/foreign/no-org/CSRF requests, zero prices, tier bounds, header immutability, default currency separation, full duplication, history-preserving delete rejection and exact-PK cleanup. Both surfaces and responsive widths render actual content. All invoices remain unchanged. Destroy the memory JVM after a failed run before retrying.
+
+Bulk import preserves its partial-success contract: each row commits or rolls back independently; counts represent committed rows. Layout checks include title/form/card/button bounds, mobile header geometry/contrast, and opening/cancelling both item/tier forms. Master-owned exact-head CI and owner real-tenant no-op evidence remain separate SOP gates. This suite does not certify pricing rules, the price engine, cost-margin semantics, Safari or every Pricing/Purchase feature.
