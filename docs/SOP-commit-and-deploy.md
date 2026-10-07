@@ -93,6 +93,14 @@ cat "component/<comp>/<path>" | ssh "$SERVER" \
 ssh "$SERVER" "docker exec $APP sh -c 'grep -c <a-marker> /opt/moqui/runtime/component/<comp>/<path>'"
 ```
 
+The `/qapps` framework wrapper is an exception to this component mapping. Its source is
+`component/zenith-erp-saas/framework-overrides/webroot/screen/webroot/qapps.xml`, and its active
+screen is `/opt/moqui/runtime/base-component/webroot/screen/webroot/qapps.xml`. The deployment
+Dockerfile copies the tracked wrapper to that active path during a rebuild. For a file-only
+wrapper deployment, maintainers must also update the active path before B3–B7; copying only the
+component source does not activate it. Preserve the wrapper's login guard, and verify an
+authenticated deep route such as `/qapps/zenith/Contacts/ContactsDashboard` stays on that screen.
+
 ### B3. Persist into the image (so a future recreate keeps it)
 ```bash
 ssh "$SERVER" 'docker commit '"$APP"' zetaerp-moqui:latest && docker image prune -f'

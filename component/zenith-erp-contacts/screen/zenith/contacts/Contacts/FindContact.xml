@@ -18,26 +18,35 @@
     <transition name="createPerson">
         <service-call name="zenith.contacts.ContactServices.create#Contact"
                       in-map="context + [partyTypeEnumId:'PtyPerson']"/>
+        <error-response url="."/>
         <default-response url="../EditContact"/>
     </transition>
     <transition name="createOrganization">
         <service-call name="zenith.contacts.ContactServices.create#Contact"
                       in-map="context + [partyTypeEnumId:'PtyOrganization']"/>
+        <error-response url="."/>
         <default-response url="../EditContact"/>
     </transition>
 
     <!-- ZE-CONTACTS-027 / CT-166: real XLSX export (Moqui 4.0 has no xlsx render mode — see
-         build#ListXlsx). Exports the full org-scoped, non-disabled contact directory. GSTIN/PAN/CIN are
+         build#ListXlsx). Exports all matching contacts in the filtered, org-scoped directory. GSTIN/PAN/CIN are
          enriched per row from IndiaGstin + Party (ContactListView does not alias them), so the sheet
          carries the compliance columns. Org isolation via the ownerPartyId econdition. Read-only. -->
+    <!-- Null, empty and _NA_ active-org preferences all deny list/export scope, including direct transitions. -->
     <transition name="export" read-only="true">
         <parameter name="format"/>
         <actions>
             <entity-find entity-name="zenith.erp.contacts.ContactListView" list="contactList">
-                <econdition field-name="disabled" operator="not-equals" value="Y" or-null="true"/>
-                <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
-                <order-by field-name="organizationName"/>
-                <order-by field-name="firstName"/>
+                <!-- Moqui still honors explicit paging with paginate=false; clear it for a full filtered export. -->
+                <search-form-inputs skip-fields="ownerPartyId" input-fields-map="ec.context + [pageIndex:null, pageSize:null]" paginate="false" default-order-by="organizationName,firstName"/>
+                <econdition field-name="partyId" operator="in" from="searchPartyIds" ignore-if-empty="true"/>
+                <econdition field-name="partyId" operator="in" from="qPartyIds" ignore-if-empty="true"/>
+                <econdition field-name="partyTypeEnumId" from="partyTypeEnumId" ignore-if-empty="true"/>
+                <econdition field-name="disabled" operator="not-equals" from="disabledNe" or-null="true" ignore-if-empty="true"/>
+                <econdition field-name="disabled" operator="equals" from="disabledEq" ignore-if-empty="true"/>
+                <econdition field-name="partyId" operator="in" from="ctPartyIds" ignore-if-empty="true"/>
+                <econdition field-name="partyId" operator="like" from="walkinLike" ignore-if-empty="true"/>
+                <econdition field-name="ownerPartyId" from="(ec.user.getPreference('ACTIVE_ORGANIZATION') ?: '_NA_') == '_NA_' ? '__NO_ORGANIZATION__' : ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
             </entity-find>
             <script><![CDATA[
                 def rows = []
@@ -80,7 +89,8 @@
         <default-response type="none"/>
     </transition>
 
-    <actions>
+    <always-actions>
+        <!-- List and export share these derived search/status/role filters. -->
         <!-- ZE-CONTACTS-016: disabled contacts are hidden by default (so Customers/Vendors stay clean),
              but "Show Disabled = Yes" drops the filter so a disabled contact can be found and re-enabled
              (Edit Profile > Disabled = No). disabledFilter is null when showing all -> ignore-if-empty
@@ -154,7 +164,8 @@
                 _ids.addAll(_clv("partyId", _like))
                 _ids.addAll(ec.entity.find("zenith.erp.india.IndiaGstin").condition(_cf.makeCondition("gstin", _EC.LIKE, _like).ignoreCase()).list().collect{ it.partyId })
                 _ids.addAll(ec.entity.find("mantle.party.contact.PartyContactMechInfo").condition("contactMechTypeEnumId", "CmtEmailAddress").condition(_cf.makeCondition("infoString", _EC.LIKE, _like).ignoreCase()).list().collect{ it.partyId })
-                def _pd = _q.replaceAll(/[^0-9]/, '')
+                // Only phone-shaped queries should match phone digits; IDs/GSTINs/names can contain numbers too.
+                def _pd = (_q ==~ /[-+().0-9\s]+/) ? _q.replaceAll(/[^0-9]/, '') : ''
                 if (_pd.length() > 10) _pd = _pd.substring(_pd.length() - 10)
                 if (_pd) _ids.addAll(ec.entity.find("mantle.party.contact.PartyContactMechTelecomNumber").condition("contactNumber", "like", "%" + _pd + "%").list().collect{ it.partyId })
                 _ids.remove(null)
@@ -166,8 +177,11 @@
         <script><![CDATA[
             if (ec.web != null) { def p = ec.web.parameters; def cur = p?.pageSize; if (cur == null || cur.toString().trim().isEmpty()) { ec.context.pageSize = 20; try { p.put("pageSize", "20") } catch (Throwable _t) { } } }
         ]]></script>
+    </always-actions>
+
+    <actions>
         <entity-find entity-name="zenith.erp.contacts.ContactListView" list="contactList">
-            <search-form-inputs default-order-by="organizationName,firstName"/>
+            <search-form-inputs skip-fields="ownerPartyId" default-order-by="organizationName,firstName"/>
             <econdition field-name="partyId" operator="in" from="searchPartyIds" ignore-if-empty="true"/>
             <econdition field-name="partyId" operator="in" from="qPartyIds" ignore-if-empty="true"/>
             <econdition field-name="partyTypeEnumId" from="partyTypeEnumId" ignore-if-empty="true"/>
@@ -175,7 +189,7 @@
             <econdition field-name="disabled" operator="equals" from="disabledEq" ignore-if-empty="true"/>
             <econdition field-name="partyId" operator="in" from="ctPartyIds" ignore-if-empty="true"/>
             <econdition field-name="partyId" operator="like" from="walkinLike" ignore-if-empty="true"/>
-            <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+            <econdition field-name="ownerPartyId" from="(ec.user.getPreference('ACTIVE_ORGANIZATION') ?: '_NA_') == '_NA_' ? '__NO_ORGANIZATION__' : ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
         </entity-find>
 
         <!-- ZE-SALES-0306 f/u: Indian state list for the optional "Place of Supply" dropdown on the create forms. -->
@@ -198,7 +212,8 @@
           }, 300);
         })();
         </script>]]></text></render-mode>
-        <container-box class="zenith-card"><box-header title="All Contacts — everyone you do business with"/><box-toolbar>
+        <container style="zac-page">
+        <container-box class="zenith-card"><box-header title="All Contacts"/><box-toolbar>
             <section name="FindContact_write">
               <condition><expression>modCanWrite</expression></condition>
               <widgets>
@@ -208,7 +223,7 @@
             <render-mode><text type="html,qvt,vuet"><![CDATA[
                 <button type="button" class="cust-nc-solo cust-nc-ghost" data-nctext="Add Person"><span class="material-icons">person</span>Add Person</button>
                 <button type="button" class="cust-nc-solo cust-nc-ghost" data-nctext="Add Company"><span class="material-icons">apartment</span>Add Company</button>
-                <div class="cust-newcust"><button type="button" class="cust-nc-trigger"><span class="material-icons cust-nc-plus">add</span>New Contact<span class="material-icons cust-nc-caret">arrow_drop_down</span></button>
+                <div class="cust-newcust"><button type="button" class="cust-nc-trigger" aria-expanded="false"><span class="material-icons cust-nc-plus">add</span>New Contact<span class="material-icons cust-nc-caret">arrow_drop_down</span></button>
                   <div class="cust-nc-menu">
                     <button type="button" class="cust-nc-item cust-nc-person"><span class="cust-nc-ico material-icons">person</span>Add a Person</button>
                     <button type="button" class="cust-nc-item cust-nc-org"><span class="cust-nc-ico material-icons">apartment</span>Add a Company</button>
@@ -313,19 +328,22 @@
                  via the shared export transition — replaces the native show-csv-button, unifying with the
                  other Contacts lists as proper columns rather than the old 3 mushed HTML columns). -->
             <link url="export" text="Export to CSV" parameter-map="[format:'csv']" link-type="anchor" target-window="_blank" style="cust-export"/>
-            <link url="export" text="Export to Excel" parameter-map="[format:'xlsx']" link-type="anchor" target-window="_blank" style="cust-export"/>
+            <render-mode><text type="html,qvt,vuet" template="true"><![CDATA[
+                <#assign contactsModuleNavPrefix = '../'>
+                <#include 'component://zenith-erp-contacts/screen/zenith/contacts/includes/ContactsModuleLinks.html.ftl'>
+            ]]></text></render-mode>
         </box-toolbar><box-body>
-            <label text="View and manage all your customers, suppliers, and other contacts." type="p" style="text-grey-6 text-caption q-mt-none q-mb-sm"/>
             <!-- ZE-CONTACTS-SEARCH: full-width unified search box + a "Filters" button. Native GET form (no JS/CSRF —
                  works on /apps + /qapps like the filter-bar links); carries the other three filters as hidden inputs so
                  a search preserves them. The Filters button proxy-opens the framework Find Options dialog (cpe-tabs.js,
                  which also hides the now-redundant native "Find Options" trigger). SVG icons render on both surfaces. -->
+            <container style="zac-controls">
             <render-mode><text type="html,qvt,vuet"><![CDATA[
                 <#assign _q0 = (quickSearch)!''><#assign _ct0 = (contactTypeFilter)!''><#assign _st0 = (statusFilter)!''><#assign _sd0 = (showDisabled)!''>
                 <form class="sup-searchrow" method="get">
                   <div class="sup-search">
                     <svg class="sup-search-ico" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M15.5 14h-.79l-.28-.27a6.5 6.5 0 1 0-.7.7l.27.28v.79l5 4.99L20.49 19zm-6 0A4.5 4.5 0 1 1 14 9.5 4.5 4.5 0 0 1 9.5 14z"/></svg>
-                    <input type="text" name="quickSearch" class="sup-search-input" value="${_q0?html}" placeholder="Search by name, phone, email, GSTIN or contact ID..." autocomplete="off"/>
+                    <input type="text" name="quickSearch" class="sup-search-input" aria-label="Search contacts" value="${_q0?html}" placeholder="Search by name, phone, email, GSTIN or contact ID..." autocomplete="off"/>
                     <button type="submit" class="sup-search-go" title="Search" aria-label="Search"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M15.5 14h-.79l-.28-.27a6.5 6.5 0 1 0-.7.7l.27.28v.79l5 4.99L20.49 19zm-6 0A4.5 4.5 0 1 1 14 9.5 4.5 4.5 0 0 1 9.5 14z"/></svg></button>
                   </div>
                   <input type="hidden" name="contactTypeFilter" value="${_ct0?html}"/>
@@ -342,9 +360,9 @@
                 <#assign _ctName><#if _ct == 'customer'>Customer<#elseif _ct == 'supplier'>Supplier<#elseif _ct == 'walkin'>Walk-in<#else>All</#if></#assign>
                 <#assign _stName><#if _st == 'active'>Active<#elseif _st == 'inactive'>Inactive<#else>All</#if></#assign>
                 <div class="sup-filterbar2">
-                  <span class="sup-flabel">Contact Type:</span>
+                  <div class="zac-filter"><span class="sup-flabel">Contact Type</span>
                   <details class="sup-dd">
-                    <summary class="sup-dd-btn"><span>${_ctName}</span><span class="sup-dd-caret">&#9660;</span></summary>
+                    <summary class="sup-dd-btn" aria-label="Contact Type"><span>${_ctName}</span><span class="sup-dd-caret">&#9660;</span></summary>
                     <div class="sup-dd-menu">
                       <a href="?contactTypeFilter=&amp;statusFilter=${_st}&amp;showDisabled=${_sd}&amp;quickSearch=${_q?url('UTF-8')}" class="sup-dd-item<#if _ct == ''> on</#if>">All</a>
                       <a href="?contactTypeFilter=customer&amp;statusFilter=${_st}&amp;showDisabled=${_sd}&amp;quickSearch=${_q?url('UTF-8')}" class="sup-dd-item<#if _ct == 'customer'> on</#if>">Customer</a>
@@ -352,20 +370,30 @@
                       <a href="?contactTypeFilter=walkin&amp;statusFilter=${_st}&amp;showDisabled=${_sd}&amp;quickSearch=${_q?url('UTF-8')}" class="sup-dd-item<#if _ct == 'walkin'> on</#if>">Walk-in</a>
                     </div>
                   </details>
-                  <span class="sup-flabel">Status:</span>
+                  </div>
+                  <div class="zac-filter"><span class="sup-flabel">Status</span>
                   <details class="sup-dd">
-                    <summary class="sup-dd-btn"><span>${_stName}</span><span class="sup-dd-caret">&#9660;</span></summary>
+                    <summary class="sup-dd-btn" aria-label="Status"><span>${_stName}</span><span class="sup-dd-caret">&#9660;</span></summary>
                     <div class="sup-dd-menu">
                       <a href="?statusFilter=&amp;contactTypeFilter=${_ct}&amp;showDisabled=${_sd}&amp;quickSearch=${_q?url('UTF-8')}" class="sup-dd-item<#if _st == ''> on</#if>">All</a>
                       <a href="?statusFilter=active&amp;contactTypeFilter=${_ct}&amp;showDisabled=${_sd}&amp;quickSearch=${_q?url('UTF-8')}" class="sup-dd-item<#if _st == 'active'> on</#if>">Active</a>
                       <a href="?statusFilter=inactive&amp;contactTypeFilter=${_ct}&amp;showDisabled=${_sd}&amp;quickSearch=${_q?url('UTF-8')}" class="sup-dd-item<#if _st == 'inactive'> on</#if>">Inactive</a>
                     </div>
                   </details>
-                  <span class="sup-fspacer"></span>
-                  <a href="?showDisabled=<#if _sd == 'Y'>N<#else>Y</#if>&amp;contactTypeFilter=${_ct}&amp;statusFilter=${_st}&amp;quickSearch=${_q?url('UTF-8')}" class="sup-switch-link<#if _sd == 'Y'> sup-switch-on</#if>">Show Disabled</a>
+                  </div>
+                  <a href="?showDisabled=<#if _sd == 'Y'>N<#else>Y</#if>&amp;contactTypeFilter=${_ct}&amp;statusFilter=${_st}&amp;quickSearch=${_q?url('UTF-8')}" class="sup-switch-link<#if _sd == 'Y'> sup-switch-on</#if>" role="switch" aria-checked="${(_sd == 'Y')?c}">Show Disabled</a>
                 </div>
             ]]></text></render-mode>
-            <container style="sup-compact">
+            </container>
+            <!-- Bootstrap's renderer does not render show-page-size; Quasar keeps its native picker. -->
+            <render-mode><text type="html"><![CDATA[
+                <select class="zac-pagesize" aria-label="Contacts per page">
+                  <#list [10,20,50,100,200,500] as _size>
+                    <option value="${_size?c}" <#if _size == (contactListPageSize!20)>selected</#if>>${_size}</option>
+                  </#list>
+                </select>
+            ]]></text></render-mode>
+            <container style="sup-compact zac-list">
             <form-list name="ContactListForm" list="contactList" skip-form="true" header-dialog="true"
                        show-page-size="true">
                 
@@ -448,18 +476,17 @@
                             &lt;div style='display:flex; align-items:center;'&gt;
                                 &lt;div class='cav' style='background:&quot; + avBg + &quot;;color:&quot; + avFg + &quot;;'&gt;&quot; + initial + &quot;&lt;/div&gt;
                                 &lt;div style='min-width:0;'&gt;
-                                    &lt;div class='text-weight-bold text-primary' style='font-size:0.95rem; max-width:230px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;' title='&quot; + contactName + &quot;'&gt;&quot; + contactName + &quot;&lt;/div&gt;
-                                    &lt;div class='text-caption text-grey-6'&gt;
-                                        &lt;span class='zenith-badge &quot; + (isOrg ? 'secondary' : 'primary') + &quot;' style='padding:2px 8px;font-size:0.65rem;'&gt;&quot; + (isOrg ? 'Organization' : 'Person') + &quot;&lt;/span&gt;&quot; + (disabled == 'Y' ? &quot; &lt;span class='zenith-badge negative' style='padding:2px 8px;font-size:0.65rem;'&gt;Disabled&lt;/span&gt;&quot; : &quot;&quot;) + &quot;
-                                        ID: &quot; + partyId + &quot;
+                                    &lt;div class='zac-name' title='&quot; + contactName + &quot;'&gt;&quot; + contactName + &quot;&lt;/div&gt;
+                                    &lt;div class='zac-meta'&gt;
+                                        &lt;span&gt;&quot; + (isOrg ? 'Organization' : 'Person') + &quot;&lt;/span&gt;&quot; + (disabled == 'Y' ? &quot; &lt;span class='zenith-badge negative' style='padding:2px 8px;font-size:0.65rem;'&gt;Disabled&lt;/span&gt;&quot; : &quot;&quot;) + &quot; · ID: &quot; + partyId + &quot;
                                     &lt;/div&gt;
                                 &lt;/div&gt;
                             &lt;/div&gt;&quot;"/>
 
                         <set field="contactHtml" from="&quot;
                             &lt;div style='display:flex; flex-direction:column; gap:4px;'&gt;
-                                &quot; + (emailAddress ? &quot;&lt;div&gt;&lt;i class='fa fa-envelope text-primary' style='width:16px;'&gt;&lt;/i&gt; &quot; + emailAddress + &quot;&lt;/div&gt;&quot; : &quot;&quot;) + &quot;
-                                &quot; + (phoneNumber ? &quot;&lt;div&gt;&lt;i class='fa fa-phone text-secondary' style='width:16px;'&gt;&lt;/i&gt; &quot; + phoneNumber + &quot;&lt;/div&gt;&quot; : &quot;&quot;) + &quot;
+                                &quot; + (emailAddress ? &quot;&lt;div&gt;&lt;i class='fa fa-envelope' style='width:16px;'&gt;&lt;/i&gt; &quot; + emailAddress + &quot;&lt;/div&gt;&quot; : &quot;&quot;) + &quot;
+                                &quot; + (phoneNumber ? &quot;&lt;div&gt;&lt;i class='fa fa-phone' style='width:16px;'&gt;&lt;/i&gt; &quot; + phoneNumber + &quot;&lt;/div&gt;&quot; : &quot;&quot;) + &quot;
                             &lt;/div&gt;&quot;"/>
 
                         <set field="taxHtml" from="&quot;
@@ -506,13 +533,17 @@
                      above (which resolve via IndiaGstin / Party / ContactMech since these values are NOT reliably
                      on ContactListView). Removed the duplicates; the *Search fields remain the single search path. -->
                 <!-- ZE-CONTACTS-016: reveal disabled contacts so they can be re-enabled -->
-                <field name="showDisabled"><header-field title="Show Disabled">
-                    <drop-down no-current-selected-key="N"><option key="N" text="No"/><option key="Y" text="Yes (include disabled)"/></drop-down>
-                </header-field></field>
+                <!-- The inline toggle owns this value. Keep it in Find Options/pagination without a second control or default-No summary. -->
+                <field name="showDisabled"><header-field><hidden/></header-field><default-field><hidden/></default-field></field>
                 <!-- ZE-CONTACTS-FILTER: Status + Contact Type also in Find Options so the inline dropdowns round-trip. -->
                 <field name="statusFilter"><header-field title="Status"><drop-down allow-empty="true"><option key="active" text="Active"/><option key="inactive" text="Inactive"/></drop-down></header-field><default-field><hidden/></default-field></field>
                 <field name="contactTypeFilter"><header-field title="Contact Type"><drop-down allow-empty="true"><option key="customer" text="Customer"/><option key="supplier" text="Supplier"/><option key="walkin" text="Walk-in"/></drop-down></header-field><default-field><hidden/></default-field></field>
 
+                <!-- Selection is local to the displayed page; it never submits a write action. -->
+                <field name="selection">
+                    <header-field title=""/>
+                    <default-field><display text="&lt;input type='checkbox' class='zac-select' aria-label='Select ${contactName}' value='${partyId}'&gt;" encode="false"/></default-field>
+                </field>
                 <!-- Visible Columns -->
                 <field name="contactProfile">
                     <header-field title="Contact Profile" show-order-by="false"/>
@@ -549,5 +580,6 @@
             </form-list>
             </container>
         </box-body></container-box>
+        </container>
     </widgets>
 </screen>
