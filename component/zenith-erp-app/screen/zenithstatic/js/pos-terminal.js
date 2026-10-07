@@ -2693,6 +2693,8 @@ window.posToggleFullscreen = function() {
                 + '</div>';
         }
 
+        function cartText(value) { return window._posReceiptTextData(String(value == null ? '' : value)); }
+
         function renderCart(d) {
             if (!d || !d.success) { if (d && d.error) alert(d.error); return; }
             TX = d.transactionId || '';
@@ -2717,28 +2719,28 @@ window.posToggleFullscreen = function() {
                     else if (/custom/i.test(_mn)) { _cbg = '#D5F0EC'; _cfg = '#0F766E'; }
                     if (d.modes.length > 1) {
                         var mo = '';
-                        d.modes.forEach(function(m){ mo += '<option value="'+m.id+'"'+(it.mode===m.id?' selected':'')+'>'+m.name+(Number(m.disc)>0?(' −'+Number(m.disc)+'%'):'')+'</option>'; });
-                        modeCell = '<select class="aj-mode" data-seq="'+it.seq+'" title="Sale mode for this item" style="font-size:12px;font-weight:600;padding:3px 6px;border:1px solid '+_cbg+';border-radius:6px;background:'+_cbg+';color:'+_cfg+';cursor:pointer;max-width:120px">'+mo+'</select>';
+                        d.modes.forEach(function(m){ mo += '<option value="'+cartText(m.id)+'"'+(it.mode===m.id?' selected':'')+'>'+cartText(m.name)+(Number(m.disc)>0?(' −'+Number(m.disc)+'%'):'')+'</option>'; });
+                        modeCell = '<select class="aj-mode" data-seq="'+cartText(it.seq)+'" title="Sale mode for this item" style="font-size:12px;font-weight:600;padding:3px 6px;border:1px solid '+_cbg+';border-radius:6px;background:'+_cbg+';color:'+_cfg+';cursor:pointer;max-width:120px">'+mo+'</select>';
                     } else {
-                        modeCell = '<span style="display:inline-block;font-size:12px;font-weight:600;padding:3px 8px;border-radius:6px;background:'+_cbg+';color:'+_cfg+'">'+_mn+'</span>';
+                        modeCell = '<span style="display:inline-block;font-size:12px;font-weight:600;padding:3px 8px;border-radius:6px;background:'+_cbg+';color:'+_cfg+'">'+cartText(_mn)+'</span>';
                     }
                 }
-                h += '<td style="padding:3px 10px"><div style="font-size:14px;font-weight:600;color:#000;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+it.name+'</div><div style="font-size:11px;color:#555">'+it.pid+'</div></td>';
+                h += '<td style="padding:3px 10px"><div style="font-size:14px;font-weight:600;color:#000;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+cartText(it.name)+'</div><div style="font-size:11px;color:#555">'+cartText(it.pid)+'</div></td>';
                 h += '<td style="padding:3px 8px;text-align:left;vertical-align:middle">'+modeCell+'</td>';
                 h += '<td style="padding:4px 4px;text-align:right;vertical-align:middle"><div style="display:flex;align-items:center;gap:3px;justify-content:flex-end">';
-                h += '<input type="text" inputmode="decimal" value="'+Number(it.price)+'" data-seq="'+it.seq+'" class="aj-p" style="width:65px;padding:8px 6px;border:1px solid #ccc;border-radius:6px;font-size:14px;text-align:right;background:#fff;color:#000;box-sizing:border-box"/>';
-                h += '<button data-seq="'+it.seq+'" class="aj-pb" style="width:32px;height:32px;border:none;background:#7C3AED;color:#fff;border-radius:6px;cursor:pointer;font-size:14px;display:flex;align-items:center;justify-content:center;padding:0;flex-shrink:0">&#10003;</button>';
+                h += '<input type="text" inputmode="decimal" value="'+Number(it.price)+'" data-seq="'+cartText(it.seq)+'" class="aj-p" style="width:65px;padding:8px 6px;border:1px solid #ccc;border-radius:6px;font-size:14px;text-align:right;background:#fff;color:#000;box-sizing:border-box"/>';
+                h += '<button data-seq="'+cartText(it.seq)+'" class="aj-pb" style="width:32px;height:32px;border:none;background:#7C3AED;color:#fff;border-radius:6px;cursor:pointer;font-size:14px;display:flex;align-items:center;justify-content:center;padding:0;flex-shrink:0">&#10003;</button>';
                 h += '</div></td>';
                 h += '<td style="padding:4px;text-align:center;vertical-align:middle"><div style="display:flex;align-items:center;justify-content:center;gap:0">';
-                h += '<button data-seq="'+it.seq+'" data-q="'+(Number(it.qty)-1)+'" class="aj-q" style="width:34px;height:34px;border:2px solid #e53935;background:#fff;font-size:19px;font-weight:bold;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0;border-radius:8px 0 0 8px;color:#e53935">-</button>';
-                h += '<input type="number" step="any" value="'+Number(it.qty)+'" data-seq="'+it.seq+'" class="aj-qi" style="width:58px;text-align:center;font-weight:bold;font-size:16px;border-top:2px solid #ccc;border-bottom:2px solid #ccc;border-left:none;border-right:none;height:34px;background:#fff;color:#000;outline:none;box-sizing:border-box"/>';
-                h += '<button data-seq="'+it.seq+'" data-q="'+(Number(it.qty)+1)+'" class="aj-q" style="width:34px;height:34px;border:2px solid #2e7d32;background:#fff;font-size:19px;font-weight:bold;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0;border-radius:0 8px 8px 0;color:#2e7d32">+</button>';
-                if (it.uom) h += '<span style="font-size:11px;color:#e65100;font-weight:700;margin-left:5px;white-space:nowrap;flex-shrink:0">'+it.uom+'</span>';
+                h += '<button data-seq="'+cartText(it.seq)+'" data-q="'+(Number(it.qty)-1)+'" class="aj-q" style="width:34px;height:34px;border:2px solid #e53935;background:#fff;font-size:19px;font-weight:bold;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0;border-radius:8px 0 0 8px;color:#e53935">-</button>';
+                h += '<input type="number" step="any" value="'+Number(it.qty)+'" data-seq="'+cartText(it.seq)+'" class="aj-qi" style="width:58px;text-align:center;font-weight:bold;font-size:16px;border-top:2px solid #ccc;border-bottom:2px solid #ccc;border-left:none;border-right:none;height:34px;background:#fff;color:#000;outline:none;box-sizing:border-box"/>';
+                h += '<button data-seq="'+cartText(it.seq)+'" data-q="'+(Number(it.qty)+1)+'" class="aj-q" style="width:34px;height:34px;border:2px solid #2e7d32;background:#fff;font-size:19px;font-weight:bold;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0;border-radius:0 8px 8px 0;color:#2e7d32">+</button>';
+                if (it.uom) h += '<span style="font-size:11px;color:#e65100;font-weight:700;margin-left:5px;white-space:nowrap;flex-shrink:0">'+cartText(it.uom)+'</span>';
                 h += '</div>';
                 h += '</td>';
                 h += '<td style="padding:3px 10px;text-align:right;font-size:14px;color:#6B7280;vertical-align:middle">'+Number(it.tax||0).toFixed(3)+'</td>';
                 h += '<td style="padding:3px 10px;text-align:right;font-size:15px;font-weight:700;color:#000;vertical-align:middle">'+fmt2(it.total)+'</td>';
-                h += '<td style="padding:4px 6px;text-align:center;vertical-align:middle"><button data-seq="'+it.seq+'" class="aj-rm" style="width:32px;height:32px;border:none;background:#e53935;color:#fff;border-radius:6px;cursor:pointer;font-size:16px;display:flex;align-items:center;justify-content:center;padding:0" title="Remove item">&#10005;</button></td>';
+                h += '<td style="padding:4px 6px;text-align:center;vertical-align:middle"><button data-seq="'+cartText(it.seq)+'" class="aj-rm" style="width:32px;height:32px;border:none;background:#e53935;color:#fff;border-radius:6px;cursor:pointer;font-size:16px;display:flex;align-items:center;justify-content:center;padding:0" title="Remove item">&#10005;</button></td>';
                 h += '</tr>';
             });
             var _cs = document.getElementById('cartScroll'); var _ps = _cs ? _cs.scrollTop : 0; var _pc = (lastCartData && lastCartData.items) ? lastCartData.items.length : 0;
@@ -2764,6 +2766,13 @@ window.posToggleFullscreen = function() {
                     sm.setAttribute('data-sig', _sig);
                 }
             }
+            // Mirror authoritative and optimistic cart changes in the visible side summary.
+            var sideCount = document.getElementById('pos-side-item-count');
+            if (sideCount) sideCount.textContent = 'Subtotal (' + d.items.length + ' item' + (d.items.length === 1 ? '' : 's') + ')';
+            [['pos-side-subtotal', d.sub], ['pos-side-discount', d.disc], ['pos-side-tax', d.tax], ['pos-side-round', d.round]].forEach(function(pair) {
+                var value = document.getElementById(pair[0]);
+                if (value) value.textContent = CS + fmt2(pair[1] || 0);
+            });
             document.querySelectorAll('.pos-pay-form input[name="amount"]').forEach(function(el) { el.value = d.pay; });
             document.querySelectorAll('.pos-pay-form input[name="transactionId"]').forEach(function(el) { el.value = TX; });
             var bn = document.querySelector('.pos-header [style*="background:#e65100"]') || document.querySelector('.pos-header [style*="background: rgb(230, 81, 0)"]');

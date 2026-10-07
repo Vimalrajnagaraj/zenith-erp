@@ -47,6 +47,8 @@ deployment claim. Never reuse a database containing customer records.
   rendering, one search-add POST, active till layouts and both app shells. Normal
   and Advanced layouts retain cart height, contain wrapped headers and scroll
   to both the cart and payment controls at five widths; the fullscreen icon uses SVG.
+  AJAX cart add/remove updates the side Bill Summary, names remain literal text,
+  and Advanced mobile checkout stacks the catalog/cart and wraps readable payment buttons.
 
 Render checks do not certify every business operation in a screen. Physical QZ
 printers, scales, handheld scanners, external payment providers and Safari dark

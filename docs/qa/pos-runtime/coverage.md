@@ -15,7 +15,7 @@ hardware, external providers and Safari require the owner's environment.
 | PS-004a / 1 | **ALL ITEMS is instant** | Pending: not yet fully exercised |
 | PS-005 / 1 | Product search | Pending: not yet fully exercised |
 | PS-005a / 1 | **Search-bar add = qty 1** | One search/Enter ajaxCart POST, qty 1 |
-| PS-005b / 1 | Search-add shows the name | Search-added product name in cart DOM |
+| PS-005b / 1 | Search-add shows the name | Search-added product name in cart DOM; markup stays literal in AJAX cart, side summary follows add/remove |
 | PS-005c / 1 | Search box still scans | Pending: not yet fully exercised |
 | PS-006 / 1 | Qty + / − | Pending: not yet fully exercised |
 | PS-007 / 1 | **Qty edit never deletes** | Invalid quantity POST retains the cart line |
