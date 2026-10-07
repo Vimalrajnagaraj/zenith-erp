@@ -291,6 +291,7 @@ module.exports=async function({ctx,p,post,invoke,q,rows,inv,count,check,base,out
    report.viewports.push({shell,screen,width,...g,sop:true});
   }
  });
+ await require('./verify-postmerge.cjs')({ctx,p,post,invoke,q,rows,inv,count,check,base,out,report});
  fs.writeFileSync(path.join(out,'sop-extra.json'),JSON.stringify({cases,failures},null,2));
  const coverage=require('./sop-coverage.cjs')(report,cases,out);
  check('SOP run sheet has evidence for all 88 cases',coverage.total===88&&coverage.unverified.length===0,coverage);

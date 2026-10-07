@@ -152,3 +152,36 @@ while those native files remain.
 - Cash/mock settlement preserves the existing status-based payment convention;
   it does not introduce GL posting or provider integration. Senior review should
   confirm that convention before production deployment.
+
+## Post-merge review of PR 23 (7 October 2026)
+
+The senior merged PR 23 as `69d6f7f` with deployment gates. The additional
+`verify-postmerge.cjs` runs after the SOP suite on the same disposable tenant.
+
+| Confirmed issue | Fix | Running-app regression |
+| --- | --- | --- |
+| Accounting A/R dashboard/list/ageing read pre-tax totals raw | Shared read-only display amounts | Real invoice/list/ageing pages plus independent arithmetic |
+| GSTR-3B subtracts taxable from pre-tax headers and drops GST | New Sales writes declare `salesTotalsPreTax=Y`; marked readers use charged tax | New, legacy gross/tax-off, foreign records |
+| Returned challan goods/status accept forged writes | Match server guards and controls, including legacy aliases | Both shells, unchanged snapshots |
+| Debit notes can collect payments | Shared payable guard rejects both adjustment types | No links or invoice mutations |
+| GST attribution string-sorts 100+ line sequences | Retain creation-returned sequence IDs | 105 varying-price lines, independent line/header GST |
+| Equal-date commissions have no stable choice | Ascending commissionId after descending validFrom | Repeated choice and amount checks |
+| CI reconciliation omitted PDF parser install | Retain pinned pypdf 6.10.0 | Existing and additional GST PDF semantics |
+
+The new nullable field has **no default and no historical backfill**. Only Sales
+creation/recalculation stamps it. Unmarked legacy/POS and purchase report rows
+keep their gross/charged-delta convention; historical tax-off metadata does not
+become phantom charged GST. Apply the additive schema through the normal
+staging process before enabling this code. Issued invoices are not rewritten.
+
+If PR 23 already created pre-tax records before the marker existed, reconcile
+those individually; old tax-off records can carry identical metadata, so no
+safe automatic inference or bulk backfill is claimed. The senior must confirm
+actual MARUTHI status counts and historical conventions before deployment.
+Synthetic forecast history covers InvoiceFinalized and InvoicePmtRecvd with
+unchanged expected totals; this is not evidence of production status counts.
+
+The 18 retained native QA files are on the other computer and remain a manual
+cleanup gate. This run uses independently asserted CI teardown. The three
+existing SOP policy deviations and senior billing review remain required.
+No production merge, deployment or customer writes are performed here.
