@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Disposable-only helper. Copy into the Pricing screen directory only for the regression run. -->
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd" default-menu-include="false">
+<transition name="initialize"><actions><script><![CDATA[
+    if (System.getProperty('purchase.pricing.qa.disposable')!='true' || !ec.user.isInGroup('ADMIN')) {
+        ec.web.response.setStatus(403); ec.web.sendJsonResponse([denied:true]); return
+    }
+    if (ec.entity.find('mantle.party.Party').condition('partyId','PP_QA_A').disableAuthz().count()) {
+        ec.web.response.setStatus(409); ec.web.sendJsonResponse([denied:true]); return
+    }
+    ec.entity.makeDataLoader().location('component://zenith-erp-purchase/JobWorkQaFixture.xml').load()
+    if(ec.message.hasError() || !ec.entity.find('mantle.product.Product').condition('productId','PP_QA_PRODUCT_A').disableAuthz().one()) {
+        throw new IllegalStateException('Fixture load failed; refuse stale-state verification')
+    }
+    def demo=ec.entity.find('moqui.security.UserAccount').condition('userId','EX_JOHN_DOE').one()
+    def user=ec.entity.find('moqui.security.UserAccount').condition('userId','PP_QA_USER').one()
+    ['currentPassword','passwordSalt','passwordHashType','passwordBase64'].each {user.set(it,demo.get(it))}
+    user.disabled='N'; user.requirePasswordChange='N'; user.update()
+    ec.web.sendJsonResponse([initialized:true])
+]]></script></actions><default-response type="none"/></transition>
+<transition name="scope"><actions><script><![CDATA[
+    if (System.getProperty('purchase.pricing.qa.disposable')!='true' || ec.user.username!='purchase.pricing.qa' || !['PP_QA_A','PP_QA_B','NONE'].contains(ec.web.parameters.org)) {
+        ec.web.response.setStatus(403); ec.web.sendJsonResponse([denied:true]); return
+    }
+    ec.user.setPreference('ACTIVE_ORGANIZATION',ec.web.parameters.org=='NONE'?null:ec.web.parameters.org)
+    ec.web.sendJsonResponse([scope:ec.web.parameters.org])
+]]></script></actions><default-response type="none"/></transition>
+<transition name="cleanup"><actions><script><![CDATA[
+    if(System.getProperty('purchase.pricing.qa.disposable')!='true' || !ec.user.isInGroup('ADMIN')) {
+        ec.web.response.setStatus(403); ec.web.sendJsonResponse([denied:true]); return
+    }
+    def fixture=new groovy.xml.XmlParser().parseText(ec.resource.getLocationText('component://zenith-erp-purchase/JobWorkQaFixture.xml',false))
+    int removed=0
+    def ownedHeaders=ec.entity.find('zenith.erp.india.JobWorkChallan').condition('organizationPartyId','in',['PP_QA_A','PP_QA_B']).disableAuthz().list()
+    ownedHeaders.each { header ->
+        ec.entity.find('zenith.erp.india.JobWorkChallanItem').condition('challanId',header.challanId).disableAuthz().list().each { item -> item.delete(); removed++ }
+        header.delete(); removed++
+    }
+    fixture.children().reverse().each { node ->
+        def entityName=node.name().toString()
+        def pkFields=ec.entity.getEntityDefinition(entityName).getPkFieldNames()
+        def keys=[:]
+        pkFields.each {field ->
+            def raw=node.attribute(field)
+            if(raw!=null) keys[field]=(field=='fromDate' ? java.sql.Timestamp.valueOf(raw.toString().replace('T',' ')) : raw.toString())
+        }
+        if(!keys.values().any {it.toString().startsWith('PP_QA_')}) throw new IllegalStateException('Refusing non-fixture cleanup')
+        def value=ec.entity.find(entityName).condition(keys).disableAuthz().one()
+        if(value!=null) {value.delete(); removed++}
+    }
+    ec.web.sendJsonResponse([removed:removed])
+]]></script></actions><default-response type="none"/></transition>
+</screen>
