@@ -18,26 +18,35 @@
     <transition name="createPerson">
         <service-call name="zenith.contacts.ContactServices.create#Contact"
                       in-map="context + [partyTypeEnumId:'PtyPerson']"/>
+        <error-response url="."/>
         <default-response url="../EditContact"/>
     </transition>
     <transition name="createOrganization">
         <service-call name="zenith.contacts.ContactServices.create#Contact"
                       in-map="context + [partyTypeEnumId:'PtyOrganization']"/>
+        <error-response url="."/>
         <default-response url="../EditContact"/>
     </transition>
 
     <!-- ZE-CONTACTS-027 / CT-166: real XLSX export (Moqui 4.0 has no xlsx render mode — see
-         build#ListXlsx). Exports the full org-scoped, non-disabled contact directory. GSTIN/PAN/CIN are
+         build#ListXlsx). Exports all matching contacts in the filtered, org-scoped directory. GSTIN/PAN/CIN are
          enriched per row from IndiaGstin + Party (ContactListView does not alias them), so the sheet
          carries the compliance columns. Org isolation via the ownerPartyId econdition. Read-only. -->
+    <!-- Null, empty and _NA_ active-org preferences all deny list/export scope, including direct transitions. -->
     <transition name="export" read-only="true">
         <parameter name="format"/>
         <actions>
             <entity-find entity-name="zenith.erp.contacts.ContactListView" list="contactList">
-                <econdition field-name="disabled" operator="not-equals" value="Y" or-null="true"/>
-                <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
-                <order-by field-name="organizationName"/>
-                <order-by field-name="firstName"/>
+                <!-- Moqui still honors explicit paging with paginate=false; clear it for a full filtered export. -->
+                <search-form-inputs skip-fields="ownerPartyId" input-fields-map="ec.context + [pageIndex:null, pageSize:null]" paginate="false" default-order-by="organizationName,firstName"/>
+                <econdition field-name="partyId" operator="in" from="searchPartyIds" ignore-if-empty="true"/>
+                <econdition field-name="partyId" operator="in" from="qPartyIds" ignore-if-empty="true"/>
+                <econdition field-name="partyTypeEnumId" from="partyTypeEnumId" ignore-if-empty="true"/>
+                <econdition field-name="disabled" operator="not-equals" from="disabledNe" or-null="true" ignore-if-empty="true"/>
+                <econdition field-name="disabled" operator="equals" from="disabledEq" ignore-if-empty="true"/>
+                <econdition field-name="partyId" operator="in" from="ctPartyIds" ignore-if-empty="true"/>
+                <econdition field-name="partyId" operator="like" from="walkinLike" ignore-if-empty="true"/>
+                <econdition field-name="ownerPartyId" from="(ec.user.getPreference('ACTIVE_ORGANIZATION') ?: '_NA_') == '_NA_' ? '__NO_ORGANIZATION__' : ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
             </entity-find>
             <script><![CDATA[
                 def rows = []
@@ -80,7 +89,8 @@
         <default-response type="none"/>
     </transition>
 
-    <actions>
+    <always-actions>
+        <!-- List and export share these derived search/status/role filters. -->
         <!-- ZE-CONTACTS-016: disabled contacts are hidden by default (so Customers/Vendors stay clean),
              but "Show Disabled = Yes" drops the filter so a disabled contact can be found and re-enabled
              (Edit Profile > Disabled = No). disabledFilter is null when showing all -> ignore-if-empty
@@ -154,7 +164,8 @@
                 _ids.addAll(_clv("partyId", _like))
                 _ids.addAll(ec.entity.find("zenith.erp.india.IndiaGstin").condition(_cf.makeCondition("gstin", _EC.LIKE, _like).ignoreCase()).list().collect{ it.partyId })
                 _ids.addAll(ec.entity.find("mantle.party.contact.PartyContactMechInfo").condition("contactMechTypeEnumId", "CmtEmailAddress").condition(_cf.makeCondition("infoString", _EC.LIKE, _like).ignoreCase()).list().collect{ it.partyId })
-                def _pd = _q.replaceAll(/[^0-9]/, '')
+                // Only phone-shaped queries should match phone digits; IDs/GSTINs/names can contain numbers too.
+                def _pd = (_q ==~ /[-+().0-9\s]+/) ? _q.replaceAll(/[^0-9]/, '') : ''
                 if (_pd.length() > 10) _pd = _pd.substring(_pd.length() - 10)
                 if (_pd) _ids.addAll(ec.entity.find("mantle.party.contact.PartyContactMechTelecomNumber").condition("contactNumber", "like", "%" + _pd + "%").list().collect{ it.partyId })
                 _ids.remove(null)
@@ -166,8 +177,11 @@
         <script><![CDATA[
             if (ec.web != null) { def p = ec.web.parameters; def cur = p?.pageSize; if (cur == null || cur.toString().trim().isEmpty()) { ec.context.pageSize = 20; try { p.put("pageSize", "20") } catch (Throwable _t) { } } }
         ]]></script>
+    </always-actions>
+
+    <actions>
         <entity-find entity-name="zenith.erp.contacts.ContactListView" list="contactList">
-            <search-form-inputs default-order-by="organizationName,firstName"/>
+            <search-form-inputs skip-fields="ownerPartyId" default-order-by="organizationName,firstName"/>
             <econdition field-name="partyId" operator="in" from="searchPartyIds" ignore-if-empty="true"/>
             <econdition field-name="partyId" operator="in" from="qPartyIds" ignore-if-empty="true"/>
             <econdition field-name="partyTypeEnumId" from="partyTypeEnumId" ignore-if-empty="true"/>
@@ -175,7 +189,7 @@
             <econdition field-name="disabled" operator="equals" from="disabledEq" ignore-if-empty="true"/>
             <econdition field-name="partyId" operator="in" from="ctPartyIds" ignore-if-empty="true"/>
             <econdition field-name="partyId" operator="like" from="walkinLike" ignore-if-empty="true"/>
-            <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+            <econdition field-name="ownerPartyId" from="(ec.user.getPreference('ACTIVE_ORGANIZATION') ?: '_NA_') == '_NA_' ? '__NO_ORGANIZATION__' : ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
         </entity-find>
 
         <!-- ZE-SALES-0306 f/u: Indian state list for the optional "Place of Supply" dropdown on the create forms. -->
@@ -198,6 +212,7 @@
           }, 300);
         })();
         </script>]]></text></render-mode>
+        <container style="zc-contacts-list-page">
         <container-box class="zenith-card"><box-header title="All Contacts — everyone you do business with"/><box-toolbar>
             <section name="FindContact_write">
               <condition><expression>modCanWrite</expression></condition>
@@ -549,5 +564,6 @@
             </form-list>
             </container>
         </box-body></container-box>
+        </container>
     </widgets>
 </screen>
