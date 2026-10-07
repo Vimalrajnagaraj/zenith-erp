@@ -7,6 +7,7 @@
     <parameter name="dashDate"/>
     <parameter name="dashDateTo"/>
     <parameter name="dateMode"/>
+    <parameter name="dashFacilityId"/>
 
     <!-- ZE-DASH: switchable widgets + drag-reorder + a date-range filter that drives the Stock Movements time series -->
     <transition name="saveDashLayout">
@@ -14,13 +15,13 @@
             def _wk = ['kpis','health','lowstock','warehouse','recent','movements','category','pricecov','forecast']
             ec.user.setPreference('INV_DASH_HIDDEN', _wk.findAll { !context.get('w_' + it) }.join(','))
         ]]></script></actions>
-        <default-response url="." parameter-map="[dashDate:dashDate, dashDateTo:dashDateTo]"/>
+        <default-response url="." parameter-map="[dashDate:dashDate, dashDateTo:dashDateTo, dashFacilityId:dashFacilityId, dateMode:dateMode, showSettings:'0']"/>
     </transition>
     <transition name="resetDashLayout">
         <actions><script>ec.user.setPreference('INV_DASH_HIDDEN', null); ec.user.setPreference('INV_DASH_ORDER', null); ec.user.setPreference('INV_DASH_SIZE', null)</script></actions>
-        <default-response url="." parameter-map="[dashDate:dashDate, dashDateTo:dashDateTo]"/>
+        <default-response url="." parameter-map="[dashDate:dashDate, dashDateTo:dashDateTo, dashFacilityId:dashFacilityId, dateMode:dateMode, showSettings:'0']"/>
     </transition>
-    <transition name="changeDashDate"><default-response url="." parameter-map="[dashDate:dashDate, dashDateTo:dashDateTo, dateMode:'custom']"/></transition>
+    <transition name="changeDashDate"><default-response url="." parameter-map="[dashDate:dashDate, dashDateTo:dashDateTo, dashFacilityId:dashFacilityId, dateMode:'custom']"/></transition>
     <transition name="saveDashOrder" require-session-token="false">
         <actions><script><![CDATA[
             def _valid = ['kpis','health','lowstock','warehouse','recent','movements','category','pricecov','forecast']
@@ -29,8 +30,8 @@
             if (context.sizes != null) {
                 def _sz = ((context.sizes ?: '').toString().split(',') as List)
                         .collect { it.split(':') as List }
-                        .findAll { it.size()==2 && _valid.contains(it[0]) && it[1]=='half' }
-                        .collect { it[0]+':half' }
+                        .findAll { it.size()==2 && _valid.contains(it[0]) && it[1] in ['half','third'] }
+                        .collect { it[0]+':'+it[1] }
                 ec.user.setPreference('INV_DASH_SIZE', _sz.join(','))
             }
             ec.web.sendJsonResponse([saved:true, order:_clean.join(',')])
@@ -56,6 +57,22 @@
             // ZE-SHOP: when a shop is selected globally, scope the STOCK figures (units/value/expiring) to its
             // facility (null = All Shops). Product/category counts stay org-wide (products belong to the org).
             def _activeShop = null; try { def _sc = ec.service.sync().name("zenith.base.ShopServices.get#ActiveShopScope").call(); _activeShop = _sc?.activeShopId } catch (Exception _e) {}
+
+            // Warehouse choices never expand the current organization or global shop scope.
+            def _fq = ef.find("mantle.facility.Facility").condition("ownerPartyId", orgId).orderBy("facilityName")
+            if (_activeShop) _fq.condition("facilityId", _activeShop)
+            warehouseOptions = _fq.list()
+            dashFacilityId = (dashFacilityId ?: '').toString()
+            if (dashFacilityId && !warehouseOptions.any { it.facilityId == dashFacilityId }) dashFacilityId = ''
+            if (dashFacilityId) _activeShop = dashFacilityId
+            warehouseScopeLabel = _activeShop ? (warehouseOptions.find { it.facilityId == _activeShop }?.facilityName ?: 'Current shop') : 'All Warehouses'
+            def _scopeQoh = [:]
+            if (_activeShop) {
+                ef.find("mantle.product.asset.Asset").condition("ownerPartyId", orgId).condition("facilityId", _activeShop)
+                  .condition("assetTypeEnumId", "AstTpInventory").list().each { a ->
+                    _scopeQoh[a.productId] = (_scopeQoh[a.productId] ?: 0G) + (a.quantityOnHandTotal ?: 0G)
+                }
+            }
 
             // ----- Stock value + units in hand (across ALL of the org's inventory) -----
             // ZE-INV-001/IV-001: sum per ASSET (not the by-facility view). Two fixes:
@@ -128,9 +145,11 @@
             int lowStockCnt = 0
             def _lowAll = []
             if (trackedCount > 0) {
-                def psv = ef.find("zenith.erp.inventory.ProductStockView").condition("ownerPartyId", orgId).list()
+                def trackedIds = ef.find("mantle.product.Product").condition("ownerPartyId", orgId).condition("inventoryTracked", "Y").list()*.productId
+                def psv = ef.find("zenith.erp.inventory.ProductStockView").condition("ownerPartyId", orgId).condition("productId", EntityCondition.IN, trackedIds).list()
                 for (r in psv) {
-                    def q = (r.totalQoh ?: 0G); def rp = (r.reorderPoint ?: 0G)
+                    if (_activeShop && !_scopeQoh.containsKey(r.productId)) continue
+                    def q = _activeShop ? (_scopeQoh[r.productId] ?: 0G) : (r.totalQoh ?: 0G); def rp = (r.reorderPoint ?: 0G)
                     if (rp > 0G && q <= rp) {
                         lowStockCnt++
                         _lowAll.add([name: (r.productName ?: r.productId), sku: (r.pseudoId ?: ''), q: q,
@@ -238,6 +257,14 @@
             def _todayStr = _sdf.format(_now)
             if (!dashDate) dashDate = ''
             if (!dashDateTo) dashDateTo = ''
+            try {
+                if (dashDate) java.time.LocalDate.parse(dashDate)
+                if (dashDateTo) java.time.LocalDate.parse(dashDateTo)
+                if (!dashDate && dashDateTo) dashDate = dashDateTo
+            } catch (java.time.format.DateTimeParseException ignored) {
+                ec.message.addError('Enter valid dates in YYYY-MM-DD format.')
+                dashDate = ''; dashDateTo = ''
+            }
             dayStart = null; dayEndExcl = null
             if (dashDate) {
                 if (!dashDateTo) dashDateTo = dashDate
@@ -249,7 +276,7 @@
             def _cw = java.util.Calendar.getInstance(); _cw.setTime(_now); _cw.set(java.util.Calendar.DAY_OF_WEEK, _cw.getFirstDayOfWeek()); def _weekStartStr = _sdf.format(_cw.getTime())
             def _cm = java.util.Calendar.getInstance(); _cm.setTime(_now); _cm.set(java.util.Calendar.DAY_OF_MONTH,1); def _monthStartStr = _sdf.format(_cm.getTime())
             def _c30 = java.util.Calendar.getInstance(); _c30.setTime(_now); _c30.add(java.util.Calendar.DAY_OF_MONTH,-29); def _last30Str = _sdf.format(_c30.getTime())
-            urlAll = "?"; urlToday = "?dashDate="+_todayStr+"&dashDateTo="+_todayStr
+            urlAll = "?dateMode=all"; urlToday = "?dashDate="+_todayStr+"&dashDateTo="+_todayStr
             urlWeek = "?dashDate="+_weekStartStr+"&dashDateTo="+_todayStr
             urlMonth = "?dashDate="+_monthStartStr+"&dashDateTo="+_todayStr
             url30 = "?dashDate="+_last30Str+"&dashDateTo="+_todayStr
@@ -270,27 +297,46 @@
             if (dashDate && dashDateTo == _dwToday && dashDate == _dwYearStart) presetActive = 'year'
             showCustom = (((dateMode ?: '') == 'custom') || (presetActive == 'custom'))
             urlCustom = dashDate ? ("?dateMode=custom&dashDate="+dashDate+"&dashDateTo="+dashDateTo) : "?dateMode=custom"
+            def _ioAssetQuery = ef.find("mantle.product.asset.Asset").condition("ownerPartyId", orgId)
+            if (_activeShop) _ioAssetQuery.condition("facilityId", _activeShop)
+            def _ioAssetIds = _ioAssetQuery.selectField("assetId").list()*.assetId as HashSet
+            def _allTime = !dayStart && dateMode == 'all'
             def _mvStart; def _mvEnd
             if (dayStart) { _mvStart = dayStart; _mvEnd = dayEndExcl }
             else {
                 def _c6 = java.util.Calendar.getInstance(); _c6.setTime(_now); _c6.set(java.util.Calendar.DAY_OF_MONTH,1); _c6.add(java.util.Calendar.MONTH,-5); _mvStart = new java.sql.Timestamp(_c6.getTimeInMillis())
                 def _ce2 = java.util.Calendar.getInstance(); _ce2.setTime(_now); _ce2.add(java.util.Calendar.DAY_OF_MONTH,1); _mvEnd = new java.sql.Timestamp(_ce2.getTimeInMillis())
+                if (_allTime) {
+                    def _starts = []
+                    def _first = ef.find("mantle.product.asset.AssetDetail").condition("assetId", EntityCondition.IN, _ioAssetIds ? (_ioAssetIds as List) : ['__none__']).condition("quantityOnHandDiff", EntityCondition.NOT_EQUAL, 0G).condition("effectiveDate", EntityCondition.LESS_THAN, _mvEnd).orderBy("effectiveDate").limit(1).list()
+                    if (_first) _starts.add(_first[0].effectiveDate)
+                    if (!_activeShop) {
+                        def _firstAdj = ef.find("zenith.erp.inventory.StockAdjustment").condition("organizationPartyId", orgId).condition("adjustmentDate", EntityCondition.LESS_THAN, _mvEnd).orderBy("adjustmentDate").limit(1).list()
+                        def _firstTrf = ef.find("zenith.erp.inventory.StockTransfer").condition("organizationPartyId", orgId).condition("transferDate", EntityCondition.LESS_THAN, _mvEnd).orderBy("transferDate").limit(1).list()
+                        if (_firstAdj) _starts.add(_firstAdj[0].adjustmentDate)
+                        if (_firstTrf) _starts.add(_firstTrf[0].transferDate)
+                    }
+                    if (_starts) _mvStart = java.sql.Timestamp.valueOf(_sdf.format(_starts.min()) + ' 00:00:00')
+                }
             }
-            def _daily = ((_mvEnd.getTime() - _mvStart.getTime()) / (1000L*60*60*24)) <= 62
-            def _bfmt = _daily ? new java.text.SimpleDateFormat("yyyy-MM-dd") : new java.text.SimpleDateFormat("yyyy-MM")
-            def _lfmt = _daily ? new java.text.SimpleDateFormat("dd MMM") : new java.text.SimpleDateFormat("MMM yy")
+            def _rangeDays = (_mvEnd.getTime() - _mvStart.getTime()) / (1000L*60*60*24)
+            def _daily = _rangeDays <= 62
+            def _yearly = _rangeDays > 365 * 30
+            def _bfmt = new java.text.SimpleDateFormat(_daily ? "yyyy-MM-dd" : (_yearly ? "yyyy" : "yyyy-MM"))
+            def _lfmt = new java.text.SimpleDateFormat(_daily ? "dd MMM" : (_yearly ? "yyyy" : "MMM yy"))
             def _adjs = ef.find("zenith.erp.inventory.StockAdjustment").condition("organizationPartyId", orgId).condition("adjustmentDate", EntityCondition.GREATER_THAN_EQUAL_TO, _mvStart).condition("adjustmentDate", EntityCondition.LESS_THAN, _mvEnd).selectField("adjustmentDate").list()
             def _trfs = ef.find("zenith.erp.inventory.StockTransfer").condition("organizationPartyId", orgId).condition("transferDate", EntityCondition.GREATER_THAN_EQUAL_TO, _mvStart).condition("transferDate", EntityCondition.LESS_THAN, _mvEnd).selectField("transferDate").list()
             // ZE-INV §7: Stock In/Out FLOW from the AssetDetail ledger (org-scoped; AssetDetail is small). Positive
             // quantityOnHandDiff = stock in, negative = stock out. Real data — no fabrication.
-            def _ioAssetIds = ef.find("mantle.product.asset.Asset").condition("ownerPartyId", orgId).selectField("assetId").list()*.assetId as HashSet
             def _ioLedger = ef.find("mantle.product.asset.AssetDetail").condition("effectiveDate", EntityCondition.GREATER_THAN_EQUAL_TO, _mvStart).condition("effectiveDate", EntityCondition.LESS_THAN, _mvEnd).selectField("assetId").selectField("effectiveDate").selectField("quantityOnHandDiff").list().findAll { _ioAssetIds.contains(it.assetId) }
             def _keys = []; def _labelByKey = [:]; def _adjBy = [:]; def _trfBy = [:]; def _ioInBy = [:]; def _ioOutBy = [:]
             def _bc = java.util.Calendar.getInstance(); _bc.setTime(_mvStart); def _bendMs = _mvEnd.getTime(); int _guard = 0
-            while (_bc.getTimeInMillis() < _bendMs && _guard < 400) {
+            if (!_daily) _bc.set(java.util.Calendar.DAY_OF_MONTH, 1)
+            if (_yearly) _bc.set(java.util.Calendar.MONTH, 0)
+            while (_bc.getTimeInMillis() < _bendMs && _guard < 10000) {
                 def _k = _bfmt.format(_bc.getTime())
                 if (!_labelByKey.containsKey(_k)) { _keys.add(_k); _labelByKey[_k] = _lfmt.format(_bc.getTime()); _adjBy[_k]=0; _trfBy[_k]=0; _ioInBy[_k]=0G; _ioOutBy[_k]=0G }
-                _bc.add(_daily ? java.util.Calendar.DAY_OF_MONTH : java.util.Calendar.MONTH, 1); _guard++
+                _bc.add(_daily ? java.util.Calendar.DAY_OF_MONTH : (_yearly ? java.util.Calendar.YEAR : java.util.Calendar.MONTH), 1); _guard++
             }
             _adjs.each { def _k = _bfmt.format(it.adjustmentDate); if (_adjBy.containsKey(_k)) _adjBy[_k] = _adjBy[_k] + 1 }
             _trfs.each { def _k = _bfmt.format(it.transferDate); if (_trfBy.containsKey(_k)) _trfBy[_k] = _trfBy[_k] + 1 }
@@ -301,8 +347,8 @@
             mvInJson = "["+_mIn.join(",")+"]"; mvOutJson = "["+_mOut.join(",")+"]"
             def _ioInTot = 0G; def _ioOutTot = 0G; _ioInBy.values().each { _ioInTot += it }; _ioOutBy.values().each { _ioOutTot += it }
             mvInTotalDisp = ec.l10n.format(_ioInTot, '#,##0.##'); mvOutTotalDisp = ec.l10n.format(_ioOutTot, '#,##0.##')
-            mvAdjCount = _adjs.size(); mvTrfCount = _trfs.size(); mvHasData = (_adjs.size() + _trfs.size() + _ioLedger.size()) > 0
-            mvRangeLabel = dashDate ? (dashDate == dashDateTo ? dashDate : (dashDate + " to " + dashDateTo)) : "last 6 months"
+            mvAdjCount = _adjs.size(); mvTrfCount = _trfs.size(); mvHasData = _activeShop ? !_ioLedger.isEmpty() : ((_adjs.size() + _trfs.size() + _ioLedger.size()) > 0)
+            mvRangeLabel = dashDate ? (dashDate == dashDateTo ? dashDate : (dashDate + " to " + dashDateTo)) : (_allTime ? "All time" : "last 6 months")
             // ZE-INV §5: week-over-week units delta = net AssetDetail movement in the last 7 days (org-scoped) — real.
             def _ioWc7 = java.util.Calendar.getInstance(); _ioWc7.setTime(_now); _ioWc7.add(java.util.Calendar.DAY_OF_MONTH, -7); def _ioWkAgo = new java.sql.Timestamp(_ioWc7.getTimeInMillis())
             def _ioWkNet = 0G
@@ -332,6 +378,7 @@
             // matching /qapps where the row-col lg8/lg4 renders 2-col natively). Users can still resize; a saved pref wins.
             dashSizeCsv = (ec.user.getPreference('INV_DASH_SIZE') ?: 'category:half,pricecov:half')
             urlSettings = dashDate ? ("?dashDate="+dashDate+"&dashDateTo="+dashDateTo+"&showSettings=1") : "?showSettings=1"
+            if (dateMode) urlSettings += '&dateMode=' + java.net.URLEncoder.encode(dateMode.toString(), 'UTF-8')
 
             // ========================================================================================
             // inventory-dashboard mockup restructure (real data only — NO fabricated deltas)
@@ -367,7 +414,7 @@
 
             // §9 Recent Transactions as ITEM-LEVEL movements from the ledger (newest first) — real.
             def _rMoves = []; def _pNameCache = [:]
-            def _rlRows = ef.find("mantle.product.asset.AssetDetail").orderBy("-effectiveDate").limit(50).list()
+            def _rlRows = ef.find("mantle.product.asset.AssetDetail").condition("assetId", EntityCondition.IN, _ioAssetIds ? (_ioAssetIds as List) : ['__none__']).condition("quantityOnHandDiff", EntityCondition.NOT_EQUAL, 0G).orderBy("-effectiveDate,assetDetailId").limit(50).list()
             for (r in _rlRows) {
                 if (!_ioAssetIds.contains(r.assetId)) continue
                 def _d = (r.quantityOnHandDiff ?: 0G) as BigDecimal
@@ -412,13 +459,307 @@
             // §8 Quick Actions tile links — surface-correct ABSOLUTE paths derived from the current screen path
             // (raw <a> relative hrefs don't follow Moqui's ../ sibling semantics, so build the parent path here).
             def _qaBase = (ec.web?.request?.requestURI ?: '').replaceAll('/+$','')
-            def _qaParent = _qaBase.contains('/') ? _qaBase.substring(0, _qaBase.lastIndexOf('/')) : _qaBase
+            def _qaParent = _qaBase.endsWith('/Inventory') ? _qaBase : (_qaBase.contains('/') ? _qaBase.substring(0, _qaBase.lastIndexOf('/')) : _qaBase)
+            qaFacility = _qaParent + '/FindFacility'; qaEditProduct = _qaParent + '/FindProduct'
             qaProducts = _qaParent + '/FindProduct'; qaReceive = _qaParent + '/FindReceipt'; qaTransfer = _qaParent + '/StockTransfers'
             qaAdjust = _qaParent + '/StockAdjustments'; qaLevels = _qaParent + '/StockLevels'; qaForecast = _qaParent + '/DemandForecast'
+            if (_activeShop) qaLevels += '?facilityId=' + java.net.URLEncoder.encode(_activeShop, 'UTF-8')
+            def _detailScope = '?dashFacilityId=' + java.net.URLEncoder.encode(dashFacilityId, 'UTF-8')
+            ['dashDate','dashDateTo','dateMode'].each { key -> if (context[key]) _detailScope += '&' + key + '=' + java.net.URLEncoder.encode(context[key].toString(), 'UTF-8') }
+            qaRecent = _qaParent + '/DashboardDetails' + _detailScope + '&listType=movements'
+            qaLowstock = _qaParent + '/DashboardDetails' + _detailScope + '&listType=lowstock'
+            qaIncomplete = _qaParent + '/DashboardDetails' + _detailScope + '&listType=products'
+            if (dashFacilityId) {
+                def _warehouseParam = '&dashFacilityId=' + java.net.URLEncoder.encode(dashFacilityId, 'UTF-8')
+                ['urlAll','urlToday','urlWeek','urlMonth','url30','urlYear','urlCustom','urlSettings'].each { k -> context[k] = context[k] + _warehouseParam }
+            }
         ]]></script>
     </actions>
 
     <widgets>
+        <render-mode><text type="html,vuet,qvt" template="true"><![CDATA[<div class="inv-dashboard">
+<header class="inv-header">
+<div>
+<h1>Inventory Dashboard</h1>
+<p>Real-time overview of your inventory operations</p>
+</div>
+<div class="inv-filters">
+<form class="inv-warehouse-filter" method="get" action=".">
+<label class="inv-control" style="margin:0">
+<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="m12 3 9 5-9 5-9-5 9-5ZM3 8v9l9 5 9-5V8M12 13v9"/></svg>
+<select name="dashFacilityId" aria-label="Warehouse" onchange="this.form.submit()" style="border:0;background:transparent;color:inherit;font:inherit;max-width:210px;padding:0;appearance:none">
+<option value="">All Warehouses</option>
+<#list warehouseOptions as w><option value="${w.facilityId?html}" <#if dashFacilityId == w.facilityId>selected</#if>>${w.facilityName?html}</option></#list>
+</select><span aria-hidden="true">▾</span>
+</label><input type="hidden" name="dashDate" value="${dashDate}"/><input type="hidden" name="dashDateTo" value="${dashDateTo}"/><input type="hidden" name="dateMode" value="${(dateMode!'')?html}"/>
+</form>
+<details class="inv-date">
+<summary class="inv-control">${mvRangeLabel} ▾</summary>
+<form method="get" action="."><input type="hidden" name="dashFacilityId" value="${dashFacilityId?html}"/>
+<label>From<input type="date" name="dashDate" value="${dashDate}" required>
+</label>
+<label>To<input type="date" name="dashDateTo" value="${dashDateTo}" required>
+</label>
+<button type="submit">Apply range</button>
+<a href="${urlWeek}">This week</a>
+<a href="${urlAll}">All time</a>
+</form>
+</details>
+<#if invCanWrite!false>
+<a class="inv-control inv-primary" href="${qaEditProduct}">
+<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true">
+<path d="m12 3 9 5-9 5-9-5 9-5ZM3 8v9l9 5 9-5V8M12 13v9"/>
+</svg>Add New</a>
+</#if>
+</div>
+</header>
+<#if showKpis>
+<div class="inv-stats">
+<article class="inv-stat inv-violet">
+<span class="inv-icon" style="font-size:32px">
+<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true">
+<path d="m12 3 9 5-9 5-9-5 9-5ZM3 8v9l9 5 9-5V8M12 13v9"/>
+</svg>
+</span>
+<div>
+<span class="inv-stat-label">Total Items</span>
+<strong>${totalItemsDisp}</strong>
+<span class="inv-stat-caption">Organization catalog</span>
+</div>
+<div class="inv-delta">Current catalog</div>
+</article>
+<article class="inv-stat inv-blue">
+<span class="inv-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg></span>
+<div>
+<span class="inv-stat-label">Total Stock Value</span>
+<strong>₹${stockValueDispK}</strong>
+<span class="inv-stat-caption">${warehouseScopeLabel?html}</span>
+</div>
+<div class="inv-delta"><#if kpiValSub?contains('%')><span style="color:${kpiValColor};font-weight:600;display:inline-flex;align-items:center;gap:8px"><#if kpiValColor == '#DC2626'><svg viewBox="0 0 24 24" width="14" height="14" style="width:14px;height:14px;vertical-align:middle" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14m-6-6 6 6 6-6"/></svg><#else><svg viewBox="0 0 24 24" width="14" height="14" style="width:14px;height:14px;vertical-align:middle" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5m-6 6 6-6 6 6"/></svg></#if>${kpiValSub?keep_before('%')?replace('▲','')?replace('▼','')?replace('+','')?replace('−','')?replace('-','')?trim}%</span><span style="margin-left:20px">${kpiValSub?keep_after('%')}</span><#else>${kpiValSub}</#if></div>
+</article>
+<article class="inv-stat inv-green">
+<span class="inv-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12m-6-6 6 6 6-6M3 15v6h18v-6"/></svg></span>
+<div>
+<span class="inv-stat-label">Stock In (7 days)</span>
+<strong>${weekInDisp}</strong>
+<span class="inv-stat-caption">Inventory receipts</span>
+</div>
+<div class="inv-delta"><#if kpiInSub?contains('%')><span style="color:${kpiInColor};font-weight:600;display:inline-flex;align-items:center;gap:8px"><#if kpiInColor == '#DC2626'><svg viewBox="0 0 24 24" width="14" height="14" style="width:14px;height:14px;vertical-align:middle" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14m-6-6 6 6 6-6"/></svg><#else><svg viewBox="0 0 24 24" width="14" height="14" style="width:14px;height:14px;vertical-align:middle" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5m-6 6 6-6 6 6"/></svg></#if>${kpiInSub?keep_before('%')?replace('▲','')?replace('▼','')?replace('+','')?replace('−','')?replace('-','')?trim}%</span><span style="margin-left:20px">${kpiInSub?keep_after('%')}</span><#else>${kpiInSub}</#if></div>
+</article>
+<article class="inv-stat inv-orange">
+<span class="inv-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 17V3m-6 6 6-6 6 6M3 15v6h18v-6"/></svg></span>
+<div>
+<span class="inv-stat-label">Stock Out (7 days)</span>
+<strong>${weekOutDisp}</strong>
+<span class="inv-stat-caption">Inventory issues</span>
+</div>
+<div class="inv-delta"><#if kpiOutSub?contains('%')><span style="color:${kpiOutColor};font-weight:600;display:inline-flex;align-items:center;gap:8px"><#if kpiOutColor == '#DC2626'><svg viewBox="0 0 24 24" width="14" height="14" style="width:14px;height:14px;vertical-align:middle" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14m-6-6 6 6 6-6"/></svg><#else><svg viewBox="0 0 24 24" width="14" height="14" style="width:14px;height:14px;vertical-align:middle" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5m-6 6 6-6 6 6"/></svg></#if>${kpiOutSub?keep_before('%')?replace('▲','')?replace('▼','')?replace('+','')?replace('−','')?replace('-','')?trim}%</span><span style="margin-left:20px">${kpiOutSub?keep_after('%')}</span><#else>${kpiOutSub}</#if></div>
+</article>
+<article class="inv-stat inv-red">
+<span class="inv-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="4" width="14" height="18" rx="2"/><path d="M9 4V2h6v2M8 10h8M8 14h8M8 18h5"/></svg></span>
+<div>
+<span class="inv-stat-label">Low Stock Items</span>
+<strong>${lowStockCountDisp}</strong>
+<span class="inv-stat-caption">Reorder required</span>
+</div>
+<div class="inv-delta">Below reorder point</div>
+</article>
+</div>
+</#if>
+<div class="inv-middle">
+<#if showWarehouse>
+<article class="inv-card inv-warehouse">
+<div class="inv-card-head">
+<h2>Stock by Warehouse</h2>
+</div>
+<div class="inv-warehouse-list">
+<#list warehouseList as w>
+<div>
+<span>${w.name?html}</span>
+<strong>₹${w.valueDisp}</strong>
+</div>
+<#else>
+<p class="inv-empty">No inventory on hand in the current shop scope.</p>
+</#list>
+</div>
+<div class="inv-total">
+<span>Total Stock Value</span>
+<strong>₹${warehouseTotalDisp}</strong>
+</div>
+</article>
+</#if>
+<#if showMovements>
+<article class="inv-card inv-movement">
+<div class="inv-card-head">
+<h2>Stock Movement Overview</h2>
+</div>
+<p class="inv-muted">${mvRangeLabel} · ${mvInTotalDisp} in · ${mvOutTotalDisp} out</p>
+<#if mvHasData>
+<div id="inventoryOverviewChart">
+</div>
+<img alt="" style="display:none" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" onload="zChart(this,function(){var el=document.getElementById('inventoryOverviewChart');if(!el||el.dataset.ready)return;el.dataset.ready='true';var s=getComputedStyle(el.closest('.inv-dashboard'));new ApexCharts(el,{chart:{type:'line',height:230,toolbar:{show:false},fontFamily:'Inter, sans-serif'},series:[{name:'Stock In',data:${mvInJson}},{name:'Stock Out',data:${mvOutJson}}],xaxis:{categories:${mvLabelsJson}},colors:[s.getPropertyValue('--green').trim(),s.getPropertyValue('--orange').trim()],stroke:{curve:'smooth',width:2},markers:{size:4},fill:{type:'solid',opacity:1},dataLabels:{enabled:false},legend:{position:'top',horizontalAlign:'left'},yaxis:{min:0},grid:{show:false},tooltip:{theme:'light'}}).render();})"/>
+<#else>
+<div class="inv-chart-empty">
+<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true">
+<path d="m12 3 9 5-9 5-9-5 9-5ZM3 8v9l9 5 9-5V8M12 13v9"/>
+</svg>
+<strong>No stock movements in this period</strong>
+<span>Choose a wider date range or record a receipt, transfer, or adjustment.</span>
+</div>
+</#if>
+</article>
+</#if>
+<article class="inv-card">
+<div class="inv-card-head">
+<h2>Quick Actions</h2>
+</div>
+<div class="inv-actions">
+<a class="inv-action inv-violet" href="${qaProducts}">
+<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true">
+<path d="M14 2H5v20h14V7l-5-5ZM14 2v6h5M8 12h8M8 16h8"/>
+</svg>
+<span>Add / Find Products</span>
+</a>
+<a class="inv-action inv-violet" href="${qaTransfer}">
+<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true">
+<path d="M3 7h18m-5-5 5 5-5 5M21 17H3m5-5-5 5 5 5"/>
+</svg>
+<span>Stock Transfer</span>
+</a>
+<a class="inv-action inv-orange" href="${qaAdjust}">
+<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true">
+<rect x="3" y="3" width="18" height="18" rx="2"/>
+<path d="M3 9h18M9 3v6M15 3v6"/>
+</svg>
+<span>Stock Adjustment</span>
+</a>
+<a class="inv-action inv-green" href="${qaReceive}">
+<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true">
+<path d="M14 2H5v20h14V7l-5-5ZM14 2v6h5M8 12h8M8 16h8"/>
+</svg>
+<span>View GRN / Receipts</span>
+</a>
+<a class="inv-action inv-blue" href="${qaLevels}">
+<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true">
+<path d="M14 2H5v20h14V7l-5-5ZM14 2v6h5M8 12h8M8 16h8"/>
+</svg>
+<span>View Stock Levels</span>
+</a>
+<a class="inv-action inv-orange" href="${qaForecast}">
+<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true">
+<path d="M12 3v9h9M9 3a9 9 0 1 0 12 12"/>
+</svg>
+<span>Sales Forecast</span>
+</a>
+</div>
+</article>
+</div>
+<div class="inv-bottom">
+<#if showRecent>
+<article class="inv-card">
+<div class="inv-card-head">
+<h2>Recent Transactions</h2>
+<a href="${qaRecent}">View All</a>
+</div>
+<div class="inv-table-wrap">
+<table>
+<thead>
+<tr>
+<th>Date &amp; Time</th>
+<th>Item</th>
+<th>Type</th>
+<th class="inv-number">Qty</th>
+<th class="inv-number">Amount</th>
+</tr>
+</thead>
+<tbody>
+<#list recentMoves as r>
+<tr>
+<td>${r.dateDisp}</td>
+<td>${r.name?html}</td>
+<td>
+<span class="inv-badge ${r.isIn?string('inv-green','inv-orange')}">${r.isIn?string('Stock In','Stock Out')}</span>
+</td>
+<td class="inv-number <#if !r.isIn>inv-negative</#if>">${r.qtyDisp}</td>
+<td class="inv-number <#if !r.isIn>inv-negative</#if>">${r.amtDisp}</td>
+</tr>
+<#else>
+<tr>
+<td colspan="5" class="inv-empty">No stock movements recorded yet.</td>
+</tr>
+</#list>
+</tbody>
+</table>
+</div>
+</article>
+</#if>
+<#if showLowstock>
+<article class="inv-card">
+<div class="inv-card-head">
+<h2>Low Stock Alerts</h2>
+<a href="${qaLowstock}">View All</a>
+</div>
+<div class="inv-table-wrap">
+<table>
+<thead>
+<tr>
+<th>Item</th>
+<th class="inv-number">Available</th>
+<th class="inv-number">Min. Required</th>
+</tr>
+</thead>
+<tbody>
+<#list lowStockList as l>
+<tr>
+<td>${l.name?html}</td>
+<td class="inv-number inv-negative">${l.qohDisp}</td>
+<td class="inv-number">${l.rpDisp}</td>
+</tr>
+<#else>
+<tr>
+<td colspan="3" class="inv-empty">All tracked items are above their reorder point.</td>
+</tr>
+</#list>
+</tbody>
+</table>
+</div>
+</article>
+</#if>
+<article class="inv-card">
+<div class="inv-card-head">
+<h2>Products Needing Details</h2>
+<a href="${qaIncomplete}">View All</a>
+</div>
+<table>
+<thead>
+<tr>
+<th>By Category</th>
+<th class="inv-number">Count</th>
+</tr>
+</thead>
+<tbody>
+<#list compRows as c>
+<tr>
+<td>${c.label}</td>
+<td class="inv-number">
+<span class="inv-count">${c.n}</span>
+</td>
+</tr>
+</#list>
+</tbody>
+<tfoot>
+<tr>
+<td>Unique products needing attention</td>
+<td class="inv-number">${compTotalDisp}</td>
+</tr>
+</tfoot>
+</table>
+</article>
+</div>
+<img alt="" style="display:none" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" onload="(function(img){var root=img.parentNode;var m=location.pathname.match(/^(.*\/Inventory)(?:\/|$)/);if(!m)return;root.querySelectorAll('a').forEach(function(a){var h=a.getAttribute('href');var n=h&amp;&amp;h.match(/\/Inventory\/(.*)$/);if(n)a.href=m[1]+'/'+n[1];});var f=root.querySelector('.inv-date form');if(f)f.action=location.pathname;var wf=root.querySelector('.inv-warehouse-filter');if(wf)wf.action=location.pathname;})(this)"/>
+</div>]]>
+</text></render-mode>
+        <render-mode><text type="html,vuet,qvt"><![CDATA[<details class="inv-additional"<#if (showSettings!'') == '1'> open</#if>><summary>Customize dashboard and additional insights</summary>]]></text></render-mode>
         <!-- Header -->
         <container style="q-mb-md">
             <label text="Inventory Dashboard" type="h3" style="text-primary text-weight-bold q-my-none"/>
@@ -427,7 +768,7 @@
 
         <!-- ZE-DASH: date-range filter (drives the Stock Movements chart) + customize gear -->
         <container style="q-px-lg q-py-md q-mb-md zenith-card bg-white shadow-1 border-radius-lg">
-            <render-mode><text type="html,vuet,qvt" template="true"><![CDATA[<div style="display:flex;flex-wrap:wrap;align-items:center;gap:8px;font-family:Segoe UI,Arial,sans-serif;margin-bottom:8px"><span style="font-size:11.5px;font-weight:800;color:#6B7280;letter-spacing:.06em;margin-right:4px">MOVEMENTS RANGE</span><details class="zdash-dr"><summary class="zdash-chip zdash-dr-sum${showCustom?string(' on','')}">&#128197; <#if (showCustom!false) && (dashDate!'')?has_content>${dashDate}<#if (dashDateTo!'')?has_content && dashDateTo != dashDate> to ${dashDateTo}</#if><#else>Date-wise</#if> &#9662;</summary><form method="get" action="." class="zdash-dr-pop"><input type="hidden" name="dateMode" value="custom"/><div class="zdash-dr-row"><span>From</span><input type="date" name="dashDate" value="${dashDate}"/></div><div class="zdash-dr-row"><span>To</span><input type="date" name="dashDateTo" value="${dashDateTo}"/></div><button type="submit" class="zdash-dr-apply">&#10003; Apply</button></form></details><a href="${urlAll}" class="zdash-chip${(presetActive=='all' && !showCustom)?string(' on','')}">All time</a><a href="${urlToday}" class="zdash-chip${(presetActive=='today')?string(' on','')}">Today</a><a href="${urlWeek}" class="zdash-chip${(presetActive=='week')?string(' on','')}">This Week</a><a href="${urlMonth}" class="zdash-chip${(presetActive=='month')?string(' on','')}">This Month</a><a href="${url30}" class="zdash-chip${(presetActive=='last30')?string(' on','')}">Last 30 Days</a><a href="${urlYear}" class="zdash-chip${(presetActive=='year')?string(' on','')}">This Year</a><a href="${urlSettings}" title="Customize dashboard widgets" style="margin-left:auto;color:#9CA3AF;font-size:18px;line-height:1;text-decoration:none;padding:2px 6px">&#9881;</a></div><div style="font-size:11px;color:#9CA3AF">This range drives the <b>Stock Movements</b> chart. The KPI tiles always show your <b>current</b> stock.</div>]]></text></render-mode>
+            <render-mode><text type="html,vuet,qvt" template="true"><![CDATA[<div style="display:flex;flex-wrap:wrap;align-items:center;gap:8px;font-family:Segoe UI,Arial,sans-serif;margin-bottom:8px"><span style="font-size:11.5px;font-weight:800;color:#6B7280;letter-spacing:.06em;margin-right:4px">MOVEMENTS RANGE</span><details class="zdash-dr"><summary class="zdash-chip zdash-dr-sum${showCustom?string(' on','')}">&#128197; <#if (showCustom!false) && (dashDate!'')?has_content>${dashDate}<#if (dashDateTo!'')?has_content && dashDateTo != dashDate> to ${dashDateTo}</#if><#else>Date-wise</#if> &#9662;</summary><form method="get" action="." class="zdash-dr-pop"><img alt="" style="display:none" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" onload="this.parentNode.action=location.pathname"/><input type="hidden" name="dateMode" value="custom"/><input type="hidden" name="dashFacilityId" value="${dashFacilityId?html}"/><div class="zdash-dr-row"><span>From</span><input type="date" name="dashDate" value="${dashDate}"/></div><div class="zdash-dr-row"><span>To</span><input type="date" name="dashDateTo" value="${dashDateTo}"/></div><button type="submit" class="zdash-dr-apply">&#10003; Apply</button></form></details><a href="${urlAll}" class="zdash-chip${(presetActive=='all' && !showCustom)?string(' on','')}">All time</a><a href="${urlToday}" class="zdash-chip${(presetActive=='today')?string(' on','')}">Today</a><a href="${urlWeek}" class="zdash-chip${(presetActive=='week')?string(' on','')}">This Week</a><a href="${urlMonth}" class="zdash-chip${(presetActive=='month')?string(' on','')}">This Month</a><a href="${url30}" class="zdash-chip${(presetActive=='last30')?string(' on','')}">Last 30 Days</a><a href="${urlYear}" class="zdash-chip${(presetActive=='year')?string(' on','')}">This Year</a><a href="${urlSettings}" title="Customize dashboard widgets" style="margin-left:auto;color:#9CA3AF;font-size:18px;line-height:1;text-decoration:none;padding:2px 6px">&#9881;</a></div><div style="font-size:11px;color:#9CA3AF">This range drives the <b>Stock Movements</b> chart. The KPI tiles always show your <b>current</b> stock.</div>]]></text></render-mode>
             <!-- ZE-DATEPICKER: superseded by the compact <details> date-range pill in the chip row; keep the
                  form defined but never render it (condition false) so the bulky From/To panel can't reappear. -->
             <section name="wDateCustom">
@@ -446,6 +787,10 @@
                 <container style="q-px-lg q-py-md q-mb-md zenith-card bg-white shadow-1 border-radius-lg">
                     <render-mode><text type="html"><![CDATA[<div style="font-size:12.5px;font-weight:800;color:#7C3AED;letter-spacing:.04em;margin-bottom:2px">&#9881; CUSTOMIZE DASHBOARD</div><div style="font-size:12px;color:#6B7280;margin-bottom:8px">Tick the sections you want to see &mdash; saved to your account. Drag the handle on any card to reorder.</div>]]></text></render-mode>
                     <form-single name="DashLayoutForm" transition="saveDashLayout">
+                        <field name="dashDate"><default-field><hidden/></default-field></field>
+                        <field name="dashDateTo"><default-field><hidden/></default-field></field>
+                        <field name="dashFacilityId"><default-field><hidden/></default-field></field>
+                        <field name="dateMode"><default-field><hidden/></default-field></field>
                         <field name="w_kpis"><default-field title="Catalog KPIs (products, categories, stores)"><check><option key="Y" text=" "/></check></default-field></field>
                         <field name="w_health"><default-field title="Health strip (priced / missing / expiring / low stock)"><check><option key="Y" text=" "/></check></default-field></field>
                         <field name="w_movements"><default-field title="Stock Movements chart (over the selected range)"><check><option key="Y" text=" "/></check></default-field></field>
@@ -458,8 +803,8 @@
                         <field name="saveBtn"><default-field title=""><submit text="Save Layout" icon="fa fa-check"/></default-field></field>
                     </form-single>
                     <container style="row q-gutter-sm q-mt-sm">
-                        <link url="resetDashLayout" text="Reset to Default" icon="fa fa-undo" btn-type="warning"/>
-                        <link url="." text="Close" btn-type="flat"/>
+                        <link url="resetDashLayout" parameter-map="[dashDate:dashDate, dashDateTo:dashDateTo, dashFacilityId:dashFacilityId, dateMode:dateMode, showSettings:'0']" text="Reset to Default" icon="fa fa-undo" btn-type="warning"/>
+                        <link url="." parameter-map="[dashDate:dashDate, dashDateTo:dashDateTo, dashFacilityId:dashFacilityId, dateMode:dateMode, showSettings:'0']" text="Close" btn-type="flat"/>
                     </container>
                 </container>
             </widgets>
@@ -781,5 +1126,6 @@
         <render-mode><text type="html"><![CDATA[</div>]]></text></render-mode>
 
         <render-mode><text type="html" template="true"><![CDATA[<script>window.__dashLayout={saveUrl:(("${ec.web.request.requestURI}").replace(/\/+$/,''))+'/saveDashOrder',order:"${dashOrderCsv}",sizes:"${dashSizeCsv}"};</script><script src="/zenithstatic/js/dash-layout.js?v=6"></script>]]></text></render-mode>
+        <render-mode><text type="html,vuet,qvt"><![CDATA[</details>]]></text></render-mode>
     </widgets>
 </screen>
