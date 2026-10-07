@@ -44,8 +44,8 @@ async function submit(id){await Promise.all([page.waitForNavigation({waitUntil:'
    return {nativePost:true,countryRegion:true};
   });
   await record(shell+' registration edit persists safe text',async()=>{
-   await open(`/${shell}/zenith/tax/FindTaxRegistration`);
-   const href=await page.$$eval('a[href*="EditTaxRegistration"]',(a,shell)=>a.filter(e=>shell==='qapps'?e.id.includes('_registrationId_'):e.closest('tr')?.textContent.includes('29ABCDE1234F2ZV')).map(e=>e.getAttribute('href')).sort((x,y)=>Number(new URL(y,location.origin).searchParams.get('registrationId'))-Number(new URL(x,location.origin).searchParams.get('registrationId')))[0],shell);assert(href,'New contact registration edit link');await open(href);
+   await open(`/${shell}/zenith/tax/FindTaxRegistration`);if(shell==='qapps')await page.waitForFunction(()=>document.querySelectorAll('a[id*="_registrationId_"]').length>=3,{timeout:15000});
+   const href=await page.$$eval('a[href*="EditTaxRegistration"]',(a,shell)=>a.filter(e=>shell==='qapps'?e.id.includes('_registrationId_'):e.closest('tr')?.textContent.includes('29ABCDE1234F2ZV')).map(e=>e.getAttribute('href')).filter(h=>Number.isFinite(Number(new URL(h,location.origin).searchParams.get('registrationId')))).sort((x,y)=>Number(new URL(y,location.origin).searchParams.get('registrationId'))-Number(new URL(x,location.origin).searchParams.get('registrationId')))[0],shell);assert(href,'New contact registration edit link');await open(href);
    await fill('.zc-tax-form [name=description]',"Synthetic UI O'Brien edited");
    const button=await page.$('.zc-tax-form button[type=submit]');assert(button,'Edit button');await Promise.all([page.waitForNavigation({waitUntil:'networkidle2'}),button.click()]);
    assert(await page.$eval('.zc-tax-form [name=description]',e=>e.value==="Synthetic UI O'Brien edited"),'Description did not persist');assert(!await page.$('.zc-tax-form img[src="x"]'),'XSS markup executed');
