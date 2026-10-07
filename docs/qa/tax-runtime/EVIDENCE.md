@@ -1,5 +1,7 @@
 # Local verification evidence
 
+These retained local summaries verify baseline `0bec06d7`, before the senior-review TaxSummary parity follow-up. The rebased candidate adds four own/foreign invoice/POS summary cases; its exact-SHA CI results and baseline acceptance are recorded in PR #28.
+
 - Date: 7 October 2026. Component overlay matches the candidate application changes; latest master was merged without conflicts. Subsequent changes exclude unverified legacy TDS deduction/deposit edits.
 - Clean runtime archive SHA256: `0305b2d2f7124781c41de04eb8aa8a7847ee5116ee01f09dc52d7f12dc513b93`.
 - Running framework jar SHA256: `47c2b9cd86b005437abb75dbfd2d5027c00687ead4c5f7b0c9577b340f9e2e3d`.

@@ -92,6 +92,9 @@ check('master rates cannot be changed by tenant admin','rate',{'taxName':'synthe
 check('forged org preference resolves membership','forgeScope',{},lambda r:True)
 check('forged preference cannot grant foreign access','deleteRegistration',{'registrationId':'TAX_QA_REG_B'},lambda r:False,error=True)
 post('resetScope')
+for reference_type,own_id,foreign_id in [('InvoiceItem','TAX_QA_INV_A','TAX_QA_INV_FOREIGN'),('PosTransactionItem','TAX_QA_POS_A','TAX_QA_POS_B')]:
+ check('own '+reference_type+' tax summary preserved','taxSummary',{'referenceType':reference_type,'referenceId':own_id},lambda r:eq(r['grandTotalTax'],18) and len(r['taxSummary'])==1 and eq(r['taxSummary'][0]['totalTax'],18))
+ check('foreign '+reference_type+' tax summary denied','taxSummary',{'referenceType':reference_type,'referenceId':foreign_id},lambda r:False,error=True)
 check('foreign tax document denied','taxLines',{'referenceType':'InvoiceItem','referenceId':'TAX_QA_INV_FOREIGN'},lambda r:False,error=True)
 check('fake PIN distance prohibited','distance',{'fromPincode':'560001','toPincode':'600001'},lambda r:False,error=True)
 check('fake payment QR prohibited','qr',{'invoiceId':'TAX_QA_INV_A','upiId':'synthetic@invalid','merchantName':'Disposable'},lambda r:False,error=True)

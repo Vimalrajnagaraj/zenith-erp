@@ -51,3 +51,7 @@ The SOP contains older examples; current rules take precedence. B2CL above ₹1 
 ## Verification evidence
 
 Final local counts, clean runtime fingerprint, DB goldens, cleanup proof and exact-SHA CI status are recorded in `EVIDENCE.md` and the PR. All fixtures/screenshots are synthetic; no production credentials, records or session-bearing HTML are attached. A checksum-valid QA GSTIN is not a verified real registration.
+
+## Senior-review parity follow-up
+
+`TaxServices.get#TaxSummary` lacked the document-access guard already present on its siblings. The shared guard now runs before the aggregate query. Four disposable cases cover own/foreign invoice and POS summaries; this changes no POS source files. Evidence for the rebased candidate is linked in PR #28. The senior approved merge review after this parity fix; the MARUTHI deployment gates above remain separate and mandatory.
