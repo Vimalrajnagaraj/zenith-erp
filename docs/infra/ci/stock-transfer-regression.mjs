@@ -5,8 +5,10 @@ import {execFileSync} from 'node:child_process';
 import {writeFileSync} from 'node:fs';
 const base=process.env.STOCK_TRANSFER_URL || 'http://localhost:8080';
 assert(['localhost','127.0.0.1'].includes(new URL(base).hostname),'Local verification only');
+const database=process.env.STOCK_TRANSFER_DATABASE || 'moqui';
+assert(/^[a-z][a-z0-9_]*$/.test(database),'Local database name');
 const route='/apps/zenith/Inventory/';
-const sql=statement => execFileSync('docker',['exec','zenith-erp-db-1','psql','-U','moqui','-d','moqui','-At','-v','ON_ERROR_STOP=1','-c',statement],{encoding:'utf8'}).trim();
+const sql=statement => execFileSync('docker',['exec','zenith-erp-db-1','psql','-U','moqui','-d',database,'-At','-v','ON_ERROR_STOP=1','-c',statement],{encoding:'utf8'}).trim();
 const quote=s=>"'"+String(s).replaceAll("'","''")+"'";
 const row=(table,where)=>JSON.parse(sql(`select row_to_json(t) from (select * from ${table} where ${where}) t`)||'null');
 const transfer=id=>row('stock_transfer',`stock_transfer_id=${quote(id)}`);
@@ -68,7 +70,7 @@ try {
  check('Explicit zero price and fractional quantity retained',()=>{assert.equal(Number(line(first,seq).quantity),7.5);assert.equal(Number(line(first,seq).unit_amount),0);});
  await writer.post('StockTransfers','updateTransfer',{stockTransferId:first,vehicleNumber:' audit van ',statusId:'StxReceived',organizationPartyId:'STFIX_OTHER',totalValue:'999',fromFacilityId:'STFIX_FOREIGN'});
  check('Logistics saves only permitted fields',()=>{const t=transfer(first);assert.equal(t.status_id,'StxDraft');assert.equal(t.organization_party_id,'STFIX_ORG');assert.equal(t.from_facility_id,'STFIX_A');assert.equal(Number(t.total_value),0);assert.equal(t.vehicle_number,'AUDIT VAN');});
- await ship(first); await ship(first);
+ await writer.request('/qapps/zenith/Inventory/StockTransfers/shipTransfer',{stockTransferId:first}); await ship(first);
  check('Shipping moves stock once and preserves reservations',()=>{assert.equal(transfer(first).status_id,'StxInTransit');assert.equal(balance('STFIX_P','STFIX_A'),7.5);assert.equal(balance('STFIX_P','STFIX_A','available_to_promise_total'),5.5);});
  await writer.post('EditStockTransfer','deleteItem',{stockTransferId:first,transferItemSeqId:seq}); await add(first,'1');
  await writer.post('EditStockTransfer','editHeader',{stockTransferId:first,fromFacilityId:'STFIX_B',toFacilityId:'STFIX_A'});
@@ -76,7 +78,7 @@ try {
  for(const quantityReceived of ['-1','8']) await writer.post('EditStockTransfer','setReceivedQty',{stockTransferId:first,transferItemSeqId:seq,quantityReceived});
  check('Receipt underflow and overage rejected',()=>assert.equal(line(first,seq).quantity_received,null));
  await writer.post('EditStockTransfer','setReceivedQty',{stockTransferId:first,transferItemSeqId:seq,quantityReceived:'6'});
- await receive(first);await receive(first);
+ await writer.request('/qapps/zenith/Inventory/StockTransfers/receiveTransfer',{stockTransferId:first});await receive(first);
  check('Partial receiving moves the actual quantity once',()=>{assert.equal(transfer(first).status_id,'StxReceived');assert.equal(balance('STFIX_P','STFIX_B'),8);assert.equal(Number(line(first,seq).quantity_received),6);});
  check('Asset totals and movement ledger agree',()=>{for(const asset of ['STFIX_A1','STFIX_B1']) assert.equal(Number(sql(`select quantity_on_hand_total from asset where asset_id=${quote(asset)}`)),Number(sql(`select coalesce(sum(quantity_on_hand_diff),0) from asset_detail where asset_id=${quote(asset)}`)));assert.equal(Number(sql(`select sum(quantity_on_hand_diff) from asset_detail where description=${quote('Transfer out '+first)}`)),-7.5);});
  const zero=await create();const zseq=await add(zero,'1');await ship(zero);
@@ -107,8 +109,25 @@ try {
  const found=await writer.request(route+'StockTransfers?quickSearch=fractional');
  check('Product search returns scoped transfer matches',()=>{if(!found.text.includes(first))writeFileSync('tmp/stock-transfer-search-failure.html',found.text);assert(found.text.includes(first));assert(!found.text.includes('STFIX-FOREIGN-TRANSFER'));});
  for(const surface of ['apps','qapps']) {const result=await writer.request(`/${surface}/zenith/Inventory/StockTransfers?quickSearch=fractional&pageSize=1&lastStandalone=true&renderMode=${surface==='qapps'?'qvt':'html'}`);assert.equal(result.response.status,200);assert(result.text.includes('TransferListForm'),surface+' list payload');}
+ // Rendering the enhanced list must honor the chosen primary sort and retain a stable tie-breaker.
+ sql(`update stock_transfer set transfer_date='2099-01-01' where stock_transfer_id=${quote(first)}`);
+ const sorted=await writer.request(route+'StockTransfers?pageSize=100&orderByField=-transferDate');
+ const sortedTable=sorted.text.match(/<table[^>]*id="TransferListForm_table"[^>]*>([\s\S]*?)<\/table>/)?.[1];assert(sortedTable,'Rendered transfer table');
+ const ids=[...sortedTable.matchAll(/href="[^"]*\/EditStockTransfer\?stockTransferId=([^"&]+)/g)].map(m=>m[1]);
+ check('Date ordering remains primary with stable ID tie-breaker',()=>{assert(ids.length>1);assert(!sortedTable.includes('STFIX_FOREIGN'));assert.equal(ids[0],first);});
+ const sortedNumber=await writer.request(route+'StockTransfers?pageSize=100&orderByField=transferNumber');
+ const numberTable=sortedNumber.text.match(/<table[^>]*id="TransferListForm_table"[^>]*>([\s\S]*?)<\/table>/)?.[1];assert(numberTable,'Rendered transfer table');
+ const numbers=[...numberTable.matchAll(/href="[^"]*\/EditStockTransfer\?stockTransferId=([^"&]+)/g)].map(m=>m[1]);
+ check('Transfer-number ordering honors the requested direction',()=>assert.deepEqual(numbers,[...numbers].sort()));
+ const multiSorted=await writer.request(route+'StockTransfers?pageSize=100&orderByField=transferDate&orderByField=transferNumber');
+ const multiTable=multiSorted.text.match(/<table[^>]*id="TransferListForm_table"[^>]*>([\s\S]*?)<\/table>/)?.[1];assert(multiTable,'Rendered multi-sort table');
+ const multiIds=[...new Set([...multiTable.matchAll(/href="[^"]*\/EditStockTransfer\?stockTransferId=([^"&]+)/g)].map(m=>m[1]))];
+ const expectedIds=JSON.parse(sql("select json_agg(stock_transfer_id order by transfer_date,transfer_number,stock_transfer_id desc) from stock_transfer where organization_party_id='STFIX_ORG'"));
+ check('Native multi-column sorting accepts repeated parameters',()=>assert.deepEqual(multiIds,expectedIds));
+ check('Find Options retains the product quick search',()=>assert(/name="quickSearch"[^>]*value="fractional"/.test(found.text) || /value="fractional"[^>]*name="quickSearch"/.test(found.text)));
  const exported=await writer.request(route+'StockTransfers?quickSearch=fractional&renderMode=csv&pageNoLimit=true');
  check('CSV preserves product search and tenant scope',()=>{assert(exported.text.includes(first));assert(!exported.text.includes('STFIX-FOREIGN-TRANSFER'));});
+ check('CSV has a clean eight-column header without page text or action menus',()=>{assert.equal(exported.text.split(/\r?\n/).find(line=>line.trim()),'Transfer #,Date,From,To,Value,E-Way,Status,E-Way Bill & Logistics');assert(!exported.text.includes('<form'));assert(!exported.text.includes('Move stock from'));});
  // Non-legal test markers exercise the existing inter-state branch; no provider is contacted.
  sql("update facility set facility_gstin='29-LOCAL-TEST',gst_state_code='29' where facility_id='STFIX_A'; update facility set facility_gstin='33-LOCAL-TEST',gst_state_code='33' where facility_id='STFIX_B';");
  const interstate=await create();await add(interstate,'0.5');await ship(interstate);
