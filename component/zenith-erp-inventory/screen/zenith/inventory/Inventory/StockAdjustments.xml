@@ -4,11 +4,16 @@
         default-menu-title="Adjustments" default-menu-index="5">
 
     <transition name="createAdjustment">
-        <service-call name="zenith.inventory.InventoryServices.create#StockAdjustment"/>
+        <actions>
+            <if condition="ec.web.request.method != 'POST'"><return error="true" message="Stock adjustment changes require a POST request."/></if>
+            <service-call name="zenith.inventory.InventoryServices.create#StockAdjustment" in-map="[facilityId:(context.containsKey('newFacilityId') ? newFacilityId : facilityId), adjustmentType:(context.containsKey('newAdjustmentType') ? newAdjustmentType : adjustmentType), adjustmentDate:(context.containsKey('newAdjustmentDate') ? newAdjustmentDate : adjustmentDate), remarks:(context.containsKey('newRemarks') ? newRemarks : remarks)]" out-map="context"/>
+        </actions>
+        <error-response url="."/>
         <default-response url="../EditStockAdjustment"><parameter name="stockAdjustmentId" from="stockAdjustmentId"/></default-response>
     </transition>
     <transition name="applyAdjustment">
         <actions>
+            <if condition="ec.web.request.method != 'POST'"><return error="true" message="Stock adjustment changes require a POST request."/></if>
             <!-- ZE-INV-IV-06A: same cross-tenant guard as the Edit screen — the list's Apply link posts a
                  stockAdjustmentId too, so it is an equally exploitable IDOR vector without this check -->
             <service-call name="zenith.inventory.InventoryServices.assert#StockAdjustmentAccess" in-map="[stockAdjustmentId:stockAdjustmentId]" out-map="_acc"/>
@@ -21,38 +26,59 @@
     </transition>
     <transition name="approveAdjustment">
         <actions>
+            <if condition="ec.web.request.method != 'POST'"><return error="true" message="Stock adjustment changes require a POST request."/></if>
             <!-- ZE-INV-IV-06A: block approving another tenant's adjustment -->
             <service-call name="zenith.inventory.InventoryServices.assert#StockAdjustmentAccess" in-map="[stockAdjustmentId:stockAdjustmentId]" out-map="_acc"/>
             <if condition="!_acc.allowed"><return error="true" message="You do not have access to this stock adjustment."/></if>
-            <service-call name="update#zenith.erp.inventory.StockAdjustment" in-map="[stockAdjustmentId:stockAdjustmentId, statusId:'AdjApproved']"/>
+            <service-call name="zenith.inventory.StockAdjustmentServices.approve#StockAdjustment" in-map="[stockAdjustmentId:stockAdjustmentId]"/>
         </actions>
         <default-response url="."/>
     </transition>
 
     <actions>
+        <service-call name="zenith.inventory.StockAdjustmentServices.get#StockAdjustmentScope" out-map="adjustmentScope"/>
+        <set field="adjustmentOrgId" from="adjustmentScope.organizationPartyId"/>
+        <set field="pageSize" from="pageSize ?: 100"/>
+        <script><![CDATA[
+            orderByField = orderByField instanceof Collection ? orderByField.join(',') : (orderByField ?: '-adjustmentDate,-lastUpdatedStamp').toString()
+            def stableSort = orderByField
+            if (!stableSort.split(',').any { it.replaceFirst('^[-+]', '') == 'stockAdjustmentId' }) stableSort += ',-stockAdjustmentId'
+            adjustmentSearch = new HashMap(ec.context)
+            adjustmentSearch.orderByField = stableSort
+        ]]></script>
         <entity-find entity-name="zenith.erp.inventory.StockAdjustment" list="adjList">
-            <search-form-inputs default-order-by="-adjustmentDate"/>
-            <econdition field-name="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+            <search-form-inputs input-fields-map="adjustmentSearch" default-order-by="-adjustmentDate,-lastUpdatedStamp,-stockAdjustmentId"/>
+            <econdition field-name="organizationPartyId" from="adjustmentOrgId"/>
+            <econdition field-name="organizationPartyId" operator="not-equals" value="_NA_"/>
         </entity-find>
         <entity-find entity-name="mantle.facility.Facility" list="facilityList">
+            <econdition field-name="ownerPartyId" from="adjustmentOrgId"/>
+            <econdition field-name="ownerPartyId" operator="not-equals" value="_NA_"/>
             <order-by field-name="facilityName"/></entity-find>
     </actions>
 
     <widgets>
-        <container-box><box-header title="Stock Adjustments"/><box-toolbar>
-            <!-- friendly intro shown in body below -->
-            <!-- ZE-INV-010: New Adjustment only for full Inventory write access -->
+        <container id="stockAdjustments">
+            <container style="sa-page-head">
+                <container style="sa-heading">
+                    <label text="Stock Adjustments" type="h1"/>
+                    <container id="sa-instructions" style="sa-instructions">
+                        <label text="Use this when your real shelf count is different from the system — e.g. after a stock-take, breakage, or expiry." type="p"/>
+                        <label text="Create one, add the items with their correct counts, then approve to update stock." type="p"/>
+                    </container>
+                </container>
+                <container style="sa-head-actions">
             <section name="NewAdjWrite">
               <condition><expression>invCanWrite</expression></condition>
               <widgets>
             <container-dialog id="NewAdjDialog" button-text="New Adjustment">
                 <form-single name="NewAdjForm" transition="createAdjustment">
-                    <field name="facilityId"><default-field title="Warehouse">
+                    <field name="newFacilityId" required="true"><default-field title="Warehouse">
                         <drop-down>
                             <list-options list="facilityList" key="${facilityId}" text="${facilityName}"/>
                         </drop-down>
                     </default-field></field>
-                    <field name="adjustmentType"><default-field title="Reason">
+                    <field name="newAdjustmentType" required="true"><default-field title="Reason">
                         <drop-down>
                             <option key="PhysicalCount" text="Physical Count (recount the shelf)"/>
                             <option key="Damage" text="Damage/Breakage"/>
@@ -61,19 +87,23 @@
                             <option key="Opening" text="Opening Stock"/>
                         </drop-down>
                     </default-field></field>
-                    <field name="adjustmentDate"><default-field title="Date"><date-time type="date"/></default-field></field>
-                    <field name="remarks"><default-field><text-area rows="2" cols="50"/></default-field></field>
+                    <field name="newAdjustmentDate"><default-field title="Date"><date-time type="date"/></default-field></field>
+                    <field name="newRemarks"><default-field title="Remarks"><text-area rows="2" cols="50"/></default-field></field>
                     <field name="submitButton"><default-field title="Create"><submit/></default-field></field>
                 </form-single>
             </container-dialog>
               </widgets>
             </section>
-        </box-toolbar><box-body>
-            <label text="Use this when your real shelf count is different from the system — e.g. after a stock-take, breakage, or expiry. Create one, add the items with their correct counts, then approve to update stock." type="p" style="text-grey-7 q-pa-sm q-mb-sm"/>
-            <render-mode><text type="html,qvt"><![CDATA[<span class="zlc-ph" data-ph="Search Adjustments..." style="display:none"></span>]]></text></render-mode>
+                    <render-mode><text type="html,qvt"><![CDATA[
+                        <button class="sa-collapse" type="button" aria-label="Collapse instructions" aria-expanded="true" aria-controls="sa-instructions"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="m6 15 6-6 6 6"/></svg></button>
+                    ]]></text></render-mode>
+                </container>
+            </container>
+            <container style="sa-card">
             <form-list name="AdjListForm" list="adjList" skip-form="true" header-dialog="true"
                        show-page-size="true">
                 <field name="stockAdjustmentId">
+                    <header-field title="ID"><text-find/></header-field>
                     <default-field title="ID"><link url="../EditStockAdjustment" text="${stockAdjustmentId}" parameter-map="[stockAdjustmentId:stockAdjustmentId]" style="text-indigo-8 text-weight-bold"/></default-field>
                 </field>
                 <field name="adjustmentDate">
@@ -98,7 +128,9 @@
                             <option key="Opening" text="Opening"/>
                         </drop-down>
                     </header-field>
-                    <default-field><display/></default-field>
+                    <conditional-field name="opening" condition="adjustmentType == 'Opening'" title="Type"><label text="Opening" type="span" style="sa-badge sa-amber"/></conditional-field>
+                    <conditional-field name="physical" condition="adjustmentType == 'PhysicalCount'" title="Type"><label text="Physical Count" type="span" style="sa-badge sa-blue"/></conditional-field>
+                    <default-field><label text="${adjustmentType == 'WriteOff' ? 'Write Off' : (adjustmentType ?: '—')}" type="span" style="sa-badge sa-neutral"/></default-field>
                 </field>
                 <field name="statusId">
                     <header-field title="Status">
@@ -108,24 +140,20 @@
                             <option key="AdjApplied" text="Applied"/>
                         </drop-down>
                     </header-field>
-                    <default-field><display text="${ec.entity.find('moqui.basic.StatusItem').condition('statusId', statusId).useCache(true).one()?.description ?: statusId}"/></default-field>
+                    <conditional-field name="applied" condition="statusId == 'AdjApplied'" title="Status"><label text="Applied" type="span" style="sa-badge sa-green"/></conditional-field>
+                    <conditional-field name="approved" condition="statusId == 'AdjApproved'" title="Status"><label text="Approved" type="span" style="sa-badge sa-blue"/></conditional-field>
+                    <conditional-field name="pending" condition="statusId == 'AdjPending'" title="Status"><label text="Pending" type="span" style="sa-badge sa-amber"/></conditional-field>
+                    <default-field><label text="${statusId ?: '—'}" type="span" style="sa-badge sa-neutral"/></default-field>
                 </field>
                 <field name="remarks">
-                    <default-field><display/></default-field>
-                </field>
-                <field name="actions">
-                    <!-- ZE-INV-010: Approve is a write action; the Open link stays (read/detail nav) -->
-                    <conditional-field name="actionsWrite" condition="invCanWrite" title="">
-                    <link url="approveAdjustment" text="Approve" parameter-map="[stockAdjustmentId:stockAdjustmentId]"
-                          condition="statusId == 'AdjPending'" confirmation="Approve this adjustment?"/>
-                    <link url="../EditStockAdjustment" text="Open / add items" parameter-map="[stockAdjustmentId:stockAdjustmentId]" condition="statusId != 'AdjApplied'"/>
-                    </conditional-field>
-                    <default-field title="">
-                    <link url="../EditStockAdjustment" text="Open / add items" parameter-map="[stockAdjustmentId:stockAdjustmentId]" condition="statusId != 'AdjApplied'"/>
-                    </default-field>
+                    <default-field><display text="${remarks ?: '—'}"/></default-field>
                 </field>
                 <field name="submitButton"><header-field title="Find"><submit/></header-field></field>
             </form-list>
-        </box-body></container-box>
+            </container>
+        </container>
+        <render-mode><text type="html,qvt"><![CDATA[
+            <img alt="" aria-hidden="true" style="display:none" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" onload="if(!document.querySelector('script[data-stock-adjustments]')){var s=document.createElement('script');s.src='/zenithstatic/js/stock-adjustments.js?v=7';s.dataset.stockAdjustments='1';document.head.appendChild(s)}"/>
+        ]]></text></render-mode>
     </widgets>
 </screen>

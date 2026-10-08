@@ -1,0 +1,127 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+    <service verb="get" noun="CatalogueScope" authenticate="true">
+        <in-parameters><parameter name="orgPartyId"/></in-parameters>
+        <out-parameters>
+            <parameter name="selOrg"/><parameter name="selOrgName"/>
+            <parameter name="showOrgPicker" type="Boolean"/><parameter name="orgList" type="List"/>
+        </out-parameters>
+        <actions>
+            <script><![CDATA[
+                def active = ec.user.getPreference('ACTIVE_ORGANIZATION')
+                if (!active || active == '_NA_' || active == '__NO_ORGANIZATION__') active = null
+                boolean admin = ec.user.isInGroup('ADMIN')
+                showOrgPicker = !active && admin
+                selOrg = active ?: (admin && orgPartyId && orgPartyId != '_NA_' ? orgPartyId : null)
+                // Without an active organization, a tenant must not receive the platform organization list.
+                orgList = active || admin ? (ec.service.sync().name('zenith.base.SecurityServices.get#ActiveOrgList').call().orgList ?: []) : []
+                def selected = selOrg ? orgList.find { it.partyId == selOrg } : null
+                if (selOrg && selected == null) {
+                    selOrg = null
+                    ec.message.addError('Choose a valid organization before managing catalogues.')
+                }
+                selOrgName = selected?.organizationName ?: ''
+            ]]></script>
+        </actions>
+    </service>
+
+    <service verb="get" noun="CatalogueWriteContext" authenticate="true">
+        <in-parameters><parameter name="orgPartyId"/></in-parameters>
+        <out-parameters><parameter name="selOrg"/></out-parameters>
+        <actions>
+            <service-call name="zenith.base.SecurityServices.check#ModuleWriteAccess" in-map="[moduleId:'inventory']" out-map="access"/>
+            <if condition="access.canWrite != true"><return error="true" message="Inventory write access is required."/></if>
+            <service-call name="zenith.inventory.CatalogueServices.get#CatalogueScope" in-map="[orgPartyId:orgPartyId]" out-map="scope"/>
+            <set field="selOrg" from="scope.selOrg"/>
+            <if condition="!selOrg"><return error="true" message="Choose an organization before managing catalogues."/></if>
+        </actions>
+    </service>
+
+    <service verb="create" noun="Catalogue" authenticate="true">
+        <in-parameters>
+            <parameter name="orgPartyId"/><parameter name="categoryName" required="true"/>
+            <parameter name="description"/>
+        </in-parameters>
+        <out-parameters><parameter name="productCategoryId"/><parameter name="selOrg"/></out-parameters>
+        <actions>
+            <service-call name="zenith.inventory.CatalogueServices.get#CatalogueWriteContext" in-map="[orgPartyId:orgPartyId]" out-map="scope"/>
+            <if condition="ec.message.hasError()"><return/></if>
+            <set field="selOrg" from="scope.selOrg"/>
+            <script><![CDATA[
+                def name = categoryName?.trim()
+                def detail = description?.trim()
+                if (!name || name.length() > 128 || (detail?.length() ?: 0) > 4000) {
+                    ec.message.addError('Enter a catalogue name of 1–128 characters and a description of at most 4000 characters.'); return
+                }
+                // Serialize creation within this organization, including case-insensitive duplicate names.
+                ec.entity.find('mantle.party.Party').condition('partyId',selOrg).disableAuthz().forUpdate(true).one()
+                def existing = ec.entity.find('mantle.product.category.ProductCategory')
+                        .condition('ownerPartyId',selOrg).disableAuthz().list()
+                        .find { it.categoryName?.trim()?.equalsIgnoreCase(name) }
+                if (existing != null) { ec.message.addError('A catalogue with that name already exists in this organization.'); return }
+                def category = ec.entity.makeValue('mantle.product.category.ProductCategory')
+                        .setAll([categoryName:name, description:detail, ownerPartyId:selOrg])
+                category.setSequencedIdPrimary(); category.create(); productCategoryId = category.productCategoryId
+                ec.message.addMessage('Catalogue created. Now add products to it.','success')
+            ]]></script>
+        </actions>
+    </service>
+
+    <service verb="add" noun="CatalogueProduct" authenticate="true">
+        <in-parameters><parameter name="orgPartyId"/><parameter name="productCategoryId" required="true"/><parameter name="productId" required="true"/></in-parameters>
+        <actions>
+            <service-call name="zenith.inventory.CatalogueServices.get#CatalogueWriteContext" in-map="[orgPartyId:orgPartyId]" out-map="scope"/>
+            <if condition="ec.message.hasError()"><return/></if>
+            <script><![CDATA[
+                def category = ec.entity.find('mantle.product.category.ProductCategory')
+                        .condition('productCategoryId',productCategoryId).disableAuthz().forUpdate(true).one()
+                def product = ec.entity.find('mantle.product.Product').condition('productId',productId).disableAuthz().one()
+                // Primary-key optimizations may ignore extra predicates; verify loaded ownership explicitly.
+                if (category == null || category.ownerPartyId != scope.selOrg || product == null || product.ownerPartyId != scope.selOrg) {
+                    ec.message.addError('Choose a catalogue and product belonging to the selected organization.'); return
+                }
+                def now = ec.user.nowTimestamp
+                def members = ec.entity.find('mantle.product.category.ProductCategoryMember')
+                        .condition([productCategoryId:productCategoryId,productId:productId]).disableAuthz().forUpdate(true).list()
+                if (members.any { it.fromDate <= now && (it.thruDate == null || it.thruDate > now) }) {
+                    ec.message.addMessage('That product is already in this catalogue.','warning'); return
+                }
+                if (members.any { it.fromDate > now && (it.thruDate == null || it.thruDate > it.fromDate) }) {
+                    ec.message.addError('That product already has a scheduled catalogue membership.'); return
+                }
+                // Preserve historical rows, including a remove/re-add within the same millisecond.
+                def start = now
+                while (members.any { it.fromDate == start }) start = new java.sql.Timestamp(start.time + 1)
+                ec.entity.makeValue('mantle.product.category.ProductCategoryMember')
+                        .setAll([productCategoryId:productCategoryId,productId:productId,fromDate:start]).create()
+                ec.message.addMessage('Product added to the catalogue.','success')
+            ]]></script>
+        </actions>
+    </service>
+
+    <service verb="remove" noun="CatalogueProduct" authenticate="true">
+        <in-parameters><parameter name="orgPartyId"/><parameter name="productCategoryId" required="true"/><parameter name="productId" required="true"/></in-parameters>
+        <actions>
+            <service-call name="zenith.inventory.CatalogueServices.get#CatalogueWriteContext" in-map="[orgPartyId:orgPartyId]" out-map="scope"/>
+            <if condition="ec.message.hasError()"><return/></if>
+            <script><![CDATA[
+                def category = ec.entity.find('mantle.product.category.ProductCategory')
+                        .condition('productCategoryId',productCategoryId).disableAuthz().forUpdate(true).one()
+                def product = ec.entity.find('mantle.product.Product').condition('productId',productId).disableAuthz().one()
+                if (category == null || category.ownerPartyId != scope.selOrg || product == null || product.ownerPartyId != scope.selOrg) {
+                    ec.message.addError('Choose a catalogue and product belonging to the selected organization.'); return
+                }
+                def now = ec.user.nowTimestamp
+                def members = ec.entity.find('mantle.product.category.ProductCategoryMember')
+                        .condition([productCategoryId:productCategoryId,productId:productId]).disableAuthz().forUpdate(true).list()
+                members.findAll { it.thruDate == null || it.thruDate > now }.each {
+                    // A future membership is cancelled with a zero-length interval, preventing later reappearance.
+                    it.thruDate = it.fromDate > now ? it.fromDate : now
+                    it.update()
+                }
+                ec.message.addMessage('Product removed from the catalogue.','success')
+            ]]></script>
+        </actions>
+    </service>
+</services>

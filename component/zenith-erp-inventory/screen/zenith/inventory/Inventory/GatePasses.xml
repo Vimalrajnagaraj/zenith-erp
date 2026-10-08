@@ -3,47 +3,63 @@
         xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
         default-menu-title="Gate Passes" default-menu-index="4">
 
+    <!-- Keep transitions discoverable to both native form renderers; enforce POST inside actions. -->
     <transition name="createGatePass">
-        <service-call name="create#zenith.erp.inventory.GatePass" in-map="context + [organizationPartyId:ec.user.getPreference('ACTIVE_ORGANIZATION')]"/>
+        <actions>
+            <if condition="ec.web.request.method != 'POST' || !ec.web.parameters.moquiSessionToken || ec.web.parameters.moquiSessionToken != ec.web.sessionToken">
+                <return error="true" message="Submit the gate pass using the secure form."/>
+            </if>
+            <service-call name="zenith.inventory.GatePassServices.create#GatePass"
+                          in-map="[passTypeEnumId:passTypeEnumId, facilityId:facilityId, partyId:partyId, issueDate:issueDate, expectedReturnDate:expectedReturnDate, vehicleNumber:vehicleNumber, transporterName:transporterName, remarks:remarks]"/>
+        </actions>
         <default-response url="."/>
     </transition>
     <transition name="updateGatePass">
         <actions>
-            <!-- ZE-INV-IV-06A: block editing another tenant's gate pass via a forged inline-edit POST -->
-            <service-call name="zenith.inventory.InventoryServices.assert#GatePassAccess" in-map="[gatePassId:gatePassId]" out-map="_acc"/>
-            <if condition="!_acc.allowed"><return error="true" message="You do not have access to this gate pass."/></if>
-            <service-call name="update#zenith.erp.inventory.GatePass" in-map="context"/>
+            <if condition="ec.web.request.method != 'POST' || !ec.web.parameters.moquiSessionToken || ec.web.parameters.moquiSessionToken != ec.web.sessionToken">
+                <return error="true" message="Submit the gate pass using the secure form."/>
+            </if>
+            <service-call name="zenith.inventory.GatePassServices.update#GatePass"
+                          in-map="[gatePassId:gatePassKey ?: gatePassId, statusId:statusId, vehicleNumber:vehicleNumber]"/>
         </actions>
         <default-response url="."/>
     </transition>
 
-    <!-- ZE-SEC-JSON f/u: org-scoped party picker (stock SimpleScreens searchPartyList leaks cross-tenant). -->
+    <always-actions><set field="partyPickerStrictOrg" from="true"/></always-actions>
     <transition-include name="searchPartyList" location="component://zenith-erp-base/screen/include/PartyPicker.xml"/>
 
     <actions>
+        <set field="activeOrgId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+        <set field="activeOrgId" from="(!activeOrgId || activeOrgId == '_NA_') ? '__NO_ORGANIZATION__' : activeOrgId"/>
+        <set field="newGatePassIssueDate" from="ec.l10n.format(ec.user.nowTimestamp,'yyyy-MM-dd HH:mm')"/>
         <entity-find entity-name="zenith.erp.inventory.GatePass" list="gatePassList">
-            <search-form-inputs default-order-by="-issueDate"/>
-            <econdition field-name="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+            <search-form-inputs default-order-by="-issueDate,-lastUpdatedStamp,gatePassId"/>
+            <econdition field-name="organizationPartyId" from="activeOrgId"/>
         </entity-find>
         <entity-find entity-name="mantle.facility.Facility" list="facilityList">
+            <econdition field-name="ownerPartyId" from="activeOrgId"/>
             <order-by field-name="facilityName"/></entity-find>
     </actions>
 
     <widgets>
-        <container-box><box-header title="Security Gate Passes"/><box-toolbar>
+        <render-mode><text type="html,qvt"><![CDATA[<link rel="stylesheet" href="/zenithstatic/css/gate-passes.css?v=12"/>]]></text></render-mode>
+        <container id="gatePassesPage" style="gp-page">
+        <container style="gp-header">
+            <label text="Security Gate Passes" type="h1"/>
+            <container style="gp-header-actions">
             <!-- ZE-INV-010 (IV-110): write features only for users with full Inventory access -->
             <section name="GatePassWriteToolbar">
               <condition><expression>invCanWrite</expression></condition>
               <widgets>
-            <container-dialog id="NewGatePassDialog" button-text="Issue Gate Pass">
+            <container-dialog id="NewGatePassDialog" button-text="Issue Gate Pass" width="620" button-style="gp-issue-button">
                 <form-single name="NewGatePassForm" transition="createGatePass">
-                    <field name="passTypeEnumId"><default-field title="Type">
+                    <field name="passTypeEnumId"><default-field title="Type" required="true">
                         <drop-down>
                             <option key="GptRgp" text="Returnable (RGP)"/>
                             <option key="GptNrgp" text="Non-Returnable (NRGP)"/>
                         </drop-down>
                     </default-field></field>
-                    <field name="facilityId"><default-field title="Facility">
+                    <field name="facilityId"><default-field title="Facility" required="true">
                         <drop-down>
                             <list-options list="facilityList" key="${facilityId}" text="${facilityName}"/>
                         </drop-down>
@@ -53,26 +69,39 @@
                             <dynamic-options transition="searchPartyList" server-search="true" min-length="2"/>
                         </drop-down>
                     </default-field></field>
-                    <field name="issueDate"><default-field title="Issue Date"><date-time type="date-time" default-value="${ec.user.nowTimestamp}"/></default-field></field>
+                    <field name="issueDate"><default-field title="Issue Date" required="true"><date-time type="date-time" default-value="${newGatePassIssueDate}"/></default-field></field>
                     <field name="expectedReturnDate"><default-field title="Expected Return"><date-time type="date"/></default-field></field>
                     <field name="vehicleNumber"><default-field title="Vehicle No"><text-line size="20"/></default-field></field>
                     <field name="transporterName"><default-field title="Transporter Name"><text-line size="30"/></default-field></field>
                     <field name="remarks"><default-field><text-area rows="2" cols="50"/></default-field></field>
-                    <field name="statusId"><default-field><hidden default-value="GpIssued"/></default-field></field>
+
                     <field name="submitButton"><default-field title="Create"><submit/></default-field></field>
                 </form-single>
             </container-dialog>
               </widgets>
             </section>
-        </box-toolbar><box-body>
-            <!-- IV-120 (ZE-INV-015): must NOT be skip-form — this list has INLINE-EDIT row fields (status/vehicle
+        <render-mode><text type="html,qvt"><![CDATA[<button type="button" class="gp-collapse" aria-label="Collapse gate pass list" aria-expanded="true" aria-controls="gatePassCard" onclick="var p=document.getElementById('gatePassCard');p.hidden=!p.hidden;this.setAttribute('aria-expanded',String(!p.hidden));this.setAttribute('aria-label',p.hidden?'Expand gate pass list':'Collapse gate pass list');">⌃</button>]]></text></render-mode>
+            </container>
+        </container>
+        <container id="gatePassCard" style="gp-card">
+            <!-- IV-120 (ZE-INV-015): must NOT be skip-form - this list has INLINE-EDIT row fields (status/vehicle
                  drop-downs + per-row Update, added by ZE-INV-010) that reference the form's `formProps` slot scope.
                  skip-form removes the list's form, so once a row rendered the /qapps Vue template threw
                  "formProps is not defined" and the whole screen went blank. A normal form-list provides formProps;
                  native column sorting still works on this entity-value list. -->
-            <render-mode><text type="html,qvt"><![CDATA[<span class="zlc-ph" data-ph="Search Gate Passes..." style="display:none"></span>]]></text></render-mode>
-            <form-list name="GatePassListForm" list="gatePassList" header-dialog="true" transition="updateGatePass">
-                <field name="gatePassId"><default-field title="GP ID"><display/></default-field></field>
+
+            <form-list name="GatePassListForm" list="gatePassList" header-dialog="true" transition="updateGatePass" show-page-size="false">
+                <row-actions>
+                    <set field="gpPartyName" value=""/>
+                    <if condition="partyId">
+                        <entity-find-one entity-name="mantle.party.PartyDetail" value-field="gpParty"><field-map field-name="partyId"/></entity-find-one>
+                        <if condition="gpParty != null &amp;&amp; gpParty.ownerPartyId == activeOrgId">
+                            <set field="gpPartyName" from="ec.resource.expand('PartyNameTemplate','',gpParty)"/>
+                        </if>
+                    </if>
+                </row-actions>
+                <field name="gatePassKey"><default-field><hidden default-value="${gatePassId}"/></default-field></field>
+                <field name="gatePassId"><header-field title="GP ID"><text-find/></header-field><default-field title="GP ID"><link url="../PrintGatePass" text="${gatePassId}" parameter-map="[gatePassId:gatePassId]"/></default-field></field>
                 <field name="passTypeEnumId">
                     <header-field title="Type" show-order-by="true">
                         <drop-down allow-empty="true">
@@ -80,15 +109,15 @@
                             <option key="GptNrgp" text="NRGP"/>
                         </drop-down>
                     </header-field>
-                    <default-field><display text="${passTypeEnumId == 'GptRgp' ? 'Returnable' : 'Non-Returnable'}"/></default-field>
+                    <default-field><display text="${passTypeEnumId == 'GptRgp' ? 'Returnable' : (passTypeEnumId == 'GptNrgp' ? 'Non-Returnable' : 'Unknown type')}" style="gp-badge ${passTypeEnumId == 'GptRgp' ? 'gp-returnable' : (passTypeEnumId == 'GptNrgp' ? 'gp-nonreturnable' : '')}"/></default-field>
                 </field>
                 <field name="partyId">
                     <default-field title="Party">
-                        <display-entity entity-name="mantle.party.PartyDetail" text="${organizationName?:firstName} ${lastName?:''}"/>
+                        <display text="${gpPartyName}"/>
                     </default-field>
                 </field>
                 <field name="issueDate">
-                    <header-field title="Issued" show-order-by="true"/>
+                    <header-field title="Issued" show-order-by="true"><date-find type="date"/></header-field>
                     <default-field><display format="dd MMM yyyy HH:mm"/></default-field>
                 </field>
                 <field name="expectedReturnDate">
@@ -99,7 +128,7 @@
                 </field>
                 <field name="vehicleNumber">
                     <!-- ZE-INV-010 (IV-110): inline vehicle edit only for full-access users; view-only sees the value -->
-                    <conditional-field name="vehicleEdit_write" condition="invCanWrite" title="Vehicle"><text-line size="15"/></conditional-field>
+                    <conditional-field name="vehicleEdit_write" condition="invCanWrite" title="Vehicle"><text-line size="15" placeholder="Vehicle" maxlength="63"/></conditional-field>
                     <default-field title="Vehicle"><display/></default-field>
                 </field>
                 <field name="statusId">
@@ -112,7 +141,7 @@
                         </drop-down>
                     </header-field>
                     <!-- ZE-INV-010 (IV-110): inline status edit only for full-access users; view-only sees the value read-only -->
-                    <conditional-field name="statusEdit_write" condition="invCanWrite">
+                    <conditional-field name="statusEdit_write" condition="invCanWrite" title="Status ID">
                         <drop-down>
                             <option key="GpIssued" text="Issued"/>
                             <option key="GpReturned" text="Returned"/>
@@ -126,20 +155,27 @@
                 </field>
                 <!-- Print Barcode Action -->
                 <field name="printAction"><default-field title="">
-                    <container-dialog id="PrintDialog_${gatePassId}" button-text="Print" icon="glyphicon glyphicon-print">
-                        <label text="Gate Pass Print Preview" type="h4"/>
-                        <label text="GP ID: ${gatePassId}" type="h5"/>
-                        <label text="Type: ${passTypeEnumId == 'GptRgp' ? 'Returnable' : 'Non-Returnable'}" type="p"/>
-                        <label text="Vehicle: ${vehicleNumber}" type="p"/>
-                        <!-- IV-120: removed a dead <image> placeholder (barcode-placeholder.png doesn't exist; the
-                             <image> widget errored with "url-type of content is not yet supported" on the plain URL). -->
-                    </container-dialog>
+                    <link url="../PrintGatePass" text="Print" icon="fa fa-print" parameter-map="[gatePassId:gatePassId, lastStandalone:true]" target="_blank" style="gp-print-button"/>
                 </default-field></field>
                 <field name="submitButton"><header-field title="Find"><submit/></header-field>
                 <!-- ZE-INV-010 (IV-110): row Update only for full-access users; view-only can still Find (search) but not save -->
-                <conditional-field name="update_write" condition="invCanWrite"><submit text="Update"/></conditional-field>
+                <conditional-field name="update_write" condition="invCanWrite"><submit text="Update" style="gp-update-button"/></conditional-field>
                 <default-field><label text="" type="span"/></default-field></field>
             </form-list>
-        </box-body></container-box>
+        <render-mode><text type="html"><![CDATA[
+<#assign page=(gatePassListPageIndex)!0><#assign last=(gatePassListPageMaxIndex)!0>
+<#assign count=(gatePassListCount)!0><#assign low=(gatePassListPageRangeLow)!0><#assign high=(gatePassListPageRangeHigh)!0>
+<nav class="gp-bottom-pager" aria-label="Gate pass pages">
+<#if page gt 0><a href="${sri.getScreenUrlInstance().cloneUrlInstance().addParameter('pageIndex',0).pathWithParams?html}" aria-label="First page">|‹</a><a href="${sri.getScreenUrlInstance().cloneUrlInstance().addParameter('pageIndex',page-1).pathWithParams?html}" aria-label="Previous page">«</a><#else><span aria-disabled="true">|‹</span><span aria-disabled="true">«</span></#if>
+<span>${page+1} / ${last+1} (${low}-${high} / ${count})</span>
+<#if page lt last><a href="${sri.getScreenUrlInstance().cloneUrlInstance().addParameter('pageIndex',page+1).pathWithParams?html}" aria-label="Next page">»</a><a href="${sri.getScreenUrlInstance().cloneUrlInstance().addParameter('pageIndex',last).pathWithParams?html}" aria-label="Last page">›|</a><#else><span aria-disabled="true">»</span><span aria-disabled="true">›|</span></#if>
+</nav>
+        ]]></text></render-mode>
+        <section name="GatePassEmpty" condition="gatePassList.isEmpty()"><widgets>
+            <container style="gp-empty"><label text="No gate passes found" type="h2"/><label text="Try different Find Options or issue a gate pass." type="p"/></container>
+        </widgets></section>
+        </container>
+        <render-mode><text type="html,qvt"><![CDATA[<footer class="gp-footer"><span>© 2024-2026 ZetaERP · Cloud ERP Platform</span><a href="mailto:support@zetaclantech.com">Support</a></footer>]]></text></render-mode>
+        </container>
     </widgets>
 </screen>

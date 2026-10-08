@@ -19,6 +19,13 @@
                     .condition("trialEndDate", "<", today)
                     .disableAuthz().list()
 
+                // Cancelled subscriptions must stop access at their paid period end, but must never
+                // cancel a newer active subscription after the tenant changes plans.
+                ec.entity.find('zenith.erp.saas.SaasSubscription').condition('statusId','SubCancelled')
+                    .disableAuthz().list().each { cancelled ->
+                        ec.service.sync().name('zenith.saas.SaasLifecycleServices.expire#CancelledSubscription')
+                            .parameters([subscriptionId:cancelled.subscriptionId]).disableAuthz().call()
+                    }
                 int expiredCount = 0
                 expiredSubs.each { sub ->
                     def res = ec.service.sync().name("zenith.saas.SaasLifecycleServices.expire#TrialSubscription")
@@ -53,6 +60,30 @@
                          description:('Trial expired on ' + trialEndDate + '. Tenant suspended.')]"/>
             <set field="suspended" from="true"/>
         </actions>
+    </service>
+
+    <service verb="expire" noun="CancelledSubscription" authenticate="anonymous-all" transaction="force-new">
+        <in-parameters><parameter name="subscriptionId" required="true"/></in-parameters>
+        <actions><script><![CDATA[
+            if (ec.web != null && !ec.user.isInGroup('ADMIN')) { ec.message.addError('Only the platform administrator can run subscription expiry.'); return }
+            def candidate = ec.entity.find('zenith.erp.saas.SaasSubscription').condition('subscriptionId',subscriptionId).one()
+            if (!candidate) return
+            // Match the tenant-first lock order used by plan changes and cancellation.
+            def tenant = ec.entity.find('zenith.erp.saas.SaasTenant').condition('tenantId',candidate.tenantId).forUpdate(true).one()
+            def sub = ec.entity.find('zenith.erp.saas.SaasSubscription').condition('subscriptionId',subscriptionId).forUpdate(true).one()
+            if (!sub || sub.statusId != 'SubCancelled') return
+            def end = sub.endDate ?: sub.renewalDate ?: sub.trialEndDate
+            def today = java.sql.Date.valueOf(ec.user.nowTimestamp.toLocalDateTime().toLocalDate())
+            if (!end || end > today) return
+            if (ec.entity.find('zenith.erp.saas.SaasSubscription').condition('tenantId',sub.tenantId)
+                    .condition('statusId','in',['SubActive','SubTrial','SubPastDue']).count() > 0) return
+            if (!tenant || tenant.statusId == 'SaasTenantCancelled') return
+            ec.service.sync().name('update#zenith.erp.saas.SaasTenant')
+                .parameters([tenantId:sub.tenantId,statusId:'SaasTenantCancelled']).call()
+            ec.service.sync().name('create#zenith.erp.saas.SaasAuditLog').parameters([
+                tenantId:sub.tenantId,eventType:'CANCEL_PERIOD_ENDED',eventDate:ec.user.nowTimestamp,
+                description:'Cancelled subscription reached the end of its billing period']).call()
+        ]]></script></actions>
     </service>
 
     <!-- ==================== SUBSCRIPTION RENEWAL CHECK ==================== -->
@@ -150,7 +181,10 @@
                     // Update subscription renewal date
                     ec.service.sync().name("update#zenith.erp.saas.SaasSubscription")
                         .parameter("subscriptionId", sub.subscriptionId)
+                        .parameter("startDate", periodFrom)
                         .parameter("renewalDate", periodTo)
+                        .parameter("amount", amount)
+                        .parameter("prorationBaseAmount", amount)
                         .disableAuthz().call()
 
                     // Audit log
@@ -393,6 +427,18 @@ ${fromName}"""
                 <return message="Tenant is not suspended."/>
             </if>
 
+            <entity-find entity-name="zenith.erp.saas.SaasPayment" list="receipts" limit="1">
+                <econdition field-name="tenantId"/><econdition field-name="gatewayPaymentId" from="paymentId"/>
+                <econdition field-name="statusId" value="SpSuccess"/>
+            </entity-find>
+            <if condition="!paymentId || !receipts"><return error="true" message="A confirmed subscription payment is required."/></if>
+            <entity-find-one entity-name="zenith.erp.saas.SaasInvoice" value-field="paidInvoice"><field-map field-name="saasInvoiceId" from="receipts[0].saasInvoiceId"/></entity-find-one>
+            <if condition="!paidInvoice || paidInvoice.tenantId != tenantId || paidInvoice.statusId != 'SiPaid' || receipts[0].amount != paidInvoice.totalAmount"><return error="true" message="Payment does not settle this account's invoice."/></if>
+            <entity-find-count entity-name="zenith.erp.saas.SaasInvoice" count-field="remainingOverdue">
+                <econdition field-name="tenantId"/><econdition field-name="statusId" value="SiOverdue"/>
+            </entity-find-count>
+            <if condition="remainingOverdue &gt; 0"><return message="Payment recorded. Other overdue invoices still need to be settled."/></if>
+
             <!-- Reactivate tenant -->
             <service-call name="update#zenith.erp.saas.SaasTenant"
                 in-map="[tenantId:tenantId, statusId:'SaasTenantActive']"/>
@@ -406,25 +452,6 @@ ${fromName}"""
                 <service-call name="update#zenith.erp.saas.SaasSubscription"
                     in-map="[subscriptionId:sub.subscriptionId, statusId:'SubActive']"/>
             </iterate>
-
-            <!-- Settle ONLY the invoice tied to THIS payment (scoped to the tenant, idempotent). Bulk-marking
-                 EVERY SiOverdue invoice paid off a single payment was a revenue-loss / ledger-corruption bug:
-                 a tenant with several unpaid invoices who paid one got them all cleared. The payment handler
-                 (verify#RazorpayPayment / webhook) normally already settled the specific invoice; this is a guard. -->
-            <if condition="paymentId">
-                <entity-find entity-name="zenith.erp.saas.SaasPayment" list="_pmts" limit="1">
-                    <econdition field-name="gatewayPaymentId" from="paymentId"/>
-                    <econdition field-name="tenantId"/>
-                </entity-find>
-                <if condition="_pmts &amp;&amp; _pmts[0].saasInvoiceId">
-                    <entity-find-one entity-name="zenith.erp.saas.SaasInvoice" value-field="_inv">
-                        <field-map field-name="saasInvoiceId" from="_pmts[0].saasInvoiceId"/></entity-find-one>
-                    <if condition="_inv &amp;&amp; _inv.tenantId == tenantId &amp;&amp; _inv.statusId != 'SiPaid'">
-                        <service-call name="update#zenith.erp.saas.SaasInvoice"
-                            in-map="[saasInvoiceId:_inv.saasInvoiceId, statusId:'SiPaid', paidDate:ec.user.nowTimestamp]"/>
-                    </if>
-                </if>
-            </if>
 
             <!-- Audit log -->
             <service-call name="create#zenith.erp.saas.SaasAuditLog"
