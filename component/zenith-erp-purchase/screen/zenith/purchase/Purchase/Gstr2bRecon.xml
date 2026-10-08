@@ -15,29 +15,32 @@
                 ExecutionContext ec = context.ec
                 // Use searchFormInputs to apply the same filters the user applied on the UI
                 def ef = ec.entity.find("zenith.erp.india.Gstr2bReconView")
-                ef.searchFormInputs("", "-invoiceDate", false)
+                ef.searchFormInputs("", null, "organizationPartyId", "-invoiceDate", false)
                 // ZE-SALES-014 f/u: org-isolate the CSV export (standalone render bypasses the MANTLE_ACTIVE_ORG authz filter)
-                def activeOrg = ec.user.getPreference('ACTIVE_ORGANIZATION')
-                if (activeOrg) ef.condition("organizationPartyId", activeOrg)
+                def requestedOrg = ec.user.getPreference('ACTIVE_ORGANIZATION')
+                def scope = requestedOrg && requestedOrg != '_NA_' ? ec.service.sync().name('zenith.tax.TaxAccessServices.get#AuthorizedActiveOrganization').call() : [:]
+                def activeOrg = requestedOrg && requestedOrg == scope.activeOrgId ? scope.activeOrgId : null
+                ef.condition("organizationPartyId", activeOrg ?: '__NO_ORGANIZATION__')
                 def reconList = ef.list()
 
                 def escapeCsv = { val ->
                     if (val == null) return ""
                     String str = val.toString().trim()
-                    if (str.contains(",") || str.contains("\"") || str.contains("\n")) {
+                    if (str.contains(",") || str.contains("\"") || str.contains("\n") || str.contains("\r")) {
                         return "\"" + str.replace("\"", "\"\"") + "\""
                     }
                     return str
                 }
-                def num = { v -> String.format("%.2f", (v ?: 0.0) as double) }
+                def num = { v -> ((v == null ? 0G : v) as BigDecimal).setScale(2, java.math.RoundingMode.HALF_UP).toPlainString() }
 
                 StringBuilder csv = new StringBuilder()
                 csv.append("ZetaERP - GSTR-2B Reconciliation Report\n")
                 csv.append("Generated on: ${ec.l10n.format(ec.user.nowTimestamp, 'dd MMM yyyy HH:mm')}\n\n")
 
-                csv.append("Supplier GSTIN,Supplier,Portal Inv#,Portal Date,Portal Taxable,IGST,CGST,SGST,Book Inv#,Book Taxable,Status,ITC,Mismatch\n")
+                csv.append("Supplier GSTIN,Supplier,Portal Inv#,Portal Date,Portal Taxable,IGST,CGST,SGST,Cess,Book Inv#,Book Taxable,Status,Matched ITC,Taxable Difference\n")
 
                 def statusLabel = { s ->
+                    if (s in ['Mismatch','Unmatched']) return 'Unmatched'
                     if (s == 'MissingInBooks') return 'Missing in Books'
                     if (s == 'MissingInPortal') return 'Missing in Portal'
                     return s ?: ''
@@ -47,9 +50,9 @@
                     def dateStr = row.invoiceDate ? ec.l10n.format(row.invoiceDate, "dd/MM/yyyy") : ""
                     def portalTax = (row.taxableAmount ?: 0.0) as BigDecimal
                     def bookTax = (row.bookTaxableAmount ?: 0.0) as BigDecimal
-                    def mismatch = (portalTax - bookTax).abs()
-                    def itc = (row.itcAvailable == 'Y')
-                        ? (((row.cgstAmount ?: 0.0) as BigDecimal) + ((row.sgstAmount ?: 0.0) as BigDecimal) + ((row.igstAmount ?: 0.0) as BigDecimal))
+                    def mismatch = row.bookInvoiceId && row.taxableAmount != null && row.bookTaxableAmount != null ? (portalTax - bookTax).abs() : null
+                    def itc = (row.itcAvailable == 'Y' && row.matchStatus == 'Matched' && row.bookInvoiceId && row.bookItcEligible != 'N' && row.bookIsCompositionDealer != 'Y')
+                        ? (((row.cgstAmount ?: 0.0) as BigDecimal) + ((row.sgstAmount ?: 0.0) as BigDecimal) + ((row.igstAmount ?: 0.0) as BigDecimal) + ((row.cessAmount ?: 0.0) as BigDecimal))
                         : (0.0 as BigDecimal)
 
                     csv.append(escapeCsv(row.supplierGstin)).append(",")
@@ -60,11 +63,12 @@
                     csv.append(escapeCsv(num(row.igstAmount))).append(",")
                     csv.append(escapeCsv(num(row.cgstAmount))).append(",")
                     csv.append(escapeCsv(num(row.sgstAmount))).append(",")
+                    csv.append(escapeCsv(num(row.cessAmount))).append(",")
                     csv.append(escapeCsv(row.bookInvoiceNumber)).append(",")
                     csv.append(escapeCsv(num(row.bookTaxableAmount))).append(",")
                     csv.append(escapeCsv(statusLabel(row.matchStatus))).append(",")
                     csv.append(escapeCsv(num(itc))).append(",")
-                    csv.append(escapeCsv(num(mismatch))).append("\n")
+                    csv.append(escapeCsv(mismatch == null ? '' : num(mismatch))).append("\n")
                 }
 
                 String fileName = "GSTR2B_Recon_${ec.l10n.format(ec.user.nowTimestamp, 'yyyyMMdd_HHmm')}.csv"
@@ -75,6 +79,12 @@
     </transition>
 
     <actions>
+        <set field="requestedOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+        <set field="g2bOrgId" from="null"/>
+        <if condition="requestedOrg &amp;&amp; requestedOrg != '_NA_'">
+            <service-call name="zenith.tax.TaxAccessServices.get#AuthorizedActiveOrganization" out-map="g2bScope"/>
+            <set field="g2bOrgId" from="requestedOrg == g2bScope.activeOrgId ? g2bScope.activeOrgId : null"/>
+        </if>
         <set field="cal" from="new java.util.GregorianCalendar()"/>
         <set field="yr" from="cal.get(java.util.Calendar.YEAR)"/>
         <set field="mn" from="cal.get(java.util.Calendar.MONTH) + 1"/>
@@ -82,40 +92,41 @@
         <set field="currentFy" value="${fyStart}-${fyStart + 1}"/>
 
         <entity-find entity-name="zenith.erp.india.Gstr2bReconView" list="reconList">
-            <search-form-inputs default-order-by="-invoiceDate"/>
+            <search-form-inputs default-order-by="-invoiceDate" skip-fields="organizationPartyId"/>
             <!-- ZE-SALES-014 f/u: org-isolate CSV/XLSX export (standalone render bypasses the MANTLE_ACTIVE_ORG authz filter) -->
-            <econdition field-name="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+            <econdition field-name="organizationPartyId" from="g2bOrgId ?: '__NO_ORGANIZATION__'"/>
         </entity-find>
-        <entity-find entity-name="mantle.party.PartyDetailAndRole" list="orgList">
-            <econdition field-name="roleTypeId" value="OrgInternal"/>
-            <econdition field-name="disabled" value="N" or-null="true"/>
-            <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
-        </entity-find>
+        <set field="orgList" from="[]"/>
+        <if condition="g2bOrgId">
+            <service-call name="zenith.base.SecurityServices.get#ActiveOrgList" out-map="context"/>
+        </if>
 
         <entity-find-count entity-name="zenith.erp.india.Gstr2bReconView" count-field="matchedCount">
-            <econdition field-name="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+            <econdition field-name="organizationPartyId" from="g2bOrgId ?: '__NO_ORGANIZATION__'"/>
             <econdition field-name="matchStatus" value="Matched"/>
         </entity-find-count>
         <entity-find-count entity-name="zenith.erp.india.Gstr2bReconView" count-field="unmatchedCount">
-            <econdition field-name="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
-            <econdition field-name="matchStatus" value="Unmatched"/>
+            <econdition field-name="organizationPartyId" from="g2bOrgId ?: '__NO_ORGANIZATION__'"/>
+            <econdition field-name="matchStatus" operator="in" from="['Mismatch','Unmatched']"/>
         </entity-find-count>
         <entity-find-count entity-name="zenith.erp.india.Gstr2bReconView" count-field="missingInBooksCount">
-            <econdition field-name="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+            <econdition field-name="organizationPartyId" from="g2bOrgId ?: '__NO_ORGANIZATION__'"/>
             <econdition field-name="matchStatus" value="MissingInBooks"/>
         </entity-find-count>
         <entity-find-count entity-name="zenith.erp.india.Gstr2bReconView" count-field="missingInPortalCount">
-            <econdition field-name="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+            <econdition field-name="organizationPartyId" from="g2bOrgId ?: '__NO_ORGANIZATION__'"/>
             <econdition field-name="matchStatus" value="MissingInPortal"/>
         </entity-find-count>
     </actions>
 
     <widgets>
+        <container style="zg2b-page">
+        <section name="Gstr2bDisplaySummary" condition="!(sri.getRenderMode() in ['csv','xlsx'])"><widgets>
         <!-- Page header: title + FY subtitle (left), solid Reconcile Now CTA (right) -->
         <container style="zsec-hdr row items-center justify-between q-mb-lg">
             <container style="column">
                 <label text="GSTR-2B Reconciliation" type="h3" style="text-primary text-weight-bold q-my-none"/>
-                <label text="Financial Year: ${currentFy}" type="p" style="text-grey-7 q-mt-sm q-mb-none"/>
+                <label text="Compare imported portal records with purchase bills." type="p" style="text-grey-7 q-mt-sm q-mb-none"/>
             </container>
             <container style="z-newbtn-wrap">
                 <container-dialog id="ReconcileTopDialog" button-text="Reconcile Now" width="500"
@@ -142,17 +153,17 @@
         <container style="z-statrow">
             <container style="z-statcell zenith-card bg-white border-radius-lg q-pa-md">
                 <container style="z-statinner">
-                    <container style="z-icobadge lg green"><label text="verified" type="span" style="material-icons"/></container>
+                    <container style="z-icobadge zg2b-icon green"><label text="verified" type="span" style="material-icons"/></container>
                     <container style="z-statmeta">
                         <label text="Matched" type="span" style="z-statlabel"/>
                         <label text="${matchedCount ?: 0}" type="span" style="z-statnum z-amt-green"/>
-                        <label text="Invoices where portal data matches your books within ₹1 tolerance." type="span" style="z-statdesc"/>
+                        <label text="Invoices where portal data matches your books within ₹0.01 per tax component." type="span" style="z-statdesc"/>
                     </container>
                 </container>
             </container>
             <container style="z-statcell zenith-card bg-white border-radius-lg q-pa-md">
                 <container style="z-statinner">
-                    <container style="z-icobadge lg orange"><label text="error" type="span" style="material-icons"/></container>
+                    <container style="z-icobadge zg2b-icon orange"><label text="error" type="span" style="material-icons"/></container>
                     <container style="z-statmeta">
                         <label text="Unmatched" type="span" style="z-statlabel"/>
                         <label text="${unmatchedCount ?: 0}" type="span" style="z-statnum z-txt-orange"/>
@@ -162,7 +173,7 @@
             </container>
             <container style="z-statcell zenith-card bg-white border-radius-lg q-pa-md">
                 <container style="z-statinner">
-                    <container style="z-icobadge lg red"><label text="description" type="span" style="material-icons"/></container>
+                    <container style="z-icobadge zg2b-icon red"><label text="description" type="span" style="material-icons"/></container>
                     <container style="z-statmeta">
                         <label text="Missing in Books" type="span" style="z-statlabel"/>
                         <label text="${missingInBooksCount ?: 0}" type="span" style="z-statnum z-txt-red"/>
@@ -172,11 +183,11 @@
             </container>
             <container style="z-statcell zenith-card bg-white border-radius-lg q-pa-md">
                 <container style="z-statinner">
-                    <container style="z-icobadge lg blue"><label text="cloud_upload" type="span" style="material-icons"/></container>
+                    <container style="z-icobadge zg2b-icon blue"><label text="cloud_upload" type="span" style="material-icons"/></container>
                     <container style="z-statmeta">
                         <label text="Missing in Portal" type="span" style="z-statlabel"/>
                         <label text="${missingInPortalCount ?: 0}" type="span" style="z-statnum z-amt-blue"/>
-                        <label text="In your books but supplier hasn't filed in GSTR-1." type="span" style="z-statdesc"/>
+                        <label text="Book records marked missing from the imported portal data." type="span" style="z-statdesc"/>
                     </container>
                 </container>
             </container>
@@ -186,7 +197,7 @@
         <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md q-mb-lg">
             <container style="zsec-hdr row items-center justify-between">
                 <container style="z-statinner">
-                    <container style="z-icobadge lg primary"><label text="fact_check" type="span" style="material-icons"/></container>
+                    <container style="z-icobadge zg2b-icon primary"><label text="fact_check" type="span" style="material-icons"/></container>
                     <container style="column">
                         <label text="Run Reconciliation" type="h6" style="text-weight-bold q-my-none"/>
                         <label text="Upload GSTR-2B JSON from the GST portal, then run reconciliation to match against purchase invoices." type="p" style="text-grey-7 q-mb-none q-mt-none"/>
@@ -211,8 +222,10 @@
             </container>
         </container>
 
+        </widgets></section>
         <!-- Reconciliation Records -->
         <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md">
+            <section name="Gstr2bDisplayToolbar" condition="!(sri.getRenderMode() in ['csv','xlsx'])"><widgets>
             <container style="zsec-hdr row items-center justify-between q-mb-md">
                 <label text="Reconciliation Records" type="h6" style="text-weight-bold q-my-none"/>
                 <container style="z-btnrow">
@@ -224,7 +237,7 @@
                             <field name="matchStatus">
                                 <default-field title="Status">
                                     <drop-down allow-empty="true">
-                                        <option key="Matched"/><option key="Unmatched"/>
+                                        <option key="Matched"/><option key="Mismatch" text="Unmatched"/>
                                         <option key="MissingInBooks" text="Missing in Books"/>
                                         <option key="MissingInPortal" text="Missing in Portal"/>
                                     </drop-down>
@@ -237,19 +250,20 @@
                 </container>
             </container>
 
+            </widgets></section>
             <form-list name="ReconListForm" list="reconList" skip-form="true">
                 <row-actions>
                     <script><![CDATA[
                         def portalTax = (taxableAmount ?: 0.0) as BigDecimal
                         def bookTax = (bookTaxableAmount ?: 0.0) as BigDecimal
-                        def mismatchAmt = (portalTax - bookTax).abs()
-                        def itcAmt = (itcAvailable == 'Y')
-                            ? (((cgstAmount ?: 0.0) as BigDecimal) + ((sgstAmount ?: 0.0) as BigDecimal) + ((igstAmount ?: 0.0) as BigDecimal))
+                        def mismatchAmt = bookInvoiceId && taxableAmount != null && bookTaxableAmount != null ? (portalTax - bookTax).abs() : null
+                        def itcAmt = (itcAvailable == 'Y' && matchStatus == 'Matched' && bookInvoiceId && bookItcEligible != 'N' && bookIsCompositionDealer != 'Y')
+                            ? (((cgstAmount ?: 0.0) as BigDecimal) + ((sgstAmount ?: 0.0) as BigDecimal) + ((igstAmount ?: 0.0) as BigDecimal) + ((cessAmount ?: 0.0) as BigDecimal))
                             : (0.0 as BigDecimal)
 
-                        def scMap = [Matched:'success', Unmatched:'warning', MissingInBooks:'danger', MissingInPortal:'info']
+                        def scMap = [Matched:'success', Mismatch:'warning', Unmatched:'warning', MissingInBooks:'danger', MissingInPortal:'info']
                         statusColor = scMap[matchStatus] ?: 'grey'
-                        def slMap = [Matched:'Matched', Unmatched:'Unmatched', MissingInBooks:'Missing in Books', MissingInPortal:'Missing in Portal']
+                        def slMap = [Matched:'Matched', Mismatch:'Unmatched', Unmatched:'Unmatched', MissingInBooks:'Missing in Books', MissingInPortal:'Missing in Portal']
                         statusText = slMap[matchStatus] ?: (matchStatus ?: '—')
 
                         def rupee = { v -> v != null ? ('₹' + ec.l10n.format(v, '#,##,##0.00')) : '—' }
@@ -261,11 +275,14 @@
                         igstDisp = rupee(igstAmount)
                         cgstDisp = rupee(cgstAmount)
                         sgstDisp = rupee(sgstAmount)
+                        cessDisp = rupee(cessAmount)
                         bookInvDisp = bookInvoiceNumber ?: '—'
                         bookTaxDisp = rupee(bookTaxableAmount)
                         itcDisp = '₹' + ec.l10n.format(itcAmt, '#,##,##0.00')
-                        mismatchDisp = '₹' + ec.l10n.format(mismatchAmt, '#,##,##0.00')
-                        mismatchIsZero = (mismatchAmt.compareTo(0.0 as BigDecimal) == 0)
+                        itcExportAmount = itcAmt
+                        mismatchDisp = mismatchAmt == null ? '—' : '₹' + ec.l10n.format(mismatchAmt, '#,##,##0.00')
+                        mismatchExportAmount = mismatchAmt == null ? '' : mismatchAmt
+                        mismatchIsZero = mismatchAmt == null || (mismatchAmt.compareTo(0.0 as BigDecimal) == 0)
 
                         // muted-dash flags (portal cols null on MissingInPortal rows; book cols null on MissingInBooks)
                         portalInvMuted = (invoiceNumber == null)
@@ -274,6 +291,7 @@
                         igstMuted = (igstAmount == null)
                         cgstMuted = (cgstAmount == null)
                         sgstMuted = (sgstAmount == null)
+                        cessMuted = (cessAmount == null)
                         bookInvMuted = (bookInvoiceNumber == null)
                         bookTaxMuted = (bookTaxableAmount == null)
 
@@ -282,57 +300,76 @@
                 </row-actions>
                 <field name="supplierGstin">
                     <header-field title="Supplier GSTIN" show-order-by="true"/>
+                    <conditional-field condition="sri.getRenderMode() in ['csv', 'xlsx']"><display text="${supplierGstin}"/></conditional-field>
                     <default-field><label text="${gstinDisp}" type="span" style="z-txt-primary text-weight-medium"/></default-field>
                 </field>
                 <field name="supplierName">
                     <header-field title="Supplier"/>
+                    <conditional-field condition="sri.getRenderMode() in ['csv', 'xlsx']"><display text="${supplierName}"/></conditional-field>
                     <default-field><label text="${supplierDisp}" type="span" style="text-dark"/></default-field>
                 </field>
                 <field name="invoiceNumber">
                     <header-field title="Portal Inv#"/>
+                    <conditional-field condition="sri.getRenderMode() in ['csv', 'xlsx']"><display text="${invoiceNumber}"/></conditional-field>
                     <default-field><label text="${portalInvDisp}" type="span" style="${portalInvMuted ? 'text-grey-6' : 'z-txt-primary text-weight-medium'}"/></default-field>
                 </field>
                 <field name="invoiceDate">
                     <header-field title="Portal Date" show-order-by="true"/>
+                    <conditional-field condition="sri.getRenderMode() in ['csv', 'xlsx']"><display text="${portalDateDisp}"/></conditional-field>
                     <default-field><label text="${portalDateDisp}" type="span" style="${portalDateMuted ? 'text-grey-6' : 'text-dark'}"/></default-field>
                 </field>
                 <field name="taxableAmount">
                     <header-field title="Portal Taxable"/>
+                    <conditional-field condition="sri.getRenderMode() in ['csv', 'xlsx']"><display text="${taxableAmount}"/></conditional-field>
                     <default-field><label text="${portalTaxDisp}" type="span" style="${portalTaxMuted ? 'text-grey-6' : 'text-dark'}"/></default-field>
                 </field>
                 <field name="igstAmount">
                     <header-field title="IGST"/>
+                    <conditional-field condition="sri.getRenderMode() in ['csv', 'xlsx']"><display text="${igstAmount}"/></conditional-field>
                     <default-field><label text="${igstDisp}" type="span" style="${igstMuted ? 'text-grey-6' : 'text-dark'}"/></default-field>
                 </field>
                 <field name="cgstAmount">
                     <header-field title="CGST"/>
+                    <conditional-field condition="sri.getRenderMode() in ['csv', 'xlsx']"><display text="${cgstAmount}"/></conditional-field>
                     <default-field><label text="${cgstDisp}" type="span" style="${cgstMuted ? 'text-grey-6' : 'text-dark'}"/></default-field>
                 </field>
                 <field name="sgstAmount">
                     <header-field title="SGST"/>
+                    <conditional-field condition="sri.getRenderMode() in ['csv', 'xlsx']"><display text="${sgstAmount}"/></conditional-field>
                     <default-field><label text="${sgstDisp}" type="span" style="${sgstMuted ? 'text-grey-6' : 'text-dark'}"/></default-field>
+                </field>
+                <field name="cessAmount">
+                    <header-field title="Cess"/>
+                    <conditional-field condition="sri.getRenderMode() in ['csv', 'xlsx']"><display text="${cessAmount}"/></conditional-field>
+                    <default-field><label text="${cessDisp}" type="span" style="${cessMuted ? 'text-grey-6' : 'text-dark'}"/></default-field>
                 </field>
                 <field name="bookInvoiceNumber">
                     <header-field title="Book Inv#"/>
+                    <conditional-field condition="sri.getRenderMode() in ['csv', 'xlsx']"><display text="${bookInvoiceNumber}"/></conditional-field>
                     <default-field><label text="${bookInvDisp}" type="span" style="${bookInvMuted ? 'text-grey-6' : 'z-txt-primary text-weight-medium'}"/></default-field>
                 </field>
                 <field name="bookTaxableAmount">
                     <header-field title="Book Taxable"/>
+                    <conditional-field condition="sri.getRenderMode() in ['csv', 'xlsx']"><display text="${bookTaxableAmount}"/></conditional-field>
                     <default-field><label text="${bookTaxDisp}" type="span" style="${bookTaxMuted ? 'text-grey-6' : 'text-dark'}"/></default-field>
                 </field>
                 <field name="matchStatus">
                     <header-field title="Status"/>
+                    <conditional-field condition="sri.getRenderMode() in ['csv', 'xlsx']"><display text="${statusText}"/></conditional-field>
                     <default-field><label text="${statusText}" type="span" style="zenith-badge nd ${statusColor}"/></default-field>
                 </field>
                 <field name="itcAvailable">
-                    <header-field title="ITC"/>
+                    <header-field title="Matched ITC"/>
+                    <conditional-field condition="sri.getRenderMode() in ['csv', 'xlsx']"><display text="${itcExportAmount}"/></conditional-field>
                     <default-field><label text="${itcDisp}" type="span" style="text-dark"/></default-field>
                 </field>
                 <field name="mismatchReasons">
-                    <header-field title="Mismatch"/>
+                    <header-field title="Taxable Difference"/>
+                    <conditional-field condition="sri.getRenderMode() in ['csv', 'xlsx']"><display text="${mismatchExportAmount}"/></conditional-field>
                     <default-field><label text="${mismatchDisp}" type="span" style="${mismatchIsZero ? 'text-grey-6' : 'z-txt-red text-weight-medium'}"/></default-field>
                 </field>
             </form-list>
+        </container>
         </container>
     </widgets>
 </screen>
