@@ -1,0 +1,11 @@
+# Pricing History regression evidence
+
+Use these helpers only in an explicitly disposable, loopback Moqui runtime. Never deploy them to production. The fixture contains synthetic organizations, inactive/nondefault list headers and audit-log records with missing amounts or an arithmetic zero boundary. It defines no effective product prices, legal registrations, tax rates or stock.
+
+Copy the complete candidate component tree with repository staging base overrides and canonical framework UI patches. Enable `-Dpurchase.pricing.qa.disposable=true`, bind HTTP to `127.0.0.1:18085` and use isolated H2 TCP on `127.0.0.1:19097`, `mem:purchase-pricing-qa`. Disable jobs/external delivery. Copy `fixture.xml` to `runtime/component/zenith-erp-pricing/PricingHistoryQaFixture.xml` and `qa-screen.xml` to `runtime/component/zenith-erp-pricing/screen/zenith/pricing/PricingHistoryQaAcceptance.xml`. Do not auto-seed the fixture.
+
+With Node, Playwright, Chrome and a JDK installed, set `HISTORY_QA_RUNTIME`, `HISTORY_QA_JAVA` and `HISTORY_QA_OUT`, then run `node docs/qa/pricing-history/verify.cjs`. `HISTORY_QA_MODE=baseline` records the pre-fix failures. Default final mode checks recorded/missing/zero values, actual CSV links and reason filters, protected tenant inputs, no-org standalone exports, current-interface navigation and five viewport widths in both interfaces. If an XLSX renderer is available, the runner parses its actual download; this local runtime lacks that optional renderer and correctly advertises no XLSX link.
+
+Independent SELECT-only JDBC snapshots must show invoice, price-list, item, rule, volume-pricing and log rows unchanged by browsing/export/navigation. Cleanup resolves exact fixture keys and stored auxiliary composite keys, then independent SQL verifies zero residue across ten tables and unchanged invoices. Initialization refuses stale fixtures. Public Moqui demo authentication is copied only to disposable QA users; no deployed credentials are present.
+
+The local public-framework rebuild is not claimed byte-identical to production. Trusted master staging supplies separate image verification. Synthetic screenshots and `report.json` do not replace the SOP's owner MARUTHI before/after no-op database evidence or certify the whole Pricing module. Keep the PR draft until the owner gate is satisfied.
