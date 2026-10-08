@@ -194,11 +194,11 @@ window._posOffline = (function() {
                     var existing = store.get(row.offlineId);
                     existing.onsuccess = function() {
                         // Never overwrite a newer or different sale that happens to reuse the id.
-                        if (!existing.result) { store.add(row); copied.push({id:row.offlineId,source:JSON.stringify(sale)}); }
-                        else if (JSON.stringify(existing.result) === JSON.stringify(row)) copied.push({id:row.offlineId,source:JSON.stringify(sale)});
+                        if (!existing.result) { store.add(row); copied.push({id:row.offlineId,source:JSON.stringify(sale),payload:JSON.stringify(row)}); }
+                        else if (JSON.stringify(existing.result) === JSON.stringify(row)) copied.push({id:row.offlineId,source:JSON.stringify(sale),payload:JSON.stringify(row)});
                     };
                 });
-                transaction.oncomplete = function() { copied.forEach(function(copy) { legacyCopied[copy.id] = copy.source; }); resolve(copied.length); };
+                transaction.oncomplete = function() { copied.forEach(function(copy) { legacyCopied[copy.id] = copy; }); resolve(copied.length); };
                 transaction.onerror = transaction.onabort = function() { reject(new Error('Legacy sales were not copied')); };
             });
         });
@@ -229,14 +229,16 @@ window._posOffline = (function() {
         }).catch(function() { legacyNotice(true); return 0; });
         return recoveryInFlight.then(function(count) { recoveryInFlight = null; return count; },function(error) { recoveryInFlight = null; throw error; });
     }
-    function acknowledgeLegacy(ids) {
-        var acknowledged = ids.filter(function(id) { return legacyCopied[id]; });
+    function acknowledgeLegacy(ids,sent) {
+        var acknowledged = ids.filter(function(id) {
+            return legacyCopied[id] && sent.some(function(sale) { return sale.offlineId === id && JSON.stringify(sale) === legacyCopied[id].payload; });
+        });
         if (!legacyDb || !acknowledged.length) return Promise.resolve();
         return new Promise(function(resolve,reject) {
             var transaction = legacyDb.transaction('queue','readwrite'), store = transaction.objectStore('queue');
             acknowledged.forEach(function(id) {
                 var current = store.get(id);
-                current.onsuccess = function() { if (current.result && JSON.stringify(current.result) === legacyCopied[id]) store.delete(id); };
+                current.onsuccess = function() { if (current.result && JSON.stringify(current.result) === legacyCopied[id].source) store.delete(id); };
             });
             transaction.oncomplete = function() { acknowledged.forEach(function(id) { delete legacyCopied[id]; }); readLegacy().then(function(rows) { legacyNotice(rows.length > 0); }).catch(function() { legacyNotice(true,'Legacy offline storage could not be checked. Keep this device and retry.'); }); resolve(); };
             transaction.onerror = transaction.onabort = function() { reject(new Error('Acknowledged legacy rows remain on the device')); };
@@ -302,7 +304,7 @@ window._posOffline = (function() {
         var sale={ offlineId:'OFL-'+Date.now()+'-'+Math.floor(Math.random()*100000), organizationPartyId:orgId, taxOn:taxEnabled()?'Y':'N', terminalId:c.terminalId, sessionId:c.sessionId, items:cart.map(function(it){return {productId:it.productId,name:it.name,qty:it.qty,price:it.price,uom:it.uom};}), total:total, taxAmount:cart.reduce(function(a,it){return a+taxAmount(it);},0), roundOff:total-cart.reduce(function(a,it){return a+it.qty*it.price+taxAmount(it);},0), paymentMethod:method, ts:new Date().toISOString() };
         enqueue(sale).then(function(){ printReceipt(sale); cart=[]; render(); banner(true); toast('✔ Sale saved offline ('+method+') — will sync when online','#2e7d32'); }).catch(function(){toast('Sale NOT saved. Keep this cart and retry.','#c62828');}); }
     function removeSynced(ids){ return ensureDb().then(function(d){ if(!d) return; return new Promise(function(res,rej){ var tx=d.transaction(['queue'],'readwrite'); ids.forEach(function(id){tx.objectStore('queue').delete(id);}); tx.oncomplete=function(){res();};tx.onerror=function(){rej(new Error('Queue update failed'));}; }); }); }
-    function sync(){ if(syncing) return Promise.resolve(0); syncing=true; return recoverLegacy().then(function(){ return getQueue(); }).then(function(q){ if(!q.length) return 0; var c=tCtx(), af=document.getElementById('cartInlineAddForm'), tk=af&&af.querySelector('[name=moquiSessionToken]'); var body=JSON.stringify({moquiSessionToken:tk?tk.value:'', terminalId:c.terminalId, transactions:q.map(function(s){return JSON.stringify(s);})}); return fetch('Terminal/syncOfflineTransactions',{method:'POST',headers:{'Content-Type':'application/json'},body:body,credentials:'same-origin'}).then(function(r){if(!r.ok)throw new Error('Sync rejected');return r.json();}).then(function(d){ var ack=Array.isArray(d.syncedIds)?d.syncedIds.filter(function(id){return q.some(function(s){return s.offlineId===id;});}):[]; return removeSynced(ack).then(function(){ return acknowledgeLegacy(ack); }).then(function(){ if(q.length>ack.length)toast('Some offline sales remain pending. Review and retry.','#c62828'); return ack.length; }); }); }).catch(function(){return 0;}).then(function(n){syncing=false;return n;}); }
+    function sync(){ if(syncing) return Promise.resolve(0); syncing=true; return recoverLegacy().then(function(){ return getQueue(); }).then(function(q){ if(!q.length) return 0; var c=tCtx(), af=document.getElementById('cartInlineAddForm'), tk=af&&af.querySelector('[name=moquiSessionToken]'); var body=JSON.stringify({moquiSessionToken:tk?tk.value:'', terminalId:c.terminalId, transactions:q.map(function(s){return JSON.stringify(s);})}); return fetch('Terminal/syncOfflineTransactions',{method:'POST',headers:{'Content-Type':'application/json'},body:body,credentials:'same-origin'}).then(function(r){if(!r.ok)throw new Error('Sync rejected');return r.json();}).then(function(d){ var ack=Array.isArray(d.syncedIds)?d.syncedIds.filter(function(id){return q.some(function(s){return s.offlineId===id;});}):[]; return removeSynced(ack).then(function(){ return acknowledgeLegacy(ack,q); }).then(function(){ if(q.length>ack.length)toast('Some offline sales remain pending. Review and retry.','#c62828'); return ack.length; }); }); }).catch(function(){return 0;}).then(function(n){syncing=false;return n;}); }
     // Instant local-first reads against the cached master data (no server round-trip)
     function search(term){ var lc=(term||'').toLowerCase().trim(); if(!lc) return []; var out=[]; for(var k in catalog){ var p=catalog[k]; if((p.name||'').toLowerCase().indexOf(lc)!==-1 || (p.barcode||'').toLowerCase().indexOf(lc)===0 || (p.productId||'').toLowerCase()===lc){ out.push(p); if(out.length>=30) break; } } return out; }
     function lookup(pid){ return catalog[pid] || null; }
