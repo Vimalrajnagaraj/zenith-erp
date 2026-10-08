@@ -6,6 +6,7 @@
 - `qapps-375.jpg`, `qapps-768.jpg`, `qapps-1440.jpg`: responsive Quasar screenshots.
 - `apps-375-dialog.jpg`, `qapps-375-dialog.jpg`: mobile confirmation dialogs.
 - `qapps-topbar-before.jpg`: reproduced incorrect framework test-mode header before the correction.
+- `qapps-topbar-overlap-before.jpg`: reproduced mobile organization/utility collision before wrapping and height reservation.
 - `header-summary.json`: live color comparison, corrected dev/test headers, responsive measurements and preserved controls.
 
 All images contain explicitly synthetic data. My Subscription's light header now matches live white instead of the framework dev/test tint. Development/test mode remains enabled; the Bootstrap test-mode page background is still inherited. Responsive measurements are actual `innerWidth`/`innerHeight`, not resized desktop screenshots. No full HTML, CSRF token, credentials, provider keys or customer records are attached.
