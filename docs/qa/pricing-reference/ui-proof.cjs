@@ -18,7 +18,7 @@ module.exports=async function(p,check,base,out){
       }
       await p.setViewportSize({width:1440,height:1000});
       if(screen!=='PricingDashboard') {
-        const find=p.getByText('Find Options',{exact:true}).first();
+        const find=p.getByText('Find Options',{exact:true}).filter({visible:true}).first();
         check(`${shell} ${screen} server filter is visible`,await find.isVisible());
         await find.click();
         const submit=p.getByRole('button',{name:'Find',exact:true}).filter({visible:true}).first();
