@@ -11,33 +11,8 @@
          quantity persists (a direct qoh with no ledger receipt gets zeroed on the first sale). -->
     <transition name="createExpiryStock">
         <actions>
-            <!-- ZE-INV-010 (IV-110): enforce Inventory write access (defense-in-depth; the central gate is fail-open) -->
-            <service-call name="zenith.base.SecurityServices.check#ModuleWriteAccess" out-map="_wac" in-map="[moduleId:'inventory']"/>
-            <if condition="!(_wac?.canWrite)"><return error="true" message="You have view-only access to Inventory — you can't make changes here."/></if>
-            <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-            <if condition="!productId"><return error="true" message="Please select a product."/></if>
-            <if condition="!expiryDate"><return error="true" message="Please enter an expiry date."/></if>
-            <script><![CDATA[
-                def _numOk = { v -> v != null && v.toString().trim() != '' && (v.toString().trim() ==~ /\d*\.?\d+/) }
-                if (!_numOk(quantity)) { ec.message.addError("Quantity must be a number greater than zero."); return }
-                def _qty = new BigDecimal(quantity)
-                if (_qty.signum() <= 0) { ec.message.addError("Quantity must be greater than zero."); return }
-                def _rate = _numOk(unitValue) ? new BigDecimal(unitValue) : BigDecimal.ZERO
-                def _org = (activeOrg && activeOrg != '_NA_') ? activeOrg : null
-                def inMap = [
-                    assetTypeEnumId:'AstTpInventory', classEnumId:'AsClsInventory', statusId:'AstAvailable',
-                    productId:productId, quantityOnHandTotal:_qty, availableToPromiseTotal:_qty,
-                    valuationRate:_rate, acquireCost:_rate, expiryDate:expiryDate, receivedDate:ec.user.nowTimestamp
-                ]
-                if (_org) inMap.ownerPartyId = _org
-                if (facilityId) inMap.facilityId = facilityId
-                if (batchNumber) inMap.batchNumber = batchNumber
-                def _a = ec.service.sync().name("create#mantle.product.asset.Asset").parameters(inMap).call()
-                ec.service.sync().name("create#mantle.product.asset.AssetDetail").parameters([
-                    assetId:_a.assetId, productId:productId, effectiveDate:ec.user.nowTimestamp,
-                    quantityOnHandDiff:_qty, availableToPromiseDiff:_qty, description:'Expiry-tracked stock added']).call()
-                ec.message.addMessage("Added " + _qty + " units (expiry " + expiryDate + "). It will appear below if it expires within 90 days.")
-            ]]></script>
+            <if condition="ec.web.request.method != 'POST'"><return error="true" message="Expiry stock changes require POST."/></if>
+            <service-call name="zenith.inventory.ExpiryRiskServices.create#ExpiryStock" in-map="context"/>
         </actions>
         <default-response url="."/>
     </transition>
@@ -49,76 +24,27 @@
          AssetDetail ledger diff so the on-hand persists (matching the create path). -->
     <transition name="updateExpiryStock">
         <actions>
-            <!-- ZE-INV-010 (IV-110): enforce Inventory write access (defense-in-depth; the central gate is fail-open) -->
-            <service-call name="zenith.base.SecurityServices.check#ModuleWriteAccess" out-map="_wac" in-map="[moduleId:'inventory']"/>
-            <if condition="!(_wac?.canWrite)"><return error="true" message="You have view-only access to Inventory — you can't make changes here."/></if>
-            <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-            <if condition="!assetId"><return error="true" message="Missing stock reference."/></if>
-            <if condition="!expiryDate"><return error="true" message="Please enter an expiry date."/></if>
-            <script><![CDATA[
-                def _asset = ec.entity.find("mantle.product.asset.Asset").condition("assetId", assetId).disableAuthz().one()
-                if (_asset == null) { ec.message.addError("Stock not found."); return }
-                if (activeOrg && activeOrg != '_NA_' && _asset.ownerPartyId != activeOrg) { ec.message.addError("You can only edit stock owned by your organization."); return }
-                def _numOk = { v -> v != null && v.toString().trim() != '' && (v.toString().trim() ==~ /\d*\.?\d+/) }
-                if (!_numOk(quantity)) { ec.message.addError("Quantity must be a number greater than zero."); return }
-                def _newQty = new BigDecimal(quantity.toString().trim())
-                if (_newQty.signum() <= 0) { ec.message.addError("Quantity must be greater than zero."); return }
-                def _rate = _numOk(unitValue) ? new BigDecimal(unitValue.toString().trim()) : (_asset.valuationRate ?: BigDecimal.ZERO)
-                def _oldQty = _asset.quantityOnHandTotal ?: BigDecimal.ZERO
-                def _bn = (batchNumber != null && batchNumber.toString().trim() != '' && batchNumber.toString().trim() != 'N/A') ? batchNumber.toString().trim() : null
-                // metadata (expiry / value / batch) — a plain field update; on-hand is ledger-driven, handled below
-                ec.service.sync().name("update#mantle.product.asset.Asset")
-                    .parameters([assetId:assetId, expiryDate:expiryDate, valuationRate:_rate, acquireCost:_rate, batchNumber:_bn]).call()
-                // A quantity change is a formal Inventory Adjustment: record a StockAdjustment header (who / when /
-                // reason / org) + a StockAdjustmentItem line (product / lot / system vs actual qty), so the correction
-                // is visible in the Stock Adjustments audit trail — not just a bare ledger line. Created already-applied
-                // because we post the ledger right here (the shared apply#StockAdjustment is product-level, not lot-
-                // precise, so we can't reuse it for a specific expiry lot).
-                if (_newQty.compareTo(_oldQty) != 0) {
-                    def _reason = (adjustReason != null && adjustReason.toString().trim() != '') ? adjustReason.toString().trim() : 'PhysicalCount'
-                    def _saOrg = (activeOrg && activeOrg != '_NA_') ? activeOrg : _asset.ownerPartyId
-                    def _sa = ec.service.sync().name("create#zenith.erp.inventory.StockAdjustment").parameters([
-                        organizationPartyId:_saOrg, facilityId:_asset.facilityId, adjustmentType:_reason,
-                        adjustmentDate:ec.user.nowTimestamp, statusId:'AdjApplied', adjustedBy:ec.user.userId,
-                        remarks:'Expiry Risk dashboard — lot ' + assetId + ' qty ' + _oldQty + ' → ' + _newQty]).call()
-                    ec.service.sync().name("create#zenith.erp.inventory.StockAdjustmentItem").parameters([
-                        stockAdjustmentId:_sa.stockAdjustmentId, productId:_asset.productId, assetId:assetId,
-                        systemQuantity:_oldQty, actualQuantity:_newQty, differenceQuantity:_newQty.subtract(_oldQty),
-                        valuationRate:_rate, remarks:'Edited from Expiry Risk dashboard']).call()
-                    // Post the ledger for THIS lot. Moqui recomputes quantityOnHandTotal from the SUM of AssetDetail
-                    // diffs, so the diff is (target - ledger sum), NOT (target - qoh) — this lands the on-hand exactly
-                    // on target even for legacy/migrated lots whose qoh was set without a ledger, and reconciles it.
-                    def _qohSum = BigDecimal.ZERO; def _atpSum = BigDecimal.ZERO
-                    for (def d : ec.entity.find("mantle.product.asset.AssetDetail").condition("assetId", assetId).disableAuthz().list()) {
-                        _qohSum = _qohSum.add(d.quantityOnHandDiff ?: BigDecimal.ZERO)
-                        _atpSum = _atpSum.add(d.availableToPromiseDiff ?: BigDecimal.ZERO)
-                    }
-                    ec.service.sync().name("create#mantle.product.asset.AssetDetail").parameters([
-                        assetId:assetId, productId:_asset.productId, effectiveDate:ec.user.nowTimestamp,
-                        quantityOnHandDiff:_newQty.subtract(_qohSum), availableToPromiseDiff:_newQty.subtract(_atpSum),
-                        description:'Stock adjustment ' + _sa.stockAdjustmentId + ' (' + _reason + ')']).call()
-                    ec.message.addMessage("Updated stock " + assetId + " — qty " + _oldQty + " → " + _newQty + " (adjustment " + _sa.stockAdjustmentId + " logged). Expiry " + expiryDate + ".")
-                } else {
-                    ec.message.addMessage("Updated stock " + assetId + " — expiry " + expiryDate + ".")
-                }
-            ]]></script>
+            <if condition="ec.web.request.method != 'POST'"><return error="true" message="Expiry stock changes require POST."/></if>
+            <service-call name="zenith.inventory.ExpiryRiskServices.update#ExpiryStock" in-map="context"/>
         </actions>
         <default-response url="."/>
     </transition>
 
     <!-- ZE-INV-004 (IV-103): the filter form submits here and just re-renders the dashboard; the actions read
          searchText / withinDays from the request and narrow the list. -->
-    <transition name="filterExpiry">
-        <default-response url="."/>
+    <transition name="filterExpiry" read-only="true">
+        <default-response url="."><parameter name="searchText"/><parameter name="withinDays"/><parameter name="categoryFilter"/><parameter name="supplierFilter"/><parameter name="daysBucket"/><parameter name="orderByField"/><parameter name="pageSize"/></default-response>
     </transition>
 
     <!-- ZE-INV-008 (IV-107): save this tenant's expiry-alert threshold + on/off -->
     <transition name="saveAlertSettings">
-        <actions>
+        <actions><if condition="ec.web.request.method != 'POST'"><return error="true" message="Changes require POST."/></if>
+            <service-call name="zenith.inventory.ExpiryRiskServices.get#ExpiryScope" out-map="expiryScope"/>
+            <if condition="expiryScope.organizationPartyId == '__NO_ORGANIZATION__'"><return error="true" message="Select an organization you belong to."/></if>
             <!-- ZE-INV-010 (IV-110): enforce Inventory write access (defense-in-depth; the central gate is fail-open) -->
             <service-call name="zenith.base.SecurityServices.check#ModuleWriteAccess" out-map="_wac" in-map="[moduleId:'inventory']"/>
             <if condition="!(_wac?.canWrite)"><return error="true" message="You have view-only access to Inventory — you can't make changes here."/></if>
-            <set field="_org" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <set field="_org" from="expiryScope.organizationPartyId"/>
             <if condition="!_org || _org == '_NA_'"><return error="true" message="Select an organization before changing alert settings."/></if>
             <service-call name="zenith.inventory.InventoryAlertServices.set#ExpiryAlertConfig"
                 in-map="[organizationPartyId: _org, alertDays: alertDays, alertEnabled: alertEnabled, alertEmail: alertEmail]"/>
@@ -137,7 +63,7 @@
                          searchText: ec.context.searchText, withinDays: ec.context.withinDays, orderByField: ec.context.orderByField,
                          categoryFilter: ec.context.categoryFilter, supplierFilter: ec.context.supplierFilter, daysBucket: ec.context.daysBucket]"/>
             <script><![CDATA[
-                def esc = { s -> '"' + (s == null ? '' : s.toString()).replace('"','""') + '"' }
+                def esc = { s -> def v = s == null ? '' : s.toString(); if (!(s instanceof Number) && v ==~ /(?s)^[\s]*[=+@-].*/) v = "'" + v; '"' + v.replace('"','""') + '"' }
                 def sb = new StringBuilder()
                 sb.append("Stock ID,Product Name,Batch/Lot,Supplier,Expiry Date,Days to Expiry,Quantity,Value at Risk,Valuation Basis\r\n")
                 // expiry-risk §9 bulk: when specific rows are selected (Export Selected), narrow the export to them.
@@ -146,7 +72,7 @@
                 if (_sel) { def _ids = _sel.split(',').findAll { it }.collect { it.trim() }.toSet(); _rows = _rows.findAll { _ids.contains((it.assetId ?: '').toString()) } }
                 for (def r : _rows) {
                     def _basis = (r.valueBasis == 'MRP') ? 'MRP (retail)' : (r.valueBasis == 'unvalued' ? 'not valued' : 'cost')
-                    def _days = (r.daysToExpiry != null && r.daysToExpiry <= 0) ? 'EXPIRED' : ('' + r.daysToExpiry)
+                    def _days = r.daysToExpiry
                     def _exp = r.expiryDate ? ec.l10n.format(r.expiryDate, 'yyyy-MM-dd') : ''
                     sb.append([esc(r.assetId), esc(r.productName), esc(r.batchNumber), esc(r.supplierName), esc(_exp), esc(_days), esc(r.quantity), esc(r.value), esc(_basis)].join(',')).append("\r\n")
                 }
@@ -176,13 +102,15 @@
          (safe self-service; team distribution stays the opt-in Alert Settings email digest). Reuses the proven
          EXPIRY_ALERT email template + send#EmailTemplate (same as the scheduled alert). -->
     <transition name="emailReport">
-        <actions>
+        <actions><if condition="ec.web.request.method != 'POST'"><return error="true" message="Changes require POST."/></if>
+            <service-call name="zenith.inventory.ExpiryRiskServices.get#ExpiryScope" out-map="expiryScope"/>
+            <if condition="expiryScope.organizationPartyId == '__NO_ORGANIZATION__'"><return error="true" message="Select an organization you belong to."/></if>
             <service-call name="zenith.base.SecurityServices.check#ModuleWriteAccess" out-map="_wac" in-map="[moduleId:'inventory']"/>
             <if condition="!(_wac?.canWrite)"><return error="true" message="You have view-only access to Inventory."/></if>
-            <set field="_org" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <set field="_org" from="expiryScope.organizationPartyId"/>
             <if condition="!_org || _org == '_NA_'"><return error="true" message="Select an organization before emailing a report."/></if>
             <service-call name="zenith.inventory.InventoryServices.get#ExpiryRisk" out-map="_ex"
-                in-map="[organizationPartyId: _org, searchText: searchText, withinDays: withinDays,
+                in-map="[organizationPartyId: _org, searchText: searchText, withinDays: withinDays, orderByField:orderByField,
                          categoryFilter: categoryFilter, supplierFilter: supplierFilter, daysBucket: daysBucket]"/>
             <script><![CDATA[
                 def _ua = ec.entity.find("moqui.security.UserAccount").condition("userId", ec.user.userId).disableAuthz().one()
@@ -192,10 +120,11 @@
                 def _cnt = (_ex.expiringAssets ?: []).size()
                 try {
                     ec.service.sync().name("org.moqui.impl.EmailServices.send#EmailTemplate").parameters([
-                        emailTemplateId:"EXPIRY_ALERT", toAddresses:_to.toString().trim(),
-                        bodyParameters:[orgName:(_orgRec?.organizationName ?: 'Your organization'), count:_cnt, days:90,
+                        emailTemplateId:"EXPIRY_RISK_REPORT", toAddresses:_to.toString().trim(),
+                        bodyParameters:[orgName:(_orgRec?.organizationName ?: 'Your organization'), count:_cnt, days:(withinDays ?: '90'), reportRows:(_ex.expiringAssets ?: []),
                                         valueAtRisk:(_ex.totalExpiryValue ?: 0),
-                                        dashboardUrl:"https://erp.zetaclantech.com/apps/zenith/Inventory/ExpiryDashboard"]]).disableAuthz().call()
+                                        dashboardUrl:ec.web.getWebappRootUrl(false, null)+"/apps/zenith/Inventory/ExpiryDashboard"]]).disableAuthz().call()
+                    if (ec.message.hasError()) return
                     ec.message.addMessage("Expiry Risk report emailed to " + _to + " (" + _cnt + " lot" + (_cnt == 1 ? '' : 's') + ").")
                 } catch (Exception _ee) { ec.message.addError("Couldn't send the email right now: " + _ee.message) }
             ]]></script>
@@ -206,29 +135,33 @@
     <!-- expiry-risk §7: Save / Manage Views — persist named filter-sets in a per-user preference (JSON). No new
          entity; just the current search/period/category/supplier/tier stored under a name and re-applied via URL. -->
     <transition name="saveView">
-        <actions><script><![CDATA[
+        <actions><if condition="ec.web.request.method != 'POST'"><return error="true" message="Changes require POST."/></if>
+            <service-call name="zenith.inventory.ExpiryRiskServices.get#ExpiryScope" out-map="expiryScope"/>
+            <if condition="expiryScope.organizationPartyId == '__NO_ORGANIZATION__'"><return error="true" message="Select an organization you belong to."/></if><script><![CDATA[
             def _nm = (viewName ?: '').toString().trim()
-            if (!_nm) { ec.message.addError("Enter a name for the view."); return }
+            if (!_nm || _nm.length() > 80) { ec.message.addError("Enter a name for the view."); return }
             def _list = []
-            def _raw = ec.user.getPreference('EXPIRY_SAVED_VIEWS')
-            if (_raw) { try { _list = new groovy.json.JsonSlurper().parseText(_raw.toString()) } catch (Exception _e) { _list = [] } }
+            def _raw = ec.user.getPreference('EXPIRY_SAVED_VIEWS_' + ec.user.getPreference('ACTIVE_ORGANIZATION'))
+            if (_raw) { try { def parsed = new groovy.json.JsonSlurper().parseText(_raw.toString()); _list = parsed instanceof List ? parsed.findAll { it instanceof Map && it.name instanceof String } : [] } catch (Exception _e) { _list = [] } }
             _list = _list.findAll { it?.name != _nm }
             _list.add([name:_nm, searchText:(searchText ?: ''), withinDays:(withinDays ?: ''),
-                       categoryFilter:(categoryFilter ?: ''), supplierFilter:(supplierFilter ?: ''), daysBucket:(daysBucket ?: '')])
+                       categoryFilter:(categoryFilter ?: ''), supplierFilter:(supplierFilter ?: ''), daysBucket:(daysBucket ?: ''), orderByField:(orderByField ?: 'expiryDate'), pageSize:(pageSize ?: '20')])
             if (_list.size() > 20) _list = new ArrayList(_list.subList(_list.size()-20, _list.size()))
-            ec.user.setPreference('EXPIRY_SAVED_VIEWS', groovy.json.JsonOutput.toJson(_list))
+            ec.user.setPreference('EXPIRY_SAVED_VIEWS_' + ec.user.getPreference('ACTIVE_ORGANIZATION'), groovy.json.JsonOutput.toJson(_list))
             ec.message.addMessage("Saved view “" + _nm + "”.")
         ]]></script></actions>
         <default-response url="."><parameter name="searchText"/><parameter name="withinDays"/><parameter name="categoryFilter"/><parameter name="supplierFilter"/><parameter name="daysBucket"/></default-response>
     </transition>
     <transition name="deleteView">
-        <actions><script><![CDATA[
+        <actions><if condition="ec.web.request.method != 'POST'"><return error="true" message="Changes require POST."/></if>
+            <service-call name="zenith.inventory.ExpiryRiskServices.get#ExpiryScope" out-map="expiryScope"/>
+            <if condition="expiryScope.organizationPartyId == '__NO_ORGANIZATION__'"><return error="true" message="Select an organization you belong to."/></if><script><![CDATA[
             def _nm = (viewName ?: '').toString().trim()
             def _list = []
-            def _raw = ec.user.getPreference('EXPIRY_SAVED_VIEWS')
-            if (_raw) { try { _list = new groovy.json.JsonSlurper().parseText(_raw.toString()) } catch (Exception _e) { _list = [] } }
+            def _raw = ec.user.getPreference('EXPIRY_SAVED_VIEWS_' + ec.user.getPreference('ACTIVE_ORGANIZATION'))
+            if (_raw) { try { def parsed = new groovy.json.JsonSlurper().parseText(_raw.toString()); _list = parsed instanceof List ? parsed.findAll { it instanceof Map && it.name instanceof String } : [] } catch (Exception _e) { _list = [] } }
             _list = _list.findAll { it?.name != _nm }
-            ec.user.setPreference('EXPIRY_SAVED_VIEWS', groovy.json.JsonOutput.toJson(_list))
+            ec.user.setPreference('EXPIRY_SAVED_VIEWS_' + ec.user.getPreference('ACTIVE_ORGANIZATION'), groovy.json.JsonOutput.toJson(_list))
             ec.message.addMessage("Removed view “" + _nm + "”.")
         ]]></script></actions>
         <default-response url="."/>
@@ -237,18 +170,20 @@
     <!-- expiry-risk §8: Columns picker — per-user show/hide of the optional columns. Stored as a preference; applied
          via injected CSS (nth-child) which /apps renders; on /qapps injected <style> is stripped so all columns show. -->
     <transition name="saveColumns">
-        <actions><script><![CDATA[
+        <actions><if condition="ec.web.request.method != 'POST'"><return error="true" message="Changes require POST."/></if>
+            <service-call name="zenith.inventory.ExpiryRiskServices.get#ExpiryScope" out-map="expiryScope"/>
+            <if condition="expiryScope.organizationPartyId == '__NO_ORGANIZATION__'"><return error="true" message="Select an organization you belong to."/></if><script><![CDATA[
             def _keys = ['sku','batch','supplier','status','quantity','value']
             def _shown = { k -> def v = context.get('col_' + k); (v == 'Y' || v == true || v == 'true') }
             def _hidden = _keys.findAll { !_shown(it) }
-            ec.user.setPreference('EXPIRY_HIDDEN_COLS', _hidden.join(','))
+            ec.user.setPreference('EXPIRY_HIDDEN_COLS_' + ec.user.getPreference('ACTIVE_ORGANIZATION'), _hidden.join(','))
             ec.message.addMessage("Columns updated.")
         ]]></script></actions>
         <default-response url="."><parameter name="searchText"/><parameter name="withinDays"/><parameter name="categoryFilter"/><parameter name="supplierFilter"/><parameter name="daysBucket"/></default-response>
     </transition>
 
     <actions>
-        <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+        <service-call name="zenith.inventory.ExpiryRiskServices.get#ExpiryScope" out-map="pageScope"/><set field="activeOrg" from="pageScope.organizationPartyId"/>
         <!-- ZE-INV-006 (IV-105): the list is built by the shared get#ExpiryRisk service (org isolation, value
              fallback, supplier, search+filter, sort) so the screen and the CSV export return the same data. -->
         <service-call name="zenith.inventory.InventoryServices.get#ExpiryRisk" out-map="expiryOut"
@@ -279,7 +214,7 @@
             def _all = (expiryOut?.expiringAssets ?: [])
             expiryRowCount = _all.size()
             expiryCapped = false
-            def _pgSize = 20
+            def _pgSize = ['20','50','100'].contains((ec.context.pageSize ?: '20').toString()) ? (ec.context.pageSize as Integer ?: 20) : 20
             int _pgIdx = 0
             try { _pgIdx = ((ec.context.pageIndex ?: '0').toString().trim() ?: '0') as Integer } catch (Exception _pe) { _pgIdx = 0 }
             int _pgCount = (expiryRowCount <= 0) ? 1 : ((int)((expiryRowCount - 1) / _pgSize) + 1)
@@ -294,32 +229,23 @@
             // ZE-INV expiry-risk §5.2/§7: derive the "Expired" KPI + tier-bucket counts from the ALREADY-LOADED
             // list — real data (daysToExpiry comes from get#ExpiryRisk), no fabrication, no extra query.
             def _de = { r -> (r.daysToExpiry != null) ? (r.daysToExpiry as Integer) : 999 }
-            expiredCount = _all.count { _de(it) <= 0 }
-            def _expv = BigDecimal.ZERO
-            for (def r : _all) { if (_de(r) <= 0) _expv = _expv.add(r.value ?: BigDecimal.ZERO) }
-            expiredValue = _expv
-            cntAll = _all.size()
-            cnt7  = _all.count { def d = _de(it); d > 0 && d <= 7 }
-            cnt30 = _all.count { def d = _de(it); d > 0 && d <= 30 }
-            cnt60 = _all.count { def d = _de(it); d > 0 && d <= 60 }
-
-            // expiry-risk §5: items + units behind each stat card (real, from the loaded list — no extra query).
-            def _vaRUnits = BigDecimal.ZERO; def _expUnits = BigDecimal.ZERO
-            for (def r : _all) { def q = (r.quantity ?: 0G) as BigDecimal; _vaRUnits = _vaRUnits.add(q); if (_de(r) <= 0) _expUnits = _expUnits.add(q) }
-            vaRItems = cntAll
-            vaRUnitsDisp = ec.l10n.format(_vaRUnits, '#,##0.##')
-            expiredUnitsDisp = ec.l10n.format(_expUnits, '#,##0.##')
-            vaRValueDisp = zinr.inr(ec.l10n.format(expiryOut?.totalExpiryValue ?: 0, '#,##,##0.00'))
-            expiredValueDisp = zinr.inr(ec.l10n.format(expiredValue ?: 0, '#,##,##0.00'))
+            def riskSummary = expiryOut.summary
+            expiredCount = riskSummary.expiredCount
+            expiredValue = riskSummary.expiredValue
+            vaRItems = riskSummary.riskCount
+            vaRUnitsDisp = ec.l10n.format(riskSummary.riskUnits, '#,##0.######')
+            expiredUnitsDisp = ec.l10n.format(riskSummary.expiredUnits, '#,##0.######')
+            vaRValueDisp = com.zenith.Fmt.regroup(ec.l10n.format(riskSummary.riskValue, '#,##0.00'))
+            expiredValueDisp = com.zenith.Fmt.regroup(ec.l10n.format(riskSummary.expiredValue, '#,##0.00'))
             expiredColor = (expiredCount > 0) ? '#DC2626' : '#111827'
 
             // §7: saved views (per-user preference, JSON list of named filter-sets)
             savedViews = []
-            def _svRaw = ec.user.getPreference('EXPIRY_SAVED_VIEWS')
-            if (_svRaw) { try { savedViews = new groovy.json.JsonSlurper().parseText(_svRaw.toString()) } catch (Exception _sve) { savedViews = [] } }
+            def _svRaw = ec.user.getPreference('EXPIRY_SAVED_VIEWS_' + ec.user.getPreference('ACTIVE_ORGANIZATION'))
+            if (_svRaw) { try { def parsed = new groovy.json.JsonSlurper().parseText(_svRaw.toString()); savedViews = parsed instanceof List ? parsed.findAll { it instanceof Map && it.name instanceof String } : [] } catch (Exception _sve) { savedViews = [] } }
 
             // §8: columns picker — hidden set + the checkbox defaults + the nth-child hide CSS (/apps only).
-            def _hcRaw = (ec.user.getPreference('EXPIRY_HIDDEN_COLS') ?: '').toString()
+            def _hcRaw = (ec.user.getPreference('EXPIRY_HIDDEN_COLS_' + ec.user.getPreference('ACTIVE_ORGANIZATION')) ?: '').toString()
             def _hcSet = _hcRaw.split(',').findAll { it }.toSet()
             col_sku = _hcSet.contains('sku') ? 'N' : 'Y'
             col_batch = _hcSet.contains('batch') ? 'N' : 'Y'
@@ -365,12 +291,12 @@
             </container-dialog>
             <container-dialog id="AddExpiryStockDialog" button-text="Add Expiring Stock" button-icon="fa fa-plus-circle"
                               button-class="q-btn bg-primary text-white text-weight-bold border-radius-md q-px-md">
-                <form-single name="AddExpiryStockForm" transition="createExpiryStock">
+                <form-single name="AddExpiryStockForm" transition="createExpiryStock"><field name="receiptRequestId"><default-field><hidden default-value="${java.util.UUID.randomUUID().toString()}"/></default-field></field>
                     <field name="productId"><default-field title="Product">
                         <drop-down allow-empty="false">
                             <entity-options key="${productId}" text="${pseudoId} - ${productName}">
                                 <entity-find entity-name="mantle.product.Product">
-                                    <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+                                    <econdition field-name="ownerPartyId" from="activeOrg" />
                                     <order-by field-name="productName"/>
                                 </entity-find>
                             </entity-options>
@@ -384,7 +310,7 @@
                         <drop-down allow-empty="true">
                             <entity-options key="${facilityId}" text="${facilityName}">
                                 <entity-find entity-name="mantle.facility.Facility">
-                                    <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+                                    <econdition field-name="ownerPartyId" from="activeOrg" />
                                     <order-by field-name="facilityName"/>
                                 </entity-find>
                             </entity-options>
@@ -420,7 +346,7 @@
             <section name="ExpiryAlertActive">
                 <condition><expression>alertEnabled == 'Y' &amp;&amp; alertCount &gt; 0</expression></condition>
                 <widgets>
-                    <label text="⚠ ${alertCount} item(s) expiring within ${alertDays} days — ${currSymbol}${zinr.inr(ec.l10n.format(alertValue ?: 0, '#,##,##0.00'))} at risk. Sell them, run an offer, or return them to the supplier before they go to waste." type="p" style="text-danger text-weight-bold"/>
+                    <label text="⚠ ${alertCount} item(s) expiring within ${alertDays} days — ${currSymbol}${ec.l10n.format(alertValue ?: 0, '#,##,##0.00')} at risk. Sell them, run an offer, or return them to the supplier before they go to waste." type="p" style="text-danger text-weight-bold"/>
                     <!-- ZE-INV-010 (IV-110): the "adjust settings" hint only for users who can actually change settings -->
                     <section name="ExpiryAlertHint">
                         <condition><expression>invCanWrite</expression></condition>
@@ -482,7 +408,7 @@
 
             <!-- ZE-INV expiry-risk §7: quick filter pills with LIVE counts (derived from the loaded list, not
                  fabricated). Each links to the existing withinDays filter and preserves the current search. -->
-            <render-mode><text type="html,qvt,vuet"><![CDATA[<#assign _db = (daysBucket)!''><#assign _sq = (searchText)!''><#assign _cf = (categoryFilter)!''><#assign _sf = (supplierFilter)!''><#assign _qs = 'searchText='+_sq?url('UTF-8')+'&amp;categoryFilter='+_cf?url('UTF-8')+'&amp;supplierFilter='+_sf?url('UTF-8')><#assign _tc = (expiryOut.tierCounts)!{}><#macro rchip k lbl cnt bd tx><#local on=(_db==k)><a href="?daysBucket=${k}&amp;${_qs}" style="display:inline-flex;align-items:center;gap:6px;padding:5px 12px;border-radius:9999px;font-size:12.5px;font-weight:600;text-decoration:none;border:1px solid ${on?string('#7C3AED',bd)};background:${on?string('#7C3AED','#FFFFFF')};color:${on?string('#FFFFFF',tx)}">${lbl} <b>${cnt}</b></a></#macro><div style="display:flex;flex-wrap:wrap;gap:8px;margin:4px 0 14px"><@rchip k='' lbl='All' cnt=(_tc.all)!0 bd='#7C3AED' tx='#7C3AED'/><@rchip k='0-30' lbl='Within 30 days' cnt=(_tc.d30)!0 bd='#F59E0B' tx='#B45309'/><@rchip k='31-60' lbl='31&#8211;60 days' cnt=(_tc.d3160)!0 bd='#DC2626' tx='#DC2626'/><@rchip k='61-90' lbl='61&#8211;90 days' cnt=(_tc.d6190)!0 bd='#059669' tx='#059669'/><@rchip k='90+' lbl='After 90 days' cnt=(_tc.after90)!0 bd='#E5E7EB' tx='#9CA3AF'/><@rchip k='expired' lbl='Expired' cnt=(_tc.expired)!0 bd='#DC2626' tx='#DC2626'/></div>]]></text></render-mode>
+            <render-mode><text type="html,qvt,vuet"><![CDATA[<#assign _db = (daysBucket)!''><#assign _sq = (searchText)!''><#assign _cf = (categoryFilter)!''><#assign _sf = (supplierFilter)!''><#assign _qs = 'searchText='+_sq?url('UTF-8')+'&amp;categoryFilter='+_cf?url('UTF-8')+'&amp;supplierFilter='+_sf?url('UTF-8')><#assign _tc = (expiryOut.tierCounts)!{}><#macro rchip k lbl cnt bd tx><#local on=(_db==k)><a href="?daysBucket=${k?url('UTF-8')}&amp;${_qs}" style="display:inline-flex;align-items:center;gap:6px;padding:5px 12px;border-radius:9999px;font-size:12.5px;font-weight:600;text-decoration:none;border:1px solid ${on?string('#7C3AED',bd)};background:${on?string('#7C3AED','#FFFFFF')};color:${on?string('#FFFFFF',tx)}">${lbl} <b>${cnt}</b></a></#macro><div style="display:flex;flex-wrap:wrap;gap:8px;margin:4px 0 14px"><@rchip k='' lbl='All' cnt=(_tc.all)!0 bd='#7C3AED' tx='#7C3AED'/><@rchip k='0-30' lbl='Within 30 days' cnt=(_tc.d30)!0 bd='#F59E0B' tx='#B45309'/><@rchip k='31-60' lbl='31&#8211;60 days' cnt=(_tc.d3160)!0 bd='#DC2626' tx='#DC2626'/><@rchip k='61-90' lbl='61&#8211;90 days' cnt=(_tc.d6190)!0 bd='#059669' tx='#059669'/><@rchip k='90+' lbl='After 90 days' cnt=(_tc.after90)!0 bd='#E5E7EB' tx='#9CA3AF'/><@rchip k='expired' lbl='Expired' cnt=(_tc.expired)!0 bd='#DC2626' tx='#DC2626'/></div>]]></text></render-mode>
 
             <!-- expiry-risk §7 (right cluster): Save View + Manage Views — per-user saved filter-sets. -->
             <container style="row items-center q-gutter-sm q-mb-sm">
@@ -581,8 +507,8 @@
                     <script><![CDATA[
                         def nowLong = ec.user.nowTimestamp.getTime()
                         def expLong = expiryDate?.getTime() ?: 0
-                        daysToExpiry = expLong > 0 ? (int)((expLong - nowLong) / (1000 * 60 * 60 * 24)) : 999
-                        isExpired = daysToExpiry <= 0
+                        // Calendar-day classification is supplied by the shared report service.
+                        isExpired = daysToExpiry < 0
                         // expiry-risk §9: per-row overflow (⋮) menu — safe secondary navigations (no destructive
                         // default; Edit + the qty-to-zero write-off already live in the inline Edit dialog).
                         kebabHtml = '<details class="exp-kebab"><summary class="exp-kebab-btn" title="More actions">&#8942;</summary><div class="exp-kebab-menu"><a href="/apps/zenith/Inventory/EditProduct?productId=' + (productId ?: '') + '">View product</a><a href="/apps/zenith/Inventory/StockAdjustments">Adjust stock</a></div></details>'
@@ -623,7 +549,7 @@
                     <container-dialog id="EditExpiry_${assetId}" button-text="Edit" button-icon="fa fa-pencil"
                                       button-class="q-btn--flat text-primary text-caption q-px-sm">
                         <form-single name="EditExpiryForm" transition="updateExpiryStock">
-                            <field name="assetId"><default-field><hidden default-value="${assetId}"/></default-field></field>
+                            <field name="assetId"><default-field><hidden default-value="${assetId}"/></default-field></field><field name="stockVersion"><default-field><hidden default-value="${stockVersion}"/></default-field></field>
                             <field name="lotLabel"><default-field title="Editing"><display text="${productName} — ${assetId}"/></default-field></field>
                             <field name="expiryDate"><default-field title="Expiry Date"><date-time type="date" default-value="${expiryDate ? ec.l10n.format(expiryDate, 'yyyy-MM-dd') : ''}"/></default-field></field>
                             <field name="quantity"><default-field title="Quantity"><text-line size="10" default-value="${quantity}"/></default-field></field>

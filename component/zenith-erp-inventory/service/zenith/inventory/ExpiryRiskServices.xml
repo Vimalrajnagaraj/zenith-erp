@@ -1,0 +1,126 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+    <service verb="get" noun="ExpiryScope">
+        <out-parameters><parameter name="organizationPartyId"/></out-parameters>
+        <actions><script><![CDATA[
+            organizationPartyId = '__NO_ORGANIZATION__'
+            def selected = ec.user.getPreference('ACTIVE_ORGANIZATION')
+            if (!selected || selected == '_NA_') return
+            if (!ec.user.isInGroup('ADMIN')) {
+                def membership = ec.service.sync().name('mantle.party.PartyServices.get#PartyOrganizationInfo').parameters([partyId:ec.user.userAccount?.partyId]).call()
+                if (!membership?.userOrgIds?.contains(selected)) return
+            }
+            if (!ec.entity.find('mantle.party.Organization').condition('partyId', selected).one()) return
+            organizationPartyId = selected
+        ]]></script></actions>
+    </service>
+    <service verb="require" noun="ExpiryWrite">
+        <out-parameters><parameter name="organizationPartyId"/></out-parameters>
+        <actions>
+            <service-call name="zenith.inventory.ExpiryRiskServices.get#ExpiryScope" out-map="scope"/>
+            <set field="organizationPartyId" from="scope.organizationPartyId"/>
+            <if condition="organizationPartyId == '__NO_ORGANIZATION__'"><return error="true" message="Select an organization you belong to before changing expiry stock."/></if>
+            <service-call name="zenith.base.SecurityServices.check#ModuleWriteAccess" in-map="[moduleId:'inventory']" out-map="access"/>
+            <if condition="!access.canWrite"><return error="true" message="You have view-only access to Inventory."/></if>
+        </actions>
+    </service>
+    <service verb="create" noun="ExpiryStock">
+        <in-parameters>
+            <parameter name="productId" required="true"/><parameter name="facilityId" required="true"/>
+            <parameter name="expiryDate" required="true"/><parameter name="quantity" type="BigDecimal" required="true"/>
+            <parameter name="unitValue" type="BigDecimal" required="true"/><parameter name="batchNumber"/>
+            <parameter name="receiptRequestId" required="true"/>
+        </in-parameters>
+        <out-parameters><parameter name="assetId"/></out-parameters>
+        <actions>
+            <service-call name="zenith.inventory.ExpiryRiskServices.require#ExpiryWrite" out-map="guard"/>
+            <script><![CDATA[
+                if (!(receiptRequestId.toString() ==~ /[a-fA-F0-9-]{36}/)) { ec.message.addError('Refresh the entry form before adding stock.'); return }
+                ec.entity.find('moqui.security.UserAccount').condition('userId', ec.user.userId).forUpdate(true).one()
+                def receiptKey = 'EXPIRY_RECEIPT_' + guard.organizationPartyId + '_' + receiptRequestId
+                def previous = ec.entity.find('moqui.security.UserPreference').condition('userId', ec.user.userId).condition('preferenceKey', receiptKey).one()
+                if (previous) { assetId = previous.preferenceValue; ec.message.addMessage('This stock entry was already recorded.'); return }
+                def product = ec.entity.find('mantle.product.Product').condition('productId', productId).forUpdate(true).one()
+                def facility = ec.entity.find('mantle.facility.Facility').condition('facilityId', facilityId).one()
+                if (!product || product.ownerPartyId != guard.organizationPartyId || product.productTypeEnumId != 'PtAsset') { ec.message.addError('Choose a physical product from your organization.'); return }
+                if (!facility || facility.ownerPartyId != guard.organizationPartyId) { ec.message.addError('Choose a warehouse from your organization.'); return }
+                if (product.enableSerialTracking == 'Y') { ec.message.addError('Receive serial-tracked stock through Receiving with its individual serial numbers.'); return }
+                if (quantity.signum() <= 0 || quantity.stripTrailingZeros().scale() > 6 || unitValue.signum() < 0 || unitValue.stripTrailingZeros().scale() > 6) { ec.message.addError('Enter a positive quantity and non-negative unit value, with at most six decimal places.'); return }
+                def lot = batchNumber?.toString()?.trim()
+                if (lot?.length() > 100 || (product.enableBatchTracking == 'Y' && !lot)) { ec.message.addError('Enter the batch / lot for this batch-tracked product (maximum 100 characters).'); return }
+                java.time.LocalDate date
+                try { date = java.time.LocalDate.parse(expiryDate.toString()) } catch (Exception ignored) { ec.message.addError('Enter a valid expiry date.'); return }
+                def zone = java.time.ZoneId.of(ec.user.userAccount?.timeZone ?: java.util.TimeZone.getDefault().ID)
+                def expiry = java.sql.Timestamp.from(date.atStartOfDay(zone).toInstant())
+                def result = ec.service.sync().name('create#mantle.product.asset.Asset').parameters([
+                    productId:productId, facilityId:facilityId, ownerPartyId:guard.organizationPartyId,
+                    assetTypeEnumId:'AstTpInventory', classEnumId:'AsClsInventory', statusId:'AstAvailable',
+                    quantityOnHandTotal:0G, availableToPromiseTotal:0G, valuationRate:unitValue, acquireCost:unitValue,
+                    batchNumber:lot, expiryDate:expiry, receivedDate:ec.user.nowTimestamp]).call()
+                assetId = result.assetId
+                ec.service.sync().name('create#mantle.product.asset.AssetDetail').parameters([
+                    assetId:assetId, productId:productId, effectiveDate:ec.user.nowTimestamp,
+                    quantityOnHandDiff:quantity, availableToPromiseDiff:quantity, description:'Expiry stock received']).call()
+                ec.service.sync().name('update#mantle.product.Product').parameters([productId:productId, inventoryTracked:'Y']).call()
+                ec.service.sync().name('create#moqui.security.UserPreference').parameters([userId:ec.user.userId, preferenceKey:receiptKey, preferenceValue:assetId]).call()
+                ec.message.addMessage('Expiring stock added. Use the date filters to review it.')
+            ]]></script>
+        </actions>
+    </service>
+    <service verb="update" noun="ExpiryStock">
+        <in-parameters>
+            <parameter name="assetId" required="true"/><parameter name="expiryDate" required="true"/>
+            <parameter name="quantity" type="BigDecimal" required="true"/><parameter name="unitValue" type="BigDecimal" required="true"/>
+            <parameter name="batchNumber"/><parameter name="adjustReason" default-value="PhysicalCount"/>
+            <parameter name="stockVersion" required="true"/>
+        </in-parameters>
+        <actions>
+            <service-call name="zenith.inventory.ExpiryRiskServices.require#ExpiryWrite" out-map="guard"/>
+            <script><![CDATA[
+                def asset = ec.entity.find('mantle.product.asset.Asset').condition('assetId', assetId).forUpdate(true).one()
+                if (!asset || asset.ownerPartyId != guard.organizationPartyId || asset.assetTypeEnumId != 'AstTpInventory' || asset.statusId != 'AstAvailable') { ec.message.addError('This inventory lot is not available in your organization.'); return }
+                def product = ec.entity.find('mantle.product.Product').condition('productId', asset.productId).one()
+                def facility = ec.entity.find('mantle.facility.Facility').condition('facilityId', asset.facilityId).one()
+                if (!product || product.ownerPartyId != guard.organizationPartyId || !facility || facility.ownerPartyId != guard.organizationPartyId) { ec.message.addError('The product and warehouse must belong to your organization.'); return }
+                if (stockVersion.toString() != asset.lastUpdatedStamp?.getTime()?.toString()) { ec.message.addError('Stock changed since you opened this page. Refresh and review the current lot before saving.'); return }
+                if (quantity.signum() < 0 || quantity.stripTrailingZeros().scale() > 6 || unitValue.signum() < 0 || unitValue.stripTrailingZeros().scale() > 6) { ec.message.addError('Enter non-negative quantity and unit value, with at most six decimal places.'); return }
+                if (!(adjustReason in ['PhysicalCount','Damage','Expiry','WriteOff'])) { ec.message.addError('Choose a valid stock-correction reason.'); return }
+                def oldQty = asset.quantityOnHandTotal ?: 0G
+                def oldAtp = asset.availableToPromiseTotal ?: 0G
+                def reserved = oldQty - oldAtp
+                if (reserved < 0 || quantity < reserved) { ec.message.addError('The count cannot remove stock reserved for orders.'); return }
+                if (adjustReason != 'PhysicalCount' && quantity > oldQty) { ec.message.addError('Damage, expiry and write-off cannot increase stock.'); return }
+                if (product.enableSerialTracking == 'Y' && quantity != oldQty) { ec.message.addError('Correct serial quantities through Stock Adjustments with explicit serial identities.'); return }
+                def lot = batchNumber?.toString()?.trim()
+                if (lot == 'N/A') lot = null
+                if (lot?.length() > 100 || (product.enableBatchTracking == 'Y' && lot != asset.batchNumber)) { ec.message.addError('Preserve the existing batch identity; receive a new batch through Receiving.'); return }
+                java.time.LocalDate date
+                try { date = java.time.LocalDate.parse(expiryDate.toString()) } catch (Exception ignored) { ec.message.addError('Enter a valid expiry date.'); return }
+                def zone = java.time.ZoneId.of(ec.user.userAccount?.timeZone ?: java.util.TimeZone.getDefault().ID)
+                def expiry = java.sql.Timestamp.from(date.atStartOfDay(zone).toInstant())
+                if (quantity != oldQty) {
+                    def qohSum = 0G; def atpSum = 0G
+                    for (def detail : ec.entity.find('mantle.product.asset.AssetDetail').condition('assetId', assetId).list()) { qohSum += detail.quantityOnHandDiff ?: 0G; atpSum += detail.availableToPromiseDiff ?: 0G }
+                    if (qohSum != oldQty || atpSum != oldAtp) ec.service.sync().name('create#mantle.product.asset.AssetDetail').parameters([
+                        assetId:assetId, productId:asset.productId, effectiveDate:ec.user.nowTimestamp,
+                        quantityOnHandDiff:oldQty-qohSum, availableToPromiseDiff:oldAtp-atpSum, description:'Reconcile legacy expiry lot ledger']).call()
+                    def adjustment = ec.service.sync().name('create#zenith.erp.inventory.StockAdjustment').parameters([
+                        organizationPartyId:guard.organizationPartyId, facilityId:asset.facilityId, adjustmentType:adjustReason,
+                        adjustmentDate:ec.user.nowTimestamp, statusId:'AdjApplied', adjustedBy:ec.user.userId,
+                        remarks:'Expiry Risk lot correction: '+assetId]).call()
+                    ec.service.sync().name('create#zenith.erp.inventory.StockAdjustmentItem').parameters([
+                        stockAdjustmentId:adjustment.stockAdjustmentId, productId:asset.productId, assetId:assetId,
+                        systemQuantity:oldQty, actualQuantity:quantity, differenceQuantity:quantity-oldQty,
+                        valuationRate:unitValue, remarks:'Expiry Risk lot count']).call()
+                    ec.service.sync().name('create#mantle.product.asset.AssetDetail').parameters([
+                        assetId:assetId, productId:asset.productId, effectiveDate:ec.user.nowTimestamp,
+                        quantityOnHandDiff:quantity-oldQty, availableToPromiseDiff:quantity-oldQty,
+                        description:'Stock adjustment '+adjustment.stockAdjustmentId+' ('+adjustReason+')']).call()
+                }
+                ec.service.sync().name('update#mantle.product.asset.Asset').parameters([
+                    assetId:assetId, expiryDate:expiry, valuationRate:unitValue, acquireCost:unitValue, batchNumber:lot]).call()
+                ec.message.addMessage('Expiry lot updated. Stock corrections are recorded in the adjustment audit trail.')
+            ]]></script>
+        </actions>
+    </service>
+</services>
