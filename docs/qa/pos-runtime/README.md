@@ -64,8 +64,9 @@ unverified steps are not recorded as passes.
 
 Merge and deployment are separate. Only Amal deploys, following
 [`SOP-commit-and-deploy.md`](../../SOP-commit-and-deploy.md). This candidate depends
-on refreshed master `5b49021`, retaining the Product Catalog assets and
-`9ed3612`'s tax-inclusive Sales invoice contract. Deploy the reviewed,
+on master `1997a90f97fb1743b88c8d51a4e2aee418aab2b5`, retaining the merged
+Sales tax-inclusive invoice contract, Tax safeguards, Inventory styles and
+Contacts/dashboard asset registrations. Deploy the reviewed,
 complete component tree in one maintenance operation and restart Moqui so the new
 POS access/services and their callers become available together. Do not copy a
 child screen or JavaScript ahead of its service dependency.
