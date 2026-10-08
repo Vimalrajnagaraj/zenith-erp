@@ -46,6 +46,19 @@ try {
  check('Seeded fixtures exist before testing',()=>{assert.equal(asset('ERFIX_A1').quantity_on_hand_total,10);assert.equal(count('party',"party_id='ERFIX_ORG'"),1);});
  const all=await writer.csv({withinDays:'all'});
  check('Reports include only available inventory owned by the active organization',()=>{assert(ids(all).includes('ERFIX_A1'));assert(!ids(all).includes('ERFIX_SUPPLY'));assert(!ids(all).includes('ERFIX_BAD_OWNER'));assert(!ids(all).includes('ERFIX_SCRAPPED'));});
+ const selected=await writer.csv({withinDays:'all',searchText:'ERFIX-SKU',selIds:'ERFIX_BATCH1,ERFIX_A1'});
+ check('Selected export retains search scope instead of exposing nonmatching selected IDs',()=>assert.deepEqual(ids(selected),['ERFIX_A1']));
+ const initialPage=await writer.request(route+'?daysBucket=all&pageSize=50&orderByField=-value');
+ check('KPI totals keep prospective and expired values separate from the active date bucket',()=>{assert(initialPage.text.includes('98.00'));assert(initialPage.text.includes('32.00'));assert(initialPage.text.includes('value="50" selected'));});
+ const pdf=await writer.request('/fop/apps/zenith/Inventory/ExpiryRiskPrint?daysBucket=expired&filename=expiry-risk-test.pdf');
+ check('Filtered PDF renders as an actual PDF download',()=>{assert.equal(pdf.response.status,200);assert(pdf.response.headers.get('content-type').includes('application/pdf'));assert(pdf.text.startsWith('%PDF-'));});
+ await writer.post('saveView',{viewName:'Expiry review',searchText:'ERFIX-SKU',withinDays:'all',daysBucket:'90+',pageSize:50,orderByField:'-value'});
+ check('Saved view retains the date range, sorting and page size for this organization',()=>{const view=JSON.parse(sql("select preference_value from user_preference where user_id='ERFIX_USER' and preference_key='EXPIRY_SAVED_VIEWS_ERFIX_ORG'"))[0];assert.equal(view.daysBucket,'90+');assert.equal(String(view.pageSize),'50');assert.equal(view.orderByField,'-value');assert.equal(count('user_preference',"user_id='ERFIX_USER' and preference_key='EXPIRY_SAVED_VIEWS_ERFIX_OTHER'"),0);});
+ await writer.post('saveColumns',{col_batch:'Y',col_supplier:'Y',col_status:'Y',col_quantity:'Y',col_value:'Y'});
+ for(const surface of ['apps','qapps']) {const page=await writer.request(`/${surface}/zenith/Inventory/ExpiryDashboard?lastStandalone=true&renderMode=${surface==='qapps'?'qvt':'html'}`);check('Saved column choices reach '+surface,()=>assert(page.text.includes('er-hide-sku')));}
+ await writer.post('saveColumns',{col_sku:'Y',col_batch:'Y',col_supplier:'Y',col_status:'Y',col_quantity:'Y',col_value:'Y'});
+ await writer.post('emailReport',{});const noEmail=await writer.request(route);
+ check('Email report does not claim success when the account has no email address',()=>{assert(!noEmail.text.includes('report emailed to'));assert(noEmail.text.includes('no email address'));});
  const today=all.text.split(/\r?\n/).find(l=>l.startsWith('"ERFIX_TODAY"'));
  check('Expiry-today stays at zero calendar days and explicit zero valuation remains zero',()=>{assert(today.includes('"0","1","0"'));});
  const after=await writer.csv({daysBucket:'90+'});
