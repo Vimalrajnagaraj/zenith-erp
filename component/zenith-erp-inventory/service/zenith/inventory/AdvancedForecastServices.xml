@@ -39,26 +39,26 @@
                     if (leadTime < 1) leadTime = 7
 
                     def orgId = organizationPartyId ?: ec.user.getPreference("ACTIVE_ORGANIZATION")
-                    if (!orgId) { summary = "No active organization in context; cannot forecast."; result = res; return }
+                    if (!orgId || orgId in ['_NA_', '__NO_ORGANIZATION__']) { summary = "No active organization in context; cannot forecast."; result = res; return }
 
                     def prod = null
                     if (productId) prod = ec.entity.find("mantle.product.Product").condition("productId", productId).condition("ownerPartyId", orgId).one()
-                    if (!prod && productName) {
+                    if (prod && prod.ownerPartyId != orgId) prod = null
+                    if (!prod && !productId && productName) {
                         def pl = ec.entity.find("mantle.product.Product").condition("ownerPartyId", orgId)
-                            .condition("productName", "like", "%" + productName + "%").orderBy("productName").limit(1).list()
-                        if (pl) prod = pl[0]
+                            .condition("productName", "like", "%" + productName + "%").orderBy("productName").limit(2).list()
+                        if (pl?.size() == 1) prod = pl[0]
                     }
                     if (!prod) { summary = "I could not find a product called '" + (productName ?: productId) + "' in your catalog. Please double-check the spelling, or tell me the exact product name, and I will get its forecast."; result = res; return }
                     def pid = prod.productId
                     def pname = prod.productName
 
-                    def txnDate = [:]
-                    ec.entity.find("zenith.erp.pos.PosTransaction").condition("organizationPartyId", orgId)
-                        .selectField("transactionId").selectField("entryDate").list().each {
-                            if (it.entryDate != null) txnDate[it.transactionId] = it.entryDate.toLocalDateTime().toLocalDate()
-                        }
+                    def today = ec.user.nowTimestamp.toInstant().atZone(java.time.ZoneId.of('Asia/Kolkata')).toLocalDate()
+                    def sales = ec.service.sync().name('zenith.inventory.AdvancedForecastServices.get#CompletedSales')
+                        .parameters([organizationPartyId: orgId]).call()
+                    def txnDate = sales.transactionDates ?: [:]
                     def daily = [:]
-                    ec.entity.find("zenith.erp.pos.PosTransactionItem").condition("productId", pid)
+                    ec.entity.find("zenith.erp.pos.PosTransactionItem").condition("productId", pid).condition("transactionId", "in", txnDate.keySet() ?: ['__none__'])
                         .selectField("transactionId").selectField("quantity").list().each {
                             def ld = txnDate[it.transactionId]
                             if (ld != null) { double q = (it.quantity ?: 0) as double; daily[ld] = ((daily[ld] ?: 0.0d) as double) + q }
@@ -78,7 +78,7 @@
                     }
 
                     def dts = new ArrayList(daily.keySet()); Collections.sort(dts)
-                    def minD = dts.get(0); def maxD = dts.get(dts.size()-1)
+                    def minD = dts.get(0); def maxD = today.minusDays(1)
                     def series = []
                     def cur = minD
                     while (!cur.isAfter(maxD)) { series.add(((daily[cur] ?: 0.0d) as double)); cur = cur.plusDays(1) }
@@ -198,6 +198,8 @@
                         suggestedOrderQty: (int)Math.round(suggestedOrder),
                         reorderPoint: (int)Math.round(rop), safetyStock: (int)Math.round(safety),
                         leadTimeDays: leadTime, serviceLevel: sl,
+                        periodStart: today.toString(), periodEnd: today.plusDays(horizon - 1).toString(),
+                        recentActualDemand: daily.findAll { d, q -> !d.isBefore(today.minusDays(horizon)) }.values().sum() ?: 0,
                         forecastDemand: (int)Math.round(fTotal), horizonDays: horizon,
                         avgDailyDemand: r2(mean), trendPerDay: r2(slope), peakWeekday: dowNames[peakDow],
                         historyDays: n,
@@ -252,23 +254,36 @@
                 boolean _d = ec.artifactExecution.disableAuthz()
                 int prc = 0, cal = 0, fc = 0, alerts = 0
                 try {
-                    int period = (periodDays ?: 7) as int; if (period < 1) period = 7
+                    int period = Math.max(1, Math.min(120, (periodDays ?: 7) as int))
                     int top = (topN ?: 50) as int
-                    def today = ec.user.nowTimestamp.toLocalDateTime().toLocalDate()
+                    def today = ec.user.nowTimestamp.toInstant().atZone(java.time.ZoneId.of('Asia/Kolkata')).toLocalDate()
                     def todaySql = java.sql.Date.valueOf(today)
                     def orgs = []
                     if (organizationPartyId) orgs.add(organizationPartyId)
                     else ec.entity.find("zenith.erp.saas.SaasTenant").condition("statusId","SaasTenantActive").selectField("organizationPartyId").list().each { if (it.organizationPartyId) orgs.add(it.organizationPartyId) }
 
                     for (org in orgs) {
-                        def topRows = ec.entity.find("zenith.erp.pos.ProductDemandView").condition("organizationPartyId", org).orderBy("-unitsSold").limit(top).list()
-                        if (!topRows) continue
-                        def txnDate = [:]
-                        ec.entity.find("zenith.erp.pos.PosTransaction").condition("organizationPartyId", org).selectField("transactionId").selectField("entryDate").list().each { if (it.entryDate != null) txnDate[it.transactionId] = it.entryDate.toLocalDateTime().toLocalDate() }
-                        // category maps for category-level demand aggregation/detection
+                        if (org in ['_NA_', '__NO_ORGANIZATION__']) continue
+                        def orgRecord = ec.entity.find('mantle.party.Party').condition('partyId', org).forUpdate(true).one()
+                        if (!orgRecord) continue
+                        def owned = ec.entity.find('mantle.product.Product').condition('ownerPartyId', org).list()
+                        def names = owned.collectEntries { [(it.productId): it.productName] }
+                        def txnDate = ec.service.sync().name('zenith.inventory.AdvancedForecastServices.get#CompletedSales')
+                            .parameters([organizationPartyId: org]).call().transactionDates ?: [:]
+                        def quantities = [:]
+                        def items = ec.entity.find('zenith.erp.pos.PosTransactionItem')
+                            .condition('transactionId', 'in', txnDate.keySet() ?: ['__none__'])
+                            .condition('productId', 'in', names.keySet() ?: ['__none__']).list()
+                        items.each { quantities[it.productId] = (quantities[it.productId] ?: 0G) + (it.quantity ?: 0G) }
+                        def topRows = quantities.entrySet().sort { a, b -> (b.value <=> a.value) ?: (a.key <=> b.key) }
+                            .take(Math.max(1, Math.min(1000, top))).collect { [productId: it.key, productName: names[it.key]] }
                         def catOfProduct = [:]; def catNameMap = [:]; def catDaily = [:]
-                        ec.entity.find("mantle.product.category.ProductCategoryMember").selectField("productCategoryId").selectField("productId").list().each { if (it.productId != null && !catOfProduct.containsKey(it.productId)) catOfProduct[it.productId] = it.productCategoryId }
-                        ec.entity.find("mantle.product.category.ProductCategory").selectField("productCategoryId").selectField("categoryName").list().each { catNameMap[it.productCategoryId] = it.categoryName }
+                        ec.entity.find('mantle.product.category.ProductCategory').condition('ownerPartyId', org).list()
+                            .each { catNameMap[it.productCategoryId] = it.categoryName }
+                        ec.entity.find('mantle.product.category.ProductCategoryMember')
+                            .condition('productCategoryId', 'in', catNameMap.keySet() ?: ['__none__'])
+                            .condition('productId', 'in', names.keySet() ?: ['__none__'])
+                            .orderBy('productCategoryId').list().findAll { (it.fromDate == null || it.fromDate <= ec.user.nowTimestamp) && (it.thruDate == null || it.thruDate > ec.user.nowTimestamp) }.each { if (!catOfProduct.containsKey(it.productId)) catOfProduct[it.productId] = it.productCategoryId }
                         for (row in topRows) {
                             def pid = row.productId; if (!pid) continue
                             prc++
@@ -282,7 +297,7 @@
                             if (_cat != null) { def cd = catDaily[_cat]; if (cd == null) { cd = [:]; catDaily[_cat] = cd }; prodDaily.each { k, v -> cd[k] = ((cd[k] ?: 0.0d) as double) + (v as double) } }
                             // ---- 1) calibrate past-due forecasts for this product ----
                             def due = ec.entity.find("zenith.erp.inventory.DemandForecast").condition("productId", pid)
-                                .condition("periodEnd", "<", todaySql).list().findAll { it.accuracyPercent == null && it.periodStart != null && it.periodEnd != null }
+                                .condition("facilityId", null).condition("periodEnd", "<", todaySql).list().findAll { it.accuracyPercent == null && it.periodStart != null && it.periodEnd != null }
                             if (due) {
                                 for (f in due) {
                                     def ps = f.periodStart instanceof java.sql.Date ? f.periodStart.toLocalDate() : f.periodStart
@@ -298,7 +313,7 @@
                             try {
                                 if (prodDaily.size() >= 2) {
                                     def adts = new ArrayList(prodDaily.keySet()); Collections.sort(adts)
-                                    def amin = adts.get(0); def amax = adts.get(adts.size()-1)
+                                    def amin = adts.get(0); def amax = today.minusDays(1)
                                     def aser = []; def ac = amin
                                     while (!ac.isAfter(amax)) { aser.add(((prodDaily[ac] ?: 0.0d) as double)); ac = ac.plusDays(1) }
                                     int an = aser.size()
@@ -343,15 +358,15 @@
                                 double rop = (r.reorderPoint ?: 0) as double
                                 double ss = (r.safetyStock ?: 0) as double
                                 int sugg = (r.suggestedOrderQty ?: 0) as int
-                                def existing = ec.entity.find("zenith.erp.inventory.DemandForecast").condition("productId", pid).condition("periodStart", todaySql).list()
-                                if (!existing) {
-                                    ec.service.sync().name("create#zenith.erp.inventory.DemandForecast").parameters([
-                                        productId: pid, periodStart: todaySql, periodEnd: java.sql.Date.valueOf(today.plusDays(period)),
-                                        forecastQuantity: r.forecastDemand, forecastMethodEnumId: (r.methodEnumId ?: "FmSeasonal"), actualQuantity: null, accuracyPercent: null,
-                                        reorderPoint: rop, safetyStock: ss, suggestedOrderQty: sugg
-                                    ]).call()
-                                    fc++
-                                }
+                                def endSql = java.sql.Date.valueOf(today.plusDays(period - 1))
+                                def existing = ec.entity.find('zenith.erp.inventory.DemandForecast').condition('productId', pid)
+                                    .condition('facilityId', null).condition('periodStart', todaySql).condition('periodEnd', endSql)
+                                    .condition('accuracyPercent', null).orderBy('forecastId').list()
+                                def values = [productId: pid, periodStart: todaySql, periodEnd: endSql,
+                                    forecastQuantity: r.forecastDemand, forecastMethodEnumId: (r.methodEnumId ?: 'FmSeasonal'),
+                                    actualQuantity: null, accuracyPercent: null, reorderPoint: rop, safetyStock: ss, suggestedOrderQty: sugg]
+                                if (existing) { existing.each { it.setAll(values); it.update() } }
+                                else { ec.service.sync().name('create#zenith.erp.inventory.DemandForecast').parameters(values).call(); fc++ }
                                 // ---- 3) REORDER alert: delegate to shared check#ProductReorder (also used by the intraday cycle#ReorderCheck) ----
                                 try {
                                     if (rop > 0) {
@@ -370,7 +385,7 @@
                                 try {
                                     if (cmap && cmap.size() >= 2) {
                                         def cdts = new ArrayList(cmap.keySet()); Collections.sort(cdts)
-                                        def cmin = cdts.get(0); def cmax = cdts.get(cdts.size()-1)
+                                        def cmin = cdts.get(0); def cmax = today.minusDays(1)
                                         def cser = []; def cc = cmin
                                         while (!cc.isAfter(cmax)) { cser.add(((cmap[cc] ?: 0.0d) as double)); cc = cc.plusDays(1) }
                                         int cn = cser.size()
@@ -534,7 +549,7 @@
                 boolean _d = ec.artifactExecution.disableAuthz()
                 int checked = 0, raised = 0
                 try {
-                    def today = ec.user.nowTimestamp.toLocalDateTime().toLocalDate()
+                    def today = ec.user.nowTimestamp.toInstant().atZone(java.time.ZoneId.of('Asia/Kolkata')).toLocalDate()
                     def todaySql = java.sql.Date.valueOf(today)
                     // ZE-DF-007/008: gate each tenant by whether it is open right now (IST) - Store operating hours if
                     // configured (source of truth), else the per-tenant CompanySettings window (default 8-22). Once per org.
@@ -609,11 +624,10 @@
                     if (_e) ec.service.sync().name("update#zenith.erp.base.CompanySettings").parameters([organizationPartyId:organizationPartyId, settingKey:k, settingValue:v]).call()
                     else ec.service.sync().name("create#zenith.erp.base.CompanySettings").parameters([organizationPartyId:organizationPartyId, settingKey:k, settingValue:v]).call()
                 }
-                int _oh = 8, _ch = 22
-                try { _oh = Integer.parseInt(openHour.toString().trim()) } catch (Exception e) {}
-                try { _ch = Integer.parseInt(closeHour.toString().trim()) } catch (Exception e) {}
-                if (_oh < 0 || _oh > 23) _oh = 8
-                if (_ch < 1 || _ch > 24) _ch = 22
+                int _oh, _ch
+                try { _oh = Integer.parseInt(openHour?.toString()?.trim()); _ch = Integer.parseInt(closeHour?.toString()?.trim()) }
+                catch (Exception e) { ec.message.addError('Choose valid opening and closing hours.'); return }
+                if (_oh < 0 || _oh > 23 || _ch < 1 || _ch > 24) { ec.message.addError('Opening hour must be 0–23 and closing hour 1–24.'); return }
                 _upsert('REORDER_OPEN_HOUR', _oh.toString())
                 _upsert('REORDER_CLOSE_HOUR', _ch.toString())
             ]]></script>
@@ -636,7 +650,7 @@
                 import org.moqui.context.ExecutionContext
                 ExecutionContext ec = context.ec
                 open = false; source = 'settings'
-                def now = ec.user.nowTimestamp.toLocalDateTime()   // IST (container/scheduler run Asia/Kolkata)
+                def now = ec.user.nowTimestamp.toInstant().atZone(java.time.ZoneId.of('Asia/Kolkata'))
                 int nowMin = now.getHour() * 60 + now.getMinute()
                 int nowHour = now.getHour()
                 def dowNames = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun']
@@ -682,7 +696,7 @@
 
                 // ---- FALLBACK: per-tenant CompanySettings window (default 8-22 IST) ----
                 def cfg = ec.service.sync().name("zenith.inventory.AdvancedForecastServices.get#ReorderCheckConfig").parameters([organizationPartyId: organizationPartyId]).call()
-                int oh2 = (cfg?.openHour ?: 8) as int; int ch2 = (cfg?.closeHour ?: 22) as int
+                int oh2 = (cfg?.openHour != null ? cfg.openHour : 8) as int; int ch2 = (cfg?.closeHour ?: 22) as int
                 boolean w2
                 if (oh2 == ch2) w2 = true
                 else if (oh2 < ch2) w2 = (nowHour >= oh2 && nowHour < ch2)
@@ -712,12 +726,13 @@
                 boolean _d = ec.artifactExecution.disableAuthz()
                 try {
                     def orgId = organizationPartyId ?: ec.user.getPreference("ACTIVE_ORGANIZATION")
-                    if (!orgId) { summary = "No active organization in context."; result = res; return }
+                    if (!orgId || orgId in ['_NA_', '__NO_ORGANIZATION__']) { summary = "No active organization in context."; result = res; return }
                     def prod = null
                     if (productId) prod = ec.entity.find("mantle.product.Product").condition("productId", productId).condition("ownerPartyId", orgId).one()
-                    if (!prod && productName) {
-                        def pl = ec.entity.find("mantle.product.Product").condition("ownerPartyId", orgId).condition("productName", "like", "%" + productName + "%").orderBy("productName").limit(1).list()
-                        if (pl) prod = pl[0]
+                    if (prod && prod.ownerPartyId != orgId) prod = null
+                    if (!prod && !productId && productName) {
+                        def pl = ec.entity.find("mantle.product.Product").condition("ownerPartyId", orgId).condition("productName", "like", "%" + productName + "%").orderBy("productName").limit(2).list()
+                        if (pl?.size() == 1) prod = pl[0]
                     }
                     if (!prod) { summary = "I could not find a product called '" + (productName ?: productId) + "' in your catalog. Please double-check the spelling, or tell me the exact product name."; result = res; return }
                     def pid = prod.productId; def pname = prod.productName
@@ -773,7 +788,7 @@
                 boolean _d = ec.artifactExecution.disableAuthz()
                 try {
                     def orgId = organizationPartyId ?: ec.user.getPreference("ACTIVE_ORGANIZATION")
-                    if (!orgId) { summary = "No active organization."; alertCount = 0; result = [:]; return }
+                    if (!orgId || orgId in ['_NA_', '__NO_ORGANIZATION__']) { summary = "No active organization."; alertCount = 0; result = [:]; return }
                     def ef = ec.entity.find("zenith.erp.inventory.DemandAlert").condition("organizationPartyId", orgId).condition("statusId", "AlertNew")
                     if (direction) ef.condition("direction", direction)
                     def list = ef.orderBy("alertType").orderBy("-alertDate").limit((maxAlerts ?: 20) as int).list()
@@ -837,27 +852,29 @@
                     int horizon = (horizonDays ?: 14) as int; int leadTime = (leadTimeDays ?: 7) as int; double sl = (serviceLevel ?: 0.95) as double
                     if (horizon < 1) horizon = 14; if (horizon > 120) horizon = 120; if (leadTime < 1) leadTime = 7
                     def orgId = organizationPartyId ?: ec.user.getPreference("ACTIVE_ORGANIZATION")
-                    if (!orgId) { summary = "No active organization."; result = res; return }
-                    // resolve category (prefer ones that actually have this org's products)
+                    if (!orgId || orgId in ['_NA_', '__NO_ORGANIZATION__']) { summary = "No active organization."; result = res; return }
                     def cat = null
                     if (categoryId) cat = ec.entity.find("mantle.product.category.ProductCategory").condition("productCategoryId", categoryId).one()
-                    if (!cat && categoryName) {
-                        def want = categoryName.trim().toLowerCase()
-                        def cl = ec.entity.find("mantle.product.category.ProductCategory").selectField("productCategoryId").selectField("categoryName").list()
-                        cat = cl.find { (it.categoryName ?: "").toLowerCase() == want } ?: cl.find { (it.categoryName ?: "").toLowerCase().contains(want) } ?: cl.find { want.contains((it.categoryName ?: "x").toLowerCase()) }
+                    if (cat && cat.ownerPartyId != orgId) cat = null
+                    if (!cat && !categoryId && categoryName) {
+                        def matches = ec.entity.find("mantle.product.category.ProductCategory").condition("ownerPartyId", orgId)
+                            .condition("categoryName", "like", "%" + categoryName.trim() + "%").orderBy("productCategoryId").limit(2).list()
+                        if (matches.size() == 1) cat = matches[0]
                     }
                     if (!cat) { summary = "I could not find a category called '" + (categoryName ?: categoryId) + "'. Please double-check the name and try again."; result = res; return }
                     def catId = cat.productCategoryId; def catNm = cat.categoryName
                     // member products owned by this org
-                    def memberPids = ec.entity.find("mantle.product.category.ProductCategoryMember").condition("productCategoryId", catId).selectField("productId").list().collect { it.productId }.unique()
+                    def memberPids = ec.entity.find("mantle.product.category.ProductCategoryMember").condition("productCategoryId", catId).list().findAll { (it.fromDate == null || it.fromDate <= ec.user.nowTimestamp) && (it.thruDate == null || it.thruDate > ec.user.nowTimestamp) }.collect { it.productId }.unique()
                     def ownedPids = []
                     if (memberPids) ec.entity.find("mantle.product.Product").condition("productId", "in", memberPids).condition("ownerPartyId", orgId).selectField("productId").list().each { ownedPids.add(it.productId) }
                     if (!ownedPids) { summary = "The '" + catNm + "' category has no products for your business yet."; result = [categoryName: catNm]; return }
                     // aggregate daily demand across member products
-                    def txnDate = [:]
-                    ec.entity.find("zenith.erp.pos.PosTransaction").condition("organizationPartyId", orgId).selectField("transactionId").selectField("entryDate").list().each { if (it.entryDate != null) txnDate[it.transactionId] = it.entryDate.toLocalDateTime().toLocalDate() }
+                    def today = ec.user.nowTimestamp.toInstant().atZone(java.time.ZoneId.of('Asia/Kolkata')).toLocalDate()
+                    def sales = ec.service.sync().name('zenith.inventory.AdvancedForecastServices.get#CompletedSales')
+                        .parameters([organizationPartyId: orgId]).call()
+                    def txnDate = sales.transactionDates ?: [:]
                     def daily = [:]
-                    ec.entity.find("zenith.erp.pos.PosTransactionItem").condition("productId", "in", ownedPids).selectField("transactionId").selectField("quantity").list().each {
+                    ec.entity.find("zenith.erp.pos.PosTransactionItem").condition("productId", "in", ownedPids).condition("transactionId", "in", txnDate.keySet() ?: ['__none__']).selectField("transactionId").selectField("quantity").list().each {
                         def ld = txnDate[it.transactionId]; if (ld != null) { double q = (it.quantity ?: 0) as double; daily[ld] = ((daily[ld] ?: 0.0d) as double) + q }
                     }
                     if (daily.isEmpty()) { summary = "No sales history for the '" + catNm + "' category yet."; result = [categoryName: catNm]; return }
@@ -869,7 +886,7 @@
                         return
                     }
                     def dts = new ArrayList(daily.keySet()); Collections.sort(dts)
-                    def minD = dts.get(0); def maxD = dts.get(dts.size()-1)
+                    def minD = dts.get(0); def maxD = today.minusDays(1)
                     def series = []; def cur = minD
                     while (!cur.isAfter(maxD)) { series.add(((daily[cur] ?: 0.0d) as double)); cur = cur.plusDays(1) }
                     int n = series.size()
@@ -927,7 +944,7 @@
                     def trendTxt = slope>0.02?"rising":(slope<-0.02?"declining":"stable")
                     // plain-language reliability band (ZE-CP-E-02c)
                     def confBand = { Integer c -> c == null ? null : (c >= 75 ? "high" : (c >= 55 ? "good" : (c >= 40 ? "moderate" : (c >= 25 ? "low" : "very rough")))) }
-                    res = [categoryName: catNm, products: ownedPids.size(), historyDays: n, avgDailyDemand: (Math.round(mean*100)/100.0), trendPerDay: (Math.round(slope*100)/100.0), peakWeekday: dowNames[peakDow], horizonDays: horizon, forecastDemand: (int)Math.round(fTotal), reorderPoint: (int)Math.round(rop), safetyStock: (int)Math.round(safety), confidencePct: confidence]
+                    res = [categoryName: catNm, periodStart: today.toString(), periodEnd: today.plusDays(horizon - 1).toString(), recentActualDemand: daily.findAll { d, q -> !d.isBefore(today.minusDays(horizon)) }.values().sum() ?: 0, products: ownedPids.size(), historyDays: n, avgDailyDemand: (Math.round(mean*100)/100.0), trendPerDay: (Math.round(slope*100)/100.0), peakWeekday: dowNames[peakDow], horizonDays: horizon, forecastDemand: (int)Math.round(fTotal), reorderPoint: (int)Math.round(rop), safetyStock: (int)Math.round(safety), confidencePct: confidence]
                     summary = "Category '" + catNm + "' (" + ownedPids.size() + " products): expect about " + ((int)Math.round(fTotal)) + " units of total demand over the next " + horizon + " days (around " + String.format("%.1f", fTotal / (double) horizon) + "/day, " + trendTxt + " trend, busiest on " + dowNames[peakDow] + "). " + (confidence != null ? ("Back-tested confidence about " + confidence + "% (" + confBand(confidence) + "). ") : "") + "Based on " + n + " days of sales."
                     result = res
                 } catch (Exception e) { ec.logger.error("forecast#CategoryDemand failed: " + e.message, e); summary = "The category forecast could not be completed."; result = res } finally { if (!_d) ec.artifactExecution.enableAuthz() }
@@ -935,4 +952,23 @@
         </actions>
     </service>
 
+    <service verb="get" noun="CompletedSales" authenticate="false">
+        <in-parameters><parameter name="organizationPartyId" required="true"/></in-parameters>
+        <out-parameters><parameter name="transactionDates" type="Map"/></out-parameters>
+        <actions><script><![CDATA[
+            transactionDates = [:]
+            if (organizationPartyId in ['_NA_', '__NO_ORGANIZATION__']) return
+            def zone = java.time.ZoneId.of('Asia/Kolkata')
+            def today = ec.user.nowTimestamp.toInstant().atZone(zone).toLocalDate()
+            ec.entity.find('zenith.erp.pos.PosTransaction').condition('organizationPartyId', organizationPartyId)
+                .condition('statusId', 'PtCompleted').selectField('transactionId').selectField('entryDate').selectField('completedDate')
+                .disableAuthz().list().each { sale ->
+                    def stamp = sale.completedDate ?: sale.entryDate
+                    if (stamp != null) {
+                        def date = stamp.toInstant().atZone(zone).toLocalDate()
+                        if (date.isBefore(today)) transactionDates[sale.transactionId] = date
+                    }
+                }
+        ]]></script></actions>
+    </service>
 </services>
