@@ -15,4 +15,7 @@ SELECT id,audit_username,'Serial Tracking Sample Review',current_password,passwo
 INSERT INTO user_group_member (user_group_id,user_id,from_date) SELECT user_group_id,id,from_date FROM user_group_member CROSS JOIN (VALUES ('SNFIX_USER'),('SNFIX_NOORG')) AS users(id) WHERE user_id='EX_JOHN_DOE';
 INSERT INTO user_group_member (user_group_id,user_id,from_date) VALUES ('ZENITH_ALL','SNFIX_VIEW',CURRENT_TIMESTAMP),('ZENITH_AUDITOR','SNFIX_VIEW',CURRENT_TIMESTAMP),('ZENITH_ALL','SNFIX_MANAGER','2024-01-01'),('ZENITH_INVENTORY_MGR','SNFIX_MANAGER','2024-01-01');
 INSERT INTO user_preference (user_id,preference_key,preference_value) VALUES ('SNFIX_USER','ACTIVE_ORGANIZATION','SNFIX_ORG'),('SNFIX_VIEW','ACTIVE_ORGANIZATION','SNFIX_ORG'),('SNFIX_NOORG','ACTIVE_ORGANIZATION','_NA_'),('SNFIX_MANAGER','ACTIVE_ORGANIZATION','SNFIX_ORG');
+INSERT INTO form_list_find (form_list_find_id,description,form_location,order_by_field) VALUES ('SNFIX_FIND','Sample serial filter','component://zenith-erp-inventory/screen/zenith/inventory/Inventory/SerialNumbers.xml.form_list$SerialListForm','serialNumber');
+INSERT INTO form_list_find_user (form_list_find_id,user_id) VALUES ('SNFIX_FIND','SNFIX_USER');
+INSERT INTO form_list_find_field (form_list_find_id,field_name,field_value,field_operator,field_ignore_case) VALUES ('SNFIX_FIND','serialNumber','SAMPLE-SR-001','equals','Y');
 COMMIT;

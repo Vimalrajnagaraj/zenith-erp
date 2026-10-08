@@ -37,6 +37,17 @@ try{
  check('CSV contains only the selected organization',()=>{assert(report.text.includes('SAMPLE-SR-001'));assert(!report.text.includes('FOREIGN-SR-001'));assert.equal(report.response.status,200);});
  const page=await writer.request(route);
  check('Summary counts and product/facility choices are scoped',()=>{assert(!page.text.includes('Foreign Serial Product'));assert(!page.text.includes('Foreign Serial Warehouse'));assert(page.text.includes('Total Serials'));});
+ check('Scoped KPI counts reflect the two owned serials',()=>{assert.match(page.text,/sn-stat-label">Total Serials<\/div><div class="sn-stat-value">2<\/div>/);assert.match(page.text,/sn-stat-label">Sold<\/div><div class="sn-stat-value">0<\/div>/);});
+ const saved=await writer.request(route+'?formListFindId=SNFIX_FIND');
+ check('Restored saved find filters the server report and CSV',()=>{assert(saved.text.includes('Showing 1 to 1 of 1 entries'));assert(!saved.text.includes('>SAMPLE-SR-002<'));assert(saved.text.includes('serialNumber=SAMPLE-SR-001'));});
+ sql("update product_serial_number set facility_id='SNFIX_FOREIGN' where serial_number_id='SNFIX_1'");
+ const corrupt=await writer.csv({});
+ check('Foreign warehouse references do not leak into reports',()=>assert(!corrupt.text.includes('SAMPLE-SR-001')));
+ sql("insert into asset (asset_id,owner_party_id,product_id) values ('SNFIX_LINKED_GUARD','SNFIX_ORG','SNFIX_P')");
+ sql("update product_serial_number set facility_id='SNFIX_A',asset_id='SNFIX_LINKED_GUARD' where serial_number_id='SNFIX_1'");
+ await writer.post('updateSerialStatus',{serialNumberId:'SNFIX_1',expectedStatusId:'SnInStock',statusId:'SnDefective'});
+ check('Asset-linked serials require the inventory workflow',()=>{assert.equal(status('SNFIX_1'),'SnInStock');assert.equal(count('serial_number_history',"serial_number_id='SNFIX_1'"),0);});
+ sql("update product_serial_number set asset_id=null where serial_number_id='SNFIX_1'");
  const before=total();
  for(const p of [{serialNumber:' '},{serialNumber:'a'.repeat(101)},{productId:'SNFIX_OFF'},{productId:'SNFIX_FOREIGN'},{facilityId:'SNFIX_FOREIGN'},{facilityId:''},{receivedDate:'invalid'},{receivedDate:'2099-01-01'},{warrantyExpiryDate:'2000-01-01'},{supplierPartyId:'SNFIX_OTHER'},{productId:'SNFIX_BATCH',batchNumber:''}])await register(p);
  check('Invalid serials, dates, untracked products, foreign choices and missing batches are rejected',()=>assert.equal(total(),before));
@@ -80,7 +91,8 @@ try{
  const serials=rows("select coalesce(json_agg(serial_number_id),'[]') from product_serial_number where product_id in ('SNFIX_P','SNFIX_BATCH','SNFIX_OFF','SNFIX_FOREIGN')");
  const history=rows(`select coalesce(json_agg(history_id),'[]') from serial_number_history where serial_number_id in (${serials.map(q).join(',')||'NULL'})`);
  const statements=[];const del=(t,k,v)=>{if(v.length)statements.push(`delete from ${t} where ${k} in (${v.map(q).join(',')});`);};
- del('serial_number_history','history_id',history);del('product_serial_number','serial_number_id',serials);del('product','product_id',['SNFIX_P','SNFIX_BATCH','SNFIX_OFF','SNFIX_FOREIGN']);del('facility','facility_id',['SNFIX_A','SNFIX_FOREIGN']);
+ del('form_list_find_field','form_list_find_id',['SNFIX_FIND']);del('form_list_find_user','form_list_find_id',['SNFIX_FIND']);del('form_list_find','form_list_find_id',['SNFIX_FIND']);
+ del('serial_number_history','history_id',history);del('product_serial_number','serial_number_id',serials);del('asset','asset_id',['SNFIX_LINKED_GUARD']);del('product','product_id',['SNFIX_P','SNFIX_BATCH','SNFIX_OFF','SNFIX_FOREIGN']);del('facility','facility_id',['SNFIX_A','SNFIX_FOREIGN']);
  for(const t of ['user_preference','user_group_member','user_account'])del(t,'user_id',['SNFIX_USER','SNFIX_VIEW','SNFIX_NOORG','SNFIX_MANAGER']);
  del('party_relationship','party_relationship_id',['SNFIX_MEMBERSHIP']);for(const t of ['party_role','organization','party'])del(t,'party_id',['SNFIX_ORG','SNFIX_OTHER','SNFIX_PERSON','SNFIX_SUP']);
  writeFileSync(process.env.SERIAL_TRACKING_MANIFEST||'tmp/serial-tracking-audit.json',JSON.stringify({serials,history,checks},null,2));
