@@ -18,6 +18,8 @@ Scoped `#serialTracking` only; the shared ZenithApp file registers three assets 
 
 Components: title/subtitle and violet Register Serial; four live-count white cards with violet/green/blue/red icon tiles; search/Columns/Saved Finds/CSV/Reset toolbar; eight-column Tracked Serials table with semantic status badges; entries and server pagination footer.
 
+Typography follows the existing Inventory pages: 26px desktop title (24px phone), 13px body/controls, 12px table headers/status badges, 18px section heading and 28px summary values (26px phone).
+
 Tokens: action violet #7C3AED, text #101029, secondary #50536F, border #E6E7EE, page #F7F7F8. Desktop four cards; narrower layouts two cards and wrapping controls; phone title/action stack. The wide table scrolls inside its card. Dialogs are bounded by the viewport. No duplicate serial identity is deliberately reproduced from the reference image.
 
 ## Verification and current limits
