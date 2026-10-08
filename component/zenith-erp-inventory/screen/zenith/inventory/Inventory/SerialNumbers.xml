@@ -4,28 +4,86 @@
         default-menu-title="Serial Numbers" default-menu-index="8">
 
     <transition name="registerSerial">
-        <service-call name="create#zenith.erp.inventory.ProductSerialNumber"/>
+        <actions>
+            <if condition="ec.web.request.method != 'POST'"><return error="true" message="Registration requires POST."/></if>
+            <service-call name="zenith.inventory.SerialTrackingServices.register#TrackedSerial" in-map="context"/>
+        </actions>
         <default-response url="."/>
     </transition>
     <transition name="updateSerialStatus">
-        <service-call name="update#zenith.erp.inventory.ProductSerialNumber"/>
+        <actions>
+            <if condition="ec.web.request.method != 'POST'"><return error="true" message="Serial changes require POST."/></if>
+            <service-call name="zenith.inventory.SerialTrackingServices.update#TrackedSerialStatus" in-map="context"/>
+        </actions>
         <default-response url="."/>
+    </transition>
+    <transition name="exportCsv" read-only="true">
+        <actions>
+            <service-call name="zenith.inventory.SerialTrackingServices.prepare#SerialSearch" in-map="[filters:context]" out-map="exportSearch"/>
+            <entity-find entity-name="zenith.erp.inventory.ProductSerialNumberView" list="exportSerials">
+                <search-form-inputs input-fields-map="exportSearch.serialSearchParams + [pageIndex:null,pageSize:null]" paginate="false" default-order-by="-receivedDate,serialNumberId"/>
+                <econdition-object field="exportSearch.serialFilterCondition"/>
+                <econdition field-name="ownerPartyId" from="exportSearch.organizationPartyId"/>
+            <econditions combine="or">
+                <econdition field-name="facilityId" operator="is-null"/>
+                <econdition field-name="facilityOwnerPartyId" from="exportSearch.organizationPartyId"/>
+            </econditions>
+            </entity-find>
+            <script><![CDATA[
+                def esc = { s -> def v = s == null ? '' : s.toString(); if (v ==~ /(?s)^[\s]*[=+@-].*/) v = "'" + v; '"' + v.replace('"','""') + '"' }
+                def date = { value -> value ? ec.l10n.format(value,'dd-MMM-yyyy') : '' }
+                def result = new StringBuilder('Serial #,Product,Status,Location,Received,Sold,Warranty,Batch\r\n')
+                for (def row : exportSerials) {
+                    def status = ec.entity.find('moqui.basic.StatusItem').condition('statusId',row.statusId).one()?.description ?: row.statusId
+                    result.append([row.serialNumber,(row.pseudoId ?: row.productId)+': '+(row.productName ?: ''),status,row.facilityName,date(row.receivedDate),date(row.soldDate),date(row.warrantyExpiryDate),row.batchNumber].collect(esc).join(',')).append('\r\n')
+                }
+                ec.web.response.setContentType('text/csv; charset=UTF-8')
+                ec.web.response.addHeader('Content-Disposition','attachment; filename="tracked-serials.csv"')
+                ec.web.response.writer.write(result.toString()); ec.web.response.writer.flush()
+            ]]></script>
+        </actions>
+        <default-response type="none"/>
     </transition>
 
     <actions>
+        <service-call name="zenith.inventory.SerialTrackingServices.prepare#SerialSearch" in-map="[filters:new HashMap(ec.web.parameters)]" out-map="serialSearch"/>
         <entity-find entity-name="zenith.erp.inventory.ProductSerialNumberView" list="serialList">
-            <search-form-inputs default-order-by="-receivedDate"/>
+            <search-form-inputs input-fields-map="serialSearch.serialSearchParams" default-order-by="-receivedDate,serialNumberId"/>
+            <econdition-object field="serialSearch.serialFilterCondition"/>
             <!-- ZE-SALES-014 f/u: org-isolate CSV/XLSX export (standalone render bypasses the MANTLE_ACTIVE_ORG authz filter) -->
-            <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+            <econdition field-name="ownerPartyId" from="serialSearch.organizationPartyId"/>
+            <econditions combine="or">
+                <econdition field-name="facilityId" operator="is-null"/>
+                <econdition field-name="facilityOwnerPartyId" from="serialSearch.organizationPartyId"/>
+            </econditions>
         </entity-find>
 
         <!-- Summary counts -->
-        <entity-find-count entity-name="zenith.erp.inventory.ProductSerialNumberView" count-field="totalSerials"></entity-find-count>
+        <entity-find-count entity-name="zenith.erp.inventory.ProductSerialNumberView" count-field="totalSerials"><econdition field-name="ownerPartyId" from="serialSearch.organizationPartyId"/>
+            <econditions combine="or">
+                <econdition field-name="facilityId" operator="is-null"/>
+                <econdition field-name="facilityOwnerPartyId" from="serialSearch.organizationPartyId"/>
+            </econditions></entity-find-count>
         <entity-find-count entity-name="zenith.erp.inventory.ProductSerialNumberView" count-field="inStockCount">
+            <econdition field-name="ownerPartyId" from="serialSearch.organizationPartyId"/>
+            <econditions combine="or">
+                <econdition field-name="facilityId" operator="is-null"/>
+                <econdition field-name="facilityOwnerPartyId" from="serialSearch.organizationPartyId"/>
+            </econditions>
             <econdition field-name="statusId" value="SnInStock"/></entity-find-count>
         <entity-find-count entity-name="zenith.erp.inventory.ProductSerialNumberView" count-field="soldCount">
+            <econdition field-name="ownerPartyId" from="serialSearch.organizationPartyId"/>
+            <econditions combine="or">
+                <econdition field-name="facilityId" operator="is-null"/>
+                <econdition field-name="facilityOwnerPartyId" from="serialSearch.organizationPartyId"/>
+            </econditions>
             <econdition field-name="statusId" value="SnSold"/></entity-find-count>
         <entity-find-count entity-name="zenith.erp.inventory.ProductSerialNumberView" count-field="defectiveCount">
+            <econdition field-name="ownerPartyId" from="serialSearch.organizationPartyId"/>
+            <econditions combine="or">
+                <econdition field-name="facilityId" operator="is-null"/>
+                <econdition field-name="facilityOwnerPartyId" from="serialSearch.organizationPartyId"/>
+            </econditions>
             <econdition field-name="statusId" operator="in" value="SnDefective,SnInWarranty"/></entity-find-count>
     </actions>
 
@@ -33,7 +91,7 @@
         <container style="row items-center justify-between q-mb-lg">
             <container>
                 <label text="Serial Number Tracking" type="h3" style="text-primary text-weight-bold q-my-none"/>
-                <label text="For items you track one-by-one (like electronics): record each serial number and follow it from received → sold → warranty." type="p" style="text-grey-7 q-mt-sm q-mb-none"/>
+                <label text="For items you track one-by-one (like electronics): record each serial number and follow it from received â†’ sold â†’ warranty." type="p" style="text-grey-7 q-mt-sm q-mb-none"/>
             </container>
             <!-- ZE-INV-010 (IV-110): write features only for users with full Inventory access -->
             <section name="SerialWriteButton">
@@ -47,20 +105,21 @@
                             <entity-options key="${productId}" text="${pseudoId}: ${productName}">
                                 <entity-find entity-name="mantle.product.Product">
                                     <econdition field-name="enableSerialTracking" value="Y" ignore-if-empty="true"/>
-                                    <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+                                    <econdition field-name="ownerPartyId" from="serialSearch.organizationPartyId"/>
                                     <order-by field-name="productName"/>
                                 </entity-find>
                             </entity-options>
                         </drop-down>
                         <!-- ZE-INV-IV-090: only products with "Track by serial number?" = Yes appear here. If this
-                             list is empty, turn that on for a product first (Inventory → Products → Edit). -->
+                             list is empty, turn that on for a product first (Inventory â†’ Products â†’ Edit). -->
                         <label text="Only products marked &quot;Track by serial number&quot; appear here. If empty, open the product in Products and turn that on first." style="text-grey-6 text-caption" type="p"/>
                     </default-field></field>
                     <field name="serialNumber"><default-field title="Serial Number"><text-line size="25"/></default-field></field>
                     <field name="facilityId"><default-field title="Location">
-                        <drop-down allow-empty="true">
+                        <drop-down allow-empty="false">
                             <entity-options key="${facilityId}" text="${facilityName}">
                                 <entity-find entity-name="mantle.facility.Facility">
+                                    <econdition field-name="ownerPartyId" from="serialSearch.organizationPartyId"/>
                                     <order-by field-name="facilityName"/>
                                 </entity-find>
                             </entity-options>
@@ -74,7 +133,7 @@
                             <entity-options key="${partyId}" text="${organizationName ?: (firstName + ' ' + lastName)}">
                                 <entity-find entity-name="mantle.party.PartyDetailAndRole">
                                     <econdition field-name="roleTypeId" value="Supplier"/>
-                                    <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+                                    <econdition field-name="ownerPartyId" from="serialSearch.organizationPartyId"/>
                                     <order-by field-name="organizationName,firstName"/>
                                 </entity-find>
                             </entity-options>
