@@ -45,3 +45,11 @@ Keep the PR draft until the owner supplies the required approved production-tena
 The production browser was inspected read-only. The live `/apps` Barcode routes loaded; `/qapps` was observed stuck in the shell's offline/progress state. No customer records, live screenshots, credentials or database output are included in the evidence. Merge does not deploy. Amal controls deployment sequencing and should rebase overlapping POS PR #27 or this PR against the actual merged base before deployment.
 
 Deployment must load the Barcode view definition together with its screens/services/assets and reload entity/screen/service caches (or restart the app). The added owner alias is a view definition, with no database DDL or data migration. Do not copy a new screen onto a runtime that still caches the old view definition.
+
+## Final software evidence
+
+Candidate `b9d765b20f30125a32ed3b49e6b007002938ebe5` on master `ba5143a3d1d5e97d2182ff7ba535f36862690a2f` passed **290 assertions, zero failures/errors**, including **60 page bounds checks** on the two surfaces at five widths. Component tree `af1c4eb3e74ab15bbadb352444aef9820a866d98` identifies the tested deployable source; subsequent evidence-only commits do not change it. Full-copy parity checked **931 component files with zero mismatches**. The independent billing/stock/payment fingerprints remained unchanged. Exact-key cleanup returned zero retained tested records; the tagged disposable JVM was then stopped and HTTP/H2 ports closed, destroying the in-memory identities/organizations.
+
+The [native report](evidence/native-report.json), [no-op fingerprints](evidence/billing-no-op.json), [parity](evidence/source-parity.json), [cleanup summary](evidence/cleanup.json), and [eight supplemental modal/focus checks](evidence/supplemental-ui.json) contain synthetic evidence only. Wide `/apps` and `/qapps` template screenshots and the final mobile screenshot are in `evidence/`. Page bounds passing does not certify all shared shell chrome: the narrow `/qapps` screenshot shows pre-existing global header overlap, and the `/apps` shell can open its sidebar over content. Those shared-shell observations are disclosed rather than claimed fixed by scoped Barcode CSS.
+
+These software results do not close the production/physical gates above or guarantee absence of unknown bugs.

@@ -41,8 +41,8 @@ Statuses describe disposable software evidence; `PARTIAL` explicitly leaves the 
 | BC-054 | PARTIAL | Millimetre geometry checked. Physical scans at 38x25/100x50 and printer calibration remain pending. |
 | BC-055 | PARTIAL | Batch/copies/count/captured values checked. Actual printed pagination remains pending. |
 | BC-056 | PARTIAL | Iframe readiness path checked. Real browser print-dialog/cancellation remains pending. |
-| BC-057 | SOFTWARE VERIFIED | Long / special-char value — actual runtime/API/DB or browser assertion in the suite. |
-| BC-058 | SOFTWARE VERIFIED | Edit pseudoId — actual runtime/API/DB or browser assertion in the suite. |
+| BC-057 | PARTIAL | Special-character Code128 pixels decoded; 256-character validation accepted and 257 rejected. Physical long-code readability remains pending. |
+| BC-058 | PARTIAL | Actual Inventory update POST mirrors/clears codes atomically and rejects collisions. Owner should repeat the visual keyboard path in the Inventory editor. |
 | BC-059 | SOFTWARE VERIFIED | No validation on pseudoId — actual runtime/API/DB or browser assertion in the suite. |
 | BC-060 | PARTIAL | Rich-only exact resolution verified. A staged cart/billing exercise remains owner-gated. |
 | BC-061 | PARTIAL | PseudoId exact resolution verified. A staged cart/billing exercise remains owner-gated. |
