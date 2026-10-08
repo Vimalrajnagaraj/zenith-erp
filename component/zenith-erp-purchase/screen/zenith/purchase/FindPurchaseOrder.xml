@@ -5,43 +5,28 @@
 
     <transition name="editOrder"><default-response url="../EditPurchaseOrder"/></transition>
     
-    <transition name="createOrder">
-        <!-- ZE-SB-013 (Tier 1): the vendor must belong to this org; guard only when a vendorPartyId is supplied. -->
-        <if condition="ec.web.parameters.vendorPartyId">
-            <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" out-map="_ca"
-                          in-map="[entityName:'mantle.party.Party', idField:'partyId', idValue:ec.web.parameters.vendorPartyId, orgField:'ownerPartyId']"/>
-            <if condition="!_ca.allowed"><return error="true" message="Please select a valid vendor from your account."/></if>
-        </if>
-        <!-- Currency from the buying org's configured currency (CompanySettings CURRENCY_UOM_ID),
-             falling back to INR. Was `companyCurrency`, which is never set here -> orders defaulted to USD.
-             Also switched from raw create#OrderHeader/OrderPart (which left a part-less order) to
-             create#Order, which builds the header AND the vendor/customer part together. -->
-        <entity-find-one entity-name="zenith.erp.base.CompanySettings" value-field="currSetting">
-            <field-map field-name="organizationPartyId" from="organizationPartyId"/>
-            <field-map field-name="settingKey" value="CURRENCY_UOM_ID"/>
-        </entity-find-one>
-        <service-call name="mantle.order.OrderServices.create#Order" out-map="createOut"
-                      in-map="[orderName:'New Purchase Order', entryDate:ec.user.nowTimestamp, statusId:'OrderOpen',
-                               currencyUomId:(currSetting?.settingValue ?: 'INR'),
-                               vendorPartyId:vendorPartyId, customerPartyId:organizationPartyId]"/>
-        <default-response url="../EditPurchaseOrder">
-            <parameter name="orderId" value="${createOut.orderId}"/>
-        </default-response>
-    </transition>
+    <transition name="createOrder"><actions>
+        <service-call name="zenith.purchase.OperationsServices.create#PurchaseOrder" in-map="[vendorPartyId:vendorPartyId,organizationPartyId:organizationPartyId]" out-map="createOut"/>
+    </actions><default-response url="../EditPurchaseOrder"><parameter name="orderId" value="${createOut.orderId}"/></default-response><error-response url="."/></transition>
 
     <actions>
-        <service-call name="zenith.base.SecurityServices.get#ActiveOrgList" out-map="context"/>
-        <!-- ZE-INV-IV-070 f/u: a tenant has exactly one org; auto-fill it (the /qapps Vue m-drop-down renders the
-             get#ActiveOrgList list-options EMPTY, blocking the form). Super-admins (no active org) keep the picker. -->
-        <set field="_ao" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-        <set field="_hasActiveOrg" from="(_ao != null &amp;&amp; _ao != '_NA_')"/>
-        <if condition="_hasActiveOrg"><set field="organizationPartyId" from="_ao"/></if>
-        <entity-find entity-name="mantle.party.PartyRole" list="internalOrgRoles">
-            <econdition field-name="roleTypeId" operator="in" value="OrgInternal,InternalOrganization"/>
-        </entity-find>
-        <set field="internalOrgIdList" from="internalOrgRoles.partyId"/>
-        <set field="activeOrgId" from="ec.user.getPreference('ActiveOrgId') ?: (internalOrgIdList ? internalOrgIdList[0] : null)"/>
-        
+        <script><![CDATA[
+            // Export only supported search fields, never request/session attributes or scope overrides.
+            csvFilters=[:]
+            def fields=['orderId', 'orderName', 'entryDate', 'vendorPartyId', 'statusId']
+            def suffixes=['','_op','_not','_ic','_from','_thru','_period','_poffset']
+            fields.each {field -> suffixes.each {suffix ->
+                def key=field+suffix
+                if(ec.web.requestParameters[key]!=null) csvFilters[key]=ec.web.requestParameters[key]
+            }}
+            if(ec.web.requestParameters.orderByField) csvFilters.orderByField=ec.web.requestParameters.orderByField
+        ]]></script>
+        <service-call name="zenith.purchase.OperationsServices.get#PurchaseOrganization" out-map="scope"/>
+        <set field="_org" from="scope.organizationPartyId ?: '__NO_ORGANIZATION__'"/>
+        <service-call name="zenith.purchase.OperationsServices.get#PurchaseOrderIds" out-map="poScope"/>
+        <set field="_hasActiveOrg" from="scope.organizationPartyId != null"/>
+        <set field="organizationPartyId" from="scope.organizationPartyId"/>
+        <set field="activeOrgId" from="scope.organizationPartyId"/>
         <!-- mockup dot-pills: Open(blue), Pending(orange), Approved(green) -->
         <set field="statusColorMap" from="[
             'OrderOpen': 'info', 'OrderProposed': 'warning', 'OrderPlaced': 'warning',
@@ -54,10 +39,10 @@
         <set field="currSymbol" from="currSymbol ?: '₹'"/>
     </actions>
 
-    <widgets>
+    <widgets><container style="zpur-page">
       <!-- exclude the page header from the CSV standalone render so Export CSV is clean (table only) -->
       <section name="PoHeaderSec">
-        <condition><expression>ec.web.parameters.renderMode != 'csv'</expression></condition>
+        <condition><expression>!(sri.getRenderMode() in ['csv','xlsx'])</expression></condition>
         <widgets>
         <container style="zsec-hdr row items-center justify-between q-mb-lg z-newbtn-wrap" id="po-header">
             <container>
@@ -77,8 +62,8 @@
                                 <drop-down allow-empty="false">
                                     <entity-options key="${partyId}" text="${organizationName?:firstName} ${lastName?:''} [${partyId}]">
                                         <entity-find entity-name="mantle.party.PartyDetailAndRole">
-                                            <econdition field-name="roleTypeId" value="Supplier"/>
-                                            <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+                                            <econdition field-name="roleTypeId" operator="in" value="Vendor,Supplier"/><econdition field-name="disabled" value="N" or-null="true"/>
+                                            <econdition field-name="ownerPartyId" from="_org"/>
                                         </entity-find>
                                     </entity-options>
                                 </drop-down>
@@ -87,18 +72,14 @@
                         <field name="organizationPartyId">
                             <!-- ZE-INV-IV-070 f/u: tenant -> hidden auto-fill; super-admin -> picker (see actions). -->
                             <conditional-field name="orgAutoFill" condition="_hasActiveOrg"><hidden/></conditional-field>
-                            <default-field title="Buying Organization">
-                                <drop-down allow-empty="false" no-current-selected-key="${activeOrgId}">
-                                    <list-options list="orgList" key="${partyId}" text="${organizationName} [${partyId}]"/>
-                                </drop-down>
-                            </default-field>
+                            <default-field title="Buying Organization"><display text="Select your active organization before creating a PO."/></default-field>
                         </field>
                         <field name="submitButton"><default-field title="Create PO"><submit/></default-field></field>
                     </form-single>
                 </container-dialog>
                   </widgets>
                 </section>
-                <link url="." text="Export CSV" icon="download" link-type="anchor" style="z-obtn" parameter-map="[renderMode:'csv', pageNoLimit:'true', saveFilename:'PurchaseOrders.csv', lastStandalone:'true']"/>
+                <link url="." text="Export CSV" icon="download" link-type="anchor" style="z-obtn" parameter-map="csvFilters + [renderMode:'csv', pageNoLimit:'true', saveFilename:'PurchaseOrders.csv', lastStandalone:'true']"/>
             </container>
         </container>
         </widgets>
@@ -109,9 +90,9 @@
             <form-list name="FindPoList" list="poList" skip-form="true" header-dialog="true">
                 <entity-find entity-name="mantle.order.OrderHeaderAndPart" list="poList">
                     <!-- ZE-SALES-014 f/u: org-isolate CSV/XLSX export (standalone render bypasses the MANTLE_ACTIVE_ORG authz filter) -->
-                    <econdition field-name="customerPartyId" operator="in" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+                    <econdition field-name="customerPartyId" from="_org"/><econdition field-name="orderId" operator="in" from="poScope.orderIds ?: ['__NO_ORGANIZATION__']"/>
                     <econdition field-name="vendorPartyId" operator="is-not-null"/>
-                    <search-form-inputs default-order-by="-entryDate,orderId"/>
+                    <search-form-inputs skip-fields="organizationPartyId,ownerPartyId,customerPartyId,toPartyId,orderPartSeqId" default-order-by="-entryDate,orderId"/>
                 </entity-find>
 
                 <row-actions>
@@ -125,7 +106,7 @@
 
                 <field name="orderId">
                     <header-field title="PO Number" show-order-by="true"><text-line/></header-field>
-                    <conditional-field condition="sri.getRenderMode() == 'csv'"><display text="${orderId}"/></conditional-field>
+                    <conditional-field condition="sri.getRenderMode() in ['csv','xlsx']"><display text="${orderId}"/></conditional-field>
                     <default-field>
                         <link url="editOrder" text="${orderId}" parameter-map="[orderId:orderId]" style="z-idbadge"/>
                     </default-field>
@@ -133,7 +114,7 @@
 
                 <field name="entryDate">
                     <header-field title="Order Date" show-order-by="true"><date-find type="date"/></header-field>
-                    <conditional-field condition="sri.getRenderMode() == 'csv'"><display format="yyyy-MM-dd"/></conditional-field>
+                    <conditional-field condition="sri.getRenderMode() in ['csv','xlsx']"><display format="yyyy-MM-dd"/></conditional-field>
                     <default-field>
                         <label text="event" type="span" style="material-icons z-cellico"/>
                         <label text="${ec.l10n.format(entryDate, 'dd MMM yyyy')}" type="span" style="text-dark"/>
@@ -145,13 +126,13 @@
                         <drop-down allow-empty="true">
                             <entity-options key="${partyId}" text="${organizationName?:firstName} ${lastName?:''} [${partyId}]">
                                 <entity-find entity-name="mantle.party.PartyDetailAndRole">
-                                    <econdition field-name="roleTypeId" value="Supplier"/>
-                                    <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+                                    <econdition field-name="roleTypeId" operator="in" value="Vendor,Supplier"/><econdition field-name="disabled" value="N" or-null="true"/>
+                                    <econdition field-name="ownerPartyId" from="_org"/>
                                 </entity-find>
                             </entity-options>
                         </drop-down>
                     </header-field>
-                    <conditional-field condition="sri.getRenderMode() == 'csv'">
+                    <conditional-field condition="sri.getRenderMode() in ['csv','xlsx']">
                         <display text="${vendorName2}"/>
                     </conditional-field>
                     <default-field>
@@ -160,14 +141,15 @@
                 </field>
 
                 <field name="grandTotal">
-                    <header-field title="Grand Total (${currSymbol})" show-order-by="true"/>
-                    <conditional-field condition="sri.getRenderMode() == 'csv'"><display text="${grandTotal ?: 0}"/></conditional-field>
+                    <header-field title="Grand Total" show-order-by="true"/>
+                    <conditional-field condition="sri.getRenderMode() in ['csv','xlsx']"><display text="${grandTotal ?: 0}"/></conditional-field>
                     <default-field>
-                        <label text="₹" type="span" style="text-grey-6 q-mr-xs"/>
+                        <label text="${currencyUomId}" type="span" style="text-grey-6 q-mr-xs"/>
                         <label text="${ec.l10n.format(grandTotal ?: 0, '#,##,##0.00')}" type="span" style="text-weight-bold z-amt-green"/>
                     </default-field>
                 </field>
 
+                <field name="currencyUomId"><header-field title="Currency"/><conditional-field condition="sri.getRenderMode() in ['csv','xlsx']"><display/></conditional-field><default-field><display/></default-field></field>
                 <field name="statusId">
                     <header-field title="Status">
                         <drop-down allow-empty="true">
@@ -179,7 +161,7 @@
                             <option key="OrderCancelled" text="Cancelled"/>
                         </drop-down>
                     </header-field>
-                    <conditional-field condition="sri.getRenderMode() == 'csv'">
+                    <conditional-field condition="sri.getRenderMode() in ['csv','xlsx']">
                         <display text="${statusLabel}"/>
                     </conditional-field>
                     <default-field>
@@ -189,12 +171,12 @@
                 
                 <field name="actions">
                     <!-- CSV: render an empty cell (not <ignored/>) so header + body column counts match (RFC-4180) -->
-                    <conditional-field condition="sri.getRenderMode() == 'csv'"><display text=""/></conditional-field>
+                    <conditional-field condition="sri.getRenderMode() in ['csv','xlsx']"><display text=""/></conditional-field>
                     <default-field title="Actions">
-                        <link url="editOrder" text="⋮" parameter-map="[orderId:orderId]" style="z-kebab"/>
+                        <link url="editOrder" text="View" parameter-map="[orderId:orderId]" style="z-kebab"/>
                     </default-field>
                 </field>
             </form-list>
         </container>
-    </widgets>
+</container>    </widgets>
 </screen>
