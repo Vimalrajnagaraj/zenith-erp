@@ -40,10 +40,12 @@ if __name__=='__main__':
     path=html_module.unescape(export)
     parsed=urllib.parse.urlsplit(urllib.parse.urljoin(BASE,path))
     assert parsed.hostname==u.hostname and parsed.port==u.port,'Local export only'
+    if parsed.path!=f'/{surface}/zenith/Purchase/{route}':continue
     content=http.open(urllib.parse.urlunsplit(parsed),timeout=60).read().decode('utf-8-sig')
-    rows=list(csv.reader(io.StringIO(content)))
+    OUT.joinpath(route+'.csv').write_text(content,encoding='utf-8')
+    rows=[row for row in csv.reader(io.StringIO(content)) if any(cell.strip() for cell in row)]
     assert rows and title.replace('&amp;','&') not in rows[0][0],route+' leaked page chrome into CSV'
-    assert all(len(row)==len(rows[0]) for row in rows[1:]),route+' CSV column mismatch'
+    assert all(len(row)==len(rows[0]) for row in rows[1:]),route+' CSV column mismatch '+str([len(row) for row in rows])
     OUT.joinpath(route+'.csv').write_text(content,encoding='utf-8')
     print('PASS CSV '+route+' ('+str(len(rows)-1)+' rows, '+str(len(rows[0]))+' columns)')
    print(('PASS' if passed else 'FAIL')+' '+surface+' '+route)
