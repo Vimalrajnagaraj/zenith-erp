@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+    <!-- All RFQ mutations resolve ownership from the stored record, never a submitted owner. -->
+    <service verb="assert" noun="RfqAccess">
+        <in-parameters><parameter name="rfqId" required="true"/></in-parameters>
+        <out-parameters><parameter name="allowed" type="Boolean"/></out-parameters>
+        <actions><script><![CDATA[
+            def rfq = ec.entity.find('zenith.erp.purchase.PurchaseRfq').condition('rfqId', rfqId).disableAuthz().one()
+            def org = ec.user.getPreference('ACTIVE_ORGANIZATION')
+            allowed = rfq != null && (ec.user.isInGroup('ADMIN') || (org && org != '_NA_' && rfq.organizationPartyId == org))
+        ]]></script></actions>
+    </service>
+    <service verb="update" noun="Rfq">
+        <in-parameters><parameter name="rfqId" required="true"/><parameter name="closingDate" type="Timestamp"/><parameter name="statusId"/><parameter name="description"/><parameter name="remarks"/></in-parameters>
+        <actions>
+            <service-call name="zenith.purchase.RfqServices.assert#RfqAccess" in-map="[rfqId:rfqId]" out-map="access"/>
+            <if condition="!access.allowed"><return error="true" message="RFQ not found for your account."/></if>
+            <if condition="statusId &amp;&amp; !['RfqDraft','RfqSent','RfqClosed','RfqCancelled'].contains(statusId)"><return error="true" message="Please select a valid RFQ status."/></if>
+            <service-call name="update#zenith.erp.purchase.PurchaseRfq" in-map="[rfqId:rfqId, closingDate:closingDate, statusId:statusId, description:description, remarks:remarks]"/>
+        </actions>
+    </service>
+    <service verb="set" noun="RfqItem">
+        <in-parameters><parameter name="rfqId" required="true"/><parameter name="rfqItemSeqId"/><parameter name="productId"/><parameter name="description"/><parameter name="quantity" type="BigDecimal" required="true"/><parameter name="uomId"/><parameter name="productTaxCode"/><parameter name="requiredByDate" type="Date"/></in-parameters>
+        <out-parameters><parameter name="rfqItemSeqId"/></out-parameters>
+        <actions>
+            <service-call name="zenith.purchase.RfqServices.assert#RfqAccess" in-map="[rfqId:rfqId]" out-map="access"/>
+            <if condition="!access.allowed"><return error="true" message="RFQ not found for your account."/></if>
+            <if condition="quantity &lt;= 0"><return error="true" message="Quantity must be greater than zero."/></if>
+            <if condition="productId">
+                <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" out-map="productAccess" in-map="[entityName:'mantle.product.Product', idField:'productId', idValue:productId, orgField:'ownerPartyId']"/>
+                <if condition="!productAccess.allowed"><return error="true" message="Please select a product from your account."/></if>
+            </if>
+            <if condition="rfqItemSeqId">
+                <entity-find-one entity-name="zenith.erp.purchase.PurchaseRfqItem" value-field="item"/>
+                <if condition="!item"><return error="true" message="RFQ item not found."/></if>
+                <service-call name="update#zenith.erp.purchase.PurchaseRfqItem" in-map="[rfqId:rfqId, rfqItemSeqId:rfqItemSeqId, productId:productId, description:description, quantity:quantity, uomId:uomId, productTaxCode:productTaxCode, requiredByDate:requiredByDate]"/>
+                <else>
+                    <service-call name="create#zenith.erp.purchase.PurchaseRfqItem" out-map="itemOut" in-map="[rfqId:rfqId, productId:productId, description:description, quantity:quantity, uomId:uomId, productTaxCode:productTaxCode, requiredByDate:requiredByDate]"/>
+                    <set field="rfqItemSeqId" from="itemOut.rfqItemSeqId"/>
+                </else>
+            </if>
+        </actions>
+    </service>
+    <service verb="delete" noun="RfqItem">
+        <in-parameters><parameter name="rfqId" required="true"/><parameter name="rfqItemSeqId" required="true"/></in-parameters>
+        <actions>
+            <service-call name="zenith.purchase.RfqServices.assert#RfqAccess" in-map="[rfqId:rfqId]" out-map="access"/>
+            <if condition="!access.allowed"><return error="true" message="RFQ not found for your account."/></if>
+            <entity-find-one entity-name="zenith.erp.purchase.PurchaseRfqItem" value-field="item"/>
+            <if condition="!item"><return error="true" message="RFQ item not found."/></if>
+            <entity-find entity-name="zenith.erp.purchase.RfqVendorResponse" list="responses"><econdition field-name="rfqId"/></entity-find>
+            <if condition="responses">
+                <entity-find entity-name="zenith.erp.purchase.RfqVendorResponseItem" list="quotedItems">
+                    <econdition field-name="rfqResponseId" operator="in" from="responses.rfqResponseId"/>
+                    <econdition field-name="rfqItemSeqId"/>
+                </entity-find>
+                <if condition="quotedItems"><return error="true" message="This item has vendor quotes and cannot be deleted."/></if>
+            </if>
+            <service-call name="delete#zenith.erp.purchase.PurchaseRfqItem" in-map="[rfqId:rfqId, rfqItemSeqId:rfqItemSeqId]"/>
+        </actions>
+    </service>
+    <service verb="set" noun="VendorResponse">
+        <in-parameters><parameter name="rfqId" required="true"/><parameter name="rfqResponseId"/><parameter name="vendorPartyId"/><parameter name="responseDate" type="Timestamp"/><parameter name="totalAmount" type="BigDecimal"/><parameter name="deliveryDays" type="Integer"/><parameter name="paymentTerms"/><parameter name="remarks"/><parameter name="isSelected"/></in-parameters>
+        <out-parameters><parameter name="rfqResponseId"/></out-parameters>
+        <actions>
+            <service-call name="zenith.purchase.RfqServices.assert#RfqAccess" in-map="[rfqId:rfqId]" out-map="access"/>
+            <if condition="!access.allowed"><return error="true" message="RFQ not found for your account."/></if>
+            <if condition="(totalAmount != null &amp;&amp; totalAmount &lt; 0) || (deliveryDays != null &amp;&amp; deliveryDays &lt; 0)"><return error="true" message="Quote amount and delivery days cannot be negative."/></if>
+            <if condition="isSelected &amp;&amp; !['Y','N'].contains(isSelected)"><return error="true" message="Please select Yes or No for the winning response."/></if>
+            <if condition="rfqResponseId">
+                <entity-find-one entity-name="zenith.erp.purchase.RfqVendorResponse" value-field="response"/>
+                <if condition="!response || response.rfqId != rfqId"><return error="true" message="Vendor response not found on this RFQ."/></if>
+                <!-- Parent and vendor are immutable on update. The submitted parent must match the stored one. -->
+                <service-call name="update#zenith.erp.purchase.RfqVendorResponse" in-map="[rfqResponseId:rfqResponseId, responseDate:responseDate, totalAmount:totalAmount, deliveryDays:deliveryDays, paymentTerms:paymentTerms, isSelected:isSelected]"/>
+                <else>
+                    <if condition="!vendorPartyId"><return error="true" message="Please select a vendor."/></if>
+                    <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" out-map="vendorAccess" in-map="[entityName:'mantle.party.Party', idField:'partyId', idValue:vendorPartyId, orgField:'ownerPartyId']"/>
+                    <if condition="!vendorAccess.allowed"><return error="true" message="Please select a vendor from your account."/></if>
+                    <service-call name="create#zenith.erp.purchase.RfqVendorResponse" out-map="responseOut" in-map="[rfqId:rfqId, vendorPartyId:vendorPartyId, responseDate:responseDate ?: ec.user.nowTimestamp, totalAmount:totalAmount, deliveryDays:deliveryDays, paymentTerms:paymentTerms, remarks:remarks, isSelected:isSelected ?: 'N']"/>
+                    <set field="rfqResponseId" from="responseOut.rfqResponseId"/>
+                </else>
+            </if>
+        </actions>
+    </service>
+    <service verb="delete" noun="VendorResponse">
+        <in-parameters><parameter name="rfqId" required="true"/><parameter name="rfqResponseId" required="true"/></in-parameters>
+        <actions>
+            <service-call name="zenith.purchase.RfqServices.assert#RfqAccess" in-map="[rfqId:rfqId]" out-map="access"/>
+            <if condition="!access.allowed"><return error="true" message="RFQ not found for your account."/></if>
+            <entity-find-one entity-name="zenith.erp.purchase.RfqVendorResponse" value-field="response"/>
+            <if condition="!response || response.rfqId != rfqId"><return error="true" message="Vendor response not found on this RFQ."/></if>
+            <entity-find entity-name="zenith.erp.purchase.RfqVendorResponseItem" list="quotedItems"><econdition field-name="rfqResponseId"/></entity-find>
+            <if condition="quotedItems"><return error="true" message="This response has quoted items and cannot be deleted."/></if>
+            <service-call name="delete#zenith.erp.purchase.RfqVendorResponse" in-map="[rfqResponseId:rfqResponseId]"/>
+        </actions>
+    </service>
+</services>
