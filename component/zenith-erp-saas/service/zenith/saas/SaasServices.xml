@@ -346,7 +346,9 @@
             <parameter name="billingCycle" default-value="Monthly"/>
         </in-parameters>
         <actions>
-            <entity-find-one entity-name="zenith.erp.saas.SaasTenant" value-field="tenant"/>
+            <service-call name="zenith.saas.SaasAccessServices.assert#TenantAccess" in-map="[tenantId:tenantId]" out-map="access"/>
+            <if condition="ec.message.hasError()"><return/></if>
+            <set field="tenant" from="ec.entity.find('zenith.erp.saas.SaasTenant').condition('tenantId',tenantId).forUpdate(true).one()"/>
             <if condition="!tenant"><return error="true" message="Tenant not found."/></if>
             <set field="oldPlanId" from="tenant.planId"/>
             <entity-find-one entity-name="zenith.erp.saas.SaasPlan" value-field="newPlan">
@@ -354,12 +356,9 @@
             </entity-find-one>
             <if condition="!newPlan"><return error="true" message="Plan not found."/></if>
 
-            <!-- Block a change (e.g. a downgrade) that would leave the tenant OVER the target plan's limits. -->
-            <service-call name="zenith.saas.SaasServices.check#UsageLimits"
-                in-map="[tenantId:tenantId, planId:newPlanId]" out-map="limitOut"/>
-            <if condition="limitOut.withinLimits == false">
-                <return error="true" message="Can't switch to ${newPlan.planName}: your current usage exceeds that plan's limits (${limitOut.violations.join('; ')}). Reduce usage first, or choose a larger plan."/>
-            </if>
+            <if condition="!(billingCycle in ['Monthly','Yearly'])"><return error="true" message="Select Monthly or Yearly billing."/></if>
+            <if condition="newPlan.isActive != 'Y' || (billingCycle == 'Yearly' ? newPlan.yearlyPrice : newPlan.monthlyPrice) == null || (billingCycle == 'Yearly' ? newPlan.yearlyPrice : newPlan.monthlyPrice) &lt; 0"><return error="true" message="This plan is not available for the selected billing cycle."/></if>
+            <if condition="!(tenant.statusId in ['SaasTenantActive','SaasTenantTrial'])"><return error="true" message="Resolve the account status before changing plans."/></if>
 
             <!-- Current ACTIVE subscription (its price + remaining days) BEFORE we retire it — for proration.
                  Deterministic tie-break: two subs written in one tx share startDate (day-granularity) AND can
@@ -368,12 +367,23 @@
                  intentionally NOT a proration basis (curSub stays null → a trial upgrade raises no invoice). -->
             <entity-find entity-name="zenith.erp.saas.SaasSubscription" list="activeSubs">
                 <econdition field-name="tenantId"/>
-                <econdition field-name="statusId" value="SubActive"/>
+                <econdition field-name="statusId" operator="in" from="['SubActive','SubCancelled']"/>
                 <order-by field-name="-startDate"/>
                 <order-by field-name="-lastUpdatedStamp"/>
+                <order-by field-name="-subscriptionId"/>
             </entity-find>
             <set field="curSub" from="activeSubs ? activeSubs[0] : null"/>
+            <set field="prorationBase" from="curSub?.prorationBaseAmount != null ? curSub.prorationBaseAmount : (curSub?.amount ?: 0)"/>
             <set field="subAmount" from="billingCycle == 'Yearly' ? newPlan.yearlyPrice : newPlan.monthlyPrice"/>
+
+            <if condition="curSub != null &amp;&amp; curSub.billingCycle != billingCycle"><return error="true" message="Please contact support to change a current subscription's billing cycle."/></if>
+            <if condition="tenant.planId == newPlanId &amp;&amp; curSub != null &amp;&amp; curSub.billingCycle == billingCycle"><return error="true" message="This is already your current plan."/></if>
+            <!-- Block a change (e.g. a downgrade) that would leave the tenant OVER the target plan's limits. -->
+            <service-call name="zenith.saas.SaasServices.check#UsageLimits"
+                in-map="[tenantId:tenantId, planId:newPlanId]" out-map="limitOut"/>
+            <if condition="limitOut.withinLimits == false">
+                <return error="true" message="Can't switch to ${newPlan.planName}: your current usage exceeds that plan's limits (${limitOut.violations.join('; ')}). Reduce usage first, or choose a larger plan."/>
+            </if>
 
             <!-- ZE-SUBLC-01: Swap plan — update tenant, retire ALL live subs (SubActive AND SubTrial) to SubExpired,
                  create the new active subscription. Retiring the TRIAL too is what stops an upgrade DURING trial from leaving
@@ -382,7 +392,7 @@
                  is never mislabeled as churn in the Cancelled count/notice. SubTrial→SubExpired is now a valid
                  Default-flow transition (ZE-SUBLC-02). Net result: exactly one active sub, no dangling trial. -->
             <service-call name="update#zenith.erp.saas.SaasTenant"
-                in-map="[tenantId:tenantId, planId:newPlanId]"/>
+                in-map="[tenantId:tenantId, planId:newPlanId, statusId:'SaasTenantActive']"/>
             <entity-find entity-name="zenith.erp.saas.SaasSubscription" list="liveSubs">
                 <econdition field-name="tenantId"/>
                 <econdition field-name="statusId" operator="in" from="['SubActive','SubTrial']"/>
@@ -395,21 +405,23 @@
                 import java.time.LocalDate
                 def today = LocalDate.now()
                 def renewal = billingCycle == 'Yearly' ? today.plusYears(1) : today.plusMonths(1)
-                context.renewalDate = java.sql.Date.valueOf(renewal)
+                // A mid-cycle change must not reset prepaid time or grant a fresh free period.
+                context.renewalDate = curSub?.renewalDate ?: java.sql.Date.valueOf(renewal)
+                context.periodStart = curSub?.startDate ?: ec.user.nowTimestamp
             ]]></script>
             <service-call name="create#zenith.erp.saas.SaasSubscription"
                 in-map="[tenantId:tenantId, planId:newPlanId, statusId:'SubActive',
-                         billingCycle:billingCycle, startDate:ec.user.nowTimestamp,
-                         renewalDate:renewalDate, amount:subAmount,
+                         billingCycle:billingCycle, startDate:periodStart,
+                         renewalDate:renewalDate, amount:subAmount, prorationBaseAmount:(subAmount > prorationBase ? subAmount : prorationBase),
                          currencyUomId:tenant.currencyUomId]"/>
 
             <!-- UPGRADE proration: raise a payable invoice for the prorated price difference over the days
                  remaining in the current cycle (tenant pays it via Razorpay — never auto-charged).
-                 Downgrade -> no immediate charge; the lower price applies from the next renewal. -->
+                 Downgrade -> no immediate charge; the lower plan and its limits apply immediately; no mid-cycle refund is created. -->
             <set field="proratedDiff" from="0" type="BigDecimal"/>
             <if condition="curSub != null">
                 <script><![CDATA[
-                    def diff = ((subAmount ?: 0) as BigDecimal) - ((curSub.amount ?: 0) as BigDecimal)
+                    def diff = ((subAmount ?: 0) as BigDecimal) - (prorationBase as BigDecimal)
                     context.proratedDiff = 0.0
                     if (diff > 0 && curSub.renewalDate != null) {
                         def _prToday = java.time.LocalDate.now()
@@ -446,6 +458,8 @@
         </in-parameters>
         <out-parameters><parameter name="saasInvoiceId"/></out-parameters>
         <actions>
+            <service-call name="zenith.saas.SaasAccessServices.assert#TenantAccess" in-map="[tenantId:tenantId]" out-map="access"/>
+            <if condition="ec.message.hasError()"><return/></if>
             <script><![CDATA[
                 import java.time.LocalDate
                 def tenant = ec.entity.find("zenith.erp.saas.SaasTenant").condition("tenantId", tenantId).disableAuthz().one()
@@ -491,67 +505,18 @@
             <parameter name="tenantId" required="true"/>
         </in-parameters>
         <actions>
-            <entity-find-one entity-name="zenith.erp.saas.SaasTenant" value-field="tenant"/>
-            <set field="orgId" from="tenant.organizationPartyId"/>
-            <script><![CDATA[
-                import java.time.LocalDate
-                import java.time.YearMonth
-                def now = LocalDate.now()
-                context.periodMonth = (now.year * 100) + now.monthValue
-
-                // Count active users linked to this org
-                def userCount = ec.entity.find("moqui.security.UserAccount")
-                    .condition("partyId", orgId).count()
-                context.activeUsers = userCount as int
-
-                // Count products
-                def prodCount = ec.entity.find("mantle.product.Product")
-                    .condition("ownerPartyId", orgId).count()
-                context.totalProducts = prodCount as int
-
-                // Count POS transactions this month
-                def monthStart = YearMonth.of(now.year, now.monthValue).atDay(1).atStartOfDay()
-                def txnCount = ec.entity.find("zenith.erp.pos.PosTransaction")
-                    .condition("organizationPartyId", orgId)
-                    .condition("entryDate", ">=", java.sql.Timestamp.valueOf(monthStart))
-                    .count()
-                context.totalTransactions = txnCount as int
-
-                // POS terminals
-                def termCount = ec.entity.find("zenith.erp.pos.PosTerminal")
-                    .condition("organizationPartyId", orgId)
-                    .condition("isActive", "Y").count()
-                context.posTerminals = termCount as int
-
-                // Stores — Store uses statusId (StActive/StInactive/StRenovation/StClosed), NOT isActive. The old
-                // .condition("isActive","Y") referenced a non-existent field -> the find THREW -> the catch set
-                // totalStores=0, so the store limit was NEVER enforced on a plan downgrade (ZE-SUB-006, MS-022).
-                // Count the org's stores that aren't permanently closed (StActive/Inactive/Renovation all consume
-                // the entitlement; StClosed is freed). Filter in-script so a NULL status still counts.
-                try {
-                    def _stores = ec.entity.find("zenith.erp.stores.Store")
-                        .condition("organizationPartyId", orgId).list()
-                    context.totalStores = _stores.count { it.statusId != 'StClosed' } as int
-                } catch (Exception e) { ec.logger.error("update#TenantUsage: store count failed for org ${orgId}", e); context.totalStores = 0 }
-
-                // Loyalty members — LoyaltyMember has NEITHER organizationPartyId NOR isActive; it scopes via
-                // programId -> LoyaltyProgram.organizationPartyId, and its status is LmActive. The old query hit
-                // both missing fields -> threw -> loyaltyMembers=0 (same silent-0 class as stores).
-                try {
-                    def _progIds = ec.entity.find("zenith.erp.loyalty.LoyaltyProgram")
-                        .condition("organizationPartyId", orgId).list().collect { it.programId }
-                    context.loyaltyMembers = (_progIds ? ec.entity.find("zenith.erp.loyalty.LoyaltyMember")
-                        .condition("programId", "in", _progIds).condition("statusId", "LmActive").count() : 0) as int
-                } catch (Exception e) { ec.logger.error("update#TenantUsage: loyalty count failed for org ${orgId}", e); context.loyaltyMembers = 0 }
-
-                // Active promotions
-                try {
-                    def promoCount = ec.entity.find("zenith.erp.promotions.Promotion")
-                        .condition("organizationPartyId", orgId)
-                        .condition("isActive", "Y").count()
-                    context.activePromotions = promoCount as int
-                } catch (Exception e) { context.activePromotions = 0 }
-            ]]></script>
+            <service-call name="zenith.saas.SaasAccessServices.assert#TenantAccess" in-map="[tenantId:tenantId]" out-map="access"/>
+            <if condition="ec.message.hasError()"><return/></if>
+            <service-call name="zenith.saas.SaasUsageServices.get#TenantUsage" in-map="[tenantId:tenantId]" out-map="usageOut"/>
+            <if condition="ec.message.hasError()"><return/></if>
+            <set field="periodMonth" from="usageOut.usage.periodMonth"/>
+            <set field="activeUsers" from="usageOut.usage.activeUsers"/>
+            <set field="posTerminals" from="usageOut.usage.posTerminals"/>
+            <set field="totalProducts" from="usageOut.usage.totalProducts"/>
+            <set field="totalTransactions" from="usageOut.usage.totalTransactions"/>
+            <set field="totalStores" from="usageOut.usage.totalStores"/>
+            <set field="loyaltyMembers" from="usageOut.usage.loyaltyMembers"/>
+            <set field="activePromotions" from="usageOut.usage.activePromotions"/>
 
             <!-- Upsert usage record -->
             <entity-find-one entity-name="zenith.erp.saas.SaasUsage" value-field="existing">
@@ -593,11 +558,14 @@
             <parameter name="violations" type="List"/>
         </out-parameters>
         <actions>
+            <service-call name="zenith.saas.SaasAccessServices.assert#TenantAccess" in-map="[tenantId:tenantId]" out-map="access"/>
+            <if condition="ec.message.hasError()"><return/></if>
             <entity-find-one entity-name="zenith.erp.saas.SaasTenant" value-field="tenant"/>
             <entity-find-one entity-name="zenith.erp.saas.SaasPlan" value-field="plan">
                 <field-map field-name="planId" from="planId ?: tenant.planId"/>
             </entity-find-one>
 
+            <if condition="!plan"><return error="true" message="Plan not found."/></if>
             <set field="violations" from="[]"/>
 
             <!-- Enterprise plan (0 = unlimited) -->
@@ -655,7 +623,9 @@
             <parameter name="immediate" type="Boolean" default-value="false"/>
         </in-parameters>
         <actions>
-            <entity-find-one entity-name="zenith.erp.saas.SaasTenant" value-field="tenant"/>
+            <service-call name="zenith.saas.SaasAccessServices.assert#TenantAccess" in-map="[tenantId:tenantId]" out-map="access"/>
+            <if condition="ec.message.hasError()"><return/></if>
+            <set field="tenant" from="ec.entity.find('zenith.erp.saas.SaasTenant').condition('tenantId',tenantId).forUpdate(true).one()"/>
             <if condition="!tenant">
                 <return error="true" message="Tenant not found"/>
             </if>
@@ -663,13 +633,15 @@
             <!-- Cancel active subscriptions -->
             <entity-find entity-name="zenith.erp.saas.SaasSubscription" list="activeSubs">
                 <econdition field-name="tenantId"/>
-                <econdition field-name="statusId" operator="in" value="SubActive,SubTrial"/>
+                <econdition field-name="statusId" operator="in" value="SubActive,SubTrial,SubPastDue"/>
             </entity-find>
+            <if condition="!activeSubs &amp;&amp; !immediate"><message>Subscription is already cancelled.</message><return/></if>
+            <if condition="!immediate &amp;&amp; activeSubs.any { !(it.renewalDate ?: it.trialEndDate) }"><return error="true" message="Contact support to confirm this subscription's period end before cancelling."/></if>
             <iterate list="activeSubs" entry="sub">
                 <service-call name="update#zenith.erp.saas.SaasSubscription"
                     in-map="[subscriptionId:sub.subscriptionId, statusId:'SubCancelled',
                              cancelledDate:ec.user.nowTimestamp, cancelReason:reason,
-                             autoRenew:'N']"/>
+                             autoRenew:'N', endDate:(sub.renewalDate ?: sub.trialEndDate)]"/>
             </iterate>
 
             <if condition="immediate">
