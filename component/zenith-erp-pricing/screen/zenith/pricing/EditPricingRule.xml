@@ -8,58 +8,24 @@
     <!-- ZE-PRC-016: every mutation is org-guarded (screen actions don't run for transitions, and the IDs are
          attacker-controllable form/link params). deleteCondition resolves the parent pricingRuleId from the row. -->
     <transition name="updateRule">
-        <actions>
-            <service-call name="zenith.pricing.PricingServices.assert#PricingRuleAccess" in-map="[pricingRuleId:pricingRuleId]" out-map="_acc"/>
-            <if condition="_acc.allowed"><service-call name="update#zenith.erp.pricing.PricingRule" in-map="context"/></if>
-        </actions>
+        <service-call name="zenith.pricing.RuleServices.update#Rule" in-map="[pricingRuleId:pricingRuleId,changes:ec.web.parameters]"/>
         <default-response url="."/>
     </transition>
     <transition name="addCondition">
-        <actions>
-            <service-call name="zenith.pricing.PricingServices.assert#PricingRuleAccess" in-map="[pricingRuleId:pricingRuleId]" out-map="_acc"/>
-            <!-- ZE-PRC-075: go through add#PricingRuleCondition so a 'between' operator is rejected unless
-                 BOTH Value and Value To are provided (was the raw entity create -> blank "To" saved silently). -->
-            <if condition="_acc.allowed"><service-call name="zenith.pricing.PricingServices.add#PricingRuleCondition" in-map="context"/></if>
-        </actions>
+        <service-call name="zenith.pricing.RuleServices.add#Condition"/>
         <default-response url="."/>
     </transition>
     <transition name="deleteCondition">
-        <actions>
-            <entity-find-one entity-name="zenith.erp.pricing.PricingRuleCondition" value-field="_cond"/>
-            <service-call name="zenith.pricing.PricingServices.assert#PricingRuleAccess" in-map="[pricingRuleId:_cond?.pricingRuleId]" out-map="_acc"/>
-            <if condition="_cond != null &amp;&amp; _acc.allowed"><service-call name="delete#zenith.erp.pricing.PricingRuleCondition" in-map="context"/></if>
-        </actions>
+        <service-call name="zenith.pricing.RuleServices.delete#Condition"/>
         <default-response url="."/>
     </transition>
     <!-- ZE-PRC redesign: Delete Rule (conditions first to clear FK) + Duplicate, both org-guarded. -->
     <transition name="deleteRule">
-        <actions>
-            <service-call name="zenith.pricing.PricingServices.assert#PricingRuleAccess" in-map="[pricingRuleId:pricingRuleId]" out-map="_acc"/>
-            <if condition="_acc.allowed"><script><![CDATA[
-                ec.entity.find("zenith.erp.pricing.PricingRuleCondition").condition("pricingRuleId", pricingRuleId).deleteAll()
-                ec.entity.find("zenith.erp.pricing.PricingRule").condition("pricingRuleId", pricingRuleId).deleteAll()
-            ]]></script></if>
-        </actions>
+        <service-call name="zenith.pricing.RuleServices.delete#Rule"/>
         <default-response url="../FindPricingRule"/>
     </transition>
     <transition name="duplicateRule">
-        <actions>
-            <service-call name="zenith.pricing.PricingServices.assert#PricingRuleAccess" in-map="[pricingRuleId:pricingRuleId]" out-map="_acc"/>
-            <set field="newRuleId" from="null"/>
-            <if condition="_acc.allowed"><script><![CDATA[
-                def src = ec.entity.find("zenith.erp.pricing.PricingRule").condition("pricingRuleId", pricingRuleId).one()
-                if (src) {
-                    def created = ec.service.sync().name("create#zenith.erp.pricing.PricingRule").parameters([
-                        ruleName: ((src.ruleName ?: 'Rule') + ' (copy)'), description: src.description,
-                        priority: src.priority, isActive: 'N', isStackable: src.isStackable,
-                        organizationPartyId: src.organizationPartyId,
-                        validFromDate: src.validFromDate, validThruDate: src.validThruDate,
-                        actionType: src.actionType, actionValue: src.actionValue,
-                        maxDiscount: src.maxDiscount, minimumPrice: src.minimumPrice]).call()
-                    newRuleId = created?.pricingRuleId
-                }
-            ]]></script></if>
-        </actions>
+        <service-call name="zenith.pricing.RuleServices.duplicate#Rule" out-map="context"/>
         <default-response url="../EditPricingRule"><parameter name="pricingRuleId" from="newRuleId ?: pricingRuleId"/></default-response>
     </transition>
 
@@ -75,13 +41,16 @@
             </entity-find>
 
             <script><![CDATA[
-                def z = com.zenith.Fmt.INSTANCE
+                def currencySetting=ec.entity.find('zenith.erp.base.CompanySettings').condition('organizationPartyId',rule.organizationPartyId).condition('settingKey','CURRENCY_UOM_ID').one()
+                ruleCurrencyId=currencySetting?.settingValue ?: 'currency units'
+                // Quasar AJAX renders may arrive at /apps; the renderer identifies the visible surface.
+                ruleListUrl=sri.getRenderMode()=='qvt' ? '/qapps/zenith/pricing/FindPricingRule' : '/apps/zenith/pricing/FindPricingRule'
                 def fmtN = { v -> v == null ? '' : ec.l10n.format(v, '0.##') }
-                def fmtM = { v -> v == null ? '' : z.inr(ec.l10n.format(v, '#,##0.##')) }
+                def fmtM = { v -> v == null ? '' : ec.l10n.format(v, '#,##0.00') + ' ' + ruleCurrencyId }
                 // action type
                 def actEnum = ec.entity.find("moqui.basic.Enumeration").condition("enumId", rule.actionType).one()
                 actionLabel = actEnum?.description ?: (rule.actionType ?: '—')
-                def actShortMap = [PatDiscountPercent:'Discount %', PatDiscountAmount:'Discount ₹', PatFixedPrice:'Fixed Price', PatMarginPercent:'Markup %']
+                def actShortMap = [PatDiscountPercent:'Discount %', PatDiscountAmount:'Discount amount', PatFixedPrice:'Fixed Price', PatMarginPercent:'Cost margin unavailable']
                 actionShort = actShortMap[rule.actionType] ?: actionLabel
                 def isPct = (rule.actionType in ['PatDiscountPercent','PatMarginPercent'])
                 def isMarkup = (rule.actionType in ['PatMarginPercent'])
@@ -93,9 +62,9 @@
                 condMatchWord = 'ALL must match'
                 // discount value stat
                 def avStr = fmtN(rule.actionValue)
-                discountValueStr = isPct ? (avStr + '%') : ('₹' + fmtM(rule.actionValue))
-                discBadgeText = isPct ? (avStr + '% ' + (isMarkup ? 'markup' : 'discount')) : ('₹' + fmtM(rule.actionValue) + (isMarkup ? ' markup' : ''))
-                maxCapStr = (rule.maxDiscount != null) ? ('Max cap: ₹' + fmtM(rule.maxDiscount)) : 'No cap set'
+                discountValueStr = isPct ? (avStr + '%') : fmtM(rule.actionValue)
+                discBadgeText = isMarkup ? 'Cost margin unavailable' : isPct ? (avStr + '% discount') : fmtM(rule.actionValue)
+                maxCapStr = (rule.maxDiscount != null) ? ('Max cap: ' + fmtM(rule.maxDiscount)) : 'No cap set'
                 // validity
                 def dfShort = new java.text.SimpleDateFormat('dd MMM'); def dfFull = new java.text.SimpleDateFormat('dd MMM yyyy')
                 def vf = rule.validFromDate; def vt = rule.validThruDate
@@ -122,11 +91,11 @@
                 // action phrase for summary
                 def actPhrase
                 if (rule.actionType == 'PatDiscountPercent') actPhrase = 'Apply a ' + avStr + '% discount'
-                else if (rule.actionType == 'PatDiscountAmount') actPhrase = 'Apply a ₹' + fmtM(rule.actionValue) + ' discount'
-                else if (rule.actionType == 'PatFixedPrice') actPhrase = 'Set a fixed price of ₹' + fmtM(rule.actionValue)
-                else if (rule.actionType == 'PatMarginPercent') actPhrase = 'Apply a ' + avStr + '% markup'
+                else if (rule.actionType == 'PatDiscountAmount') actPhrase = 'Apply a ' + fmtM(rule.actionValue) + ' discount'
+                else if (rule.actionType == 'PatFixedPrice') actPhrase = 'Set a fixed price of ' + fmtM(rule.actionValue)
+                else if (rule.actionType == 'PatMarginPercent') actPhrase = 'Cost margin unavailable; approved cost calculation is required'
                 else actPhrase = 'Apply ' + actionLabel
-                capPhrase = (rule.maxDiscount != null) ? (', capped at ₹' + fmtM(rule.maxDiscount) + ' maximum') : ''
+                capPhrase = (rule.maxDiscount != null) ? (', capped at ' + fmtM(rule.maxDiscount) + ' maximum') : ''
                 summaryActionStr = actPhrase + capPhrase
                 summaryMetaStr = 'Valid ' + validFullStr + ' · ' + stackableStr + ' · Priority ' + priorityVal
             ]]></script>
@@ -134,6 +103,7 @@
     </actions>
 
     <widgets>
+        <container style="zprr-page">
         <section name="prc_noAccess" condition="noAccess"><widgets>
             <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg">
                 <label text="This pricing rule was not found or you do not have access to it." type="h6" style="text-negative text-weight-bold"/>
@@ -141,22 +111,20 @@
             </container>
         </widgets></section>
         <section name="prc_hasAccess" condition="!noAccess"><widgets>
-        <!-- cross-surface interaction bootstrap: tab switching, add-condition toggle, Update-button forwarding -->
-        <render-mode><text type="html,qvt"><![CDATA[<img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" alt="" style="display:none" onload="(function(){if(window.__prrInit)return;window.__prrInit=1;document.addEventListener('click',function(ev){var t=ev.target.closest?ev.target.closest('.prr-tab,.prr-addcond-toggle,.prr-addcond-cancel,.prr-update-btn,.prr-dup-btn'):null;if(!t)return;if(t.classList.contains('prr-tab')){var n=t.getAttribute('data-tab');[].forEach.call(document.querySelectorAll('.prr-tab'),function(x){if(x===t)x.classList.add('prr-active');else x.classList.remove('prr-active');});[].forEach.call(document.querySelectorAll('.prr-panel'),function(p){if(p.className.indexOf('prr-panel-'+n)>=0)p.classList.add('prr-active');else p.classList.remove('prr-active');});}else if(t.classList.contains('prr-addcond-toggle')){var f=document.querySelector('.prr-addform');if(f)f.classList.toggle('prr-show');}else if(t.classList.contains('prr-addcond-cancel')){var f=document.querySelector('.prr-addform');if(f)f.classList.remove('prr-show');}else if(t.classList.contains('prr-update-btn')){var s=document.getElementById('UpdateRuleForm_submitBtn');if(s)s.click();}else if(t.classList.contains('prr-dup-btn')){var d=document.querySelector('.prr-dup-real');if(d)d.click();}},true);})()"/>]]></text></render-mode>
-        <link url="duplicateRule" text="Duplicate" parameter-map="[pricingRuleId:rule.pricingRuleId]" style="prr-dup-real"/>
+<link url="duplicateRule" text="Duplicate" parameter-map="[pricingRuleId:rule.pricingRuleId]" style="prr-dup-real"/>
 
         <container style="prr-wrap">
             <!-- Breadcrumb + Header + Quick stats + Tab nav (pure display) -->
             <render-mode><text type="html,qvt" template="true"><![CDATA[
-<div class="prr-breadcrumb"><a href="../FindPricingRule">Pricing</a><span>/</span><a href="../FindPricingRule">Pricing Rules</a><span>/</span><span class="prr-bc-cur">${rule.ruleName!"Rule"}</span></div>
+<div class="prr-breadcrumb"><a href="${ruleListUrl?html}">Pricing</a><span>/</span><a href="${ruleListUrl?html}">Pricing Rules</a><span>/</span><span class="prr-bc-cur">${(rule.ruleName!"Rule")?html}</span></div>
 <div class="prr-header">
   <div class="prr-avatar"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg></div>
   <div class="prr-hmeta">
-    <h1>${rule.ruleName!"Rule"}</h1>
+    <h1>${(rule.ruleName!"Rule")?html}</h1>
     <div class="prr-metarow">
-      <span>${actionLabel}</span><span class="prr-sep">|</span><span>Priority ${priorityVal}</span>
+      <span>${actionLabel?html}</span><span class="prr-sep">|</span><span>Priority ${priorityVal}</span>
       <span class="prr-badge ${statusActive?string('prr-badge-green','prr-badge-grey')}">${statusLabel}</span>
-      <span class="prr-badge prr-badge-orange">${discBadgeText}</span>
+      <span class="prr-badge prr-badge-orange">${discBadgeText?html}</span>
       <span class="prr-badge prr-badge-purple">${condCount} Condition${(condCount==1)?string('','s')}</span>
     </div>
   </div>
@@ -166,10 +134,10 @@
   </div>
 </div>
 <div class="prr-stats">
-  <div class="prr-stat"><div class="prr-stat-label">Action</div><div class="prr-stat-value" style="font-size:16px">${actionShort}</div><div class="prr-stat-sub">${actionSub}</div></div>
-  <div class="prr-stat"><div class="prr-stat-label">Discount Value</div><div class="prr-stat-value" style="color:#D97706">${discountValueStr}</div><div class="prr-stat-sub">${maxCapStr}</div></div>
-  <div class="prr-stat"><div class="prr-stat-label">Conditions</div><div class="prr-stat-value" style="color:#7C3AED">${condCount}</div><div class="prr-stat-sub">${condMatchWord}</div></div>
-  <div class="prr-stat"><div class="prr-stat-label">Validity</div><div class="prr-stat-value" style="font-size:14px">${validRangeStr}</div><div class="prr-stat-sub">${validSubStr}</div></div>
+  <div class="prr-stat"><div class="prr-stat-label">Action</div><div class="prr-stat-value" style="font-size:16px">${actionShort?html}</div><div class="prr-stat-sub">${actionSub?html}</div></div>
+  <div class="prr-stat"><div class="prr-stat-label">Discount Value</div><div class="prr-stat-value" style="color:#D97706">${discountValueStr?html}</div><div class="prr-stat-sub">${maxCapStr?html}</div></div>
+  <div class="prr-stat"><div class="prr-stat-label">Conditions</div><div class="prr-stat-value" style="color:#7C3AED">${condCount}</div><div class="prr-stat-sub">${condMatchWord?html}</div></div>
+  <div class="prr-stat"><div class="prr-stat-label">Validity</div><div class="prr-stat-value" style="font-size:14px">${validRangeStr?html}</div><div class="prr-stat-sub">${validSubStr?html}</div></div>
 </div>
 <div class="prr-tabs"><button type="button" class="prr-tab prr-active" data-tab="details">Rule Details</button><button type="button" class="prr-tab" data-tab="conditions">Conditions</button></div>
             ]]></text></render-mode>
@@ -190,8 +158,8 @@
                                     <econdition field-name="enumTypeId" value="PricingActionType"/><order-by field-name="sequenceNum"/>
                                 </entity-find></entity-options></drop-down></default-field></field>
                         <field name="actionValue"><default-field title="Value"><text-line size="10"/></default-field></field>
-                        <field name="maxDiscount"><default-field title="Max Discount (₹)"><text-line size="10"/></default-field></field>
-                        <field name="minimumPrice"><default-field title="Price Floor (₹)"><text-line size="10"/></default-field></field>
+                        <field name="maxDiscount"><default-field title="Max Discount (${ruleCurrencyId})"><text-line size="10"/></default-field></field>
+                        <field name="minimumPrice"><default-field title="Price Floor (${ruleCurrencyId})"><text-line size="10"/></default-field></field>
                         <field name="isStackable"><default-field title="Stackable?">
                             <drop-down><option key="N" text="No"/><option key="Y" text="Yes"/></drop-down></default-field></field>
                         <field name="validFromDate"><default-field title="Valid From"><date-time type="date"/></default-field></field>
@@ -281,7 +249,7 @@
                     <render-mode><text type="html,qvt" template="true"><![CDATA[
 <div class="prr-summary">
   <div class="prr-summary-title"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>Rule Summary</div>
-  <div class="prr-summary-body"><strong>When</strong> ${condSummaryStr}: <br><strong>${summaryActionStr}</strong>.<br><span class="prr-summary-meta">${summaryMetaStr}</span></div>
+  <div class="prr-summary-body"><strong>When</strong> ${condSummaryStr?html}: <br><strong>${summaryActionStr?html}</strong>.<br><span class="prr-summary-meta">${summaryMetaStr?html}</span></div>
 </div>
                     ]]></text></render-mode>
                 </container>
@@ -297,5 +265,6 @@
             </container>
         </container>
         </widgets></section>
+        </container>
     </widgets>
 </screen>
