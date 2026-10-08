@@ -70,8 +70,8 @@ async function submit(id){await Promise.all([page.waitForNavigation({waitUntil:'
    const href=await page.$$eval('a[href*="EditTaxRegistration"]',(a,shell)=>a.filter(e=>shell==='qapps'?e.id.includes('_registrationId_'):e.closest('tr')?.textContent.includes('29ABCDE1234F2ZV')).map(e=>e.getAttribute('href')).filter(h=>Number.isFinite(Number(new URL(h,location.origin).searchParams.get('registrationId')))).sort((x,y)=>Number(new URL(y,location.origin).searchParams.get('registrationId'))-Number(new URL(x,location.origin).searchParams.get('registrationId')))[0],shell);assert(href,'New contact registration edit link');await open(href);
    assert(await page.$eval('#tx-efffrom',e=>e.value==='2026-07-01'),'Create date did not persist');await fill('#tx-effthru','2027-08-01');
    await page.screenshot({path:out+'/'+shell+'-registration-edit-desktop.png',fullPage:false});
-   for(const width of [1366,800,390,320]) {await page.setViewport({width,height:900});assert(await page.$eval('.zc-tax-form',e=>e.scrollWidth<=e.clientWidth+1),'Edit form horizontal overflow');}
-   await page.screenshot({path:out+'/'+shell+'-registration-edit-mobile.png',fullPage:false});await page.setViewport({width:1366,height:900});
+   for(const width of [1366,800,390,320]) {await page.setViewport({width,height:900});await page.evaluate(()=>new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r))));assert(await page.$eval('.zc-tax-form',e=>e.clientWidth>0&&e.scrollWidth<=e.clientWidth+1),'Edit form horizontal overflow or missing layout');}
+   await page.screenshot({path:out+'/'+shell+'-registration-edit-mobile.png',fullPage:false});await page.setViewport({width:1366,height:900});await page.evaluate(()=>new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r))));
    await fill('.zc-tax-form [name=description]',"Synthetic UI O'Brien edited");
    const button=await page.$('.zc-tax-form button[type=submit]');assert(button,'Edit button');await Promise.all([page.waitForNavigation({waitUntil:'networkidle2'}),button.click()]);
    await page.waitForSelector('.zc-tax-form [name=description]',{timeout:15000});
