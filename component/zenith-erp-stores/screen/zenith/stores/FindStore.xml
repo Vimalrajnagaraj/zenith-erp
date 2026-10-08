@@ -4,25 +4,48 @@
         default-menu-title="All Stores" default-menu-index="1">
 
     <transition name="editStore"><default-response url="../EditStore"/></transition>
-    <transition name="createStore">
+    <transition name="syncShops" method="post">
+        <service-call name="zenith.stores.StoreServices.reconcile#OrgShops"/>
+        <default-response url="${ec.web.getRequest().getRequestURI().split('/zenith/')[0]}/zenith/Stores/FindStore" url-type="plain"/>
+        <error-response url="${ec.web.getRequest().getRequestURI().split('/zenith/')[0]}/zenith/Stores/FindStore" url-type="plain"/>
+    </transition>
+    <transition name="createStore" method="post">
         <service-call name="zenith.stores.StoreServices.create#Store"/>
-        <default-response url="../EditStore"/>
+        <default-response url="${ec.web.getRequest().getRequestURI().split('/zenith/')[0]}/zenith/Stores/EditStore?storeId=${java.net.URLEncoder.encode(storeId,'UTF-8')}" url-type="plain"/>
+        <error-response url="${ec.web.getRequest().getRequestURI().split('/zenith/')[0]}/zenith/Stores/FindStore" url-type="plain"/>
     </transition>
 
     <actions>
-        <!-- ZE-SHOP: adopt any org retail-store facility (e.g. the onboarding Main Store) that lacks a Store row. -->
-        <service-call name="zenith.stores.StoreServices.reconcile#OrgShops"/>
-        <set field="curOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+        <service-call name="zenith.base.SecurityServices.check#ModuleWriteAccess" in-map="[moduleId:'stores']" out-map="shopPermission"/>
+        <set field="shopCanWrite" from="shopPermission.canWrite"/>
+        <service-call name="zenith.stores.StoreAccessServices.get#AuthorizedActiveOrganization" out-map="scope"/>
+        <set field="curOrg" from="scope.activeOrgId ?: '__NO_ORGANIZATION__'"/>
 
+        <script><![CDATA[
+            // Match the Shops toolbar's default page size; retain explicit size/limit requests.
+            if (!ec.web.parameters.pageSize) {ec.context.pageSize=10; ec.web.parameters.put('pageSize','10')}
+        ]]></script>
         <entity-find entity-name="zenith.erp.stores.StoreDetail" list="stores">
             <search-form-inputs default-order-by="storeName"/>
             <!-- ZE-SALES-014 f/u: org-isolate CSV/XLSX export -->
-            <econdition field-name="organizationPartyId" from="curOrg" ignore-if-empty="true"/>
+            <econdition field-name="organizationPartyId" from="curOrg"/>
         </entity-find>
+
+        <service-call name="zenith.stores.StoreAccessServices.get#SafeStoreDetails" in-map="[rows:stores]" out-map="safeDetails"/>
+        <script><![CDATA[
+            // Keep EntityList pagination metadata; mask only transient joined display fields.
+            def safeById = safeDetails.safeRows.collectEntries {[(it.storeId):it]}
+            stores.each { row ->
+                def safe = safeById[row.storeId]
+                row.set('facilityName',safe?.facilityName)
+                row.set('managerFirstName',safe?.managerFirstName)
+                row.set('managerLastName',safe?.managerLastName)
+            }
+        ]]></script>
 
         <!-- Stat cards: whole-org counts (NOT just the current page), org-scoped. -->
         <entity-find entity-name="zenith.erp.stores.Store" list="_allStores">
-            <econdition field-name="organizationPartyId" from="curOrg" ignore-if-empty="true"/>
+            <econdition field-name="organizationPartyId" from="curOrg"/>
             <select-field field-name="city"/><select-field field-name="managerPartyId"/><select-field field-name="statusId"/>
         </entity-find>
 
@@ -42,18 +65,31 @@
     </actions>
 
     <widgets>
+        <container style="zc-shops-page">
         <!-- ===== Header: title + subtitle + violet New Store ===== -->
+        <section name="ShopsPageHeader" condition="ec.web.parameters.renderMode != 'csv'"><widgets>
         <container style="pb-head">
             <container style="pb-head-text">
                 <label text="Stores" type="h4" style="pb-head-title"/>
                 <label text="Manage and monitor all company stores and their details." type="p" style="pb-head-sub"/>
             </container>
             <container style="pb-head-actions">
+                <section name="ShopsWriteActions" condition="shopCanWrite">
+                <widgets>
                 <render-mode><text type="html,qvt"><![CDATA[
                     <button type="button" onclick="var o=document.getElementById('ns-overlay');if(o){o.style.display='flex';var n=document.getElementById('ns-name');if(n)n.focus();}" style="display:inline-flex;align-items:center;gap:7px;height:42px;padding:0 18px;background:#7C3AED;color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer"><span class="material-icons" style="font-size:19px">add</span>New Store</button>
                 ]]></text></render-mode>
+                <render-mode><text type="html,qvt" template="true"><![CDATA[
+                    <form method="post" action="${appBase}/zenith/Stores/FindStore/syncShops" style="display:inline">
+                        <input type="hidden" name="moquiSessionToken" value="${moquiToken?html}"/>
+                        <button type="submit" class="zc-shop-sync">Sync existing shops</button>
+                    </form>
+                ]]></text></render-mode>
+                </widgets></section>
             </container>
         </container>
+
+        </widgets></section>
 
         <!-- ===== Stat cards (real, org-scoped) ===== -->
         <render-mode><text type="html,qvt"><![CDATA[
@@ -79,7 +115,7 @@
 
         <!-- ===== Table (native form-list + z-listchrome toolbar/footer) ===== -->
         <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg z-listchrome">
-            <render-mode><text type="html,qvt"><![CDATA[<span class="zlc-ph" data-ph="Search stores..." style="display:none"></span>]]></text></render-mode>
+            <render-mode><text type="html,qvt"><![CDATA[<span class="zlc-ph" data-ph="Search stores (Enter searches all)..." style="display:none"></span>]]></text></render-mode>
             <form-list name="StoresForm" list="stores" list-entry="st" skip-form="true" header-dialog="true"
                        select-columns="true" show-csv-button="true">
                 <row-actions><script><![CDATA[
@@ -93,6 +129,7 @@
                 <field name="storeCode"><header-field title="Code"/>
                     <default-field title="Code"><label text="${st.storeCode ?: '—'}" type="span" style="text-dark text-weight-medium"/></default-field></field>
                 <field name="storeName"><header-field title="Store" show-order-by="true"><text-find size="20"/></header-field>
+                    <conditional-field condition="ec.web.parameters.renderMode == 'csv'"><label text="${st.storeName}"/></conditional-field>
                     <default-field title="Store">
                         <link url="editStore" text="${st.storeName}" parameter-map="[storeId:st.storeId]" style="z-dklink"/>
                     </default-field></field>
@@ -123,52 +160,35 @@
             </form-list>
         </container>
 
-        <!-- ===== New Store modal (custom <div>+fetch; posts to the unchanged createStore transition) ===== -->
+        <!-- ===== New Store modal (native POST with server validation) ===== -->
         <render-mode><text type="html,qvt" template="true"><![CDATA[
         <#assign nsRow="display:flex;align-items:center;gap:16px;margin-bottom:16px">
         <#assign nsLbl="width:150px;flex:0 0 auto;text-align:right;font-size:14px;font-weight:600;color:#111827">
         <#assign nsTile="width:40px;height:40px;flex:0 0 auto;border-radius:8px;background:rgba(124,58,237,.1);display:flex;align-items:center;justify-content:center;color:#7C3AED">
         <#assign nsInp="flex:1;min-width:0;height:48px;box-sizing:border-box;padding:0 16px;border:1px solid #E5E7EB;border-radius:10px;font-size:14px;color:#111827;background:#fff;outline:none">
         <div id="ns-overlay" style="display:none;position:fixed;inset:0;background:rgba(17,24,39,.45);z-index:12000;align-items:flex-start;justify-content:center;padding:40px 16px;overflow-y:auto;font-family:'Segoe UI',Arial,sans-serif">
-            <div id="ns-modal" style="background:#fff;border-radius:12px;box-shadow:0 20px 50px rgba(17,24,39,.22);width:100%;max-width:680px">
-                <input id="ns-token" type="hidden" value="${(moquiToken)!''}"/>
+            <form id="ns-modal" method="post" action="${appBase}/zenith/Stores/FindStore/createStore" role="dialog" aria-modal="true" aria-label="New Store" style="background:#fff;border-radius:12px;box-shadow:0 20px 50px rgba(17,24,39,.22);width:100%;max-width:680px">
+                <input id="ns-token" name="moquiSessionToken" type="hidden" value="${(moquiToken!'')?html}"/>
                 <div style="display:flex;align-items:center;gap:16px;padding:24px 28px;border-bottom:1px solid #E5E7EB;position:relative">
                     <div style="width:52px;height:52px;flex:0 0 auto;border-radius:12px;background:rgba(124,58,237,.1);display:flex;align-items:center;justify-content:center"><span class="material-icons" style="font-size:28px;color:#7C3AED">storefront</span></div>
                     <div><div style="font-size:22px;font-weight:700;color:#111827;line-height:1.2">New Store</div><div style="font-size:14px;margin-top:3px;color:#6B7280">Add a new store to your organization.</div></div>
                     <button type="button" onclick="document.getElementById('ns-overlay').style.display='none'" title="Close" style="position:absolute;top:22px;right:24px;width:32px;height:32px;border:none;background:transparent;color:#9CA3AF;cursor:pointer;border-radius:8px;display:flex;align-items:center;justify-content:center"><span class="material-icons" style="font-size:22px">close</span></button>
                 </div>
                 <div style="padding:26px 28px 18px">
-                    <div style="${nsRow}"><label style="${nsLbl}">Store Name <span style="color:#EF4444">*</span></label><span style="${nsTile}"><span class="material-icons" style="font-size:20px">storefront</span></span><input id="ns-name" class="st-inp" type="text" placeholder="Enter store name" style="${nsInp}"/></div>
-                    <div style="${nsRow}"><label style="${nsLbl}">Type <span style="color:#EF4444">*</span></label><span style="${nsTile}"><span class="material-icons" style="font-size:20px">sell</span></span><select id="ns-type" class="st-sel" style="${nsInp};background:#F5F3FF;border-color:transparent"><#list (storeTypeOptions![]) as o><option value="${(o.id)?html}"<#if o.id=='StOwned'> selected</#if>>${(o.label)?html}</option></#list></select></div>
-                    <div style="${nsRow}"><label style="${nsLbl}">City <span style="color:#EF4444">*</span></label><span style="${nsTile}"><span class="material-icons" style="font-size:20px">place</span></span><input id="ns-city" class="st-inp" type="text" placeholder="Enter city" style="${nsInp}"/></div>
-                    <div style="${nsRow}"><label style="${nsLbl}">Phone</label><span style="${nsTile}"><span class="material-icons" style="font-size:20px">call</span></span><input id="ns-phone" class="st-inp" type="tel" placeholder="Enter phone number" style="${nsInp}"/></div>
-                    <div style="${nsRow}"><label style="${nsLbl}">Area (sq ft)</label><span style="${nsTile}"><span class="material-icons" style="font-size:20px">open_in_full</span></span><input id="ns-area" class="st-inp" type="number" placeholder="Enter area in square feet" style="${nsInp}"/></div>
+                    <div style="${nsRow}"><label for="ns-name" style="${nsLbl}">Store Name <span style="color:#EF4444">*</span></label><span style="${nsTile}"><span class="material-icons" style="font-size:20px">storefront</span></span><input id="ns-name" name="storeName" required class="st-inp" type="text" placeholder="Enter store name" style="${nsInp}"/></div>
+                    <div style="${nsRow}"><label for="ns-type" style="${nsLbl}">Type <span style="color:#EF4444">*</span></label><span style="${nsTile}"><span class="material-icons" style="font-size:20px">sell</span></span><select id="ns-type" name="storeTypeEnumId" required class="st-sel" style="${nsInp};background:#F5F3FF;border-color:transparent"><#list (storeTypeOptions![]) as o><option value="${(o.id)?html}"<#if o.id=='StOwned'> selected</#if>>${(o.label)?html}</option></#list></select></div>
+                    <div style="${nsRow}"><label for="ns-city" style="${nsLbl}">City <span style="color:#EF4444">*</span></label><span style="${nsTile}"><span class="material-icons" style="font-size:20px">place</span></span><input id="ns-city" name="city" required class="st-inp" type="text" placeholder="Enter city" style="${nsInp}"/></div>
+                    <div style="${nsRow}"><label for="ns-phone" style="${nsLbl}">Phone</label><span style="${nsTile}"><span class="material-icons" style="font-size:20px">call</span></span><input id="ns-phone" name="phone" class="st-inp" type="tel" placeholder="Enter phone number" style="${nsInp}"/></div>
+                    <div style="${nsRow}"><label for="ns-area" style="${nsLbl}">Area (sq ft)</label><span style="${nsTile}"><span class="material-icons" style="font-size:20px">open_in_full</span></span><input id="ns-area" name="areaSqFt" class="st-inp" type="number" min="0" step="any" placeholder="Enter area in square feet" style="${nsInp}"/></div>
                 </div>
                 <div style="display:flex;justify-content:flex-end;gap:12px;padding:18px 28px;border-top:1px solid #E5E7EB">
                     <button type="button" onclick="document.getElementById('ns-overlay').style.display='none'" style="height:44px;padding:0 22px;border:1px solid #E5E7EB;border-radius:10px;background:#fff;color:#111827;font-size:14px;font-weight:600;cursor:pointer">Cancel</button>
-                    <button type="button" id="ns-create" style="display:inline-flex;align-items:center;gap:8px;height:44px;padding:0 24px;border:none;border-radius:10px;background:#7C3AED;color:#fff;font-size:14px;font-weight:600;cursor:pointer"><span class="material-icons" style="font-size:19px">storefront</span>Create Store</button>
+                    <button type="submit" id="ns-create" style="display:inline-flex;align-items:center;gap:8px;height:44px;padding:0 24px;border:none;border-radius:10px;background:#7C3AED;color:#fff;font-size:14px;font-weight:600;cursor:pointer"><span class="material-icons" style="font-size:19px">storefront</span>Create Store</button>
                 </div>
-            </div>
+            </form>
         </div>
-        <script>
-        (function(){
-            var create=document.getElementById('ns-create'); if(!create || create.__w) return; create.__w=1;
-            var g=function(id){ var e=document.getElementById(id); return e?(e.value||'').trim():''; };
-            create.addEventListener('click', function(){
-                var name=g('ns-name'); if(!name){ alert('Store Name is required.'); return; }
-                var city=g('ns-city'); if(!city){ alert('City is required.'); return; }
-                var tok=''; try{ tok=window.moqui.webrootVue.moquiSessionToken; }catch(e){} if(!tok){ var t=document.getElementById('ns-token'); tok=t?t.value:''; }
-                var body=new URLSearchParams();
-                body.append('storeName', name); body.append('storeTypeEnumId', g('ns-type')); body.append('city', city);
-                body.append('phone', g('ns-phone')); body.append('areaSqFt', g('ns-area')); body.append('moquiSessionToken', tok);
-                var base=location.pathname.split('/zenith/')[0];
-                create.disabled=true; create.textContent='Creating...';
-                fetch(base+'/zenith/Stores/FindStore/createStore',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body,credentials:'same-origin'})
-                    .then(function(r){ location.href = r.url || location.href; })
-                    .catch(function(){ create.disabled=false; create.textContent='Create Store'; alert('Create failed - please try again.'); });
-            });
-        })();
-        </script>
+        <img alt="" style="display:none" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==" onload="if(window.zcShopsInit){window.zcShopsInit()}else{var s=document.createElement('script');s.src='/zenithstatic/js/shops.js?v=3';document.head.appendChild(s)}"/>
         ]]></text></render-mode>
+            </container>
     </widgets>
 </screen>

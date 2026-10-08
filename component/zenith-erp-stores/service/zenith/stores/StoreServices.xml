@@ -22,69 +22,46 @@
         </in-parameters>
         <out-parameters><parameter name="storeId"/></out-parameters>
         <actions>
-            <!-- ZE-SB-013 (Tier 4): FORCE the owning org from the session — never trust a submitted
-                 organizationPartyId (create#Store used to accept it as free input = cross-tenant stamp). -->
-            <set field="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-            <if condition="!organizationPartyId || organizationPartyId == '_NA_'">
-                <return error="true" message="No active organization is selected. Switch into an organization first."/>
-            </if>
-            <!-- ZE-SB-013 (Tier 5): a store manager must be a member of this org. -->
-            <if condition="managerPartyId">
-                <service-call name="zenith.base.SecurityServices.assert#PartyOrgMembership" out-map="_ma" in-map="[partyId:managerPartyId]"/>
-                <if condition="!_ma.allowed"><return error="true" message="That manager isn't part of your organization."/></if>
-            </if>
-            <if condition="!storeCode">
-                <script><![CDATA[
-                    def existing = ec.entity.find("zenith.erp.stores.Store").condition("organizationPartyId", organizationPartyId).count()
-                    storeCode = "STR" + String.format("%04d", existing + 1)
-                ]]></script>
-            </if>
-            <!-- ZE-SHOP: a shop IS a FcTpRetailStore facility (the POS/dashboards filter on it). Auto-create one when
-                 none is linked; if a facility was chosen it MUST belong to this org (defense in depth). Keeps 1:1. -->
+            <service-call name="zenith.stores.StoreAccessServices.assert#WriteAccess" out-map="writeScope"/>
+            <set field="organizationPartyId" from="writeScope.organizationPartyId"/>
+            <script>ec.entity.find('mantle.party.Party').condition('partyId',writeScope.organizationPartyId).disableAuthz().forUpdate(true).one()</script>
+            <service-call name="zenith.stores.StoreServices.validate#StoreFields" in-map="context"/>
+            <if condition="ec.message.hasError()"><return/></if>
             <script><![CDATA[
-                if (facilityId) {
-                    boolean _dz = ec.artifactExecution.disableAuthz()
-                    try {
-                        def _pf = ec.entity.find("mantle.facility.Facility").condition("facilityId", facilityId).one()
-                        if (_pf == null || _pf.ownerPartyId != organizationPartyId) { ec.message.addError("That facility isn't part of your organization."); return }
-                    } finally { if (!_dz) ec.artifactExecution.enableAuthz() }
-                } else {
-                    def _fac = ec.service.sync().name("create#mantle.facility.Facility")
-                        .parameters([facilityTypeEnumId:'FcTpRetailStore', facilityName:storeName, ownerPartyId:organizationPartyId]).call()
-                    facilityId = _fac.facilityId
+                storeName = storeName.trim()
+                if (!storeCode) {
+                    def codes = ec.entity.find('zenith.erp.stores.Store').condition('organizationPartyId',organizationPartyId).list().collect {it.storeCode} as Set
+                    int next=1
+                    while (codes.contains('STR'+String.format('%04d',next))) next++
+                    storeCode='STR'+String.format('%04d',next)
+                }
+                if (!facilityId) {
+                    facilityId = ec.service.sync().name('create#mantle.facility.Facility')
+                        .parameters([facilityTypeEnumId:'FcTpRetailStore',facilityName:storeName,ownerPartyId:organizationPartyId]).call().facilityId
                 }
             ]]></script>
-            <service-call name="create#zenith.erp.stores.Store" out-map="context"
-                          in-map="context + [organizationPartyId:organizationPartyId, statusId:'StActive']"/>
+            <if condition="ec.message.hasError() || !facilityId"><return error="true" message="Unable to create the shop facility."/></if>
+            <service-call name="create#zenith.erp.stores.Store" out-map="context" in-map="context + [statusId:'StActive']"/>
         </actions>
     </service>
 
     <!-- ZE-SHOP: adopt every FcTpRetailStore facility the org owns (e.g. the onboarding "Main Store") that has no
          Store row yet, so the Stores list == the shops the switcher/filters see. Idempotent, keyed on facilityId
-         (1:1 Store<->Facility). Safe to call on every Stores list render. -->
+         (1:1 Store<->Facility). Invoked only by an explicit POST, never by a list render. -->
     <service verb="reconcile" noun="OrgShops" authenticate="true">
         <actions>
+            <service-call name="zenith.stores.StoreAccessServices.assert#WriteAccess" out-map="writeScope"/>
+            <script>ec.entity.find('mantle.party.Party').condition('partyId',writeScope.organizationPartyId).disableAuthz().forUpdate(true).one()</script>
             <script><![CDATA[
-                def org = ec.user.getPreference("ACTIVE_ORGANIZATION")
-                if (!org || org == '_NA_') return
-                boolean _dz = ec.artifactExecution.disableAuthz()
-                try {
-                    def facs = ec.entity.find("mantle.facility.Facility")
-                        .condition("ownerPartyId", org).condition("facilityTypeEnumId", "FcTpRetailStore").list()
-                    def existing = ec.entity.find("zenith.erp.stores.Store").condition("organizationPartyId", org).list()
-                    def haveFac = existing.collect { it.facilityId }.findAll { it } as Set
-                    int _seq = existing.size()
-                    facs.each { f ->
-                        if (!haveFac.contains(f.facilityId)) {
-                            _seq++
-                            ec.service.sync().name("create#zenith.erp.stores.Store").parameters([
-                                storeName: (f.facilityName ?: f.facilityId), storeCode: "STR" + String.format("%04d", _seq),
-                                storeTypeEnumId: "StOwned", facilityId: f.facilityId, organizationPartyId: org, statusId: "StActive"
-                            ]).call()
-                            haveFac.add(f.facilityId)
-                        }
+                def org=writeScope.organizationPartyId
+                def facilities=ec.entity.find('mantle.facility.Facility').condition('ownerPartyId',org).condition('facilityTypeEnumId','FcTpRetailStore').list()
+                def linked=ec.entity.find('zenith.erp.stores.Store').condition('organizationPartyId',org).list().collect {it.facilityId} as Set
+                facilities.each { f ->
+                    if (!linked.contains(f.facilityId)) {
+                        ec.service.sync().name('zenith.stores.StoreServices.create#Store')
+                            .parameters([storeName:f.facilityName ?: f.facilityId,storeTypeEnumId:'StOwned',facilityId:f.facilityId]).call()
                     }
-                } finally { if (!_dz) ec.artifactExecution.enableAuthz() }
+                }
             ]]></script>
         </actions>
     </service>
@@ -97,15 +74,19 @@
             <parameter name="terminalId" required="true"/>
         </in-parameters>
         <actions>
-            <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" out-map="_sa"
-                          in-map="[entityName:'zenith.erp.stores.Store', idField:'storeId', idValue:storeId, orgField:'organizationPartyId']"/>
-            <if condition="!_sa.allowed"><return error="true" message="Store not found for your account."/></if>
-            <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" out-map="_ta"
-                          in-map="[entityName:'zenith.erp.pos.PosTerminal', idField:'terminalId', idValue:terminalId, orgField:'organizationPartyId']"/>
-            <if condition="!_ta.allowed"><return error="true" message="Counter not found for your account."/></if>
-            <entity-find-one entity-name="zenith.erp.stores.Store" value-field="_st"/>
-            <if condition="!_st?.facilityId"><return error="true" message="This shop has no linked facility."/></if>
-            <service-call name="update#zenith.erp.pos.PosTerminal" in-map="[terminalId:terminalId, facilityId:_st.facilityId]"/>
+            <service-call name="zenith.stores.StoreAccessServices.assert#WriteAccess" out-map="writeScope"/>
+            <service-call name="zenith.stores.StoreAccessServices.assert#StoreAccess" out-map="storeAccess" in-map="[storeId:storeId]"/>
+            <if condition="!storeAccess.allowed"><return error="true" message="Store not found for your organization."/></if>
+            <entity-find-one entity-name="zenith.erp.stores.Store" value-field="shop"/>
+            <entity-find-one entity-name="zenith.erp.pos.PosTerminal" value-field="counter"/>
+            <if condition="!counter || counter.organizationPartyId != writeScope.organizationPartyId"><return error="true" message="Counter not found for your organization."/></if>
+            <entity-find-one entity-name="mantle.facility.Facility" value-field="facility"><field-map field-name="facilityId" from="shop.facilityId"/></entity-find-one>
+            <if condition="!facility || facility.ownerPartyId != writeScope.organizationPartyId || facility.facilityTypeEnumId != 'FcTpRetailStore'"><return error="true" message="This shop has no valid linked retail facility."/></if>
+            <if condition="counter.facilityId != shop.facilityId">
+                <set field="sessionCount" from="ec.entity.find('zenith.erp.pos.PosSession').condition('terminalId',terminalId).disableAuthz().count()"/>
+                <if condition="sessionCount"><return error="true" message="A counter with session history cannot be moved to another shop."/></if>
+            </if>
+            <service-call name="update#zenith.erp.pos.PosTerminal" in-map="[terminalId:terminalId,facilityId:shop.facilityId]"/>
         </actions>
     </service>
 
@@ -128,15 +109,27 @@
             <parameter name="statusId"/>
         </in-parameters>
         <actions>
-            <!-- ZE-SB-013 (Tier 4): only update a store your org owns (org is not an in-param, so it can't be re-homed). -->
-            <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" out-map="_ca"
-                          in-map="[entityName:'zenith.erp.stores.Store', idField:'storeId', idValue:storeId, orgField:'organizationPartyId']"/>
-            <if condition="!_ca.allowed"><return error="true" message="Store not found for your account."/></if>
-            <if condition="managerPartyId">
-                <service-call name="zenith.base.SecurityServices.assert#PartyOrgMembership" out-map="_ma" in-map="[partyId:managerPartyId]"/>
-                <if condition="!_ma.allowed"><return error="true" message="That manager isn't part of your organization."/></if>
+            <service-call name="zenith.stores.StoreAccessServices.assert#WriteAccess" out-map="writeScope"/>
+            <service-call name="zenith.stores.StoreAccessServices.assert#StoreAccess" out-map="storeAccess" in-map="[storeId:storeId]"/>
+            <if condition="!storeAccess.allowed"><return error="true" message="Store not found for your organization."/></if>
+            <script>ec.entity.find('mantle.party.Party').condition('partyId',writeScope.organizationPartyId).disableAuthz().forUpdate(true).one()</script>
+            <entity-find-one entity-name="zenith.erp.stores.Store" value-field="existingStore" for-update="true"/>
+            <service-call name="zenith.stores.StoreServices.validate#StoreFields" in-map="context + [organizationPartyId:writeScope.organizationPartyId,facilityId:facilityId != null ? facilityId : existingStore.facilityId]"/>
+            <if condition="ec.message.hasError()"><return/></if>
+            <if condition="facilityId != null &amp;&amp; existingStore.facilityId &amp;&amp; facilityId != existingStore.facilityId">
+                <return error="true" message="A linked shop facility cannot be changed. Create a separate shop instead."/>
             </if>
+            <if condition="statusId &amp;&amp; statusId != existingStore.statusId">
+                <entity-find entity-name="moqui.basic.StatusFlowTransition" list="flows">
+                    <econdition field-name="statusFlowId" value="Default"/><econdition field-name="statusId" from="existingStore.statusId"/><econdition field-name="toStatusId" from="statusId"/>
+                </entity-find>
+                <if condition="!flows"><return error="true" message="That shop status transition is not allowed."/></if>
+            </if>
+            <if condition="storeName != null"><set field="storeName" from="storeName.trim()"/></if>
             <service-call name="update#zenith.erp.stores.Store" in-map="context"/>
+            <if condition="storeName &amp;&amp; existingStore.facilityId">
+                <service-call name="update#mantle.facility.Facility" in-map="[facilityId:existingStore.facilityId,facilityName:storeName.trim()]"/>
+            </if>
         </actions>
     </service>
 
@@ -149,13 +142,20 @@
             <parameter name="isClosed" default-value="N"/>
         </in-parameters>
         <actions>
-            <!-- ZE-SB-013 (Tier 4): child of Store — guard via the parent store's org. -->
-            <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" out-map="_ca"
-                          in-map="[entityName:'zenith.erp.stores.Store', idField:'storeId', idValue:storeId, orgField:'organizationPartyId']"/>
-            <if condition="!_ca.allowed"><return error="true" message="Store not found for your account."/></if>
-            <service-call name="store#zenith.erp.stores.StoreOperatingHours"
-                          in-map="[storeId:storeId, dayOfWeek:dayOfWeek, openTime:openTime,
-                                   closeTime:closeTime, isClosed:isClosed]"/>
+            <service-call name="zenith.stores.StoreAccessServices.assert#WriteAccess" out-map="writeScope"/>
+            <service-call name="zenith.stores.StoreAccessServices.assert#StoreAccess" out-map="storeAccess" in-map="[storeId:storeId]"/>
+            <if condition="!storeAccess.allowed"><return error="true" message="Store not found for your organization."/></if>
+            <script><![CDATA[
+                if (!(dayOfWeek in ['Mon','Tue','Wed','Thu','Fri','Sat','Sun']) || !(isClosed in ['Y','N'])) {
+                    ec.message.addError('Choose a valid day and closed state.');return
+                }
+                def validTime={v -> !v || v ==~ /(?:[01][0-9]|2[0-3]):[0-5][0-9]/}
+                if (!validTime(openTime) || !validTime(closeTime) || (isClosed != 'Y' && (!!openTime != !!closeTime))) {
+                    ec.message.addError('Enter both opening and closing times in HH:mm format, or leave both blank.');return
+                }
+            ]]></script>
+            <if condition="ec.message.hasError()"><return/></if>
+            <service-call name="store#zenith.erp.stores.StoreOperatingHours" in-map="[storeId:storeId,dayOfWeek:dayOfWeek,openTime:openTime,closeTime:closeTime,isClosed:isClosed]"/>
         </actions>
     </service>
 
@@ -171,16 +171,13 @@
         </in-parameters>
         <out-parameters><parameter name="targetId"/></out-parameters>
         <actions>
-            <!-- ZE-SB-013 (Tier 4): child of Store — guard via the parent store's org. -->
-            <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" out-map="_ca"
-                          in-map="[entityName:'zenith.erp.stores.Store', idField:'storeId', idValue:storeId, orgField:'organizationPartyId']"/>
-            <if condition="!_ca.allowed"><return error="true" message="Store not found for your account."/></if>
-            <service-call name="create#zenith.erp.stores.StoreTarget" out-map="context"
-                          in-map="[storeId:storeId, targetPeriodEnumId:targetPeriodEnumId,
-                                   periodStart:periodStart, periodEnd:periodEnd,
-                                   salesTarget:salesTarget, transactionTarget:transactionTarget,
-                                   footfallTarget:footfallTarget, actualSales:0,
-                                   actualTransactions:0, actualFootfall:0]"/>
+            <service-call name="zenith.stores.StoreAccessServices.assert#WriteAccess" out-map="writeScope"/>
+            <service-call name="zenith.stores.StoreAccessServices.assert#StoreAccess" out-map="storeAccess" in-map="[storeId:storeId]"/>
+            <if condition="!storeAccess.allowed"><return error="true" message="Store not found for your organization."/></if>
+            <entity-find-one entity-name="moqui.basic.Enumeration" value-field="period"><field-map field-name="enumId" from="targetPeriodEnumId"/></entity-find-one>
+            <if condition="period?.enumTypeId != 'TargetPeriod' || periodEnd &lt; periodStart"><return error="true" message="Choose a valid target period with the end on or after the start."/></if>
+            <if condition="(salesTarget != null &amp;&amp; salesTarget &lt; 0) || (transactionTarget != null &amp;&amp; transactionTarget &lt; 0) || (footfallTarget != null &amp;&amp; footfallTarget &lt; 0)"><return error="true" message="Targets cannot be negative."/></if>
+            <service-call name="create#zenith.erp.stores.StoreTarget" out-map="context" in-map="[storeId:storeId,targetPeriodEnumId:targetPeriodEnumId,periodStart:periodStart,periodEnd:periodEnd,salesTarget:salesTarget,transactionTarget:transactionTarget,footfallTarget:footfallTarget,actualSales:0,actualTransactions:0,actualFootfall:0]"/>
         </actions>
     </service>
 
@@ -191,12 +188,10 @@
             <parameter name="configValue" required="true"/>
         </in-parameters>
         <actions>
-            <!-- ZE-SB-013 (Tier 4): child of Store — guard via the parent store's org. -->
-            <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" out-map="_ca"
-                          in-map="[entityName:'zenith.erp.stores.Store', idField:'storeId', idValue:storeId, orgField:'organizationPartyId']"/>
-            <if condition="!_ca.allowed"><return error="true" message="Store not found for your account."/></if>
-            <service-call name="store#zenith.erp.stores.StoreConfiguration"
-                          in-map="[storeId:storeId, configKey:configKey, configValue:configValue]"/>
+            <service-call name="zenith.stores.StoreAccessServices.assert#WriteAccess" out-map="writeScope"/>
+            <service-call name="zenith.stores.StoreAccessServices.assert#StoreAccess" out-map="storeAccess" in-map="[storeId:storeId]"/>
+            <if condition="!storeAccess.allowed"><return error="true" message="Store not found for your organization."/></if>
+            <service-call name="store#zenith.erp.stores.StoreConfiguration" in-map="[storeId:storeId,configKey:configKey,configValue:configValue]"/>
         </actions>
     </service>
 
@@ -210,24 +205,130 @@
         </out-parameters>
         <actions>
             <!-- ZE-SB-013 (Tier 4): only read a dashboard for a store your org owns. -->
-            <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" out-map="_ca"
-                          in-map="[entityName:'zenith.erp.stores.Store', idField:'storeId', idValue:storeId, orgField:'organizationPartyId']"/>
+            <service-call name="zenith.stores.StoreAccessServices.assert#StoreAccess" out-map="_ca"
+                          in-map="[storeId:storeId]"/>
             <if condition="!_ca.allowed"><return error="true" message="Store not found for your account."/></if>
             <entity-find-one entity-name="zenith.erp.stores.StoreDetail" value-field="store"/>
+            <service-call name="zenith.stores.StoreAccessServices.get#SafeStoreDetails" in-map="[rows:[store]]" out-map="safeDetails"/>
+            <set field="store" from="safeDetails.safeRows ? safeDetails.safeRows[0] : [:]"/>
             <entity-find entity-name="zenith.erp.stores.StoreOperatingHours" list="operatingHours">
                 <econdition field-name="storeId"/>
                 <order-by field-name="dayOfWeek"/>
             </entity-find>
+            <set field="today" from="java.sql.Date.valueOf(ec.l10n.format(ec.user.nowTimestamp,'yyyy-MM-dd'))"/>
             <entity-find entity-name="zenith.erp.stores.StoreTarget" list="currentTargets">
                 <econdition field-name="storeId"/>
-                <econdition field-name="periodEnd" operator="greater-equals" from="ec.user.nowTimestamp"/>
+                <econdition field-name="periodEnd" operator="greater-equals" from="today"/>
                 <order-by field-name="-periodStart"/>
             </entity-find>
             <entity-find entity-name="zenith.erp.stores.StoreHoliday" list="holidays">
                 <econdition field-name="storeId"/>
-                <econdition field-name="holidayDate" operator="greater-equals" from="ec.user.nowTimestamp"/>
+                <econdition field-name="holidayDate" operator="greater-equals" from="today"/>
                 <order-by field-name="holidayDate"/>
             </entity-find>
+        </actions>
+    </service>
+
+    <service verb="validate" noun="StoreFields">
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/><parameter name="storeId"/><parameter name="storeName"/><parameter name="storeCode"/><parameter name="storeTypeEnumId"/><parameter name="facilityId"/><parameter name="managerPartyId"/><parameter name="areaSqFt" type="BigDecimal"/><parameter name="email"/>
+        </in-parameters>
+        <actions><script><![CDATA[
+            if (storeName != null && !storeName.trim()) ec.message.addError('Store Name is required.')
+            if (areaSqFt != null && areaSqFt < 0) ec.message.addError('Area cannot be negative.')
+            if (email && !(email ==~ /[^\s@]+@[^\s@]+\.[^\s@]+/)) ec.message.addError('Enter a valid email address.')
+            if (storeTypeEnumId && ec.entity.find('moqui.basic.Enumeration').condition('enumId',storeTypeEnumId).one()?.enumTypeId != 'StoreType') ec.message.addError('Choose a valid store type.')
+            if (storeCode) {
+                def q=ec.entity.find('zenith.erp.stores.Store').condition('organizationPartyId',organizationPartyId).condition('storeCode',storeCode)
+                if (storeId) q.condition('storeId','not-equals',storeId)
+                if (q.count()) ec.message.addError('Store Code is already used in this organization.')
+            }
+            if (facilityId) {
+                def f=ec.entity.find('mantle.facility.Facility').condition('facilityId',facilityId).disableAuthz().one()
+                if (!f || f.ownerPartyId != organizationPartyId || f.facilityTypeEnumId != 'FcTpRetailStore') ec.message.addError('Choose a retail facility belonging to this organization.')
+                def q=ec.entity.find('zenith.erp.stores.Store').condition('facilityId',facilityId).disableAuthz()
+                if (storeId) q.condition('storeId','not-equals',storeId)
+                if (q.count()) ec.message.addError('That facility is already linked to a shop.')
+            }
+            if (managerPartyId) {
+                def own=ec.entity.find('mantle.party.Party').condition('partyId',managerPartyId).condition('ownerPartyId',organizationPartyId).disableAuthz().count()
+                def employee=ec.entity.find('zenith.erp.hr.Employee').condition('partyId',managerPartyId).condition('organizationPartyId',organizationPartyId).disableAuthz().count()
+                if (!own && !employee) ec.message.addError('Choose a manager belonging to this organization.')
+            }
+        ]]></script></actions>
+    </service>
+    <service verb="save" noun="StoreProfile">
+        <in-parameters>
+            <parameter name="storeId" required="true"/>
+            <parameter name="storeName"/>
+            <parameter name="storeCode"/>
+            <parameter name="storeTypeEnumId"/>
+            <parameter name="facilityId"/>
+            <parameter name="managerPartyId"/>
+            <parameter name="address"/>
+            <parameter name="city"/>
+            <parameter name="regionGeoId"/>
+            <parameter name="countryGeoId"/>
+            <parameter name="postalCode"/>
+            <parameter name="phone"/>
+            <parameter name="email"/>
+            <parameter name="areaSqFt" type="BigDecimal"/>
+            <parameter name="statusId"/>
+            <parameter name="hDay" type="List"/><parameter name="hOpen" type="List"/><parameter name="hClose" type="List"/><parameter name="hClosed" type="List"/>
+        </in-parameters>
+        <actions>
+            <service-call name="zenith.stores.StoreAccessServices.assert#WriteAccess" out-map="writeScope"/>
+            <service-call name="zenith.stores.StoreAccessServices.assert#StoreAccess" out-map="storeAccess" in-map="[storeId:storeId]"/>
+            <if condition="!storeAccess.allowed"><return error="true" message="Store not found for your organization."/></if>
+            <script><![CDATA[
+                def days=hDay ?: []
+                if (days.size()!=7 || (days as Set) != (['Mon','Tue','Wed','Thu','Fri','Sat','Sun'] as Set) || [hOpen,hClose,hClosed].any {it == null || it.size()!=7}) {
+                    ec.message.addError('Submit all seven operating-hours rows.');return
+                }
+                days.eachWithIndex {day,i ->
+                    ec.service.sync().name('zenith.stores.StoreServices.set#OperatingHours')
+                        .parameters([storeId:storeId,dayOfWeek:day,openTime:hOpen[i],closeTime:hClose[i],isClosed:hClosed[i]]).call()
+                }
+            ]]></script>
+            <if condition="ec.message.hasError()"><return/></if>
+            <service-call name="zenith.stores.StoreServices.update#Store" in-map="context"/>
+        </actions>
+    </service>
+    <service verb="add" noun="StoreHoliday">
+        <in-parameters><parameter name="storeId" required="true"/><parameter name="holidayDate" type="Date" required="true"/><parameter name="description"/></in-parameters>
+        <actions>
+            <service-call name="zenith.stores.StoreAccessServices.assert#WriteAccess" out-map="writeScope"/>
+            <service-call name="zenith.stores.StoreAccessServices.assert#StoreAccess" out-map="storeAccess" in-map="[storeId:storeId]"/>
+            <if condition="!storeAccess.allowed"><return error="true" message="Store not found for your organization."/></if>
+            <entity-find-one entity-name="zenith.erp.stores.StoreHoliday" value-field="holiday"/>
+            <if condition="holiday"><return error="true" message="A holiday already exists on that date."/></if>
+            <service-call name="create#zenith.erp.stores.StoreHoliday" in-map="context"/>
+        </actions>
+    </service>
+    <service verb="delete" noun="Store">
+        <in-parameters><parameter name="storeId" required="true"/></in-parameters>
+        <actions>
+            <service-call name="zenith.stores.StoreAccessServices.assert#WriteAccess" out-map="writeScope"/>
+            <service-call name="zenith.stores.StoreAccessServices.assert#StoreAccess" out-map="storeAccess" in-map="[storeId:storeId]"/>
+            <if condition="!storeAccess.allowed"><return error="true" message="Store not found for your organization."/></if>
+            <entity-find-one entity-name="zenith.erp.stores.Store" value-field="shop" for-update="true"/>
+            <if condition="shop.facilityId">
+                <entity-find-one entity-name="mantle.facility.Facility" value-field="facility"><field-map field-name="facilityId" from="shop.facilityId"/></entity-find-one>
+                <if condition="!facility || facility.ownerPartyId != writeScope.organizationPartyId || facility.facilityTypeEnumId != 'FcTpRetailStore'"><return error="true" message="The linked facility is invalid; deletion is blocked."/></if>
+                <set field="linkedStoreCount" from="ec.entity.find('zenith.erp.stores.Store').condition('facilityId',shop.facilityId).disableAuthz().count()"/>
+                <if condition="linkedStoreCount != 1"><return error="true" message="The facility is shared by multiple profiles; deletion is blocked."/></if>
+            </if>
+            <if condition="shop.facilityId">
+                <entity-find entity-name="zenith.erp.pos.PosTerminal" list="counters"><econdition field-name="facilityId" from="shop.facilityId"/></entity-find>
+                <if condition="counters"><return error="true" message="This shop still has assigned counters and cannot be deleted."/></if>
+            </if>
+            <entity-delete-by-condition entity-name="zenith.erp.stores.StoreOperatingHours"><econdition field-name="storeId"/></entity-delete-by-condition>
+            <entity-delete-by-condition entity-name="zenith.erp.stores.StoreTarget"><econdition field-name="storeId"/></entity-delete-by-condition>
+            <entity-delete-by-condition entity-name="zenith.erp.stores.StoreHoliday"><econdition field-name="storeId"/></entity-delete-by-condition>
+            <entity-delete-by-condition entity-name="zenith.erp.stores.StoreConfiguration"><econdition field-name="storeId"/></entity-delete-by-condition>
+            <entity-delete value-field="shop"/>
+            <!-- A referenced facility causes a transaction rollback, including its profile/children. -->
+            <if condition="facility"><entity-delete value-field="facility"/></if>
         </actions>
     </service>
 
