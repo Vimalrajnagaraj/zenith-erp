@@ -31,19 +31,7 @@
         <in-parameters><parameter name="pricingRuleId"/></in-parameters>
         <out-parameters><parameter name="allowed" type="Boolean"/></out-parameters>
         <actions>
-            <script><![CDATA[
-                allowed = true
-                if (!ec.user.isInGroup('ADMIN')) {
-                    def activeOrg = ec.user.getPreference('ACTIVE_ORGANIZATION')
-                    if (!activeOrg || activeOrg == '_NA_' || !pricingRuleId) {
-                        allowed = false
-                    } else {
-                        def r = ec.entity.find('zenith.erp.pricing.PricingRule').condition('pricingRuleId', pricingRuleId).disableAuthz().one()
-                        if (r == null || r.organizationPartyId != activeOrg) allowed = false
-                    }
-                    if (!allowed) ec.message.addError("You do not have access to this pricing rule.")
-                }
-            ]]></script>
+            <service-call name="zenith.pricing.RuleServices.assert#RuleAccess" in-map="[pricingRuleId:pricingRuleId,errorOnDenied:'N']" out-map="context"/>
         </actions>
     </service>
 
@@ -435,8 +423,8 @@
         <in-parameters>
             <parameter name="ruleName" required="true"/>
             <parameter name="description"/>
-            <parameter name="priority" type="Integer" default="10"/>
-            <parameter name="isStackable" default-value="N"/>
+            <parameter name="priority" default-value="10"/>
+            <parameter name="isStackable" default-value="N"/><parameter name="isActive" default-value="Y"/>
             <parameter name="organizationPartyId"/>
             <parameter name="validFromDate" type="Timestamp"/>
             <parameter name="validThruDate" type="Timestamp"/>
@@ -457,34 +445,7 @@
             <parameter name="pricingRuleId"/>
         </out-parameters>
         <actions>
-            <!-- ZE-PRC-018 (PRC-084): stamp the creator's active org so a rule is NEVER born null-org.
-                 The New Rule screen passes no organizationPartyId; without this every rule became global
-                 and (via the old is-null match in calculate#Price) polluted every tenant's prices. A
-                 super-admin with no active org still creates a null-org rule, which the engine now ignores. -->
-            <if condition="!organizationPartyId">
-                <set field="_activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-                <if condition="_activeOrg &amp;&amp; _activeOrg != '_NA_'">
-                    <set field="organizationPartyId" from="_activeOrg"/>
-                </if>
-            </if>
-            <service-call name="create#zenith.erp.pricing.PricingRule" out-map="context"
-                          in-map="[ruleName:ruleName, description:description, priority:priority,
-                                   isStackable:isStackable, organizationPartyId:organizationPartyId,
-                                   validFromDate:validFromDate, validThruDate:validThruDate,
-                                   actionType:actionType, actionValue:actionValue,
-                                   maxDiscount:maxDiscount, minimumPrice:minimumPrice]"/>
-
-            <if condition="conditions">
-                <iterate list="conditions" entry="cond">
-                    <!-- ZE-PRC-075: shared validation (rejects a 'between' missing either bound). -->
-                    <service-call name="zenith.pricing.PricingServices.add#PricingRuleCondition"
-                                  in-map="[pricingRuleId:pricingRuleId,
-                                           conditionTypeEnumId:cond.conditionTypeEnumId,
-                                           operator:cond.operator ?: 'equals',
-                                           fieldValue:cond.fieldValue,
-                                           fieldValueTo:cond.fieldValueTo]"/>
-                </iterate>
-            </if>
+            <service-call name="zenith.pricing.RuleServices.create#Rule" in-map="context" out-map="context"/>
         </actions>
     </service>
 
@@ -505,13 +466,7 @@
         </in-parameters>
         <out-parameters><parameter name="conditionId"/></out-parameters>
         <actions>
-            <!-- 'between' is a range: it needs a lower (Value) AND an upper (Value To) bound. -->
-            <if condition="operator == 'between' &amp;&amp; (!fieldValue?.toString()?.trim() || !fieldValueTo?.toString()?.trim())">
-                <return error="true" message="The 'between' operator needs both a Value and a Value To."/>
-            </if>
-            <service-call name="create#zenith.erp.pricing.PricingRuleCondition" out-map="context"
-                          in-map="[pricingRuleId:pricingRuleId, conditionTypeEnumId:conditionTypeEnumId,
-                                   operator:operator, fieldValue:fieldValue, fieldValueTo:fieldValueTo]"/>
+            <service-call name="zenith.pricing.RuleServices.add#Condition" in-map="context" out-map="context"/>
         </actions>
     </service>
 
@@ -546,6 +501,15 @@
         <actions>
             <set field="now" from="orderDate"/>
             <set field="appliedRules" from="[]"/>
+            <if condition="quantity == null || quantity &lt;= 0">
+                <return error="true" message="Quantity must be greater than zero."/>
+            </if>
+            <if condition="!organizationPartyId">
+                <set field="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            </if>
+            <if condition="!organizationPartyId || organizationPartyId == '_NA_' || (!ec.user.isInGroup('ADMIN') &amp;&amp; organizationPartyId != ec.user.getPreference('ACTIVE_ORGANIZATION'))">
+                <return error="true" message="Choose your active organization before calculating a price."/>
+            </if>
 
             <!-- Get product base price -->
             <entity-find-one entity-name="mantle.product.Product" value-field="product"/>
@@ -563,7 +527,8 @@
             <if condition="!effectivePriceListId &amp;&amp; customerPartyId">
                 <entity-find entity-name="zenith.erp.pricing.CustomerPriceList" list="custPls">
                     <econdition field-name="partyId" from="customerPartyId"/>
-                    <date-filter from-field-name="validFromDate" thru-field-name="validThruDate"/>
+                    <econdition field-name="organizationPartyId" from="organizationPartyId ?: '__NO_ORGANIZATION__'"/>
+                    <date-filter valid-date="now" from-field-name="validFromDate" thru-field-name="validThruDate"/>
                     <order-by field-name="priority"/>
                 </entity-find>
                 <if condition="custPls">
@@ -587,14 +552,14 @@
             <if condition="!effectivePriceListId &amp;&amp; customerPartyId">
                 <entity-find entity-name="zenith.erp.contacts.CustomerGroupMember" list="_cgMems">
                     <econdition field-name="partyId" from="customerPartyId"/>
-                    <date-filter/>
+                    <date-filter valid-date="now"/>
                 </entity-find>
                 <iterate list="_cgMems" entry="_gm">
                     <if condition="!effectivePriceListId">
                         <entity-find-one entity-name="zenith.erp.contacts.CustomerGroup" value-field="_cg">
                             <field-map field-name="customerGroupId" from="_gm.customerGroupId"/>
                         </entity-find-one>
-                        <if condition="_cg?.priceListId">
+                        <if condition="_cg?.priceListId &amp;&amp; _cg.organizationPartyId == organizationPartyId">
                             <entity-find-one entity-name="zenith.erp.pricing.PriceList" value-field="_gpl">
                                 <field-map field-name="priceListId" from="_cg.priceListId"/>
                             </entity-find-one>
@@ -610,7 +575,8 @@
             <if condition="!effectivePriceListId &amp;&amp; customerGroupId">
                 <entity-find entity-name="zenith.erp.pricing.CustomerPriceList" list="groupPls">
                     <econdition field-name="customerGroupId"/>
-                    <date-filter from-field-name="validFromDate" thru-field-name="validThruDate"/>
+                    <econdition field-name="organizationPartyId" from="organizationPartyId ?: '__NO_ORGANIZATION__'"/>
+                    <date-filter valid-date="now" from-field-name="validFromDate" thru-field-name="validThruDate"/>
                     <order-by field-name="priority"/>
                 </entity-find>
                 <if condition="groupPls">
@@ -625,10 +591,26 @@
                     <econdition field-name="priceListTypeEnumId" value="PltSelling"/>
                     <econdition field-name="isDefault" value="Y"/>
                     <econdition field-name="isActive" value="Y"/>
+                    <econdition field-name="currencyUomId" ignore-if-empty="true"/>
+                    <date-filter valid-date="now" from-field-name="validFromDate" thru-field-name="validThruDate"/>
+                    <order-by field-name="priceListId"/>
                 </entity-find>
                 <if condition="defPls">
                     <set field="effectivePriceListId" from="defPls[0].priceListId"/>
                 </if>
+            </if>
+
+            <!-- Check the list header before reading items, volume tiers, parent or rounding metadata.
+                 These services also run with authz disabled by POS/order callers. -->
+            <if condition="effectivePriceListId">
+                <entity-find entity-name="zenith.erp.pricing.PriceList" list="eligibleLists" limit="1">
+                    <econdition field-name="priceListId" from="effectivePriceListId"/>
+                    <econdition field-name="organizationPartyId" from="organizationPartyId ?: '__NO_ORGANIZATION__'"/>
+                    <econdition field-name="isActive" value="Y"/>
+                    <econdition field-name="currencyUomId" ignore-if-empty="true"/>
+                    <date-filter valid-date="now" from-field-name="validFromDate" thru-field-name="validThruDate"/>
+                </entity-find>
+                <if condition="!eligibleLists"><set field="effectivePriceListId" from="null"/></if>
             </if>
 
             <!-- Step 2: Look up price from price list -->
@@ -641,7 +623,7 @@
                         <econdition field-name="maxQuantity" operator="is-null"/>
                         <econdition field-name="maxQuantity" operator="greater-equals" from="quantity"/>
                     </econditions>
-                    <date-filter from-field-name="validFromDate" thru-field-name="validThruDate"/>
+                    <date-filter valid-date="now" from-field-name="validFromDate" thru-field-name="validThruDate"/>
                     <order-by field-name="-minQuantity"/>
                 </entity-find>
                 <if condition="plItems">
@@ -649,7 +631,7 @@
                     <if condition="plItem.priceTypeEnumId == 'PtpFixed'">
                         <set field="unitPrice" from="plItem.unitPrice" type="BigDecimal"/>
                         <set field="priceSource" value="PriceList"/>
-                    <else-if condition="plItem.priceTypeEnumId == 'PtpDiscount' &amp;&amp; plItem.discountPercent">
+                    <else-if condition="plItem.priceTypeEnumId == 'PtpDiscount' &amp;&amp; plItem.discountPercent != null">
                         <set field="unitPrice" from="(listPrice * (100 - plItem.discountPercent) / 100).setScale(2, java.math.RoundingMode.HALF_UP)" type="BigDecimal"/>
                         <set field="priceSource" value="PriceListDiscount"/>
                     </else-if></if>
@@ -679,6 +661,7 @@
                             <service-call name="zenith.pricing.PricingServices.calculate#Price"
                                           in-map="[productId:productId, quantity:quantity,
                                                    priceListId:pl.parentPriceListId, orderDate:orderDate,
+                                                   organizationPartyId:organizationPartyId, currencyUomId:currencyUomId,
                                                    _visitedPriceLists:_seenPls]"
                                           out-map="parentResult"/>
                             <if condition="parentResult.priceSource != 'ProductListPrice'">
@@ -700,15 +683,15 @@
                         <econdition field-name="maxQuantity" operator="is-null"/>
                         <econdition field-name="maxQuantity" operator="greater-equals" from="quantity"/>
                     </econditions>
-                    <date-filter from-field-name="validFromDate" thru-field-name="validThruDate"/>
+                    <date-filter valid-date="now" from-field-name="validFromDate" thru-field-name="validThruDate"/>
                     <order-by field-name="-minQuantity"/>
                 </entity-find>
                 <if condition="volPrices">
                     <set field="vp" from="volPrices[0]"/>
-                    <if condition="vp.unitPrice">
+                    <if condition="vp.unitPrice != null">
                         <set field="unitPrice" from="vp.unitPrice" type="BigDecimal"/>
                         <set field="priceSource" value="VolumePricing"/>
-                    <else-if condition="vp.discountPercent">
+                    <else-if condition="vp.discountPercent != null">
                         <set field="unitPrice" from="(unitPrice * (100 - vp.discountPercent) / 100).setScale(2, java.math.RoundingMode.HALF_UP)" type="BigDecimal"/>
                         <set field="priceSource" value="VolumeDiscount"/>
                     </else-if></if>
@@ -721,12 +704,12 @@
                  a cross-tenant leak that silently discounted other tenants (e.g. a null-org "QA_Discount_10"
                  turned DOODLE's ₹80 volume tier into ₹72, reported as "volume tier ignored"). Now a rule
                  applies only to its own org, and with no org in context NO rules apply (rules stays unset). -->
-            <if condition="organizationPartyId">
+            <if condition="organizationPartyId &amp;&amp; !_visitedPriceLists">
                 <entity-find entity-name="zenith.erp.pricing.PricingRule" list="rules">
                     <econdition field-name="isActive" value="Y"/>
                     <econdition field-name="organizationPartyId" from="organizationPartyId"/>
-                    <date-filter from-field-name="validFromDate" thru-field-name="validThruDate"/>
-                    <order-by field-name="priority"/>
+                    <date-filter valid-date="now" from-field-name="validFromDate" thru-field-name="validThruDate"/>
+                    <order-by field-name="priority,pricingRuleId"/>
                 </entity-find>
             </if>
             <iterate list="rules" entry="rule">
@@ -752,9 +735,8 @@
                          equals/membership; Minimum-Quantity/Amount = '>=' (the "Minimum ..." type meaning).
                          Explicit operators refine: not-equals / in (value & id types); greater-than /
                          less-than / between (the numeric Minimum types). An operator that doesn't apply to a
-                         type falls back to that type's default; malformed numeric input makes the condition
-                         FAIL (allMatch=false) so a bad rule never silently BROADENS its scope. Day-of-Week and
-                         Time-Range keep their own parsing (operators don't apply). -->
+                         type fails closed, as does malformed input. Weekday and time-range comparisons use
+                         the user's time zone and support their validated operators. -->
                     <script><![CDATA[
                         def op = (cond.operator ?: 'equals').toString().trim()
                         if (!op) op = 'equals'
@@ -763,8 +745,10 @@
                         def t = cond.conditionTypeEnumId
 
                         def csvList = { s -> (s ?: '').toString().split(',').collect { it.trim() }.findAll { it } }
-                        // id / enum equality: equals (default), not-equals, in; any other op -> equals
+                        // Invalid legacy operators and incomplete lists must not broaden a rule's scope.
                         def catMatch = { actual ->
+                            if (!(op in ['equals','not-equals','in']) || !fv?.toString()?.trim()) return false
+                            if (op=='in' && fv.toString().split(',',-1).any {!it.trim()}) return false
                             def a = (actual == null) ? null : actual.toString()
                             def f = (fv == null) ? null : fv.toString()
                             if (op == 'not-equals') return a != f
@@ -776,12 +760,18 @@
                         def numMatch = { lv ->
                             if (lv == null) return false
                             try {
+                                if (!(op in ['equals','not-equals','greater-than','less-than','between','in'])) return false
+                                if (op == 'in') {
+                                    if (!fv || fv.toString().split(',',-1).any {!it.trim()}) return false
+                                    def numbers=csvList(fv).collect {it as BigDecimal}
+                                    return numbers && numbers.every {it>=0} && numbers.any {lv==it}
+                                }
                                 def bd = (fv as BigDecimal)
+                                if (bd<0 || (op=='between' && ((fvTo as BigDecimal)<bd))) return false
                                 if (op == 'greater-than') return lv > bd
                                 if (op == 'less-than')    return lv < bd
                                 if (op == 'not-equals')   return lv != bd
                                 if (op == 'between')      return lv >= bd && lv <= (fvTo as BigDecimal)
-                                if (op == 'in')           return csvList(fv).any { lv == (it as BigDecimal) }
                                 return lv >= bd
                             } catch (Exception e) { return false }
                         }
@@ -794,10 +784,7 @@
                         } else if (t == 'PctCustomerGroup') {
                             match = catMatch(customerGroupId)
                         } else if (t == 'PctRegion') {
-                            def has = (regionGeoId != null && regionGeoId.toString().trim() != '')
-                            if (op == 'not-equals')  match = !(has && regionGeoId.toString() == (fv?.toString()))
-                            else if (op == 'in')     match = has && csvList(fv).contains(regionGeoId.toString())
-                            else                     match = has && regionGeoId.toString() == (fv?.toString())
+                            match = catMatch(regionGeoId)
                         } else if (t == 'PctProductCategory') {
                             def cats = (op == 'in') ? csvList(fv) : [ (fv == null ? null : fv.toString()) ]
                             boolean isMember = false
@@ -808,30 +795,32 @@
                                            .conditionDate('fromDate', 'thruDate', now).list()
                                 if (cm) { isMember = true; break }
                             }
-                            match = (op == 'not-equals') ? !isMember : isMember
+                            def validCategory=op in ['equals','not-equals','in'] && fv?.toString()?.trim() && (op!='in' || !fv.toString().split(',',-1).any {!it.trim()})
+                            match = validCategory && ((op == 'not-equals') ? !isMember : isMember)
                         } else if (t == 'PctMinQuantity') {
                             match = numMatch(quantity == null ? null : (quantity as BigDecimal))
                         } else if (t == 'PctMinAmount') {
                             match = (unitPrice == null || quantity == null) ? false : numMatch((unitPrice as BigDecimal) * (quantity as BigDecimal))
                         } else if (t == 'PctDayOfWeek') {
-                            def ldt = new java.sql.Timestamp(((java.util.Date) now).getTime()).toLocalDateTime()
-                            def f = (fv ?: '').toString().toUpperCase()
-                            def dn = ldt.getDayOfWeek().name().substring(0, 3)
-                            def di = '' + ldt.getDayOfWeek().getValue()
-                            def days = f.replace(' ', '').split(',')
-                            match = (f.contains(dn) || days.contains(di))
+                            def zone=ec.user.getTimeZone().toZoneId()
+                            def day=java.time.Instant.ofEpochMilli(((java.util.Date)now).time).atZone(zone).getDayOfWeek()
+                            def name=day.name(), abbreviation=name.substring(0,3), number=day.value.toString()
+                            def days=csvList(fv).collect {it.toUpperCase(java.util.Locale.ROOT)}
+                            def legalDays=['MON','TUE','WED','THU','FRI','SAT','SUN','MONDAY','TUESDAY','WEDNESDAY','THURSDAY','FRIDAY','SATURDAY','SUNDAY','1','2','3','4','5','6','7']
+                            def includes=days.any {it in [name,abbreviation,number]}
+                            match=days && days.every {it in legalDays} && (op=='not-equals' ? !includes : op in ['equals','in'] && includes)
                         } else if (t == 'PctTimeRange') {
-                            def f = (fv ?: '').toString().trim()
-                            match = false
-                            if (f.contains('-')) {
-                                try {
-                                    def parts = f.split('-')
-                                    def lt = new java.sql.Timestamp(((java.util.Date) now).getTime()).toLocalDateTime().toLocalTime()
-                                    def st = java.time.LocalTime.parse(parts[0].trim())
-                                    def en = java.time.LocalTime.parse(parts[1].trim())
-                                    match = !(lt.isBefore(st) || lt.isAfter(en))
-                                } catch (Exception ex) { match = false }
-                            }
+                            match=false
+                            try {
+                                def parts=(fv ?: '').toString().split('-',-1)
+                                if(parts.length==2 && op in ['equals','not-equals']) {
+                                    def zone=ec.user.getTimeZone().toZoneId()
+                                    def time=java.time.Instant.ofEpochMilli(((java.util.Date)now).time).atZone(zone).toLocalTime()
+                                    def start=java.time.LocalTime.parse(parts[0].trim()), end=java.time.LocalTime.parse(parts[1].trim())
+                                    def inside=start.isAfter(end) ? !time.isBefore(start) || !time.isAfter(end) : !time.isBefore(start) && !time.isAfter(end)
+                                    match=op=='not-equals' ? !inside : inside
+                                }
+                            } catch(Exception ignored) {match=false}
                         } else {
                             match = false
                         }
@@ -839,17 +828,17 @@
                     ]]></script>
                 </iterate>
 
-                <if condition="allMatch">
+                <if condition="allMatch &amp;&amp; rule.actionType in ['PatDiscountPercent','PatDiscountAmount','PatFixedPrice'] &amp;&amp; rule.actionValue != null &amp;&amp; rule.actionValue &gt;= 0 &amp;&amp; (rule.actionType != 'PatDiscountPercent' || rule.actionValue &lt;= 100) &amp;&amp; (rule.maxDiscount == null || rule.maxDiscount &gt;= 0) &amp;&amp; (rule.minimumPrice == null || rule.minimumPrice &gt;= 0)">
                     <set field="preBefore" from="unitPrice"/>
                     <if condition="rule.actionType == 'PatDiscountPercent'">
                         <set field="discount" from="(unitPrice * rule.actionValue / 100).setScale(2, java.math.RoundingMode.HALF_UP)"/>
-                        <if condition="rule.maxDiscount &amp;&amp; discount &gt; rule.maxDiscount">
+                        <if condition="rule.maxDiscount != null &amp;&amp; discount &gt; rule.maxDiscount">
                             <set field="discount" from="rule.maxDiscount"/>
                         </if>
                         <set field="unitPrice" from="unitPrice - discount"/>
                     <else-if condition="rule.actionType == 'PatDiscountAmount'">
                         <set field="discAmt" from="rule.actionValue"/>
-                        <if condition="rule.maxDiscount &amp;&amp; discAmt &gt; rule.maxDiscount">
+                        <if condition="rule.maxDiscount != null &amp;&amp; discAmt &gt; rule.maxDiscount">
                             <set field="discAmt" from="rule.maxDiscount"/>
                         </if>
                         <set field="unitPrice" from="unitPrice - discAmt"/>
@@ -858,7 +847,7 @@
                         <set field="unitPrice" from="rule.actionValue" type="BigDecimal"/>
                     </else-if></if>
 
-                    <if condition="rule.minimumPrice &amp;&amp; unitPrice &lt; rule.minimumPrice">
+                    <if condition="rule.minimumPrice != null &amp;&amp; unitPrice &lt; rule.minimumPrice">
                         <set field="unitPrice" from="rule.minimumPrice" type="BigDecimal"/>
                     </if>
                     <if condition="unitPrice &lt; 0">
