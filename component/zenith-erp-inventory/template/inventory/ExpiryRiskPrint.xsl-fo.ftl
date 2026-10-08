@@ -23,10 +23,10 @@
             <fo:block text-align="center" font-size="15pt" font-weight="bold" margin-bottom="2mm">Expiry Risk Report</fo:block>
             <fo:block text-align="center" font-size="10pt" margin-bottom="1mm"><@encodeText orgName!""/></fo:block>
             <fo:block text-align="center" font-size="8pt" color="#444444" margin-bottom="4mm">
-                As of ${reportDate!""} &#8226; Items expiring within the next 90 days &#8226;
+                As of ${reportDate!""} &#8226; Filtered expiry stock report &#8226;
                 Total value at risk: <fo:inline font-weight="bold"><@inr expiryOut.totalExpiryValue!0/></fo:inline>
                 <#if (searchText!"")?has_content> &#8226; Search: &#8220;<@encodeText searchText/>&#8221;</#if>
-                <#if (withinDays!"")?has_content> &#8226; Filter: <#if withinDays=='expired'>already expired<#else>within ${withinDays} days</#if></#if>
+                <#if (withinDays!"")?has_content> &#8226; Filter: <#if withinDays=='expired'>already expired<#else><#if withinDays=='all'>all expiry dates<#else>within ${withinDays} days</#if></#if></#if>
             </fo:block>
 
             <#-- TABLE -->
@@ -50,7 +50,7 @@
                 <fo:table-body>
                     <#if items?has_content>
                         <#list items as r>
-                        <#assign expired = (r.daysToExpiry!999)?number &lt;= 0>
+                        <#assign expired = (r.daysToExpiry!999)?number &lt; 0>
                         <fo:table-row>
                             <fo:table-cell padding="2.5pt" border-bottom="0.25pt solid #cccccc"><fo:block><@encodeText r.assetId!""/></fo:block></fo:table-cell>
                             <fo:table-cell padding="2.5pt" border-bottom="0.25pt solid #cccccc"><fo:block><@encodeText r.productName!""/></fo:block></fo:table-cell>

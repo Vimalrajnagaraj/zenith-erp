@@ -5,7 +5,7 @@
          (ZE-INV-002), supplier (ZE-INV-004), search/filter (ZE-INV-004) and sort (ZE-INV-003) stay in one place. -->
     <service verb="get" noun="ExpiryRisk">
         <in-parameters>
-            <parameter name="organizationPartyId"/>  <!-- org isolation; blank/_NA_ = all (super-admin) -->
+            <parameter name="organizationPartyId"/>  <!-- must match the active organization; missing selection fails closed -->
             <parameter name="searchText"/>            <!-- product / stock id / batch / supplier contains -->
             <parameter name="withinDays"/>            <!-- '7'/'30'/'60' = within N days; 'expired' = past; '' = all 90d -->
             <parameter name="categoryFilter"/>        <!-- expiry-risk §6: exact category name -->
@@ -18,32 +18,38 @@
             <parameter name="expiringAssets" type="List"/>
             <parameter name="categoryOptions" type="List"/>  <!-- distinct categories in the org's expiry list -->
             <parameter name="supplierOptions" type="List"/>  <!-- distinct suppliers in the org's expiry list -->
-            <parameter name="tierCounts" type="Map"/>        <!-- §7 chip counts: all/expired/d30/d3160/d6190/after90 -->
+            <parameter name="summary" type="Map"/><parameter name="tierCounts" type="Map"/>        <!-- §7 chip counts: all/expired/d30/d3160/d6190/after90 -->
         </out-parameters>
         <actions>
+            <service-call name="zenith.inventory.ExpiryRiskServices.get#ExpiryScope" out-map="scope"/>
             <script><![CDATA[
+                totalExpiryValue = 0G; expiringAssets = []; categoryOptions = []; supplierOptions = []
+                tierCounts = [all:0, expired:0, d30:0, d3160:0, d6190:0, after90:0]
+                summary = [riskValue:0G, riskUnits:0G, riskCount:0, expiredValue:0G, expiredUnits:0G, expiredCount:0]
+                def selected = scope.organizationPartyId
+                if (selected == '__NO_ORGANIZATION__' || (organizationPartyId && organizationPartyId != selected)) return
+                def validBucket = (daysBucket ?: '').toString().trim()
+                def validWithin = (withinDays ?: '90').toString().trim()
+                if (!(validBucket in ['', 'all', 'expired', '0-30', '31-60', '61-90', '90+']) || !(validWithin in ['7','30','60','90','all','expired'])) { ec.message.addError('Choose a valid expiry period.'); return }
+                def zone = java.time.ZoneId.of(ec.user.userAccount?.timeZone ?: java.util.TimeZone.getDefault().ID)
+                def today = ec.user.nowTimestamp.toInstant().atZone(zone).toLocalDate()
                 import java.sql.Timestamp
-                Calendar cal = Calendar.getInstance()
-                cal.add(Calendar.DAY_OF_YEAR, 90)
-                Timestamp thresholdDate = new Timestamp(cal.getTimeInMillis())
-
-                // Org isolation (explicit — Asset isn't in the active-org entity-filter set).
-                def assetFind = ec.entity.find("mantle.product.asset.Asset")
-                    .condition("expiryDate", org.moqui.entity.EntityCondition.LESS_THAN_EQUAL_TO, thresholdDate)
-                    .condition("quantityOnHandTotal", org.moqui.entity.EntityCondition.GREATER_THAN, BigDecimal.ZERO)
-                if (organizationPartyId && organizationPartyId != '_NA_') assetFind.condition("ownerPartyId", organizationPartyId)
-                def assetList = assetFind.list()
+                def assetList = ec.entity.find("mantle.product.asset.Asset")
+                    .condition("ownerPartyId", selected).condition("assetTypeEnumId", "AstTpInventory")
+                    .condition("statusId", "AstAvailable")
+                    .condition("expiryDate", org.moqui.entity.EntityCondition.NOT_EQUAL, null)
+                    .condition("quantityOnHandTotal", org.moqui.entity.EntityCondition.GREATER_THAN, BigDecimal.ZERO).list()
 
                 // ZE-INV-011 (IV-111): batch-load products + suppliers up front to avoid an N+1 (was one Product
                 // query per asset + per-order supplier queries, so the page slowed in proportion to the number
                 // of expiring lots). Now 3 set-based lookups regardless of asset count.
                 def _pids = assetList.collect { it.productId }.findAll { it }.unique()
                 def _prodMap = [:]
-                if (_pids) ec.entity.find("mantle.product.Product").condition("productId", "in", _pids).list().each { _prodMap[it.productId] = it }
+                if (_pids) ec.entity.find("mantle.product.Product").condition("productId", "in", _pids).condition("ownerPartyId", selected).list().each { _prodMap[it.productId] = it }
 
                 def _oids = assetList.collect { it.acquireOrderId }.findAll { it }.unique()
                 def _orderVendor = [:]
-                if (_oids) ec.entity.find("mantle.order.OrderPart").condition("orderId", "in", _oids).disableAuthz().list().each {
+                if (_oids) ec.entity.find("mantle.order.OrderPart").condition("orderId", "in", _oids).condition("customerPartyId", selected).disableAuthz().list().each {
                     if (it.vendorPartyId && !_orderVendor.containsKey(it.orderId)) _orderVendor[it.orderId] = it.vendorPartyId
                 }
                 def _vids = _orderVendor.values().findAll { it }.unique()
@@ -63,7 +69,7 @@
                     }
                     def _ecCids = _ecCat.values().findAll { it }.unique()
                     def _ecCName = [:]
-                    if (_ecCids) ec.entity.find("mantle.product.category.ProductCategory").condition("productCategoryId", "in", _ecCids).disableAuthz().list().each { _ecCName[it.productCategoryId] = it.categoryName ?: it.productCategoryId }
+                    if (_ecCids) ec.entity.find("mantle.product.category.ProductCategory").condition("productCategoryId", "in", _ecCids).condition("ownerPartyId", "in", [selected, "_NA_"]).disableAuthz().list().each { _ecCName[it.productCategoryId] = it.categoryName ?: it.productCategoryId }
                     def _ecResolved = [:]
                     for (def _ecK : new ArrayList(_ecCat.keySet())) { _ecResolved[_ecK] = _ecCName[_ecCat[_ecK]] ?: '' }
                     _ecCat = _ecResolved
@@ -77,14 +83,15 @@
                     def supplierName = _vid ? (_vendorName[_vid] ?: '') : ''
                     // value at cost (valuationRate) -> acquireCost -> MRP; tag the basis
                     def _pos = { v -> (v != null && (v as BigDecimal).signum() > 0) ? (v as BigDecimal) : null }
-                    def valRate = _pos(asset.valuationRate) ?: _pos(asset.acquireCost)
+                    def valRate = asset.valuationRate != null && asset.valuationRate >= 0 ? asset.valuationRate : (asset.acquireCost != null && asset.acquireCost >= 0 ? asset.acquireCost : null)
                     def valBasis = (valRate != null) ? 'cost' : null
-                    if (valRate == null) { valRate = _pos(asset.mrpAmount); if (valRate != null) valBasis = 'MRP' }
+                    if (valRate == null) { valRate = _pos(asset.mrpAmount) ?: _pos(product.mrpAmount); if (valRate != null) valBasis = 'MRP' }
                     if (valRate == null) { valRate = BigDecimal.ZERO; valBasis = 'unvalued' }
                     def qoh = asset.quantityOnHandTotal ?: BigDecimal.ZERO
-                    def _days = asset.expiryDate ? (int)((asset.expiryDate.getTime() - _nowMs) / 86400000L) : 999
+                    def _days = (int)java.time.temporal.ChronoUnit.DAYS.between(today, (asset.expiryDate instanceof java.sql.Date ? asset.expiryDate.toLocalDate() : java.time.Instant.ofEpochMilli(asset.expiryDate.getTime()).atZone(zone).toLocalDate()))
                     expList.add([
                         assetId: asset.assetId, productId: asset.productId, productName: product?.productName ?: 'Unknown', supplierName: supplierName,
+                        stockVersion: asset.lastUpdatedStamp?.getTime()?.toString(), facilityId:asset.facilityId, uqcEnumId:product.uqcEnumId,
                         pseudoId: product?.pseudoId ?: '', category: (_ecCat[asset.productId] ?: ''),
                         expiryDate: asset.expiryDate, daysToExpiry: _days, quantity: qoh,
                         value: valRate.multiply(qoh), valuationRate: valRate, valueBasis: valBasis,
@@ -112,26 +119,31 @@
                 def _deT = { r -> (r.daysToExpiry != null) ? (r.daysToExpiry as Integer) : 999 }
                 tierCounts = [
                     all:     expList.size(),
-                    expired: expList.count { _deT(it) <= 0 },
-                    d30:     expList.count { def d = _deT(it); d > 0 && d <= 30 },
+                    expired: expList.count { _deT(it) < 0 },
+                    d30:     expList.count { def d = _deT(it); d >= 0 && d <= 30 },
                     d3160:   expList.count { def d = _deT(it); d > 30 && d <= 60 },
                     d6190:   expList.count { def d = _deT(it); d > 60 && d <= 90 },
                     after90: expList.count { _deT(it) > 90 }
                 ]
 
+                for (def r : expList) {
+                    if (r.daysToExpiry < 0) { summary.expiredValue += r.value; summary.expiredUnits += r.quantity; summary.expiredCount++ }
+                    else if (r.daysToExpiry <= 90) { summary.riskValue += r.value; summary.riskUnits += r.quantity; summary.riskCount++ }
+                }
+
                 // §7 tier (range) filter from the chips, OR the cumulative 'within N days' dropdown (§6)
                 def _bucket = (daysBucket ?: '').toString().trim()
-                def _within = (withinDays ?: '').toString().trim()
+                def _within = validWithin
                 if (_bucket) {
                     expList = expList.findAll { r -> def d = _deT(r)
-                        (_bucket == 'expired') ? (d <= 0) :
-                        ((_bucket == '0-30') ? (d > 0 && d <= 30) :
+                        (_bucket == 'expired') ? (d < 0) :
+                        ((_bucket == '0-30') ? (d >= 0 && d <= 30) :
                         ((_bucket == '31-60') ? (d > 30 && d <= 60) :
                         ((_bucket == '61-90') ? (d > 60 && d <= 90) :
                         ((_bucket == '90+') ? (d > 90) : true))))
                     }
-                } else if (_within) {
-                    expList = expList.findAll { r -> (_within == 'expired') ? (r.daysToExpiry <= 0) : (r.daysToExpiry <= (_within as Integer)) }
+                } else if (_within && _within != 'all') {
+                    expList = expList.findAll { r -> (_within == 'expired') ? (r.daysToExpiry < 0) : (r.daysToExpiry <= (_within as Integer)) }
                 }
 
                 BigDecimal totalVal = BigDecimal.ZERO
@@ -140,9 +152,9 @@
                 // sort (leading '-' = desc, whitelist, nulls last)
                 def _ob = (orderByField ?: 'expiryDate').toString()
                 def _desc = _ob.startsWith('-'); def _fld = _desc ? _ob.substring(1) : _ob
-                if (!(_fld in ['assetId','productName','batchNumber','supplierName','expiryDate','quantity','value'])) _fld = 'expiryDate'
+                if (!(_fld in ['assetId','productName','pseudoId','batchNumber','supplierName','expiryDate','daysToExpiry','quantity','value'])) _fld = 'expiryDate'
                 def _nc = { a, b -> (a == null && b == null) ? 0 : (a == null ? 1 : (b == null ? -1 : (a <=> b))) }
-                expList.sort { x, y -> def c = _nc(x[_fld], y[_fld]); _desc ? -c : c }
+                expList.sort { x, y -> def c = _nc(x[_fld], y[_fld]); (c ? (_desc ? -c : c) : (x.assetId <=> y.assetId)) }
 
                 totalExpiryValue = totalVal
                 expiringAssets = expList
