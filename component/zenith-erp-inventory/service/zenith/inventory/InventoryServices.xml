@@ -189,121 +189,28 @@
         </actions>
     </service>
 
-    <service verb="create" noun="StockTransfer">
-        <in-parameters>
-            <auto-parameters entity-name="zenith.erp.inventory.StockTransfer" include="nonpk"/>
-        </in-parameters>
+    <service verb="create" noun="StockTransfer" no-tx-cache="true">
+        <in-parameters><parameter name="fromFacilityId" required="true"/><parameter name="toFacilityId" required="true"/><parameter name="transferDate" type="Timestamp"/><parameter name="remarks"/></in-parameters>
         <out-parameters>
             <parameter name="stockTransferId" type="id"/>
         </out-parameters>
-        <actions>
-            <set field="organizationPartyId" from="organizationPartyId ?: ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-            <entity-find-one entity-name="mantle.facility.Facility" value-field="fromFac">
-                <field-map field-name="facilityId" from="fromFacilityId"/>
-            </entity-find-one>
-            <entity-find-one entity-name="mantle.facility.Facility" value-field="toFac">
-                <field-map field-name="facilityId" from="toFacilityId"/>
-            </entity-find-one>
-            
-            <script><![CDATA[
-                // ZE-INV-IV-075: the facility GSTIN is stored on facilityGstin (what EditFacility saves) — NOT
-                // taxRegistrationNumber, which the UI never populates. Reading the wrong (always-empty) field made
-                // EVERY transfer look intra-state, so the IGST branch-transfer invoice never generated and
-                // inter-state was never flagged for E-Way. Read facilityGstin.
-                String fromGstin = fromFac?.facilityGstin
-                String toGstin = toFac?.facilityGstin
-                String igstInvoiceIdOut = null
-                // ZE-INV-IV-074: inter- vs intra-state is decided by the STATE CODE (first 2 digits of the GSTIN),
-                // NOT the whole GSTIN — two GSTINs in the SAME state is intra-state (CGST+SGST), no IGST.
-                boolean interState = (fromGstin && toGstin && fromGstin.take(2) != toGstin.take(2))
-                // The IGST branch-transfer invoice — with line items + per-item IGST tax — is generated at SHIP
-                // time (build#StockTransferIgstInvoice), when the goods actually move and line quantities are
-                // final. Nothing to create at draft; igstInvoiceIdOut stays null (the list shows "IGST pending").
-
-                // ZE-INV-IV-075 + IV-077: E-Way Bill required when consignment value > ₹50,000 OR the move is
-                // inter-state. Value is 0 here (no lines yet) — recalc#StockTransferTotals keeps it current as
-                // lines are added.
-                BigDecimal val = totalValue ?: BigDecimal.ZERO
-                String ewayRequired = ((val.compareTo(new BigDecimal("50000")) > 0) || interState) ? "Y" : "N"
-                
-                // Create the StockTransfer
-                def result = ec.service.sync().name("create#zenith.erp.inventory.StockTransfer")
-                    .parameters(context + [statusId: 'StxDraft', igstInvoiceId: igstInvoiceIdOut, ewayBillRequired: ewayRequired])
-                    .call()
-                stockTransferId = result.stockTransferId
-            ]]></script>
-        </actions>
+        <actions><service-call name="zenith.inventory.StockTransferServices.create#StockTransfer" in-map="context" out-map="context"/></actions>
     </service>
 
     <!-- Add a product line to a stock transfer -->
-    <service verb="add" noun="StockTransferItem">
+    <service verb="add" noun="StockTransferItem" no-tx-cache="true">
         <in-parameters>
             <parameter name="stockTransferId" required="true"/>
             <parameter name="productId" required="true"/>
-            <parameter name="quantity" type="BigDecimal" required="true"/>
+            <parameter name="quantity" type="BigDecimal"/>
             <parameter name="unitAmount" type="BigDecimal"/>
             <parameter name="batchNumber"><description>Optional lot to move (batch-tracked products). Validated against
-                the sending facility's stock; blank = the ship auto-picks the earliest-expiry lot.</description></parameter>
+                the sending facility's stock; blank = shipping selects an available lot that covers the line.</description></parameter>
             <parameter name="serialNumbers" type="List"><description>Optional serialNumberIds to move (serial-tracked products).
-                When given, sets the line quantity to the count of selected serials; blank = Receive auto-relocates the first N.</description></parameter>
+                When given, sets the line quantity to the count of selected serials; blank = Ship selects available units and records their identities.</description></parameter>
         </in-parameters>
-        <actions>
-            <entity-find-one entity-name="mantle.product.Product" value-field="prod"><field-map field-name="productId"/></entity-find-one>
-            <entity-find-one entity-name="zenith.erp.inventory.StockTransfer" value-field="stx"/>
-            <!-- ZE-INV-IV-06A: cross-tenant guard (defense-in-depth for any non-screen caller) -->
-            <if condition="stx != null &amp;&amp; !ec.user.isInGroup('ADMIN') &amp;&amp; ec.user.getPreference('ACTIVE_ORGANIZATION') != stx.organizationPartyId">
-                <return error="true" message="You do not have access to this stock transfer."/>
-            </if>
-            <set field="fromAssetId" from="null"/>
 
-            <!-- If the user picked specific serials, confirm each is an in-stock unit of THIS product at the
-                 sender, then set the quantity to the number chosen. -->
-            <script><![CDATA[
-                serIds = (serialNumbers instanceof List) ? serialNumbers : (serialNumbers ? [serialNumbers] : [])
-                serIds = serIds.findAll { it }
-                validSerials = []
-                for (sid in serIds) {
-                    def sn = ec.entity.find("zenith.erp.inventory.ProductSerialNumber").condition("serialNumberId", sid).one()
-                    if (sn == null || sn.productId != productId || sn.statusId != 'SnInStock'
-                        || (stx?.fromFacilityId && sn.facilityId != stx.fromFacilityId)) {
-                        ec.message.addError("Serial " + (sn?.serialNumber ?: sid) + " isn't an in-stock unit of this product at the sending facility.")
-                    } else { validSerials.add(sn) }
-                }
-            ]]></script>
-            <if condition="ec.message.hasError()"><return/></if>
-            <if condition="validSerials"><set field="quantity" from="validSerials.size() as BigDecimal"/></if>
-            <!-- If the user picked a specific lot, confirm that lot of THIS product is in stock at the sender
-                 and remember its asset so ship/receive carry the exact batch (identity + expiry). -->
-            <if condition="batchNumber">
-                <entity-find-one entity-name="zenith.erp.inventory.StockTransfer" value-field="stx"/>
-                <entity-find entity-name="mantle.product.asset.Asset" list="batchAssets" limit="1">
-                    <econdition field-name="ownerPartyId" from="stx?.organizationPartyId ?: ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-                    <econdition field-name="productId"/>
-                    <econdition field-name="facilityId" from="stx?.fromFacilityId" ignore-if-empty="true"/>
-                    <econdition field-name="batchNumber"/>
-                    <order-by field-name="assetId"/>
-                </entity-find>
-                <if condition="!batchAssets">
-                    <return error="true" message="Lot ${batchNumber} of this product isn't in stock at the sending facility. Pick a lot that has stock there, or leave it blank."/>
-                </if>
-                <set field="fromAssetId" from="batchAssets[0].assetId"/>
-            </if>
-            <service-call name="create#zenith.erp.inventory.StockTransferItem" out-map="createdItem"
-                in-map="[stockTransferId:stockTransferId, productId:productId, quantity:quantity,
-                         unitAmount:(unitAmount ?: prod?.mrpAmount), productTaxCode:prod?.productTaxCode,
-                         batchNumber:batchNumber, fromAssetId:fromAssetId]"/>
-            <!-- Record the chosen serial units against the new line so Receive relocates exactly these. -->
-            <if condition="validSerials">
-                <iterate list="validSerials" entry="sn">
-                    <service-call name="create#zenith.erp.inventory.StockTransferItemSerial"
-                        in-map="[stockTransferId:stockTransferId, transferItemSeqId:createdItem.transferItemSeqId,
-                                 serialNumberId:sn.serialNumberId, serialNumber:sn.serialNumber]"/>
-                </iterate>
-            </if>
-            <!-- ZE-INV-IV-077: a line was added — recompute the transfer's total value and whether an E-Way
-                 Bill is required (consignment value > ₹50,000, intra- OR inter-state). -->
-            <service-call name="zenith.inventory.InventoryServices.recalc#StockTransferTotals" in-map="[stockTransferId:stockTransferId]"/>
-        </actions>
+        <actions><service-call name="zenith.inventory.StockTransferServices.add#StockTransferItem" in-map="context"/></actions>
     </service>
 
     <!-- ZE-INV-IV-077: recompute total_value (Σ qty × unitAmount over the lines) and ewayBillRequired
@@ -315,6 +222,7 @@
         <in-parameters><parameter name="stockTransferId" required="true"/></in-parameters>
         <out-parameters><parameter name="totalValue" type="BigDecimal"/><parameter name="ewayBillRequired"/></out-parameters>
         <actions>
+            <service-call name="zenith.inventory.StockTransferServices.require#StockTransferWrite" in-map="[stockTransferId:stockTransferId, requiredStatus:'StxDraft']" out-map="guard"/>
             <entity-find entity-name="zenith.erp.inventory.StockTransferItem" list="_stiList">
                 <econdition field-name="stockTransferId"/>
             </entity-find>
@@ -342,98 +250,12 @@
         </actions>
     </service>
 
-    <service verb="ship" noun="StockTransfer">
+    <service verb="ship" noun="StockTransfer" no-tx-cache="true">
         <in-parameters>
             <parameter name="stockTransferId" required="true"/>
         </in-parameters>
-        <actions>
-            <!-- for-update locks the row so two fast "Ship" clicks can't both pass the Draft check and
-                 double-deplete the source (the second waits, then sees StxInTransit and is blocked). -->
-            <entity-find-one entity-name="zenith.erp.inventory.StockTransfer" value-field="stx" for-update="true"/>
-            <if condition="stx == null"><return error="true" message="Transfer not found"/></if>
-            <!-- ZE-INV-IV-06A: cross-tenant guard (defense-in-depth) -->
-            <if condition="!ec.user.isInGroup('ADMIN') &amp;&amp; ec.user.getPreference('ACTIVE_ORGANIZATION') != stx.organizationPartyId">
-                <return error="true" message="You do not have access to this stock transfer."/>
-            </if>
-            <if condition="stx.statusId != 'StxDraft'">
-                <return error="true" message="Can only ship from Draft status"/>
-            </if>
-            <!-- E-Way Bill hard gate (was a soft addError inside the script): block the ship outright. -->
-            <if condition="stx.ewayBillRequired == 'Y' &amp;&amp; (!stx.transporterGstin || !stx.vehicleNumber)">
-                <return error="true" message="E-Way Bill is required: enter Transporter GSTIN and Vehicle Number before shipping."/>
-            </if>
 
-            <script><![CDATA[
-                def org = stx.organizationPartyId ?: ec.user.getPreference('ACTIVE_ORGANIZATION')
-                def shipItems = ec.entity.find("zenith.erp.inventory.StockTransferItem").condition("stockTransferId", stockTransferId).list()
-
-                // Validate every line before moving anything (don't partially ship).
-                //  - Batch-tracked product: a line moves from ONE source batch (its own batch, else the
-                //    earliest-expiry batch) so the batch identity + expiry can follow the goods (Receive
-                //    recreates it at the destination). If that batch can't cover the qty, block with a
-                //    clear message rather than silently losing traceability.
-                //  - Other tracked products: just check the source facility on-hand (no negative stock).
-                //  - Untracked products (non-tracking tenants, on-hand 0): no guard.
-                def picks = [:]  // transferItemSeqId -> chosen source batch Asset
-                for (li in shipItems) {
-                    if (!li.productId || !li.quantity) continue
-                    def prod = ec.entity.find("mantle.product.Product").condition("productId", li.productId).one()
-                    def qty = li.quantity as BigDecimal
-                    // ZE-INV-IV-078: name the product by SKU/name in guard messages, not the raw internal id.
-                    def _pl = (prod?.pseudoId ? (prod.pseudoId + ' · ') : '') + (prod?.productName ?: li.productId)
-                    if (prod?.enableBatchTracking == 'Y') {
-                        def bf = ec.entity.find("mantle.product.asset.Asset")
-                            .condition("ownerPartyId", org).condition("productId", li.productId)
-                            .condition("facilityId", stx.fromFacilityId)
-                            .condition("quantityOnHandTotal", org.moqui.entity.EntityCondition.GREATER_THAN, BigDecimal.ZERO)
-                        if (li.batchNumber) bf.condition("batchNumber", li.batchNumber)
-                        def batches = bf.orderBy("expiryDate,receivedDate,assetId").list()
-                        if (!batches) { ec.message.addError("No stock of " + _pl + " at the source facility to ship."); continue }
-                        def picked = batches[0]
-                        if (qty.compareTo((picked.quantityOnHandTotal ?: 0) as BigDecimal) > 0) {
-                            ec.message.addError("Batch " + (picked.batchNumber ?: '(no batch)') + " of " + _pl + " has only " + picked.quantityOnHandTotal + " at the source; choose a batch with enough stock or split this transfer line."); continue
-                        }
-                        picks[li.transferItemSeqId] = picked
-                    } else if (prod?.inventoryTracked == 'Y') {
-                        def srcAssets = ec.entity.find("mantle.product.asset.Asset")
-                            .condition("ownerPartyId", org).condition("productId", li.productId)
-                            .condition("facilityId", stx.fromFacilityId).list()
-                        def srcQoh = srcAssets ? (srcAssets.sum { it.quantityOnHandTotal ?: 0 } as BigDecimal) : BigDecimal.ZERO
-                        if (qty.compareTo(srcQoh) > 0) {
-                            ec.message.addError("Not enough stock to ship " + _pl + " from the source facility: have " + srcQoh + ", need " + li.quantity + ".")
-                        }
-                    }
-                }
-                if (ec.message.hasError()) return
-
-                // All lines valid — move stock out of the source.
-                ec.service.sync().name("update#zenith.erp.inventory.StockTransfer")
-                    .parameters([stockTransferId: stockTransferId, statusId: 'StxInTransit']).call()
-                for (li in shipItems) {
-                    if (!li.productId || !li.quantity) continue
-                    def qty = li.quantity as BigDecimal
-                    def picked = picks[li.transferItemSeqId]
-                    if (picked != null) {
-                        // Deplete the SPECIFIC source batch (via the batch-aware stock service) and stamp the
-                        // batch on the line so Receive can recreate it at the destination with its expiry.
-                        ec.service.sync().name("zenith.inventory.InventoryStockServices.adjust#AssetOnHand")
-                            .parameters([organizationPartyId:org, productId:li.productId, facilityId:stx.fromFacilityId,
-                                         batchNumber:picked.batchNumber, quantityDiff:(-qty), reason:("Transfer out " + stockTransferId)]).call()
-                        ec.service.sync().name("update#zenith.erp.inventory.StockTransferItem").parameters([
-                            stockTransferId:stockTransferId, transferItemSeqId:li.transferItemSeqId,
-                            batchNumber:picked.batchNumber, fromAssetId:picked.assetId]).call()
-                    } else {
-                        ec.service.sync().name("zenith.inventory.InventoryStockServices.adjust#AssetOnHand")
-                            .parameters([organizationPartyId:org, productId:li.productId, facilityId:stx.fromFacilityId,
-                                         quantityDiff:(-qty), reason:("Transfer out " + stockTransferId)]).call()
-                    }
-                }
-                // ZE-INV-IV-075: goods have moved and line quantities are final — generate the IGST
-                // branch-transfer invoice (line items + per-item IGST tax). No-op for an intra-state move.
-                ec.service.sync().name("zenith.inventory.InventoryServices.build#StockTransferIgstInvoice")
-                    .parameters([stockTransferId: stockTransferId]).call()
-            ]]></script>
-        </actions>
+        <actions><service-call name="zenith.inventory.StockTransferServices.ship#StockTransfer" in-map="context"/></actions>
     </service>
 
     <!-- ZE-INV-IV-075 f/u: generate the FULL IGST branch-transfer invoice (one line item per transfer line +
@@ -444,8 +266,11 @@
         <in-parameters><parameter name="stockTransferId" required="true"/></in-parameters>
         <out-parameters><parameter name="igstInvoiceId"/></out-parameters>
         <actions>
+            <service-call name="zenith.inventory.StockTransferServices.require#StockTransferWrite" in-map="[stockTransferId:stockTransferId]" out-map="guard"/>
             <entity-find-one entity-name="zenith.erp.inventory.StockTransfer" value-field="stx"/>
             <if condition="stx == null"><return/></if>
+            <if condition="stx.igstInvoiceId"><set field="igstInvoiceId" from="stx.igstInvoiceId"/><return/></if>
+            <if condition="!(stx.statusId in ['StxInTransit','StxReceived'])"><return error="true" message="Ship the transfer before generating its invoice."/></if>
             <entity-find-one entity-name="mantle.facility.Facility" value-field="fromFac"><field-map field-name="facilityId" from="stx.fromFacilityId"/></entity-find-one>
             <entity-find-one entity-name="mantle.facility.Facility" value-field="toFac"><field-map field-name="facilityId" from="stx.toFacilityId"/></entity-find-one>
             <script><![CDATA[
@@ -475,7 +300,7 @@
                 for (li in items) {
                     def prod = ec.entity.find("mantle.product.Product").condition("productId", li.productId).one()
                     def qty = (li.quantity ?: 0) as BigDecimal
-                    def unit = (li.unitAmount ?: prod?.mrpAmount ?: 0) as BigDecimal
+                    def unit = (li.unitAmount != null ? li.unitAmount : (prod?.mrpAmount ?: 0)) as BigDecimal
                     def taxable = qty.multiply(unit)
                     def g = ec.service.sync().name("zenith.india.GstServices.calculate#Gst").parameters([
                         supplierStateCode: supState, buyerStateCode: buyState,
@@ -499,91 +324,17 @@
         </actions>
     </service>
 
-    <service verb="receive" noun="StockTransfer">
+    <service verb="receive" noun="StockTransfer" no-tx-cache="true">
         <in-parameters>
             <parameter name="stockTransferId" required="true"/>
         </in-parameters>
-        <actions>
-            <!-- for-update: two fast "Receive" clicks can't both pass the In-Transit check and double-add. -->
-            <entity-find-one entity-name="zenith.erp.inventory.StockTransfer" value-field="stx" for-update="true"/>
-            <if condition="stx == null"><return error="true" message="Transfer not found"/></if>
-            <!-- ZE-INV-IV-06A: cross-tenant guard (defense-in-depth) -->
-            <if condition="!ec.user.isInGroup('ADMIN') &amp;&amp; ec.user.getPreference('ACTIVE_ORGANIZATION') != stx.organizationPartyId">
-                <return error="true" message="You do not have access to this stock transfer."/>
-            </if>
-            <if condition="stx.statusId != 'StxInTransit'">
-                <return error="true" message="Can only receive if In Transit"/>
-            </if>
-            
-            <script><![CDATA[
-                // Update status
-                ec.service.sync().name("update#zenith.erp.inventory.StockTransfer")
-                    .parameters([stockTransferId: stockTransferId, statusId: 'StxReceived']).call()
-                // Add the received stock to the DESTINATION facility (per line)
-                def org = stx.organizationPartyId ?: ec.user.getPreference('ACTIVE_ORGANIZATION')
-                def recItems = ec.entity.find("zenith.erp.inventory.StockTransferItem").condition("stockTransferId", stockTransferId).list()
-                for (li in recItems) {
-                    def qr = (li.quantityReceived != null) ? li.quantityReceived : li.quantity
-                    if (!li.productId || !qr) continue
-                    qr = qr as BigDecimal
-                    def prod = ec.entity.find("mantle.product.Product").condition("productId", li.productId).one()
 
-                    if (prod?.enableBatchTracking == 'Y' && li.fromAssetId) {
-                        // Carry the batch number + expiry/mfg/mrp to the destination facility (so Expiry Risk
-                        // stays accurate) instead of dropping it into a generic no-batch asset. The batch-aware
-                        // stock service finds-or-creates the destination batch asset and adds the qty.
-                        def src = ec.entity.find("mantle.product.asset.Asset").condition("assetId", li.fromAssetId).one()
-                        ec.service.sync().name("zenith.inventory.InventoryStockServices.adjust#AssetOnHand")
-                            .parameters([organizationPartyId:org, productId:li.productId, facilityId:stx.toFacilityId,
-                                         batchNumber:li.batchNumber, quantityDiff:qr, reason:("Transfer in " + stockTransferId),
-                                         expiryDate:src?.expiryDate, manufacturingDate:src?.manufacturingDate,
-                                         mrpAmount:src?.mrpAmount, valuationRate:src?.valuationRate]).call()
-                    } else {
-                        ec.service.sync().name("zenith.inventory.InventoryStockServices.adjust#AssetOnHand")
-                            .parameters([organizationPartyId:org, productId:li.productId, facilityId:stx.toFacilityId,
-                                         quantityDiff:qr, reason:("Transfer in " + stockTransferId)]).call()
-                    }
-
-                    // Serial-tracked: relocate the serials to the destination facility + audit row, so a
-                    // serial's recorded location follows the physical goods. Move the units the user PICKED
-                    // for this line if any; otherwise fall back to the first N in-stock serials at the source.
-                    if (prod?.enableSerialTracking == 'Y') {
-                        def picked = ec.entity.find("zenith.erp.inventory.StockTransferItemSerial")
-                            .condition("stockTransferId", stockTransferId).condition("transferItemSeqId", li.transferItemSeqId).list()
-                        def serials
-                        if (picked) {
-                            serials = picked.collect { ec.entity.find("zenith.erp.inventory.ProductSerialNumber").condition("serialNumberId", it.serialNumberId).one() }.findAll { it != null }
-                        } else {
-                            def moveN = qr.setScale(0, java.math.RoundingMode.DOWN).intValue()
-                            serials = moveN > 0 ? ec.entity.find("zenith.erp.inventory.ProductSerialNumber")
-                                .condition("productId", li.productId).condition("facilityId", stx.fromFacilityId)
-                                .condition("statusId", "SnInStock").orderBy("receivedDate,serialNumberId").limit(moveN).list() : []
-                        }
-                        for (sn in serials) {
-                            if (sn == null) continue
-                            ec.service.sync().name("update#zenith.erp.inventory.ProductSerialNumber")
-                                .parameters([serialNumberId:sn.serialNumberId, facilityId:stx.toFacilityId]).call()
-                            ec.service.sync().name("create#zenith.erp.inventory.SerialNumberHistory").parameters([
-                                serialNumberId:sn.serialNumberId, eventDate:ec.user.nowTimestamp, eventType:'Transfer',
-                                fromFacilityId:stx.fromFacilityId, toFacilityId:stx.toFacilityId,
-                                referenceType:'StockTransfer', referenceId:stockTransferId, performedByUserId:ec.user.userId,
-                                notes:('Relocated by stock transfer ' + stockTransferId)]).call()
-                        }
-                    }
-
-                    if (li.quantityReceived == null) {
-                        ec.service.sync().name("update#zenith.erp.inventory.StockTransferItem")
-                            .parameters([stockTransferId:stockTransferId, transferItemSeqId:li.transferItemSeqId, quantityReceived:li.quantity]).call()
-                    }
-                }
-            ]]></script>
-        </actions>
+        <actions><service-call name="zenith.inventory.StockTransferServices.receive#StockTransfer" in-map="context"/></actions>
     </service>
 
     <!-- XF-004: edit a DRAFT transfer's header (destination / date / notes). The SOURCE is fixed once
          product lines exist (their lot/serial picks came from that sender) — to change it, remove the
-         lines first (or delete + recreate). Recomputes the inter-state IGST placeholder invoice so the
-         header stays consistent with create#StockTransfer. Blocked once shipped (stock has moved). -->
+         lines first (or delete + recreate). Validates warehouse ownership and recalculates the E-Way requirement from facility GSTINs. Blocked once shipped (stock has moved). -->
     <service verb="edit" noun="StockTransfer">
         <in-parameters>
             <parameter name="stockTransferId" required="true"/>
@@ -593,12 +344,9 @@
             <parameter name="remarks"/>
         </in-parameters>
         <actions>
+            <service-call name="zenith.inventory.StockTransferServices.require#StockTransferWrite" in-map="[stockTransferId:stockTransferId, requiredStatus:'StxDraft']" out-map="guard"/>
             <entity-find-one entity-name="zenith.erp.inventory.StockTransfer" value-field="stx" for-update="true"/>
             <if condition="stx == null"><return error="true" message="Transfer not found"/></if>
-            <!-- ZE-INV-IV-06A: cross-tenant guard (defense-in-depth) -->
-            <if condition="!ec.user.isInGroup('ADMIN') &amp;&amp; ec.user.getPreference('ACTIVE_ORGANIZATION') != stx.organizationPartyId">
-                <return error="true" message="You do not have access to this stock transfer."/>
-            </if>
             <if condition="stx.statusId != 'StxDraft'">
                 <return error="true" message="Only a draft transfer can be edited — this one has already been shipped."/>
             </if>
@@ -610,30 +358,12 @@
             </if>
             <set field="newFrom" from="fromFacilityId ?: stx.fromFacilityId"/>
             <set field="newTo" from="toFacilityId ?: stx.toFacilityId"/>
+            <service-call name="zenith.inventory.StockTransferServices.validate#StockTransferFacilities"
+                in-map="[organizationPartyId:guard.organizationPartyId, fromFacilityId:newFrom, toFacilityId:newTo]"/>
             <service-call name="update#zenith.erp.inventory.StockTransfer"
                 in-map="[stockTransferId:stockTransferId, fromFacilityId:newFrom, toFacilityId:newTo,
-                         transferDate:transferDate, remarks:remarks]"/>
-            <!-- keep the inter-state IGST placeholder consistent (mirrors create#StockTransfer) -->
-            <script><![CDATA[
-                def fromFac = ec.entity.find("mantle.facility.Facility").condition("facilityId", newFrom).one()
-                def toFac = ec.entity.find("mantle.facility.Facility").condition("facilityId", newTo).one()
-                def interState = (fromFac?.taxRegistrationNumber && toFac?.taxRegistrationNumber
-                                  && fromFac.taxRegistrationNumber != toFac.taxRegistrationNumber)
-                if (interState && !stx.igstInvoiceId) {
-                    def inv = ec.service.sync().name("create#mantle.account.invoice.Invoice").parameters([
-                        invoiceTypeEnumId:'InvoiceSales', statusId:'InvoiceInProcess',
-                        fromPartyId:stx.organizationPartyId, toPartyId:stx.organizationPartyId,
-                        invoiceDate:ec.user.nowTimestamp, description:'IGST Invoice for Branch Transfer']).call()
-                    ec.service.sync().name("update#zenith.erp.inventory.StockTransfer")
-                        .parameters([stockTransferId:stockTransferId, igstInvoiceId:inv.invoiceId]).call()
-                } else if (!interState && stx.igstInvoiceId) {
-                    // now intra-state: void the placeholder invoice + detach it
-                    def inv = ec.entity.find("mantle.account.invoice.Invoice").condition("invoiceId", stx.igstInvoiceId).one()
-                    if (inv && inv.statusId != 'InvoiceCancelled') { inv.statusId = 'InvoiceCancelled'; inv.update() }
-                    def ev = ec.entity.find("zenith.erp.inventory.StockTransfer").condition("stockTransferId", stockTransferId).one()
-                    if (ev) { ev.igstInvoiceId = null; ev.update() }
-                }
-            ]]></script>
+                         transferDate:(transferDate ?: stx.transferDate ?: ec.user.nowTimestamp), remarks:remarks]"/>
+            <service-call name="zenith.inventory.InventoryServices.recalc#StockTransferTotals" in-map="[stockTransferId:stockTransferId]"/>
         </actions>
     </service>
 
@@ -645,12 +375,9 @@
             <parameter name="stockTransferId" required="true"/>
         </in-parameters>
         <actions>
+            <service-call name="zenith.inventory.StockTransferServices.require#StockTransferWrite" in-map="[stockTransferId:stockTransferId, requiredStatus:'StxDraft']" out-map="guard"/>
             <entity-find-one entity-name="zenith.erp.inventory.StockTransfer" value-field="stx" for-update="true"/>
             <if condition="stx == null"><return error="true" message="Transfer not found"/></if>
-            <!-- ZE-INV-IV-06A: cross-tenant guard (defense-in-depth) -->
-            <if condition="!ec.user.isInGroup('ADMIN') &amp;&amp; ec.user.getPreference('ACTIVE_ORGANIZATION') != stx.organizationPartyId">
-                <return error="true" message="You do not have access to this stock transfer."/>
-            </if>
             <if condition="stx.statusId != 'StxDraft'">
                 <return error="true" message="Only a draft transfer can be deleted. This one has already shipped — the stock has moved, so reverse it with a return transfer instead."/>
             </if>
@@ -666,7 +393,10 @@
                 <script><![CDATA[
                     // placeholder IGST invoice (never finalized in the draft flow): void it rather than hard-delete
                     def inv = ec.entity.find("mantle.account.invoice.Invoice").condition("invoiceId", stx.igstInvoiceId).one()
-                    if (inv && inv.statusId != 'InvoiceCancelled') { inv.statusId = 'InvoiceCancelled'; inv.update() }
+                    if (inv && (inv.fromPartyId != stx.organizationPartyId || !(inv.statusId in ['InvoiceInProcess','InvoiceCancelled']))) {
+                        ec.message.addError('This transfer is linked to an issued or foreign invoice and cannot be deleted.'); return
+                    }
+                    if (inv && inv.statusId == 'InvoiceInProcess') { inv.statusId = 'InvoiceCancelled'; inv.update() }
                 ]]></script>
             </if>
             <entity-delete value-field="stx"/>
@@ -678,19 +408,11 @@
     <service verb="assert" noun="StockTransferAccess">
         <in-parameters><parameter name="stockTransferId" required="true"/></in-parameters>
         <out-parameters><parameter name="allowed" type="Boolean"/></out-parameters>
-        <actions>
-            <script><![CDATA[
-                allowed = true
-                if (!ec.user.isInGroup('ADMIN')) {
-                    def activeOrg = ec.user.getPreference('ACTIVE_ORGANIZATION')
-                    def t = ec.entity.find('zenith.erp.inventory.StockTransfer')
-                            .condition('stockTransferId', stockTransferId).disableAuthz().one()
-                    if (t == null || !activeOrg || activeOrg == '_NA_' || t.organizationPartyId != activeOrg) {
-                        allowed = false
-                    }
-                }
-            ]]></script>
-        </actions>
+        <actions><script><![CDATA[
+            def activeOrg = ec.user.getPreference('ACTIVE_ORGANIZATION')
+            def transfer = ec.entity.find('zenith.erp.inventory.StockTransfer').condition('stockTransferId', stockTransferId).one()
+            allowed = !!(activeOrg && activeOrg != '_NA_' && transfer && transfer.organizationPartyId == activeOrg)
+        ]]></script></actions>
     </service>
 
     <!-- ZE-INV-IV-06A (systemic sweep): cross-tenant guard for Gate Passes. GatePass.organizationPartyId owns. -->
