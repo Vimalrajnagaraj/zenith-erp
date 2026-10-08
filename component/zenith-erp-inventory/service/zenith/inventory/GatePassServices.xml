@@ -1,0 +1,125 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+    <service verb="get" noun="GatePassWriteContext" authenticate="true">
+        <out-parameters><parameter name="organizationPartyId"/></out-parameters>
+        <actions>
+            <service-call name="zenith.base.SecurityServices.check#ModuleWriteAccess" in-map="[moduleId:'inventory']" out-map="access"/>
+            <if condition="access.canWrite != true"><return error="true" message="Inventory write access is required."/></if>
+            <set field="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <if condition="!organizationPartyId || organizationPartyId == '_NA_' || organizationPartyId == '__NO_ORGANIZATION__'">
+                <return error="true" message="Select an organization before issuing or updating a gate pass."/>
+            </if>
+        </actions>
+    </service>
+
+    <service verb="create" noun="GatePass" authenticate="true">
+        <in-parameters>
+            <parameter name="passTypeEnumId" required="true"/>
+            <parameter name="facilityId" required="true"/>
+            <parameter name="partyId"/>
+            <parameter name="issueDate" required="true"/>
+            <parameter name="expectedReturnDate"/>
+            <parameter name="vehicleNumber"/><parameter name="transporterName"/><parameter name="remarks"/>
+        </in-parameters>
+        <out-parameters><parameter name="gatePassId"/></out-parameters>
+        <actions>
+            <service-call name="zenith.inventory.GatePassServices.get#GatePassWriteContext" out-map="scope"/>
+            <if condition="ec.message.hasError()"><return/></if>
+            <script><![CDATA[
+                if (!(passTypeEnumId in ['GptRgp','GptNrgp'])) { ec.message.addError('Select a valid gate pass type.'); return }
+                def facility = ec.entity.find('mantle.facility.Facility').condition('facilityId', facilityId)
+                        .condition('ownerPartyId', scope.organizationPartyId).disableAuthz().one()
+                if (facility == null || facility.ownerPartyId != scope.organizationPartyId) {
+                    ec.message.addError('Select a facility belonging to the active organization.'); return
+                }
+                def party = partyId ? ec.entity.find('mantle.party.Party').condition('partyId', partyId).disableAuthz().one() : null
+                if (partyId && (party == null || party.ownerPartyId != scope.organizationPartyId)) {
+                    ec.message.addError('Select a party belonging to the active organization.'); return
+                }
+                // Parse strictly: lenient timestamp conversion silently normalizes impossible dates.
+                def parseDate = { value, boolean dateOnly ->
+                    def text = value?.toString()?.trim()?.replace('T',' ')
+                    if (!text) return null
+                    def pattern = dateOnly ? 'yyyy-MM-dd' :
+                            (text ==~ /\d{4}-\d{2}-\d{2} \d{2}:\d{2}/ ? 'yyyy-MM-dd HH:mm' :
+                            (text ==~ /\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/ ? 'yyyy-MM-dd HH:mm:ss' : 'yyyy-MM-dd HH:mm:ss.SSS'))
+                    if (dateOnly && !(text ==~ /\d{4}-\d{2}-\d{2}/)) throw new IllegalArgumentException()
+                    def formatter = new java.text.SimpleDateFormat(pattern)
+                    formatter.setLenient(false); formatter.setTimeZone(ec.user.timeZone)
+                    def position = new java.text.ParsePosition(0)
+                    def parsed = formatter.parse(text, position)
+                    if (!parsed || position.index != text.length()) throw new IllegalArgumentException()
+                    new java.sql.Timestamp(parsed.time)
+                }
+                def issued; def expected
+                try { issued = parseDate(issueDate, false); expected = parseDate(expectedReturnDate, true) }
+                catch (IllegalArgumentException ignored) { ec.message.addError('Enter valid issue and expected return dates.'); return }
+                if (!issued) { ec.message.addError('Issue date is required.'); return }
+                if (passTypeEnumId == 'GptRgp' && !expected) { ec.message.addError('Expected return date is required for a returnable pass.'); return }
+                if (expected && ec.l10n.format(expected,'yyyy-MM-dd') < ec.l10n.format(issued,'yyyy-MM-dd')) {
+                    ec.message.addError('Expected return date cannot be before the issue date.'); return
+                }
+                if ((vehicleNumber?.length() ?: 0) > 63 || (transporterName?.length() ?: 0) > 255 || (remarks?.length() ?: 0) > 4000) {
+                    ec.message.addError('Vehicle, transporter, or remarks exceed the supported length.'); return
+                }
+                def pass = ec.entity.makeValue('zenith.erp.inventory.GatePass').setAll([
+                        organizationPartyId:scope.organizationPartyId, passTypeEnumId:passTypeEnumId,
+                        facilityId:facilityId, partyId:partyId ?: null, issueDate:issued,
+                        expectedReturnDate:passTypeEnumId == 'GptRgp' ? expected : null,
+                        statusId:'GpIssued', issuedBy:ec.user.userId, vehicleNumber:vehicleNumber?.trim(),
+                        transporterName:transporterName?.trim(), remarks:remarks])
+                pass.setSequencedIdPrimary(); pass.create(); gatePassId = pass.gatePassId
+            ]]></script>
+        </actions>
+    </service>
+
+    <service verb="update" noun="GatePass" authenticate="true">
+        <in-parameters>
+            <parameter name="gatePassId" required="true"/><parameter name="statusId" required="true"/>
+            <parameter name="vehicleNumber"/>
+        </in-parameters>
+        <actions>
+            <service-call name="zenith.inventory.GatePassServices.get#GatePassWriteContext" out-map="scope"/>
+            <if condition="ec.message.hasError()"><return/></if>
+            <script><![CDATA[
+                def pass = ec.entity.find('zenith.erp.inventory.GatePass').condition('gatePassId',gatePassId)
+                        .condition('organizationPartyId',scope.organizationPartyId).forUpdate(true).one()
+                // one() may optimize primary-key lookups; check ownership on the loaded value as well.
+                if (pass == null || pass.organizationPartyId != scope.organizationPartyId) {
+                    ec.message.addError('Gate pass not found in the active organization.'); return
+                }
+                if (!(statusId in ['GpIssued','GpReturned','GpOverdue','GpClosed'])) { ec.message.addError('Select a valid gate pass status.'); return }
+                if ((vehicleNumber?.length() ?: 0) > 63) { ec.message.addError('Vehicle number cannot exceed 63 characters.'); return }
+                if (statusId != pass.statusId) {
+                    def transitions = pass.passTypeEnumId == 'GptRgp' ?
+                            [GpIssued:['GpReturned','GpOverdue'], GpOverdue:['GpReturned'], GpReturned:['GpClosed'], GpClosed:[]] :
+                            [GpIssued:['GpClosed'], GpClosed:[]]
+                    if (!(statusId in (transitions[pass.statusId] ?: []))) {
+                        ec.message.addError('That status change is not valid for this gate pass.'); return
+                    }
+                    if (statusId == 'GpOverdue' && (!pass.expectedReturnDate ||
+                            ec.l10n.format(pass.expectedReturnDate,'yyyy-MM-dd') >= ec.l10n.format(ec.user.nowTimestamp,'yyyy-MM-dd'))) {
+                        ec.message.addError('A pass becomes overdue after its expected return date.'); return
+                    }
+                    if (statusId == 'GpReturned') {
+                        if (pass.issueDate != null && pass.issueDate > ec.user.nowTimestamp) {
+                            ec.message.addError('A pass cannot be returned before it is issued.'); return
+                        }
+                        // Returning the whole pass records its documented quantities, without moving stock.
+                        def items = ec.entity.find('zenith.erp.inventory.GatePassItem')
+                                .condition('gatePassId',gatePassId).forUpdate(true).list()
+                        if (items.any { it.quantity == null || it.quantity < 0G ||
+                                (it.returnedQuantity != null && (it.returnedQuantity < 0G || it.returnedQuantity > it.quantity)) }) {
+                            ec.message.addError('Correct the gate pass item quantities before recording its return.'); return
+                        }
+                        items.each { it.returnedQuantity = it.quantity; it.update() }
+                        pass.actualReturnDate = ec.user.nowTimestamp
+                    }
+                }
+                // Inline editing is deliberately limited to these two fields; ownership and issue details are immutable.
+                pass.statusId = statusId; pass.vehicleNumber = vehicleNumber?.trim(); pass.update()
+            ]]></script>
+        </actions>
+    </service>
+</services>
