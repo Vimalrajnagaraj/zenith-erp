@@ -1604,10 +1604,18 @@
         <actions><script><![CDATA[
             def txId = ec.web.parameters.transactionId
             def cpid = ec.web.parameters.customerPartyId
-            if (!txId || !cpid) { ec.web.sendJsonResponse([success:false, error:'Missing customer or bill']); return }
+            def sid = ec.web.parameters.sessionId
+            if (!cpid || (!txId && !sid)) { ec.web.sendJsonResponse([success:false, error:'Missing customer or session']); return }
             def access = ec.service.sync().name('zenith.pos.PosAccessServices.assert#PosAccess')
-                .parameters([transactionId:txId,customerPartyId:cpid]).call()
+                .parameters([transactionId:txId,sessionId:sid,customerPartyId:cpid]).call()
             if (!access?.allowed) { ec.web.sendJsonResponse([success:false,error:'Customer or bill unavailable in this organization.']); return }
+            // Selecting before the first item creates/reuses an unnumbered empty cart.
+            // The session lock in create#PosTransaction serializes concurrent first-item requests.
+            if (!txId) {
+                def created = ec.service.sync().name('zenith.pos.PosServices.create#PosTransaction').parameter('sessionId',sid).call()
+                txId = created?.transactionId
+                if (!txId || ec.message.hasError()) { ec.web.sendJsonResponse([success:false,error:'Could not prepare the empty bill.']); return }
+            }
             def txn = ec.entity.find('zenith.erp.pos.PosTransaction').condition('transactionId',txId).forUpdate(true).one()
             if (txn.statusId != 'PtCreated') { ec.web.sendJsonResponse([success:false,error:'This bill is already finalized']); return }
             def registration = ec.service.sync().name('zenith.tax.TaxServices.get#PartyTaxRegistration').parameter('partyId',cpid).call()
@@ -1635,7 +1643,7 @@
                 transactionId:txId,customerPartyId:cpid,customerName:name,customerPhone:phone,
                 customerGstin:gstin,customerTaxRegNumber:gstin,destinationRegionGeoId:destination]).call()
             if (ec.message.hasError()) { ec.web.sendJsonResponse([success:false,error:'Customer could not be changed.']); return }
-            ec.web.sendJsonResponse([success:true,customer:name,customerPhone:phone ?: '',customerPartyId:cpid,customerGstin:gstin ?: ''])
+            ec.web.sendJsonResponse([success:true,transactionId:txId,customer:name,customerPhone:phone ?: '',customerPartyId:cpid,customerGstin:gstin ?: ''])
         ]]></script></actions><default-response type="none"/>
     </transition>
     <transition name="clearCustomer" method="post" begin-transaction="true">
@@ -1679,7 +1687,9 @@
                     .condition('organizationPartyId',access.organizationPartyId).one()
                 def terminal = ec.entity.find('zenith.erp.pos.PosTerminal').condition('terminalId',candidate.terminalId)
                     .condition('organizationPartyId',access.organizationPartyId).one()
-                if (session && terminal && session.terminalId == terminal.terminalId) eligible.add(candidate.offlineId)
+                // one() may resolve by primary key; compare stored ownership explicitly.
+                if (session?.organizationPartyId == access.organizationPartyId && terminal?.organizationPartyId == access.organizationPartyId &&
+                    session.terminalId == terminal.terminalId) eligible.add(candidate.offlineId)
             }
             ec.web.sendJsonResponse([organizationPartyId:access.organizationPartyId,eligibleIds:eligible.unique()])
         ]]></script></actions><default-response type="none"/>

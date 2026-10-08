@@ -238,7 +238,7 @@ window._posOffline = (function() {
                 var current = store.get(id);
                 current.onsuccess = function() { if (current.result && JSON.stringify(current.result) === legacyCopied[id]) store.delete(id); };
             });
-            transaction.oncomplete = function() { acknowledged.forEach(function(id) { delete legacyCopied[id]; }); readLegacy().then(function(rows) { legacyNotice(rows.length > 0); }); resolve(); };
+            transaction.oncomplete = function() { acknowledged.forEach(function(id) { delete legacyCopied[id]; }); readLegacy().then(function(rows) { legacyNotice(rows.length > 0); }).catch(function() { legacyNotice(true,'Legacy offline storage could not be checked. Keep this device and retry.'); }); resolve(); };
             transaction.onerror = transaction.onabort = function() { reject(new Error('Acknowledged legacy rows remain on the device')); };
         });
     }
@@ -1169,9 +1169,18 @@ window._posOffline = (function() {
                 row.addEventListener('click', function() {
                     var tx = getOpenTxId();
                     var pid = row.dataset.pid, nm = row.dataset.name;
-                    if (!tx) { histToast('Add an item to the bill first, then set the customer', '#e65100'); return; }
+                    if (!tx && !CTX.sessionId) { histToast('Open a session before selecting a customer', '#e65100'); return; }
                     custPost('setCustomer', {transactionId: tx, customerPartyId: pid}).then(function(d) {
-                        if (d && d.success) { if (window._posRefreshCart) window._posRefreshCart(); setCustChip(d.customer || nm); histToast('Customer: ' + (d.customer || nm), '#7C3AED'); closeCustomer(); }
+                        if (d && d.success) {
+                            if (!tx && d.transactionId) {
+                                var next = new URL(window.location.href);
+                                next.searchParams.set('sessionId',CTX.sessionId); next.searchParams.set('transactionId',d.transactionId);
+                                next.searchParams.delete('freshSale'); next.searchParams.delete('lastCompletedId');
+                                window.location.assign(next.toString()); return;
+                            }
+                            if (window._posRefreshCart) window._posRefreshCart();
+                            setCustChip(d.customer || nm); histToast('Customer: ' + (d.customer || nm), '#7C3AED'); closeCustomer();
+                        }
                         else { histToast((d && d.error) || 'Could not set customer', '#c62828'); }
                     });
                 });
