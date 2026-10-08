@@ -1,0 +1,168 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+    <service verb="get" noun="BuyerCompositionScheme">
+        <in-parameters><parameter name="organizationPartyId" required="true"/></in-parameters>
+        <out-parameters><parameter name="isCompositionBuyer" type="Boolean"/></out-parameters>
+        <actions>
+            <service-call name="zenith.tax.TaxAccessServices.assert#Organization" in-map="context"/>
+            <script><![CDATA[
+                isCompositionBuyer=false
+                // India is optional for Purchase; read an explicit buyer scheme without inferring it from a supplier.
+                if(ec.entity.isEntityDefined('zenith.erp.india.IndiaGstConfig')) {
+                    def config=ec.entity.find('zenith.erp.india.IndiaGstConfig').condition('organizationPartyId',organizationPartyId).one()
+                    isCompositionBuyer=config?.isCompositionScheme=='Y'
+                }
+            ]]></script>
+        </actions>
+    </service>
+    <service verb="assert" noun="VendorBillAccess">
+        <in-parameters><parameter name="invoiceId" required="true"/><parameter name="editable" type="Boolean" default="false"/><parameter name="errorOnDenied" type="Boolean" default="true"/></in-parameters>
+        <out-parameters><parameter name="allowed" type="Boolean"/></out-parameters>
+        <actions><script><![CDATA[
+            def bill=ec.entity.find('mantle.account.invoice.Invoice').condition('invoiceId',invoiceId).forUpdate(editable).disableAuthz().one()
+            def org=ec.user.getPreference('ACTIVE_ORGANIZATION')
+            def authorizedOrg=ec.user.isInGroup('ADMIN') ? org :
+                (org && org!='_NA_' ? ec.service.sync().name('zenith.tax.TaxAccessServices.get#AuthorizedActiveOrganization').call()?.activeOrgId : null)
+            allowed=bill != null && bill.invoiceTypeEnumId=='InvoicePurchase' &&
+                (ec.user.isInGroup('ADMIN') || (org && org!='_NA_' && org==authorizedOrg && bill.toPartyId==org))
+            if(!allowed) {if(errorOnDenied) ec.message.addError('That purchase invoice is not part of your account.');return}
+            if(editable && !(bill.statusId in ['InvoiceIncoming','InvoiceInProcess','InvoiceReceived'])) {
+                allowed=false;ec.message.addError('This bill is closed for editing. Issued bills cannot be changed.');return
+            }
+        ]]></script></actions>
+    </service>
+    <service verb="refresh" noun="VendorBillTotals">
+        <in-parameters><parameter name="invoiceId" required="true"/></in-parameters>
+        <actions>
+            <service-call name="zenith.purchase.PurchaseInvoiceServices.assert#VendorBillAccess" in-map="[invoiceId:invoiceId,editable:true]" out-map="access"/>
+            <if condition="!access.allowed"><return/></if>
+            <script><![CDATA[
+                def bill=ec.entity.find('mantle.account.invoice.Invoice').condition('invoiceId',invoiceId).one()
+                def taxable=BigDecimal.ZERO,tax=BigDecimal.ZERO,cgst=BigDecimal.ZERO,sgst=BigDecimal.ZERO,igst=BigDecimal.ZERO,cess=BigDecimal.ZERO
+                ec.entity.find('mantle.account.invoice.InvoiceItem').condition('invoiceId',invoiceId).list().each { line ->
+                    taxable+=(line.taxableAmount != null ? line.taxableAmount : (line.quantity ?: 0)*(line.amount ?: 0)-(line.discountAmount ?: 0)) as BigDecimal
+                    tax+=(line.totalTaxAmount != null ? line.totalTaxAmount : (line.cgstAmount ?: 0)+(line.sgstAmount ?: 0)+(line.igstAmount ?: 0)+(line.cessAmount ?: 0)) as BigDecimal
+                    cgst+=(line.cgstAmount ?: 0) as BigDecimal;sgst+=(line.sgstAmount ?: 0) as BigDecimal;igst+=(line.igstAmount ?: 0) as BigDecimal;cess+=(line.cessAmount ?: 0) as BigDecimal
+                }
+                def grand=taxable+tax
+                def roundOff=bill.currencyUomId=='INR' ? grand.setScale(0,java.math.RoundingMode.HALF_UP)-grand : BigDecimal.ZERO
+                def words=bill.currencyUomId=='INR' ? ec.service.sync().name('zenith.base.LocalizationServices.convert#AmountToWords').parameters([amount:grand+roundOff,currencyUomId:bill.currencyUomId,organizationPartyId:bill.toPartyId]).call() : null
+                // SOP convention: stored grand is unrounded and tax-inclusive; round-off stays separate.
+                // This service edits draft lines only. Payments and their applications are a separate workflow.
+                ec.service.sync().name('update#mantle.account.invoice.Invoice').parameters([invoiceId:invoiceId,
+                    invoiceTotal:grand,unpaidTotal:grand-(bill.appliedPaymentsTotal ?: 0),totalTaxableAmount:taxable,
+                    totalTaxAmount:tax,totalCgst:cgst,totalSgst:sgst,totalIgst:igst,totalCess:cess,roundOffAmount:roundOff,amountInWords:words?.amountInWords]).call()
+            ]]></script>
+        </actions>
+    </service>
+    <service verb="update" noun="VendorBill">
+        <in-parameters>
+            <parameter name="invoiceId" required="true"/>
+            <parameter name="updates" type="Map" required="true">
+                <parameter name="vendorInvoiceNumber"/><parameter name="supplierGstin"/>
+                <parameter name="itcEligible"/><parameter name="isReverseCharge"/>
+                <parameter name="dueDate" type="Timestamp"/><parameter name="statusId"/>
+            </parameter>
+        </in-parameters>
+        <actions>
+            <service-call name="zenith.purchase.PurchaseInvoiceServices.assert#VendorBillAccess" in-map="[invoiceId:invoiceId,editable:true]" out-map="access"/>
+            <if condition="!access.allowed"><return/></if>
+            <script><![CDATA[
+                def bill=ec.entity.find('mantle.account.invoice.Invoice').condition('invoiceId',invoiceId).one()
+                def buyerScheme=ec.service.sync().name('zenith.purchase.PurchaseInvoiceServices.get#BuyerCompositionScheme').parameters([organizationPartyId:bill.toPartyId]).call()
+                if(ec.message.hasError()) return
+                def patch=updates.findAll { k,v -> k in ['vendorInvoiceNumber','supplierGstin','itcEligible','isReverseCharge','dueDate','statusId'] }
+                if(patch.any { k,v -> k in ['itcEligible','isReverseCharge'] && !(v in ['Y','N']) }) {ec.message.addError('Choose Yes or No for ITC and reverse charge.');return}
+                if(patch.supplierGstin) {
+                    def gstin=patch.supplierGstin.trim().toUpperCase(java.util.Locale.ROOT)
+                    def validation=ec.service.sync().name('zenith.india.GstServices.validate#Gstin').parameters([gstin:gstin]).call()
+                    if(!validation.isValid) {ec.message.addError(validation.errorMessage ?: 'Enter a valid supplier GSTIN.');return}
+                    patch.supplierGstin=gstin
+                }
+                if(patch.dueDate && bill.invoiceDate && patch.dueDate.before(bill.invoiceDate)) {ec.message.addError('The due date cannot precede the bill date.');return}
+                if(bill.isCompositionDealer=='Y' && patch.itcEligible=='Y') {ec.message.addError('A composition supplier bill cannot claim ITC.');return}
+                if(buyerScheme.isCompositionBuyer && patch.itcEligible=='Y') {ec.message.addError('A composition buying organization cannot claim ITC.');return}
+                if(patch.containsKey('isReverseCharge') && patch.isReverseCharge!=bill.isReverseCharge &&
+                    ec.entity.find('mantle.account.invoice.InvoiceItem').condition('invoiceId',invoiceId).count()) {
+                    ec.message.addError('Remove draft lines before changing reverse charge so tax can be recalculated.');return
+                }
+                if(patch.statusId && patch.statusId!=bill.statusId) {
+                    if(!(patch.statusId in ['InvoiceReceived','InvoiceApproved','InvoiceCancelled'])) {ec.message.addError('Choose a valid bill workflow status. Payments must use the payment workflow.');return}
+                    def flow=bill.statusId=='InvoiceInProcess' ? 'Default' : 'InvoicePayable'
+                    def transition=ec.entity.find('moqui.basic.StatusFlowTransition').condition('statusFlowId',flow).condition('statusId',bill.statusId).condition('toStatusId',patch.statusId).one()
+                    if(!transition || (transition.userPermissionId && !ec.user.hasPermission(transition.userPermissionId))) {ec.message.addError('This status transition is not available to your account.');return}
+                }
+                if(patch) ec.service.sync().name('update#mantle.account.invoice.Invoice').parameters(patch+[invoiceId:invoiceId]).call()
+            ]]></script>
+        </actions>
+    </service>
+    <service verb="add" noun="VendorBillLine">
+        <in-parameters>
+            <parameter name="invoiceId" required="true"/><parameter name="productId"/><parameter name="description"/>
+            <parameter name="hsnSacCode" required="true"/><parameter name="quantity" type="BigDecimal" required="true"/>
+            <parameter name="amount" type="BigDecimal" required="true"/><parameter name="taxPercentage" type="BigDecimal" required="true"/>
+            <parameter name="discountPercent" type="BigDecimal" default="0"/>
+        </in-parameters>
+        <out-parameters><parameter name="invoiceItemSeqId"/></out-parameters>
+        <actions>
+            <service-call name="zenith.purchase.PurchaseInvoiceServices.assert#VendorBillAccess" in-map="[invoiceId:invoiceId,editable:true]" out-map="access"/>
+            <if condition="!access.allowed"><return/></if>
+            <script><![CDATA[
+                def bill=ec.entity.find('mantle.account.invoice.Invoice').condition('invoiceId',invoiceId).one()
+                def product=productId ? ec.entity.find('mantle.product.Product').condition('productId',productId).disableAuthz().one() : null
+                if(productId && (!product || product.ownerPartyId!=bill.toPartyId)) {ec.message.addError('Choose a product from the buying organization.');return}
+                if(quantity<=0 || amount<0 || discountPercent<0 || discountPercent>100 || ![0,5,12,18,28].any { taxPercentage == it }) {
+                    ec.message.addError('Use a positive quantity, nonnegative price, discount from 0 to 100 and an available GST rate.');return
+                }
+                def gross=quantity*amount
+                def discount=(gross*discountPercent/100).setScale(2,java.math.RoundingMode.HALF_UP)
+                def taxable=gross-discount
+                def tax=[cgstRate:0,cgstAmount:0,sgstRate:0,sgstAmount:0,igstRate:0,igstAmount:0,cessRate:0,cessAmount:0,totalTaxAmount:0]
+                if(bill.isCompositionDealer!='Y' && taxPercentage>0) {
+                    def vendor=ec.service.sync().name('zenith.tax.TaxServices.get#PartyTaxRegistration').parameters([partyId:bill.fromPartyId]).call()
+                    def buyer=ec.service.sync().name('zenith.tax.TaxServices.get#PartyTaxRegistration').parameters([partyId:bill.toPartyId]).call()
+                    def stateFor={ party, registration ->
+                        if(registration?.regionGeoId) return registration.regionGeoId
+                        def pcm=ec.entity.find('mantle.party.contact.PartyContactMechInfo').condition('partyId',party).condition('contactMechTypeEnumId','CmtPostalAddress').list()
+                        def state=pcm ? ec.entity.find('mantle.party.contact.PostalAddress').condition('contactMechId',pcm[0].contactMechId).one()?.stateProvinceGeoId : null
+                        return state && ec.entity.find('zenith.erp.india.IndiaState').condition('stateCode',state).one() ? state : null
+                    }
+                    def supplierState=stateFor(bill.fromPartyId,vendor),buyerState=stateFor(bill.toPartyId,buyer)
+                    if(!supplierState || !buyerState) {ec.message.addError('Set valid vendor and buyer supply states before adding a taxable line.');return}
+                    // Use the tracked approved slab behind the existing UI rate; never guess a tax rate.
+                    def slab=ec.entity.find('zenith.erp.india.IndiaGstSlab').condition('igstRate',taxPercentage).condition('isActive','Y').condition('cessRate',0).list()
+                    def productSlab=product?.gstSlabId ? ec.entity.find('zenith.erp.india.IndiaGstSlab').condition('gstSlabId',product.gstSlabId).one() : null
+                    if(productSlab && productSlab.isActive!='N' && productSlab.igstRate==taxPercentage) slab=[productSlab]
+                    if(!slab) {ec.message.addError('No active approved GST slab matches this rate.');return}
+                    tax=ec.service.sync().name('zenith.india.GstServices.calculate#Gst').parameters([supplierStateCode:supplierState,buyerStateCode:buyerState,gstSlabId:slab[0].gstSlabId,taxableAmount:taxable,isReverseCharge:bill.isReverseCharge ?: 'N']).call()
+                    if(ec.message.hasError()) return
+                }
+                def lines=ec.entity.find('mantle.account.invoice.InvoiceItem').condition('invoiceId',invoiceId).orderBy('-invoiceItemSeqId').list()
+                invoiceItemSeqId=String.format('%05d',lines ? (lines[0].invoiceItemSeqId as int)+1 : 1)
+                def values=[invoiceId:invoiceId,invoiceItemSeqId:invoiceItemSeqId,itemTypeEnumId:'ItemInventory',productId:productId,
+                    description:description ?: product?.productName,hsnSacCode:hsnSacCode,productTaxCode:hsnSacCode,quantity:quantity,amount:amount,
+                    taxableAmount:taxable,discountPercent:discountPercent,discountAmount:discount,totalTaxAmount:tax.totalTaxAmount]
+                ['cgstRate','cgstAmount','sgstRate','sgstAmount','igstRate','igstAmount','cessRate','cessAmount'].each { values[it]=tax[it] }
+                ec.service.sync().name('create#mantle.account.invoice.InvoiceItem').parameters(values).call()
+                def breakdowns=[]
+                ['CGST','SGST','IGST','CESS'].each { name -> def key=name.toLowerCase();if(tax[key+'Rate']>0) breakdowns.add([taxName:name,taxRate:tax[key+'Rate'],taxableAmount:taxable,taxAmount:tax[key+'Amount'],countryGeoId:'IND',isIncludedInPrice:'N']) }
+                if(breakdowns) ec.service.sync().name('zenith.tax.TaxServices.store#TaxLineDetails').parameters([referenceType:'InvoiceItem',referenceId:invoiceId,referenceSeqId:invoiceItemSeqId,currencyUomId:bill.currencyUomId,taxBreakdowns:breakdowns]).call()
+            ]]></script>
+            <service-call name="zenith.purchase.PurchaseInvoiceServices.refresh#VendorBillTotals" in-map="[invoiceId:invoiceId]"/>
+        </actions>
+    </service>
+    <service verb="delete" noun="VendorBillLine">
+        <in-parameters><parameter name="invoiceId" required="true"/><parameter name="invoiceItemSeqId" required="true"/></in-parameters>
+        <actions>
+            <service-call name="zenith.purchase.PurchaseInvoiceServices.assert#VendorBillAccess" in-map="[invoiceId:invoiceId,editable:true]" out-map="access"/>
+            <if condition="!access.allowed"><return/></if>
+            <entity-find-one entity-name="mantle.account.invoice.InvoiceItem" value-field="line"/>
+            <if condition="!line"><return error="true" message="Bill line not found."/></if>
+            <script><![CDATA[
+                ec.entity.find('zenith.erp.tax.TaxLineDetail').condition('referenceType','InvoiceItem').condition('referenceId',invoiceId).condition('referenceSeqId',invoiceItemSeqId).list().each { it.delete() }
+                ec.service.sync().name('delete#mantle.account.invoice.InvoiceItem').parameters([invoiceId:invoiceId,invoiceItemSeqId:invoiceItemSeqId]).call()
+            ]]></script>
+            <service-call name="zenith.purchase.PurchaseInvoiceServices.refresh#VendorBillTotals" in-map="[invoiceId:invoiceId]"/>
+        </actions>
+    </service>
+</services>
