@@ -7,118 +7,16 @@
 
     <transition name="findInvoice"><default-response url="../PurchaseReturns"/></transition>
     
-    <transition name="updateInvoice">
-        <service-call name="update#mantle.account.invoice.Invoice"/>
-        <default-response url="."/>
-    </transition>
+    <transition name="updateInvoice"><actions><service-call name="zenith.purchase.ReturnServices.update#PurchaseReturn" in-map="[invoiceId:invoiceId,updates:[vendorInvoiceNumber:ec.web.requestParameters.vendorInvoiceNumber,purchaseOrderNumber:ec.web.requestParameters.purchaseOrderNumber,description:ec.web.requestParameters.description,statusId:ec.web.requestParameters.statusId]]"/></actions><default-response url="."/><error-response url="."/></transition>
 
-    <transition name="addItem">
-        <script><![CDATA[
-            // ZE-SB-013 (Tier 2): the whole screen was unguarded — the parent debit-note (buyer=toPartyId) AND the
-            // line product must belong to this org before writing a line.
-            def _ao = ec.user.getPreference('ACTIVE_ORGANIZATION')
-            def _admin = ec.user.isInGroup('ADMIN')
-            def _inv = ec.entity.find("mantle.account.invoice.Invoice").condition("invoiceId", invoiceId).disableAuthz().one()
-            if (!_admin && (_inv == null || _inv.toPartyId != _ao)) { ec.message.addError("You do not have access to this record."); return }
-            if (productId && !_admin) {
-                def _prd = ec.entity.find("mantle.product.Product").condition("productId", productId).disableAuthz().one()
-                if (_prd == null || _prd.ownerPartyId != _ao) { ec.message.addError("Please select a valid product from your account."); return }
-            }
-            if (!hsnSacCode) {
-                ec.message.addError("HSN/SAC Code is strictly required under Indian GST Law.")
-                return
-            }
+    <transition name="addItem"><actions><service-call name="zenith.purchase.ReturnServices.add#PurchaseReturnLine" in-map="[invoiceId:invoiceId,productId:productId,description:description,hsnSacCode:hsnSacCode,quantity:quantity,amount:amount,taxPercentage:taxPercentage]"/></actions><default-response url="."/><error-response url="."/></transition>
         
-            def invoice = ec.entity.find("mantle.account.invoice.Invoice").condition("invoiceId", invoiceId).one()
-            
-            def vendorAddress = ec.entity.find("mantle.party.contact.PartyContactMechInfo")
-                                .condition("partyId", invoice.fromPartyId)
-                                .condition("contactMechTypeEnumId", "CmtPostalAddress").list().first()
-            def buyerAddress = ec.entity.find("mantle.party.contact.PartyContactMechInfo")
-                                .condition("partyId", invoice.toPartyId)
-                                .condition("contactMechTypeEnumId", "CmtPostalAddress").list().first()
-            
-            def isInterstate = true
-            if (vendorAddress && buyerAddress && vendorAddress.stateProvinceGeoId == buyerAddress.stateProvinceGeoId) {
-                isInterstate = false
-            }
-
-            def qty = new BigDecimal(quantity ?: 0)
-            def price = new BigDecimal(amount ?: 0)
-            def taxableVal = qty.multiply(price)
-            def taxPct = new BigDecimal(taxPercentage ?: 0)
-
-            def igstRate = 0.0
-            def cgstRate = 0.0
-            def sgstRate = 0.0
-            def igstAmount = 0.0
-            def cgstAmount = 0.0
-            def sgstAmount = 0.0
-
-            if (taxPct > 0) {
-                if (isInterstate) {
-                    igstRate = taxPct
-                    igstAmount = taxableVal.multiply(taxPct).divide(new BigDecimal(100), 2, java.math.RoundingMode.HALF_UP)
-                } else {
-                    cgstRate = taxPct.divide(new BigDecimal(2), 2, java.math.RoundingMode.HALF_UP)
-                    sgstRate = cgstRate
-                    cgstAmount = taxableVal.multiply(cgstRate).divide(new BigDecimal(100), 2, java.math.RoundingMode.HALF_UP)
-                    sgstAmount = cgstAmount
-                }
-            }
-
-            def inMap = context + [
-                itemTypeEnumId: 'ItemInventory',
-                taxableAmount: taxableVal,
-                igstRate: igstRate, igstAmount: igstAmount,
-                cgstRate: cgstRate, cgstAmount: cgstAmount,
-                sgstRate: sgstRate, sgstAmount: sgstAmount
-            ]
-            ec.service.sync().name("create#mantle.account.invoice.InvoiceItem").parameters(inMap).call()
-            
-            ec.service.sync().name("mantle.account.InvoiceServices.calculate#InvoiceTotal").parameters([invoiceId:invoiceId]).call()
-        ]]></script>
-        
-        <script><![CDATA[
-            def invItems = ec.entity.find("mantle.account.invoice.InvoiceItem").condition("invoiceId", invoiceId).list()
-            def tCgst = 0.0, tSgst = 0.0, tIgst = 0.0, tTaxable = 0.0
-            for (def it : invItems) {
-                tCgst += (it.cgstAmount ?: 0.0)
-                tSgst += (it.sgstAmount ?: 0.0)
-                tIgst += (it.igstAmount ?: 0.0)
-                tTaxable += (it.taxableAmount ?: ((it.quantity?:1)*(it.amount?:0)))
-            }
-            ec.service.sync().name("update#mantle.account.invoice.Invoice").parameters([
-                invoiceId: invoiceId,
-                totalCgst: tCgst, totalSgst: tSgst, totalIgst: tIgst, totalTaxableAmount: tTaxable
-            ]).call()
-        ]]></script>
-
-        <default-response url="."/>
-    </transition>
-
-    <transition name="deleteItem">
-        <service-call name="delete#mantle.account.invoice.InvoiceItem"/>
-        <script><![CDATA[
-            ec.service.sync().name("mantle.account.InvoiceServices.calculate#InvoiceTotal").parameters([invoiceId:invoiceId]).call()
-            
-            def invItems = ec.entity.find("mantle.account.invoice.InvoiceItem").condition("invoiceId", invoiceId).list()
-            def tCgst = 0.0, tSgst = 0.0, tIgst = 0.0, tTaxable = 0.0
-            for (def it : invItems) {
-                tCgst += (it.cgstAmount ?: 0.0)
-                tSgst += (it.sgstAmount ?: 0.0)
-                tIgst += (it.igstAmount ?: 0.0)
-                tTaxable += (it.taxableAmount ?: ((it.quantity?:1)*(it.amount?:0)))
-            }
-            ec.service.sync().name("update#mantle.account.invoice.Invoice").parameters([
-                invoiceId: invoiceId,
-                totalCgst: tCgst, totalSgst: tSgst, totalIgst: tIgst, totalTaxableAmount: tTaxable
-            ]).call()
-        ]]></script>
-        <default-response url="."/>
-    </transition>
+    <transition name="deleteItem"><actions><service-call name="zenith.purchase.ReturnServices.delete#PurchaseReturnLine" in-map="[invoiceId:invoiceId,invoiceItemSeqId:invoiceItemSeqId]"/></actions><default-response url="."/><error-response url="."/></transition>
 
     <actions>
+        <service-call name="zenith.purchase.ReturnServices.assert#PurchaseReturn" in-map="[invoiceId:invoiceId,errorOnDenied:'N']" out-map="access"/>
+        <set field="noAccess" from="!access.allowed"/>
+        <if condition="access.allowed">
         <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="invoice"/>
         
         <entity-find entity-name="mantle.account.invoice.InvoiceItem" list="invoiceItems">
@@ -131,28 +29,32 @@
         </entity-find-one>
 
         <set field="statusColorMap" from="[
-            'InvoiceIn-Process': 'grey',
+            'InvoiceInProcess': 'grey',
             'InvoiceApproved': 'primary',
             'InvoiceReceived': 'warning',
-            'InvoicePaid': 'success',
+            'InvoiceFinalized': 'success',
             'InvoiceCancelled': 'danger'
         ]"/>
         <set field="statusColor" from="statusColorMap[invoice?.statusId] ?: 'dark'"/>
+        <set field="currSymbol" from="invoice?.currencyUomId ?: ''"/>
+        </if>
     </actions>
 
-    <widgets>
+    <widgets><container style="zpur-page">
         <link url="findInvoice" text="Back to Debit Notes" link-type="anchor"/>
 
+        <section name="ReturnNoAccess" condition="noAccess"><widgets><label text="This debit note is not part of your account." type="p"/></widgets></section>
+        <section name="ReturnDetails" condition="!noAccess"><widgets>
         <!-- Profile Banner -->
         <container style="zenith-profile-banner q-pa-lg bg-white shadow-1 border-radius-lg q-mb-lg q-mt-md">
             <container style="row items-center justify-between no-wrap">
                 <container style="row items-center">
-                    <container style="zenith-avatar q-mr-lg text-white; border-radius:12px; background:linear-gradient(135deg, #b91c1c, #991b1b);">
-                        <label text="DR" type="span" style="font-weight:bold; font-size:1.2rem;"/>
+                    <container style="zenith-avatar q-mr-lg zpur-return-avatar">
+                        <label text="DR" type="span" style="zpur-avatar-label"/>
                     </container>
                     <container style="column">
                         <label text="Debit Note: ${invoiceId}" type="h3" style="text-primary text-weight-bold q-my-none"/>
-                        <label text="Value Reversed: ₹ ${zinr.inr(ec.l10n.format(invoice?.invoiceTotal ?: 0, '#,##,##0.00'))} - Date: ${invoice?.invoiceDate ? ec.l10n.format(invoice.invoiceDate, 'dd MMM yyyy') : 'N/A'}" type="p" style="text-grey-7 text-subtitle2 q-mt-xs q-mb-none"/>
+                        <label text="Recorded Return Value: ${currSymbol} ${zinr.inr(ec.l10n.format(invoice?.invoiceTotal ?: 0, '#,##,##0.00'))} - Date: ${invoice?.invoiceDate ? ec.l10n.format(invoice.invoiceDate, 'dd MMM yyyy') : 'N/A'}" type="p" style="text-grey-7 text-subtitle2 q-mt-xs q-mb-none"/>
                     </container>
                 </container>
                 
@@ -161,13 +63,13 @@
                         <field name="invoiceId"><default-field><hidden/></default-field></field>
                         <field name="statusId"><default-field title="">
                             <drop-down current="selected">
-                                <option key="InvoiceIn-Process" text="Draft"/>
-                                <option key="InvoiceApproved" text="Approved"/>
-                                <option key="InvoicePaid" text="Settled / Adjusted"/>
+                                <option key="InvoiceInProcess" text="Draft"/>
+                                <option key="InvoiceFinalized" text="Finalize"/>
+
                                 <option key="InvoiceCancelled" text="Cancelled"/>
                             </drop-down>
                         </default-field></field>
-                        <field name="submitButton"><conditional-field name="save_write" condition="modCanWrite" title="Update Status"><submit/></conditional-field><default-field title="Update Status"><label text="You have view-only access — changes are disabled." type="span" style="text-grey-7"/></default-field></field>
+                        <field name="submitButton"><conditional-field name="save_write" condition="modCanWrite &amp;&amp; invoice?.statusId=='InvoiceInProcess'" title="Update Status"><submit/></conditional-field><default-field title="Update Status"><label text="Changes are unavailable for your account or this record." type="span" style="text-grey-7"/></default-field></field>
                         <field-layout><field-row><field-ref name="statusId"/><field-ref name="submitButton"/></field-row></field-layout>
                     </form-single>
                 </container>
@@ -197,7 +99,7 @@
                         <field name="purchaseOrderNumber"><default-field title="Original PO No."><text-line size="20"/></default-field></field>
                         <field name="description"><default-field title="Reason for Return"><text-area rows="3" cols="60"/></default-field></field>
                         
-                        <field name="submitButton"><conditional-field name="save_write" condition="modCanWrite" title="Save Details"><submit/></conditional-field><default-field title="Save Details"><label text="You have view-only access — changes are disabled." type="span" style="text-grey-7"/></default-field></field>
+                        <field name="submitButton"><conditional-field name="save_write" condition="modCanWrite &amp;&amp; invoice?.statusId=='InvoiceInProcess'" title="Save Details"><submit/></conditional-field><default-field title="Save Details"><label text="Changes are unavailable for your account or this record." type="span" style="text-grey-7"/></default-field></field>
                     </form-single>
                 </container>
             </row-col>
@@ -205,12 +107,12 @@
             <row-col lg="6">
                 <!-- ITC Reversal Dashboard -->
                 <container style="zenith-card q-pa-md bg-red-9 text-white shadow-1 border-radius-md q-mb-md">
-                    <label text="ITC Reversal Summary" type="h5" style="text-white text-weight-bold q-mb-md border-bottom q-pb-sm"/>
+                    <label text="Return Tax Summary" type="h5" style="text-white text-weight-bold q-mb-md border-bottom q-pb-sm"/>
                     <container style="row q-col-gutter-md text-center">
                         <container style="col-3"><label text="Taxable Base" type="strong" style="text-red-2 block"/><label text="${currSymbol}${zinr.inr(ec.l10n.format(invoice.totalTaxableAmount ?: 0, '#,##0.00'))}" type="p" style="q-my-none text-white"/></container>
-                        <container style="col-3"><label text="IGST Reversed" type="strong" style="text-red-2 block"/><label text="${currSymbol}${zinr.inr(ec.l10n.format(invoice.totalIgst ?: 0, '#,##0.00'))}" type="p" style="q-my-none text-white"/></container>
-                        <container style="col-3"><label text="CGST Reversed" type="strong" style="text-red-2 block"/><label text="${currSymbol}${zinr.inr(ec.l10n.format(invoice.totalCgst ?: 0, '#,##0.00'))}" type="p" style="q-my-none text-white"/></container>
-                        <container style="col-3"><label text="SGST Reversed" type="strong" style="text-red-2 block"/><label text="${currSymbol}${zinr.inr(ec.l10n.format(invoice.totalSgst ?: 0, '#,##0.00'))}" type="p" style="q-my-none text-white"/></container>
+                        <container style="col-3"><label text="IGST" type="strong" style="text-red-2 block"/><label text="${currSymbol}${zinr.inr(ec.l10n.format(invoice.totalIgst ?: 0, '#,##0.00'))}" type="p" style="q-my-none text-white"/></container>
+                        <container style="col-3"><label text="CGST" type="strong" style="text-red-2 block"/><label text="${currSymbol}${zinr.inr(ec.l10n.format(invoice.totalCgst ?: 0, '#,##0.00'))}" type="p" style="q-my-none text-white"/></container>
+                        <container style="col-3"><label text="SGST" type="strong" style="text-red-2 block"/><label text="${currSymbol}${zinr.inr(ec.l10n.format(invoice.totalSgst ?: 0, '#,##0.00'))}" type="p" style="q-my-none text-white"/></container>
                     </container>
                 </container>
             </row-col>
@@ -221,7 +123,7 @@
             <container style="row justify-between items-center q-mb-md border-bottom q-pb-sm">
                 <label text="Returned Items" type="h5" style="text-primary text-weight-bold q-my-none"/>
                 
-                <section name="DebitAddItem_write"><condition><expression>modCanWrite</expression></condition><widgets>
+                <section name="DebitAddItem_write"><condition><expression>modCanWrite &amp;&amp; invoice?.statusId=='InvoiceInProcess'</expression></condition><widgets>
                 <container-dialog id="AddItemDialog" button-text="Add Returned Item" button-class="q-btn--flat bg-primary text-white border-radius-md">
                     <form-single name="AddItemForm" transition="addItem">
                         <field name="invoiceId"><default-field><hidden/></default-field></field>
@@ -229,7 +131,7 @@
                         <field name="productId"><default-field title="Product">
                             <drop-down allow-empty="true">
                                 <entity-options key="${productId}" text="${pseudoId} - ${productName}">
-                                    <entity-find entity-name="mantle.product.Product"><econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/><order-by field-name="productName"/></entity-find>
+                                    <entity-find entity-name="mantle.product.Product"><econdition field-name="ownerPartyId" from="invoice?.toPartyId ?: '__NO_ORGANIZATION__'"/><order-by field-name="productName"/></entity-find>
                                 </entity-options>
                             </drop-down>
                         </default-field></field>
@@ -241,7 +143,7 @@
                         
                         <!-- GST Field -->
                         <field name="taxPercentage"><default-field title="GST Rate (%)">
-                            <drop-down no-current-selected-key="18">
+                            <drop-down allow-empty="true">
                                 <option key="0" text="0% (Exempt)"/>
                                 <option key="5" text="5%"/>
                                 <option key="12" text="12%"/>
@@ -279,9 +181,9 @@
                 
                 <!-- GST Breakdown -->
                 <field name="gstBreakdown"><default-field title="Tax Reversed">
-                    <label text="${igstRate ? ('IGST: ' + igstRate + '% (₹' + igstAmount + ')') : ''}" type="span" style="block text-grey-8 text-caption"/>
-                    <label text="${cgstRate ? ('CGST: ' + cgstRate + '% (₹' + cgstAmount + ')') : ''}" type="span" style="block text-grey-8 text-caption"/>
-                    <label text="${sgstRate ? ('SGST: ' + sgstRate + '% (₹' + sgstAmount + ')') : ''}" type="span" style="block text-grey-8 text-caption"/>
+                    <label text="${igstRate ? ('IGST: ' + igstRate + '% (' + currSymbol + igstAmount + ')') : ''}" type="span" style="block text-grey-8 text-caption"/>
+                    <label text="${cgstRate ? ('CGST: ' + cgstRate + '% (' + currSymbol + cgstAmount + ')') : ''}" type="span" style="block text-grey-8 text-caption"/>
+                    <label text="${sgstRate ? ('SGST: ' + sgstRate + '% (' + currSymbol + sgstAmount + ')') : ''}" type="span" style="block text-grey-8 text-caption"/>
                     <label text="${!igstRate &amp;&amp; !cgstRate ? '-' : ''}" type="span" style="block text-grey-8 text-caption"/>
                 </default-field></field>
 
@@ -290,7 +192,7 @@
                 </default-field></field>
                 
                 <field name="deleteItem">
-                    <conditional-field name="del_write" condition="modCanWrite" title=" ">
+                    <conditional-field name="del_write" condition="modCanWrite &amp;&amp; invoice?.statusId=='InvoiceInProcess'" title=" ">
                         <link url="deleteItem" parameter-map="[invoiceId:invoiceId, invoiceItemSeqId:invoiceItemSeqId]" icon="delete" style="text-danger" confirmation="Remove item?"/>
                     </conditional-field>
                     <default-field title=" "><label text="" type="span"/></default-field>
@@ -298,5 +200,6 @@
             </form-list>
         </container>
 
-    </widgets>
+        </widgets></section>
+</container>    </widgets>
 </screen>

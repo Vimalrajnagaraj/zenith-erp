@@ -1,0 +1,152 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+    <service verb="get" noun="PurchaseOrganization">
+        <out-parameters><parameter name="organizationPartyId"/></out-parameters>
+        <actions><script><![CDATA[
+            organizationPartyId=null
+            def requested=ec.user.getPreference('ACTIVE_ORGANIZATION')
+            if(!requested || requested=='_NA_') return
+            if(ec.user.isInGroup('ADMIN')) {
+                def party=ec.entity.find('mantle.party.Party').condition('partyId',requested).disableAuthz().one()
+                def internal=ec.entity.find('mantle.party.PartyRole').condition('partyId',requested).condition('roleTypeId','OrgInternal').disableAuthz().count()
+                if(party && party.disabled!='Y' && internal && ec.entity.find('mantle.party.Organization').condition('partyId',requested).disableAuthz().one()) organizationPartyId=requested
+                return
+            }
+            def partyId=ec.user.userAccount?.partyId
+            if(!partyId) return
+            def scope=ec.service.sync().name('mantle.party.PartyServices.get#PartyOrganizationInfo').parameters([partyId:partyId]).disableAuthz().call()
+            if(requested==scope?.activeOrgId && (scope?.userOrgIds ?: []).contains(requested)) organizationPartyId=requested
+        ]]></script></actions>
+    </service>
+    <service verb="assert" noun="PurchaseWrite">
+        <actions>
+            <service-call name="zenith.base.SecurityServices.check#ModuleWriteAccess" in-map="[moduleId:'purchase']" out-map="write"/>
+            <if condition="!write.canWrite"><return error="true" message="You have view-only access to Purchase."/></if>
+        </actions>
+    </service>
+    <service verb="assert" noun="PurchaseVendor">
+        <in-parameters><parameter name="vendorPartyId"/><parameter name="organizationPartyId" required="true"/></in-parameters>
+        <out-parameters><parameter name="allowed" type="Boolean"/></out-parameters>
+        <actions><script><![CDATA[
+            def vendor=vendorPartyId ? ec.entity.find('mantle.party.Party').condition('partyId',vendorPartyId).disableAuthz().one() : null
+            def role=vendor ? ec.entity.find('mantle.party.PartyRole').condition('partyId',vendorPartyId).condition('roleTypeId','in',['Vendor','Supplier']).disableAuthz().count() : 0
+            allowed=vendor!=null && vendor.ownerPartyId==organizationPartyId && vendor.disabled!='Y' && role>0
+            if(!allowed) ec.message.addError('Select an enabled supplier from your active organization.')
+        ]]></script></actions>
+    </service>
+    <service verb="assert" noun="PurchaseOrder">
+        <in-parameters><parameter name="orderId" required="true"/><parameter name="editable" type="Boolean" default="false"/><parameter name="errorOnDenied" default-value="Y"/></in-parameters>
+        <out-parameters><parameter name="allowed" type="Boolean"/><parameter name="order" type="Map"/><parameter name="part" type="Map"/></out-parameters>
+        <actions><script><![CDATA[
+            order=ec.entity.find('mantle.order.OrderHeader').condition('orderId',orderId).disableAuthz().forUpdate(editable).one()
+            def parts=ec.entity.find('mantle.order.OrderPart').condition('orderId',orderId).disableAuthz().list()
+            part=parts.size()==1 ? parts[0] : null
+            def org=ec.service.sync().name('zenith.purchase.OperationsServices.get#PurchaseOrganization').call().organizationPartyId
+            def vendor=part?.vendorPartyId ? ec.entity.find('mantle.party.Party').condition('partyId',part.vendorPartyId).disableAuthz().one() : null
+            // This UI creates one buying part ('01'); never treat a sales or mixed-tenant order as a PO.
+            allowed=order!=null && part!=null && part.orderPartSeqId=='01' && vendor!=null && vendor.ownerPartyId==part.customerPartyId &&
+                (ec.user.isInGroup('ADMIN') || (org && part.customerPartyId==org))
+            if(editable && order?.statusId!='OrderOpen') allowed=false
+            if(!allowed && errorOnDenied!='N') ec.message.addError('Purchase order not found, outside your organization, or closed for editing.')
+        ]]></script></actions>
+    </service>
+    <service verb="get" noun="PurchaseOrderIds">
+        <out-parameters><parameter name="orderIds" type="List"/></out-parameters>
+        <actions>
+            <service-call name="zenith.purchase.OperationsServices.get#PurchaseOrganization" out-map="scope"/>
+            <script><![CDATA[
+                orderIds=[]
+                if(!scope.organizationPartyId) return
+                def candidates=ec.entity.find('mantle.order.OrderPart').condition('customerPartyId',scope.organizationPartyId).disableAuthz().list().orderId.unique()
+                if(!candidates) return
+                def groups=ec.entity.find('mantle.order.OrderPart').condition('orderId','in',candidates).disableAuthz().list().groupBy{it.orderId}
+                def vendors=ec.entity.find('mantle.party.Party').condition('ownerPartyId',scope.organizationPartyId).disableAuthz().list().partyId as Set
+                groups.each {id,parts -> if(parts.size()==1 && parts[0].orderPartSeqId=='01' && vendors.contains(parts[0].vendorPartyId)) orderIds.add(id)}
+            ]]></script>
+        </actions>
+    </service>
+    <service verb="create" noun="PurchaseOrder">
+        <in-parameters><parameter name="vendorPartyId"/><parameter name="organizationPartyId"/></in-parameters>
+        <out-parameters><parameter name="orderId"/></out-parameters>
+        <actions>
+            <service-call name="zenith.purchase.OperationsServices.assert#PurchaseWrite"/>
+            <service-call name="zenith.purchase.OperationsServices.get#PurchaseOrganization" out-map="scope"/>
+            <if condition="!scope.organizationPartyId || (organizationPartyId &amp;&amp; organizationPartyId!=scope.organizationPartyId)"><return error="true" message="Select your authorized active organization before creating a PO."/></if>
+            <service-call name="zenith.purchase.OperationsServices.assert#PurchaseVendor" in-map="[vendorPartyId:vendorPartyId,organizationPartyId:scope.organizationPartyId]" out-map="vendor"/>
+            <if condition="!vendor.allowed"><return/></if>
+            <entity-find-one entity-name="zenith.erp.base.CompanySettings" value-field="currencySetting"><field-map field-name="organizationPartyId" from="scope.organizationPartyId"/><field-map field-name="settingKey" value="CURRENCY_UOM_ID"/></entity-find-one>
+            <set field="currency" from="currencySetting?.settingValue ?: 'INR'"/>
+            <entity-find-one entity-name="moqui.basic.Uom" value-field="currencyUom"><field-map field-name="uomId" from="currency"/></entity-find-one>
+            <if condition="currencyUom?.uomTypeEnumId!='UT_CURRENCY_MEASURE'"><return error="true" message="Configure a valid buying-organization currency."/></if>
+            <service-call name="mantle.order.OrderServices.create#Order" in-map="[orderName:'New Purchase Order',entryDate:ec.user.nowTimestamp,statusId:'OrderOpen',currencyUomId:currency,vendorPartyId:vendorPartyId,customerPartyId:scope.organizationPartyId]" out-map="context"/>
+        </actions>
+    </service>
+    <service verb="update" noun="PurchaseOrder">
+        <in-parameters><parameter name="orderId" required="true"/><parameter name="updates" type="Map" required="true"/></in-parameters>
+        <actions>
+            <service-call name="zenith.purchase.OperationsServices.assert#PurchaseWrite"/>
+            <service-call name="zenith.purchase.OperationsServices.assert#PurchaseOrder" in-map="[orderId:orderId]" out-map="access"/>
+            <if condition="!access.allowed"><return/></if>
+            <script><![CDATA[
+                def row=ec.entity.find('mantle.order.OrderHeader').condition('orderId',orderId).forUpdate(true).one()
+                if(updates.orderName!=null && row.statusId!='OrderOpen') {ec.message.addError('Issued PO details cannot be edited.');return}
+                if(updates.statusId && updates.statusId!=row.statusId) {
+                    def flow=ec.entity.find('moqui.basic.StatusFlowTransition').condition('statusFlowId','Default').condition('statusId',row.statusId).condition('toStatusId',updates.statusId).one()
+                    if(!flow || (flow.userPermissionId && !ec.user.hasPermission(flow.userPermissionId))) {ec.message.addError('Select an available PO workflow status.');return}
+                    ec.service.sync().name('mantle.order.OrderServices.update#OrderStatus').parameters([orderId:orderId,statusId:updates.statusId]).call()
+                    if(ec.message.hasError()) return
+                }
+                if(updates.orderName!=null) ec.service.sync().name('update#mantle.order.OrderHeader').parameters([orderId:orderId,orderName:updates.orderName]).call()
+            ]]></script>
+        </actions>
+    </service>
+    <service verb="add" noun="PurchaseOrderLine">
+        <in-parameters><parameter name="orderId" required="true"/><parameter name="productId"/><parameter name="itemDescription"/><parameter name="quantity" type="BigDecimal" required="true"/><parameter name="unitAmount" type="BigDecimal" required="true"/><parameter name="requiredByDate" type="Timestamp"/></in-parameters>
+        <out-parameters><parameter name="orderItemSeqId"/></out-parameters>
+        <actions>
+            <service-call name="zenith.purchase.OperationsServices.assert#PurchaseWrite"/>
+            <service-call name="zenith.purchase.OperationsServices.assert#PurchaseOrder" in-map="[orderId:orderId,editable:true]" out-map="access"/>
+            <if condition="!access.allowed"><return/></if>
+            <if condition="quantity&lt;=0 || unitAmount&lt;0 || (!productId &amp;&amp; !itemDescription?.trim())"><return error="true" message="Enter a product or description, positive quantity and nonnegative unit price."/></if>
+            <script><![CDATA[
+                def product=productId ? ec.entity.find('mantle.product.Product').condition('productId',productId).disableAuthz().one() : null
+                if(productId && (!product || product.ownerPartyId!=access.part.customerPartyId)) ec.message.addError('Select a product from the buying organization.')
+            ]]></script>
+            <if condition="ec.message.hasError()"><return/></if>
+            <service-call name="create#mantle.order.OrderItem" in-map="[orderId:orderId,orderPartSeqId:'01',productId:productId,itemDescription:itemDescription,quantity:quantity,unitAmount:unitAmount,requiredByDate:requiredByDate,itemTypeEnumId:'ItemInventory']" out-map="context"/>
+            <service-call name="mantle.order.OrderServices.update#OrderHeaderTotal" in-map="[orderId:orderId]"/>
+        </actions>
+    </service>
+    <service verb="delete" noun="PurchaseOrderLine">
+        <in-parameters><parameter name="orderId" required="true"/><parameter name="orderItemSeqId" required="true"/></in-parameters>
+        <actions>
+            <service-call name="zenith.purchase.OperationsServices.assert#PurchaseWrite"/>
+            <service-call name="zenith.purchase.OperationsServices.assert#PurchaseOrder" in-map="[orderId:orderId,editable:true]" out-map="access"/>
+            <if condition="!access.allowed"><return/></if>
+            <entity-find-one entity-name="mantle.order.OrderItem" value-field="line"><field-map field-name="orderId"/><field-map field-name="orderPartSeqId" value="01"/><field-map field-name="orderItemSeqId"/></entity-find-one>
+            <if condition="!line"><return error="true" message="PO line not found."/></if>
+            <service-call name="delete#mantle.order.OrderItem" in-map="[orderId:orderId,orderPartSeqId:'01',orderItemSeqId:orderItemSeqId]"/>
+            <service-call name="mantle.order.OrderServices.update#OrderHeaderTotal" in-map="[orderId:orderId]"/>
+        </actions>
+    </service>
+    <service verb="create" noun="GoodsReceiptNote">
+        <in-parameters><parameter name="purchaseOrderId" required="true"/><parameter name="receiptDate" required="true"/><parameter name="freightAmount" type="BigDecimal"/><parameter name="insuranceAmount" type="BigDecimal"/><parameter name="customsDutyAmount" type="BigDecimal"/></in-parameters>
+        <out-parameters><parameter name="grnId"/></out-parameters>
+        <actions>
+            <service-call name="zenith.purchase.OperationsServices.assert#PurchaseWrite"/>
+            <service-call name="zenith.purchase.OperationsServices.get#PurchaseOrganization" out-map="scope"/>
+            <if condition="!scope.organizationPartyId"><return error="true" message="Select your authorized active organization before recording a GRN."/></if>
+            <service-call name="zenith.purchase.OperationsServices.assert#PurchaseOrder" in-map="[orderId:purchaseOrderId]" out-map="access"/>
+            <if condition="!access.allowed"><return/></if>
+            <if condition="access.order.statusId in ['OrderCancelled','OrderRejected']"><return error="true" message="This PO cannot receive a GRN."/></if>
+            <script><![CDATA[
+                def date
+                try {date=java.sql.Timestamp.valueOf(java.time.LocalDate.parse(receiptDate.toString().trim()).atStartOfDay())} catch(Exception ignored) {ec.message.addError('Enter a valid receipt date.');return}
+                def amounts=[freightAmount,insuranceAmount,customsDutyAmount]
+                if(amounts.any {it!=null && it<0}) {ec.message.addError('Landed surcharges cannot be negative.');return}
+                def row=ec.entity.makeValue('zenith.erp.purchase.GoodsReceiptNote').setAll([purchaseOrderId:purchaseOrderId,vendorPartyId:access.part.vendorPartyId,receiptDate:date,freightAmount:freightAmount,insuranceAmount:insuranceAmount,customsDutyAmount:customsDutyAmount]).setSequencedIdPrimary().create()
+                grnId=row.grnId
+            ]]></script>
+        </actions>
+    </service>
+</services>

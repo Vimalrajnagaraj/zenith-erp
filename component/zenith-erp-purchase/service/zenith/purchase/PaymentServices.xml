@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+    <service verb="create" noun="PurchasePayment">
+        <in-parameters><parameter name="invoiceId" required="true"/><parameter name="amount" type="BigDecimal"/><parameter name="paymentDate" type="Timestamp" default="ec.user.nowTimestamp"/><parameter name="paymentMethodEnumId" default-value="PmtBankAccount"/></in-parameters>
+        <out-parameters><parameter name="paymentId"/></out-parameters>
+        <actions>
+            <service-call name="zenith.purchase.OperationsServices.assert#PurchaseWrite"/>
+            <service-call name="zenith.purchase.OperationsServices.get#PurchaseOrganization" out-map="scope"/>
+            <script><![CDATA[
+                def bill=ec.entity.find('mantle.account.invoice.Invoice').condition('invoiceId',invoiceId).disableAuthz().forUpdate(true).one()
+                if(!bill || bill.invoiceTypeEnumId!='InvoicePurchase' || (!scope.organizationPartyId || (!ec.user.isInGroup('ADMIN') && bill.toPartyId!=scope.organizationPartyId))) {
+                    ec.message.addError('Purchase invoice not found or outside your active organization.');return
+                }
+                if(!(bill.statusId in ['InvoiceReceived','InvoiceApproved','InvoiceFinalized','InvoiceSent','InvoiceAcked','InvoiceWriteOff'])) {
+                    ec.message.addError('This bill is not available for a payment promise.');return
+                }
+                def method=ec.entity.find('moqui.basic.Enumeration').condition('enumId',paymentMethodEnumId).one()
+                if(method?.enumTypeId!='PaymentMethodType') {ec.message.addError('Select a valid payment method.');return}
+                def currency=ec.entity.find('moqui.basic.Uom').condition('uomId',bill.currencyUomId).one()
+                if(currency?.uomTypeEnumId!='UT_CURRENCY_MEASURE') {ec.message.addError('The bill requires a valid recorded currency.');return}
+                def remaining=(bill.invoiceTotal ?: 0)+(bill.roundOffAmount ?: 0)-(bill.appliedPaymentsTotal ?: 0)
+                // Undelivered linked promises reserve the remaining amount; delivered/applied payments are already counted above.
+                def promises=ec.entity.find('mantle.account.payment.Payment').condition('forInvoiceId',invoiceId).condition('statusId','in',['PmntProposed','PmntPromised']).disableAuthz().list()
+                remaining-=promises.sum {it.amount ?: 0} ?: 0
+                def value=amount==null ? remaining : amount
+                if(value<=0 || value>remaining) {ec.message.addError('Use a positive amount within the remaining payable balance, including existing promises.');return}
+                paymentId=ec.service.sync().name('create#mantle.account.payment.Payment').parameters([paymentTypeEnumId:'PtInvoicePayment',fromPartyId:bill.toPartyId,toPartyId:bill.fromPartyId,forInvoiceId:invoiceId,amount:value,amountUomId:bill.currencyUomId,paymentMethodEnumId:paymentMethodEnumId,effectiveDate:paymentDate,statusId:'PmntPromised']).call().paymentId
+                // This preserves the existing promise workflow: never mark delivered, apply, or transfer money here.
+            ]]></script>
+        </actions>
+    </service>
+</services>

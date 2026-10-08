@@ -1,0 +1,107 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Disposable-only helper. Copy into the Pricing screen directory only for the regression run. -->
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd" default-menu-include="false">
+<transition name="initialize"><actions><script><![CDATA[
+    if (System.getProperty('purchase.pricing.qa.disposable')!='true' || !ec.user.isInGroup('ADMIN')) {
+        ec.web.response.setStatus(403); ec.web.sendJsonResponse([denied:true]); return
+    }
+    if (ec.entity.find('mantle.party.Party').condition('partyId','PP_QA_A').disableAuthz().count()) {
+        ec.web.response.setStatus(409); ec.web.sendJsonResponse([denied:true]); return
+    }
+    ec.entity.makeDataLoader().location('component://zenith-erp-purchase/PurchaseRemainingQaFixture.xml').load()
+    if(ec.message.hasError() || !ec.entity.find('mantle.order.OrderPart').condition('orderId','PP_QA_PO_A').condition('orderPartSeqId','01').disableAuthz().one()) {
+        throw new IllegalStateException('Fixture load failed; refuse stale-state verification')
+    }
+    def demo=ec.entity.find('moqui.security.UserAccount').condition('userId','EX_JOHN_DOE').one()
+    ['PP_QA_USER','PP_QA_VIEWER'].each {userId ->
+        def user=ec.entity.find('moqui.security.UserAccount').condition('userId',userId).one()
+        ['currentPassword','passwordSalt','passwordHashType','passwordBase64'].each {user.set(it,demo.get(it))}
+        user.disabled='N'; user.requirePasswordChange='N'; user.update()
+    }
+    ec.web.sendJsonResponse([initialized:true])
+]]></script></actions><default-response type="none"/></transition>
+<transition name="invoke"><actions><script><![CDATA[
+    if(System.getProperty('purchase.pricing.qa.disposable')!='true' || !(ec.user.username in ['purchase.pricing.qa','purchase.pricing.viewer'])) {
+        ec.web.response.setStatus(403);ec.web.sendJsonResponse([denied:true]);return
+    }
+    def calls=[pay:'zenith.purchase.PurchaseServices.create#PurchasePayment',tdspay:'zenith.india.IndiaPurchaseServices.create#PurchasePaymentWithTds',poaccess:'zenith.purchase.PurchaseServices.assert#PurchaseOrderAccess']
+    def name=calls[ec.web.parameters.op];if(!name){ec.web.response.setStatus(400);ec.web.sendJsonResponse([denied:true]);return}
+    def fields=['invoiceId','amount','paymentDate','paymentMethodEnumId','tdsSectionId','orderId','organizationPartyId','customerPartyId','forInvoiceId']
+    def values=[:];fields.each {if(ec.web.parameters.containsKey(it))values[it]=ec.web.parameters[it]}
+    ec.message.clearErrors()
+    def result=ec.service.sync().name(name).parameters(values).call()
+    def errors=ec.message.hasError() ? [ec.message.getErrorsString()] : [];ec.message.clearErrors()
+    ec.web.sendJsonResponse([result:result,errors:errors])
+]]></script></actions><default-response type="none"/></transition>
+<transition name="scope"><actions><script><![CDATA[
+    if (System.getProperty('purchase.pricing.qa.disposable')!='true' || ec.user.username!='purchase.pricing.qa' || !['PP_QA_A','PP_QA_B','NONE'].contains(ec.web.parameters.org)) {
+        ec.web.response.setStatus(403); ec.web.sendJsonResponse([denied:true]); return
+    }
+    ec.user.setPreference('ACTIVE_ORGANIZATION',ec.web.parameters.org=='NONE'?null:ec.web.parameters.org)
+    ec.web.sendJsonResponse([scope:ec.web.parameters.org])
+]]></script></actions><default-response type="none"/></transition>
+<transition name="cleanup"><actions><script><![CDATA[
+    if(System.getProperty('purchase.pricing.qa.disposable')!='true' || !ec.user.isInGroup('ADMIN')) {
+        ec.web.response.setStatus(403); ec.web.sendJsonResponse([denied:true]); return
+    }
+    def fixture=new groovy.xml.XmlParser().parseText(ec.resource.getLocationText('component://zenith-erp-purchase/PurchaseRemainingQaFixture.xml',false))
+    int removed=0
+    def captured=new groovy.json.JsonSlurper().parseText(ec.web.parameters.createdIds ?: '{}')
+    // The runner captures actual primary keys before submitting this cleanup; never broad-match business rows.
+    def deleteRow={entity,idField,id ->
+        if(!id?.toString()?.matches('[A-Za-z0-9_-]+')) throw new IllegalStateException('Invalid captured fixture ID')
+        def row=ec.entity.find(entity).condition(idField,id).disableAuthz().one()
+        if(row) {row.delete();removed++}
+    }
+    def fixtureParty={id -> id?.toString()?.startsWith('PP_QA_')}
+    (captured.payment ?: []).each {id ->
+        def row=ec.entity.find('mantle.account.payment.Payment').condition('paymentId',id).disableAuthz().one()
+        if(!row || !fixtureParty(row.fromPartyId) || !fixtureParty(row.toPartyId)) throw new IllegalStateException('Refusing non-fixture payment')
+    }
+    (captured.invoice ?: []).each {id ->
+        def row=ec.entity.find('mantle.account.invoice.Invoice').condition('invoiceId',id).disableAuthz().one()
+        if(!row || !fixtureParty(row.fromPartyId) || !fixtureParty(row.toPartyId)) throw new IllegalStateException('Refusing non-fixture invoice')
+    }
+    (captured.order ?: []).each {id ->
+        def parts=ec.entity.find('mantle.order.OrderPart').condition('orderId',id).disableAuthz().list()
+        if(parts.size()!=1 || !fixtureParty(parts[0].customerPartyId) || !fixtureParty(parts[0].vendorPartyId)) throw new IllegalStateException('Refusing non-fixture order')
+    }
+    (captured.grn ?: []).each {id ->
+        def row=ec.entity.find('zenith.erp.purchase.GoodsReceiptNote').condition('grnId',id).disableAuthz().one()
+        if(!row || !fixtureParty(row.vendorPartyId)) throw new IllegalStateException('Refusing non-fixture receipt')
+    }
+    (captured.payment ?: []).each {id -> deleteRow('mantle.account.payment.Payment','paymentId',id)}
+    (captured.grn ?: []).each {id -> deleteRow('zenith.erp.purchase.GoodsReceiptNote','grnId',id)}
+    def invoices=(captured.invoice ?: [])+['PP_QA_RETURN_A','PP_QA_RETURN_B']
+    invoices.each {id ->
+        if(!id?.toString()?.matches('[A-Za-z0-9_-]+')) throw new IllegalStateException('Invalid invoice key')
+        ec.entity.find('zenith.erp.tax.TaxLineDetail').condition('referenceType','InvoiceItem').condition('referenceId',id).disableAuthz().list().each {it.delete();removed++}
+        ec.entity.find('mantle.account.invoice.InvoiceItem').condition('invoiceId',id).disableAuthz().list().each {it.delete();removed++}
+    }
+    (captured.invoice ?: []).each {id -> deleteRow('mantle.account.invoice.Invoice','invoiceId',id)}
+    def orders=(captured.order ?: [])+['PP_QA_PO_A','PP_QA_PO_B','PP_QA_PO_ISSUED','PP_QA_PO_MIXED','PP_QA_PO_SALES']
+    orders.each {id ->
+        if(!id?.toString()?.matches('[A-Za-z0-9_-]+')) throw new IllegalStateException('Invalid order key')
+        ec.entity.find('mantle.order.OrderItem').condition('orderId',id).disableAuthz().list().each {it.delete();removed++}
+        if(id in (captured.order ?: [])) ec.entity.find('mantle.order.OrderPart').condition('orderId',id).disableAuthz().list().each {it.delete();removed++}
+    }
+    (captured.order ?: []).each {id -> deleteRow('mantle.order.OrderHeader','orderId',id)}
+    // Resolve stored composite keys instead of guessing the initializing user's timestamp zone.
+    ec.entity.find('moqui.security.UserGroupMember').condition('userId','in',['PP_QA_USER','PP_QA_VIEWER']).disableAuthz().list().each { it.delete();removed++ }
+    // The UI may persist page-size/saved-find preferences not present in the initial fixture.
+    ec.entity.find('moqui.security.UserPreference').condition('userId','in',['PP_QA_USER','PP_QA_VIEWER']).disableAuthz().list().each { it.delete();removed++ }
+    fixture.children().reverse().each { node ->
+        def entityName=node.name().toString()
+        def pkFields=ec.entity.getEntityDefinition(entityName).getPkFieldNames()
+        def keys=[:]
+        pkFields.each {field ->
+            def raw=node.attribute(field)
+            if(raw!=null) keys[field]=(field=='fromDate' ? java.sql.Timestamp.valueOf(raw.toString().replace('T',' ')) : raw.toString())
+        }
+        if(!keys.values().any {it.toString().startsWith('PP_QA_')}) throw new IllegalStateException('Refusing non-fixture cleanup')
+        def value=ec.entity.find(entityName).condition(keys).disableAuthz().one()
+        if(value!=null) {value.delete(); removed++}
+    }
+    ec.web.sendJsonResponse([removed:removed])
+]]></script></actions><default-response type="none"/></transition>
+</screen>

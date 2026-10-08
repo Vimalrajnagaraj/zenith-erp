@@ -1,0 +1,215 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+    <service verb="get" noun="RuleOrganization">
+        <out-parameters><parameter name="organizationPartyId"/></out-parameters>
+        <actions><script><![CDATA[
+            organizationPartyId=null
+            def requested=ec.user.getPreference('ACTIVE_ORGANIZATION')
+            if(!requested || requested=='_NA_') return
+            if(ec.user.isInGroup('ADMIN')) {
+                def party=ec.entity.find('mantle.party.Party').condition('partyId',requested).disableAuthz().one()
+                def internal=ec.entity.find('mantle.party.PartyRole').condition('partyId',requested).condition('roleTypeId','OrgInternal').disableAuthz().count()
+                if(party && party.disabled!='Y' && internal && ec.entity.find('mantle.party.Organization').condition('partyId',requested).disableAuthz().one()) organizationPartyId=requested
+                return
+            }
+            def partyId=ec.user.userAccount?.partyId
+            if(!partyId) return
+            def scope=ec.service.sync().name('mantle.party.PartyServices.get#PartyOrganizationInfo').parameters([partyId:partyId]).disableAuthz().call()
+            if(requested==scope?.activeOrgId && (scope?.userOrgIds ?: []).contains(requested)) organizationPartyId=requested
+        ]]></script></actions>
+    </service>
+    <service verb="assert" noun="RuleAccess">
+        <in-parameters><parameter name="pricingRuleId"/><parameter name="errorOnDenied" default-value="Y"/></in-parameters>
+        <out-parameters><parameter name="allowed" type="Boolean"/><parameter name="rule" type="Map"/></out-parameters>
+        <actions><script><![CDATA[
+            rule=pricingRuleId ? ec.entity.find('zenith.erp.pricing.PricingRule').condition('pricingRuleId',pricingRuleId).disableAuthz().one() : null
+            def org=ec.service.sync().name('zenith.pricing.RuleServices.get#RuleOrganization').call().organizationPartyId
+            allowed=rule!=null && (ec.user.isInGroup('ADMIN') || (org && rule.organizationPartyId==org))
+            if(!allowed && errorOnDenied!='N') ec.message.addError('Pricing rule not found or outside your active organization.')
+        ]]></script></actions>
+    </service>
+    <service verb="assert" noun="RuleWriteAccess">
+        <actions>
+            <service-call name="zenith.base.SecurityServices.check#ModuleWriteAccess" in-map="[moduleId:'pricing']" out-map="write"/>
+            <if condition="!write.canWrite"><return error="true" message="You have view-only access to pricing rules."/></if>
+        </actions>
+    </service>
+    <service verb="validate" noun="RuleHeader">
+        <in-parameters><parameter name="values" type="Map" required="true"/></in-parameters>
+        <out-parameters><parameter name="fields" type="Map"/><parameter name="valid" type="Boolean"/></out-parameters>
+        <actions><script><![CDATA[
+            valid=false;fields=[:]
+            try {
+                def name=values.ruleName?.toString()?.trim()
+                def action=values.actionType?.toString()
+                def active=values.isActive==null ? 'Y' : values.isActive, stack=values.isStackable==null ? 'N' : values.isStackable
+                if(!name || !(active in ['Y','N']) || !(stack in ['Y','N']) || !(action in ['PatDiscountPercent','PatDiscountAmount','PatFixedPrice','PatMarginPercent'])) throw new IllegalArgumentException()
+                if(action=='PatMarginPercent' && active=='Y') {
+                    ec.message.addError('Margin on Cost cannot be activated until its approved cost calculation is implemented.');return
+                }
+                def amount=(values.actionValue==null || values.actionValue=='') ? null : values.actionValue as BigDecimal
+                def cap=(values.maxDiscount==null || values.maxDiscount=='') ? null : values.maxDiscount as BigDecimal
+                def floor=(values.minimumPrice==null || values.minimumPrice=='') ? null : values.minimumPrice as BigDecimal
+                def priority=(values.priority==null || values.priority=='') ? 10 : Integer.valueOf(values.priority.toString())
+                if(amount==null || amount<0 || (action=='PatDiscountPercent' && amount>100) || (cap!=null && cap<0) || (floor!=null && floor<0)) throw new IllegalArgumentException()
+                def stamp={v -> v==null || v=='' ? null : (v instanceof java.sql.Timestamp ? v : ec.l10n.parseTimestamp(v.toString(),null))}
+                def from=stamp(values.validFromDate), thru=stamp(values.validThruDate)
+                if((values.validFromDate && !from) || (values.validThruDate && !thru) || (from && thru && thru.before(from))) throw new IllegalArgumentException()
+                fields=[ruleName:name,description:values.description,priority:priority,isActive:active,isStackable:stack,actionType:action,actionValue:amount,maxDiscount:cap,minimumPrice:floor,validFromDate:from,validThruDate:thru]
+                valid=true
+            } catch(Exception ignored) {ec.message.addError('Enter a rule name, valid action, nonnegative amounts, percentage from 0 to 100, Y/N flags and an ordered date range.')}
+        ]]></script></actions>
+    </service>
+    <service verb="validate" noun="RuleCondition">
+        <in-parameters><parameter name="organizationPartyId" required="true"/><parameter name="values" type="Map" required="true"/></in-parameters>
+        <out-parameters><parameter name="fields" type="Map"/><parameter name="valid" type="Boolean"/></out-parameters>
+        <actions><script><![CDATA[
+            valid=false;fields=[:]
+            def scope=ec.service.sync().name('zenith.pricing.RuleServices.get#RuleOrganization').call()
+            if(!ec.user.isInGroup('ADMIN') && organizationPartyId!=scope.organizationPartyId){ec.message.addError('Condition references must belong to your active organization.');return}
+            try {
+                def type=values.conditionTypeEnumId?.toString(), op=values.operator?.toString()?.trim() ?: 'equals'
+                def value=values.fieldValue?.toString()?.trim(), upper=values.fieldValueTo?.toString()?.trim()
+                def numeric=type in ['PctMinQuantity','PctMinAmount']
+                def categorical=type in ['PctProduct','PctProductCategory','PctCustomerGroup','PctChannel','PctRegion','PctDayOfWeek']
+                if(!value || !(numeric || categorical || type=='PctTimeRange')) throw new IllegalArgumentException()
+                def allowed=numeric ? ['equals','not-equals','greater-than','less-than','in','between'] : type=='PctTimeRange' ? ['equals','not-equals'] : ['equals','not-equals','in']
+                if(!(op in allowed)) throw new IllegalArgumentException()
+                def tokens=value.split(',',-1).collect{it.trim()}
+                if(tokens.any{!it}) throw new IllegalArgumentException()
+                if(numeric) {
+                    def numbers=(op=='in' ? tokens : [value]).collect{it as BigDecimal}
+                    if(numbers.any{it<0}) throw new IllegalArgumentException()
+                    if(op=='between' && (!upper || (upper as BigDecimal)<numbers[0])) throw new IllegalArgumentException()
+                } else if(type=='PctDayOfWeek') {
+                    def dayMap=[MONDAY:'MON',TUESDAY:'TUE',WEDNESDAY:'WED',THURSDAY:'THU',FRIDAY:'FRI',SATURDAY:'SAT',SUNDAY:'SUN','1':'MON','2':'TUE','3':'WED','4':'THU','5':'FRI','6':'SAT','7':'SUN']
+                    def days=tokens.collect{def day=it.toUpperCase(java.util.Locale.ROOT);dayMap[day] ?: day}
+                    if(days.any{!(it in ['MON','TUE','WED','THU','FRI','SAT','SUN'])}) throw new IllegalArgumentException()
+                    value=days.join(',')
+                } else if(type=='PctTimeRange') {
+                    def parts=value.split('-',-1)
+                    if(parts.length!=2) throw new IllegalArgumentException()
+                    def from=java.time.LocalTime.parse(parts[0].trim()), thru=java.time.LocalTime.parse(parts[1].trim())
+                    value=from.toString()+'-'+thru.toString()
+                } else if(type in ['PctProduct','PctProductCategory','PctCustomerGroup']) {
+                    def refs=op=='in' ? tokens : [value]
+                    def metadata=[PctProduct:['mantle.product.Product','productId','ownerPartyId'],PctProductCategory:['mantle.product.category.ProductCategory','productCategoryId',null],PctCustomerGroup:['zenith.erp.contacts.CustomerGroup','customerGroupId','organizationPartyId']][type]
+                    for(id in refs) {
+                        def row=ec.entity.find(metadata[0]).condition(metadata[1],id).disableAuthz().one()
+                        if(!row || (metadata[2] && row.get(metadata[2])!=organizationPartyId)) throw new IllegalArgumentException()
+                    }
+                }
+                fields=[conditionTypeEnumId:type,operator:op,fieldValue:value,fieldValueTo:op=='between' ? upper : null];valid=true
+            } catch(Exception ignored) {ec.message.addError('Choose a supported condition/operator, complete nonnegative numeric range, weekday, time range or an existing reference in this organization.')}
+        ]]></script></actions>
+    </service>
+    <service verb="create" noun="Rule">
+        <in-parameters>
+            <!-- Parse an integral priority explicitly; automatic Number-to-Integer conversion truncates fractions. -->
+            <parameter name="ruleName" required="true"/><parameter name="description"/><parameter name="priority" default-value="10"/>
+            <parameter name="isActive" default-value="Y"/><parameter name="isStackable" default-value="N"/><parameter name="organizationPartyId"/>
+            <parameter name="validFromDate" type="Timestamp"/><parameter name="validThruDate" type="Timestamp"/>
+            <parameter name="actionType" required="true"/><parameter name="actionValue" type="BigDecimal" required="true"/>
+            <parameter name="maxDiscount" type="BigDecimal"/><parameter name="minimumPrice" type="BigDecimal"/><parameter name="conditions" type="List"/>
+        </in-parameters>
+        <out-parameters><parameter name="pricingRuleId"/></out-parameters>
+        <actions>
+            <service-call name="zenith.pricing.RuleServices.assert#RuleWriteAccess"/>
+            <service-call name="zenith.pricing.RuleServices.get#RuleOrganization" out-map="scope"/>
+            <if condition="!scope.organizationPartyId || (organizationPartyId &amp;&amp; organizationPartyId != scope.organizationPartyId)"><return error="true" message="Select your authorized active organization before creating a pricing rule."/></if>
+            <!-- Snapshot the caller before the nested service pushes its own execution context. -->
+            <service-call name="zenith.pricing.RuleServices.validate#RuleHeader" in-map="[values:new LinkedHashMap(context)]" out-map="header"/>
+            <if condition="!header.valid"><return/></if>
+            <script><![CDATA[
+                def validated=[]
+                for(cond in (conditions ?: [])) {
+                    if(!(cond instanceof Map)){ec.message.addError('Each condition must contain typed fields.');return}
+                    def result=ec.service.sync().name('zenith.pricing.RuleServices.validate#RuleCondition').parameters([organizationPartyId:scope.organizationPartyId,values:cond]).call()
+                    if(!result.valid || ec.message.hasError()) return
+                    validated.add(result.fields)
+                }
+                def created=ec.entity.makeValue('zenith.erp.pricing.PricingRule').setAll(header.fields+[organizationPartyId:scope.organizationPartyId]).setSequencedIdPrimary().create()
+                pricingRuleId=created.pricingRuleId
+                validated.each {ec.entity.makeValue('zenith.erp.pricing.PricingRuleCondition').setAll(it+[pricingRuleId:pricingRuleId]).setSequencedIdPrimary().create()}
+            ]]></script>
+        </actions>
+    </service>
+    <service verb="update" noun="Rule">
+        <in-parameters><parameter name="pricingRuleId" required="true"/><parameter name="changes" type="Map" required="true"/></in-parameters>
+        <actions>
+            <service-call name="zenith.pricing.RuleServices.assert#RuleWriteAccess"/>
+            <service-call name="zenith.pricing.RuleServices.assert#RuleAccess" in-map="[pricingRuleId:pricingRuleId]" out-map="access"/>
+            <if condition="!access.allowed"><return/></if>
+            <script><![CDATA[
+                if(changes.containsKey('organizationPartyId') && changes.organizationPartyId!=access.rule.organizationPartyId){ec.message.addError('A pricing rule owner cannot be changed.');return}
+                def editable=['ruleName','description','priority','isActive','isStackable','validFromDate','validThruDate','actionType','actionValue','maxDiscount','minimumPrice']
+                // Disabling a legacy invalid rule must remain possible without applying its action.
+                if(changes.isActive=='N' && editable.findAll{changes.containsKey(it)}==['isActive']) {
+                    def stored=ec.entity.find('zenith.erp.pricing.PricingRule').condition('pricingRuleId',pricingRuleId).forUpdate(true).one()
+                    if(!stored || stored.organizationPartyId!=access.rule.organizationPartyId){ec.message.addError('Pricing rule changed; refresh before updating.');return}
+                    stored.isActive='N';stored.update();return
+                }
+                def values=[:]+access.rule
+                editable.each{if(changes.containsKey(it)) values[it]=changes[it]}
+                def validated=ec.service.sync().name('zenith.pricing.RuleServices.validate#RuleHeader').parameters([values:values]).call()
+                if(!validated.valid || ec.message.hasError()) return
+                if(validated.fields.isActive=='Y') {
+                    for(condition in ec.entity.find('zenith.erp.pricing.PricingRuleCondition').condition('pricingRuleId',pricingRuleId).list()) {
+                        def check=ec.service.sync().name('zenith.pricing.RuleServices.validate#RuleCondition').parameters([organizationPartyId:access.rule.organizationPartyId,values:condition]).call()
+                        if(!check.valid || ec.message.hasError()) return
+                    }
+                }
+                def stored=ec.entity.find('zenith.erp.pricing.PricingRule').condition('pricingRuleId',pricingRuleId).forUpdate(true).one()
+                if(!stored || stored.organizationPartyId!=access.rule.organizationPartyId){ec.message.addError('Pricing rule changed; refresh before updating.');return}
+                stored.setAll(validated.fields);stored.update()
+            ]]></script>
+        </actions>
+    </service>
+    <service verb="add" noun="Condition">
+        <in-parameters><parameter name="pricingRuleId" required="true"/><parameter name="conditionTypeEnumId" required="true"/><parameter name="operator" default-value="equals"/><parameter name="fieldValue"/><parameter name="fieldValueTo"/></in-parameters>
+        <out-parameters><parameter name="conditionId"/></out-parameters>
+        <actions>
+            <service-call name="zenith.pricing.RuleServices.assert#RuleWriteAccess"/>
+            <service-call name="zenith.pricing.RuleServices.assert#RuleAccess" in-map="[pricingRuleId:pricingRuleId]" out-map="access"/>
+            <if condition="!access.allowed"><return/></if>
+            <service-call name="zenith.pricing.RuleServices.validate#RuleCondition" in-map="[organizationPartyId:access.rule.organizationPartyId,values:new LinkedHashMap(context)]" out-map="validated"/>
+            <if condition="validated.valid"><service-call name="create#zenith.erp.pricing.PricingRuleCondition" in-map="validated.fields+[pricingRuleId:pricingRuleId]" out-map="context"/></if>
+        </actions>
+    </service>
+    <service verb="duplicate" noun="Rule">
+        <in-parameters><parameter name="pricingRuleId" required="true"/></in-parameters>
+        <out-parameters><parameter name="newRuleId"/></out-parameters>
+        <actions>
+            <service-call name="zenith.pricing.RuleServices.assert#RuleWriteAccess"/>
+            <service-call name="zenith.pricing.RuleServices.assert#RuleAccess" in-map="[pricingRuleId:pricingRuleId]" out-map="access"/>
+            <if condition="!access.allowed"><return/></if>
+            <script><![CDATA[
+                def conditions=ec.entity.find('zenith.erp.pricing.PricingRuleCondition').condition('pricingRuleId',pricingRuleId).orderBy('conditionId').list()
+                def values=[:]+access.rule;values.ruleName=(access.rule.ruleName ?: 'Rule')+' (copy)';values.isActive='N';values.conditions=conditions
+                def result=ec.service.sync().name('zenith.pricing.RuleServices.create#Rule').parameters(values).call()
+                if(!ec.message.hasError()) newRuleId=result.pricingRuleId
+            ]]></script>
+        </actions>
+    </service>
+    <service verb="delete" noun="Condition">
+        <in-parameters><parameter name="conditionId" required="true"/></in-parameters>
+        <actions>
+            <service-call name="zenith.pricing.RuleServices.assert#RuleWriteAccess"/>
+            <entity-find-one entity-name="zenith.erp.pricing.PricingRuleCondition" value-field="condition"/>
+            <service-call name="zenith.pricing.RuleServices.assert#RuleAccess" in-map="[pricingRuleId:condition?.pricingRuleId]" out-map="access"/>
+            <if condition="condition &amp;&amp; access.allowed"><service-call name="delete#zenith.erp.pricing.PricingRuleCondition" in-map="[conditionId:conditionId]"/></if>
+        </actions>
+    </service>
+    <service verb="delete" noun="Rule">
+        <in-parameters><parameter name="pricingRuleId" required="true"/></in-parameters>
+        <actions>
+            <service-call name="zenith.pricing.RuleServices.assert#RuleWriteAccess"/>
+            <service-call name="zenith.pricing.RuleServices.assert#RuleAccess" in-map="[pricingRuleId:pricingRuleId]" out-map="access"/>
+            <if condition="!access.allowed"><return/></if>
+            <script><![CDATA[
+                ec.entity.find('zenith.erp.pricing.PricingRuleCondition').condition('pricingRuleId',pricingRuleId).list().each{it.delete()}
+                ec.entity.find('zenith.erp.pricing.PricingRule').condition('pricingRuleId',pricingRuleId).one().delete()
+            ]]></script>
+        </actions>
+    </service>
+</services>
