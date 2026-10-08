@@ -1,0 +1,262 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+    <service verb="get" noun="StockAdjustmentScope">
+        <out-parameters><parameter name="organizationPartyId"/></out-parameters>
+        <actions><script><![CDATA[
+            def selected = ec.user.getPreference('ACTIVE_ORGANIZATION')
+            organizationPartyId = '_NA_'
+            if (!selected || selected == '_NA_') return
+            if (!ec.user.isInGroup('ADMIN')) {
+                def membership = ec.service.sync().name('mantle.party.PartyServices.get#PartyOrganizationInfo').parameters([partyId:ec.user.userAccount?.partyId]).call()
+                if (!membership?.userOrgIds?.contains(selected)) return
+            }
+            organizationPartyId = selected
+        ]]></script></actions>
+    </service>
+    <service verb="assert" noun="StockAdjustmentAccess">
+        <in-parameters><parameter name="stockAdjustmentId" required="true"/></in-parameters>
+        <out-parameters><parameter name="allowed" type="Boolean"/></out-parameters>
+        <actions><script><![CDATA[
+            def activeOrg = ec.user.getPreference('ACTIVE_ORGANIZATION')
+            def adjustment = ec.entity.find('zenith.erp.inventory.StockAdjustment').condition('stockAdjustmentId', stockAdjustmentId).one()
+            allowed = !!(activeOrg && activeOrg != '_NA_' && adjustment && adjustment.organizationPartyId == activeOrg)
+            if (allowed) {
+                def warehouse = ec.entity.find('mantle.facility.Facility').condition('facilityId', adjustment.facilityId).one()
+                allowed = !!(warehouse && warehouse.ownerPartyId == activeOrg)
+            }
+            if (allowed && !ec.user.isInGroup('ADMIN')) {
+                def membership = ec.service.sync().name('mantle.party.PartyServices.get#PartyOrganizationInfo').parameters([partyId:ec.user.userAccount?.partyId]).call()
+                allowed = !!membership?.userOrgIds?.contains(activeOrg)
+            }
+        ]]></script></actions>
+    </service>
+    <!-- Serialize every line/state mutation on the parent. Even admins stay in the selected tenant. -->
+    <service verb="require" noun="StockAdjustmentWrite">
+        <in-parameters><parameter name="stockAdjustmentId"/><parameter name="requiredStatus"/></in-parameters>
+        <out-parameters><parameter name="organizationPartyId"/><parameter name="adjustment" type="Map"/></out-parameters>
+        <actions>
+            <service-call name="zenith.base.SecurityServices.check#ModuleWriteAccess" in-map="[moduleId:'inventory']" out-map="access"/>
+            <if condition="!access.canWrite"><return error="true" message="You have view-only access to Inventory."/></if>
+            <set field="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <if condition="!organizationPartyId || organizationPartyId == '_NA_'"><return error="true" message="Select an organization before changing stock adjustments."/></if>
+            <if condition="!ec.user.isInGroup('ADMIN')">
+                <service-call name="mantle.party.PartyServices.get#PartyOrganizationInfo" in-map="[partyId:ec.user.userAccount?.partyId]" out-map="membership"/>
+                <if condition="!membership.userOrgIds?.contains(organizationPartyId)"><return error="true" message="You do not belong to the selected organization."/></if>
+            </if>
+            <if condition="stockAdjustmentId">
+                <entity-find-one entity-name="zenith.erp.inventory.StockAdjustment" value-field="adjustment" for-update="true"/>
+                <if condition="adjustment == null || adjustment.organizationPartyId != organizationPartyId"><return error="true" message="You do not have access to this stock adjustment."/></if>
+                <if condition="requiredStatus &amp;&amp; adjustment.statusId != requiredStatus"><return error="true" message="This action is not available in the adjustment's current status."/></if>
+                <entity-find-one entity-name="mantle.facility.Facility" value-field="warehouse"><field-map field-name="facilityId" from="adjustment.facilityId"/></entity-find-one>
+                <if condition="warehouse == null || warehouse.ownerPartyId != organizationPartyId"><return error="true" message="The warehouse must belong to your active organization."/></if>
+            </if>
+        </actions>
+    </service>
+    <service verb="create" noun="StockAdjustment">
+        <in-parameters><parameter name="facilityId" required="true"/><parameter name="adjustmentType" required="true"/><parameter name="adjustmentDate" type="Timestamp"/><parameter name="remarks"/></in-parameters>
+        <out-parameters><parameter name="stockAdjustmentId"/></out-parameters>
+        <actions>
+            <service-call name="zenith.inventory.StockAdjustmentServices.require#StockAdjustmentWrite" out-map="guard"/>
+            <entity-find-one entity-name="mantle.facility.Facility" value-field="warehouse"/>
+            <if condition="warehouse == null || warehouse.ownerPartyId != guard.organizationPartyId"><return error="true" message="Choose a warehouse from your active organization."/></if>
+            <if condition="!(adjustmentType in ['PhysicalCount','Opening','Damage','Expiry','WriteOff'])"><return error="true" message="Choose a valid adjustment reason."/></if>
+            <service-call name="create#zenith.erp.inventory.StockAdjustment" in-map="[organizationPartyId:guard.organizationPartyId, facilityId:facilityId, adjustmentType:adjustmentType, adjustmentDate:adjustmentDate ?: ec.user.nowTimestamp, remarks:remarks, statusId:'AdjPending', adjustedBy:ec.user.userId]" out-map="created"/>
+            <set field="stockAdjustmentId" from="created.stockAdjustmentId"/>
+        </actions>
+    </service>
+    <service verb="add" noun="StockAdjustmentItem" no-tx-cache="true">
+        <in-parameters><parameter name="stockAdjustmentId" required="true"/><parameter name="productId" required="true"/><parameter name="actualQuantity" type="BigDecimal" required="true"/><parameter name="assetId"/><parameter name="countedSerialNumbers"/><parameter name="remarks"/></in-parameters>
+        <out-parameters><parameter name="adjustmentItemSeqId"/></out-parameters>
+        <actions>
+            <service-call name="zenith.inventory.StockAdjustmentServices.require#StockAdjustmentWrite" in-map="[stockAdjustmentId:stockAdjustmentId, requiredStatus:'AdjPending']" out-map="guard"/>
+            <script><![CDATA[
+                def prod = ec.entity.find('mantle.product.Product').condition('productId', productId).one()
+                if (!prod || prod.ownerPartyId != guard.organizationPartyId) { ec.message.addError('Choose a product from your active organization.'); return }
+                if (actualQuantity == null || actualQuantity < 0 || actualQuantity.stripTrailingZeros().scale() > 6) { ec.message.addError('Actual count must be zero or greater, with at most six decimal places.'); return }
+                def batch = prod.enableBatchTracking == 'Y'
+                if (batch && !assetId) { ec.message.addError('Choose the exact batch asset to count.'); return }
+                if (!batch && assetId) { ec.message.addError('Ordinary products count all assets at this warehouse; leave the batch asset empty.'); return }
+                def assets = ec.entity.find('mantle.product.asset.Asset').condition('ownerPartyId', guard.organizationPartyId)
+                    .condition('productId', productId).condition('facilityId', guard.adjustment.facilityId).condition('assetTypeEnumId', 'AstTpInventory').orderBy('assetId').forUpdate(true).list()
+                if (batch) assets = assets.findAll { it.assetId == assetId && it.batchNumber }
+                if (batch && !assets) { ec.message.addError('Choose an existing batch for this product at this warehouse. Register new lots through Receiving.'); return }
+                def existing = ec.entity.find('zenith.erp.inventory.StockAdjustmentItem').condition('stockAdjustmentId', stockAdjustmentId).condition('productId', productId).list()
+                if (existing.any { !batch || it.assetId == assetId }) { ec.message.addError('This product or batch is already counted. Remove its draft line before recounting.'); return }
+                def system = assets.sum { it.quantityOnHandTotal ?: 0G } ?: 0G
+                def free = assets.sum { it.availableToPromiseTotal ?: 0G } ?: 0G
+                if (assets.any { (it.quantityOnHandTotal ?: 0G) < 0 || (it.availableToPromiseTotal ?: 0G) < 0 || (it.availableToPromiseTotal ?: 0G) > (it.quantityOnHandTotal ?: 0G) }) { ec.message.addError('Resolve inconsistent asset balances before counting this product.'); return }
+                if (actualQuantity < system - free) { ec.message.addError('The count cannot remove stock reserved for orders. Release the reservations first.'); return }
+                if (guard.adjustment.adjustmentType in ['Damage','Expiry','WriteOff'] && actualQuantity > system) { ec.message.addError('Damage, expiry and write-off counts cannot increase stock.'); return }
+                def snapshot = assets.collect { [assetId:it.assetId, quantity:it.quantityOnHandTotal ?: 0G, batch:it.batchNumber, expiry:it.expiryDate?.time] }
+                def serialData = null
+                def serialText = countedSerialNumbers?.trim()
+                if (prod.enableSerialTracking != 'Y' && serialText) { ec.message.addError('This product does not track serial numbers.'); return }
+                if (prod.enableSerialTracking == 'Y') {
+                    if (actualQuantity.stripTrailingZeros().scale() > 0) { ec.message.addError('Serial counts must be whole numbers.'); return }
+                    def names = serialText ? serialText.split(/[\r\n,;]+/).collect { it.trim() }.findAll { it } : []
+                    if (names.size() != names.toSet().size() || (names.size() as BigDecimal) != actualQuantity) { ec.message.addError('List each counted serial once, matching the actual count. For zero leave the serial list empty.'); return }
+                    def sns = ec.entity.find('zenith.erp.inventory.ProductSerialNumber').condition('productId', productId).condition('facilityId', guard.adjustment.facilityId).orderBy('serialNumberId').forUpdate(true).list()
+                    if (batch) sns = sns.findAll { it.batchNumber == assets[0].batchNumber && (!it.assetId || it.assetId == assetId) }
+                    def current = sns.findAll { it.statusId in ['SnInStock','SnReserved'] }
+                    if (system.stripTrailingZeros().scale() > 0 || (current.size() as BigDecimal) != system) { ec.message.addError('Serial identities and the system quantity do not agree. Resolve them before counting.'); return }
+                    def picked = []
+                    for (name in names) {
+                        def matches = sns.findAll { it.serialNumber == name && it.statusId in ['SnInStock','SnReserved','SnReturned'] }
+                        if (matches.size() != 1) { ec.message.addError('Counted serials must uniquely identify in-stock, reserved or registered returned units at this warehouse.'); return }
+                        picked.add(matches[0])
+                    }
+                    if (current.any { it.statusId == 'SnReserved' && !picked.contains(it) }) { ec.message.addError('Reserved serials must be included in the count. Release their orders first.'); return }
+                    serialData = [rows:(current + picked.findAll { it.statusId == 'SnReturned' }).collect { [id:it.serialNumberId, status:it.statusId, asset:it.assetId, batch:it.batchNumber] }, counted:picked.collect { it.serialNumberId }]
+                }
+                def created = ec.service.sync().name('create#zenith.erp.inventory.StockAdjustmentItem').parameters([
+                    stockAdjustmentId:stockAdjustmentId, productId:productId, assetId:batch ? assetId : null,
+                    systemQuantity:system, actualQuantity:actualQuantity, differenceQuantity:actualQuantity-system,
+                    stockSnapshot:groovy.json.JsonOutput.toJson(snapshot), serialSnapshot:serialData ? groovy.json.JsonOutput.toJson(serialData) : null, remarks:remarks]).call()
+                adjustmentItemSeqId = created.adjustmentItemSeqId
+            ]]></script>
+        </actions>
+    </service>
+    <service verb="delete" noun="StockAdjustmentItem">
+        <in-parameters><parameter name="stockAdjustmentId" required="true"/><parameter name="adjustmentItemSeqId" required="true"/></in-parameters>
+        <actions>
+            <service-call name="zenith.inventory.StockAdjustmentServices.require#StockAdjustmentWrite" in-map="[stockAdjustmentId:stockAdjustmentId, requiredStatus:'AdjPending']"/>
+            <entity-find-one entity-name="zenith.erp.inventory.StockAdjustmentItem" value-field="line"/>
+            <if condition="line == null"><return error="true" message="Count line not found."/></if>
+            <entity-delete value-field="line"/>
+        </actions>
+    </service>
+    <!-- Build and validate every movement before any write. Recheck under asset/serial locks at apply. -->
+    <service verb="validate" noun="StockAdjustmentCounts" no-tx-cache="true">
+        <in-parameters><parameter name="stockAdjustmentId" required="true"/></in-parameters>
+        <out-parameters><parameter name="plans" type="List"/></out-parameters>
+        <actions>
+            <service-call name="zenith.inventory.StockAdjustmentServices.require#StockAdjustmentWrite" in-map="[stockAdjustmentId:stockAdjustmentId]" out-map="guard"/>
+            <script><![CDATA[
+                if (!(guard.adjustment.statusId in ['AdjPending','AdjApproved'])) { ec.message.addError('Only draft or approved adjustments can update stock.'); return }
+                def lines = ec.entity.find('zenith.erp.inventory.StockAdjustmentItem').condition('stockAdjustmentId', stockAdjustmentId).orderBy('productId,assetId,adjustmentItemSeqId').list()
+                if (!lines) { ec.message.addError('Add at least one counted product before approval.'); return }
+                ec.entity.find('mantle.facility.Facility').condition('facilityId', guard.adjustment.facilityId).forUpdate(true).one()
+                plans = []; def used = new HashSet()
+                for (line in lines) {
+                    def prod = ec.entity.find('mantle.product.Product').condition('productId', line.productId).one()
+                    if (!prod || prod.ownerPartyId != guard.organizationPartyId || line.actualQuantity == null || line.actualQuantity < 0 || !line.stockSnapshot) { ec.message.addError('Remove and recount invalid or legacy count lines before applying.'); continue }
+                    def batch = prod.enableBatchTracking == 'Y'
+                    def key = line.productId + ':' + (batch ? line.assetId : '*')
+                    if (!used.add(key)) { ec.message.addError('Duplicate count lines are not allowed.'); continue }
+                    def assets = ec.entity.find('mantle.product.asset.Asset').condition('ownerPartyId', guard.organizationPartyId).condition('productId', line.productId)
+                        .condition('facilityId', guard.adjustment.facilityId).condition('assetTypeEnumId', 'AstTpInventory').orderBy('assetId').forUpdate(true).list()
+                    if (batch) assets = assets.findAll { it.assetId == line.assetId && it.batchNumber }
+                    def snapshot
+                    try { snapshot = new groovy.json.JsonSlurper().parseText(line.stockSnapshot) } catch (Exception ignored) { ec.message.addError('Remove and recount the invalid stock snapshot.'); continue }
+                    def current = assets.collect { [assetId:it.assetId, quantity:it.quantityOnHandTotal ?: 0G, batch:it.batchNumber, expiry:it.expiryDate?.time] }
+                    def total = assets.sum { it.quantityOnHandTotal ?: 0G } ?: 0G
+                    if (current != snapshot || total != line.systemQuantity || (batch && !assets) || (!batch && line.assetId)) { ec.message.addError('Stock changed since counting ' + prod.productName + '. Reopen, remove its line and recount.'); continue }
+                    def free = assets.sum { it.availableToPromiseTotal ?: 0G } ?: 0G
+                    if (assets.any { (it.quantityOnHandTotal ?: 0G) < 0 || (it.availableToPromiseTotal ?: 0G) < 0 || (it.availableToPromiseTotal ?: 0G) > (it.quantityOnHandTotal ?: 0G) } || line.actualQuantity < total-free) { ec.message.addError('The count would remove reserved stock or use an inconsistent asset balance.'); continue }
+                    def diff = line.actualQuantity-total
+                    if (guard.adjustment.adjustmentType in ['Damage','Expiry','WriteOff'] && diff > 0) { ec.message.addError('This adjustment reason cannot increase stock.'); continue }
+                    def changes = []
+                    if (diff > 0) changes.add([asset:assets ? assets[0] : null, diff:diff])
+                    if (diff < 0) {
+                        def needed = -diff
+                        for (asset in assets) {
+                            def take = [(asset.availableToPromiseTotal ?: 0G), needed].min()
+                            if (take > 0) changes.add([asset:asset, diff:-take])
+                            needed -= take
+                            if (needed == 0) break
+                        }
+                        if (needed != 0) { ec.message.addError('Not enough unreserved stock for this count.'); continue }
+                    }
+                    def serialChanges = []; def serialData = null
+                    if (prod.enableSerialTracking == 'Y') {
+                        if (!line.serialSnapshot || line.actualQuantity.stripTrailingZeros().scale() > 0) { ec.message.addError('Remove and recount this serial product with its identities.'); continue }
+                        try { serialData = new groovy.json.JsonSlurper().parseText(line.serialSnapshot) } catch (Exception ignored) { ec.message.addError('Remove and recount the invalid serial snapshot.'); continue }
+                        def data = serialData
+                        if (!(data.rows instanceof List) || !(data.counted instanceof List)) { ec.message.addError('Remove and recount the invalid serial snapshot.'); continue }
+                        def sns = ec.entity.find('zenith.erp.inventory.ProductSerialNumber').condition('productId', line.productId).condition('facilityId', guard.adjustment.facilityId).orderBy('serialNumberId').forUpdate(true).list()
+                        if (batch) sns = sns.findAll { it.batchNumber == assets[0].batchNumber && (!it.assetId || it.assetId == line.assetId) }
+                        def ids = data.rows.collect { it.id }.toSet()
+                        def now = sns.findAll { it.statusId in ['SnInStock','SnReserved'] || ids.contains(it.serialNumberId) }.collect { [id:it.serialNumberId, status:it.statusId, asset:it.assetId, batch:it.batchNumber] }
+                        def counted = data.counted as Set
+                        if (now.sort { it.id } != data.rows.sort { it.id } || (counted.size() as BigDecimal) != line.actualQuantity || !ids.containsAll(counted) || total.stripTrailingZeros().scale() > 0 || (now.count { it.status in ['SnInStock','SnReserved'] } as BigDecimal) != total || now.any { it.status == 'SnReserved' && !counted.contains(it.id) }) { ec.message.addError('Serial identities changed since counting. Reopen and recount this product.'); continue }
+                        for (sn in sns) {
+                            def next = counted.contains(sn.serialNumberId) ? (sn.statusId == 'SnReturned' ? 'SnInStock' : sn.statusId) : (sn.statusId == 'SnInStock' ? 'SnScrapped' : sn.statusId)
+                            if (next != sn.statusId) serialChanges.add([serial:sn, from:sn.statusId, to:next])
+                        }
+                    } else if (line.serialSnapshot) { ec.message.addError('Product tracking changed; remove and recount this line.'); continue }
+                    if (prod.enableSerialTracking == 'Y') {
+                        def data = serialData
+                        def active = data.rows.findAll { it.status in ['SnInStock','SnReserved'] }
+                        def assetIds = assets.collect { it.assetId }.toSet()
+                        if (data.rows.any { !assetIds.contains(it.asset) } || assets.any { a ->
+                            (active.count { it.asset == a.assetId } as BigDecimal) != (a.quantityOnHandTotal ?: 0G) ||
+                            (active.count { it.asset == a.assetId && it.status == 'SnReserved' } as BigDecimal) != ((a.quantityOnHandTotal ?: 0G)-(a.availableToPromiseTotal ?: 0G))
+                        }) { ec.message.addError('Serial identities, asset balances and reservations must agree for each asset before applying.'); continue }
+                        changes = []
+                        for (a in assets) {
+                            def delta = serialChanges.findAll { it.serial.assetId == a.assetId }.sum { it.to == 'SnInStock' ? 1G : -1G } ?: 0G
+                            if (delta != 0G) changes.add([asset:a, diff:delta])
+                        }
+                    }
+                    plans.add([product:prod, line:line, changes:changes, serialChanges:serialChanges])
+                }
+            ]]></script>
+        </actions>
+    </service>
+    <service verb="approve" noun="StockAdjustment">
+        <in-parameters><parameter name="stockAdjustmentId" required="true"/></in-parameters>
+        <actions>
+            <service-call name="zenith.inventory.StockAdjustmentServices.require#StockAdjustmentWrite" in-map="[stockAdjustmentId:stockAdjustmentId, requiredStatus:'AdjPending']" out-map="guard"/>
+            <service-call name="zenith.inventory.StockAdjustmentServices.validate#StockAdjustmentCounts" in-map="[stockAdjustmentId:stockAdjustmentId]"/>
+            <service-call name="update#zenith.erp.inventory.StockAdjustment" in-map="[stockAdjustmentId:stockAdjustmentId, statusId:'AdjApproved']"/>
+            <message>Counts approved. Apply them to update stock, or reopen to correct the draft.</message>
+        </actions>
+    </service>
+    <service verb="reopen" noun="StockAdjustment">
+        <in-parameters><parameter name="stockAdjustmentId" required="true"/></in-parameters>
+        <actions>
+            <service-call name="zenith.inventory.StockAdjustmentServices.require#StockAdjustmentWrite" in-map="[stockAdjustmentId:stockAdjustmentId, requiredStatus:'AdjApproved']"/>
+            <service-call name="update#zenith.erp.inventory.StockAdjustment" in-map="[stockAdjustmentId:stockAdjustmentId, statusId:'AdjPending']"/>
+        </actions>
+    </service>
+    <service verb="apply" noun="StockAdjustment" no-tx-cache="true">
+        <in-parameters><parameter name="stockAdjustmentId" required="true"/></in-parameters>
+        <actions>
+            <service-call name="zenith.inventory.StockAdjustmentServices.require#StockAdjustmentWrite" in-map="[stockAdjustmentId:stockAdjustmentId, requiredStatus:'AdjApproved']" out-map="guard"/>
+            <service-call name="zenith.inventory.StockAdjustmentServices.validate#StockAdjustmentCounts" in-map="[stockAdjustmentId:stockAdjustmentId]" out-map="validated"/>
+            <script><![CDATA[
+                for (plan in validated.plans) {
+                    for (part in plan.changes) {
+                        def asset = part.asset
+                        if (!asset) asset = ec.entity.makeValue('mantle.product.asset.Asset').setAll([
+                            assetTypeEnumId:'AstTpInventory', statusId:'AstAvailable', productId:plan.product.productId, ownerPartyId:guard.organizationPartyId,
+                            facilityId:guard.adjustment.facilityId, quantityOnHandTotal:0G, availableToPromiseTotal:0G]).setSequencedIdPrimary().create()
+                        def details = ec.entity.find('mantle.product.asset.AssetDetail').condition('assetId', asset.assetId).list()
+                        def qGap = (asset.quantityOnHandTotal ?: 0G) - (details.sum { it.quantityOnHandDiff ?: 0G } ?: 0G)
+                        def aGap = (asset.availableToPromiseTotal ?: 0G) - (details.sum { it.availableToPromiseDiff ?: 0G } ?: 0G)
+                        // The ledger EECA recomputes asset totals: reconcile a legacy opening balance,
+                        // then post the movement once. Do not also update the asset quantities directly.
+                        if (qGap != 0G || aGap != 0G) ec.entity.makeValue('mantle.product.asset.AssetDetail').setAll([
+                            assetId:asset.assetId, productId:asset.productId, effectiveDate:ec.user.nowTimestamp,
+                            quantityOnHandDiff:qGap, availableToPromiseDiff:aGap, description:'Opening balance before stock adjustment ' + stockAdjustmentId]).setSequencedIdPrimary().create()
+                        ec.entity.makeValue('mantle.product.asset.AssetDetail').setAll([
+                            assetId:asset.assetId, productId:asset.productId, effectiveDate:guard.adjustment.adjustmentDate,
+                            quantityOnHandDiff:part.diff, availableToPromiseDiff:part.diff,
+                            description:'Stock adjustment ' + stockAdjustmentId + ' (' + guard.adjustment.adjustmentType + ')']).setSequencedIdPrimary().create()
+                    }
+                    for (change in plan.serialChanges) {
+                        change.serial.statusId = change.to; change.serial.update()
+                        ec.entity.makeValue('zenith.erp.inventory.SerialNumberHistory').setAll([
+                            serialNumberId:change.serial.serialNumberId, eventDate:ec.user.nowTimestamp, eventType:'Stock adjustment',
+                            fromStatusId:change.from, toStatusId:change.to, fromFacilityId:guard.adjustment.facilityId, toFacilityId:guard.adjustment.facilityId,
+                            referenceType:'StockAdjustment', referenceId:stockAdjustmentId, performedByUserId:ec.user.userId,
+                            notes:'Counted identities approved before applying']).setSequencedIdPrimary().create()
+                    }
+                    ec.service.sync().name('update#mantle.product.Product').parameters([productId:plan.product.productId, inventoryTracked:'Y']).call()
+                }
+            ]]></script>
+            <service-call name="update#zenith.erp.inventory.StockAdjustment" in-map="[stockAdjustmentId:stockAdjustmentId, statusId:'AdjApplied']"/>
+            <message>Stock adjustment applied. On-hand quantities now match the approved counts.</message>
+        </actions>
+    </service>
+</services>

@@ -490,17 +490,7 @@
         <in-parameters><parameter name="stockAdjustmentId" required="true"/></in-parameters>
         <out-parameters><parameter name="allowed" type="Boolean"/></out-parameters>
         <actions>
-            <script><![CDATA[
-                allowed = true
-                if (!ec.user.isInGroup('ADMIN')) {
-                    def activeOrg = ec.user.getPreference('ACTIVE_ORGANIZATION')
-                    def a = ec.entity.find('zenith.erp.inventory.StockAdjustment')
-                            .condition('stockAdjustmentId', stockAdjustmentId).disableAuthz().one()
-                    if (a == null || !activeOrg || activeOrg == '_NA_' || a.organizationPartyId != activeOrg) {
-                        allowed = false
-                    }
-                }
-            ]]></script>
+            <service-call name="zenith.inventory.StockAdjustmentServices.assert#StockAdjustmentAccess" in-map="context" out-map="context"/>
         </actions>
     </service>
 
@@ -515,91 +505,31 @@
             <parameter name="stockAdjustmentId"/>
         </out-parameters>
         <actions>
-            <service-call name="create#zenith.erp.inventory.StockAdjustment" out-map="context"
-                in-map="[facilityId:facilityId, adjustmentType:adjustmentType, adjustmentDate:adjustmentDate, remarks:remarks, statusId:'AdjPending', adjustedBy:ec.user.userId, organizationPartyId:ec.user.getPreference('ACTIVE_ORGANIZATION')]"/>
+            <service-call name="zenith.inventory.StockAdjustmentServices.create#StockAdjustment" in-map="context" out-map="context"/>
         </actions>
     </service>
 
     <!-- Add a product line to an adjustment: captures current system qty + computes the difference -->
-    <service verb="add" noun="StockAdjustmentItem">
+    <service verb="add" noun="StockAdjustmentItem" no-tx-cache="true">
         <in-parameters>
             <parameter name="stockAdjustmentId" required="true"/>
             <parameter name="productId" required="true"/>
             <parameter name="actualQuantity" type="BigDecimal" required="true"/>
             <parameter name="remarks"/>
+            <parameter name="assetId"/>
+            <parameter name="countedSerialNumbers"/>
         </in-parameters>
         <actions>
-            <entity-find-one entity-name="zenith.erp.inventory.StockAdjustment" value-field="adj"/>
-            <if condition="!adj"><return error="true" message="Adjustment not found"/></if>
-            <!-- ZE-INV-IV-06A: server-side cross-tenant guard (defense-in-depth for any non-screen caller) -->
-            <if condition="!ec.user.isInGroup('ADMIN') &amp;&amp; ec.user.getPreference('ACTIVE_ORGANIZATION') != adj.organizationPartyId">
-                <return error="true" message="You do not have access to this stock adjustment."/>
-            </if>
-            <if condition="(actualQuantity as BigDecimal).compareTo(BigDecimal.ZERO) &lt; 0">
-                <return error="true" message="Counted quantity cannot be negative."/>
-            </if>
-            <set field="org" from="adj.organizationPartyId ?: ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-            <entity-find entity-name="mantle.product.asset.Asset" list="assets" limit="1">
-                <econdition field-name="ownerPartyId" from="org"/>
-                <econdition field-name="productId"/>
-                <!-- ZE-INV-IV-033: capture the system qty AT THE ADJUSTMENT'S FACILITY (was facility-agnostic —
-                     it grabbed the first asset at any facility), so the difference is per-facility and Apply
-                     posts to that facility. For a new product/facility this is 0 (no asset yet). -->
-                <econdition field-name="facilityId" from="adj.facilityId" ignore-if-empty="true"/>
-                <order-by field-name="assetId"/>
-            </entity-find>
-            <set field="sysQty" from="assets ? ((assets[0].quantityOnHandTotal ?: 0) as BigDecimal) : (0 as BigDecimal)"/>
-            <set field="diff" from="((actualQuantity ?: 0) as BigDecimal) - sysQty"/>
-            <service-call name="create#zenith.erp.inventory.StockAdjustmentItem"
-                in-map="[stockAdjustmentId:stockAdjustmentId, productId:productId, assetId:(assets ? assets[0].assetId : null),
-                         systemQuantity:sysQty, actualQuantity:actualQuantity, differenceQuantity:diff, remarks:remarks]"/>
+            <service-call name="zenith.inventory.StockAdjustmentServices.add#StockAdjustmentItem" in-map="context" out-map="context"/>
         </actions>
     </service>
 
-    <service verb="apply" noun="StockAdjustment">
+    <service verb="apply" noun="StockAdjustment" no-tx-cache="true">
         <in-parameters>
             <parameter name="stockAdjustmentId" required="true"/>
         </in-parameters>
         <actions>
-            <!-- for-update: serialize concurrent Apply clicks so the same adjustment can't post twice. -->
-            <entity-find-one entity-name="zenith.erp.inventory.StockAdjustment" value-field="adj" for-update="true"/>
-            <if condition="!adj"><return error="true" message="Adjustment not found"/></if>
-            <!-- ZE-INV-IV-06A: server-side cross-tenant guard (defense-in-depth for any non-screen caller) -->
-            <if condition="!ec.user.isInGroup('ADMIN') &amp;&amp; ec.user.getPreference('ACTIVE_ORGANIZATION') != adj.organizationPartyId">
-                <return error="true" message="You do not have access to this stock adjustment."/>
-            </if>
-            <if condition="adj.statusId == 'AdjApplied'"><return error="true" message="Already applied"/></if>
-            <set field="org" from="adj.organizationPartyId ?: ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-            <entity-find entity-name="zenith.erp.inventory.StockAdjustmentItem" list="adjItems">
-                <econdition field-name="stockAdjustmentId" from="stockAdjustmentId"/>
-            </entity-find>
-            <if condition="!adjItems"><return error="true" message="Add at least one product line before applying."/></if>
-            <set field="applied" from="0" type="Integer"/>
-            <iterate list="adjItems" entry="ai">
-                <if condition="ai.productId">
-                    <set field="d" from="ai.differenceQuantity"/>
-                    <if condition="d == null">
-                        <set field="d" from="((ai.actualQuantity ?: 0) as BigDecimal) - ((ai.systemQuantity ?: 0) as BigDecimal)"/>
-                    </if>
-                    <if condition="d != null &amp;&amp; (d as BigDecimal).compareTo(BigDecimal.ZERO) != 0">
-                        <!-- ZE-INV-IV-033: post the stock to the ADJUSTMENT'S FACILITY (adj.facilityId, required
-                             on create). It was omitted, so adjust#AssetOnHand fell back to the org's DEFAULT
-                             facility (or an existing asset at another facility) — the applied stock never
-                             appeared under the facility the user selected (Stock Levels / EditFacility). -->
-                        <service-call name="zenith.inventory.InventoryStockServices.adjust#AssetOnHand"
-                            in-map="[organizationPartyId:org, productId:ai.productId, quantityDiff:(d as BigDecimal),
-                                     facilityId:adj.facilityId,
-                                     reason:('Stock adjustment ' + stockAdjustmentId + ' (' + (adj.adjustmentType ?: '') + ')'),
-                                     effectiveDate:(adj.adjustmentDate ?: ec.user.nowTimestamp)]"/>
-                    </if>
-                    <!-- mark the product stock-tracked so future sales deplete it -->
-                    <service-call name="update#mantle.product.Product" in-map="[productId:ai.productId, inventoryTracked:'Y']"/>
-                    <set field="applied" from="applied + 1"/>
-                </if>
-            </iterate>
-            <service-call name="update#zenith.erp.inventory.StockAdjustment"
-                in-map="[stockAdjustmentId:stockAdjustmentId, statusId:'AdjApplied']"/>
-            <message>Stock adjustment applied — on-hand updated for ${applied} product(s).</message>
+            <service-call name="zenith.inventory.StockAdjustmentServices.apply#StockAdjustment" in-map="context" out-map="context"/>
         </actions>
     </service>
 
