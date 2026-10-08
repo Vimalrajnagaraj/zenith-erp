@@ -24,44 +24,31 @@
     return base + '/' + name + (qs ? ('?' + qs) : '');
   }
   function sessionToken() {
-    var el = document.querySelector('.mysub-session-token');
+    var el = document.querySelector('[name=moquiSessionToken]');
     return el ? el.value : '';
   }
   function ensureRazorpay(cb) {
     if (window.Razorpay) { cb(); return; }
     var s = document.getElementById('rzp-checkout-js');
-    if (s) { s.remove(); }
+    if (s) { s.addEventListener('load', cb); return; }
     s = document.createElement('script');
     s.id = 'rzp-checkout-js';
     s.src = 'https://checkout.razorpay.com/v1/checkout.js';
     s.onload = cb;
-    s.onerror = function () { releasePayment(); s.remove(); window.alert('Could not load the payment gateway. Check your connection and try again.'); };
+    s.onerror = function () { window.alert('Could not load the payment gateway. Check your connection and try again.'); };
     document.head.appendChild(s);
   }
 
-  var busyInvoice = null;
-  function releasePayment() {
-    busyInvoice = null;
-    document.querySelectorAll('.saas-pay-btn').forEach(function (btn) { btn.disabled = false; btn.removeAttribute('aria-busy'); });
-  }
   window.initiateSaasPayment = function (invoiceId) {
     if (!invoiceId) return;
-    if (busyInvoice) return;
-    if (!sessionToken()) { window.alert('Your session has expired. Reload the page before paying.'); return; }
-    busyInvoice = invoiceId;
-    document.querySelectorAll('.saas-pay-btn').forEach(function (btn) { btn.disabled = true; btn.setAttribute('aria-busy', 'true'); });
-    fetch(txnUrl('initiatePayment'), {
-      method: 'POST',
-      headers: { 'Accept': 'application/json', 'Content-Type': 'application/x-www-form-urlencoded' }, credentials: 'same-origin',
-      body: new URLSearchParams({saasInvoiceId: invoiceId, moquiSessionToken: sessionToken()}).toString()
+    fetch(txnUrl('initiatePayment', 'saasInvoiceId=' + encodeURIComponent(invoiceId)), {
+      headers: { 'Accept': 'application/json' }, credentials: 'same-origin'
     }).then(function (r) { return r.json(); }).then(function (data) {
       if (!data || !data.razorpayOrderId) {
-        releasePayment();
         window.alert('Could not start the payment.\n' + ((data && data.errors) || 'Please try again later.'));
         return;
       }
       ensureRazorpay(function () {
-        try {
         var rzp = new Razorpay({
           key: data.razorpayKeyId,
           amount: data.amount,
@@ -71,7 +58,6 @@
           order_id: data.razorpayOrderId,
           prefill: { email: data.adminEmail || '', contact: '' },
           theme: { color: '#7C3AED' },
-          modal: { ondismiss: releasePayment },
           handler: function (response) {
             var f = document.createElement('form');
             f.method = 'POST';
@@ -81,7 +67,6 @@
               razorpay_payment_id: response.razorpay_payment_id,
               razorpay_signature: response.razorpay_signature,
               saasInvoiceId: invoiceId,
-              returnSurface: /^\/qapps\//.test(window.location.pathname) ? 'qapps' : 'apps',
               moquiSessionToken: sessionToken()
             };
             Object.keys(fields).forEach(function (k) {
@@ -92,12 +77,8 @@
           }
         });
         rzp.open();
-        } catch (error) {
-          releasePayment();
-          window.alert('Could not open the payment gateway. Please try again later.');
-        }
       });
-    }).catch(function () { releasePayment(); window.alert('Error connecting to the payment gateway. Please try again.'); });
+    }).catch(function () { window.alert('Error connecting to the payment gateway. Please try again.'); });
   };
 
   document.addEventListener('click', function (e) {

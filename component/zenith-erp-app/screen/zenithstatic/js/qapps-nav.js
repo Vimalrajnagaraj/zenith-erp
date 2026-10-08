@@ -312,16 +312,7 @@
         var header = document.querySelector('.q-header');
         if (header) document.body.style.setProperty('--zq-contacts-header-height', (header.offsetHeight || 51) + 'px');
     }
-    // My Subscription keeps the content below its wrapped mobile toolbar.
-    function syncMySubscriptionHeader() {
-        if (!document.querySelector('.mysub-wrap')) {
-            document.body.style.removeProperty('--zq-mysub-header-height'); return;
-        }
-        var header = document.querySelector('.q-header');
-        if (header) document.body.style.setProperty('--zq-mysub-header-height', (header.offsetHeight || 51) + 'px');
-    }
     function updateSubnav() {
-        syncMySubscriptionHeader();
         if (!subBar) return;
         var rel = location.pathname.replace(/^\/qapps\/zenith/, '') || '/';
         // Home/Dashboard landing → the "Dashboards" hub (every ERP dashboard)
@@ -390,8 +381,6 @@
         else window.addEventListener('resize', syncContactsHeader);
         if (window.ResizeObserver) new ResizeObserver(syncSalesHeader).observe(header);
         else window.addEventListener('resize', syncSalesHeader);
-        if (window.ResizeObserver) new ResizeObserver(syncMySubscriptionHeader).observe(header);
-        else window.addEventListener('resize', syncMySubscriptionHeader);
         // collapse (persisted)
         try { if (localStorage.getItem('zqSideCollapsed') === '1') body.classList.add('zq-side-collapsed'); } catch (_e) {}
         var tgl = document.getElementById('zq-side-toggle');
