@@ -10,6 +10,7 @@ DO $$ BEGIN
  IF EXISTS (SELECT 1 FROM india_einvoice) OR EXISTS (SELECT 1 FROM india_eway_bill) THEN RAISE EXCEPTION 'Provider mock persisted a statutory record'; END IF;
  IF NOT EXISTS (SELECT 1 FROM invoice WHERE invoice_id='TAX_QA_INV_PURCHASE' AND invoice_total=140.25 AND total_taxable_amount=100 AND total_cess=12 AND round_off_amount=0.25) THEN RAISE EXCEPTION 'Tax-inclusive convention changed'; END IF;
  IF (SELECT count(*) FROM tax_registration WHERE party_id='TAX_QA_UI_CUST' AND organization_party_id='TAX_QA_A' AND description='Synthetic UI O''Brien edited')<>2 THEN RAISE EXCEPTION 'Both native registration create/edit flows must persist'; END IF;
+ IF (SELECT count(*) FROM tax_registration WHERE party_id='TAX_QA_UI_CUST' AND effective_from=DATE '2026-07-01' AND effective_thru=DATE '2027-08-01')<>2 THEN RAISE EXCEPTION 'Both native date create/edit flows must persist'; END IF;
  IF (SELECT count(*) FROM tax_exemption WHERE party_id='TAX_QA_UI_CUST' AND description='Synthetic exemption edited')<>2 THEN RAISE EXCEPTION 'Both exemption create/edit flows must persist'; END IF;
  IF EXISTS (SELECT 1 FROM tax_registration WHERE registration_number='NO_CSRF') THEN RAISE EXCEPTION 'CSRF request wrote a row'; END IF;
  IF (SELECT count(*) FROM tax_exemption WHERE organization_party_id='TAX_QA_A')<>4 THEN RAISE EXCEPTION 'Viewer or denied request wrote an exemption'; END IF;
