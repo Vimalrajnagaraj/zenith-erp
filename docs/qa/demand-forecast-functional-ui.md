@@ -28,12 +28,12 @@ Verified locally on 2026-10-08. Main screen: `component/zenith-erp-inventory/scr
 - Native history-find assertion verifies filter/view retention without placing a session token in the redirect URL. The viewer lookup assertion checks the actual forecast result, not merely HTTP success.
 - Browser checks on both surfaces at 320, 375, 768, 1024 and 1536 pixels: no page-level horizontal overflow. Chart scrolling remains inside its own container. Product lookup and populated history worked in `/qapps`; no browser console errors were observed.
 - XML parsing and the four repository lint guards passed. Commit hooks remain enabled.
-- Throwaway records were captured by their exact primary keys and purged, including test-user visit/login records. Zero residue was verified across 17 affected tables before commit. Local review samples are recreated separately at the user's request and must be removed before publication.
+- Throwaway records were captured by their exact primary keys and purged, including test-user visit/login records. Zero residue was verified across 17 affected tables before commit. Local review samples were recreated at the user's request, visually approved, then purged by captured primary keys before publication; zero residue verified across all 12 review tables.
 
 No stock, prices, tax rates, legal identifiers, invoices or bill numbers were fabricated. Synthetic completed-sales quantities and predictions were confined to local throwaway organizations. No billing services or issued documents were changed; no production system was accessed.
 
 ## Review and deployment gates
 
-The user requested visual review before pushing. GitHub PR creation and branch acceptance CI therefore remain pending push confirmation. Run repo-guards and staging acceptance against the published candidate SHA before marking the PR ready.
+The user approved the visual preview and authorized publication. Rebased onto the latest fetched master and resolved only additive stylesheet-registration overlaps while retaining newer registrations. Run repo-guards and staging acceptance against the published candidate SHA before marking the PR ready.
 
 **Deploy gate:** review the ownership/permission changes and nightly-job registration. Load the updated job seed using the normal deployment procedure; confirm the scheduler timezone and avoid a duplicate manually configured demand job. The 30-day distribution is an estimate from current forecast rates, not thirty days of independently stored predictions.
