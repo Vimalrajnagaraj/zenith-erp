@@ -7,53 +7,11 @@
 
     <transition name="findOrder"><default-response url="../FindPurchaseOrder"/></transition>
     
-    <transition name="updateOrder">
-        <actions>
-            <!-- ZE-INV-IV-06A: block editing another tenant's purchase order via a forged POST -->
-            <service-call name="zenith.purchase.PurchaseServices.assert#PurchaseOrderAccess" in-map="[orderId:orderId]" out-map="_acc"/>
-            <if condition="!_acc.allowed"><return error="true" message="You do not have access to this purchase order."/></if>
-            <service-call name="update#mantle.order.OrderHeader" in-map="context"/>
-        </actions>
-        <default-response url="."/>
-    </transition>
+    <transition name="updateOrder"><actions><service-call name="zenith.purchase.OperationsServices.update#PurchaseOrder" in-map="[orderId:orderId,updates:[orderName:ec.web.requestParameters.orderName,statusId:ec.web.requestParameters.statusId]]"/></actions><default-response url="."/><error-response url="."/></transition>
 
-    <transition name="addItem">
-        <actions>
-            <!-- ZE-SB-013 (Tier 2): the line-item product must belong to this org. -->
-            <if condition="ec.web.parameters.productId">
-                <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" out-map="_pa"
-                              in-map="[entityName:'mantle.product.Product', idField:'productId', idValue:ec.web.parameters.productId, orgField:'ownerPartyId']"/>
-                <if condition="!_pa.allowed"><return error="true" message="Please select a valid product from your account."/></if>
-            </if>
-            <!-- ZE-INV-IV-06A: block adding a line to another tenant's purchase order -->
-            <service-call name="zenith.purchase.PurchaseServices.assert#PurchaseOrderAccess" in-map="[orderId:orderId]" out-map="_acc"/>
-            <if condition="!_acc.allowed"><return error="true" message="You do not have access to this purchase order."/></if>
-            <!-- ZE-INV-IV-050: OrderItem's PK is orderId + orderPartSeqId + orderItemSeqId. The Add-Item form
-                 doesn't send orderPartSeqId, so the raw create#OrderItem failed "Order Part Seq ID cannot be
-                 empty" (500) on every new PO. create#Order always makes the single part '01' (and the whole
-                 screen keys off '01'), so pin the line to it. -->
-            <service-call name="create#mantle.order.OrderItem" in-map="context + [itemTypeEnumId:'ItemInventory', orderPartSeqId:'01']"/>
-            <!-- ZE-INV-IV-050: mantle.order.OrderServices.calculate#OrderTotal does NOT exist (Service not found -> 500
-                 rollback that discarded the just-created line). Recompute the header grand total with the real
-                 service update#OrderHeaderTotal; the per-part total is already maintained by Mantle's OrderItem SECA. -->
-            <script>ec.service.sync().name("mantle.order.OrderServices.update#OrderHeaderTotal").parameters([orderId:orderId]).call()</script>
-        </actions>
-        <default-response url="."/>
-    </transition>
+    <transition name="addItem"><actions><service-call name="zenith.purchase.OperationsServices.add#PurchaseOrderLine" in-map="[orderId:orderId,productId:productId,itemDescription:itemDescription,quantity:quantity,unitAmount:unitAmount,requiredByDate:requiredByDate]"/></actions><default-response url="."/><error-response url="."/></transition>
 
-    <transition name="deleteItem">
-        <actions>
-            <!-- ZE-INV-IV-06A: block removing a line from another tenant's purchase order -->
-            <service-call name="zenith.purchase.PurchaseServices.assert#PurchaseOrderAccess" in-map="[orderId:orderId]" out-map="_acc"/>
-            <if condition="!_acc.allowed"><return error="true" message="You do not have access to this purchase order."/></if>
-            <service-call name="delete#mantle.order.OrderItem" in-map="context"/>
-            <!-- ZE-INV-IV-050: mantle.order.OrderServices.calculate#OrderTotal does NOT exist (Service not found -> 500
-                 rollback that discarded the just-created line). Recompute the header grand total with the real
-                 service update#OrderHeaderTotal; the per-part total is already maintained by Mantle's OrderItem SECA. -->
-            <script>ec.service.sync().name("mantle.order.OrderServices.update#OrderHeaderTotal").parameters([orderId:orderId]).call()</script>
-        </actions>
-        <default-response url="."/>
-    </transition>
+    <transition name="deleteItem"><actions><service-call name="zenith.purchase.OperationsServices.delete#PurchaseOrderLine" in-map="[orderId:orderId,orderItemSeqId:orderItemSeqId]"/></actions><default-response url="."/><error-response url="."/></transition>
     
     <transition name="createVendorBill">
         <!-- Transition to explicitly convert this PO to a Purchase Invoice -->
@@ -64,6 +22,8 @@
     </transition>
 
     <actions>
+        <service-call name="zenith.purchase.OperationsServices.get#PurchaseOrganization" out-map="scope"/>
+        <set field="_org" from="scope.organizationPartyId ?: '__NO_ORGANIZATION__'"/>
         <!-- ZE-INV-IV-06A: org-isolation guard — only open a PO owned (bought) by the caller's active org
              (super-admins exempt). A PO's owner is OrderPart.customerPartyId. Load NOTHING when blocked. -->
         <service-call name="zenith.purchase.PurchaseServices.assert#PurchaseOrderAccess" in-map="[orderId:orderId]" out-map="_acc"/>
@@ -76,7 +36,7 @@
         </entity-find-one>
 
         <entity-find entity-name="mantle.order.OrderItem" list="orderItems">
-            <econdition field-name="orderId"/>
+            <econdition field-name="orderId"/><econdition field-name="orderPartSeqId" value="01"/>
             <order-by field-name="orderItemSeqId"/>
         </entity-find>
 
@@ -92,11 +52,11 @@
             'OrderCompleted': 'dark',
             'OrderCancelled': 'danger'
         ]"/>
-        <set field="statusColor" from="statusColorMap[order?.statusId] ?: 'dark'"/>
+        <set field="statusColor" from="statusColorMap[order?.statusId] ?: 'dark'"/><set field="currSymbol" from="order?.currencyUomId ?: ''"/>
         </if>
     </actions>
 
-    <widgets>
+    <widgets><container style="zpur-page">
         <link url="findOrder" text="Back to Purchase Orders" link-type="anchor"/>
 
         <!-- ZE-INV-IV-06A: cross-tenant / missing record — plain notice, never another org's PO -->
@@ -117,8 +77,8 @@
         <container style="zenith-profile-banner q-pa-lg bg-white shadow-1 border-radius-lg q-mb-lg">
             <container style="row items-center justify-between no-wrap">
                 <container style="row items-center">
-                    <container style="zenith-avatar q-mr-lg text-white; border-radius:12px; background:linear-gradient(135deg, #7C3AED, #463D7A);">
-                        <label text="PO" type="span" style="font-weight:bold; font-size:1.2rem;"/>
+                    <container style="zenith-avatar q-mr-lg zpur-po-avatar">
+                        <label text="PO" type="span" style="zpur-avatar-label"/>
                     </container>
                     <container style="column">
                         <label text="Purchase Order #${orderId}" type="h3" style="text-primary text-weight-bold q-my-none"/>
@@ -139,7 +99,7 @@
                                 </entity-options>
                             </drop-down>
                         </default-field></field>
-                        <field name="submitButton"><conditional-field name="save_write" condition="modCanWrite" title="Update Status"><submit/></conditional-field><default-field title="Update Status"><label text="You have view-only access — changes are disabled." type="span" style="text-grey-7"/></default-field></field>
+                        <field name="submitButton"><conditional-field name="save_write" condition="modCanWrite" title="Update Status"><submit/></conditional-field><default-field title="Update Status"><label text="Changes are unavailable for your account or this record." type="span" style="text-grey-7"/></default-field></field>
                         <field-layout><field-row><field-ref name="statusId"/><field-ref name="submitButton"/></field-row></field-layout>
                     </form-single>
                 </container>
@@ -184,7 +144,7 @@
                                 <field name="productId"><default-field title="Product">
                                     <drop-down allow-empty="true">
                                         <entity-options key="${productId}" text="${pseudoId} - ${productName}">
-                                            <entity-find entity-name="mantle.product.Product"><econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/><order-by field-name="productName"/></entity-find>
+                                            <entity-find entity-name="mantle.product.Product"><econdition field-name="ownerPartyId" from="orderPart?.customerPartyId ?: '__NO_ORGANIZATION__'"/><order-by field-name="productName"/></entity-find>
                                         </entity-options>
                                     </drop-down>
                                 </default-field></field>
@@ -238,7 +198,7 @@
                     <form-single name="OrderDetailsForm" transition="updateOrder" map="order">
                         <field name="orderId"><default-field><hidden/></default-field></field>
                         <field name="orderName"><default-field title="Reference / Title"><text-line/></default-field></field>
-                        <field name="submitButton"><conditional-field name="save_write" condition="modCanWrite" title="Save Details"><submit/></conditional-field><default-field title="Save Details"><label text="You have view-only access — changes are disabled." type="span" style="text-grey-7"/></default-field></field>
+                        <field name="submitButton"><conditional-field name="save_write" condition="modCanWrite &amp;&amp; order?.statusId=='OrderOpen'" title="Save Details"><submit/></conditional-field><default-field title="Save Details"><label text="Changes are unavailable for your account or this record." type="span" style="text-grey-7"/></default-field></field>
                     </form-single>
                 </container>
             </row-col>
@@ -246,5 +206,5 @@
         </widgets>
         </section>
 
-    </widgets>
+</container>    </widgets>
 </screen>

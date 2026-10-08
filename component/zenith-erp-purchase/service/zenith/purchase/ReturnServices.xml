@@ -1,0 +1,129 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+    <service verb="assert" noun="PurchaseReturn">
+        <in-parameters><parameter name="invoiceId" required="true"/><parameter name="editable" type="Boolean" default="false"/><parameter name="errorOnDenied" default-value="Y"/></in-parameters>
+        <out-parameters><parameter name="allowed" type="Boolean"/><parameter name="invoice" type="Map"/></out-parameters>
+        <actions><script><![CDATA[
+            invoice=ec.entity.find('mantle.account.invoice.Invoice').condition('invoiceId',invoiceId).disableAuthz().forUpdate(editable).one()
+            def org=ec.service.sync().name('zenith.purchase.OperationsServices.get#PurchaseOrganization').call().organizationPartyId
+            allowed=invoice!=null && invoice.invoiceTypeEnumId=='InvoiceDebitNote' && (ec.user.isInGroup('ADMIN') || (org && invoice.toPartyId==org))
+            if(editable && invoice?.statusId!='InvoiceInProcess') allowed=false
+            if(!allowed && errorOnDenied!='N') ec.message.addError('Debit note not found, outside your organization, or closed for editing.')
+        ]]></script></actions>
+    </service>
+    <service verb="create" noun="PurchaseReturn">
+        <in-parameters><parameter name="vendorPartyId"/><parameter name="organizationPartyId"/><parameter name="invoiceDate" required="true"/></in-parameters>
+        <out-parameters><parameter name="invoiceId"/></out-parameters>
+        <actions>
+            <service-call name="zenith.purchase.OperationsServices.assert#PurchaseWrite"/>
+            <service-call name="zenith.purchase.OperationsServices.get#PurchaseOrganization" out-map="scope"/>
+            <if condition="!scope.organizationPartyId || (organizationPartyId &amp;&amp; organizationPartyId!=scope.organizationPartyId)"><return error="true" message="Select your authorized active organization before creating a debit note."/></if>
+            <service-call name="zenith.purchase.OperationsServices.assert#PurchaseVendor" in-map="[vendorPartyId:vendorPartyId,organizationPartyId:scope.organizationPartyId]" out-map="vendor"/>
+            <if condition="!vendor.allowed"><return/></if>
+            <script><![CDATA[
+                def date
+                try {date=java.sql.Timestamp.valueOf(java.time.LocalDate.parse(invoiceDate.toString().trim()).atStartOfDay())} catch(Exception ignored) {ec.message.addError('Enter a valid return date.');return}
+                def currency=ec.entity.find('zenith.erp.base.CompanySettings').condition('organizationPartyId',scope.organizationPartyId).condition('settingKey','CURRENCY_UOM_ID').one()?.settingValue ?: 'INR'
+                if(ec.entity.find('moqui.basic.Uom').condition('uomId',currency).one()?.uomTypeEnumId!='UT_CURRENCY_MEASURE') {ec.message.addError('Configure a valid buying-organization currency.');return}
+                invoiceId=ec.service.sync().name('create#mantle.account.invoice.Invoice').parameters([invoiceTypeEnumId:'InvoiceDebitNote',statusId:'InvoiceInProcess',fromPartyId:vendorPartyId,toPartyId:scope.organizationPartyId,invoiceDate:date,currencyUomId:currency,invoiceTotal:0,unpaidTotal:0]).call().invoiceId
+            ]]></script>
+        </actions>
+    </service>
+    <service verb="update" noun="PurchaseReturn">
+        <in-parameters><parameter name="invoiceId" required="true"/><parameter name="updates" type="Map" required="true"/></in-parameters>
+        <actions>
+            <service-call name="zenith.purchase.OperationsServices.assert#PurchaseWrite"/>
+            <service-call name="zenith.purchase.ReturnServices.assert#PurchaseReturn" in-map="[invoiceId:invoiceId,editable:true]" out-map="access"/>
+            <if condition="!access.allowed"><return/></if>
+            <script><![CDATA[
+                def patch=updates.findAll {k,v -> v!=null && k in ['vendorInvoiceNumber','purchaseOrderNumber','description','statusId']}
+                if(patch.statusId && patch.statusId!=access.invoice.statusId) {
+                    // Payment/settlement is never fabricated through a header status dropdown.
+                    if(!(patch.statusId in ['InvoiceFinalized','InvoiceCancelled'])) {ec.message.addError('Use an available draft workflow status; settlement requires its accounting workflow.');return}
+                    def flow=ec.entity.find('moqui.basic.StatusFlowTransition').condition('statusFlowId','Default').condition('statusId',access.invoice.statusId).condition('toStatusId',patch.statusId).one()
+                    if(!flow || (flow.userPermissionId && !ec.user.hasPermission(flow.userPermissionId))) {ec.message.addError('This debit-note status transition is unavailable.');return}
+                }
+                if(patch) ec.service.sync().name('update#mantle.account.invoice.Invoice').parameters(patch+[invoiceId:invoiceId]).call()
+            ]]></script>
+        </actions>
+    </service>
+    <service verb="refresh" noun="PurchaseReturnTotals">
+        <in-parameters><parameter name="invoiceId" required="true"/></in-parameters>
+        <actions>
+            <service-call name="zenith.purchase.OperationsServices.assert#PurchaseWrite"/>
+            <service-call name="zenith.purchase.ReturnServices.assert#PurchaseReturn" in-map="[invoiceId:invoiceId,editable:true]" out-map="access"/>
+            <if condition="!access.allowed"><return/></if>
+            <script><![CDATA[
+                def taxable=BigDecimal.ZERO,cgst=BigDecimal.ZERO,sgst=BigDecimal.ZERO,igst=BigDecimal.ZERO,cess=BigDecimal.ZERO
+                ec.entity.find('mantle.account.invoice.InvoiceItem').condition('invoiceId',invoiceId).list().each {line ->
+                    taxable+=(line.taxableAmount!=null ? line.taxableAmount : (line.quantity ?: 0)*(line.amount ?: 0)) as BigDecimal
+                    cgst+=(line.cgstAmount ?: 0) as BigDecimal;sgst+=(line.sgstAmount ?: 0) as BigDecimal;igst+=(line.igstAmount ?: 0) as BigDecimal;cess+=(line.cessAmount ?: 0) as BigDecimal
+                }
+                def tax=cgst+sgst+igst+cess,grand=taxable+tax
+                // Keep unrounded, tax-inclusive grand and unpaid totals; the stored round-off remains separate.
+                ec.service.sync().name('update#mantle.account.invoice.Invoice').parameters([invoiceId:invoiceId,invoiceTotal:grand,unpaidTotal:grand-(access.invoice.appliedPaymentsTotal ?: 0),totalTaxableAmount:taxable,totalTaxAmount:tax,totalCgst:cgst,totalSgst:sgst,totalIgst:igst,totalCess:cess]).call()
+            ]]></script>
+        </actions>
+    </service>
+    <service verb="add" noun="PurchaseReturnLine">
+        <in-parameters><parameter name="invoiceId" required="true"/><parameter name="productId"/><parameter name="description"/><parameter name="hsnSacCode" required="true"/><parameter name="quantity" type="BigDecimal" required="true"/><parameter name="amount" type="BigDecimal" required="true"/><parameter name="taxPercentage" type="BigDecimal" required="true"/></in-parameters>
+        <out-parameters><parameter name="invoiceItemSeqId"/></out-parameters>
+        <actions>
+            <service-call name="zenith.purchase.OperationsServices.assert#PurchaseWrite"/>
+            <service-call name="zenith.purchase.ReturnServices.assert#PurchaseReturn" in-map="[invoiceId:invoiceId,editable:true]" out-map="access"/>
+            <if condition="!access.allowed"><return/></if>
+            <script><![CDATA[
+                def bill=access.invoice
+                def product=productId ? ec.entity.find('mantle.product.Product').condition('productId',productId).disableAuthz().one() : null
+                if(productId && (!product || product.ownerPartyId!=bill.toPartyId)) {ec.message.addError('Select a product from the buying organization.');return}
+                if(quantity<=0 || amount<0 || !hsnSacCode.toString().matches('(?:[0-9]{4}|[0-9]{6}|[0-9]{8})') || ![0,5,12,18,28].any {taxPercentage==it} || (!productId && !description?.trim())) {
+                    ec.message.addError('Enter a description/product, valid HSN/SAC, positive quantity, nonnegative price and an available GST rate.');return
+                }
+                def taxable=quantity*amount,tax=[cgstRate:0,cgstAmount:0,sgstRate:0,sgstAmount:0,igstRate:0,igstAmount:0,cessRate:0,cessAmount:0,totalTaxAmount:0]
+                if(taxPercentage>0) {
+                    def vendor=ec.service.sync().name('zenith.tax.TaxServices.get#PartyTaxRegistration').parameters([partyId:bill.fromPartyId]).call()
+                    def buyer=ec.service.sync().name('zenith.tax.TaxServices.get#PartyTaxRegistration').parameters([partyId:bill.toPartyId]).call()
+                    if(ec.message.hasError()) return
+                    def stateFor={party,registration ->
+                        if(registration?.regionGeoId) return registration.regionGeoId
+                        def addresses=ec.entity.find('mantle.party.contact.PartyContactMechInfo').condition('partyId',party).condition('contactMechTypeEnumId','CmtPostalAddress').list()
+                        def state=addresses ? ec.entity.find('mantle.party.contact.PostalAddress').condition('contactMechId',addresses[0].contactMechId).one()?.stateProvinceGeoId : null
+                        return state && ec.entity.find('zenith.erp.india.IndiaState').condition('stateCode',state).one() ? state : null
+                    }
+                    def origin=stateFor(bill.fromPartyId,vendor),destination=stateFor(bill.toPartyId,buyer)
+                    if(!origin || !destination) {ec.message.addError('Set valid vendor and buyer supply states before adding a taxable return.');return}
+                    def slabs=ec.entity.find('zenith.erp.india.IndiaGstSlab').condition('igstRate',taxPercentage).condition('isActive','Y').condition('cessRate',0).list()
+                    def productSlab=product?.gstSlabId ? ec.entity.find('zenith.erp.india.IndiaGstSlab').condition('gstSlabId',product.gstSlabId).one() : null
+                    if(productSlab && productSlab.isActive!='N' && productSlab.igstRate==taxPercentage) slabs=[productSlab]
+                    if(!slabs) {ec.message.addError('Select a configured active GST slab; no rate is inferred.');return}
+                    tax=ec.service.sync().name('zenith.india.GstServices.calculate#Gst').parameters([taxableAmount:taxable,gstSlabId:slabs[0].gstSlabId,supplierStateCode:origin,buyerStateCode:destination,isReverseCharge:bill.isReverseCharge ?: 'N']).call()
+                    if(ec.message.hasError()) return
+                }
+                def lines=ec.entity.find('mantle.account.invoice.InvoiceItem').condition('invoiceId',invoiceId).orderBy('-invoiceItemSeqId').list()
+                invoiceItemSeqId=String.format('%05d',lines ? (lines[0].invoiceItemSeqId as int)+1 : 1)
+                def values=[invoiceId:invoiceId,invoiceItemSeqId:invoiceItemSeqId,itemTypeEnumId:'ItemInventory',productId:productId,description:description ?: product?.productName,hsnSacCode:hsnSacCode,productTaxCode:hsnSacCode,quantity:quantity,amount:amount,taxableAmount:taxable,totalTaxAmount:tax.totalTaxAmount]
+                ['cgstRate','cgstAmount','sgstRate','sgstAmount','igstRate','igstAmount','cessRate','cessAmount'].each {values[it]=tax[it]}
+                invoiceItemSeqId=ec.service.sync().name('create#mantle.account.invoice.InvoiceItem').parameters(values).call().invoiceItemSeqId
+                if(ec.message.hasError()) return
+                def breakdowns=[]
+                ['CGST','SGST','IGST','CESS'].each {name -> def key=name.toLowerCase();if(tax[key+'Rate']>0) breakdowns.add([taxName:name,taxRate:tax[key+'Rate'],taxableAmount:taxable,taxAmount:tax[key+'Amount'],countryGeoId:'IND',isIncludedInPrice:'N'])}
+                if(breakdowns) ec.service.sync().name('zenith.tax.TaxServices.store#TaxLineDetails').parameters([referenceType:'InvoiceItem',referenceId:invoiceId,referenceSeqId:invoiceItemSeqId,currencyUomId:bill.currencyUomId,taxBreakdowns:breakdowns]).call()
+            ]]></script>
+            <if condition="ec.message.hasError()"><return/></if>
+            <service-call name="zenith.purchase.ReturnServices.refresh#PurchaseReturnTotals" in-map="[invoiceId:invoiceId]"/>
+        </actions>
+    </service>
+    <service verb="delete" noun="PurchaseReturnLine">
+        <in-parameters><parameter name="invoiceId" required="true"/><parameter name="invoiceItemSeqId" required="true"/></in-parameters>
+        <actions>
+            <service-call name="zenith.purchase.OperationsServices.assert#PurchaseWrite"/>
+            <service-call name="zenith.purchase.ReturnServices.assert#PurchaseReturn" in-map="[invoiceId:invoiceId,editable:true]" out-map="access"/>
+            <if condition="!access.allowed"><return/></if>
+            <entity-find-one entity-name="mantle.account.invoice.InvoiceItem" value-field="line"/>
+            <if condition="!line"><return error="true" message="Debit-note line not found."/></if>
+            <script>ec.entity.find('zenith.erp.tax.TaxLineDetail').condition('referenceType','InvoiceItem').condition('referenceId',invoiceId).condition('referenceSeqId',invoiceItemSeqId).list().each {it.delete()}</script>
+            <service-call name="delete#mantle.account.invoice.InvoiceItem" in-map="[invoiceId:invoiceId,invoiceItemSeqId:invoiceItemSeqId]"/>
+            <service-call name="zenith.purchase.ReturnServices.refresh#PurchaseReturnTotals" in-map="[invoiceId:invoiceId]"/>
+        </actions>
+    </service>
+</services>
