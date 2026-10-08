@@ -21,6 +21,7 @@ try{
   const cards=await kpis(p);check(shell+' KPI values agree with scoped independent SQL',cards.map(c=>c.count).join(',')===expectedCounts.join(','),{cards,expectedCounts});
   const content=await (mode==='final'?p.locator('.zprd-page'):p.locator('body')).innerText();check(shell+' recent own logs present and foreign log absent',content.includes('Disposable history A')&&!content.includes('Disposable history B'));
   check(shell+' missing prices do not become zero',content.includes('Not recorded'));check(shell+' history does not invent rupee currency',!content.includes('₹'));
+  check(shell+' dashboard advertises available tools only',!content.includes('Import Prices')&&content.includes('Price History')&&!content.includes('Price Reports'));
   check(shell+' own chart has two positive fixture days',(await p.locator('svg[viewBox="0 0 520 240"] circle').count())===2);
   const points=await p.locator('svg[viewBox="0 0 520 240"] polyline').getAttribute('points'),ys=points.trim().split(/\s+/).map(t=>Number(t.split(',')[1]));check(shell+' chart retains inclusive user-calendar window with UTC fixture account',ys[0]===ys[ys.length-1],{first:ys[0],last:ys[ys.length-1]});
   const card=p.locator('a').filter({hasText:'Create and manage multiple price lists'}),href=await card.getAttribute('href');check(shell+' tool card stays in current interface after actual navigation',new URL(href,base).pathname==='/'+shell+'/zenith/pricing/FindPriceList',{href});
@@ -29,6 +30,13 @@ try{
    check(shell+' monthly deltas accurately say updated',cards.every(c=>c.delta.includes('updated this month')),cards);
    for(const width of [1920,1366,768,390,360]){await p.setViewportSize({width,height:900});await p.waitForFunction(()=>[...document.querySelectorAll('#z-sidebar,#zq-sidebar')].every(e=>e.getAnimations().every(a=>a.playState!=='running')));const rect=await p.evaluate(()=>({client:document.documentElement.clientWidth,scroll:document.documentElement.scrollWidth,heading:document.querySelector('.zprd-page h3').getBoundingClientRect().top,nav:document.querySelector('#zq-subnav')?.getBoundingClientRect().bottom,icons:[...document.querySelectorAll('.zprd-stats>div svg')].map(e=>({width:e.getBoundingClientRect().width,height:e.getBoundingClientRect().height}))}));check(shell+' page and icons fit '+width,rect.scroll<=rect.client+2&&rect.icons.length===4&&rect.icons.every(e=>e.width>0&&e.width===e.height),rect);if(shell==='qapps')check(shell+' heading clears navigation '+width,rect.heading>=rect.nav-2,rect);}
    await p.screenshot({path:path.join(out,shell+'-360.png'),fullPage:true});await card.click();await p.getByRole('heading',{name:'Price Lists',exact:true}).waitFor();check(shell+' actual tool card reaches intended list in current interface',new URL(p.url()).pathname==='/'+shell+'/zenith/pricing/FindPriceList');
+  }
+ }
+ if(mode==='final'){
+  await p.setViewportSize({width:1366,height:900});
+  for(const screen of ['PricingDashboard','FindPriceList','FindPricingRule','PriceChangeHistory']){
+   await p.goto(`${base}/apps/zenith/pricing/${screen}`,{waitUntil:'networkidle'});await p.waitForFunction(()=>document.body.classList.contains('zprd-module'));
+   const rect=await p.evaluate(()=>({top:document.querySelector('#top')?.getBoundingClientRect().bottom,nav:document.querySelector('#z-subnav')?.getBoundingClientRect().top}));check('apps '+screen+' tabs clear wrapped utility header',rect.nav>=rect.top-2,rect);
   }
  }
  await ctx.request.post(base+'/apps/zenith/pricing/PricingDashboardQaAcceptance/scope',{form:{moquiSessionToken:token,org:'NONE'}});
