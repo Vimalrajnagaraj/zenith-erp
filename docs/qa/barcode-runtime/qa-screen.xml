@@ -1,0 +1,87 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Disposable-only helper. Copy into the Barcode screen directory only for the regression run. -->
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd" default-menu-include="false">
+<transition name="initialize"><actions><script><![CDATA[
+    if (System.getProperty('purchase.pricing.qa.disposable')!='true' || !ec.user.isInGroup('ADMIN')) {
+        ec.web.response.setStatus(403); ec.web.sendJsonResponse([denied:true]); return
+    }
+    if (ec.entity.find('mantle.party.Party').condition('partyId','BC_QA_A').disableAuthz().count()) {
+        ec.web.response.setStatus(409); ec.web.sendJsonResponse([denied:true]); return
+    }
+    ec.entity.makeDataLoader().location('component://zenith-erp-barcode/BarcodeQaFixture.xml').load()
+    if(ec.message.hasError() || !ec.entity.find('mantle.product.Product').condition('productId','BC_QA_A1').disableAuthz().one()) {
+        throw new IllegalStateException('Fixture load failed; refuse stale-state verification')
+    }
+    def demo=ec.entity.find('moqui.security.UserAccount').condition('userId','EX_JOHN_DOE').one()
+    ['BC_QA_USER','BC_QA_VIEWER'].each {userId ->
+        def user=ec.entity.find('moqui.security.UserAccount').condition('userId',userId).one()
+        ['currentPassword','passwordSalt','passwordHashType','passwordBase64'].each {user.set(it,demo.get(it))}
+        user.disabled='N'; user.requirePasswordChange='N'; user.update()
+    }
+    // Mechanical catalogue metadata only; no prices, stock, taxes, customers or billing fixtures.
+    def catalogue=(1..3000).collect {number ->
+        def id='BC_QA_CAT_'+String.format('%04d',number)
+        ec.entity.makeValue('mantle.product.Product').setAll([productId:id,pseudoId:id,ownerPartyId:'BC_QA_A',productName:'Disposable Catalogue '+id,productTypeEnumId:'PtAsset'])
+    }
+    ec.entity.createBulk(catalogue)
+    ec.web.sendJsonResponse([initialized:true])
+]]></script></actions><default-response type="none"/></transition>
+<transition name="scope"><actions><script><![CDATA[
+    if (System.getProperty('purchase.pricing.qa.disposable')!='true' || ec.user.username!='barcode.qa' || !['BC_QA_A','BC_QA_B','BC_QA_C','NONE'].contains(ec.web.parameters.org)) {
+        ec.web.response.setStatus(403); ec.web.sendJsonResponse([denied:true]); return
+    }
+    ec.user.setPreference('ACTIVE_ORGANIZATION',ec.web.parameters.org=='NONE'?null:ec.web.parameters.org)
+    ec.web.sendJsonResponse([scope:ec.web.parameters.org])
+]]></script></actions><default-response type="none"/></transition>
+<transition name="call"><actions><script><![CDATA[
+    def allowed=['add#ProductBarcode','generate#InternalBarcode','delete#ProductBarcode','lookup#ProductByBarcode','get#ProductBarcodes','create#PrintJob','add#PrintJobItem','remove#PrintJobItem','complete#PrintJob','recompute#PrintJobTotal','create#LabelTemplate','update#LabelTemplate','sync#BarcodeFromPseudoId','sync#PseudoIdFromBarcode','get#ProductLabel','resolve#ScanProduct']
+    if (System.getProperty('purchase.pricing.qa.disposable')!='true' || !['barcode.qa','barcode.viewer'].contains(ec.user.username) || !allowed.contains(ec.web.parameters.op)) {
+        ec.web.response.setStatus(403); ec.web.sendJsonResponse([denied:true]); return
+    }
+    def args=new groovy.json.JsonSlurper().parseText(ec.web.parameters.args ?: '{}')
+    def result=ec.service.sync().name('zenith.barcode.BarcodeServices.'+ec.web.parameters.op).parameters(args).call()
+    ec.web.sendJsonResponse([result:result,errors:ec.message.errors])
+]]></script></actions><default-response type="none"/></transition>
+
+<transition name="fixtureState"><actions><script><![CDATA[
+    if(System.getProperty('purchase.pricing.qa.disposable')!='true' || !ec.user.isInGroup('ADMIN')){ec.web.response.setStatus(403);ec.web.sendJsonResponse([denied:true]);return}
+    def p=ec.web.parameters
+    if(p.barcodeId && p.barcodeId.toString()==~ /[0-9]+/ && ['Y','N'].contains(p.active)){
+        def row=ec.entity.find('zenith.erp.barcode.ProductBarcode').condition('barcodeId',p.barcodeId).disableAuthz().one()
+        if(!row || !['BC_QA_A1','BC_QA_A2'].contains(row.productId))throw new IllegalStateException('Refusing non-fixture barcode')
+        row.isActive=p.active;row.update()
+    }else if(['BC_QA_A1','BC_QA_A2'].contains(p.productId)){
+        def row=ec.entity.find('mantle.product.Product').condition('productId',p.productId).disableAuthz().one().cloneValue()
+        if(p.name!=null)row.productName=p.name
+        if(p.code!=null)row.pseudoId=p.code ?: null
+        row.update()
+    }else{ec.web.response.setStatus(400);ec.web.sendJsonResponse([denied:true]);return}
+    ec.web.sendJsonResponse([updated:true])
+]]></script></actions><default-response type="none"/></transition>
+<transition name="cleanup" method="post"><actions><script><![CDATA[
+    if(System.getProperty('purchase.pricing.qa.disposable')!='true' || !ec.user.isInGroup('ADMIN')){ec.web.response.setStatus(403);ec.web.sendJsonResponse([denied:true]);return}
+    def captured=new groovy.json.JsonSlurper().parseText(ec.web.parameters.captured ?: '{}')
+    def organizations=['BC_QA_A','BC_QA_B','BC_QA_C']
+    def definitions=[
+        jobs:['zenith.erp.barcode.BarcodePrintJob','printJobId','organizationPartyId'],
+        barcodes:['zenith.erp.barcode.ProductBarcode','barcodeId','organizationPartyId'],
+        templates:['zenith.erp.barcode.BarcodeLabel','labelId','organizationPartyId'],
+        products:['mantle.product.Product','productId','ownerPartyId']]
+    // Validate every captured primary key before deleting any row. No class/prefix deletes.
+    definitions.each {kind,fields ->
+        if(!(captured[kind] instanceof List) || captured[kind].size()>10000)throw new IllegalStateException('Invalid captured-key list')
+        captured[kind].each {id ->
+            def row=ec.entity.find(fields[0]).condition(fields[1],id).disableAuthz().one()
+            if(!row || !organizations.contains(row[fields[2]]))throw new IllegalStateException('Refusing non-fixture cleanup')
+        }
+    }
+    captured.items.each {key ->
+        if(!captured.jobs.contains(key.printJobId) || !captured.products.contains(key.productId))throw new IllegalStateException('Uncaptured child key')
+        def row=ec.entity.find('zenith.erp.barcode.BarcodePrintJobItem').condition('printJobId',key.printJobId).condition('productId',key.productId).disableAuthz().one()
+        if(!row || !organizations.contains(row.organizationPartyId))throw new IllegalStateException('Refusing non-fixture child cleanup')
+    }
+    captured.items.each {key -> ec.entity.find('zenith.erp.barcode.BarcodePrintJobItem').condition('printJobId',key.printJobId).condition('productId',key.productId).disableAuthz().one().cloneValue().delete() }
+    definitions.each {kind,fields -> captured[kind].each {id -> ec.entity.find(fields[0]).condition(fields[1],id).disableAuthz().one().cloneValue().delete()} }
+    ec.web.sendJsonResponse([cleaned:true])
+]]></script></actions><default-response type="none"/></transition>
+</screen>

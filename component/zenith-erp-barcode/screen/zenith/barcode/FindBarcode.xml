@@ -3,54 +3,57 @@
         xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
         default-menu-title="Product Barcodes" default-menu-index="2">
 
-    <transition name="addBarcode">
+    <transition name="addBarcode" method="post">
         <service-call name="zenith.barcode.BarcodeServices.add#ProductBarcode"/>
         <default-response url="."/>
     </transition>
-    <transition name="generateBarcode">
+    <transition name="generateBarcode" method="post">
         <service-call name="zenith.barcode.BarcodeServices.generate#InternalBarcode"/>
         <default-response url="."/>
     </transition>
     <!-- ZE-BC-091: remove an obsolete barcode (service is org-guarded). -->
-    <transition name="deleteBarcode">
+    <transition name="deleteBarcode" method="post">
         <service-call name="zenith.barcode.BarcodeServices.delete#ProductBarcode"/>
         <default-response url="."/>
     </transition>
 
     <actions>
-        <set field="curOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+        <service-call name="zenith.barcode.BarcodeServices.get#AuthorizedActiveOrganization" out-map="_barcodeOrg"/>
+        <set field="curOrg" from="_barcodeOrg.activeOrgId ?: '__NO_ORGANIZATION__'"/>
 
         <entity-find entity-name="zenith.erp.barcode.ProductBarcodeDetail" list="barcodes">
             <!-- BC-primary: group each product's barcodes together with the PRIMARY on top (then secondaries),
                  so the authoritative barcode is never buried below an alternate. -->
-            <search-form-inputs default-order-by="productName,-isPrimary,barcodeValue"/>
+            <search-form-inputs skip-fields="organizationPartyId,ownerPartyId" default-order-by="productName,-isPrimary,barcodeValue"/>
             <!-- ZE-SALES-014 f/u: org-isolate CSV/XLSX export (standalone render bypasses the MANTLE_ACTIVE_ORG authz filter) -->
-            <econdition field-name="organizationPartyId" from="curOrg" ignore-if-empty="true"/>
+            <econdition field-name="organizationPartyId" from="curOrg"/>
+            <!-- A legacy barcode with an inconsistent product owner must not expose another tenant's name. -->
+            <econdition field-name="ownerPartyId" from="curOrg"/>
         </entity-find>
 
-        <!-- Stat cards: real, org-scoped counts (admin with no active org sees all via ignore-if-empty). -->
+        <!-- Stat cards: real, org-scoped counts (no active organization yields zero rows). -->
         <entity-find-count entity-name="zenith.erp.barcode.ProductBarcode" count-field="statTotal">
             <econdition field-name="isActive" value="Y"/>
-            <econdition field-name="organizationPartyId" from="curOrg" ignore-if-empty="true"/>
+            <econdition field-name="organizationPartyId" from="curOrg"/>
         </entity-find-count>
         <entity-find-count entity-name="zenith.erp.barcode.ProductBarcode" count-field="statInternal">
             <econdition field-name="isActive" value="Y"/>
             <econdition field-name="barcodeTypeEnumId" value="BctInternal"/>
-            <econdition field-name="organizationPartyId" from="curOrg" ignore-if-empty="true"/>
+            <econdition field-name="organizationPartyId" from="curOrg"/>
         </entity-find-count>
         <entity-find-count entity-name="zenith.erp.barcode.ProductBarcode" count-field="statEanUpc">
             <econdition field-name="isActive" value="Y"/>
             <econdition field-name="barcodeTypeEnumId" operator="in" from="['BctUpcA','BctUpcE','BctEan13','BctEan8']"/>
-            <econdition field-name="organizationPartyId" from="curOrg" ignore-if-empty="true"/>
+            <econdition field-name="organizationPartyId" from="curOrg"/>
         </entity-find-count>
         <entity-find-count entity-name="zenith.erp.barcode.BarcodePrintJob" count-field="statPrintReady">
             <econdition field-name="statusId" value="BpPending"/>
-            <econdition field-name="organizationPartyId" from="curOrg" ignore-if-empty="true"/>
+            <econdition field-name="organizationPartyId" from="curOrg"/>
         </entity-find-count>
 
         <!-- Generate Internal Barcode modal: org-scoped product options + surface-aware post target -->
         <entity-find entity-name="mantle.product.Product" list="_prodOpts">
-            <econdition field-name="ownerPartyId" from="curOrg" ignore-if-empty="true"/>
+            <econdition field-name="ownerPartyId" from="curOrg"/>
             <order-by field-name="productName"/>
         </entity-find>
         <entity-find entity-name="moqui.basic.Enumeration" list="_typeEnums">
@@ -75,6 +78,8 @@
     </actions>
 
     <widgets>
+        <container style="zbc-page">
+<render-mode><text type="html,qvt"><![CDATA[<img alt="" aria-hidden="true" style="display:none" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==" onload="if(window.ZenithBarcode){window.ZenithBarcode.init()}else{var s=document.createElement('script');s.src='/zenithstatic/js/barcode-module.js?v=1';s.onload=function(){window.ZenithBarcode.init()};document.head.appendChild(s)}"/>]]></text></render-mode>
         <!-- ===== Page header: title + subtitle + Add Barcode (violet) / Generate Internal (outline) ===== -->
         <container style="pb-head">
             <container style="pb-head-text">
@@ -175,9 +180,6 @@
                           confirmation="Delete this barcode? To replace it, delete then Add the new value. This can't be undone."
                           style="z-redlink" condition="modCanWrite"/>
                 </default-field></field>
-                <field name="kebabBtn"><default-field title="">
-                    <label text="⋮" type="span" style="z-kebab"/>
-                </default-field></field>
                 <!-- ZE-PRC-004 sweep: Find submit button so the header-dialog filters can be applied (was a dead dialog). -->
                 <field name="submitButton"><header-field title="Find"><submit/></header-field></field>
             </form-list>
@@ -216,27 +218,7 @@
                 </div>
             </div>
         </div>
-        <script>
-        (function(){
-            var ov=document.getElementById('gb-overlay'); if(!ov) return;
-            var pre=document.getElementById('gb-prefix'), code=document.getElementById('gb-code');
-            function upd(){ var p=((pre.value||'').trim())||'ZEN'; code.textContent=p+'000001'; }
-            if(pre){ pre.addEventListener('input', upd); upd(); }
-            var create=document.getElementById('gb-create');
-            if(create && !create.__w){ create.__w=1; create.addEventListener('click', function(){
-                var prod=document.getElementById('gb-product'); var pid=prod ? prod.value : '';
-                if(!pid){ alert('Select a product.'); return; }
-                var tok=''; try{ tok=window.moqui.webrootVue.moquiSessionToken; }catch(e){}
-                if(!tok){ var t=document.getElementById('gb-token'); tok=t?t.value:''; }
-                var body=new URLSearchParams(); body.append('productId', pid); body.append('prefix', ((pre.value||'ZEN').trim())||'ZEN'); body.append('moquiSessionToken', tok);
-                var base=location.pathname.split('/zenith/')[0];
-                create.disabled=true; create.textContent='Generating...';
-                fetch(base+'/zenith/barcode/FindBarcode/generateBarcode',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body,credentials:'same-origin'})
-                    .then(function(r){ location.href = r.url || location.href; })
-                    .catch(function(){ create.disabled=false; create.textContent='Generate'; alert('Generate failed — please try again.'); });
-            }); }
-        })();
-        </script>
+
         ]]></text></render-mode>
         </widgets></section>
 
@@ -269,39 +251,9 @@
                 </div>
             </div>
         </div>
-        <script>
-        (function(){
-            var ov=document.getElementById('ab-overlay'); if(!ov) return;
-            var tg=ov.querySelector('.ab-tg'); var hid=document.getElementById('ab-primary');
-            function styleTG(){
-                var cur=hid.value;
-                Array.prototype.forEach.call(tg.querySelectorAll('.ab-pill'), function(p){
-                    var v=p.getAttribute('data-v'); var ico=p.querySelector('.ab-pico'); var on=(v===cur);
-                    if(on){ p.style.background='rgba(124,58,237,.1)'; p.style.borderColor='#7C3AED'; p.style.color='#7C3AED'; }
-                    else { p.style.background='#fff'; p.style.borderColor='#E5E7EB'; p.style.color='#6B7280'; }
-                    if(ico) ico.style.display = on ? 'inline-block' : 'none';
-                });
-            }
-            Array.prototype.forEach.call(tg.querySelectorAll('.ab-pill'), function(p){ p.addEventListener('click', function(){ hid.value=p.getAttribute('data-v'); styleTG(); }); });
-            styleTG();
-            var create=document.getElementById('ab-create');
-            if(create && !create.__w){ create.__w=1; create.addEventListener('click', function(){
-                var pid=document.getElementById('ab-product').value; var typ=document.getElementById('ab-type').value;
-                var val=(document.getElementById('ab-value').value||'').trim();
-                if(!pid){ alert('Select a product.'); return; }
-                if(!typ){ alert('Select a type.'); return; }
-                if(!val){ alert('Barcode Value is required.'); return; }
-                var tok=''; try{ tok=window.moqui.webrootVue.moquiSessionToken; }catch(e){} if(!tok){ var t=document.getElementById('ab-token'); tok=t?t.value:''; }
-                var body=new URLSearchParams(); body.append('productId',pid); body.append('barcodeTypeEnumId',typ); body.append('barcodeValue',val); body.append('isPrimary',hid.value); body.append('moquiSessionToken',tok);
-                var base=location.pathname.split('/zenith/')[0];
-                create.disabled=true; create.textContent='Adding...';
-                fetch(base+'/zenith/barcode/FindBarcode/addBarcode',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body,credentials:'same-origin'})
-                    .then(function(r){ location.href = r.url || location.href; })
-                    .catch(function(){ create.disabled=false; create.textContent='Add Barcode'; alert('Add failed — please try again.'); });
-            }); }
-        })();
-        </script>
+
         ]]></text></render-mode>
         </widgets></section>
+        </container>
     </widgets>
 </screen>

@@ -8,7 +8,7 @@
     <parameter name="pageIndex"/>
 
     <!-- Save one product's Item Code / Barcode (AJAX, returns JSON). Blocks a code already used elsewhere. -->
-    <transition name="saveBarcode" begin-transaction="true">
+    <transition name="saveBarcode" method="post" begin-transaction="true">
         <actions>
             <script><![CDATA[
                 def p = ec.web.parameters
@@ -20,14 +20,23 @@
                     // Org isolation (ZE-SEC-JSON): only mutate THIS org's products — the MANTLE_ACTIVE_ORG filter
                     // does NOT apply in a transition, so verify ownership explicitly (super-admin exempt).
                     // Prevents overwriting another tenant's scan code via a forged productId.
-                    def _bcAo = ec.user.getPreference('ACTIVE_ORGANIZATION')
+                    def _bcAo = ec.service.sync().name('zenith.barcode.BarcodeServices.get#AuthorizedActiveOrganization').call().activeOrgId
+                    def permission=ec.service.sync().name('zenith.base.SecurityServices.check#ModuleWriteAccess').parameters([moduleId:'pos']).call()
+                    if(!permission.canWrite){ec.web.sendJsonResponse([success:false,error:'Product code write access is required.']);return}
                     if (!ec.user.isInGroup('ADMIN') && (!_bcAo || _bcAo == '_NA_' || ev.ownerPartyId != _bcAo)) {
                         ec.web.sendJsonResponse([success:false, error:'You do not have access to this product.']); return }
+                    if(!ev.ownerPartyId){ec.web.sendJsonResponse([success:false,error:'Select an organization-owned product.']);return}
+                    ec.entity.find('mantle.party.Party').condition('partyId',ev.ownerPartyId).forUpdate(true).disableAuthz().one()
+                    ec.entity.find('mantle.product.Product').condition('productId',p.productId).forUpdate(true).one()
                     if (code != '') {
+                        def aliases=ec.service.sync().name('zenith.barcode.BarcodeServices.get#ScanAliases').parameters([code:code]).call().aliases
+                        def richClash=ec.entity.find('zenith.erp.barcode.ProductBarcode').condition('organizationPartyId',ev.ownerPartyId).condition('barcodeValue','in',aliases).condition('productId','not-equals',p.productId).disableAuthz().count()
+                        if(richClash){ec.web.sendJsonResponse([success:false,error:'Code already assigned to another product barcode.']);return}
+                        if(ec.entity.find('mantle.product.Product').condition('ownerPartyId',ev.ownerPartyId).condition('productId',code).condition('productId','not-equals',p.productId).disableAuthz().count()){ec.web.sendJsonResponse([success:false,error:'Code matches another product ID.']);return}
                         // A barcode must be unique WITHIN the org — two products sharing a code break scanning.
                         // Scope the clash check to the product's own org: pseudoId is unique on (pseudo_id, owner_party_id),
                         // so a different org legitimately reusing the code is allowed (and must not leak that org's name).
-                        def clashFinder = ec.entity.find("mantle.product.Product").condition("pseudoId", code)
+                        def clashFinder = ec.entity.find("mantle.product.Product").condition("pseudoId", "in", aliases)
                         if (ev.ownerPartyId) clashFinder.condition("ownerPartyId", ev.ownerPartyId)
                         def clash = clashFinder.list().find { it.productId != p.productId }
                         if (clash) { ec.web.sendJsonResponse([success:false, error:'Code already used by ' + (clash.productName ?: clash.productId)]); return }
@@ -36,31 +45,16 @@
                     ec.entity.makeValue("mantle.product.Product").set("productId", p.productId).set("pseudoId", (code != '' ? code : null)).update()
                     if (code != '') {
                         // Keep the rich ProductBarcode table in sync (mirror this code as the product's
-                        // primary barcode). Best-effort — never let this fail the code save.
-                        try { ec.service.sync().name("zenith.barcode.BarcodeServices.sync#BarcodeFromPseudoId").parameters([productId:p.productId, code:code]).call() } catch (Exception se) {}
+                        // primary barcode). A mirror failure rolls back the same transaction.
+                        ec.service.sync().name("zenith.barcode.BarcodeServices.sync#BarcodeFromPseudoId").parameters([productId:p.productId, code:code]).call()
+                        if(ec.message.hasError()){ec.web.sendJsonResponse([success:false,error:"Code synchronization failed."]);return}
                         ec.web.sendJsonResponse([success:true, code:code]); return
                     }
-                    // REMOVE the POS/primary code. Moqui reverts a nulled pseudoId to the productId ("no code");
-                    // sync#BarcodeFromPseudoId no-ops on blank — so the PRIMARY ProductBarcode (the pseudoId's mirror)
-                    // would linger and keep the product scannable by its old code. Delete ONLY the primary (org's
-                    // product; ownership verified above). ZE-BC-002: never delete isPrimary='N' (secondary) rows —
-                    // those are managed in the Product Barcodes module and must survive a POS-code clear.
-                    ec.entity.find("zenith.erp.barcode.ProductBarcode").condition("productId", p.productId).condition("isPrimary", "Y").list().each { it.delete() }
-                    // ZE-BC-002 f/u (promote): "Remove" pops the primary; if an active alternate barcode remains,
-                    // promote the next one to primary and adopt its value as the new pseudoId/POS code (consistent
-                    // with delete#ProductBarcode's promote-on-primary-delete). Only a product with NO barcode left
-                    // goes to "no code". Return the actual resulting code so the grid row updates in place.
-                    def respCode = ''
-                    def nextBc = ec.entity.find("zenith.erp.barcode.ProductBarcode").condition("productId", p.productId).condition("isActive", "Y").orderBy("barcodeId").list()
-                    if (nextBc) {
-                        ec.service.sync().name("update#zenith.erp.barcode.ProductBarcode").parameters([barcodeId:nextBc[0].barcodeId, isPrimary:'Y']).call()
-                        try { ec.service.sync().name("zenith.barcode.BarcodeServices.sync#PseudoIdFromBarcode").parameters([productId:p.productId, barcodeValue:nextBc[0].barcodeValue]).call() } catch (Exception se) {}
-                        def freshP = ec.entity.find("mantle.product.Product").condition("productId", p.productId).one()
-                        def ps = (freshP?.pseudoId ?: '').toString().trim()
-                        respCode = (ps == '' || ps == p.productId) ? '' : ps
-                    }
-                    ec.web.sendJsonResponse([success:true, code:respCode])
-                } catch (Exception e) { ec.web.sendJsonResponse([success:false, error:e.message]) }
+                    // Clearing removes only the primary and preserves/promotes active secondary barcodes.
+                    def cleared=ec.service.sync().name('zenith.barcode.BarcodeServices.clear#ProductCode').parameters([productId:p.productId]).call()
+                    if(ec.message.hasError()){ec.web.sendJsonResponse([success:false,error:'Code synchronization failed.']);return}
+                    ec.web.sendJsonResponse([success:true,code:cleared.code ?: ''])
+                } catch (Exception e) { ec.message.addError('Could not save the product code.'); ec.web.sendJsonResponse([success:false, error:'Could not save the product code.']) }
             ]]></script>
         </actions>
         <default-response type="none"/>
@@ -68,7 +62,8 @@
 
     <actions>
         <script><![CDATA[
-            def posOrg = ec.user.getPreference('ACTIVE_ORGANIZATION')
+            def posOrg = ec.service.sync().name('zenith.barcode.BarcodeServices.get#AuthorizedActiveOrganization').call().activeOrgId ?: '__NO_ORGANIZATION__'
+            barcodeSessionToken=ec.web.sessionToken
             def pageSize = 60
             def pIdx = 0
             try { if (pageIndex) pIdx = (pageIndex as Integer) } catch (Exception ig) { pIdx = 0 }
@@ -127,7 +122,8 @@
             <!-- The /qapps SPA strips <script> tags from screen content, so bootstrap the external
                  save logic via an <img onload> attribute (inline event attributes survive); a script
                  element created with appendChild executes normally. -->
-            <img src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" alt="" style="display:none" onload="if(!window.__bcBoot){window.__bcBoot=1;var s=document.createElement('script');s.src='/zenithstatic/js/pos-barcodes.js?v=2';document.body.appendChild(s);}"/>
+            <input id="bc-token" type="hidden" value="${(barcodeSessionToken!'')?html}"/>
+            <img src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" alt="" style="display:none" onload="if(!window.__bcBoot){window.__bcBoot=1;var s=document.createElement('script');s.src='/zenithstatic/js/pos-barcodes.js?v=3';document.body.appendChild(s);}"/>
             <div style="font-size:22px;font-weight:800;color:#463D7A;margin-bottom:2px">&#128290; Barcodes</div>
             <div style="font-size:13px;color:#5f6368;margin-bottom:12px">Give every product a code so it can be <b>scanned</b> at billing.</div>
 
@@ -176,7 +172,7 @@
                     <#list (rows![]) as r>
                     <tr data-pid="${(r.productId)?html}" style="border-bottom:1px solid #e0e0e0">
                         <td style="padding:7px 8px;color:#222">${(r.productName)?html}</td>
-                        <td style="padding:5px 8px"><input class="bc-code" type="text" value="${(r.code)?html}" placeholder="scan or type a code" autocomplete="off" style="width:100%;padding:7px;border:1px solid #ccc;border-radius:5px;font-size:14px;box-sizing:border-box"/></td>
+                        <td style="padding:5px 8px"><input class="bc-code" aria-label="Code for ${(r.productName)?html}" type="text" value="${(r.code)?html}" placeholder="scan or type a code" autocomplete="off" style="width:100%;padding:7px;border:1px solid #ccc;border-radius:5px;font-size:14px;box-sizing:border-box"/></td>
                         <td class="bc-status" style="padding:5px 8px;text-align:center;font-size:12px;font-weight:700">
                             <#if r.status == 'missing'><span style="color:#b71c1c">&#9888; No code</span>
                             <#elseif r.status == 'dup'><span style="color:#e65100">&#9888; Duplicate</span>

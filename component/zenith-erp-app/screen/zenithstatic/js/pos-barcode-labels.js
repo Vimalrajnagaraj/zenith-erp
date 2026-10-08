@@ -12,7 +12,9 @@
     function picked(){ return Array.prototype.slice.call(document.querySelectorAll('.bl-pick:checked')); }
     function token(){ var e=document.getElementById('bl-token'); return e ? (e.getAttribute('data-t')||'') : ''; }
     function opts(){
-        var copies=Math.max(1,Math.min(200,parseInt((document.getElementById('bl-copies')||{}).value||'1',10)||1));
+        var rawCopies=(document.getElementById('bl-copies')||{}).value||'1';
+        if(!/^[0-9]{1,3}$/.test(rawCopies)||Number(rawCopies)<1||Number(rawCopies)>200){alert('Copies must be a whole number from 1 to 200.');return null;}
+        var copies=Number(rawCopies);
         var tsel=document.getElementById('bl-template');
         if(tsel && tsel.value){ return { copies:copies, labelId:tsel.value }; }
         var sz=((document.getElementById('bl-size')||{}).value||'50,25').split(',');
@@ -21,7 +23,7 @@
     }
     function buildUrl(){
         var items=picked(); if(!items.length) return null;
-        var o=opts();
+        var o=opts(); if(!o) return null;
         var pids=items.map(function(cb){ return encodeURIComponent(cb.value); }).join(',');
         var p='productIds='+pids+'&copies='+o.copies+'&moquiSessionToken='+encodeURIComponent(token());
         if(o.labelId){ p+='&labelId='+encodeURIComponent(o.labelId); }
@@ -32,10 +34,11 @@
     function show(){ var a=document.getElementById('bl-preview-area'); if(a) a.style.display='block'; }
     function loading(on){
         var l=document.getElementById('bl-loading'); if(l) l.style.display=on?'block':'none';
-        var f=frame(); if(f) f.style.display=on?'none':'block';
+        var f=frame(); if(f){f.style.display='block';f.style.visibility=on?'hidden':'visible';f.setAttribute('aria-busy',on?'true':'false');}
     }
     function doPreview(){
-        var url=buildUrl(); if(!url){ alert('Tick at least one product first.'); return; }
+        if(!picked().length){alert('Tick at least one product first.');return;}
+        var url=buildUrl(); if(!url)return;
         var f=frame(); if(!f) return;
         show(); loading(true);
         f.onload=function(){ loading(false); };
@@ -43,10 +46,11 @@
         var a=document.getElementById('bl-preview-area'); if(a) a.scrollIntoView({behavior:'smooth',block:'nearest'});
     }
     function doPrint(){
-        var url=buildUrl(); if(!url){ alert('Tick at least one product first.'); return; }
+        if(!picked().length){alert('Tick at least one product first.');return;}
+        var url=buildUrl(); if(!url)return;
         var f=frame(); if(!f) return;
         show(); loading(true);
-        f.onload=function(){ loading(false); setTimeout(function(){ try{ f.contentWindow.focus(); f.contentWindow.print(); }catch(e){} }, 500); };
+        f.onload=function(){ loading(false); setTimeout(function(){ try{ if(f.contentWindow.barcodeLabelsReady===true){f.contentWindow.focus();f.contentWindow.print();}else{alert('Labels are not ready. Review the preview errors before printing.');} }catch(e){} }, 500); };
         f.src=url;
     }
 

@@ -27,108 +27,85 @@
         <parameter name="showPrice"/>
         <parameter name="showSku"/>
         <actions>
+
             <script><![CDATA[
-                def RM = java.math.RoundingMode.HALF_UP
-                def fmtMap = [BctEan13:'EAN13', BctEan8:'EAN8', BctUpcA:'UPC', BctUpcE:'CODE128',
-                              BctCode128:'CODE128', BctCode39:'CODE39', BctInternal:'CODE128', BctQrCode:'QR']
-                def labels = []; def tpl = null
-                // org guard: this transition runs outside the MANTLE_ACTIVE_ORG filter, so a forged
-                // printJobId/barcodeId would otherwise print another tenant's product names/prices.
-                def _ao = ec.user.getPreference('ACTIVE_ORGANIZATION'); if (_ao == '_NA_') _ao = null
-                def _isAdmin = ec.user.isInGroup('ADMIN')
-                def _denied = { -> ec.web.sendTextResponse("<!DOCTYPE html><html><body style='font-family:Arial;padding:20px'><p>You do not have access to these labels.</p></body></html>", "text/html", null) }
-                if (printJobId) {
-                    def job = ec.entity.find("zenith.erp.barcode.BarcodePrintJob").condition("printJobId", printJobId).one()
-                    if (job == null || (!_isAdmin && (job.organizationPartyId == null || _ao == null || job.organizationPartyId != _ao))) { _denied(); return }
-                    if (job?.labelId) tpl = ec.entity.find("zenith.erp.barcode.BarcodeLabel").condition("labelId", job.labelId).one()
-                    ec.entity.find("zenith.erp.barcode.BarcodePrintJobItem").condition("printJobId", printJobId).list().each { it ->
-                        def prd = ec.entity.find("mantle.product.Product").condition("productId", it.productId).one()
-                        def pb = ec.entity.find("zenith.erp.barcode.ProductBarcode").condition("productId", it.productId).condition("isActive","Y").orderBy("-isPrimary").list()
-                        def bcType = pb ? pb[0].barcodeTypeEnumId : 'BctCode128'
-                        int qty = (it.quantity ?: 1) as int
-                        for (int i=0;i<qty;i++) labels.add([value:(it.barcodeValue ?: ''), fmt:(fmtMap[bcType] ?: 'CODE128'),
-                            name:(prd?.productName ?: it.productId), price:(prd?.mrpAmount), sku:(prd?.pseudoId ?: '')])
-                    }
-                } else if (barcodeId) {
-                    def bc = ec.entity.find("zenith.erp.barcode.ProductBarcode").condition("barcodeId", barcodeId).one()
-                    if (bc == null || (!_isAdmin && (bc.organizationPartyId == null || _ao == null || bc.organizationPartyId != _ao))) { _denied(); return }
-                    if (bc) {
-                        // BC-032: a single-barcode label has no job/template of its own, so honor the org's
-                        // DEFAULT label template (Show/Hide Name/Price/SKU). No default -> show all (as before).
-                        if (bc.organizationPartyId) tpl = ec.entity.find("zenith.erp.barcode.BarcodeLabel").condition("isDefault","Y").condition("organizationPartyId", bc.organizationPartyId).one()
-                        def prd = ec.entity.find("mantle.product.Product").condition("productId", bc.productId).one()
-                        labels.add([value:bc.barcodeValue, fmt:(fmtMap[bc.barcodeTypeEnumId] ?: 'CODE128'),
-                            name:(prd?.productName ?: bc.productId), price:(prd?.mrpAmount), sku:(prd?.pseudoId ?: '')])
-                    }
-                } else if (productIds) {
-                    // BATCH mode (single source of truth for the POS bulk printer): render N copies of each
-                    // selected product's label, honoring an explicit template (labelId), else ad-hoc w/h/show*
-                    // params (POS "Custom size"), else the org default template.
-                    int cp = (copies?.toString()?.isInteger()) ? (copies as int) : 1
-                    if (cp < 1) cp = 1; if (cp > 200) cp = 200
-                    if (labelId) {
-                        tpl = ec.entity.find("zenith.erp.barcode.BarcodeLabel").condition("labelId", labelId).one()
-                        if (tpl != null && !_isAdmin && tpl.organizationPartyId != _ao) { _denied(); return }
-                    }
-                    if (tpl == null && (w || h || showName || showPrice || showSku)) {
-                        tpl = [columnsPerRow:3, showProductName:(showName ?: 'Y'), showPrice:(showPrice ?: 'Y'),
-                               showSku:(showSku ?: 'N'), labelWidth:(w ? (w as BigDecimal) : null), labelHeight:(h ? (h as BigDecimal) : null)]
-                    }
-                    if (tpl == null && _ao) tpl = ec.entity.find("zenith.erp.barcode.BarcodeLabel").condition("isDefault","Y").condition("organizationPartyId", _ao).one()
-                    productIds.split(",").findAll { it }.each { pid ->
-                        def prd = ec.entity.find("mantle.product.Product").condition("productId", pid).one()
-                        if (prd == null) return
-                        // org guard: never render another tenant's product (super-admin exempt); skip foreign
-                        if (!_isAdmin && (prd.ownerPartyId == null || _ao == null || prd.ownerPartyId != _ao)) return
-                        def pb = ec.entity.find("zenith.erp.barcode.ProductBarcode").condition("productId", pid).condition("isActive","Y").orderBy("-isPrimary").list()
-                        def bcType = pb ? pb[0].barcodeTypeEnumId : 'BctCode128'
-                        def bcVal = pb ? pb[0].barcodeValue : (prd.pseudoId ?: pid)
-                        for (int i=0;i<cp;i++) labels.add([value:(bcVal ?: ''), fmt:(fmtMap[bcType] ?: 'CODE128'),
-                            name:(prd.productName ?: pid), price:(prd.mrpAmount), sku:(prd.pseudoId ?: '')])
-                    }
+                def scope=ec.service.sync().name('zenith.barcode.BarcodeServices.get#AuthorizedActiveOrganization').call()
+                def org=scope.activeOrgId;def admin=ec.user.isInGroup('ADMIN')
+                def labels=[];def tpl=null
+                def fail={int status,String message -> ec.web.response.setStatus(status);ec.web.sendTextResponse('<!DOCTYPE html><html><body><p>'+message+'</p></body></html>','text/html',null)}
+                def access={String kind,String id -> ec.service.sync().name('zenith.barcode.BarcodeServices.assert#RecordAccess').parameters([kind:kind,recordId:id,write:false]).call()}
+                def append={Map label,int qty ->
+                    if(qty<1 || qty>2000 || labels.size()+qty>2000){fail(400,'Choose between 1 and 2000 labels per preview.');return false}
+                    for(int i=0;i<qty;i++)labels.add(label);return true
                 }
-                int cols = (tpl?.columnsPerRow ?: 3) as int
-                boolean showName = (tpl == null) || tpl.showProductName == 'Y'
-                boolean showPrice = (tpl == null) || tpl.showPrice == 'Y'
-                boolean showSku = (tpl?.showSku == 'Y')
-                def lw = tpl?.labelWidth ?: 50; def lh = tpl?.labelHeight ?: 30
-                def esc = { x -> (x ?: '').toString().replace('&','&amp;').replace('<','&lt;').replace('>','&gt;') }
-                def jsq = { x -> (x ?: '').toString().replace('\\','\\\\').replace("'","\\'") }
-                def sb = new StringBuilder()
-                sb.append("<!DOCTYPE html><html><head><meta charset='utf-8'><title>Barcode Labels</title>")
-                sb.append("<scr"+"ipt src='/zenithstatic/js/JsBarcode.all.min.js'></scr"+"ipt>")
-                sb.append("<scr"+"ipt src='/zenithstatic/js/qrcode.min.js'></scr"+"ipt>")
-                sb.append("<style>body{font-family:Arial,sans-serif;margin:10px;color:#000}")
-                sb.append(".grid{display:grid;grid-template-columns:repeat(" + cols + ",1fr);gap:6px}")
-                sb.append(".lbl{border:1px solid #ddd;border-radius:4px;padding:6px;text-align:center;break-inside:avoid;min-height:" + lh + "mm;display:flex;flex-direction:column;align-items:center;justify-content:center}")
-                sb.append(".nm{font-size:11px;font-weight:bold;margin:2px 0}.pr{font-size:13px;font-weight:bold;margin-top:2px}.sk{font-size:9px;color:#666}")
-                sb.append(".qr canvas,.qr img{margin:2px auto}@media print{.noprint{display:none}}</style></head><body>")
-                sb.append("<div class='noprint' style='margin-bottom:10px'><button onclick='window.print()' style='padding:6px 14px;font-size:14px;cursor:pointer'>&#128424; Print</button> &nbsp;<b>" + labels.size() + "</b> label(s)</div>")
-                if (!labels) sb.append("<p>No labels to print (no products/barcodes in this job).</p>")
-                sb.append("<div class='grid'>")
-                labels.eachWithIndex { lab, idx ->
-                    sb.append("<div class='lbl'>")
-                    if (showName) sb.append("<div class='nm'>" + esc(lab.name) + "</div>")
-                    if (lab.fmt == 'QR') sb.append("<div class='qr' id='q" + idx + "'></div>")
-                    else sb.append("<svg class='bc' id='b" + idx + "'></svg>")
-                    if (showSku && lab.sku) sb.append("<div class='sk'>" + esc(lab.sku) + "</div>")
-                    if (showPrice && lab.price != null) sb.append("<div class='pr'>₹" + (lab.price as BigDecimal).setScale(2, RM) + "</div>")
-                    sb.append("</div>")
+                if(printJobId){
+                    def checked=access('job',printJobId);if(!checked.allowed){fail(403,'You do not have access to these labels.');return};def job=checked.record
+                    if(job.labelId){def t=access('label',job.labelId);if(!t.allowed || t.record.organizationPartyId!=job.organizationPartyId){fail(403,'Print job template ownership is inconsistent.');return};tpl=t.record}
+                    def rows=ec.entity.find('zenith.erp.barcode.BarcodePrintJobItem').condition('printJobId',printJobId).list()
+                    for(def item in rows){
+                        def prd=ec.entity.find('mantle.product.Product').condition('productId',item.productId).one()
+                        if(!prd || prd.ownerPartyId!=job.organizationPartyId || item.organizationPartyId!=job.organizationPartyId){fail(403,'Print job product ownership is inconsistent.');return}
+                        // Match the captured value, rather than borrowing the CURRENT primary's format.
+                        def bc=ec.entity.find('zenith.erp.barcode.ProductBarcode').condition('organizationPartyId',job.organizationPartyId).condition('productId',item.productId).condition('barcodeValue',item.barcodeValue).one()
+                        if(!append([value:item.barcodeValue,type:bc?.barcodeTypeEnumId ?: 'BctInternal',name:prd.productName ?: item.productId,sku:prd.pseudoId ?: '',price:prd.mrpAmount],(item.quantity ?: 0) as int))return
+                    }
+                }else if(barcodeId){
+                    def checked=access('barcode',barcodeId);if(!checked.allowed){fail(403,'You do not have access to these labels.');return};def bc=checked.record
+                    def prd=ec.entity.find('mantle.product.Product').condition('productId',bc.productId).one()
+                    if(bc.isActive!='Y' || !prd || prd.ownerPartyId!=bc.organizationPartyId){fail(400,'This barcode is inactive or has an inconsistent product owner.');return}
+                    if(bc.organizationPartyId)tpl=ec.entity.find('zenith.erp.barcode.BarcodeLabel').condition('organizationPartyId',bc.organizationPartyId).condition('isDefault','Y').one()
+                    append([value:bc.barcodeValue,type:bc.barcodeTypeEnumId,name:prd.productName ?: bc.productId,sku:prd.pseudoId ?: '',price:prd.mrpAmount],1)
+                }else if(productIds){
+                    if(!org){fail(403,'Select an active organization before printing labels.');return}
+                    def count=copies?.toString() ?: '1'
+                    if(!(count==~ /[0-9]{1,3}/) || count.toInteger()<1 || count.toInteger()>200){fail(400,'Copies must be a whole number from 1 to 200.');return}
+                    int qty=count.toInteger();def ids=productIds.toString().split(',').collect{it.trim()}.findAll{it}.unique()
+                    if(!ids || ids.size()>500 || ids.size()*qty>2000){fail(400,'Choose at most 2000 labels per preview.');return}
+                    if(labelId){def t=access('label',labelId);if(!t.allowed || t.record.organizationPartyId!=org){fail(403,'Choose a template from the active organization.');return};tpl=t.record}
+                    else if(w || h || showName || showPrice || showSku){tpl=[labelWidth:w ?: 50,labelHeight:h ?: 30,columnsPerRow:3,showProductName:showName ?: 'Y',showPrice:showPrice ?: 'Y',showSku:showSku ?: 'N']}
+                    else tpl=ec.entity.find('zenith.erp.barcode.BarcodeLabel').condition('organizationPartyId',org).condition('isDefault','Y').one()
+                    for(def pid in ids){
+                        def result=ec.service.sync().name('zenith.barcode.BarcodeServices.get#ProductLabel').parameters([productId:pid]).call()
+                        if(ec.message.hasError() || result.label?.owner!=org){fail(403,'Choose products from the active organization.');return}
+                        if(!append(result.label,qty))return
+                    }
+                }else{fail(400,'Choose a barcode, print job or product selection.');return}
+                int columns;BigDecimal width;BigDecimal height
+                try{
+                    columns=(tpl?.columnsPerRow ?: 3) as int;width=new BigDecimal((tpl?.labelWidth ?: 50).toString());height=new BigDecimal((tpl?.labelHeight ?: 30).toString())
+                    if(columns<1 || columns>10 || width<=0 || width>300 || height<=0 || height>300)throw new IllegalArgumentException()
+                }catch(Exception e){fail(400,'The label dimensions or columns are invalid.');return}
+                def format=[BctEan13:'EAN13',BctEan8:'EAN8',BctUpcA:'UPC',BctUpcE:'UPCE',BctCode128:'CODE128',BctCode39:'CODE39',BctInternal:'CODE128',BctQrCode:'QR']
+                for(def label in labels){label.format=format[label.type];if(!label.format){fail(400,'A label has an unsupported barcode type.');return}}
+                // JSON escapes all script terminators/control characters; barcode input never becomes executable JS.
+                def payload=groovy.json.JsonOutput.toJson(labels).replace('<','\\u003c').replace('>','\\u003e').replace('&','\\u0026').replace('\u2028','\\u2028').replace('\u2029','\\u2029')
+                def esc={value -> (value ?: '').toString().replace('&','&amp;').replace('<','&lt;').replace('>','&gt;').replace('"','&quot;').replace("'",'&#39;')}
+                def currency=null
+                if(org)currency=ec.entity.find('zenith.erp.base.CompanySettings').condition('organizationPartyId',org).condition('settingKey','CURRENCY_UOM_ID').one()?.settingValue
+                def sb=new StringBuilder("<!DOCTYPE html><html><head><meta charset='utf-8'><title>Barcode Labels</title><link rel='stylesheet' href='/zenithstatic/css/barcode-labels.css?v=1'>")
+                sb.append("<style>.grid{grid-template-columns:repeat("+columns+","+width.toPlainString()+"mm)}.lbl{width:"+width.toPlainString()+"mm;height:"+height.toPlainString()+"mm}</style></head><body>")
+                sb.append("<div class='noprint'><button id='print-labels' disabled>Print</button> <b>"+labels.size()+"</b> label(s)<p id='label-status' role='status'>Preparing labels…</p></div><div class='preview'><div class='grid'>")
+                labels.eachWithIndex{lab,idx ->
+                    sb.append("<div class='lbl' data-index='"+idx+"'>")
+                    if(!tpl || tpl.showProductName=='Y')sb.append("<div class='nm'>"+esc(lab.name)+"</div>")
+                    if(lab.format=='QR')sb.append("<div class='qr' id='q"+idx+"'></div>");else sb.append("<svg class='bc' id='b"+idx+"'></svg>")
+                    if(tpl?.showSku=='Y' && lab.sku)sb.append("<div class='sk'>"+esc(lab.sku)+"</div>")
+                    if((!tpl || tpl.showPrice=='Y') && lab.price!=null)sb.append("<div class='pr'>"+esc(currency ? currency+' ' : '')+(lab.price as BigDecimal).setScale(2,java.math.RoundingMode.HALF_UP)+"</div>")
+                    if(tpl?.showMrp=='Y' && lab.price!=null)sb.append("<div class='pr'>MRP: "+esc(currency ? currency+' ' : '')+(lab.price as BigDecimal).setScale(2,java.math.RoundingMode.HALF_UP)+"</div>")
+                    sb.append('</div>')
                 }
-                sb.append("</div><scr"+"ipt>function zren(){")
-                labels.eachWithIndex { lab, idx ->
-                    def v = jsq(lab.value)
-                    if (lab.fmt == 'QR')
-                        sb.append("try{new QRCode(document.getElementById('q" + idx + "'),{text:'" + v + "',width:90,height:90});}catch(e){}")
-                    else
-                        sb.append("try{JsBarcode('#b" + idx + "','" + v + "',{format:'" + lab.fmt + "',height:38,fontSize:12,margin:2});}catch(e){try{JsBarcode('#b" + idx + "','" + v + "',{format:'CODE128',height:38,fontSize:12,margin:2});}catch(e2){}}")
-                }
-                sb.append("}if(document.readyState!='loading')zren();else window.addEventListener('DOMContentLoaded',zren);</scr"+"ipt></body></html>")
-                ec.web.sendTextResponse(sb.toString(), "text/html", null)
+                sb.append("</div></div><script type='application/json' id='label-data'>"+payload+"</script><script src='/zenithstatic/js/JsBarcode.all.min.js'></script><script src='/zenithstatic/js/barcode-qrcode.min.js?v=1'></script><script src='/zenithstatic/js/barcode-label-renderer.js?v=1'></script></body></html>")
+                ec.web.sendTextResponse(sb.toString(),'text/html',null)
             ]]></script>
         </actions>
         <default-response type="none"/>
     </transition>
+
+    <pre-actions><script><![CDATA[
+        // Evaluate the pure write predicate explicitly for view-only users; never inherit a fail-open UI flag.
+        def permission=ec.service.sync().name('zenith.base.SecurityServices.check#ModuleWriteAccess').parameters([moduleId:'barcode']).disableAuthz().call()
+        modCanWrite=permission.canWrite==true
+    ]]></script></pre-actions>
 
     <widgets><subscreens-active/></widgets>
 </screen>
