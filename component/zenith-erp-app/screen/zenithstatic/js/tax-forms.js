@@ -7,6 +7,28 @@
     var prefix = screen.indexOf('Edit') === 0 ? 'tx' : (screen.indexOf('Registration') >= 0 ? 'nr' : 'te');
     var shell = location.pathname.split('/zenith/')[0];
     var base = shell + '/zenith/tax/' + screen;
+    document.querySelectorAll('[data-tax-open]').forEach(function (button) {
+      if (button.dataset.modalReady) return;
+      button.dataset.modalReady = 'true';
+      var overlay = document.getElementById(button.dataset.taxOpen);
+      if (!overlay) return;
+      function close() { overlay.style.display = 'none'; button.focus(); }
+      button.addEventListener('click', function () {
+        overlay.style.display = 'flex';
+        var first = overlay.querySelector('select,input:not([type=hidden]),textarea,button');
+        if (first) first.focus();
+      });
+      overlay.querySelector('[data-tax-close]').addEventListener('click', close);
+      overlay.addEventListener('keydown', function (event) {
+        if (event.key === 'Escape') { event.preventDefault(); close(); return; }
+        if (event.key !== 'Tab') return;
+        var controls = Array.from(overlay.querySelectorAll('button,input:not([type=hidden]),select,textarea,[tabindex="0"]'))
+          .filter(function (control) { return !control.disabled && control.getClientRects().length; });
+        var first = controls[0], last = controls[controls.length - 1];
+        if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+        else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+      });
+    });
     document.querySelectorAll('.zc-tax-page a[href^="/apps/zenith/tax/"]').forEach(function (link) {
       link.setAttribute('href', shell + link.getAttribute('href').slice('/apps'.length));
     });
@@ -25,12 +47,6 @@
         form.querySelectorAll('button[type=submit]').forEach(function (button) { button.disabled = true; });
       });
       form.addEventListener('input', function () { if (form.elements.partyId) form.elements.partyId.setCustomValidity(''); });
-    });
-    document.querySelectorAll('input[type=date][id]').forEach(function (input) {
-      var display = document.getElementById(input.id + '-disp');
-      if (!display || input.dataset.ready) return;
-      input.dataset.ready = 'true';
-      input.addEventListener('change', function () { display.value = input.value ? input.value.split('-').reverse().join(' - ') : ''; });
     });
     var country = document.getElementById(prefix + '-country');
     var region = document.getElementById(prefix + '-region');
@@ -60,6 +76,8 @@
       var select = document.getElementById(clear.dataset.for);
       if (!select || clear.dataset.ready) return;
       clear.dataset.ready = 'true';
+      var label = document.querySelector('label[for="' + select.id + '"]');
+      clear.setAttribute('aria-label', 'Clear ' + (label ? label.textContent.replace('*', '').trim() : 'selection'));
       function update() { clear.style.display = select.value ? 'flex' : 'none'; }
       select.addEventListener('change', update); update();
       clear.addEventListener('click', function () { select.value = ''; select.dispatchEvent(new Event('change', { bubbles: true })); });
@@ -75,6 +93,8 @@
         var size=Number(perPage.value), pages=Math.max(1,Math.ceil(matches.length/size));page=Math.min(page,pages);
         rows.forEach(function (row) {row.hidden=true;});
         matches.slice((page-1)*size,page*size).forEach(function (row) {row.hidden=false;});
+        var empty = document.getElementById('te-no-matches');
+        if (empty) empty.hidden = matches.length > 0 || rows.length === 0;
         document.getElementById('te-count').textContent='Showing '+(matches.length ? ((page-1)*size+1) : 0)+'–'+Math.min(page*size,matches.length)+' of '+matches.length+' matching rules';
         document.getElementById('te-page').textContent=page+' / '+pages;
         previous.disabled=page===1;next.disabled=page===pages;

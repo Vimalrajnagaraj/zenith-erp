@@ -31,12 +31,28 @@ async function submit(id){await Promise.all([page.waitForNavigation({waitUntil:'
    });
   }
   await page.setViewport({width:1366,height:900});
+  await record(shell+' accessible modals and clear controls',async()=>{
+   for(const [screen,prefix,opener,party] of [['FindTaxRegistration','nr','New Registration','TAX_QA_UI_CUST'],['FindTaxExemption','te','Add New Exemption','TAX_QA_UI_CUST']]) {
+    await open(`/${shell}/zenith/tax/${screen}`);await clickText('button',opener);await page.waitForSelector(`#${prefix}-overlay`,{visible:true});
+    assert(await page.$eval(`#${prefix}-overlay`,e=>e.getAttribute('role')==='dialog'&&e.getAttribute('aria-modal')==='true'),'Accessible dialog missing');
+    await select(`#${prefix}-party`,party);const clear=`button[data-for="${prefix}-party"]`;await page.focus(clear);await page.keyboard.press('Enter');
+    assert(await page.$eval(`#${prefix}-party`,e=>e.value===''),'Keyboard clear failed');
+    await fill(`#${prefix}-efffrom`,'2026-07-01');assert(await page.$eval(`#${prefix}-efffrom`,e=>e.labels.length===1&&getComputedStyle(e).opacity==='1'),'Native date is unlabelled or invisible');
+    for(const width of [1366,800,390,320]) {
+     await page.setViewport({width,height:900});
+     assert(await page.$eval(`#${prefix}-overlay > div`,e=>e.scrollWidth<=e.clientWidth+1),'Modal overflows horizontally');
+    }
+    await page.keyboard.press('Escape');assert(await page.$eval(`#${prefix}-overlay`,e=>getComputedStyle(e).display==='none'),'Escape did not close modal');
+    assert(await page.$eval(`[data-tax-open="${prefix}-overlay"]`,e=>document.activeElement===e),'Opener focus not restored');await page.setViewport({width:1366,height:900});
+   }
+   return {keyboardClear:true,escape:true,focusRestored:true,nativeDates:true};
+  });
   await record(shell+' registration country-region and native create',async()=>{
    await open(`/${shell}/zenith/tax/FindTaxRegistration`);await clickText('button','New Registration');await page.waitForSelector('#nr-party',{visible:true});
    await page.waitForSelector('#nr-country[data-ready="true"]',{timeout:15000});await select('#nr-country','AUS');await page.waitForFunction(()=>!document.querySelector('#nr-region').disabled&&document.querySelector('#nr-region').options.length>1);
    assert(await page.$eval('#nr-region',e=>!Array.from(e.options).some(o=>['27','29'].includes(o.value))),'Old India regions retained after initialized country change');
    await select('#nr-country','IND');await page.waitForFunction(()=>Array.from(document.querySelector('#nr-region').options).some(o=>o.value==='29'));
-   await select('#nr-party','TAX_QA_UI_CUST');await select('#nr-auth','TAX_QA_AUTH');await select('#nr-regtype','TrtGstin');await select('#nr-region','29');await fill('#nr-regnumber','29ABCDE1234F2ZV');
+   await select('#nr-party','TAX_QA_UI_CUST');await select('#nr-auth','TAX_QA_AUTH');await select('#nr-regtype','TrtGstin');await select('#nr-region','29');await fill('#nr-regnumber','29ABCDE1234F2ZV');await fill('#nr-efffrom','2026-07-01');await fill('#nr-effthru','2027-07-01');
    await page.screenshot({path:out+'/'+shell+'-registration-desktop.png',fullPage:false});await page.setViewport({width:390,height:844});await page.screenshot({path:out+'/'+shell+'-registration-mobile.png',fullPage:false});await page.setViewport({width:1366,height:900});
    // Second shell uses a different valid registration type to test both POST routes without duplicate GSTIN.
    if(shell==='qapps'){await select('#nr-regtype','TrtPan');await fill('#nr-regnumber','ABCDE1234F');}
@@ -46,12 +62,16 @@ async function submit(id){await Promise.all([page.waitForNavigation({waitUntil:'
   await record(shell+' registration edit persists safe text',async()=>{
    await open(`/${shell}/zenith/tax/FindTaxRegistration`);if(shell==='qapps')await page.waitForFunction(()=>document.querySelectorAll('a[id*="_registrationId_"]').length>=3,{timeout:15000});
    const href=await page.$$eval('a[href*="EditTaxRegistration"]',(a,shell)=>a.filter(e=>shell==='qapps'?e.id.includes('_registrationId_'):e.closest('tr')?.textContent.includes('29ABCDE1234F2ZV')).map(e=>e.getAttribute('href')).filter(h=>Number.isFinite(Number(new URL(h,location.origin).searchParams.get('registrationId')))).sort((x,y)=>Number(new URL(y,location.origin).searchParams.get('registrationId'))-Number(new URL(x,location.origin).searchParams.get('registrationId')))[0],shell);assert(href,'New contact registration edit link');await open(href);
+   assert(await page.$eval('#tx-efffrom',e=>e.value==='2026-07-01'),'Create date did not persist');await fill('#tx-effthru','2027-08-01');
+   await page.screenshot({path:out+'/'+shell+'-registration-edit-desktop.png',fullPage:false});
+   for(const width of [1366,800,390,320]) {await page.setViewport({width,height:900});assert(await page.$eval('.zc-tax-form',e=>e.scrollWidth<=e.clientWidth+1),'Edit form horizontal overflow');}
+   await page.screenshot({path:out+'/'+shell+'-registration-edit-mobile.png',fullPage:false});await page.setViewport({width:1366,height:900});
    await fill('.zc-tax-form [name=description]',"Synthetic UI O'Brien edited");
    const button=await page.$('.zc-tax-form button[type=submit]');assert(button,'Edit button');await Promise.all([page.waitForNavigation({waitUntil:'networkidle2'}),button.click()]);
    assert(await page.$eval('.zc-tax-form [name=description]',e=>e.value==="Synthetic UI O'Brien edited"),'Description did not persist');assert(!await page.$('.zc-tax-form img[src="x"]'),'XSS markup executed');
   });
   await record(shell+' exemption filter and native create/edit',async()=>{
-   await open(`/${shell}/zenith/tax/FindTaxExemption`);await fill('#te-search','NO_MATCH_SYNTHETIC');assert(await page.$eval('#te-count',e=>e.textContent.includes('of 0 matching')),'No-match count');await fill('#te-search','');
+   await open(`/${shell}/zenith/tax/FindTaxExemption`);await fill('#te-search','NO_MATCH_SYNTHETIC');assert(await page.$eval('#te-count',e=>e.textContent.includes('of 0 matching')),'No-match count');assert(await page.$eval('#te-no-matches',e=>!e.hidden),'No-match feedback missing');await fill('#te-search','');assert(await page.$eval('#te-no-matches',e=>e.hidden),'No-match feedback did not clear');
    await select('#te-status','Inactive');assert(await page.$eval('#te-count',e=>e.textContent.includes('of 0 matching')),'Inactive filter');await select('#te-status','');
    await clickText('button','Add New Exemption');await page.waitForSelector('#te-party',{visible:true});await select('#te-party','TAX_QA_UI_CUST');await select('#te-auth','TAX_QA_AUTH');await select('#te-type','TexFull');await fill('#te-number','TAX_QA_UI_'+shell);await submit('#te-create');
    assert(await page.$eval('body',(e,n)=>e.innerText.includes(n),'TAX_QA_UI_'+shell),'Exemption not displayed');
