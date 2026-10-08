@@ -29,10 +29,10 @@ Browser verification covered a 1537×1023 reference viewport, 768×1024 Bootstra
 
 Only container `zenith-erp-expiry-risk-review` at `127.0.0.1:8083`, database `moqui_expiry_risk_review`, was used. Scheduled service jobs are disabled in this disposable runtime. The seed and harness reject non-local URLs and databases outside `moqui_expiry_risk_*`; provide the existing local demo password privately as `SMOKE_PASS`. Do not seed a production or shared database.
 
-Separate `ERPREVIEW` visual fixtures are intentionally retained in the isolated preview while the user reviews six clearly labeled sample lots. They are not production rows or deployment seeds. Capture their exact related IDs and remove them before publication; the local ignored preview manifest records the review scope. Regression fixtures (`ERFIX`) have already been removed and checked independently.
+The user reviewed six clearly labeled `ERPREVIEW` sample lots in the isolated preview. On publication authorization, all related preview rows were captured by primary key, removed, and checked for zero residue. Regression fixtures (`ERFIX`) were also removed and checked independently. These were local visual fixtures, not production rows or deployment seeds.
 
 ## Publication and rollout
 
-The branch is held locally until the user's confirmation. Prepare the template-compliant PR description locally; a GitHub PR number requires pushing the branch. Run repository CI and exact-candidate staging acceptance after authorized publication, then mark ready only when the required checks pass. Recheck latest master immediately before publication; a clean local merge simulation cannot guarantee conflicts will never arise later.
+The user authorized publication after visual review. Local repository guards and the merge simulation against freshly fetched master passed, and preview cleanup is complete. Run repository CI and exact-candidate staging acceptance after publication, then mark ready only when the required checks pass. A clean local merge simulation cannot guarantee conflicts will never arise later.
 
 Maintainer review and the production deployment gate still apply because stock posting and tenant guards changed. Load `EmailExpiryRiskReportTemplateData.xml` through the approved inventory seed process before enabling Email Report. Configure/verify delivery with the approved mail setup; actual email delivery was not tested. This branch adds no entity columns and does not depend on unmerged Stock Adjustments changes. Merge does not deploy.
