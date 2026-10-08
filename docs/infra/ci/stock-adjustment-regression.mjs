@@ -3,10 +3,11 @@
 import assert from 'node:assert/strict';
 import {execFileSync} from 'node:child_process';
 import {writeFileSync} from 'node:fs';
-const base=process.env.STOCK_ADJUSTMENT_URL || 'http://localhost:8080';
+const base=process.env.STOCK_ADJUSTMENT_URL || 'http://127.0.0.1:8082';
 assert(['localhost','127.0.0.1'].includes(new URL(base).hostname),'Local verification only');
-const database=process.env.STOCK_ADJUSTMENT_DATABASE || 'moqui';
-assert(/^[a-z][a-z0-9_]*$/.test(database),'Local database name');
+const database=process.env.STOCK_ADJUSTMENT_DATABASE || 'moqui_stock_adjustments_review';
+assert(/^moqui_stock_adjustments_[a-z0-9_]+$/.test(database),'Dedicated disposable Stock Adjustments database required');
+assert(process.env.SMOKE_PASS,'Set SMOKE_PASS to the existing local demo password');
 const route='/apps/zenith/Inventory/';
 const sql=statement => execFileSync('docker',['exec','zenith-erp-db-1','psql','-U','moqui','-d',database,'-At','-v','ON_ERROR_STOP=1','-c',statement],{encoding:'utf8'}).trim();
 const quote=s=>"'"+String(s).replaceAll("'","''")+"'";
@@ -18,11 +19,11 @@ const balance=(product,facility,column='quantity_on_hand_total')=>Number(sql(`se
 const created=[]; const checks=[];
 const check=(name,fn)=>{fn();checks.push(name);console.log('PASS',name);};
 async function session(user='stock.adjustment.audit') {
- const auth='Basic '+Buffer.from(`${user}:${process.env.SMOKE_PASS || 'moqui'}`).toString('base64');
+ const auth='Basic '+Buffer.from(`${user}:${process.env.SMOKE_PASS}`).toString('base64');
  const jar=new Map(); let token;
- async function request(path,params) {
+ async function request(path,params,sendToken=true) {
   const body=params?new URLSearchParams():null;
-  if(params) for(const [key,value] of Object.entries({...params,moquiSessionToken:token})) for(const item of Array.isArray(value)?value:[value]) body.append(key,String(item));
+  if(params) for(const [key,value] of Object.entries({...params,...(sendToken?{moquiSessionToken:token}:{})})) for(const item of Array.isArray(value)?value:[value]) body.append(key,String(item));
   const response=await fetch(base+path,{redirect:'manual',method:params?'POST':'GET',headers:{...(!jar.size ? {Authorization:auth}:{}),Cookie:[...jar].map(([k,v])=>`${k}=${v}`).join('; ')},body});
   for(const entry of response.headers.getSetCookie()) {const [key,value]=entry.split(';')[0].split('=');jar.set(key,value);}
   const text=await response.text(); token=text.match(/name="moquiSessionToken" value="([^"]+)"/)?.[1] || text.match(/['"]moquiSessionToken['"]\s*:\s*['"]([^'"]+)['"]/)?.[1] || token;
@@ -59,7 +60,7 @@ try {
  check('Foreign or missing warehouse and invalid reason rejected',()=>{});
  await approve(first);await apply(first);
  check('Empty draft cannot approve or apply',()=>assert.equal(adjustment(first).status_id,'AdjPending'));
- for(const qty of ['-1','bad','']) await add(first,qty);
+ for(const qty of ['-1','bad','','1.0000001']) await add(first,qty);
  await add(first,'1',{productId:'SAFIX_FOREIGN'});
  check('Invalid counts and foreign products cannot create lines',()=>assert.equal(count('stock_adjustment_item',`stock_adjustment_id=${quote(first)}`),0));
  let seq=await add(first,'7.5');assert(seq);
@@ -93,6 +94,21 @@ try {
  check('Omitted unreserved serial is written off with audited identity',()=>{assert.equal(balance('SAFIX_SERIAL','SAFIX_A'),2);assert.equal(balance('SAFIX_SERIAL','SAFIX_A','available_to_promise_total'),1);assert.equal(row('product_serial_number',"serial_number_id='SAFIX_SN2'").status_id,'SnScrapped');assert.equal(row('product_serial_number',"serial_number_id='SAFIX_SN3'").status_id,'SnReserved');assert.equal(count('serial_number_history',`reference_id=${quote(serial)}`),1);});
  const restock=await create();await add(restock,'3',{productId:'SAFIX_SERIAL',countedSerialNumbers:'SAFIX-SN-1\nSAFIX-SN-3\nSAFIX-SN-4'});await approve(restock);await apply(restock);
  check('Only identified registered returned serials are restocked',()=>{assert.equal(balance('SAFIX_SERIAL','SAFIX_A'),3);assert.equal(row('product_serial_number',"serial_number_id='SAFIX_SN4'").status_id,'SnInStock');});
+ const newstock=await create({adjustmentType:'Opening'});await add(newstock,'2.25',{productId:'SAFIX_NEW'});await approve(newstock);await apply(newstock);
+ check('Opening count creates a usable inventory asset and posts once',()=>{assert.equal(balance('SAFIX_NEW','SAFIX_A'),2.25);assert.equal(balance('SAFIX_NEW','SAFIX_A','available_to_promise_total'),2.25);assert.equal(row('asset',"product_id='SAFIX_NEW'").status_id,'AstAvailable');});
+ const atomic=await create();await add(atomic,'11');await add(atomic,'4',{productId:'SAFIX_BATCH',assetId:'SAFIX_BATCH1'});await approve(atomic);
+ sql("update asset set quantity_on_hand_total=6,available_to_promise_total=6 where asset_id='SAFIX_BATCH1'");await apply(atomic);
+ check('A stale line rolls back the entire adjustment',()=>{assert.equal(adjustment(atomic).status_id,'AdjApproved');assert.equal(balance('SAFIX_P','SAFIX_A'),10);assert.equal(balance('SAFIX_BATCH','SAFIX_A'),6);});
+ const staleSerial=await create();await add(staleSerial,'2',{productId:'SAFIX_SERIAL',countedSerialNumbers:'SAFIX-SN-1\nSAFIX-SN-3'});await approve(staleSerial);
+ sql("update product_serial_number set status_id='SnReserved' where serial_number_id='SAFIX_SN1'");await apply(staleSerial);
+ check('Serial state changes invalidate previously approved identities',()=>{assert.equal(adjustment(staleSerial).status_id,'AdjApproved');assert.equal(balance('SAFIX_SERIAL','SAFIX_A'),3);});
+ const requestCount=count('stock_adjustment',"organization_party_id='SAFIX_ORG'");
+ await writer.request(route+'StockAdjustments/createAdjustment');
+ await writer.request(route+'StockAdjustments/createAdjustment?facilityId=SAFIX_A&adjustmentType=Opening');
+ await writer.request(route+'StockAdjustments/createAdjustment',{facilityId:'SAFIX_A',adjustmentType:'Opening'},false);
+ check('GET writes and missing CSRF tokens cannot create adjustments',()=>assert.equal(count('stock_adjustment',"organization_party_id='SAFIX_ORG'"),requestCount));
+ const named=await create({newFacilityId:'SAFIX_B',newAdjustmentType:'Opening',facilityId:'SAFIX_A',adjustmentType:'Damage'});
+ check('Native create fields override unrelated filter context and return the detail ID',()=>{assert(named);assert.equal(adjustment(named).facility_id,'SAFIX_B');assert.equal(adjustment(named).adjustment_type,'Opening');});
  const viewer=await session('stock.adjustment.viewer');const before=count('stock_adjustment',"organization_party_id='SAFIX_ORG'");await viewer.post('StockAdjustments','createAdjustment',{facilityId:'SAFIX_A',adjustmentType:'Opening'});await viewer.post('StockAdjustments','approveAdjustment',{stockAdjustmentId:reserved});
  check('View-only users cannot create or approve',()=>{assert.equal(count('stock_adjustment',"organization_party_id='SAFIX_ORG'"),before);assert.equal(adjustment(reserved).status_id,'AdjPending');});
  await approve('SAFIX_FOREIGN');await add('SAFIX_FOREIGN','1');
@@ -104,6 +120,17 @@ try {
  check('Forged active tenant cannot bypass organization membership',()=>assert.equal(count('stock_adjustment',"organization_party_id='SAFIX_OTHER'"),1));
  for(const surface of ['apps','qapps']) {const page=await writer.request(`/${surface}/zenith/Inventory/StockAdjustments?pageSize=1&lastStandalone=true&renderMode=${surface==='qapps'?'qvt':'html'}`);assert.equal(page.response.status,200);assert(page.text.includes('AdjListForm'));const detail=await writer.request(`/${surface}/zenith/Inventory/EditStockAdjustment?stockAdjustmentId=${first}&lastStandalone=true&renderMode=${surface==='qapps'?'qvt':'html'}`);assert.equal(detail.response.status,200);assert(detail.text.includes('Products in this adjustment'));}
  check('List and detail render on both apps and qapps',()=>{});
+ const filtered=await writer.request(route+'StockAdjustments?stockAdjustmentId='+first+'&stockAdjustmentId_op=equals&pageSize=1');
+ const table=filtered.text.match(/<table[^>]*id="AdjListForm_table"[^>]*>([\s\S]*?)<\/table>/)?.[1];assert(table);
+ check('ID filtering and paging use tenant-scoped native results',()=>{assert(table.includes(first));assert(!table.includes(zero));assert(!table.includes('SAFIX_FOREIGN'));});
+ const sorted=await writer.request(route+'StockAdjustments?orderByField=adjustmentDate&orderByField=adjustmentType&pageSize=100');
+ const sortedTable=sorted.text.match(/<table[^>]*id="AdjListForm_table"[^>]*>([\s\S]*?)<\/table>/)?.[1];assert(sortedTable);
+ const actual=[...sortedTable.matchAll(/href="[^"]*\/EditStockAdjustment\?stockAdjustmentId=([^"&]+)/g)].map(m=>m[1]);
+ const expected=JSON.parse(sql("select json_agg(stock_adjustment_id order by adjustment_date,adjustment_type,stock_adjustment_id desc) from stock_adjustment where organization_party_id='SAFIX_ORG'"));
+ check('Multi-column sorting keeps a stable ID tie-breaker',()=>assert.deepEqual(actual,expected));
+ const dialog=await writer.request(route+'StockAdjustments?adjustmentType=Opening');
+ check('Create dialog fields do not reuse list filter values',()=>{assert(dialog.text.includes('name="newAdjustmentType"'));assert(dialog.text.includes('name="newFacilityId"'));});
+
  console.log(JSON.stringify({passed:checks.length,created},null,2));
 } finally {
  const ids=JSON.parse(sql("select coalesce(json_agg(stock_adjustment_id),'[]') from stock_adjustment where organization_party_id in ('SAFIX_ORG','SAFIX_OTHER')"));
@@ -113,7 +140,7 @@ try {
  const cleanup=[];const del=(table,column,values)=>{if(values.length)cleanup.push(`delete from ${table} where ${column} in (${values.map(quote).join(',')});`);};
  del('stock_adjustment_item','stock_adjustment_id',ids);del('stock_adjustment','stock_adjustment_id',ids);del('serial_number_history','history_id',history);
  del('product_serial_number','serial_number_id',['SAFIX_SN1','SAFIX_SN2','SAFIX_SN3','SAFIX_SN4']);del('asset_detail','asset_detail_id',details);del('asset','asset_id',assets);
- del('product','product_id',['SAFIX_P','SAFIX_BATCH','SAFIX_SERIAL','SAFIX_FOREIGN']);del('facility','facility_id',['SAFIX_A','SAFIX_B','SAFIX_FOREIGN']);
+ del('product','product_id',['SAFIX_P','SAFIX_BATCH','SAFIX_SERIAL','SAFIX_NEW','SAFIX_FOREIGN']);del('facility','facility_id',['SAFIX_A','SAFIX_B','SAFIX_FOREIGN']);
  for(const table of ['user_preference','user_group_member','user_account'])del(table,'user_id',['SAFIX_USER','SAFIX_VIEW','SAFIX_NOORG','SAFIX_MANAGER']);
  del('party_relationship','party_relationship_id',['SAFIX_MEMBERSHIP']);for(const table of ['party_role','organization','party'])del(table,'party_id',['SAFIX_ORG','SAFIX_OTHER','SAFIX_PERSON']);
  writeFileSync(process.env.STOCK_ADJUSTMENT_MANIFEST || 'tmp/stock-adjustment-audit.json',JSON.stringify({ids,assets,details,history,checks},null,2));

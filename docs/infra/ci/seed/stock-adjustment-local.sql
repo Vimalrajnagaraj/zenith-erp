@@ -1,6 +1,9 @@
 -- Disposable local verification only. Import before stock-adjustment-regression.mjs.
 -- No customer rows, credentials or legal identifiers. Password hash is copied locally.
 BEGIN;
+DO $$ BEGIN
+ IF current_database() !~ '^moqui_stock_adjustments_[a-z0-9_]+$' THEN RAISE EXCEPTION 'Use a dedicated disposable Stock Adjustments database'; END IF;
+END $$;
 INSERT INTO party (party_id,party_type_enum_id,owner_party_id) VALUES ('SAFIX_ORG','PtyOrganization','_NA_'),('SAFIX_OTHER','PtyOrganization','_NA_'),('SAFIX_PERSON','PtyPerson','_NA_');
 INSERT INTO organization (party_id,organization_name) VALUES ('SAFIX_ORG','Stock adjustment audit'),('SAFIX_OTHER','Stock adjustment foreign audit');
 INSERT INTO party_role (party_id,role_type_id) VALUES ('SAFIX_ORG','OrgInternal'),('SAFIX_OTHER','OrgInternal');
@@ -13,6 +16,7 @@ INSERT INTO product (product_id,pseudo_id,product_name,owner_party_id,product_ty
 ('SAFIX_P','SAFIX-SKU','Adjustment fractional test','SAFIX_ORG','PtAsset',10,'Y','N','N'),
 ('SAFIX_BATCH','SAFIX-BATCH','Adjustment batch test','SAFIX_ORG','PtAsset',10,'Y','Y','N'),
 ('SAFIX_SERIAL','SAFIX-SERIAL','Adjustment serial test','SAFIX_ORG','PtAsset',10,'Y','N','Y'),
+('SAFIX_NEW','SAFIX-NEW','Adjustment opening test','SAFIX_ORG','PtAsset',10,'N','N','N'),
 ('SAFIX_FOREIGN','FOREIGN-SKU','Foreign transfer product','SAFIX_OTHER','PtAsset',10,'Y','N','N');
 INSERT INTO asset (asset_id,product_id,owner_party_id,facility_id,asset_type_enum_id,status_id,quantity_on_hand_total,available_to_promise_total,batch_number,expiry_date,manufacturing_date,valuation_rate,mrp_amount) VALUES
 ('SAFIX_A1','SAFIX_P','SAFIX_ORG','SAFIX_A','AstTpInventory','AstAvailable',10,8,NULL,NULL,NULL,5,10),
