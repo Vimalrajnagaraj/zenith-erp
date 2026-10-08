@@ -21,9 +21,13 @@ module.exports=async function(p,check,base,out){
         const find=p.getByText('Find Options',{exact:true}).filter({visible:true}).first();
         check(`${shell} ${screen} server filter is visible`,await find.isVisible());
         await find.click();
-        const submit=p.getByRole('button',{name:'Find',exact:true}).filter({visible:true}).first();
+        // Bootstrap's legacy modal keeps aria-hidden on its wrapper; address the actual native form.
+        const submit=p.locator('form[id$="_header"] [type="submit"]').filter({visible:true}).first();
+        await submit.waitFor({state:'visible'});
         check(`${shell} ${screen} server filter has a usable Find submit`,await submit.isVisible()&&await submit.isEnabled());
-        await p.keyboard.press('Escape');
+        await submit.click();
+        await p.waitForLoadState('networkidle');
+        check(`${shell} ${screen} native Find submits the read route`,p.url().includes('/pricing/'+screen));
         // Leave through the native route even if this framework keeps its dialog mounted.
         await p.goto(`${base}/${shell}/zenith/pricing/${screen}`,{waitUntil:'networkidle'});
         check(`${shell} ${screen} native CSV destination retained`,await p.locator('.zprf-list a[href*="renderMode=csv"]').count()>0);
