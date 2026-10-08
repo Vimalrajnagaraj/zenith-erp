@@ -1,0 +1,305 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+    <!-- All entry points validate the active tenant and Inventory write permission, including admins.
+         Lock the parent before editing lines or advancing the lifecycle. -->
+    <service verb="require" noun="StockTransferWrite">
+        <in-parameters><parameter name="stockTransferId"/><parameter name="requiredStatus"/></in-parameters>
+        <out-parameters><parameter name="organizationPartyId"/><parameter name="transfer" type="Map"/></out-parameters>
+        <actions>
+            <service-call name="zenith.base.SecurityServices.check#ModuleWriteAccess" in-map="[moduleId:'inventory']" out-map="access"/>
+            <if condition="!access.canWrite"><return error="true" message="You have view-only access to Inventory."/></if>
+            <set field="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <if condition="!organizationPartyId || organizationPartyId == '_NA_'"><return error="true" message="Select an organization before changing stock transfers."/></if>
+            <if condition="!ec.user.isInGroup('ADMIN')">
+                <service-call name="mantle.party.PartyServices.get#PartyOrganizationInfo" in-map="[partyId:ec.user.userAccount?.partyId]" out-map="membership"/>
+                <if condition="!membership.userOrgIds?.contains(organizationPartyId)"><return error="true" message="You do not belong to the selected organization."/></if>
+            </if>
+            <if condition="stockTransferId">
+                <entity-find-one entity-name="zenith.erp.inventory.StockTransfer" value-field="transfer" for-update="true"/>
+                <if condition="transfer == null || transfer.organizationPartyId != organizationPartyId"><return error="true" message="You do not have access to this stock transfer."/></if>
+                <if condition="requiredStatus &amp;&amp; transfer.statusId != requiredStatus"><return error="true" message="This action is not available in the transfer's current status."/></if>
+            </if>
+        </actions>
+    </service>
+    <service verb="validate" noun="StockTransferFacilities">
+        <in-parameters><parameter name="organizationPartyId" required="true"/><parameter name="fromFacilityId" required="true"/><parameter name="toFacilityId" required="true"/></in-parameters>
+        <actions>
+            <script><![CDATA[
+                if (organizationPartyId != ec.user.getPreference('ACTIVE_ORGANIZATION')) { ec.message.addError('Select your active organization.'); return }
+                if (fromFacilityId == toFacilityId) { ec.message.addError('Choose two different warehouses.'); return }
+                for (id in [fromFacilityId, toFacilityId]) {
+                    def f = ec.entity.find('mantle.facility.Facility').condition('facilityId', id).one()
+                    if (!f || f.ownerPartyId != organizationPartyId) ec.message.addError('Both warehouses must belong to your active organization.')
+                }
+            ]]></script>
+        </actions>
+    </service>
+    <service verb="create" noun="StockTransfer">
+        <in-parameters><parameter name="fromFacilityId" required="true"/><parameter name="toFacilityId" required="true"/><parameter name="transferDate" type="Timestamp"/><parameter name="remarks"/></in-parameters>
+        <out-parameters><parameter name="stockTransferId"/></out-parameters>
+        <actions>
+            <service-call name="zenith.inventory.StockTransferServices.require#StockTransferWrite" out-map="guard"/>
+            <service-call name="zenith.inventory.StockTransferServices.validate#StockTransferFacilities" in-map="[organizationPartyId:guard.organizationPartyId, fromFacilityId:fromFacilityId, toFacilityId:toFacilityId]"/>
+            <service-call name="create#zenith.erp.inventory.StockTransfer" in-map="[organizationPartyId:guard.organizationPartyId, fromFacilityId:fromFacilityId, toFacilityId:toFacilityId, transferDate:transferDate ?: ec.user.nowTimestamp, remarks:remarks, statusId:'StxDraft', totalValue:0, ewayBillRequired:'N']" out-map="created"/>
+            <set field="stockTransferId" from="created.stockTransferId"/>
+            <service-call name="update#zenith.erp.inventory.StockTransfer" in-map="[stockTransferId:stockTransferId, transferNumber:stockTransferId]"/>
+            <service-call name="zenith.inventory.InventoryServices.recalc#StockTransferTotals" in-map="[stockTransferId:stockTransferId]"/>
+        </actions>
+    </service>
+    <service verb="add" noun="StockTransferItem">
+        <in-parameters><parameter name="stockTransferId" required="true"/><parameter name="productId" required="true"/><parameter name="quantity" type="BigDecimal"/><parameter name="unitAmount" type="BigDecimal"/><parameter name="batchNumber"/><parameter name="serialNumbers" type="List"/></in-parameters>
+        <out-parameters><parameter name="transferItemSeqId"/></out-parameters>
+        <actions>
+            <service-call name="zenith.inventory.StockTransferServices.require#StockTransferWrite" in-map="[stockTransferId:stockTransferId, requiredStatus:'StxDraft']" out-map="guard"/>
+            <script><![CDATA[
+                def prod = ec.entity.find('mantle.product.Product').condition('productId', productId).one()
+                if (!prod || prod.ownerPartyId != guard.organizationPartyId) { ec.message.addError('Choose a product from your active organization.'); return }
+                def ids = (serialNumbers ?: []).findAll { it }.collect { it.toString() }
+                if (ids.size() != ids.toSet().size()) { ec.message.addError('A serial number can only be selected once.'); return }
+                if (ids && prod.enableSerialTracking != 'Y') { ec.message.addError('This product does not track serial numbers.'); return }
+                if (ids) quantity = ids.size() as BigDecimal
+                if (quantity == null || quantity.signum() <= 0) { ec.message.addError('Quantity to send must be greater than zero.'); return }
+                if (prod.enableSerialTracking == 'Y' && quantity.stripTrailingZeros().scale() > 0) { ec.message.addError('Serial-tracked quantities must be whole numbers.'); return }
+                def price = unitAmount != null ? unitAmount : (prod.mrpAmount ?: 0G)
+                if (price < 0) { ec.message.addError('Unit amount cannot be negative.'); return }
+                def picked = []
+                for (id in ids) {
+                    def sn = ec.entity.find('zenith.erp.inventory.ProductSerialNumber').condition('serialNumberId', id).one()
+                    def used = ec.entity.find('zenith.erp.inventory.StockTransferItemSerial').condition('stockTransferId', stockTransferId).condition('serialNumberId', id).count()
+                    if (!sn || sn.productId != productId || sn.facilityId != guard.transfer.fromFacilityId || sn.statusId != 'SnInStock' || used) ec.message.addError('Selected serials must be available at the sender and unused in this transfer.')
+                    else picked.add(sn)
+                }
+                def source = null
+                if (batchNumber) {
+                    source = ec.entity.find('mantle.product.asset.Asset').condition('ownerPartyId', guard.organizationPartyId).condition('productId', productId)
+                        .condition('facilityId', guard.transfer.fromFacilityId).condition('assetTypeEnumId', 'AstTpInventory').condition('batchNumber', batchNumber)
+                        .condition('quantityOnHandTotal', org.moqui.entity.EntityCondition.GREATER_THAN_EQUAL_TO, quantity)
+                        .condition('availableToPromiseTotal', org.moqui.entity.EntityCondition.GREATER_THAN_EQUAL_TO, quantity).orderBy('expiryDate,assetId').one()
+                    if (!source || prod.enableBatchTracking != 'Y') ec.message.addError('Choose an in-stock batch for this product at the sender.')
+                }
+                if (ec.message.hasError()) return
+                def created = ec.service.sync().name('create#zenith.erp.inventory.StockTransferItem').parameters([
+                    stockTransferId:stockTransferId, productId:productId, quantity:quantity, unitAmount:price,
+                    batchNumber:batchNumber ?: null, fromAssetId:source?.assetId]).call()
+                transferItemSeqId = created.transferItemSeqId
+                for (sn in picked) ec.service.sync().name('create#zenith.erp.inventory.StockTransferItemSerial').parameters([
+                    stockTransferId:stockTransferId, transferItemSeqId:transferItemSeqId, serialNumberId:sn.serialNumberId, serialNumber:sn.serialNumber]).call()
+            ]]></script>
+            <service-call name="zenith.inventory.InventoryServices.recalc#StockTransferTotals" in-map="[stockTransferId:stockTransferId]"/>
+        </actions>
+    </service>
+    <service verb="delete" noun="StockTransferItem">
+        <in-parameters><parameter name="stockTransferId" required="true"/><parameter name="transferItemSeqId" required="true"/></in-parameters>
+        <actions>
+            <service-call name="zenith.inventory.StockTransferServices.require#StockTransferWrite" in-map="[stockTransferId:stockTransferId, requiredStatus:'StxDraft']"/>
+            <entity-find-one entity-name="zenith.erp.inventory.StockTransferItem" value-field="line"/>
+            <if condition="line == null"><return error="true" message="Transfer line not found."/></if>
+            <entity-delete-by-condition entity-name="zenith.erp.inventory.StockTransferItemSerial"><econdition field-name="stockTransferId"/><econdition field-name="transferItemSeqId"/></entity-delete-by-condition>
+            <entity-delete value-field="line"/>
+            <service-call name="zenith.inventory.InventoryServices.recalc#StockTransferTotals" in-map="[stockTransferId:stockTransferId]"/>
+        </actions>
+    </service>
+    <service verb="update" noun="StockTransferLogistics">
+        <in-parameters><parameter name="stockTransferId" required="true"/><parameter name="transporterGstin"/><parameter name="lrNumber"/><parameter name="vehicleNumber"/></in-parameters>
+        <actions>
+            <service-call name="zenith.inventory.StockTransferServices.require#StockTransferWrite" in-map="[stockTransferId:stockTransferId]" out-map="guard"/>
+            <if condition="!(guard.transfer.statusId in ['StxDraft','StxInTransit'])"><return error="true" message="Logistics can only be edited before receiving."/></if>
+            <service-call name="update#zenith.erp.inventory.StockTransfer" in-map="[stockTransferId:stockTransferId, transporterGstin:transporterGstin?.trim()?.toUpperCase(), lrNumber:lrNumber?.trim(), vehicleNumber:vehicleNumber?.trim()?.toUpperCase()]"/>
+        </actions>
+    </service>
+    <service verb="set" noun="StockTransferReceivedQuantity">
+        <in-parameters><parameter name="stockTransferId" required="true"/><parameter name="transferItemSeqId" required="true"/><parameter name="quantityReceived" type="BigDecimal" required="true"/><parameter name="receivedSerialNumbers" type="List"/></in-parameters>
+        <actions>
+            <service-call name="zenith.inventory.StockTransferServices.require#StockTransferWrite" in-map="[stockTransferId:stockTransferId, requiredStatus:'StxInTransit']" out-map="guard"/>
+            <entity-find-one entity-name="zenith.erp.inventory.StockTransferItem" value-field="line"/>
+            <if condition="line == null"><return error="true" message="Transfer line not found."/></if>
+            <if condition="quantityReceived &lt; 0 || quantityReceived &gt; line.quantity"><return error="true" message="Received quantity must be between zero and the quantity sent."/></if>
+            <script><![CDATA[
+                def prod = ec.entity.find('mantle.product.Product').condition('productId', line.productId).one()
+                if (prod?.enableSerialTracking == 'Y') {
+                    if (quantityReceived.stripTrailingZeros().scale() > 0) { ec.message.addError('Serial-tracked quantities must be whole numbers.'); return }
+                    def picked = ec.entity.find('zenith.erp.inventory.StockTransferItemSerial').condition('stockTransferId', stockTransferId).condition('transferItemSeqId', transferItemSeqId).list()
+                    def ids = (receivedSerialNumbers ?: []).findAll { it }.collect { it.toString() }.toSet()
+                    if (quantityReceived == line.quantity && !ids) ids = picked.collect { it.serialNumberId }.toSet()
+                    if (ids.size() != quantityReceived.intValueExact() || !picked.collect { it.serialNumberId }.containsAll(ids)) {
+                        ec.message.addError('Select exactly the serial numbers that arrived; use zero with no selection if none arrived.'); return
+                    }
+                    for (sn in picked) { sn.received = ids.contains(sn.serialNumberId) ? 'Y' : 'N'; sn.update() }
+                }
+                line.quantityReceived = quantityReceived
+                line.update()
+            ]]></script>
+        </actions>
+    </service>
+    <!-- The ledger EECA updates quantities. Never both update totals and post the same movement.
+         Legacy opening balances are reconciled only for the exact locked asset being moved. -->
+    <service verb="move" noun="StockTransferAsset" no-tx-cache="true">
+        <in-parameters><parameter name="stockTransferId" required="true"/><parameter name="assetId" required="true"/><parameter name="quantityDiff" type="BigDecimal" required="true"/><parameter name="direction" required="true"/></in-parameters>
+        <actions>
+            <service-call name="zenith.inventory.StockTransferServices.require#StockTransferWrite" in-map="[stockTransferId:stockTransferId, requiredStatus:'StxInTransit']" out-map="guard"/>
+            <entity-find-one entity-name="mantle.product.asset.Asset" value-field="asset" for-update="true"/>
+            <if condition="asset == null || asset.ownerPartyId != guard.organizationPartyId || asset.assetTypeEnumId != 'AstTpInventory' || !(direction in ['out','in']) || asset.facilityId != (direction == 'out' ? guard.transfer.fromFacilityId : guard.transfer.toFacilityId) || (direction == 'out' ? quantityDiff &gt;= 0 : quantityDiff &lt;= 0)"><return error="true" message="Invalid stock transfer movement."/></if>
+            <if condition="direction == 'out' &amp;&amp; (((asset.quantityOnHandTotal ?: 0G) + quantityDiff) &lt; 0 || ((asset.availableToPromiseTotal ?: 0G) + quantityDiff) &lt; 0)"><return error="true" message="Not enough unreserved stock at the sender."/></if>
+            <script><![CDATA[
+                def details = ec.entity.find('mantle.product.asset.AssetDetail').condition('assetId', assetId).list()
+                def q = details.sum { it.quantityOnHandDiff ?: 0G } ?: 0G
+                def a = details.sum { it.availableToPromiseDiff ?: 0G } ?: 0G
+                def qGap = (asset.quantityOnHandTotal ?: 0G) - q
+                def aGap = (asset.availableToPromiseTotal ?: 0G) - a
+                if (qGap != 0G || aGap != 0G) ec.entity.makeValue('mantle.product.asset.AssetDetail').setAll([
+                    assetId:assetId, productId:asset.productId, effectiveDate:ec.user.nowTimestamp,
+                    quantityOnHandDiff:qGap, availableToPromiseDiff:aGap, description:'Opening balance before stock transfer ' + stockTransferId]).setSequencedIdPrimary().create()
+                ec.entity.makeValue('mantle.product.asset.AssetDetail').setAll([
+                    assetId:assetId, productId:asset.productId, effectiveDate:ec.user.nowTimestamp,
+                    quantityOnHandDiff:quantityDiff, availableToPromiseDiff:quantityDiff,
+                    description:'Transfer ' + direction + ' ' + stockTransferId]).setSequencedIdPrimary().create()
+            ]]></script>
+        </actions>
+    </service>
+    <service verb="ship" noun="StockTransfer" no-tx-cache="true">
+        <in-parameters><parameter name="stockTransferId" required="true"/></in-parameters>
+        <actions>
+            <service-call name="zenith.inventory.StockTransferServices.require#StockTransferWrite" in-map="[stockTransferId:stockTransferId, requiredStatus:'StxDraft']" out-map="guard"/>
+            <service-call name="zenith.inventory.StockTransferServices.validate#StockTransferFacilities" in-map="[organizationPartyId:guard.organizationPartyId, fromFacilityId:guard.transfer.fromFacilityId, toFacilityId:guard.transfer.toFacilityId]"/>
+            <service-call name="zenith.inventory.InventoryServices.recalc#StockTransferTotals" in-map="[stockTransferId:stockTransferId]"/>
+            <script><![CDATA[
+                def stx = ec.entity.find('zenith.erp.inventory.StockTransfer').condition('stockTransferId', stockTransferId).one()
+                if (stx.ewayBillRequired == 'Y' && (!stx.transporterGstin || !stx.vehicleNumber)) { ec.message.addError('E-Way Bill is required: enter transporter GSTIN and vehicle number before shipping.'); return }
+                def items = ec.entity.find('zenith.erp.inventory.StockTransferItem').condition('stockTransferId', stockTransferId).orderBy('transferItemSeqId').list()
+                if (!items) { ec.message.addError('Add at least one product before shipping.'); return }
+                // Serialize competing transfers at the source; assets and serials are also locked.
+                ec.entity.find('mantle.facility.Facility').condition('facilityId', stx.fromFacilityId).forUpdate(true).one()
+                def assets = ec.entity.find('mantle.product.asset.Asset').condition('ownerPartyId', guard.organizationPartyId)
+                    .condition('facilityId', stx.fromFacilityId).condition('assetTypeEnumId', 'AstTpInventory').orderBy('assetId').forUpdate(true).list()
+                def remaining = assets.collectEntries { [(it.assetId): [(it.quantityOnHandTotal ?: 0G), (it.availableToPromiseTotal ?: 0G)].min()] }
+                def capacity = assets.groupBy { it.productId }.collectEntries { product, lots ->
+                    [(product): [(lots.sum { it.quantityOnHandTotal ?: 0G } ?: 0G), (lots.sum { it.availableToPromiseTotal ?: 0G } ?: 0G)].min()]
+                }
+                def allocations = [:]; def serialPicks = [:]; def usedSerials = new HashSet()
+                for (li in items) {
+                    def prod = ec.entity.find('mantle.product.Product').condition('productId', li.productId).one()
+                    def qty = li.quantity ?: 0G
+                    if (!prod || prod.ownerPartyId != guard.organizationPartyId || qty <= 0 || (li.unitAmount ?: 0G) < 0) { ec.message.addError('Every line must contain your own product, a positive quantity and a non-negative unit amount.'); continue }
+                    if ((capacity[li.productId] ?: 0G) < qty) ec.message.addError('Not enough unreserved stock for ' + prod.productName + ' across all source lots and transfer lines.')
+                    capacity[li.productId] = (capacity[li.productId] ?: 0G) - qty
+                    def candidates = assets.findAll { it.productId == li.productId && remaining[it.assetId] > 0 }
+                    if (prod.enableBatchTracking == 'Y') {
+                        candidates = candidates.findAll { it.batchNumber && (!li.batchNumber || it.batchNumber == li.batchNumber) && (!li.fromAssetId || it.assetId == li.fromAssetId) }
+                            .sort { x, y -> (x.expiryDate?.time ?: Long.MAX_VALUE) <=> (y.expiryDate?.time ?: Long.MAX_VALUE) ?: x.assetId <=> y.assetId }
+                        candidates = candidates.findAll { remaining[it.assetId] >= qty }.take(1)
+                    }
+                    def needed = qty; def parts = []
+                    for (asset in candidates) {
+                        def take = [remaining[asset.assetId], needed].min()
+                        if (take <= 0) continue
+                        parts.add([asset:asset, quantity:take]); remaining[asset.assetId] -= take; needed -= take
+                        if (needed == 0G) break
+                    }
+                    if (needed > 0) ec.message.addError('Not enough unreserved stock for ' + prod.productName + ' at the sender (including other lines in this transfer).')
+                    allocations[li.transferItemSeqId] = parts
+                    if (prod.enableSerialTracking == 'Y') {
+                        if (qty.stripTrailingZeros().scale() > 0) { ec.message.addError('Serial-tracked quantities must be whole numbers.'); continue }
+                        def rows = ec.entity.find('zenith.erp.inventory.StockTransferItemSerial').condition('stockTransferId', stockTransferId).condition('transferItemSeqId', li.transferItemSeqId).list()
+                        def sns = ec.entity.find('zenith.erp.inventory.ProductSerialNumber').condition('productId', li.productId)
+                            .condition('facilityId', stx.fromFacilityId).condition('statusId', 'SnInStock').orderBy('serialNumberId').forUpdate(true).list()
+                        if (rows) sns = sns.findAll { rows.collect { it.serialNumberId }.contains(it.serialNumberId) }
+                        else sns = sns.findAll { !usedSerials.contains(it.serialNumberId) }.take(qty.intValueExact())
+                        if (sns.size() != qty.intValueExact() || sns.any { usedSerials.contains(it.serialNumberId) }) ec.message.addError('Selected serial numbers are no longer available at the sender.')
+                        if (prod.enableBatchTracking == 'Y' && parts && sns.any { it.batchNumber != parts[0].asset.batchNumber }) ec.message.addError('Selected serials must belong to the chosen batch.')
+                        usedSerials.addAll(sns.collect { it.serialNumberId }); serialPicks[li.transferItemSeqId] = [serials:sns, hadPicks:!!rows]
+                    }
+                }
+                if (ec.message.hasError()) return
+                stx.statusId = 'StxInTransit'; stx.update()
+                for (li in items) {
+                    for (part in allocations[li.transferItemSeqId]) ec.service.sync().name('zenith.inventory.StockTransferServices.move#StockTransferAsset')
+                        .parameters([stockTransferId:stockTransferId, assetId:part.asset.assetId, quantityDiff:-part.quantity, direction:'out']).call()
+                    def prod = ec.entity.find('mantle.product.Product').condition('productId', li.productId).one()
+                    if (prod.enableBatchTracking == 'Y') {
+                        def src = allocations[li.transferItemSeqId][0].asset
+                        li.fromAssetId = src.assetId; li.batchNumber = src.batchNumber; li.update()
+                    }
+                    def pick = serialPicks[li.transferItemSeqId]
+                    if (pick) for (sn in pick.serials) {
+                        if (!pick.hadPicks) ec.service.sync().name('create#zenith.erp.inventory.StockTransferItemSerial').parameters([
+                            stockTransferId:stockTransferId, transferItemSeqId:li.transferItemSeqId, serialNumberId:sn.serialNumberId, serialNumber:sn.serialNumber]).call()
+                        sn.statusId = 'SnInTransit'; sn.update()
+                        ec.entity.makeValue('zenith.erp.inventory.SerialNumberHistory').setAll([
+                            serialNumberId:sn.serialNumberId, eventDate:ec.user.nowTimestamp, eventType:'Transfer ship', fromStatusId:'SnInStock', toStatusId:'SnInTransit',
+                            fromFacilityId:stx.fromFacilityId, referenceType:'StockTransfer', referenceId:stockTransferId, performedByUserId:ec.user.userId]).setSequencedIdPrimary().create()
+                    }
+                }
+                if (!ec.message.hasError()) ec.service.sync().name('zenith.inventory.InventoryServices.build#StockTransferIgstInvoice').parameters([stockTransferId:stockTransferId]).call()
+            ]]></script>
+        </actions>
+    </service>
+    <service verb="receive" noun="StockTransfer" no-tx-cache="true">
+        <in-parameters><parameter name="stockTransferId" required="true"/></in-parameters>
+        <actions>
+            <service-call name="zenith.inventory.StockTransferServices.require#StockTransferWrite" in-map="[stockTransferId:stockTransferId, requiredStatus:'StxInTransit']" out-map="guard"/>
+            <service-call name="zenith.inventory.StockTransferServices.validate#StockTransferFacilities" in-map="[organizationPartyId:guard.organizationPartyId, fromFacilityId:guard.transfer.fromFacilityId, toFacilityId:guard.transfer.toFacilityId]"/>
+            <script><![CDATA[
+                def stx = guard.transfer
+                ec.entity.find('mantle.facility.Facility').condition('facilityId', stx.toFacilityId).forUpdate(true).one()
+                def items = ec.entity.find('zenith.erp.inventory.StockTransferItem').condition('stockTransferId', stockTransferId).orderBy('transferItemSeqId').list()
+                if (!items) { ec.message.addError('This transfer has no product lines.'); return }
+                def serials = [:]
+                for (li in items) {
+                    def qty = li.quantityReceived != null ? li.quantityReceived : li.quantity
+                    def prod = ec.entity.find('mantle.product.Product').condition('productId', li.productId).one()
+                    if (!prod || prod.ownerPartyId != guard.organizationPartyId || qty == null || qty < 0 || qty > li.quantity) { ec.message.addError('Invalid product or received quantity.'); continue }
+                    if (prod.enableBatchTracking == 'Y') {
+                        def src = ec.entity.find('mantle.product.asset.Asset').condition('assetId', li.fromAssetId).one()
+                        if (!src || src.ownerPartyId != guard.organizationPartyId || src.productId != li.productId || src.facilityId != stx.fromFacilityId || src.batchNumber != li.batchNumber) ec.message.addError('The original source batch is unavailable; the transfer cannot lose its batch identity.')
+                    }
+                    if (prod.enableSerialTracking == 'Y') {
+                        def rows = ec.entity.find('zenith.erp.inventory.StockTransferItemSerial').condition('stockTransferId', stockTransferId).condition('transferItemSeqId', li.transferItemSeqId).list()
+                        def arrived = rows.findAll { it.received == 'Y' || (it.received == null && qty == li.quantity) }.collect { it.serialNumberId }.toSet()
+                        if (qty.stripTrailingZeros().scale() > 0 || rows.size() != li.quantity.intValueExact() || arrived.size() != qty.intValueExact()) { ec.message.addError('Confirm exactly which serial numbers arrived before receiving a partial serialized transfer.'); continue }
+                        def sns = rows.collect { ec.entity.find('zenith.erp.inventory.ProductSerialNumber').condition('serialNumberId', it.serialNumberId).forUpdate(true).one() }
+                        if (sns.any { !it || it.productId != li.productId || it.facilityId != stx.fromFacilityId || !(it.statusId in ['SnInTransit','SnInStock']) }) ec.message.addError('A shipped serial number has changed location or status.')
+                        serials[li.transferItemSeqId] = [units:sns, arrived:arrived]
+                    }
+                }
+                if (ec.message.hasError()) return
+                for (li in items) {
+                    def qty = li.quantityReceived != null ? li.quantityReceived : li.quantity
+                    def prod = ec.entity.find('mantle.product.Product').condition('productId', li.productId).one()
+                    def src = li.fromAssetId ? ec.entity.find('mantle.product.asset.Asset').condition('assetId', li.fromAssetId).one() : null
+                    def target = null
+                    if (qty > 0) {
+                        def find = ec.entity.find('mantle.product.asset.Asset').condition('ownerPartyId', guard.organizationPartyId).condition('productId', li.productId)
+                            .condition('facilityId', stx.toFacilityId).condition('assetTypeEnumId', 'AstTpInventory').condition('batchNumber', li.batchNumber ?: null).orderBy('assetId').forUpdate(true)
+                        // Equal batch names with different expiry/manufacture dates must remain separate lots.
+                        if (prod.enableBatchTracking == 'Y') find.condition('expiryDate', src.expiryDate).condition('manufacturingDate', src.manufacturingDate)
+                        target = find.one()
+                        if (!target) target = ec.entity.makeValue('mantle.product.asset.Asset').setAll([
+                            assetTypeEnumId:'AstTpInventory', statusId:'AstAvailable', ownerPartyId:guard.organizationPartyId, productId:li.productId,
+                            facilityId:stx.toFacilityId, hasQuantity:'Y', quantityOnHandTotal:0G, availableToPromiseTotal:0G,
+                            batchNumber:li.batchNumber, expiryDate:src?.expiryDate, manufacturingDate:src?.manufacturingDate,
+                            mrpAmount:src?.mrpAmount, valuationRate:src?.valuationRate]).setSequencedIdPrimary().create()
+                        ec.service.sync().name('zenith.inventory.StockTransferServices.move#StockTransferAsset').parameters([
+                            stockTransferId:stockTransferId, assetId:target.assetId, quantityDiff:qty, direction:'in']).call()
+                    }
+                    def pick = serials[li.transferItemSeqId]
+                    if (pick) for (sn in pick.units) {
+                        def arrived = pick.arrived.contains(sn.serialNumberId)
+                        def oldStatus = sn.statusId
+                        sn.statusId = arrived ? 'SnInStock' : 'SnTransferLost'
+                        if (arrived) { sn.facilityId = stx.toFacilityId; sn.assetId = target.assetId }
+                        sn.update()
+                        ec.entity.makeValue('zenith.erp.inventory.SerialNumberHistory').setAll([
+                            serialNumberId:sn.serialNumberId, eventDate:ec.user.nowTimestamp, eventType:arrived ? 'Transfer receive' : 'Transfer loss',
+                            fromStatusId:oldStatus, toStatusId:sn.statusId, fromFacilityId:stx.fromFacilityId, toFacilityId:arrived ? stx.toFacilityId : null,
+                            referenceType:'StockTransfer', referenceId:stockTransferId, performedByUserId:ec.user.userId]).setSequencedIdPrimary().create()
+                    }
+                    li.quantityReceived = qty; li.update()
+                }
+                if (!ec.message.hasError()) {
+                    def header = ec.entity.find('zenith.erp.inventory.StockTransfer').condition('stockTransferId', stockTransferId).one()
+                    header.statusId = 'StxReceived'; header.update()
+                }
+            ]]></script>
+        </actions>
+    </service>
+</services>

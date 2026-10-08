@@ -8,29 +8,7 @@
     <!-- ZE-DASH-025: every mutation is org-guarded (pre-actions/actions don't run for transitions, and the IDs
          are attacker-controllable form/link params). Deletes resolve the parent priceListId from the row first. -->
     <transition name="updatePriceList">
-        <actions>
-            <service-call name="zenith.pricing.PricingServices.assert#PriceListAccess" in-map="[priceListId:priceListId]" out-map="_acc"/>
-            <!-- ZE-PRC-002 (PRC-040): reject an inverted validity window (Valid Thru earlier than Valid From) on edit. -->
-            <service-call name="zenith.pricing.PricingServices.assert#ValidDateRange"
-                          in-map="[validFromDate:validFromDate, validThruDate:validThruDate]" out-map="_dr"/>
-            <!-- ZE-PRC-025 (PRC-025 + f/u): validate the Fallback Price List server-side (self/cross-org/cyclic). -->
-            <service-call name="zenith.pricing.PricingServices.assert#ValidPriceListParent"
-                          in-map="[priceListId:priceListId, parentPriceListId:parentPriceListId]" out-map="_cy"/>
-            <if condition="_acc.allowed &amp;&amp; _dr.valid &amp;&amp; _cy.valid">
-                <!-- ZE-PRC-003 (PRC-013): entity-auto update# doesn't enforce single-default; unset the others first. -->
-                <if condition="isDefault == 'Y'">
-                    <entity-find-one entity-name="zenith.erp.pricing.PriceList" value-field="_plRow"/>
-                    <if condition="_plRow">
-                        <service-call name="zenith.pricing.PricingServices.clear#OtherDefaultPriceLists"
-                                      in-map="[organizationPartyId:_plRow.organizationPartyId,
-                                               priceListTypeEnumId:(priceListTypeEnumId ?: _plRow.priceListTypeEnumId),
-                                               currencyUomId:(currencyUomId ?: _plRow.currencyUomId),
-                                               excludePriceListId:priceListId]"/>
-                    </if>
-                </if>
-                <service-call name="update#zenith.erp.pricing.PriceList" in-map="context"/>
-            </if>
-        </actions>
+        <service-call name="zenith.pricing.PriceListServices.update#PriceList"/>
         <default-response url="."/>
     </transition>
     <transition name="setPriceItem">
@@ -65,35 +43,12 @@
     </transition>
     <!-- ZE-PRC redesign: Delete Price List (items + volume first for FK) + Duplicate, org-guarded. -->
     <transition name="deletePriceList">
-        <actions>
-            <service-call name="zenith.pricing.PricingServices.assert#PriceListAccess" in-map="[priceListId:priceListId]" out-map="_acc"/>
-            <if condition="_acc.allowed"><script><![CDATA[
-                ec.entity.find("zenith.erp.pricing.PriceListItem").condition("priceListId", priceListId).deleteAll()
-                ec.entity.find("zenith.erp.pricing.VolumePricing").condition("priceListId", priceListId).deleteAll()
-                ec.entity.find("zenith.erp.pricing.PriceList").condition("priceListId", priceListId).deleteAll()
-            ]]></script></if>
-        </actions>
+        <service-call name="zenith.pricing.PriceListServices.delete#PriceList"/>
         <default-response url="../FindPriceList"/>
     </transition>
     <transition name="duplicatePriceList">
-        <actions>
-            <service-call name="zenith.pricing.PricingServices.assert#PriceListAccess" in-map="[priceListId:priceListId]" out-map="_acc"/>
-            <set field="newId" from="null"/>
-            <if condition="_acc.allowed"><script><![CDATA[
-                def src = ec.entity.find("zenith.erp.pricing.PriceList").condition("priceListId", priceListId).one()
-                if (src) {
-                    def created = ec.service.sync().name("create#zenith.erp.pricing.PriceList").parameters([
-                        priceListName: ((src.priceListName ?: 'Price List') + ' (copy)'), description: src.description,
-                        priceListTypeEnumId: src.priceListTypeEnumId, currencyUomId: src.currencyUomId,
-                        parentPriceListId: src.parentPriceListId, isDefault: 'N', isActive: 'N',
-                        validFromDate: src.validFromDate, validThruDate: src.validThruDate,
-                        roundingMode: src.roundingMode, roundingPrecision: src.roundingPrecision,
-                        organizationPartyId: src.organizationPartyId]).call()
-                    newId = created?.priceListId
-                }
-            ]]></script></if>
-        </actions>
-        <default-response url="../EditPriceList"><parameter name="priceListId" from="newId ?: priceListId"/></default-response>
+        <service-call name="zenith.pricing.PriceListServices.duplicate#PriceList" out-map="copyOut"/>
+        <default-response url="../EditPriceList"><parameter name="priceListId" from="copyOut.newPriceListId ?: priceListId"/></default-response>
     </transition>
 
     <actions>
@@ -133,6 +88,7 @@
     </actions>
 
     <widgets>
+        <container style="zppl-page">
         <section name="prc_noAccess" condition="noAccess"><widgets>
             <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg">
                 <label text="You do not have access to this price list." type="h6" style="text-negative text-weight-bold"/>
@@ -192,7 +148,7 @@
                                 <entity-find entity-name="zenith.erp.pricing.PriceList">
                                     <econdition field-name="isActive" value="Y"/>
                                     <econdition field-name="priceListId" operator="not-equals" from="priceListId"/>
-                                    <econdition field-name="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+                                    <econdition field-name="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION') ?: '__NO_ORGANIZATION__'"/>
                                 </entity-find>
                             </entity-options></drop-down></default-field></field>
                         <field name="isDefault"><default-field title="Default?">
@@ -242,7 +198,7 @@
                             <field name="priceListId"><default-field><hidden default-value="${priceListId}"/></default-field></field>
                             <field name="productId"><default-field title="Product">
                                 <drop-down><entity-options key="${productId}" text="${pseudoId} - ${productName}">
-                                    <entity-find entity-name="mantle.product.Product"><econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/><order-by field-name="pseudoId"/></entity-find>
+                                    <entity-find entity-name="mantle.product.Product"><econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION') ?: '__NO_ORGANIZATION__'"/><order-by field-name="pseudoId"/></entity-find>
                                 </entity-options></drop-down></default-field></field>
                             <field name="priceTypeEnumId"><default-field title="Type">
                                 <drop-down no-current-selected-key="PtpFixed"><option key="PtpFixed" text="Fixed Price"/><option key="PtpDiscount" text="Discount % off MRP"/></drop-down></default-field></field>
@@ -312,7 +268,7 @@
                             <field name="priceListId"><default-field><hidden default-value="${priceListId}"/></default-field></field>
                             <field name="productId"><default-field title="Product">
                                 <drop-down><entity-options key="${productId}" text="${pseudoId} - ${productName}">
-                                    <entity-find entity-name="mantle.product.Product"><econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/><order-by field-name="pseudoId"/></entity-find>
+                                    <entity-find entity-name="mantle.product.Product"><econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION') ?: '__NO_ORGANIZATION__'"/><order-by field-name="pseudoId"/></entity-find>
                                 </entity-options></drop-down></default-field></field>
                             <field name="minQuantity"><default-field title="Min Qty"><text-line size="8"/></default-field></field>
                             <field name="maxQuantity"><default-field title="Max Qty"><text-line size="8"/></default-field></field>
@@ -373,5 +329,6 @@
             </container>
         </container>
         </widgets></section>
+        </container>
     </widgets>
 </screen>

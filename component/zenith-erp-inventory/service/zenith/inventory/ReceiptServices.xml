@@ -1,0 +1,130 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+    <service verb="get" noun="PurchaseOrderAccess">
+        <in-parameters><parameter name="orderId" required="true"/></in-parameters>
+        <out-parameters><parameter name="allowed" type="Boolean"/></out-parameters>
+        <actions><script><![CDATA[
+            def orgId = ec.user.getPreference('ACTIVE_ORGANIZATION')
+            def header = ec.entity.find('mantle.order.OrderHeader').condition('orderId', orderId).disableAuthz().one()
+            def parts = ec.entity.find('mantle.order.OrderPart').condition('orderId', orderId).disableAuthz().list()
+            // Check every part: the first part alone does not prove ownership of a mixed order.
+            allowed = orgId && orgId != '_NA_' && header && parts && parts.every {
+                it.customerPartyId == orgId && it.vendorPartyId && it.vendorPartyId != orgId
+            }
+        ]]></script></actions>
+    </service>
+
+    <service verb="get" noun="OrderReceiptQuantities">
+        <in-parameters><parameter name="orderId" required="true"/></in-parameters>
+        <out-parameters><parameter name="receivedByItem" type="Map"/></out-parameters>
+        <actions>
+            <service-call name="zenith.inventory.ReceiptServices.get#PurchaseOrderAccess" in-map="[orderId:orderId]" out-map="access"/>
+            <set field="receivedByItem" from="[:]"/>
+            <if condition="access.allowed"><script><![CDATA[
+                // Receipts survive sales/issues. Never infer historical delivery from current QOH.
+                for (r in ec.entity.find('mantle.product.receipt.AssetReceipt').condition('orderId', orderId).list()) {
+                    receivedByItem[r.orderItemSeqId] = (receivedByItem[r.orderItemSeqId] ?: 0G) + (r.quantityAccepted ?: 0G)
+                }
+                def orgId = ec.user.getPreference('ACTIVE_ORGANIZATION')
+                for (a in ec.entity.find('mantle.product.asset.Asset').condition('acquireOrderId', orderId).condition('ownerPartyId', orgId).list()) {
+                    // Includes historical receipts created by this screen before ledger order keys existed.
+                    for (d in ec.entity.find('mantle.product.asset.AssetDetail').condition('assetId', a.assetId)
+                            .condition('description', 'Goods received ' + orderId).list()) {
+                        if (!d.assetReceiptId && (d.quantityOnHandDiff ?: 0G) > 0G)
+                            receivedByItem[a.acquireOrderItemSeqId] = (receivedByItem[a.acquireOrderItemSeqId] ?: 0G) + d.quantityOnHandDiff
+                    }
+                }
+            ]]></script></if>
+        </actions>
+    </service>
+
+    <service verb="receive" noun="Stock" no-tx-cache="true">
+        <in-parameters>
+            <parameter name="orderId"/><parameter name="orderItemSeqId"/>
+            <parameter name="productId"/><parameter name="facilityId" required="true"/>
+            <parameter name="quantityAccepted" required="true"/>
+            <parameter name="valuationRate"/><parameter name="mrpAmount"/>
+            <parameter name="batchNumber"/><parameter name="manufacturingDate"/><parameter name="expiryDate"/>
+        </in-parameters>
+        <out-parameters><parameter name="assetId"/></out-parameters>
+        <actions>
+            <service-call name="zenith.base.SecurityServices.check#ModuleWriteAccess" in-map="[moduleId:'inventory']" out-map="writeAccess"/>
+            <if condition="!writeAccess.canWrite"><return error="true" message="You have view-only access to Inventory."/></if>
+            <script><![CDATA[
+                def orgId = ec.user.getPreference('ACTIVE_ORGANIZATION')
+                if (!orgId || orgId == '_NA_') { ec.message.addError('Select an organization before receiving stock.'); return }
+                def parseAmount = { value, label, required ->
+                    if (value == null || !value.toString().trim()) {
+                        if (required) ec.message.addError(label + ' is required.')
+                        return null
+                    }
+                    try {
+                        def amount = new BigDecimal(value.toString().trim())
+                        if (amount.signum() < 0 || amount.stripTrailingZeros().scale() > 6 || amount.precision() - amount.scale() > 20)
+                            throw new IllegalArgumentException()
+                        return amount
+                    } catch (Exception ignored) { ec.message.addError(label + ' must be a non-negative number with up to 6 decimal places.'); return null }
+                }
+                def qty = parseAmount(quantityAccepted, 'Quantity received', true)
+                if (qty != null && qty.signum() <= 0) ec.message.addError('Quantity received must be greater than zero.')
+                def cost = parseAmount(valuationRate, 'Unit cost', false)
+                def mrp = parseAmount(mrpAmount, 'Batch MRP', false)
+                def parseDate = { value, label ->
+                    if (value == null || !value.toString().trim()) return null
+                    try { return java.sql.Date.valueOf(java.time.LocalDate.parse(value.toString().trim())) }
+                    catch (Exception ignored) { ec.message.addError(label + ' must be a valid date (yyyy-MM-dd).'); return null }
+                }
+                def mfg = parseDate(manufacturingDate, 'Manufacturing date')
+                def expiry = parseDate(expiryDate, 'Expiry date')
+                if (mfg && expiry && expiry.before(mfg)) ec.message.addError('Expiry date cannot be before manufacturing date.')
+                if (ec.message.hasError()) return
+                def facility = ec.entity.find('mantle.facility.Facility').condition('facilityId', facilityId).one()
+                if (facility?.ownerPartyId != orgId) { ec.message.addError('Choose a store / warehouse from your organization.'); return }
+                def header = null
+                def item = null
+                if (orderId) {
+                    // Serialize PO receipts before checking the remaining quantity (also protects double clicks).
+                    header = ec.entity.find('mantle.order.OrderHeader').condition('orderId', orderId).forUpdate(true).useCache(false).one()
+                    def access = ec.service.sync().name('zenith.inventory.ReceiptServices.get#PurchaseOrderAccess').parameters([orderId:orderId]).call()
+                    if (!access.allowed || !(header?.statusId in ['OrderApproved','OrderCompleted'])) {
+                        ec.message.addError('Select an approved purchase order from your organization.'); return
+                    }
+                    item = ec.entity.find('mantle.order.OrderItem').condition('orderId', orderId).condition('orderItemSeqId', orderItemSeqId).one()
+                    def part = item ? ec.entity.find('mantle.order.OrderPart').condition('orderId', orderId).condition('orderPartSeqId', item.orderPartSeqId).one() : null
+                    if (!item?.productId || part?.customerPartyId != orgId || !(part?.statusId in ['OrderApproved','OrderCompleted'])) {
+                        ec.message.addError('Select a receivable product line from this purchase order.'); return
+                    }
+                    def totals = ec.service.sync().name('zenith.inventory.ReceiptServices.get#OrderReceiptQuantities').parameters([orderId:orderId]).call()
+                    def remaining = (item.quantity ?: 0G) - (item.quantityCancelled ?: 0G) - (totals.receivedByItem[item.orderItemSeqId] ?: 0G)
+                    if (qty > remaining) { ec.message.addError('Quantity exceeds the remaining purchase order quantity (' + remaining.max(0G) + ').'); return }
+                    // Product, price and currency are authoritative stored PO values, never hidden-form values.
+                    productId = item.productId
+                    cost = parseAmount(item.unitAmount ?: 0G, 'Purchase order unit cost', true)
+                } else if (orderItemSeqId) {
+                    ec.message.addError('A purchase order is required for this line.'); return
+                }
+                def product = productId ? ec.entity.find('mantle.product.Product').condition('productId', productId).one() : null
+                if (product?.ownerPartyId != orgId) { ec.message.addError('Choose a product from your organization.'); return }
+                if (product.enableSerialTracking == 'Y') { ec.message.addError('Serial-tracked goods require the serial-number receipt workflow.'); return }
+                if (product.enableBatchTracking == 'Y' && !batchNumber?.toString()?.trim()) { ec.message.addError('Batch / lot number is required for this product.'); return }
+                if (ec.message.hasError()) return
+                // A separate lot keeps each delivery's cost, dates and batch identity intact.
+                def result = ec.service.sync().name('create#mantle.product.asset.Asset').parameters([
+                    assetTypeEnumId:'AstTpInventory', classEnumId:'AsClsInventory', statusId:'AstAvailable', hasQuantity:'Y',
+                    ownerPartyId:orgId, productId:productId, facilityId:facilityId,
+                    quantityOnHandTotal:0G, availableToPromiseTotal:0G,
+                    acquireCost:cost, valuationRate:cost, acquireCostUomId:header?.currencyUomId,
+                    acquireOrderId:orderId, acquireOrderItemSeqId:item?.orderItemSeqId,
+                    batchNumber:batchNumber?.toString()?.trim(), manufacturingDate:mfg, expiryDate:expiry,
+                    mrpAmount:mrp, receivedDate:ec.user.nowTimestamp]).call()
+                if (ec.message.hasError()) return
+                assetId = result.assetId
+                ec.service.sync().name('create#mantle.product.asset.AssetDetail').parameters([
+                    assetId:assetId, productId:productId, orderId:orderId, orderItemSeqId:item?.orderItemSeqId,
+                    effectiveDate:ec.user.nowTimestamp, quantityOnHandDiff:qty, availableToPromiseDiff:qty,
+                    unitCost:cost, description:orderId ? ('Goods received ' + orderId) : 'Direct goods receipt']).call()
+                if (!ec.message.hasError()) ec.message.addMessage('Received ' + qty + ' units into stock.')
+            ]]></script>
+        </actions>
+    </service>
+</services>
