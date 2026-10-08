@@ -24,7 +24,7 @@ const rows=(table,where)=>q(`SELECT * FROM ${table} WHERE ${where}`),count=(tabl
  const cart=async(s,actor=a)=>invoke('cart',{sessionId:s.sessionId},false,actor);
  const item=async(t,extra={},actor=a)=>invoke('add',{transactionId:t.transactionId,productId:'POS_QA_A_P18',quantity:'1',...extra},false,actor);
  let s,t,discountedTx; if(process.env.POS_QA_UI_ONLY==='true'){s={sessionId:'100000'};t={transactionId:'100000'};} else {
- s=await open();report.created.push({sessionId:s.sessionId});
+ s=await open();report.created.push({sessionId:s.sessionId});check('opened session is committed with the authorized terminal and organization',count('pos_session',`session_id='${s.sessionId}' AND terminal_id='POS_QA_A_TERM1' AND organization_party_id='POS_QA_A' AND status_id='PsOpen'`)===1,{sessionId:s.sessionId});
  await invoke('open',{terminalId:'POS_QA_A_TERM2',openingCash:'-1'},true);await invoke('open',{terminalId:'POS_QA_B_TERM1',openingCash:'0'},true);
  t=await cart(s);check('unpaid cart consumes no bill number',!tx(t.transactionId).transaction_number,tx(t.transactionId));
  await invoke('complete',{transactionId:t.transactionId},true);await invoke('credit',{transactionId:t.transactionId,customerName:'Synthetic Credit',customerPhone:'0000000000'},true);

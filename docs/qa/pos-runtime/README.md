@@ -29,6 +29,10 @@ deployment claim. Never reuse a database containing customer records.
 
 ## Regressions covered
 
+- Assert an opened session actually committed to its authorized org/terminal before
+  creating a cart. Session creation no longer calls speculative pricing/tax
+  calculations or clears their errors: a failed optional warmup could roll back
+  the session while returning an id, after newer Tax input validation.
 - Reject empty checkout/credit, nonpositive quantities, negative price/discount,
   invalid tenders, zero non-free tender and non-cash overpayment before writing.
   Permit a legitimate zero-payable item without manufacturing a payment row.
