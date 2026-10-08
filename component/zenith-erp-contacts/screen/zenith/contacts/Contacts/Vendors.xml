@@ -5,6 +5,8 @@
 
     <!-- ZE-SUP-LIST: inline filter params (Supplier Type + Show Disabled), read from the GET URL. -->
     <parameter name="showDisabled"/>
+    <parameter name="quickSearch"/>
+    <parameter name="statusFilter"/>
     <parameter name="partyTypeEnumId"/>
 
     <transition name="createPerson">
@@ -34,6 +36,7 @@
                 <econdition field-name="ownerPartyId" from="_contactOrg?.activeOrgId ?: '__NO_ORGANIZATION__'"/>
                 <!-- Hide disabled contacts by default; the Show Disabled toggle drops this filter. -->
                 <econdition field-name="disabled" operator="not-equals" from="disabledFilter" or-null="true" ignore-if-empty="true"/>
+                <econdition field-name="disabled" from="disabledEq" ignore-if-empty="true"/>
                 <!-- ZE-CONTACTS-010: GSTIN/PAN/CIN/email/phone search resolves to partyIds in screen actions. -->
                 <econdition field-name="partyId" operator="in" from="searchPartyIds" ignore-if-empty="true"/>
             </entity-find>
@@ -78,18 +81,35 @@
     </transition>
 
     <always-actions>
+        <script>if (!ec.web.parameters.pageSize) { ec.context.pageSize=20; ec.web.parameters.put('pageSize','20') }</script>
         <service-call name="zenith.contacts.ContactServices.get#AuthorizedActiveOrganization" out-map="_contactOrg"/>
         <set field="planGate" from="isSaasTenant &amp;&amp; !saasHasAllAccess &amp;&amp; saasAllowedModules != null"/>
         <set field="showPurchaseBtn" from="!planGate || saasAllowedModules.contains('purchase')"/>
         <set field="showAccountingBtn" from="!planGate || saasAllowedModules.contains('accounting')"/>
         <!-- ZE-SUP-LIST: Show Disabled — default hides disabled (disabledFilter='Y' excludes them); the
              toggle sets showDisabled='Y' -> disabledFilter=null -> ignore-if-empty drops the filter. -->
-        <set field="disabledFilter" from="(showDisabled == 'Y') ? null : 'Y'"/>
+        <set field="disabledFilter" from="(statusFilter == 'inactive' || (statusFilter != 'active' &amp;&amp; showDisabled == 'Y')) ? null : 'Y'"/>
+        <set field="disabledEq" from="statusFilter == 'inactive' ? 'Y' : null"/>
         <!-- ZE-CONTACTS-010: let the Find Options dialog search by GSTIN / PAN / CIN / email / phone.
              Resolve each provided term to matching partyIds (these live on IndiaGstin / Party / ContactMech,
              not the PartyDetailAndRole search view); the list then filters on `searchPartyIds`. -->
         <script><![CDATA[
             def _sets = []
+            // Search the complete authorized directory, not just rows on the visible page.
+            def _quick = quickSearch?.toString()?.trim()
+            if (_quick) {
+                def cf = ec.entity.conditionFactory
+                _quick.split(/\s+/).each { term ->
+                    def matches = ['organizationName','firstName','lastName','partyId'].collect { field ->
+                        cf.makeCondition(field, org.moqui.entity.EntityCondition.LIKE, '%' + term + '%').ignoreCase()
+                    }
+                    def matched = ec.entity.find('zenith.erp.contacts.ContactListView')
+                        .condition('ownerPartyId', _contactOrg?.activeOrgId ?: '__NO_ORGANIZATION__')
+                        .condition(cf.makeCondition(matches, org.moqui.entity.EntityCondition.OR))
+                        .list().collect { it.partyId }.unique()
+                    _sets.add(matched ?: ['__NO_MATCH__'])
+                }
+            }
             if (gstinSearch?.trim()) _sets.add(ec.entity.find("zenith.erp.india.IndiaGstin").condition("gstin","like","%"+gstinSearch.trim().toUpperCase()+"%").list().collect{it.partyId}.findAll{it}.unique())
             if (panSearch?.trim()) _sets.add(ec.entity.find("mantle.party.Party").condition("panNumber","like","%"+panSearch.trim().toUpperCase()+"%").list().collect{it.partyId}.findAll{it}.unique())
             if (cinSearch?.trim()) _sets.add(ec.entity.find("mantle.party.Party").condition("cinNumber","like","%"+cinSearch.trim().toUpperCase()+"%").list().collect{it.partyId}.findAll{it}.unique())
@@ -117,10 +137,17 @@
             </container>
             <!-- ZE-SUP-LIST: consolidated action bar — Add buttons (write-gated) + exports, on the title row. -->
             <container style="sup-head-actions">
+              <section name="SupplierReferenceActions" condition="modCanWrite"><widgets>
+                <render-mode><text type="html,qvt,vuet"><![CDATA[
+                  <button type="button" class="cust-nc-solo cust-nc-ghost" data-nctext="Add Company"><span class="material-icons" aria-hidden="true">apartment</span>Add Company</button>
+                  <button type="button" class="cust-nc-solo cust-nc-ghost" data-nctext="Add Person"><span class="material-icons" aria-hidden="true">person_add</span>Add Person</button>
+                  <div class="cust-newcust"><button type="button" class="cust-nc-trigger" aria-expanded="false"><span class="material-icons" aria-hidden="true">add</span>New Supplier<span class="material-icons" aria-hidden="true">arrow_drop_down</span></button><div class="cust-nc-menu"><button type="button" class="cust-nc-item cust-nc-org">Add a Company</button><button type="button" class="cust-nc-item cust-nc-person">Add a Person</button></div></div>
+                ]]></text></render-mode>
+              </widgets></section>
               <section name="Vendors_write">
                 <condition><expression>modCanWrite</expression></condition>
                 <widgets>
-                  <container style="row q-gutter-x-sm">
+                  <container style="row q-gutter-x-sm cust-nc-src">
                 <container-dialog id="NewOrgDialog" button-text="Add Company" button-class="q-btn--flat bg-indigo-8 text-white" width="600">
                     <container style="q-pa-md">
                         <label text="Add a company as a supplier" type="h5" style="text-primary text-weight-bold q-mb-md"/>
@@ -176,7 +203,7 @@
                    (both kept — Excel is a real, used feature). Now on the action row with the Add buttons. -->
               <link url="export" text="Export to CSV" icon="file_download" btn-type="info" class="text-white"
                     parameter-map="[format:'csv']" link-type="anchor" target-window="_blank"/>
-              <link url="export" text="Export to Excel" icon="file_download" btn-type="success" class="text-white"
+              <link url="export" text="Export to Excel" icon="file_download" btn-type="success" class="contacts-excel"
                     parameter-map="[format:'xlsx']" link-type="anchor" target-window="_blank"/>
             </container>
         </container>
@@ -198,12 +225,20 @@
                   <a href="?partyTypeEnumId=PtyPerson&amp;showDisabled=${_sd}" class="sup-dd-item<#if _t == 'PtyPerson'> on</#if>">Individual</a>
                 </div>
               </details>
+              <span class="sup-flabel">Status:</span>
+              <details class="sup-dd"><summary class="sup-dd-btn"><span><#if (statusFilter!'') == 'active'>Active<#elseif (statusFilter!'') == 'inactive'>Inactive<#else>All</#if></span><span class="sup-dd-caret">▼</span></summary><div class="sup-dd-menu"><a href="?statusFilter=" class="sup-dd-item">All</a><a href="?statusFilter=active" class="sup-dd-item">Active</a><a href="?statusFilter=inactive" class="sup-dd-item">Inactive</a></div></details>
               <span class="sup-fspacer"></span>
               <a href="?showDisabled=<#if _sd == 'Y'>N<#else>Y</#if>&amp;partyTypeEnumId=${_t}" class="sup-switch-link<#if _sd == 'Y'> sup-switch-on</#if>">Show Disabled</a>
             </div>
         ]]></text></render-mode>
-        <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md sup-compact z-listchrome">
-            <render-mode><text type="html,qvt"><![CDATA[<span class="zlc-ph" data-ph="Search Suppliers..." style="display:none"></span>]]></text></render-mode>
+        <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md sup-compact contacts-list-card">
+            <render-mode><text type="html,qvt,vuet"><![CDATA[
+              <form method="get" action="" class="sup-searchrow contacts-quick-search">
+                <input class="sup-search-input" type="search" name="quickSearch" aria-label="Search contacts" placeholder="Search by name or contact ID..." value="${(quickSearch!'')?html}"/>
+                <button type="submit" class="sup-filters-btn contacts-search-submit" aria-label="Search contacts">Search</button>
+                <button type="button" class="sup-filters-btn">Filters</button>
+              </form>
+            ]]></text></render-mode>
             <form-list name="FindVendorList" list="vendorList" skip-form="true" header-dialog="true" show-page-size="true">
                 <entity-find entity-name="mantle.party.PartyDetailAndRole" list="vendorList">
                     <search-form-inputs skip-fields="ownerPartyId" default-order-by="organizationName,firstName"/>
@@ -211,6 +246,7 @@
                     <econdition field-name="ownerPartyId" from="_contactOrg?.activeOrgId ?: '__NO_ORGANIZATION__'"/>
                     <!-- Hide disabled contacts by default; the Show Disabled toggle drops this filter. -->
                     <econdition field-name="disabled" operator="not-equals" from="disabledFilter" or-null="true" ignore-if-empty="true"/>
+                    <econdition field-name="disabled" from="disabledEq" ignore-if-empty="true"/>
                     <!-- ZE-CONTACTS-010: GSTIN/PAN/CIN/email/phone search resolves to partyIds in screen actions. -->
                     <econdition field-name="partyId" operator="in" from="searchPartyIds" ignore-if-empty="true"/>
                 </entity-find>
@@ -244,14 +280,16 @@
                             if (_ph) rowPhone = _ph[0].contactNumber
                         } catch (Throwable _t) { }
                         // ZE-SUP-DS §7.10: Actions = single BORDERED edit button (pencil) -> opens the supplier's
-                        // ContactProfile (where POs / Bills / Ledger + Edit all live). Matches the Suppliers mockup's
+                        // editor; the name still opens the ContactProfile. Matches the Suppliers mockup's
                         // bordered edit-btn; the borderless variant is the Customers screen (§7.10 differs per page).
-                        vendActionsHtml = "<a class='sup-act-editb' href='/apps/zenith/Contacts/ContactProfile?partyId=" + partyId + "' title='Open profile'><svg viewBox='0 0 24 24' width='14' height='14' aria-hidden='true'><path fill='currentColor' d='M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z'/></svg></a>"
+                        vendActionsHtml = "<a class='sup-act-editb' href='/apps/zenith/Contacts/EditContact?partyId=" + partyId + "' title='Edit supplier' aria-label='Edit supplier'><svg viewBox='0 0 24 24' width='14' height='14' aria-hidden='true'><path fill='currentColor' d='M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z'/></svg></a>"
                     ]]></script>
+                <set field="selectionHtml" value="&lt;input type='checkbox' class='contacts-row-check' aria-label='Select this contact on this page'/&gt;"/>
                 </row-actions>
 
                 <!-- ZE-SUP-LIST: Party ID is no longer its own column (the ID shows under the supplier name);
                      kept as a hidden Find-Options search field so ID lookup still works. -->
+                <field name="selection"><header-field title="Select"/><default-field><display text="${selectionHtml}" encode="false"/></default-field></field>
                 <field name="partyId">
                     <header-field title="Party ID"><text-find/></header-field>
                     <default-field><hidden/></default-field>

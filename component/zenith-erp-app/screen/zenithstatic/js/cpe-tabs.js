@@ -8,7 +8,7 @@
   // All Contacts: Escape closes the custom New Contact menu and returns focus to its trigger.
   document.addEventListener('keydown', function (e) {
     if (e.key !== 'Escape') return;
-    var menu = document.querySelector('.zac-page .cust-newcust.open');
+    var menu = document.querySelector('.zcontacts-page .cust-newcust.open');
     if (!menu) return;
     menu.classList.remove('open');
     var trigger = menu.querySelector('.cust-nc-trigger');
@@ -18,6 +18,16 @@
   // Native page-size links retain pageIndex, which can put the new page beyond the last record.
   // Reset only All Contacts page-size navigation; keep the framework's search/filter parameters.
   document.addEventListener('click', function (e) {
+    // Inline list filters are GET navigation. Preserve existing search/page-size values
+    // instead of silently discarding them when type, status or disabled visibility changes.
+    var filter = e.target.closest && e.target.closest('.zcontacts-page .sup-dd-item, .zcontacts-page .sup-switch-link');
+    if (filter) {
+      var next = new URL(filter.href, location.href), current = new URL(location.href);
+      next.searchParams.forEach(function (value, key) { current.searchParams.set(key, value); });
+      current.searchParams.set('pageIndex', '0');
+      e.preventDefault(); e.stopImmediatePropagation(); location.href = current.href;
+      return;
+    }
     var link = e.target.closest && e.target.closest('a[href]');
     if (!link || !document.querySelector('.zac-page')) return;
     var url = new URL(link.href, location.href);
@@ -31,11 +41,19 @@
     // Persistent action-bar Save: proxy the click to the real (hidden) submit inside ContactDetailForm,
     // so the profile form submits from any tab — including the read-only Orders / Contact-Info tabs.
     var sv = tgt && tgt.closest ? tgt.closest('[data-cpesave]') : null;
-    if (sv) { e.preventDefault(); var real = document.getElementById('ContactDetailForm_submitButton'); if (real) real.click(); return; }
+    if (sv) {
+      e.preventDefault();
+      // Resolve the native form's actual submitter rather than a generated field ID.
+      // Moqui/Quasar validation, CSRF and submit handling remain authoritative.
+      var form = document.getElementById('ContactDetailForm') || document.querySelector('form[name="ContactDetailForm"]');
+      var real = form && form.querySelector('button[type="submit"], input[type="submit"]');
+      if (real) real.click();
+      return;
+    }
     // ZE-CONTACTS-SEARCH: the custom "Filters" button (All Contacts) proxy-opens the framework Find Options dialog.
     // Prefer the element we've already marked+hidden (.sup-fo-native); fall back to a text match. .click() fires even
     // on a display:none element, so the hidden native trigger still toggles the Bootstrap modal / Quasar q-dialog.
-    var fBtn = tgt && tgt.closest ? tgt.closest('.sup-filters-btn') : null;
+    var fBtn = tgt && tgt.closest ? tgt.closest('.sup-filters-btn:not([type="submit"])') : null;
     if (fBtn) {
       e.preventDefault();
       var fo = document.querySelector('.sup-fo-native');
@@ -89,6 +107,11 @@
     e.preventDefault();
     var tabs = document.querySelectorAll('.cpe-tab');
     for (var i = 0; i < tabs.length; i++) { tabs[i].classList.toggle('on', tabs[i].getAttribute('data-cpetab') === tab); }
+    for (var ti = 0; ti < tabs.length; ti++) {
+      var selected = tabs[ti].getAttribute('data-cpetab') === tab;
+      tabs[ti].setAttribute('aria-selected', String(selected));
+      tabs[ti].tabIndex = selected ? 0 : -1;
+    }
     var panels = document.querySelectorAll('.cpe-panel');
     for (var j = 0; j < panels.length; j++) {
       var show = panels[j].classList.contains('cpe-' + tab);
@@ -118,6 +141,14 @@
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', cpeColorBen); else cpeColorBen();
   document.addEventListener('change', function (e) {
     if (e.target && e.target.matches && e.target.matches('select[name="bankBeneficiaryStatus"]')) cpeColorBen();
+  });
+  document.addEventListener('submit', function (e) {
+    if (!e.target.matches('.zcontacts-page .contacts-quick-search')) return;
+    e.preventDefault();
+    var url = new URL(location.href);
+    url.searchParams.set('quickSearch', e.target.querySelector('[name="quickSearch"]').value);
+    url.searchParams.set('pageIndex', '0');
+    location.href = url.href;
   });
 
   // ZE-CG-ADD: seed placeholders on the "Add Customer Group" form (Moqui <text-line placeholder> is a no-op in this
@@ -195,7 +226,60 @@
     }
     if (all) { all.checked = rows.length > 0 && checked === rows.length; all.indeterminate = checked > 0 && checked < rows.length; }
   });
-  function cgInit() { cgPlaceholders(); cgActiveToggle(); hideNativeFindOpts(); contactSelection(); }
+  function contactsTabs() {
+    var tabs = document.querySelectorAll('.zcontacts-page .cpe-tab');
+    for (var i = 0; i < tabs.length; i++) {
+      tabs[i].setAttribute('role', 'tab');
+      tabs[i].setAttribute('aria-selected', String(tabs[i].classList.contains('on')));
+      tabs[i].tabIndex = tabs[i].classList.contains('on') ? 0 : -1;
+    }
+  }
+  // Reference list selection is UI state only. It has no bulk operation or submit path.
+  function contactsListSelection() {
+    var cards = document.querySelectorAll('.zcontacts-page .contacts-list-card');
+    for (var i = 0; i < cards.length; i++) {
+      var card = cards[i], first = card.querySelector('.thead .tr:last-child .th, thead tr:last-child th');
+      var search = card.querySelector('.contacts-quick-search');
+      if (search && !search.querySelector('.sup-filterbar2')) {
+        var page = card.closest('.zcontacts-page'), filters = page && page.querySelector('.sup-filterbar2');
+        if (filters) {
+          var labels = Array.from(filters.querySelectorAll('.sup-flabel'));
+          labels.forEach(function (label) {
+            var dropdown = label.nextElementSibling;
+            if (!dropdown || !dropdown.matches('.sup-dd')) return;
+            var group = document.createElement('div'); group.className = 'contacts-filter-field';
+            label.before(group); group.appendChild(label); group.appendChild(dropdown);
+          });
+          search.appendChild(filters);
+        }
+      }
+      if (first && !first.querySelector('.contacts-all-check')) {
+        var all = document.createElement('input'); all.type = 'checkbox'; all.className = 'contacts-all-check';
+        all.setAttribute('aria-label', 'Select all contacts on this page'); first.textContent = ''; first.appendChild(all);
+      }
+      var rows = card.querySelectorAll('.contacts-row-check');
+      for (var j = 0; j < rows.length; j++) {
+        var row = rows[j].closest('.tr, tr'), label = row && row.querySelector('.sup-name');
+        if (label) { rows[j].setAttribute('aria-label', 'Select ' + label.textContent.trim()); label.title = label.textContent.trim(); }
+      }
+    }
+  }
+  document.addEventListener('change', function (e) {
+    if (!e.target.matches('.contacts-row-check, .contacts-all-check')) return;
+    var card = e.target.closest('.contacts-list-card'); if (!card) return;
+    var all = card.querySelector('.contacts-all-check'), rows = card.querySelectorAll('.contacts-row-check'), count = 0;
+    for (var i = 0; i < rows.length; i++) { if (e.target === all) rows[i].checked = all.checked; if (rows[i].checked) count++; }
+    if (all) { all.checked = rows.length > 0 && count === rows.length; all.indeterminate = count > 0 && count < rows.length; }
+  });
+  document.addEventListener('keydown', function (e) {
+    var tab = e.target.closest && e.target.closest('.zcontacts-page .cpe-tab');
+    if (!tab || !['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) return;
+    var tabs = Array.from(tab.parentElement.querySelectorAll('.cpe-tab'));
+    var index = tabs.indexOf(tab);
+    index = e.key === 'Home' ? 0 : e.key === 'End' ? tabs.length - 1 : (index + (e.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+    e.preventDefault(); tabs[index].click(); tabs[index].focus();
+  });
+  function cgInit() { cgPlaceholders(); cgActiveToggle(); hideNativeFindOpts(); contactSelection(); contactsTabs(); contactsListSelection(); }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', cgInit); else cgInit();
   // /qapps renders screens AFTER DOMContentLoaded (async SPA transclude), so a load-time call is too early — re-run
   // when the DOM settles (idempotent; guarded by data-cgtog and the existing-placeholder check).
