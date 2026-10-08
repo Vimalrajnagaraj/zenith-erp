@@ -5,6 +5,7 @@
 
     <!-- ZE-CUST-LIST/FINAL: inline filter params (Customer Type + Status + Show Disabled), read from the GET URL. -->
     <parameter name="showDisabled"/>
+    <parameter name="quickSearch"/>
     <parameter name="statusFilter"/>
 
     <transition name="createPerson">
@@ -115,6 +116,21 @@
              Multiple terms AND together; a term that matches nothing yields an empty result. -->
         <script><![CDATA[
             def _sets = []
+            // Search the complete authorized directory, not just rows on the visible page.
+            def _quick = quickSearch?.toString()?.trim()
+            if (_quick) {
+                def cf = ec.entity.conditionFactory
+                _quick.split(/\s+/).each { term ->
+                    def matches = ['organizationName','firstName','lastName','partyId'].collect { field ->
+                        cf.makeCondition(field, org.moqui.entity.EntityCondition.LIKE, '%' + term + '%').ignoreCase()
+                    }
+                    def matched = ec.entity.find('zenith.erp.contacts.ContactListView')
+                        .condition('ownerPartyId', _contactOrg?.activeOrgId ?: '__NO_ORGANIZATION__')
+                        .condition(cf.makeCondition(matches, org.moqui.entity.EntityCondition.OR))
+                        .list().collect { it.partyId }.unique()
+                    _sets.add(matched ?: ['__NO_MATCH__'])
+                }
+            }
             if (gstinSearch?.trim()) _sets.add(ec.entity.find("zenith.erp.india.IndiaGstin").condition("gstin","like","%"+gstinSearch.trim().toUpperCase()+"%").list().collect{it.partyId}.findAll{it}.unique())
             if (panSearch?.trim()) _sets.add(ec.entity.find("mantle.party.Party").condition("panNumber","like","%"+panSearch.trim().toUpperCase()+"%").list().collect{it.partyId}.findAll{it}.unique())
             if (cinSearch?.trim()) _sets.add(ec.entity.find("mantle.party.Party").condition("cinNumber","like","%"+cinSearch.trim().toUpperCase()+"%").list().collect{it.partyId}.findAll{it}.unique())
@@ -149,10 +165,12 @@
                 <!-- ZE-CUST-FINAL: "+ New Customer" primary dropdown (per the final mockup) — consolidates the two Add
                      buttons into one prominent CTA. The menu items proxy-click the hidden real dialog triggers below
                      (cpe-tabs.js), which open the same Bootstrap modal (/apps) or q-dialog (/qapps). Consolidated (not
-                     three separate buttons like the mockup) to avoid redundancy; the create flow is unchanged. -->
+                     plus the reference's direct Add Person and Add Company actions; the create flow is unchanged. -->
                 <render-mode><text type="html,qvt,vuet"><![CDATA[
+                    <button type="button" class="cust-nc-solo cust-nc-ghost" data-nctext="Add Person"><span class="material-icons" aria-hidden="true">person_add</span>Add Person</button>
+                    <button type="button" class="cust-nc-solo cust-nc-ghost" data-nctext="Add Company"><span class="material-icons" aria-hidden="true">apartment</span>Add Company</button>
                     <div class="cust-newcust">
-                      <button type="button" class="cust-nc-trigger"><span class="material-icons cust-nc-plus">add</span>New Customer<span class="material-icons cust-nc-caret">arrow_drop_down</span></button>
+                      <button type="button" class="cust-nc-trigger" aria-expanded="false"><span class="material-icons cust-nc-plus">add</span>New Customer<span class="material-icons cust-nc-caret">arrow_drop_down</span></button>
                       <div class="cust-nc-menu">
                         <button type="button" class="cust-nc-item cust-nc-person"><span class="cust-nc-ico material-icons">person</span>Add a Person</button>
                         <button type="button" class="cust-nc-item cust-nc-org"><span class="cust-nc-ico material-icons">apartment</span>Add a Company</button>
@@ -218,10 +236,9 @@
               <!-- ZE-CONTACTS-027/025: CSV/Excel export via the shared export transition (the native show-csv-button
                    dropped ID/Name and leaked the header). CSV visible; Excel in the ⋮ overflow (kept, not removed). -->
               <!-- Both exports as Moqui <link>s (surface-aware, correct transition URL on /apps AND /qapps). Kept
-                   both visible rather than a ⋮ overflow holding a single Excel item — a raw-HTML overflow link is a
-                   relative-URL hazard (resolves to the parent screen) and an one-item overflow adds a needless click. -->
+                   CSV stays visible in the reference toolbar; the Excel transition remains available. -->
               <link url="export" text="Export to CSV" parameter-map="[format:'csv']" link-type="anchor" target-window="_blank" style="cust-export"/>
-              <link url="export" text="Export to Excel" parameter-map="[format:'xlsx']" link-type="anchor" target-window="_blank" style="cust-export"/>
+              <link url="export" text="Export to Excel" parameter-map="[format:'xlsx']" link-type="anchor" target-window="_blank" style="cust-export contacts-excel"/>
             </container>
         </container>
 
@@ -257,8 +274,14 @@
               <a href="?showDisabled=<#if _sd == 'Y'>N<#else>Y</#if>&amp;partyTypeEnumId=${_t}&amp;statusFilter=${_st}" class="sup-switch-link<#if _sd == 'Y'> sup-switch-on</#if>">Show Disabled</a>
             </div>
         ]]></text></render-mode>
-        <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md sup-compact z-listchrome">
-            <render-mode><text type="html,qvt"><![CDATA[<span class="zlc-ph" data-ph="Search Customers..." style="display:none"></span>]]></text></render-mode>
+        <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md sup-compact contacts-list-card">
+            <render-mode><text type="html,qvt,vuet"><![CDATA[
+              <form method="get" action="" class="sup-searchrow contacts-quick-search">
+                <input class="sup-search-input" type="search" name="quickSearch" aria-label="Search contacts" placeholder="Search by name or contact ID..." value="${(quickSearch!'')?html}"/>
+                <button type="submit" class="sup-filters-btn contacts-search-submit" aria-label="Search contacts">Search</button>
+                <button type="button" class="sup-filters-btn">Filters</button>
+              </form>
+            ]]></text></render-mode>
             <form-list name="FindCustomerList" list="customerList" skip-form="true" header-dialog="true" show-page-size="true">
                 <entity-find entity-name="mantle.party.PartyDetailAndRole" list="customerList">
                     <search-form-inputs skip-fields="ownerPartyId" default-order-by="organizationName,firstName"/>
@@ -304,15 +327,16 @@
                             if (_ph) rowPhone = _ph[0].contactNumber
                         } catch (Throwable _t) { }
                         // ZE-CUST-DS: Actions = single pencil icon (customers-components §7.10 "single icon-only button").
-                        // The pencil opens the customer's ContactProfile — where Orders / Invoices / Ledger (and Edit)
-                        // all live — so the mockup's bare-pencil look loses no reach, just one click deeper.
+                        // Keep the name's profile link and give the pencil its actual edit destination.
                         def _pid = partyId
                         actionsHtml = "<div class='sup-act'>" +
-                          "<a class='sup-act-edit' href='/apps/zenith/Contacts/ContactProfile?partyId=" + _pid + "' title='Open profile'><svg viewBox='0 0 24 24' width='16' height='16' aria-hidden='true'><path fill='currentColor' d='M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z'/></svg></a></div>"
+                          "<a class='sup-act-edit' href='/apps/zenith/Contacts/EditContact?partyId=" + _pid + "' title='Edit customer' aria-label='Edit customer'><svg viewBox='0 0 24 24' width='16' height='16' aria-hidden='true'><path fill='currentColor' d='M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z'/></svg></a></div>"
                     ]]></script>
+                <set field="selectionHtml" value="&lt;input type='checkbox' class='contacts-row-check' aria-label='Select this contact on this page'/&gt;"/>
                 </row-actions>
 
                 <!-- ZE-CUST-LIST: Party ID column removed (ID now shown under the name); kept as a Find-Options search. -->
+                <field name="selection"><header-field title="Select"/><default-field><display text="${selectionHtml}" encode="false"/></default-field></field>
                 <field name="partyId"><header-field title="ID Search"><text-find/></header-field><default-field><hidden/></default-field></field>
 
                 <field name="organizationName"><header-field title="Company Search"><text-find/></header-field><default-field><hidden/></default-field></field>
@@ -395,9 +419,7 @@
                     </default-field>
                 </field>
 
-                <!-- ZE-CUST-LIST: customer-appropriate row actions. The report's "POs / Bills" are VENDOR actions
-                     (purchase orders / vendor bills) — WRONG for a customer, who has sales Orders + Invoices + an
-                     accounting Ledger. Edit dropped as a text link: the name opens the profile, which has Edit. -->
+                <!-- The name opens the profile; the pencil opens the customer editor. -->
                 <field name="actions">
                     <header-field title="Actions"/>
                     <default-field><display text="${actionsHtml}" encode="false"/></default-field>
