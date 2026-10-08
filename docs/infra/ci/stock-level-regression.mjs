@@ -19,7 +19,7 @@ async function page(query = '', suffix = '', username) {
   return html;
 }
 function summary(html) {
-  const values = [...html.matchAll(/class="[^"\n]*xf-summary-num">([^<]+)/g)].map(m => Number(m[1].replace(/,/g, '')));
+  const values = [...html.matchAll(/class="[^"\n]*xf-summary-num">([^<]+)/g)].map(m => Number(m[1].replace(/[\u20b9,]/g, '')));
   assert.equal(values.length, 5, 'Five summary values render');
   return values;
 }

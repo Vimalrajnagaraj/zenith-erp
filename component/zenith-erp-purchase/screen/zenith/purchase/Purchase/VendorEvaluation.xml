@@ -4,58 +4,53 @@
         default-menu-title="Vendor Evaluation" default-menu-index="10">
 
     <transition name="createEvaluation">
-        <actions>
-            <!-- ZE-SB-013 (Tier 1): the vendor must belong to this org; guard only when supplied. -->
-            <if condition="ec.web.parameters.vendorPartyId">
-                <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" out-map="_ca"
-                              in-map="[entityName:'mantle.party.Party', idField:'partyId', idValue:ec.web.parameters.vendorPartyId, orgField:'ownerPartyId']"/>
-                <if condition="!_ca.allowed"><return error="true" message="Please select a valid vendor from your account."/></if>
-            </if>
-            <!-- Overall = average of the three 1-5 scores (mockup shows a derived value, not a manual entry) -->
-            <script><![CDATA[
-                def toNum = { v -> try { return (v == null || v.toString().trim() == '') ? 0 : (v as BigDecimal) } catch (e) { return 0 } }
-                def q = toNum(qualityScore); def d = toNum(deliveryScore); def p = toNum(priceScore)
-                overallScore = ((q + d + p) / 3).setScale(2, java.math.RoundingMode.HALF_UP)
-            ]]></script>
-            <service-call name="create#zenith.erp.purchase.VendorEvaluation" in-map="context"/>
-        </actions>
+        <actions><service-call name="zenith.purchase.VendorEvaluationServices.create#VendorEvaluation" in-map="ec.web.parameters"/></actions>
         <default-response url="."/>
     </transition>
-
-    <!-- SL f/u: delete an evaluation (org-guarded via the vendor's owner) — the ⋮ row action -->
     <transition name="deleteEvaluation">
-        <actions>
-            <entity-find-one entity-name="zenith.erp.purchase.VendorEvaluation" value-field="_ev"><field-map field-name="evaluationId"/></entity-find-one>
-            <if condition="_ev == null"><return error="true" message="Evaluation not found."/></if>
-            <set field="_org" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-            <if condition="_org">
-                <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" out-map="_ca"
-                              in-map="[entityName:'mantle.party.Party', idField:'partyId', idValue:_ev.vendorPartyId, orgField:'ownerPartyId']"/>
-                <if condition="!_ca.allowed"><return error="true" message="Evaluation not found for your account."/></if>
-            </if>
-            <service-call name="delete#zenith.erp.purchase.VendorEvaluation" in-map="[evaluationId:evaluationId]"/>
-        </actions>
+        <actions><service-call name="zenith.purchase.VendorEvaluationServices.delete#VendorEvaluation" in-map="[evaluationId:evaluationId]"/></actions>
         <default-response url="."/>
     </transition>
-    <!-- ZE-SEC-JSON f/u: org-scoped party picker (stock SimpleScreens searchPartyList leaks cross-tenant). -->
-    <transition-include name="searchPartyList" location="component://zenith-erp-base/screen/include/PartyPicker.xml"/>
-
+    <!-- Fixed supplier roles and canonical ownership apply to exact IDs as well as type-ahead. -->
+    <transition name="searchVendorList" read-only="true">
+        <parameter name="term"/>
+        <actions>
+            <service-call name="zenith.purchase.VendorEvaluationServices.get#EvaluationOrganization" out-map="scope"/>
+            <set field="term" from="(ec.web.parameters.term ?: '').toString().trim()"/>
+            <if condition="!scope.organizationPartyId || !term"><script>ec.web.sendJsonResponse([])</script><return/></if>
+            <entity-find entity-name="mantle.party.PartyDetailAndRole" list="vendors" limit="25" distinct="true">
+                <econdition field-name="ownerPartyId" from="scope.organizationPartyId"/>
+                <econdition field-name="roleTypeId" operator="in" from="['Vendor','Supplier']"/>
+                <econditions combine="or"><econdition field-name="disabled" value="N"/><econdition field-name="disabled" operator="is-null"/></econditions>
+                <econditions combine="or">
+                    <econdition field-name="partyId" from="term"/>
+                    <econdition field-name="organizationName" operator="like" value="%${term}%" ignore-case="true"/>
+                    <econdition field-name="firstName" operator="like" value="%${term}%" ignore-case="true"/>
+                    <econdition field-name="lastName" operator="like" value="%${term}%" ignore-case="true"/>
+                </econditions>
+                <order-by field-name="organizationName,firstName,lastName"/>
+            </entity-find>
+            <script><![CDATA[
+                ec.web.sendJsonResponse(vendors.collect { [value:it.partyId,label:ec.resource.expand('PartyNameTemplate','',it)] }.unique {it.value})
+            ]]></script>
+        </actions>
+        <default-response type="none"/>
+    </transition>
     <actions>
-        <!-- ZE-SALES-014 f/u (Tier D): scope export to the active org via the owner -->
-        <set field="_expOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-        <set field="_expOwnerIds" from="null"/>
-        <if condition="_expOrg">
-            <entity-find entity-name="mantle.party.Party" list="_expOwnerRows"><econdition field-name="ownerPartyId" from="_expOrg"/><select-field field-name="partyId"/></entity-find>
-            <set field="_expOwnerIds" from="_expOwnerRows ? _expOwnerRows.collect{it.partyId} : ['__none__']"/>
-        </if>
+        <service-call name="zenith.purchase.VendorEvaluationServices.get#EvaluationOrganization" out-map="scope"/>
+        <entity-find entity-name="mantle.party.Party" list="ownedVendors">
+            <econdition field-name="ownerPartyId" from="scope.organizationPartyId ?: '__NO_ORGANIZATION__'"/>
+            <select-field field-name="partyId"/>
+        </entity-find>
         <entity-find entity-name="zenith.erp.purchase.VendorEvaluation" list="evalList">
-            <search-form-inputs default-order-by="-evaluationDate"/>
-            <econdition field-name="vendorPartyId" operator="in" from="_expOwnerIds" ignore-if-empty="true"/>
+            <search-form-inputs default-order-by="-evaluationDate" skip-fields="ownerPartyId,organizationPartyId"/>
+            <econdition field-name="vendorPartyId" operator="in" from="ownedVendors ? ownedVendors.collect {it.partyId} : ['__NO_ORGANIZATION__']"/>
         </entity-find>
     </actions>
 
     <widgets>
-        <container style="column q-mb-lg z-newbtn-wrap">
+        <container style="zveval-page">
+        <container style="column q-mb-lg z-newbtn-wrap zveval-header">
             <label text="Vendor Evaluations" type="h4" style="text-dark text-weight-bold q-my-none q-mb-sm"/>
             <!-- ZE-PUR: New Evaluation (save-evaluation) is a write action — hidden for view-only users -->
             <section name="NewEvalWrite">
@@ -64,15 +59,15 @@
                 <container-dialog id="NewEvalDialog" button-text="+ New Evaluation" width="800" button-class="q-btn q-btn-item non-selectable no-outline q-btn--standard q-btn--rectangle bg-primary text-white q-btn--actionable q-focusable q-hoverable text-weight-bold q-px-md z-newbtn">
                     <container style="q-px-md q-pt-md">
                         <form-single name="NewEvalForm" transition="createEvaluation">
-                            <field name="vendorPartyId"><default-field title="Vendor">
-                                <drop-down>
-                                    <dynamic-options transition="searchPartyList" server-search="true" min-length="2"/>
+                            <field name="vendorPartyId"><default-field title="Vendor" required="true">
+                                <drop-down allow-empty="true">
+                                    <dynamic-options transition="searchVendorList" server-search="true" min-length="2"/>
                                 </drop-down>
                             </default-field></field>
-                            <field name="evaluationDate"><default-field title="Date"><date-time type="date"/></default-field></field>
-                            <field name="qualityScore"><default-field title="Quality (1-5)"><text-line/></default-field></field>
-                            <field name="deliveryScore"><default-field title="Delivery (1-5)"><text-line/></default-field></field>
-                            <field name="priceScore"><default-field title="Price (1-5)"><text-line/></default-field></field>
+                            <field name="evaluationDate"><default-field title="Date" required="true"><date-time type="date"/></default-field></field>
+                            <field name="qualityScore"><default-field title="Quality (1-5)" required="true"><text-line size="8"/></default-field></field>
+                            <field name="deliveryScore"><default-field title="Delivery (1-5)" required="true"><text-line size="8"/></default-field></field>
+                            <field name="priceScore"><default-field title="Price (1-5)" required="true"><text-line size="8"/></default-field></field>
                             <field name="remarks"><default-field><text-area rows="3"/></default-field></field>
                             <field name="submitButton"><default-field title="Save Evaluation"><submit/></default-field></field>
 
@@ -102,24 +97,27 @@
                     <!-- 5-star render as two labels (filled amber ★ + empty grey ☆, no raw HTML) + colour-coded overall (mockup §6) -->
                     <script><![CDATA[
                         def _st = { n ->
-                            int f = Math.min(Math.max(((n ?: 0) as BigDecimal).intValue(), 0), 5)
+                            if(n == null) return ['Not recorded','']
+                            def value=n as BigDecimal
+                            if(value < 1 || value > 5 || value.remainder(BigDecimal.ONE) != 0) return [value.toPlainString() + ' (legacy)','']
+                            int f=value.intValueExact()
                             return ['★' * f, '☆' * (5 - f)]
                         }
                         def _q = _st(qualityScore);  qualityOn  = _q[0]; qualityOff  = _q[1]
                         def _d = _st(deliveryScore); deliveryOn = _d[0]; deliveryOff = _d[1]
                         def _p = _st(priceScore);    priceOn    = _p[0]; priceOff    = _p[1]
-                        def _ov = (overallScore ?: 0) as BigDecimal
-                        overallDisp = _ov.setScale(2, java.math.RoundingMode.HALF_UP).toString()
-                        overallCls = (_ov >= 4.0) ? 'z-score-hi' : 'z-score-lo'
+                        def _ov = overallScore == null ? null : overallScore as BigDecimal
+                        overallDisp = _ov == null ? 'Not recorded' : _ov.setScale(2, java.math.RoundingMode.HALF_UP).toString()
+                        overallCls = (_ov != null && _ov >= 4.0 && _ov <= 5.0) ? 'z-score-hi' : 'z-score-lo'
                     ]]></script>
                 </row-actions>
                 <field name="vendorPartyId">
                     <header-field title="Vendor">
                         <drop-down allow-empty="true">
-                            <dynamic-options transition="searchPartyList" server-search="true" min-length="2"/>
+                            <dynamic-options transition="searchVendorList" server-search="true" min-length="2"/>
                         </drop-down>
                     </header-field>
-                    <conditional-field condition="sri.getRenderMode() == 'csv'">
+                    <conditional-field condition="sri.getRenderMode() in ['csv','xlsx']">
                         <display text="${vendorName}"/>
                     </conditional-field>
                     <default-field>
@@ -128,7 +126,7 @@
                 </field>
                 <field name="evaluationDate">
                     <header-field title="Date" show-order-by="true"><date-find type="date"/></header-field>
-                    <conditional-field condition="sri.getRenderMode() == 'csv'"><display format="yyyy-MM-dd"/></conditional-field>
+                    <conditional-field condition="sri.getRenderMode() in ['csv','xlsx']"><display format="yyyy-MM-dd"/></conditional-field>
                     <default-field>
                         <label text="event" type="span" style="material-icons z-cellico"/>
                         <display format="dd MMM yyyy"/>
@@ -136,34 +134,35 @@
                 </field>
                 <field name="qualityScore">
                     <header-field title="Quality"/>
-                    <conditional-field condition="sri.getRenderMode() == 'csv'"><display/></conditional-field>
+                    <conditional-field condition="sri.getRenderMode() in ['csv','xlsx']"><display/></conditional-field>
                     <default-field><label text="${qualityOn}" type="span" style="z-stars z-star-on"/><label text="${qualityOff}" type="span" style="z-stars z-star-off"/></default-field>
                 </field>
                 <field name="deliveryScore">
                     <header-field title="Delivery"/>
-                    <conditional-field condition="sri.getRenderMode() == 'csv'"><display/></conditional-field>
+                    <conditional-field condition="sri.getRenderMode() in ['csv','xlsx']"><display/></conditional-field>
                     <default-field><label text="${deliveryOn}" type="span" style="z-stars z-star-on"/><label text="${deliveryOff}" type="span" style="z-stars z-star-off"/></default-field>
                 </field>
                 <field name="priceScore">
                     <header-field title="Price"/>
-                    <conditional-field condition="sri.getRenderMode() == 'csv'"><display/></conditional-field>
+                    <conditional-field condition="sri.getRenderMode() in ['csv','xlsx']"><display/></conditional-field>
                     <default-field><label text="${priceOn}" type="span" style="z-stars z-star-on"/><label text="${priceOff}" type="span" style="z-stars z-star-off"/></default-field>
                 </field>
                 <field name="overallScore">
                     <header-field title="Overall" show-order-by="true"/>
-                    <conditional-field condition="sri.getRenderMode() == 'csv'"><display format="0.00"/></conditional-field>
+                    <conditional-field condition="sri.getRenderMode() in ['csv','xlsx']"><display format="0.00"/></conditional-field>
                     <default-field><label text="${overallDisp}" type="span" style="text-weight-bold ${overallCls}"/></default-field>
                 </field>
-                <field name="remarks"><default-field title="Remarks"><label text="${remarks ?: ''}" type="span" style="text-grey-7"/></default-field></field>
+                <field name="remarks"><conditional-field condition="sri.getRenderMode() in ['csv','xlsx']"><display/></conditional-field><default-field title="Remarks"><label text="${remarks ?: ''}" type="span" style="text-grey-7"/></default-field></field>
                 <field name="rowActions">
                     <header-field title="Actions"/>
-                    <conditional-field condition="sri.getRenderMode() == 'csv'"><ignored/></conditional-field>
+                    <conditional-field condition="sri.getRenderMode() in ['csv','xlsx']"><ignored/></conditional-field>
                     <conditional-field name="act_write" condition="modCanWrite">
-                        <link url="deleteEvaluation" text="⋮" parameter-map="[evaluationId:evaluationId]" style="z-kebab" confirmation="Delete this evaluation? This can't be undone."/>
+                        <link url="deleteEvaluation" text="Delete" parameter-map="[evaluationId:evaluationId]" style="zveval-delete" confirmation="Delete this evaluation? This can't be undone."/>
                     </conditional-field>
-                    <default-field><label text="⋮" type="span" style="z-kebab-static"/></default-field>
+                    <default-field><ignored/></default-field>
                 </field>
             </form-list>
+        </container>
         </container>
     </widgets>
 </screen>

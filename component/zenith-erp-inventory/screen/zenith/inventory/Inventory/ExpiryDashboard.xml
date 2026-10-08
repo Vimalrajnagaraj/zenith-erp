@@ -2,123 +2,30 @@
 <screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
         xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
         default-menu-title="Expiry Risk Dashboard" default-menu-index="2">
-
-    <!-- ZE-INV-001 (IV-100): the Expiry Risk module had no way to create expiry-tracked stock (the only flow that
-         sets an expiry date is ReceiveInventory, which needs a purchase order), so the dashboard was always empty.
-         This adds a direct "Add Expiring Stock" entry that creates an Asset with an expiry date, batch, quantity
-         and a valuationRate (which is what the dashboard values by — ReceiveInventory only set acquireCost), owned
-         by the active org so it shows for that tenant. Also writes the AssetDetail ledger entry so the on-hand
-         quantity persists (a direct qoh with no ledger receipt gets zeroed on the first sale). -->
     <transition name="createExpiryStock">
         <actions>
-            <!-- ZE-INV-010 (IV-110): enforce Inventory write access (defense-in-depth; the central gate is fail-open) -->
-            <service-call name="zenith.base.SecurityServices.check#ModuleWriteAccess" out-map="_wac" in-map="[moduleId:'inventory']"/>
-            <if condition="!(_wac?.canWrite)"><return error="true" message="You have view-only access to Inventory — you can't make changes here."/></if>
-            <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-            <if condition="!productId"><return error="true" message="Please select a product."/></if>
-            <if condition="!expiryDate"><return error="true" message="Please enter an expiry date."/></if>
-            <script><![CDATA[
-                def _numOk = { v -> v != null && v.toString().trim() != '' && (v.toString().trim() ==~ /\d*\.?\d+/) }
-                if (!_numOk(quantity)) { ec.message.addError("Quantity must be a number greater than zero."); return }
-                def _qty = new BigDecimal(quantity)
-                if (_qty.signum() <= 0) { ec.message.addError("Quantity must be greater than zero."); return }
-                def _rate = _numOk(unitValue) ? new BigDecimal(unitValue) : BigDecimal.ZERO
-                def _org = (activeOrg && activeOrg != '_NA_') ? activeOrg : null
-                def inMap = [
-                    assetTypeEnumId:'AstTpInventory', classEnumId:'AsClsInventory', statusId:'AstAvailable',
-                    productId:productId, quantityOnHandTotal:_qty, availableToPromiseTotal:_qty,
-                    valuationRate:_rate, acquireCost:_rate, expiryDate:expiryDate, receivedDate:ec.user.nowTimestamp
-                ]
-                if (_org) inMap.ownerPartyId = _org
-                if (facilityId) inMap.facilityId = facilityId
-                if (batchNumber) inMap.batchNumber = batchNumber
-                def _a = ec.service.sync().name("create#mantle.product.asset.Asset").parameters(inMap).call()
-                ec.service.sync().name("create#mantle.product.asset.AssetDetail").parameters([
-                    assetId:_a.assetId, productId:productId, effectiveDate:ec.user.nowTimestamp,
-                    quantityOnHandDiff:_qty, availableToPromiseDiff:_qty, description:'Expiry-tracked stock added']).call()
-                ec.message.addMessage("Added " + _qty + " units (expiry " + expiryDate + "). It will appear below if it expires within 90 days.")
-            ]]></script>
+            <if condition="ec.web.request.method != 'POST'"><return error="true" message="Expiry stock changes require POST."/></if>
+            <service-call name="zenith.inventory.ExpiryRiskServices.create#ExpiryStock" in-map="context"/>
         </actions>
         <default-response url="."/>
     </transition>
-
-    <!-- ZE-INV-007 (IV-106): UPDATE an existing expiry lot (expiry date, quantity, value, batch) from the dashboard.
-         On save the dashboard re-renders (url=".") so the list + Risk Summary reflect the change immediately. The
-         asset is looked up with disableAuthz but an EXPLICIT owner==active-org guard keeps a tenant from editing
-         another tenant's stock (a super-admin with no active org may edit any). A quantity change also writes an
-         AssetDetail ledger diff so the on-hand persists (matching the create path). -->
     <transition name="updateExpiryStock">
         <actions>
-            <!-- ZE-INV-010 (IV-110): enforce Inventory write access (defense-in-depth; the central gate is fail-open) -->
-            <service-call name="zenith.base.SecurityServices.check#ModuleWriteAccess" out-map="_wac" in-map="[moduleId:'inventory']"/>
-            <if condition="!(_wac?.canWrite)"><return error="true" message="You have view-only access to Inventory — you can't make changes here."/></if>
-            <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-            <if condition="!assetId"><return error="true" message="Missing stock reference."/></if>
-            <if condition="!expiryDate"><return error="true" message="Please enter an expiry date."/></if>
-            <script><![CDATA[
-                def _asset = ec.entity.find("mantle.product.asset.Asset").condition("assetId", assetId).disableAuthz().one()
-                if (_asset == null) { ec.message.addError("Stock not found."); return }
-                if (activeOrg && activeOrg != '_NA_' && _asset.ownerPartyId != activeOrg) { ec.message.addError("You can only edit stock owned by your organization."); return }
-                def _numOk = { v -> v != null && v.toString().trim() != '' && (v.toString().trim() ==~ /\d*\.?\d+/) }
-                if (!_numOk(quantity)) { ec.message.addError("Quantity must be a number greater than zero."); return }
-                def _newQty = new BigDecimal(quantity.toString().trim())
-                if (_newQty.signum() <= 0) { ec.message.addError("Quantity must be greater than zero."); return }
-                def _rate = _numOk(unitValue) ? new BigDecimal(unitValue.toString().trim()) : (_asset.valuationRate ?: BigDecimal.ZERO)
-                def _oldQty = _asset.quantityOnHandTotal ?: BigDecimal.ZERO
-                def _bn = (batchNumber != null && batchNumber.toString().trim() != '' && batchNumber.toString().trim() != 'N/A') ? batchNumber.toString().trim() : null
-                // metadata (expiry / value / batch) — a plain field update; on-hand is ledger-driven, handled below
-                ec.service.sync().name("update#mantle.product.asset.Asset")
-                    .parameters([assetId:assetId, expiryDate:expiryDate, valuationRate:_rate, acquireCost:_rate, batchNumber:_bn]).call()
-                // A quantity change is a formal Inventory Adjustment: record a StockAdjustment header (who / when /
-                // reason / org) + a StockAdjustmentItem line (product / lot / system vs actual qty), so the correction
-                // is visible in the Stock Adjustments audit trail — not just a bare ledger line. Created already-applied
-                // because we post the ledger right here (the shared apply#StockAdjustment is product-level, not lot-
-                // precise, so we can't reuse it for a specific expiry lot).
-                if (_newQty.compareTo(_oldQty) != 0) {
-                    def _reason = (adjustReason != null && adjustReason.toString().trim() != '') ? adjustReason.toString().trim() : 'PhysicalCount'
-                    def _saOrg = (activeOrg && activeOrg != '_NA_') ? activeOrg : _asset.ownerPartyId
-                    def _sa = ec.service.sync().name("create#zenith.erp.inventory.StockAdjustment").parameters([
-                        organizationPartyId:_saOrg, facilityId:_asset.facilityId, adjustmentType:_reason,
-                        adjustmentDate:ec.user.nowTimestamp, statusId:'AdjApplied', adjustedBy:ec.user.userId,
-                        remarks:'Expiry Risk dashboard — lot ' + assetId + ' qty ' + _oldQty + ' → ' + _newQty]).call()
-                    ec.service.sync().name("create#zenith.erp.inventory.StockAdjustmentItem").parameters([
-                        stockAdjustmentId:_sa.stockAdjustmentId, productId:_asset.productId, assetId:assetId,
-                        systemQuantity:_oldQty, actualQuantity:_newQty, differenceQuantity:_newQty.subtract(_oldQty),
-                        valuationRate:_rate, remarks:'Edited from Expiry Risk dashboard']).call()
-                    // Post the ledger for THIS lot. Moqui recomputes quantityOnHandTotal from the SUM of AssetDetail
-                    // diffs, so the diff is (target - ledger sum), NOT (target - qoh) — this lands the on-hand exactly
-                    // on target even for legacy/migrated lots whose qoh was set without a ledger, and reconciles it.
-                    def _qohSum = BigDecimal.ZERO; def _atpSum = BigDecimal.ZERO
-                    for (def d : ec.entity.find("mantle.product.asset.AssetDetail").condition("assetId", assetId).disableAuthz().list()) {
-                        _qohSum = _qohSum.add(d.quantityOnHandDiff ?: BigDecimal.ZERO)
-                        _atpSum = _atpSum.add(d.availableToPromiseDiff ?: BigDecimal.ZERO)
-                    }
-                    ec.service.sync().name("create#mantle.product.asset.AssetDetail").parameters([
-                        assetId:assetId, productId:_asset.productId, effectiveDate:ec.user.nowTimestamp,
-                        quantityOnHandDiff:_newQty.subtract(_qohSum), availableToPromiseDiff:_newQty.subtract(_atpSum),
-                        description:'Stock adjustment ' + _sa.stockAdjustmentId + ' (' + _reason + ')']).call()
-                    ec.message.addMessage("Updated stock " + assetId + " — qty " + _oldQty + " → " + _newQty + " (adjustment " + _sa.stockAdjustmentId + " logged). Expiry " + expiryDate + ".")
-                } else {
-                    ec.message.addMessage("Updated stock " + assetId + " — expiry " + expiryDate + ".")
-                }
-            ]]></script>
+            <if condition="ec.web.request.method != 'POST'"><return error="true" message="Expiry stock changes require POST."/></if>
+            <service-call name="zenith.inventory.ExpiryRiskServices.update#ExpiryStock" in-map="context"/>
         </actions>
         <default-response url="."/>
     </transition>
-
-    <!-- ZE-INV-004 (IV-103): the filter form submits here and just re-renders the dashboard; the actions read
-         searchText / withinDays from the request and narrow the list. -->
-    <transition name="filterExpiry">
-        <default-response url="."/>
+    <transition name="filterExpiry" read-only="true">
+        <default-response url="."><parameter name="searchText"/><parameter name="withinDays"/><parameter name="categoryFilter"/><parameter name="supplierFilter"/><parameter name="daysBucket"/><parameter name="orderByField"/><parameter name="pageSize"/></default-response>
     </transition>
-
-    <!-- ZE-INV-008 (IV-107): save this tenant's expiry-alert threshold + on/off -->
     <transition name="saveAlertSettings">
-        <actions>
-            <!-- ZE-INV-010 (IV-110): enforce Inventory write access (defense-in-depth; the central gate is fail-open) -->
+        <actions><if condition="ec.web.request.method != 'POST'"><return error="true" message="Changes require POST."/></if>
+            <service-call name="zenith.inventory.ExpiryRiskServices.get#ExpiryScope" out-map="expiryScope"/>
+            <if condition="expiryScope.organizationPartyId == '__NO_ORGANIZATION__'"><return error="true" message="Select an organization you belong to."/></if>
             <service-call name="zenith.base.SecurityServices.check#ModuleWriteAccess" out-map="_wac" in-map="[moduleId:'inventory']"/>
             <if condition="!(_wac?.canWrite)"><return error="true" message="You have view-only access to Inventory — you can't make changes here."/></if>
-            <set field="_org" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <set field="_org" from="expiryScope.organizationPartyId"/>
             <if condition="!_org || _org == '_NA_'"><return error="true" message="Select an organization before changing alert settings."/></if>
             <service-call name="zenith.inventory.InventoryAlertServices.set#ExpiryAlertConfig"
                 in-map="[organizationPartyId: _org, alertDays: alertDays, alertEnabled: alertEnabled, alertEmail: alertEmail]"/>
@@ -126,10 +33,6 @@
         </actions>
         <default-response url="."/>
     </transition>
-
-    <!-- ZE-INV-006 (IV-105): CSV export of the same (org-scoped, filtered, sorted) list, streamed as a download.
-         read-only so it can be invoked from a GET link with the filter/sort URL params (like the print transitions);
-         it only reads + writes the response, no data mutation. -->
     <transition name="exportCsv" read-only="true">
         <actions>
             <service-call name="zenith.inventory.InventoryServices.get#ExpiryRisk" out-map="_ex"
@@ -137,18 +40,18 @@
                          searchText: ec.context.searchText, withinDays: ec.context.withinDays, orderByField: ec.context.orderByField,
                          categoryFilter: ec.context.categoryFilter, supplierFilter: ec.context.supplierFilter, daysBucket: ec.context.daysBucket]"/>
             <script><![CDATA[
-                def esc = { s -> '"' + (s == null ? '' : s.toString()).replace('"','""') + '"' }
+                def esc = { s -> def v = s == null ? '' : s.toString(); if (!(s instanceof Number) && v ==~ /(?s)^[\s]*[=+@-].*/) v = "'" + v; '"' + v.replace('"','""') + '"' }
                 def sb = new StringBuilder()
-                sb.append("Stock ID,Product Name,Batch/Lot,Supplier,Expiry Date,Days to Expiry,Quantity,Value at Risk,Valuation Basis\r\n")
+                sb.append("Asset ID,Product Name,SKU,Category,Batch/Lot,Supplier,Expiry Date,Days Left,Quantity,Value at Risk,Valuation Basis\r\n")
                 // expiry-risk §9 bulk: when specific rows are selected (Export Selected), narrow the export to them.
                 def _rows = (_ex.expiringAssets ?: [])
                 def _sel = (ec.context.selIds ?: '').toString().trim()
                 if (_sel) { def _ids = _sel.split(',').findAll { it }.collect { it.trim() }.toSet(); _rows = _rows.findAll { _ids.contains((it.assetId ?: '').toString()) } }
                 for (def r : _rows) {
                     def _basis = (r.valueBasis == 'MRP') ? 'MRP (retail)' : (r.valueBasis == 'unvalued' ? 'not valued' : 'cost')
-                    def _days = (r.daysToExpiry != null && r.daysToExpiry <= 0) ? 'EXPIRED' : ('' + r.daysToExpiry)
+                    def _days = r.daysToExpiry
                     def _exp = r.expiryDate ? ec.l10n.format(r.expiryDate, 'yyyy-MM-dd') : ''
-                    sb.append([esc(r.assetId), esc(r.productName), esc(r.batchNumber), esc(r.supplierName), esc(_exp), esc(_days), esc(r.quantity), esc(r.value), esc(_basis)].join(',')).append("\r\n")
+                    sb.append([esc(r.assetId), esc(r.productName), esc(r.pseudoId), esc(r.category), esc(r.batchNumber), esc(r.supplierName), esc(_exp), esc(_days), esc(r.quantity), esc(r.value), esc(_basis)].join(',')).append("\r\n")
                 }
                 ec.web.response.setContentType("text/csv; charset=UTF-8")
                 ec.web.response.addHeader("Content-Disposition", "attachment; filename=\"expiry-risk-report.csv\"")
@@ -157,9 +60,6 @@
         </actions>
         <default-response type="none"/>
     </transition>
-
-    <!-- ZE-INV-006 (IV-105) f/u: PDF export — redirect to the /fop print screen (XSL-FO -> PDF), carrying the
-         current filter/sort. read-only so it accepts the GET URL params. -->
     <transition name="printExpiry" read-only="true">
         <default-response url="${ec.web.getWebappRootUrl(false, null)}/fop/apps/zenith/Inventory/ExpiryRiskPrint" url-type="plain">
             <parameter name="searchText"/>
@@ -171,18 +71,16 @@
             <parameter name="filename" value="expiry-risk-report.pdf"/>
         </default-response>
     </transition>
-
-    <!-- expiry-risk §8: Email Report — email the CURRENT (filtered) report to the logged-in user's own address
-         (safe self-service; team distribution stays the opt-in Alert Settings email digest). Reuses the proven
-         EXPIRY_ALERT email template + send#EmailTemplate (same as the scheduled alert). -->
     <transition name="emailReport">
-        <actions>
+        <actions><if condition="ec.web.request.method != 'POST'"><return error="true" message="Changes require POST."/></if>
+            <service-call name="zenith.inventory.ExpiryRiskServices.get#ExpiryScope" out-map="expiryScope"/>
+            <if condition="expiryScope.organizationPartyId == '__NO_ORGANIZATION__'"><return error="true" message="Select an organization you belong to."/></if>
             <service-call name="zenith.base.SecurityServices.check#ModuleWriteAccess" out-map="_wac" in-map="[moduleId:'inventory']"/>
             <if condition="!(_wac?.canWrite)"><return error="true" message="You have view-only access to Inventory."/></if>
-            <set field="_org" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <set field="_org" from="expiryScope.organizationPartyId"/>
             <if condition="!_org || _org == '_NA_'"><return error="true" message="Select an organization before emailing a report."/></if>
             <service-call name="zenith.inventory.InventoryServices.get#ExpiryRisk" out-map="_ex"
-                in-map="[organizationPartyId: _org, searchText: searchText, withinDays: withinDays,
+                in-map="[organizationPartyId: _org, searchText: searchText, withinDays: withinDays, orderByField:orderByField,
                          categoryFilter: categoryFilter, supplierFilter: supplierFilter, daysBucket: daysBucket]"/>
             <script><![CDATA[
                 def _ua = ec.entity.find("moqui.security.UserAccount").condition("userId", ec.user.userId).disableAuthz().one()
@@ -192,76 +90,75 @@
                 def _cnt = (_ex.expiringAssets ?: []).size()
                 try {
                     ec.service.sync().name("org.moqui.impl.EmailServices.send#EmailTemplate").parameters([
-                        emailTemplateId:"EXPIRY_ALERT", toAddresses:_to.toString().trim(),
-                        bodyParameters:[orgName:(_orgRec?.organizationName ?: 'Your organization'), count:_cnt, days:90,
+                        emailTemplateId:"EXPIRY_RISK_REPORT", toAddresses:_to.toString().trim(),
+                        bodyParameters:[orgName:(_orgRec?.organizationName ?: 'Your organization'), count:_cnt, days:(withinDays ?: '90'), reportRows:(_ex.expiringAssets ?: []),
                                         valueAtRisk:(_ex.totalExpiryValue ?: 0),
-                                        dashboardUrl:"https://erp.zetaclantech.com/apps/zenith/Inventory/ExpiryDashboard"]]).disableAuthz().call()
+                                        dashboardUrl:ec.web.getWebappRootUrl(false, null)+"/apps/zenith/Inventory/ExpiryDashboard"]]).disableAuthz().call()
+                    if (ec.message.hasError()) return
                     ec.message.addMessage("Expiry Risk report emailed to " + _to + " (" + _cnt + " lot" + (_cnt == 1 ? '' : 's') + ").")
                 } catch (Exception _ee) { ec.message.addError("Couldn't send the email right now: " + _ee.message) }
             ]]></script>
         </actions>
         <default-response url="."><parameter name="searchText"/><parameter name="withinDays"/><parameter name="categoryFilter"/><parameter name="supplierFilter"/><parameter name="daysBucket"/><parameter name="orderByField"/></default-response>
     </transition>
-
-    <!-- expiry-risk §7: Save / Manage Views — persist named filter-sets in a per-user preference (JSON). No new
-         entity; just the current search/period/category/supplier/tier stored under a name and re-applied via URL. -->
     <transition name="saveView">
-        <actions><script><![CDATA[
+        <actions><if condition="ec.web.request.method != 'POST'"><return error="true" message="Changes require POST."/></if>
+            <service-call name="zenith.inventory.ExpiryRiskServices.get#ExpiryScope" out-map="expiryScope"/>
+            <if condition="expiryScope.organizationPartyId == '__NO_ORGANIZATION__'"><return error="true" message="Select an organization you belong to."/></if><script><![CDATA[
             def _nm = (viewName ?: '').toString().trim()
-            if (!_nm) { ec.message.addError("Enter a name for the view."); return }
+            if (!_nm || _nm.length() > 80) { ec.message.addError("Enter a name for the view."); return }
             def _list = []
-            def _raw = ec.user.getPreference('EXPIRY_SAVED_VIEWS')
-            if (_raw) { try { _list = new groovy.json.JsonSlurper().parseText(_raw.toString()) } catch (Exception _e) { _list = [] } }
+            def _raw = ec.user.getPreference('EXPIRY_SAVED_VIEWS_' + ec.user.getPreference('ACTIVE_ORGANIZATION'))
+            if (_raw) { try { def parsed = new groovy.json.JsonSlurper().parseText(_raw.toString()); _list = parsed instanceof List ? parsed.findAll { it instanceof Map && it.name instanceof String } : [] } catch (Exception _e) { _list = [] } }
             _list = _list.findAll { it?.name != _nm }
             _list.add([name:_nm, searchText:(searchText ?: ''), withinDays:(withinDays ?: ''),
-                       categoryFilter:(categoryFilter ?: ''), supplierFilter:(supplierFilter ?: ''), daysBucket:(daysBucket ?: '')])
+                       categoryFilter:(categoryFilter ?: ''), supplierFilter:(supplierFilter ?: ''), daysBucket:(daysBucket ?: ''), orderByField:(orderByField ?: 'expiryDate'), pageSize:(pageSize ?: '20')])
             if (_list.size() > 20) _list = new ArrayList(_list.subList(_list.size()-20, _list.size()))
-            ec.user.setPreference('EXPIRY_SAVED_VIEWS', groovy.json.JsonOutput.toJson(_list))
+            ec.user.setPreference('EXPIRY_SAVED_VIEWS_' + ec.user.getPreference('ACTIVE_ORGANIZATION'), groovy.json.JsonOutput.toJson(_list))
             ec.message.addMessage("Saved view “" + _nm + "”.")
         ]]></script></actions>
-        <default-response url="."><parameter name="searchText"/><parameter name="withinDays"/><parameter name="categoryFilter"/><parameter name="supplierFilter"/><parameter name="daysBucket"/></default-response>
+        <default-response url="."><parameter name="searchText"/><parameter name="withinDays"/><parameter name="categoryFilter"/><parameter name="supplierFilter"/><parameter name="daysBucket"/><parameter name="orderByField"/><parameter name="pageSize"/></default-response>
     </transition>
     <transition name="deleteView">
-        <actions><script><![CDATA[
+        <actions><if condition="ec.web.request.method != 'POST'"><return error="true" message="Changes require POST."/></if>
+            <service-call name="zenith.inventory.ExpiryRiskServices.get#ExpiryScope" out-map="expiryScope"/>
+            <if condition="expiryScope.organizationPartyId == '__NO_ORGANIZATION__'"><return error="true" message="Select an organization you belong to."/></if><script><![CDATA[
             def _nm = (viewName ?: '').toString().trim()
             def _list = []
-            def _raw = ec.user.getPreference('EXPIRY_SAVED_VIEWS')
-            if (_raw) { try { _list = new groovy.json.JsonSlurper().parseText(_raw.toString()) } catch (Exception _e) { _list = [] } }
+            def _raw = ec.user.getPreference('EXPIRY_SAVED_VIEWS_' + ec.user.getPreference('ACTIVE_ORGANIZATION'))
+            if (_raw) { try { def parsed = new groovy.json.JsonSlurper().parseText(_raw.toString()); _list = parsed instanceof List ? parsed.findAll { it instanceof Map && it.name instanceof String } : [] } catch (Exception _e) { _list = [] } }
             _list = _list.findAll { it?.name != _nm }
-            ec.user.setPreference('EXPIRY_SAVED_VIEWS', groovy.json.JsonOutput.toJson(_list))
+            ec.user.setPreference('EXPIRY_SAVED_VIEWS_' + ec.user.getPreference('ACTIVE_ORGANIZATION'), groovy.json.JsonOutput.toJson(_list))
             ec.message.addMessage("Removed view “" + _nm + "”.")
         ]]></script></actions>
         <default-response url="."/>
     </transition>
-
-    <!-- expiry-risk §8: Columns picker — per-user show/hide of the optional columns. Stored as a preference; applied
-         via injected CSS (nth-child) which /apps renders; on /qapps injected <style> is stripped so all columns show. -->
     <transition name="saveColumns">
-        <actions><script><![CDATA[
+        <actions><if condition="ec.web.request.method != 'POST'"><return error="true" message="Changes require POST."/></if>
+            <service-call name="zenith.inventory.ExpiryRiskServices.get#ExpiryScope" out-map="expiryScope"/>
+            <if condition="expiryScope.organizationPartyId == '__NO_ORGANIZATION__'"><return error="true" message="Select an organization you belong to."/></if><script><![CDATA[
             def _keys = ['sku','batch','supplier','status','quantity','value']
             def _shown = { k -> def v = context.get('col_' + k); (v == 'Y' || v == true || v == 'true') }
             def _hidden = _keys.findAll { !_shown(it) }
-            ec.user.setPreference('EXPIRY_HIDDEN_COLS', _hidden.join(','))
+            ec.user.setPreference('EXPIRY_HIDDEN_COLS_' + ec.user.getPreference('ACTIVE_ORGANIZATION'), _hidden.join(','))
             ec.message.addMessage("Columns updated.")
         ]]></script></actions>
-        <default-response url="."><parameter name="searchText"/><parameter name="withinDays"/><parameter name="categoryFilter"/><parameter name="supplierFilter"/><parameter name="daysBucket"/></default-response>
+        <default-response url="."><parameter name="searchText"/><parameter name="withinDays"/><parameter name="categoryFilter"/><parameter name="supplierFilter"/><parameter name="daysBucket"/><parameter name="orderByField"/><parameter name="pageSize"/></default-response>
     </transition>
 
     <actions>
-        <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-        <!-- ZE-INV-006 (IV-105): the list is built by the shared get#ExpiryRisk service (org isolation, value
-             fallback, supplier, search+filter, sort) so the screen and the CSV export return the same data. -->
+        <service-call name="zenith.inventory.ExpiryRiskServices.get#ExpiryScope" out-map="pageScope"/><set field="activeOrg" from="pageScope.organizationPartyId"/>
+        <script><![CDATA[
+            def currencySetting = ec.entity.find('zenith.erp.base.CompanySettings').condition('organizationPartyId',activeOrg).condition('settingKey','CURRENCY_UOM_ID').disableAuthz().one()?.settingValue ?: 'INR'
+            currSymbol = [INR:'₹',USD:'$',GBP:'£',AED:'AED ',EUR:'€',JPY:'¥'][currencySetting] ?: (currencySetting + ' ')
+        ]]></script>
         <service-call name="zenith.inventory.InventoryServices.get#ExpiryRisk" out-map="expiryOut"
             in-map="[organizationPartyId: activeOrg,
                      searchText: ec.context.searchText, withinDays: ec.context.withinDays, orderByField: ec.context.orderByField,
                      categoryFilter: ec.context.categoryFilter, supplierFilter: ec.context.supplierFilter, daysBucket: ec.context.daysBucket]"/>
-        <!-- ZE-INV-003 (IV-102): the current sort field (default 'expiryDate' ascending) drives the clickable
-             column-header sort links + their asc/desc arrows below; get#ExpiryRisk already sorts by orderByField. -->
         <set field="sortField" from="(ec.context.orderByField ?: 'expiryDate').toString()"/>
-        <!-- ZE-INV-008 (IV-107): alert config + the live "expiring within your window" banner numbers -->
         <service-call name="zenith.inventory.InventoryAlertServices.get#ExpiryAlertConfig" out-map="alertCfg"
             in-map="[organizationPartyId: activeOrg]"/>
-        <!-- ZE-INV-010 (IV-110): invCanWrite is set by the parent Inventory.xml pre-actions (module-wide). -->
         <script><![CDATA[
             def _ad = (alertCfg?.alertDays ?: 30) as Integer
             alertDays = _ad.toString()
@@ -279,7 +176,7 @@
             def _all = (expiryOut?.expiringAssets ?: [])
             expiryRowCount = _all.size()
             expiryCapped = false
-            def _pgSize = 20
+            def _pgSize = ['20','50','100'].contains((ec.context.pageSize ?: '20').toString()) ? (ec.context.pageSize as Integer ?: 20) : 20
             int _pgIdx = 0
             try { _pgIdx = ((ec.context.pageIndex ?: '0').toString().trim() ?: '0') as Integer } catch (Exception _pe) { _pgIdx = 0 }
             int _pgCount = (expiryRowCount <= 0) ? 1 : ((int)((expiryRowCount - 1) / _pgSize) + 1)
@@ -288,38 +185,29 @@
             int _pgFrom = _pgIdx * _pgSize
             int _pgTo = Math.min(_pgFrom + _pgSize, expiryRowCount)
             displayAssets = (expiryRowCount > 0) ? new ArrayList(_all.subList(_pgFrom, _pgTo)) : _all
-            pgIndex = _pgIdx; pgCount = _pgCount
+            pgIndex = _pgIdx; pgCount = _pgCount; pgSize = _pgSize
             pgShowFrom = (expiryRowCount <= 0) ? 0 : (_pgFrom + 1); pgShowTo = _pgTo; pgTotal = expiryRowCount
 
             // ZE-INV expiry-risk §5.2/§7: derive the "Expired" KPI + tier-bucket counts from the ALREADY-LOADED
             // list — real data (daysToExpiry comes from get#ExpiryRisk), no fabrication, no extra query.
             def _de = { r -> (r.daysToExpiry != null) ? (r.daysToExpiry as Integer) : 999 }
-            expiredCount = _all.count { _de(it) <= 0 }
-            def _expv = BigDecimal.ZERO
-            for (def r : _all) { if (_de(r) <= 0) _expv = _expv.add(r.value ?: BigDecimal.ZERO) }
-            expiredValue = _expv
-            cntAll = _all.size()
-            cnt7  = _all.count { def d = _de(it); d > 0 && d <= 7 }
-            cnt30 = _all.count { def d = _de(it); d > 0 && d <= 30 }
-            cnt60 = _all.count { def d = _de(it); d > 0 && d <= 60 }
-
-            // expiry-risk §5: items + units behind each stat card (real, from the loaded list — no extra query).
-            def _vaRUnits = BigDecimal.ZERO; def _expUnits = BigDecimal.ZERO
-            for (def r : _all) { def q = (r.quantity ?: 0G) as BigDecimal; _vaRUnits = _vaRUnits.add(q); if (_de(r) <= 0) _expUnits = _expUnits.add(q) }
-            vaRItems = cntAll
-            vaRUnitsDisp = ec.l10n.format(_vaRUnits, '#,##0.##')
-            expiredUnitsDisp = ec.l10n.format(_expUnits, '#,##0.##')
-            vaRValueDisp = zinr.inr(ec.l10n.format(expiryOut?.totalExpiryValue ?: 0, '#,##,##0.00'))
-            expiredValueDisp = zinr.inr(ec.l10n.format(expiredValue ?: 0, '#,##,##0.00'))
+            def riskSummary = expiryOut.summary
+            expiredCount = riskSummary.expiredCount
+            expiredValue = riskSummary.expiredValue
+            vaRItems = riskSummary.riskCount
+            vaRUnitsDisp = ec.l10n.format(riskSummary.riskUnits, '#,##0.######')
+            expiredUnitsDisp = ec.l10n.format(riskSummary.expiredUnits, '#,##0.######')
+            vaRValueDisp = com.zenith.Fmt.regroup(ec.l10n.format(riskSummary.riskValue, '#,##0.00'))
+            expiredValueDisp = com.zenith.Fmt.regroup(ec.l10n.format(riskSummary.expiredValue, '#,##0.00'))
             expiredColor = (expiredCount > 0) ? '#DC2626' : '#111827'
 
             // §7: saved views (per-user preference, JSON list of named filter-sets)
             savedViews = []
-            def _svRaw = ec.user.getPreference('EXPIRY_SAVED_VIEWS')
-            if (_svRaw) { try { savedViews = new groovy.json.JsonSlurper().parseText(_svRaw.toString()) } catch (Exception _sve) { savedViews = [] } }
+            def _svRaw = ec.user.getPreference('EXPIRY_SAVED_VIEWS_' + ec.user.getPreference('ACTIVE_ORGANIZATION'))
+            if (_svRaw) { try { def parsed = new groovy.json.JsonSlurper().parseText(_svRaw.toString()); savedViews = parsed instanceof List ? parsed.findAll { it instanceof Map && it.name instanceof String } : [] } catch (Exception _sve) { savedViews = [] } }
 
             // §8: columns picker — hidden set + the checkbox defaults + the nth-child hide CSS (/apps only).
-            def _hcRaw = (ec.user.getPreference('EXPIRY_HIDDEN_COLS') ?: '').toString()
+            def _hcRaw = (ec.user.getPreference('EXPIRY_HIDDEN_COLS_' + ec.user.getPreference('ACTIVE_ORGANIZATION')) ?: '').toString()
             def _hcSet = _hcRaw.split(',').findAll { it }.toSet()
             col_sku = _hcSet.contains('sku') ? 'N' : 'Y'
             col_batch = _hcSet.contains('batch') ? 'N' : 'Y'
@@ -327,29 +215,25 @@
             col_status = _hcSet.contains('status') ? 'N' : 'Y'
             col_quantity = _hcSet.contains('quantity') ? 'N' : 'Y'
             col_value = _hcSet.contains('value') ? 'N' : 'Y'
-            def _colPos = [sku:3, batch:4, supplier:5, status:7, quantity:8, value:9]
-            def _cssB = new StringBuilder()
-            for (def _hc : _hcSet) { def _p = _colPos[_hc]; if (_p) _cssB.append('.exp-table table tr > :nth-child(' + _p + '){display:none}') }
-            colHideCss = _cssB.toString()
+            expiryColumnClasses = _hcSet.findAll { it in ['sku','batch','supplier','status','quantity','value'] }.collect { 'er-hide-' + it }.join(' ')
+            expiryBaseUrl = ec.web.request.requestURI.startsWith('/qapps/') ? '/qapps/zenith/Inventory/ExpiryDashboard' : '/apps/zenith/Inventory/ExpiryDashboard'
         ]]></script>
     </actions>
 
     <widgets>
-        <!-- ZE-INV-001 (IV-100): direct entry to create expiry-tracked stock so the dashboard can be populated. -->
+        <container id="expiryRisk" style="expiry-risk-page ${expiryColumnClasses}">
         <container style="zc-page-head q-mb-md">
             <container style="zc-page-head__titles">
-                <label text="Expiry Risk" type="h3" style="text-primary text-weight-bold q-my-none"/>
+                <label text="Expiry Risk" type="h3" style="er-title"/>
                 <label text="Track batches that will expire soon and act before they go to waste." type="p" style="text-grey-7 q-mt-xs q-mb-none"/>
             </container>
             <container style="zc-page-head__actions">
-            <!-- ZE-INV-010 (IV-110): write features only for users with full Inventory access -->
             <section name="ExpiryWriteButtons">
               <condition><expression>invCanWrite</expression></condition>
               <widgets>
             <container style="row q-gutter-sm items-center">
-            <!-- ZE-INV-008 (IV-107): configure the per-tenant expiry-alert threshold + on/off -->
             <container-dialog id="ExpiryAlertSettingsDialog" button-text="Alert Settings" button-icon="fa fa-bell"
-                              button-class="q-btn bg-grey-3 text-dark text-weight-bold border-radius-md q-px-md">
+                              button-class="er-button er-outline">
                 <form-single name="ExpiryAlertSettingsForm" transition="saveAlertSettings">
                     <field name="alertEnabled"><default-field title="Expiry alerts">
                         <drop-down allow-empty="false"><option key="Y" text="On — notify me"/><option key="N" text="Off"/></drop-down>
@@ -364,27 +248,28 @@
                 </form-single>
             </container-dialog>
             <container-dialog id="AddExpiryStockDialog" button-text="Add Expiring Stock" button-icon="fa fa-plus-circle"
-                              button-class="q-btn bg-primary text-white text-weight-bold border-radius-md q-px-md">
-                <form-single name="AddExpiryStockForm" transition="createExpiryStock">
+                              button-class="er-button er-primary">
+                <form-single name="AddExpiryStockForm" transition="createExpiryStock"><field name="receiptRequestId"><default-field><hidden default-value="${java.util.UUID.randomUUID().toString()}"/></default-field></field>
                     <field name="productId"><default-field title="Product">
                         <drop-down allow-empty="false">
                             <entity-options key="${productId}" text="${pseudoId} - ${productName}">
                                 <entity-find entity-name="mantle.product.Product">
-                                    <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+                                    <econdition field-name="ownerPartyId" from="activeOrg" /><econdition field-name="productTypeEnumId" value="PtAsset"/>
                                     <order-by field-name="productName"/>
                                 </entity-find>
                             </entity-options>
                         </drop-down>
                     </default-field></field>
                     <field name="batchNumber"><default-field title="Batch / Lot (Optional)"><text-line size="20"/></default-field></field>
-                    <field name="quantity"><default-field title="Quantity"><text-line size="10"/></default-field></field>
+
+                <field name="quantity"><default-field title="Quantity"><text-line size="10"/></default-field></field>
                     <field name="unitValue"><default-field title="Value per Unit (${currSymbol})"><text-line size="10"/></default-field></field>
                     <field name="expiryDate"><default-field title="Expiry Date"><date-time type="date"/></default-field></field>
-                    <field name="facilityId"><default-field title="Store / Warehouse (Optional)">
-                        <drop-down allow-empty="true">
+                    <field name="facilityId"><default-field title="Store / Warehouse">
+                        <drop-down allow-empty="false">
                             <entity-options key="${facilityId}" text="${facilityName}">
                                 <entity-find entity-name="mantle.facility.Facility">
-                                    <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+                                    <econdition field-name="ownerPartyId" from="activeOrg" />
                                     <order-by field-name="facilityName"/>
                                 </entity-find>
                             </entity-options>
@@ -398,96 +283,14 @@
             </section>
             </container>
         </container>
-
-        <!-- expiry-risk §5: two stat cards — Value at Risk (Next 90 days) [red-bg] + Expired [white] — each with a
-             value, an items•units caption and a semantic icon chip. Real data from the loaded list. Kept violet as the
-             brand accent (app is violet app-wide; the mockup's blue is a pre-rebrand artifact). -->
-        <render-mode><text type="html,qvt,vuet" template="true"><![CDATA[
-            <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin-bottom:16px">
-              <div style="background:#FEF2F2;border:1px solid #FECACA;border-radius:12px;padding:20px;display:flex;justify-content:space-between;align-items:flex-start;gap:12px">
-                <div><div style="font-size:13px;font-weight:500;color:#374151">Value at Risk (Next 90 days)</div><div style="font-size:26px;font-weight:700;color:#DC2626;margin-top:6px">&#8377;${vaRValueDisp}</div><div style="font-size:12.5px;color:#6B7280;margin-top:4px">${vaRItems} items &#8226; ${vaRUnitsDisp} units</div></div>
-                <span style="flex:0 0 auto;width:44px;height:44px;border-radius:10px;background:#FEE2E2;color:#DC2626;display:inline-flex;align-items:center;justify-content:center"><svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true"><path fill="currentColor" d="M1 21h22L12 2 1 21zm12-3h-2v-2h2v2zm0-4h-2v-4h2v4z"/></svg></span>
-              </div>
-              <div style="background:#fff;border:1px solid #E5E7EB;border-radius:12px;padding:20px;display:flex;justify-content:space-between;align-items:flex-start;gap:12px">
-                <div><div style="font-size:13px;font-weight:500;color:#374151">Expired</div><div style="font-size:26px;font-weight:700;color:${expiredColor};margin-top:6px">&#8377;${expiredValueDisp}</div><div style="font-size:12.5px;color:#6B7280;margin-top:4px">${expiredCount} items &#8226; ${expiredUnitsDisp} units</div></div>
-                <span style="flex:0 0 auto;width:44px;height:44px;border-radius:10px;background:#F3F4F6;color:#6B7280;display:inline-flex;align-items:center;justify-content:center"><svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true"><path fill="currentColor" d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67z"/></svg></span>
-              </div>
-            </div>
-        ]]></text></render-mode>
-
-        <container-box><box-header title="Action Required"/><box-body>
-            <!-- ZE-INV-008 (IV-107): live alert banner driven by the tenant's alert threshold/on-off -->
-            <section name="ExpiryAlertActive">
-                <condition><expression>alertEnabled == 'Y' &amp;&amp; alertCount &gt; 0</expression></condition>
-                <widgets>
-                    <label text="⚠ ${alertCount} item(s) expiring within ${alertDays} days — ${currSymbol}${zinr.inr(ec.l10n.format(alertValue ?: 0, '#,##,##0.00'))} at risk. Sell them, run an offer, or return them to the supplier before they go to waste." type="p" style="text-danger text-weight-bold"/>
-                    <!-- ZE-INV-010 (IV-110): the "adjust settings" hint only for users who can actually change settings -->
-                    <section name="ExpiryAlertHint">
-                        <condition><expression>invCanWrite</expression></condition>
-                        <widgets><label text="Your team is notified in-app when the list of expiring lots changes. Adjust the window with “Alert Settings”." type="span" style="text-caption text-grey-7"/></widgets>
-                    </section>
-                </widgets>
-                <fail-widgets>
-                    <section name="ExpiryAlertOff">
-                        <condition><expression>alertEnabled != 'Y'</expression></condition>
-                        <widgets>
-                            <label text="Expiry alerts are OFF for your organization. Turn them on in “Alert Settings” to be notified about products nearing expiry." type="p" style="text-grey-7"/>
-                        </widgets>
-                        <fail-widgets>
-                            <label text="Nothing is expiring within your ${alertDays}-day alert window. The list below still shows everything within 90 days so you can plan ahead." type="p" style="text-positive"/>
-                        </fail-widgets>
-                    </section>
-                </fail-widgets>
-            </section>
-        </box-body></container-box>
-
-        <container-box><box-header title="Products expiring soon"/><box-body>
-            <!-- ZE-INV-004 (IV-103): search + filter controls. Submits to filterExpiry (re-render); the actions
-                 narrow the list by searchText (product / stock id / batch) and withinDays (remaining-days). -->
-            <!-- expiry-risk §6: Search + Expiring within + Category + Supplier filters, then Filter + Reset.
-                 Category/Supplier options come from get#ExpiryRisk (distinct values in the org's expiry list). -->
-            <form-single name="ExpiryFilterForm" transition="filterExpiry">
-                <field name="searchText"><default-field title="Search">
-                    <text-line size="24" placeholder="Product, batch, supplier, SKU…"/>
-                </default-field></field>
-                <field name="withinDays"><default-field title="Expiring within">
-                    <drop-down allow-empty="false" no-current-selected-key="">
-                        <option key="" text="Next 90 days (all)"/>
-                        <option key="7" text="7 days"/>
-                        <option key="30" text="30 days"/>
-                        <option key="60" text="60 days"/>
-                        <option key="expired" text="Already expired"/>
-                    </drop-down>
-                </default-field></field>
-                <field name="categoryFilter"><default-field title="Category">
-                    <drop-down allow-empty="true" no-current-selected-key="">
-                        <option key="" text="All Categories"/>
-                        <list-options list="expiryOut.categoryOptions" key="${v}" text="${v}"/>
-                    </drop-down>
-                </default-field></field>
-                <field name="supplierFilter"><default-field title="Supplier">
-                    <drop-down allow-empty="true" no-current-selected-key="">
-                        <option key="" text="All Suppliers"/>
-                        <list-options list="expiryOut.supplierOptions" key="${v}" text="${v}"/>
-                    </drop-down>
-                </default-field></field>
-                <field name="submitButton"><default-field title=""><submit text="Filter" icon="fa fa-filter"/></default-field></field>
-                <field name="clearButton"><default-field title=""><link url="." text="Reset" icon="fa fa-refresh" style="q-btn--flat text-grey-8"/></default-field></field>
-                <field-layout>
-                    <field-row>
-                        <field-ref name="searchText"/><field-ref name="withinDays"/><field-ref name="categoryFilter"/><field-ref name="supplierFilter"/><field-ref name="submitButton"/><field-ref name="clearButton"/>
-                    </field-row>
-                </field-layout>
-            </form-single>
-
-            <!-- ZE-INV expiry-risk §7: quick filter pills with LIVE counts (derived from the loaded list, not
-                 fabricated). Each links to the existing withinDays filter and preserves the current search. -->
-            <render-mode><text type="html,qvt,vuet"><![CDATA[<#assign _db = (daysBucket)!''><#assign _sq = (searchText)!''><#assign _cf = (categoryFilter)!''><#assign _sf = (supplierFilter)!''><#assign _qs = 'searchText='+_sq?url('UTF-8')+'&amp;categoryFilter='+_cf?url('UTF-8')+'&amp;supplierFilter='+_sf?url('UTF-8')><#assign _tc = (expiryOut.tierCounts)!{}><#macro rchip k lbl cnt bd tx><#local on=(_db==k)><a href="?daysBucket=${k}&amp;${_qs}" style="display:inline-flex;align-items:center;gap:6px;padding:5px 12px;border-radius:9999px;font-size:12.5px;font-weight:600;text-decoration:none;border:1px solid ${on?string('#7C3AED',bd)};background:${on?string('#7C3AED','#FFFFFF')};color:${on?string('#FFFFFF',tx)}">${lbl} <b>${cnt}</b></a></#macro><div style="display:flex;flex-wrap:wrap;gap:8px;margin:4px 0 14px"><@rchip k='' lbl='All' cnt=(_tc.all)!0 bd='#7C3AED' tx='#7C3AED'/><@rchip k='0-30' lbl='Within 30 days' cnt=(_tc.d30)!0 bd='#F59E0B' tx='#B45309'/><@rchip k='31-60' lbl='31&#8211;60 days' cnt=(_tc.d3160)!0 bd='#DC2626' tx='#DC2626'/><@rchip k='61-90' lbl='61&#8211;90 days' cnt=(_tc.d6190)!0 bd='#059669' tx='#059669'/><@rchip k='90+' lbl='After 90 days' cnt=(_tc.after90)!0 bd='#E5E7EB' tx='#9CA3AF'/><@rchip k='expired' lbl='Expired' cnt=(_tc.expired)!0 bd='#DC2626' tx='#DC2626'/></div>]]></text></render-mode>
-
-            <!-- expiry-risk §7 (right cluster): Save View + Manage Views — per-user saved filter-sets. -->
+        <render-mode><text type="html,qvt,vuet" location="component://zenith-erp-inventory/template/inventory/ExpiryRiskCards.ftl"/></render-mode>
+        <container style="er-report-card">
+            <render-mode><text type="html,qvt,vuet" location="component://zenith-erp-inventory/template/inventory/ExpiryRiskFilters.ftl"/></render-mode>
+            <container style="er-view-row">
+            <render-mode><text type="html,qvt,vuet" location="component://zenith-erp-inventory/template/inventory/ExpiryRiskChips.ftl"/></render-mode>
             <container style="row items-center q-gutter-sm q-mb-sm">
                 <container-dialog id="SaveViewDialog" button-text="Save View" button-icon="fa fa-bookmark-o"
-                                  button-class="q-btn bg-grey-3 text-dark border-radius-md q-px-md">
+                                  button-class="er-button">
                     <label text="Save the current filters as a named view" type="h6" style="text-primary text-weight-bold q-mb-sm"/>
                     <form-single name="SaveViewForm" transition="saveView">
                         <field name="viewName"><default-field title="View name"><text-line size="26"/></default-field></field>
@@ -496,27 +299,47 @@
                         <field name="categoryFilter"><default-field><hidden default-value="${ec.context.categoryFilter ?: ''}"/></default-field></field>
                         <field name="supplierFilter"><default-field><hidden default-value="${ec.context.supplierFilter ?: ''}"/></default-field></field>
                         <field name="daysBucket"><default-field><hidden default-value="${ec.context.daysBucket ?: ''}"/></default-field></field>
+                        <field name="orderByField"><default-field><hidden default-value="${sortField}"/></default-field></field><field name="pageSize"><default-field><hidden default-value="${pgSize}"/></default-field></field>
                         <field name="submitButton"><default-field title=""><submit text="Save current filters"/></default-field></field>
                     </form-single>
                 </container-dialog>
                 <container-dialog id="ManageViewsDialog" button-text="Manage Views" button-icon="fa fa-cog"
-                                  button-class="q-btn bg-grey-3 text-dark border-radius-md q-px-md">
+                                  button-class="er-button">
                     <label text="Saved filter views" type="h6" style="text-primary text-weight-bold q-mb-sm"/>
                     <section name="NoViewsMsg"><condition><expression>!savedViews</expression></condition>
                         <widgets><label text="No saved views yet. Set some filters, then use “Save View”." type="p" style="text-grey-7"/></widgets></section>
                     <section-iterate name="ViewsIter" list="savedViews" entry="v">
                         <widgets>
                             <container style="row items-center justify-between q-py-xs">
-                                <link url="." text="${v.name}" parameter-map="[searchText:(v.searchText ?: ''), withinDays:(v.withinDays ?: ''), categoryFilter:(v.categoryFilter ?: ''), supplierFilter:(v.supplierFilter ?: ''), daysBucket:(v.daysBucket ?: '')]" style="text-primary text-weight-bold text-decoration-none"/>
+                                <link url="." text="${v.name}" parameter-map="[searchText:(v.searchText ?: ''), withinDays:(v.withinDays ?: ''), categoryFilter:(v.categoryFilter ?: ''), supplierFilter:(v.supplierFilter ?: ''), daysBucket:(v.daysBucket ?: ''), orderByField:(v.orderByField ?: 'expiryDate'), pageSize:(v.pageSize ?: '20')]" style="text-primary text-weight-bold text-decoration-none"/>
                                 <link url="deleteView" text="Remove" icon="fa fa-trash-o" parameter-map="[viewName:(v.name ?: '')]" btn-type="default" style="text-danger"/>
                             </container>
                         </widgets>
                     </section-iterate>
                 </container-dialog>
+
+            </container>
+            </container>
+            <container style="er-toolbar">
+                <container style="er-toolbar-left">
+                <render-mode><text type="html,qvt,vuet"><![CDATA[<button class="er-button er-clear" type="button">Clear</button><span class="er-selected" aria-live="polite"></span><button class="er-button er-export-selected" type="button" hidden>Export selected</button>]]></text></render-mode>
+                <link url="/apps/zenith/Inventory/ExpiryDashboard/exportCsv?searchText=${java.net.URLEncoder.encode((ec.context.searchText ?: '').toString(), 'UTF-8')}&amp;withinDays=${ec.context.withinDays ?: ''}&amp;categoryFilter=${java.net.URLEncoder.encode((ec.context.categoryFilter ?: '').toString(), 'UTF-8')}&amp;supplierFilter=${java.net.URLEncoder.encode((ec.context.supplierFilter ?: '').toString(), 'UTF-8')}&amp;daysBucket=${java.net.URLEncoder.encode((ec.context.daysBucket ?: '').toString(), 'UTF-8')}&amp;orderByField=${ec.context.orderByField ?: ''}"
+                      url-type="plain" text="Export CSV" icon="fa fa-download"
+                      style="er-button"/>
+                <link url="/apps/zenith/Inventory/ExpiryDashboard/printExpiry?searchText=${java.net.URLEncoder.encode((ec.context.searchText ?: '').toString(), 'UTF-8')}&amp;withinDays=${ec.context.withinDays ?: ''}&amp;categoryFilter=${java.net.URLEncoder.encode((ec.context.categoryFilter ?: '').toString(), 'UTF-8')}&amp;supplierFilter=${java.net.URLEncoder.encode((ec.context.supplierFilter ?: '').toString(), 'UTF-8')}&amp;daysBucket=${java.net.URLEncoder.encode((ec.context.daysBucket ?: '').toString(), 'UTF-8')}&amp;orderByField=${ec.context.orderByField ?: ''}"
+                      url-type="plain" text="Export PDF" icon="fa fa-file-pdf-o" target-window="_blank"
+                      style="er-button"/>
+                <section name="EmailReportBtn"><condition><expression>invCanWrite</expression></condition><widgets>
+                <link url="emailReport" text="Email Report" icon="fa fa-envelope-o"
+                      parameter-map="[searchText: ec.context.searchText, withinDays: ec.context.withinDays, categoryFilter: ec.context.categoryFilter, supplierFilter: ec.context.supplierFilter, daysBucket: ec.context.daysBucket, orderByField: ec.context.orderByField]"
+                      style="er-button"/>
+                </widgets></section>
+                </container>
+                <container style="er-toolbar-right"><label text="Last updated: ${ec.l10n.format(ec.user.nowTimestamp, 'dd MMM yyyy, hh:mm a')}" type="span" style="er-updated"/><render-mode><text type="html,qvt,vuet"><![CDATA[<button class="er-refresh" type="button" aria-label="Refresh expiry report">↻</button>]]></text></render-mode>
                 <container-dialog id="ColumnsDialog" button-text="Columns" button-icon="fa fa-table"
-                                  button-class="q-btn bg-grey-3 text-dark border-radius-md q-px-md">
+                                  button-class="er-button">
                     <label text="Show / hide optional columns" type="h6" style="text-primary text-weight-bold q-mb-xs"/>
-                    <label text="Applies to the desktop table; the mobile (/qapps) view always shows every column." type="p" style="text-caption text-grey-6 q-mb-sm"/>
+                    <label text="Your column choices apply to both dashboard views." type="p" style="text-caption text-grey-6 q-mb-sm"/>
                     <form-single name="ColumnsForm" transition="saveColumns">
                         <field name="col_sku"><default-field title="SKU"><check><option key="Y" text=" "/></check></default-field></field>
                         <field name="col_batch"><default-field title="Batch / Lot"><check><option key="Y" text=" "/></check></default-field></field>
@@ -526,108 +349,53 @@
                         <field name="col_value"><default-field title="Value at Risk"><check><option key="Y" text=" "/></check></default-field></field>
                         <field name="submitButton"><default-field title=""><submit text="Apply"/></default-field></field>
                     </form-single>
-                </container-dialog>
+                </container-dialog>                </container>
             </container>
-
-            <!-- ZE-INV-006 (IV-105): export the current (org-scoped, filtered, sorted) list as CSV or PDF. Standalone
-                 links (a <link> inside a form-single renders as a submit button, not a downloadable anchor). -->
-            <!-- expiry-risk §8: action toolbar — Export CSV/PDF on the left, a "Last updated" meta on the right. -->
-            <container style="row items-center justify-between q-mb-sm">
-                <container style="row q-gutter-sm">
-                <link url="/apps/zenith/Inventory/ExpiryDashboard/exportCsv?searchText=${java.net.URLEncoder.encode((ec.context.searchText ?: '').toString(), 'UTF-8')}&amp;withinDays=${ec.context.withinDays ?: ''}&amp;categoryFilter=${java.net.URLEncoder.encode((ec.context.categoryFilter ?: '').toString(), 'UTF-8')}&amp;supplierFilter=${java.net.URLEncoder.encode((ec.context.supplierFilter ?: '').toString(), 'UTF-8')}&amp;daysBucket=${ec.context.daysBucket ?: ''}&amp;orderByField=${ec.context.orderByField ?: ''}"
-                      url-type="plain" text="Export CSV" icon="fa fa-download"
-                      style="cust-export"/>
-                <link url="/apps/zenith/Inventory/ExpiryDashboard/printExpiry?searchText=${java.net.URLEncoder.encode((ec.context.searchText ?: '').toString(), 'UTF-8')}&amp;withinDays=${ec.context.withinDays ?: ''}&amp;categoryFilter=${java.net.URLEncoder.encode((ec.context.categoryFilter ?: '').toString(), 'UTF-8')}&amp;supplierFilter=${java.net.URLEncoder.encode((ec.context.supplierFilter ?: '').toString(), 'UTF-8')}&amp;daysBucket=${ec.context.daysBucket ?: ''}&amp;orderByField=${ec.context.orderByField ?: ''}"
-                      url-type="plain" text="Export PDF" icon="fa fa-file-pdf-o" target-window="_blank"
-                      style="cust-export"/>
-                <!-- expiry-risk §8: Email Report (emails the current filtered report to the logged-in user). -->
-                <section name="EmailReportBtn"><condition><expression>invCanWrite</expression></condition><widgets>
-                <link url="emailReport" text="Email Report" icon="fa fa-envelope-o"
-                      parameter-map="[searchText: ec.context.searchText, withinDays: ec.context.withinDays, categoryFilter: ec.context.categoryFilter, supplierFilter: ec.context.supplierFilter, daysBucket: ec.context.daysBucket, orderByField: ec.context.orderByField]"
-                      style="cust-export"/>
-                </widgets></section>
-                </container>
-                <label text="Last updated: ${ec.l10n.format(ec.user.nowTimestamp, 'dd MMM yyyy, hh:mm a')}" type="span" style="text-caption text-grey-6"/>
-            </container>
-
-            <!-- expiry-risk §9: row selection + bulk "Export selected". type="html" = /apps ONLY (so /qapps has NO
-                 checkboxes/bar — a native form would nest inside each row's Edit-dialog <form>, and JS can't run on
-                 /qapps). The checkbox is APPENDED as the LAST column so it never shifts the Columns-picker nth-child
-                 positions. Row id is read from the always-present first cell (Stock ID). exportCsv?selIds= narrows. -->
-            <render-mode><text type="html"><![CDATA[
-                <div id="exp-bulk-bar" style="display:none;align-items:center;gap:12px;padding:8px 2px;margin-bottom:4px;font-size:13px;color:#374151"><span><b id="exp-sel-n">0</b> selected</span><button type="button" class="cust-export" onclick="expExpSel()"><svg viewBox="0 0 24 24" width="15" height="15" style="vertical-align:-2px"><path fill="currentColor" d="M5 20h14v-2H5v2zM19 9h-4V3H9v6H5l7 7 7-7z"/></svg> Export selected</button><a href="#" onclick="expClearSel();return false;" style="color:#6B7280;font-size:12.5px;text-decoration:none">Clear</a></div>
-                <script>
-                (function(){
-                  function tbl(){return document.querySelector('.exp-table table');}
-                  function upd(){var n=document.querySelectorAll('.exp-sel:checked').length;var c=document.getElementById('exp-sel-n');if(c)c.textContent=n;var b=document.getElementById('exp-bulk-bar');if(b)b.style.display=n>0?'flex':'none';}
-                  function inject(){var t=tbl();if(!t||t.__expSel)return;t.__expSel=1;
-                    var hrs=t.querySelectorAll('thead tr');for(var i=0;i<hrs.length;i++){var th=document.createElement('th');th.setAttribute('style','width:30px');hrs[i].appendChild(th);}
-                    var brs=t.querySelectorAll('tbody tr');for(var j=0;j<brs.length;j++){var r=brs[j];if(!r.cells||!r.cells.length)continue;var id=(r.cells[0]?r.cells[0].textContent:'').trim();var td=document.createElement('td');td.setAttribute('style','text-align:center');if(id){var cb=document.createElement('input');cb.type='checkbox';cb.className='exp-sel';cb.value=id;td.appendChild(cb);}r.appendChild(td);}
-                    t.addEventListener('change',function(e){if(e.target&&e.target.classList&&e.target.classList.contains('exp-sel'))upd();});
-                  }
-                  window.expExpSel=function(){var ids=[].slice.call(document.querySelectorAll('.exp-sel:checked')).map(function(c){return c.value;}).filter(Boolean);if(!ids.length){return;}window.location='/apps/zenith/Inventory/ExpiryDashboard/exportCsv?selIds='+encodeURIComponent(ids.join(','));};
-                  window.expClearSel=function(){[].slice.call(document.querySelectorAll('.exp-sel:checked')).forEach(function(c){c.checked=false;});upd();};
-                  if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',inject);}else{inject();}
-                })();
-                </script>
-            ]]></text></render-mode>
-
-            <!-- §8 columns picker: /apps renders this injected <style> to hide the deselected columns by position;
-                 /qapps strips <style> so all columns show. -->
-            <render-mode><text type="html"><![CDATA[<style>${colHideCss}</style>]]></text></render-mode>
             <container style="exp-table">
             <form-list name="ExpiringAssetsForm" list="displayAssets" skip-form="true">
                 <row-actions>
                     <script><![CDATA[
                         def nowLong = ec.user.nowTimestamp.getTime()
                         def expLong = expiryDate?.getTime() ?: 0
-                        daysToExpiry = expLong > 0 ? (int)((expLong - nowLong) / (1000 * 60 * 60 * 24)) : 999
-                        isExpired = daysToExpiry <= 0
+                        // Calendar-day classification is supplied by the shared report service.
+                        isExpired = daysToExpiry < 0
+                        unitLabel = [PCS:'pcs',NOS:'nos',KGS:'kg',MTR:'m',LTR:'l',ROL:'rolls'][uqcEnumId] ?: (uqcEnumId ?: 'units')
                         // expiry-risk §9: per-row overflow (⋮) menu — safe secondary navigations (no destructive
                         // default; Edit + the qty-to-zero write-off already live in the inline Edit dialog).
-                        kebabHtml = '<details class="exp-kebab"><summary class="exp-kebab-btn" title="More actions">&#8942;</summary><div class="exp-kebab-menu"><a href="/apps/zenith/Inventory/EditProduct?productId=' + (productId ?: '') + '">View product</a><a href="/apps/zenith/Inventory/StockAdjustments">Adjust stock</a></div></details>'
+                        kebabHtml = '<details class="er-kebab"><summary class="er-kebab-btn" title="More actions">&#8942;</summary><div class="er-kebab-menu"><a href="' + expiryBaseUrl.replace('/ExpiryDashboard','/EditProduct') + '?productId=' + java.net.URLEncoder.encode((productId ?: '').toString(),'UTF-8') + '">View product</a><a href="' + expiryBaseUrl.replace('/ExpiryDashboard','/StockAdjustments') + '">Adjust stock</a></div></details>'
                     ]]></script>
                 </row-actions>
-                <field name="assetId"><header-field><link url="." text="Stock ID${(sortField == 'assetId') ? ' &#9650;' : ((sortField == '-assetId') ? ' &#9660;' : '')}" parameter-map="[searchText: ec.context.searchText, withinDays: ec.context.withinDays, categoryFilter: ec.context.categoryFilter, supplierFilter: ec.context.supplierFilter, daysBucket: ec.context.daysBucket, orderByField: ((sortField == 'assetId') ? '-assetId' : 'assetId')]" style="text-reset text-decoration-none text-weight-bolder"/></header-field><default-field><display/></default-field></field>
-                <field name="productName"><header-field><link url="." text="Product Name${(sortField == 'productName') ? ' &#9650;' : ((sortField == '-productName') ? ' &#9660;' : '')}" parameter-map="[searchText: ec.context.searchText, withinDays: ec.context.withinDays, categoryFilter: ec.context.categoryFilter, supplierFilter: ec.context.supplierFilter, daysBucket: ec.context.daysBucket, orderByField: ((sortField == 'productName') ? '-productName' : 'productName')]" style="text-reset text-decoration-none text-weight-bolder"/></header-field>
-                    <!-- ZE-INV expiry §9: product cell = name + category subtext (category surfaced by get#ExpiryRisk). -->
+                <field name="assetId"><header-field><link url="." text="Asset ID${(sortField == 'assetId') ? ' &#9650;' : ((sortField == '-assetId') ? ' &#9660;' : '')}" parameter-map="[searchText: ec.context.searchText, withinDays: ec.context.withinDays, categoryFilter: ec.context.categoryFilter, supplierFilter: ec.context.supplierFilter, daysBucket: ec.context.daysBucket, pageSize:pgSize, orderByField: ((sortField == 'assetId') ? '-assetId' : 'assetId')]" style="text-reset text-decoration-none text-weight-bolder"/></header-field><default-field><display/></default-field></field>
+                <field name="productName"><header-field><link url="." text="Product Name${(sortField == 'productName') ? ' &#9650;' : ((sortField == '-productName') ? ' &#9660;' : '')}" parameter-map="[searchText: ec.context.searchText, withinDays: ec.context.withinDays, categoryFilter: ec.context.categoryFilter, supplierFilter: ec.context.supplierFilter, daysBucket: ec.context.daysBucket, pageSize:pgSize, orderByField: ((sortField == 'productName') ? '-productName' : 'productName')]" style="text-reset text-decoration-none text-weight-bolder"/></header-field>
                     <default-field><container style="sup-nametext"><label text="${productName}" type="span" style="sup-name"/><label text="${category}" type="span" style="sup-id" condition="category"/></container></default-field></field>
-                <!-- ZE-INV expiry §9: SKU (pseudoId) column, surfaced by get#ExpiryRisk. -->
-                <field name="pseudoId"><header-field title="SKU"/><default-field><label text="${pseudoId ?: '—'}" type="span" style="sup-gstin"/></default-field></field>
-                <field name="batchNumber"><header-field><link url="." text="Batch / Lot${(sortField == 'batchNumber') ? ' &#9650;' : ((sortField == '-batchNumber') ? ' &#9660;' : '')}" parameter-map="[searchText: ec.context.searchText, withinDays: ec.context.withinDays, categoryFilter: ec.context.categoryFilter, supplierFilter: ec.context.supplierFilter, daysBucket: ec.context.daysBucket, orderByField: ((sortField == 'batchNumber') ? '-batchNumber' : 'batchNumber')]" style="text-reset text-decoration-none text-weight-bolder"/></header-field><default-field><display/></default-field></field>
-                <field name="supplierName"><header-field><link url="." text="Supplier${(sortField == 'supplierName') ? ' &#9650;' : ((sortField == '-supplierName') ? ' &#9660;' : '')}" parameter-map="[searchText: ec.context.searchText, withinDays: ec.context.withinDays, categoryFilter: ec.context.categoryFilter, supplierFilter: ec.context.supplierFilter, daysBucket: ec.context.daysBucket, orderByField: ((sortField == 'supplierName') ? '-supplierName' : 'supplierName')]" style="text-reset text-decoration-none text-weight-bolder"/></header-field><default-field><label text="${supplierName ?: '—'}" type="span" style="text-dark"/></default-field></field>
+                <field name="pseudoId"><header-field><link url="." text="SKU" parameter-map="[searchText:ec.context.searchText,withinDays:ec.context.withinDays,categoryFilter:ec.context.categoryFilter,supplierFilter:ec.context.supplierFilter,daysBucket:ec.context.daysBucket,pageSize:pgSize,orderByField:(sortField == 'pseudoId' ? '-pseudoId' : 'pseudoId')]"/></header-field><default-field><label text="${pseudoId ?: '—'}" type="span" style="er-sku"/></default-field></field>
+                <field name="batchNumber"><header-field><link url="." text="Batch / Lot${(sortField == 'batchNumber') ? ' &#9650;' : ((sortField == '-batchNumber') ? ' &#9660;' : '')}" parameter-map="[searchText: ec.context.searchText, withinDays: ec.context.withinDays, categoryFilter: ec.context.categoryFilter, supplierFilter: ec.context.supplierFilter, daysBucket: ec.context.daysBucket, pageSize:pgSize, orderByField: ((sortField == 'batchNumber') ? '-batchNumber' : 'batchNumber')]" style="text-reset text-decoration-none text-weight-bolder"/></header-field><default-field><display/></default-field></field>
+                <field name="supplierName"><header-field><link url="." text="Supplier Name${(sortField == 'supplierName') ? ' &#9650;' : ((sortField == '-supplierName') ? ' &#9660;' : '')}" parameter-map="[searchText: ec.context.searchText, withinDays: ec.context.withinDays, categoryFilter: ec.context.categoryFilter, supplierFilter: ec.context.supplierFilter, daysBucket: ec.context.daysBucket, pageSize:pgSize, orderByField: ((sortField == 'supplierName') ? '-supplierName' : 'supplierName')]" style="text-reset text-decoration-none text-weight-bolder"/></header-field><default-field><label text="${supplierName ?: '—'}" type="span" style="text-dark"/></default-field></field>
                 <field name="expiryDate">
-                    <header-field><link url="." text="Expiry Date${(sortField == 'expiryDate') ? ' &#9650;' : ((sortField == '-expiryDate') ? ' &#9660;' : '')}" parameter-map="[searchText: ec.context.searchText, withinDays: ec.context.withinDays, categoryFilter: ec.context.categoryFilter, supplierFilter: ec.context.supplierFilter, daysBucket: ec.context.daysBucket, orderByField: ((sortField == 'expiryDate') ? '-expiryDate' : 'expiryDate')]" style="text-reset text-decoration-none text-weight-bolder"/></header-field>
+                    <header-field><link url="." text="Expiry Date${(sortField == 'expiryDate') ? ' &#9650;' : ((sortField == '-expiryDate') ? ' &#9660;' : '')}" parameter-map="[searchText: ec.context.searchText, withinDays: ec.context.withinDays, categoryFilter: ec.context.categoryFilter, supplierFilter: ec.context.supplierFilter, daysBucket: ec.context.daysBucket, pageSize:pgSize, orderByField: ((sortField == 'expiryDate') ? '-expiryDate' : 'expiryDate')]" style="text-reset text-decoration-none text-weight-bolder"/></header-field>
                     <default-field>
-                        <display format="yyyy-MM-dd"/>
-                        <label text="${isExpired ? 'EXPIRED' : (daysToExpiry + 'd left')}" type="span" style="sup-badge ${isExpired ? 'sup-b-red' : (daysToExpiry &lt;= 30 ? 'sup-b-orange' : 'sup-b-green')}"/>
+                        <display format="dd MMM yyyy"/>
+                        <label text="${isExpired ? 'Expired' : (daysToExpiry + ' days left')}" type="span" style="er-badge ${isExpired ? 'er-red' : (daysToExpiry &lt;= 30 ? 'er-orange' : 'er-green')}"/>
                     </default-field>
                 </field>
-                <!-- ZE-INV expiry-risk §9: Status pill (Expired / Critical &lt;=7d / Warning &lt;=30d / OK) from daysToExpiry. -->
-                <field name="riskStatus"><header-field title="Status"/>
-                    <default-field><label type="span" text="${isExpired ? 'Expired' : (daysToExpiry &lt;= 7 ? 'Critical' : (daysToExpiry &lt;= 30 ? 'Warning' : 'OK'))}" style="sup-badge ${(isExpired || daysToExpiry &lt;= 7) ? 'sup-b-red' : (daysToExpiry &lt;= 30 ? 'sup-b-orange' : 'sup-b-green')}"/></default-field>
-                </field>
-                <field name="quantity"><header-field><link url="." text="Quantity${(sortField == 'quantity') ? ' &#9650;' : ((sortField == '-quantity') ? ' &#9660;' : '')}" parameter-map="[searchText: ec.context.searchText, withinDays: ec.context.withinDays, categoryFilter: ec.context.categoryFilter, supplierFilter: ec.context.supplierFilter, daysBucket: ec.context.daysBucket, orderByField: ((sortField == 'quantity') ? '-quantity' : 'quantity')]" style="text-reset text-decoration-none text-weight-bolder"/></header-field><default-field><display/></default-field></field>
-                <field name="value"><header-field><link url="." text="Value at Risk (${currSymbol})${(sortField == 'value') ? ' &#9650;' : ((sortField == '-value') ? ' &#9660;' : '')}" parameter-map="[searchText: ec.context.searchText, withinDays: ec.context.withinDays, categoryFilter: ec.context.categoryFilter, supplierFilter: ec.context.supplierFilter, daysBucket: ec.context.daysBucket, orderByField: ((sortField == 'value') ? '-value' : 'value')]" style="text-reset text-decoration-none text-weight-bolder"/></header-field><default-field>
+                    <field name="daysToExpiry"><header-field><link url="." text="Days Left" parameter-map="[searchText:ec.context.searchText,withinDays:ec.context.withinDays,categoryFilter:ec.context.categoryFilter,supplierFilter:ec.context.supplierFilter,daysBucket:ec.context.daysBucket,pageSize:pgSize,orderByField:(sortField == 'daysToExpiry' ? '-daysToExpiry' : 'daysToExpiry')]"/></header-field><default-field><label text="${daysToExpiry}" type="span" style="er-badge ${daysToExpiry &lt;= 7 ? 'er-red' : (daysToExpiry &lt;= 30 ? 'er-orange' : 'er-green')}"/></default-field></field>
+                <field name="quantity"><header-field><link url="." text="Quantity${(sortField == 'quantity') ? ' &#9650;' : ((sortField == '-quantity') ? ' &#9660;' : '')}" parameter-map="[searchText: ec.context.searchText, withinDays: ec.context.withinDays, categoryFilter: ec.context.categoryFilter, supplierFilter: ec.context.supplierFilter, daysBucket: ec.context.daysBucket, pageSize:pgSize, orderByField: ((sortField == 'quantity') ? '-quantity' : 'quantity')]" style="text-reset text-decoration-none text-weight-bolder"/></header-field><default-field><label text="${ec.l10n.format(quantity, '#,##0.######')} ${unitLabel ?: 'units'}" type="span"/></default-field></field>
+                <field name="value"><header-field><link url="." text="Value at Risk (${currSymbol})${(sortField == 'value') ? ' &#9650;' : ((sortField == '-value') ? ' &#9660;' : '')}" parameter-map="[searchText: ec.context.searchText, withinDays: ec.context.withinDays, categoryFilter: ec.context.categoryFilter, supplierFilter: ec.context.supplierFilter, daysBucket: ec.context.daysBucket, pageSize:pgSize, orderByField: ((sortField == 'value') ? '-value' : 'value')]" style="text-reset text-decoration-none text-weight-bolder"/></header-field><default-field>
                     <display format="#,##,##0.00"/>
-                    <!-- ZE-INV-002 f/u: flag when a row is valued at retail (MRP) or has no valuation, so the mixed
-                         basis is transparent; blank for the normal cost basis. -->
                     <label text="${valueBasis == 'MRP' ? '(at MRP)' : (valueBasis == 'unvalued' ? '(not valued)' : '')}" type="span" style="text-caption text-grey-6"/>
                 </default-field></field>
-                <!-- ZE-INV-007 (IV-106): per-row Edit — update this lot's expiry / quantity / value / batch. The
-                     dialog id interpolates per row; the form name is STATIC so its action resolves to the transition
-                     (a per-row ${}-name would leave the action pointing at the screen and the submit would no-op). -->
-                <field name="editAction"><header-field title=""/>
-                  <!-- ZE-INV-010 (IV-110): row Edit only for full-access users; view-only sees no edit control -->
+                <field name="riskStatus"><header-field title="Status"/>
+                    <default-field><label type="span" text="${isExpired ? 'Expired' : (daysToExpiry &lt;= 7 ? 'Critical' : (daysToExpiry &lt;= 30 ? 'Warning' : 'OK'))}" style="er-badge ${(isExpired || daysToExpiry &lt;= 7) ? 'er-red' : (daysToExpiry &lt;= 30 ? 'er-orange' : 'er-green')}"/></default-field>
+                </field>
+                <field name="editAction"><header-field title="Action"/>
                   <conditional-field name="editAvail" condition="invCanWrite">
                     <container-dialog id="EditExpiry_${assetId}" button-text="Edit" button-icon="fa fa-pencil"
-                                      button-class="q-btn--flat text-primary text-caption q-px-sm">
+                                      button-class="er-button er-primary er-edit">
                         <form-single name="EditExpiryForm" transition="updateExpiryStock">
-                            <field name="assetId"><default-field><hidden default-value="${assetId}"/></default-field></field>
+                            <field name="assetId"><default-field><hidden default-value="${assetId}"/></default-field></field><field name="stockVersion"><default-field><hidden default-value="${stockVersion}"/></default-field></field>
                             <field name="lotLabel"><default-field title="Editing"><display text="${productName} — ${assetId}"/></default-field></field>
                             <field name="expiryDate"><default-field title="Expiry Date"><date-time type="date" default-value="${expiryDate ? ec.l10n.format(expiryDate, 'yyyy-MM-dd') : ''}"/></default-field></field>
                             <field name="quantity"><default-field title="Quantity"><text-line size="10" default-value="${quantity}"/></default-field></field>
-                            <!-- ZE-INV-007 f/u: a quantity change is logged as an Inventory Adjustment with this reason -->
                             <field name="adjustReason"><default-field title="Reason (if quantity changed)">
                                 <drop-down allow-empty="false">
                                     <option key="PhysicalCount" text="Physical count / recount"/>
@@ -644,15 +412,13 @@
                   </conditional-field>
                   <default-field><label text="" type="span"/></default-field>
                 </field>
-                <!-- expiry-risk §9: row-end overflow (⋮) menu. -->
                 <field name="kebab"><header-field title=""/>
                     <default-field><label type="span" encode="false" text="${kebabHtml}"/></default-field>
                 </field>
             </form-list>
             </container>
-
-            <!-- expiry-risk §10: pagination footer — "Showing X to Y of N" + page controls (preserve filters + sort). -->
-            <render-mode><text type="html,qvt,vuet"><![CDATA[<#assign _pqb = 'searchText='+((searchText)!'')?url('UTF-8')+'&amp;withinDays='+((withinDays)!'')?url('UTF-8')+'&amp;categoryFilter='+((categoryFilter)!'')?url('UTF-8')+'&amp;supplierFilter='+((supplierFilter)!'')?url('UTF-8')+'&amp;daysBucket='+((daysBucket)!'')?url('UTF-8')+'&amp;orderByField='+((orderByField)!'')?url('UTF-8')><#assign _pc = pgCount!1><#assign _pi = pgIndex!0><#assign _btn = 'display:inline-flex;align-items:center;justify-content:center;min-width:30px;height:30px;padding:0 8px;border:1px solid #E5E7EB;border-radius:8px;background:#fff;color:#374151;text-decoration:none;font-size:12.5px'><#assign _act = 'display:inline-flex;align-items:center;justify-content:center;min-width:30px;height:30px;padding:0 8px;border:1px solid #7C3AED;border-radius:8px;background:#7C3AED;color:#fff;font-weight:700;font-size:12.5px'><div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;padding:14px 2px;font-size:12.5px;color:#6B7280"><div>Showing ${pgShowFrom!0} to ${pgShowTo!0} of ${pgTotal!0} items</div><#if (_pc gt 1)><div style="display:flex;gap:6px;align-items:center"><#assign _hi=(_pi+2)><#if (_hi gt _pc-1)><#assign _hi=_pc-1></#if><#assign _lo=(_hi-4)><#if (_lo lt 0)><#assign _lo=0></#if><#if (_pi gt 0)><a href="?pageIndex=${_pi-1}&amp;${_pqb}" style="${_btn}" title="Previous">&#8249;</a></#if><#list _lo.._hi as p><#if (p==_pi)><span style="${_act}">${p+1}</span><#else><a href="?pageIndex=${p}&amp;${_pqb}" style="${_btn}">${p+1}</a></#if></#list><#if (_pi lt _pc-1)><a href="?pageIndex=${_pi+1}&amp;${_pqb}" style="${_btn}" title="Next">&#8250;</a></#if></div></#if></div>]]></text></render-mode>
-        </box-body></container-box>
+            <render-mode><text type="html,qvt,vuet" location="component://zenith-erp-inventory/template/inventory/ExpiryRiskPager.ftl"/></render-mode>
+        </container>
+        </container>
     </widgets>
 </screen>

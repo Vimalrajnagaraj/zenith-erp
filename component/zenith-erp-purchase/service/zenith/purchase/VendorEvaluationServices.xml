@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+    <service verb="get" noun="EvaluationOrganization">
+        <out-parameters><parameter name="organizationPartyId"/></out-parameters>
+        <actions><script><![CDATA[
+            organizationPartyId=null
+            def requested=ec.user.getPreference('ACTIVE_ORGANIZATION')
+            if(!requested || requested=='_NA_') return
+            if(ec.user.isInGroup('ADMIN')) {
+                def party=ec.entity.find('mantle.party.Party').condition('partyId',requested).disableAuthz().one()
+                def internal=ec.entity.find('mantle.party.PartyRole').condition('partyId',requested).condition('roleTypeId','OrgInternal').disableAuthz().count()
+                if(party && party.disabled!='Y' && internal && ec.entity.find('mantle.party.Organization').condition('partyId',requested).disableAuthz().one()) organizationPartyId=requested
+                return
+            }
+            def partyId=ec.user.userAccount?.partyId
+            if(!partyId) return
+            def scope=ec.service.sync().name('mantle.party.PartyServices.get#PartyOrganizationInfo').parameters([partyId:partyId]).disableAuthz().call()
+            if(requested==scope?.activeOrgId && (scope?.userOrgIds ?: []).contains(requested)) organizationPartyId=requested
+        ]]></script></actions>
+    </service>
+    <service verb="create" noun="VendorEvaluation">
+        <in-parameters>
+            <parameter name="vendorPartyId" required="true"/><parameter name="evaluationDate" required="true"/>
+            <!-- Validate before converting to integer; automatic conversion truncates fractional scores. -->
+            <parameter name="qualityScore" required="true"/><parameter name="deliveryScore" required="true"/><parameter name="priceScore" required="true"/><parameter name="remarks"/>
+        </in-parameters>
+        <out-parameters><parameter name="evaluationId"/></out-parameters>
+        <actions>
+            <service-call name="zenith.base.SecurityServices.check#ModuleWriteAccess" in-map="[moduleId:'purchase']" out-map="write"/>
+            <if condition="!write.canWrite"><return error="true" message="You have view-only access to vendor evaluations."/></if>
+            <service-call name="zenith.purchase.VendorEvaluationServices.get#EvaluationOrganization" out-map="scope"/>
+            <if condition="!scope.organizationPartyId"><return error="true" message="Select your authorized active organization before creating an evaluation."/></if>
+            <script><![CDATA[
+                def vendor=ec.entity.find('mantle.party.Party').condition('partyId',vendorPartyId).disableAuthz().one()
+                def vendorRoles=ec.entity.find('mantle.party.PartyRole').condition('partyId',vendorPartyId).condition('roleTypeId','in',['Vendor','Supplier']).disableAuthz().count()
+                if(!vendor || vendor.ownerPartyId!=scope.organizationPartyId || vendor.disabled=='Y' || !vendorRoles) {
+                    ec.message.addError('Select an enabled supplier from your active organization.');return
+                }
+                def scores, date
+                try {
+                    scores=[qualityScore,deliveryScore,priceScore].collect {new BigDecimal(it.toString().trim()).intValueExact()}
+                    if(scores.any {it<1 || it>5}) throw new IllegalArgumentException()
+                    date=java.sql.Date.valueOf(java.time.LocalDate.parse(evaluationDate.toString().trim()))
+                } catch(Exception ignored) {
+                    ec.message.addError('Enter a valid date and whole Quality, Delivery and Price scores from 1 to 5.');return
+                }
+                def mean=(scores.sum() as BigDecimal).divide(new BigDecimal('3'),2,java.math.RoundingMode.HALF_UP)
+                def row=ec.entity.makeValue('zenith.erp.purchase.VendorEvaluation').setAll([vendorPartyId:vendorPartyId,evaluationDate:date,
+                    qualityScore:scores[0],deliveryScore:scores[1],priceScore:scores[2],overallScore:mean,remarks:remarks,evaluatedBy:ec.user.userId]).setSequencedIdPrimary().create()
+                evaluationId=row.evaluationId
+            ]]></script>
+        </actions>
+    </service>
+    <service verb="delete" noun="VendorEvaluation">
+        <in-parameters><parameter name="evaluationId" required="true"/></in-parameters>
+        <actions>
+            <service-call name="zenith.base.SecurityServices.check#ModuleWriteAccess" in-map="[moduleId:'purchase']" out-map="write"/>
+            <if condition="!write.canWrite"><return error="true" message="You have view-only access to vendor evaluations."/></if>
+            <service-call name="zenith.purchase.VendorEvaluationServices.get#EvaluationOrganization" out-map="scope"/>
+            <script><![CDATA[
+                def row=ec.entity.find('zenith.erp.purchase.VendorEvaluation').condition('evaluationId',evaluationId).disableAuthz().forUpdate(true).one()
+                def vendor=row?.vendorPartyId ? ec.entity.find('mantle.party.Party').condition('partyId',row.vendorPartyId).disableAuthz().one() : null
+                // Preserve platform ADMIN maintenance of existing records; creation still requires active scope.
+                if(!row || (!ec.user.isInGroup('ADMIN') && (!vendor || !scope.organizationPartyId || vendor.ownerPartyId!=scope.organizationPartyId))) {
+                    ec.message.addError('Evaluation not found or outside your active organization.');return
+                }
+                row.delete()
+            ]]></script>
+        </actions>
+    </service>
+</services>
