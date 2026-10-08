@@ -77,7 +77,7 @@ Actual Quasar viewport was 1039×675 with no horizontal page or Shops overflow.
 
 1. **Responsive runtime pass:** the browser tool's requested 375×812 override still
    produced an actual 1280×720 viewport. No mobile pass is claimed. Test narrow,
-   medium and wide viewports on both shells before marking ready for review.
+   medium and wide viewports on both shells before merge. The author explicitly requested review-ready status while this gap remains documented.
 2. **Production gate:** maintainer must compare the deployment payload to the live
    runtime, verify the read-only list behavior and MARUTHI no-op safety before deploy.
    Do not test writes on MARUTHI. Invalid legacy links require an explicit, reviewed
@@ -88,9 +88,32 @@ Actual Quasar viewport was 1039×675 with no horizontal page or Shops overflow.
    recorded `actualSales` convention; this patch does not invent live POS aggregation.
 4. The browser's shared offline notice and framework Vue key warnings are pre-existing
    shell behavior. No shared-shell or POS edits are included.
-5. Cache busting is page-scoped (`shops.js?v=3`, `shops.css?v=3`) because these are new
+5. Cache busting is page-scoped (`shops.js?v=5`, `shops.css?v=5`) because these are new
    Shops assets loaded by the screens, rather than globally registered assets. This
    preserves `ZenithApp.xml` and unrelated modules.
 
 This report records tested behavior and explicit limits; it does not certify that
 all possible Shops defects or production configurations have been exhausted.
+
+## Header follow-up (2026-10-08)
+
+**SHOP-15 / UI:** the screenshot's green topbar comes from the framework
+`WebrootVue.qvt.css` rule `body.test #top { background:#224422!important }`.
+Its development equivalent is grey (`#5d5d5d`). These ID selectors outrank
+the ERP's white `.q-header` rule. This is environment styling, not a Shops
+background or a screenshot rendering issue.
+
+`zenithstatic/css/shops.css` now overrides that background only on light-mode
+dev/test Quasar pages containing `.zc-shops-page`; outside Shops and in dark
+mode the override does not match. Page assets are versioned at v5 to invalidate
+the previous cache. Production mode and shared controls are unchanged.
+
+A fresh disposable run passed 104/104 checks again. Actual browser assertions
+confirmed white (`rgb(255, 255, 255)`) on both Shops list and profile, retained
+search/Owner View/utilities, and working Operating Hours tab. Navigation to
+Dashboard retained its existing green environment header; on dark Shops the new
+selector did not match and the existing header was unchanged. The final actual
+viewport was 1280x720. See [corrected screenshot](evidence/quasar-header-light.jpg)
+and [follow-up evidence](evidence/header-followup.json). Narrow viewport testing
+remains open. The author requested removal of draft status for Amal's review;
+this does not satisfy or waive any merge/deployment evidence gate.

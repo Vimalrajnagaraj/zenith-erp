@@ -7,7 +7,7 @@
         root.dataset.initialized = 'true';
         if (!document.getElementById('zc-shops-css')) {
             var css = document.createElement('link');
-            css.id = 'zc-shops-css'; css.rel = 'stylesheet'; css.href = '/zenithstatic/css/shops.css?v=3';
+            css.id = 'zc-shops-css'; css.rel = 'stylesheet'; css.href = '/zenithstatic/css/shops.css?v=5';
             document.head.appendChild(css);
         }
         var value = function (id) { var e = root.querySelector('#' + id); return e ? e.value : ''; };
