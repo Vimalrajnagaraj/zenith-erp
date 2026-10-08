@@ -27,6 +27,7 @@ Fixtures use `MYSUB_QA_` IDs. Password setup copies the existing public Moqui de
 4. Click the specific invoice's Pay Now. With no provider configuration, expect the friendly unavailable message and buttons to be enabled for retry, with no payment record.
 5. Measure actual viewport and document/content widths at 375×812, 768×1024 and 1440×900. Inspect header, plan cards, usage and contained scrolling of payment tables. Confirm shared navigation remains available.
 6. Use only synthetic screenshots, with no tokens, credentials or real tenants.
+7. Compare the My Subscription light header with live white on both surfaces. Keep dev/test mode enabled, check search and dark/light toggle, dismiss native dialogs without submission, and navigate Dashboard → My Subscription through the SPA. The scoped override must not recolor another module.
 
 ## Remaining release gates
 
