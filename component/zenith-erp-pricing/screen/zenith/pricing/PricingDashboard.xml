@@ -9,38 +9,39 @@
     <transition name="priceHistory"><default-response url="../PriceChangeHistory"/></transition>
 
     <actions>
-        <!-- ZE-SEC-024: EXPLICIT org-scoping (defense-in-depth) — these counts/list previously relied SOLELY on the
-             MANTLE_ACTIVE_ORG entity-filter which is bypassed on standalone/CSV renders. ignore-if-empty keeps the super-admin global. -->
-        <set field="_org" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+        <service-call name="zenith.pricing.DashboardServices.get#DashboardOrganization" out-map="scope"/>
+        <set field="_org" from="scope.organizationPartyId ?: '__NO_ORGANIZATION__'"/>
         <entity-find-count entity-name="zenith.erp.pricing.PriceList" count-field="totalPriceLists">
             <econdition field-name="isActive" value="Y"/>
-            <econdition field-name="organizationPartyId" from="_org" ignore-if-empty="true"/>
+            <econdition field-name="organizationPartyId" from="_org"/>
         </entity-find-count>
         <entity-find-count entity-name="zenith.erp.pricing.PriceListItem" count-field="totalPriceItems">
-            <econdition field-name="organizationPartyId" from="_org" ignore-if-empty="true"/>
+            <econdition field-name="organizationPartyId" from="_org"/>
         </entity-find-count>
         <entity-find-count entity-name="zenith.erp.pricing.PricingRule" count-field="totalRules">
             <econdition field-name="isActive" value="Y"/>
-            <econdition field-name="organizationPartyId" from="_org" ignore-if-empty="true"/>
+            <econdition field-name="organizationPartyId" from="_org"/>
         </entity-find-count>
         <entity-find-count entity-name="zenith.erp.pricing.VolumePricing" count-field="totalVolumePrices">
-            <econdition field-name="organizationPartyId" from="_org" ignore-if-empty="true"/>
+            <econdition field-name="organizationPartyId" from="_org"/>
         </entity-find-count>
 
         <entity-find entity-name="zenith.erp.pricing.PriceChangeLog" list="recentChanges" limit="5">
-            <econdition field-name="organizationPartyId" from="_org" ignore-if-empty="true"/>
+            <econdition field-name="organizationPartyId" from="_org"/>
             <order-by field-name="-changeDate"/>
         </entity-find>
         <entity-find-count entity-name="zenith.erp.pricing.PriceChangeLog" count-field="totalChangeCount">
-            <econdition field-name="organizationPartyId" from="_org" ignore-if-empty="true"/>
+            <econdition field-name="organizationPartyId" from="_org"/>
         </entity-find-count>
 
         <script><![CDATA[
             def now = ec.user.nowTimestamp
             // ---- "this month" deltas: real records created/updated in the current calendar month ----
-            def monthStart = java.sql.Timestamp.valueOf(ec.l10n.format(now, 'yyyy-MM') + '-01 00:00:00')
+            def userZone=ec.user.timeZone.toZoneId()
+            def today=now.toInstant().atZone(userZone).toLocalDate()
+            def monthStart = java.sql.Timestamp.from(today.withDayOfMonth(1).atStartOfDay(userZone).toInstant())
             def cnt = { ent -> def f = ec.entity.find(ent).condition('lastUpdatedStamp', 'greater-equals', monthStart)
-                if (_org) f.condition('organizationPartyId', _org); f.count() }
+                f.condition('organizationPartyId', _org); f.count() }
             deltaLists  = cnt('zenith.erp.pricing.PriceList')
             deltaItems  = cnt('zenith.erp.pricing.PriceListItem')
             deltaRules  = cnt('zenith.erp.pricing.PricingRule')
@@ -59,13 +60,12 @@
 
             // ---- Price Change Trends chart: daily change counts over the trailing 8 weeks (honest window incl. real data) ----
             int NDAYS = 56
-            def winStart = new java.sql.Timestamp(now.time - (NDAYS - 1) * 86400000L)
-            winStart = java.sql.Timestamp.valueOf(ec.l10n.format(winStart, 'yyyy-MM-dd') + ' 00:00:00')
+            def windowDay=today.minusDays(NDAYS-1)
+            def winStart=java.sql.Timestamp.from(windowDay.atStartOfDay(userZone).toInstant())
             def logF = ec.entity.find('zenith.erp.pricing.PriceChangeLog').condition('changeDate', 'greater-equals', winStart)
-            if (_org) logF.condition('organizationPartyId', _org)
+            logF.condition('organizationPartyId', _org)
             def counts = new int[NDAYS]
-            def startMs = winStart.time
-            logF.selectField('changeDate').list().each { def cd = it.changeDate; if (cd) { int d = (int)((cd.time - startMs) / 86400000L); if (d >= 0 && d < NDAYS) counts[d]++ } }
+            logF.selectField('changeDate').list().each { def cd = it.changeDate; if (cd) { int d = (int)java.time.temporal.ChronoUnit.DAYS.between(windowDay,cd.toInstant().atZone(userZone).toLocalDate()); if (d >= 0 && d < NDAYS) counts[d]++ } }
             double maxc = 1.0; for (c in counts) if (c > maxc) maxc = c
             double CW = 520, CH = 240, bx = 30, by = 208, topP = 12, rightP = 12
             double plotW = CW - bx - rightP, plotH = by - topP
@@ -80,11 +80,11 @@
                 grid.append('<line x1="' + f(bx) + '" y1="' + f(yv) + '" x2="' + f(CW - rightP) + '" y2="' + f(yv) + '" stroke="#E5E7EB" stroke-width="1" stroke-dasharray="3 3"/>')
                 grid.append('<text x="' + f(bx - 6) + '" y="' + f(yv + 3) + '" font-size="9" fill="#9CA3AF" text-anchor="end">' + val + '</text>') }
             def xl = new StringBuilder()
-            def xf = new java.text.SimpleDateFormat('d MMM')
-            for (int i = 0; i < NDAYS; i += 14) { double x = bx + (i * plotW / (NDAYS - 1)); def dd = new java.util.Date(startMs + i * 86400000L)
-                xl.append('<text x="' + f(x) + '" y="' + f(by + 16) + '" font-size="9" fill="#9CA3AF" text-anchor="middle">' + xf.format(dd) + '</text>') }
-            double lastX = bx + ((NDAYS - 1) * plotW / (NDAYS - 1)); def lastD = new java.util.Date(startMs + (NDAYS - 1) * 86400000L)
-            xl.append('<text x="' + f(lastX) + '" y="' + f(by + 16) + '" font-size="9" fill="#9CA3AF" text-anchor="end">' + xf.format(lastD) + '</text>')
+            def xf = java.time.format.DateTimeFormatter.ofPattern('d MMM',ec.user.locale)
+            for (int i = 0; i < NDAYS; i += 14) { double x = bx + (i * plotW / (NDAYS - 1)); def dd = windowDay.plusDays(i)
+                xl.append('<text x="' + f(x) + '" y="' + f(by + 16) + '" font-size="9" fill="#9CA3AF" text-anchor="middle">' + dd.format(xf) + '</text>') }
+            double lastX = bx + ((NDAYS - 1) * plotW / (NDAYS - 1)); def lastD = today
+            xl.append('<text x="' + f(lastX) + '" y="' + f(by + 16) + '" font-size="9" fill="#9CA3AF" text-anchor="end">' + lastD.format(xf) + '</text>')
             chartSvg = '<svg viewBox="0 0 ' + ((int)CW) + ' ' + ((int)CH) + '" preserveAspectRatio="xMidYMid meet" style="width:100%;height:auto;min-width:360px">' +
                 grid.toString() + '<path d="' + areaStr + '" fill="#2563EB" fill-opacity="0.08"/>' +
                 '<polyline points="' + lineStr + '" fill="none" stroke="#2563EB" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>' +
@@ -94,43 +94,43 @@
             def _uri = '/apps/zenith/pricing/PricingDashboard'
             try { _uri = ec.web?.request?.getRequestURI() ?: _uri } catch (Exception e) {}
             def _i = _uri.indexOf('/zenith/pricing')
-            toolBase = (_i >= 0) ? _uri.substring(0, _i + 15) + '/' : '/apps/zenith/pricing/'
+            toolBase = sri.getRenderMode()=='qvt' ? '/qapps/zenith/pricing/' : ((_i >= 0) ? _uri.substring(0, _i + 15) + '/' : '/apps/zenith/pricing/')
         ]]></script>
     </actions>
 
     <widgets>
-        <container style="q-pa-md">
+        <container style="q-pa-md zprd-page">
         <!-- Header -->
-        <container style="row items-center justify-between q-mb-lg">
+        <container style="row items-center justify-between q-mb-lg zprd-header">
             <container>
                 <label text="Pricing Overview" type="h3" style="text-primary text-weight-bold q-my-none"/>
                 <label text="Manage price lists, volume pricing, and pricing rules across your organization." type="p" style="text-grey-7 q-mt-sm q-mb-none"/>
             </container>
-            <link url="findPriceList" text="+ New Price List" btn-type="primary" style="z-solid"/>
+            <link url="findPriceList" text="Price Lists" btn-type="primary" style="z-solid"/>
         </container>
 
         <!-- 4 KPI stat cards -->
         <render-mode><text type="html,qvt" template="true"><![CDATA[
-<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:20px;margin-bottom:24px;font-family:Inter,Segoe UI,Arial,sans-serif">
+<div class="zprd-stats" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:20px;margin-bottom:24px;font-family:Inter,Segoe UI,Arial,sans-serif">
   <div style="background:#fff;border:1px solid #E5E7EB;border-radius:12px;padding:20px">
     <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px"><div style="width:44px;height:44px;border-radius:8px;background:#EDE9FE;color:#7C3AED;display:flex;align-items:center;justify-content:center;flex:0 0 auto"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M12.586 2.586A2 2 0 0 0 11.172 2H4a2 2 0 0 0-2 2v7.172a2 2 0 0 0 .586 1.414l8.704 8.704a2.426 2.426 0 0 0 3.42 0l6.58-6.58a2.426 2.426 0 0 0 0-3.42Z"/><circle cx="7.5" cy="7.5" r=".5" fill="currentColor"/></svg></div><div style="font-size:11px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#6B7280">Price Lists</div></div>
     <div style="font-size:26px;font-weight:700;color:#111827;line-height:1.1">${totalPriceListsStr}</div>
-    <div style="font-size:12px;font-weight:500;color:${deltaListsCol};margin-top:6px">${deltaListsArr}${deltaLists} this month</div>
+    <div style="font-size:12px;font-weight:500;color:${deltaListsCol};margin-top:6px">${deltaListsArr}${deltaLists} updated this month</div>
   </div>
   <div style="background:#fff;border:1px solid #E5E7EB;border-radius:12px;padding:20px">
     <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px"><div style="width:44px;height:44px;border-radius:8px;background:#D1FAE5;color:#059669;display:flex;align-items:center;justify-content:center;flex:0 0 auto"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/></svg></div><div style="font-size:11px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#6B7280">Priced Items</div></div>
     <div style="font-size:26px;font-weight:700;color:#111827;line-height:1.1">${totalPriceItemsStr}</div>
-    <div style="font-size:12px;font-weight:500;color:${deltaItemsCol};margin-top:6px">${deltaItemsArr}${deltaItems} this month</div>
+    <div style="font-size:12px;font-weight:500;color:${deltaItemsCol};margin-top:6px">${deltaItemsArr}${deltaItems} updated this month</div>
   </div>
   <div style="background:#fff;border:1px solid #E5E7EB;border-radius:12px;padding:20px">
     <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px"><div style="width:44px;height:44px;border-radius:8px;background:#FEF3C7;color:#D97706;display:flex;align-items:center;justify-content:center;flex:0 0 auto"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="m16 16 3-8 3 8c-.87.65-1.92 1-3 1s-2.13-.35-3-1Z"/><path d="m2 16 3-8 3 8c-.87.65-1.92 1-3 1s-2.13-.35-3-1Z"/><path d="M7 21h10"/><path d="M12 3v18"/><path d="M3 7h2c2 0 5-1 7-2 2 1 5 2 7 2h2"/></svg></div><div style="font-size:11px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#6B7280">Pricing Rules</div></div>
     <div style="font-size:26px;font-weight:700;color:#111827;line-height:1.1">${totalRulesStr}</div>
-    <div style="font-size:12px;font-weight:500;color:${deltaRulesCol};margin-top:6px">${deltaRulesArr}${deltaRules} this month</div>
+    <div style="font-size:12px;font-weight:500;color:${deltaRulesCol};margin-top:6px">${deltaRulesArr}${deltaRules} updated this month</div>
   </div>
   <div style="background:#fff;border:1px solid #E5E7EB;border-radius:12px;padding:20px">
     <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px"><div style="width:44px;height:44px;border-radius:8px;background:#EDE9FE;color:#7C3AED;display:flex;align-items:center;justify-content:center;flex:0 0 auto"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5V19A9 3 0 0 0 21 19V5"/><path d="M3 12A9 3 0 0 0 21 12"/></svg></div><div style="font-size:11px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#6B7280">Volume Prices</div></div>
     <div style="font-size:26px;font-weight:700;color:#111827;line-height:1.1">${totalVolumePricesStr}</div>
-    <div style="font-size:12px;font-weight:500;color:${deltaVolumeCol};margin-top:6px">${deltaVolumeArr}${deltaVolume} this month</div>
+    <div style="font-size:12px;font-weight:500;color:${deltaVolumeCol};margin-top:6px">${deltaVolumeArr}${deltaVolume} updated this month</div>
   </div>
 </div>
         ]]></text></render-mode>
@@ -145,12 +145,12 @@
                     </container>
                     <form-list name="RecentChanges" list="recentChanges" list-entry="rc" skip-form="true">
                         <row-actions><script><![CDATA[
-                            def prev = (rc.previousPrice ?: 0) as BigDecimal
-                            def nw = (rc.newPrice ?: 0) as BigDecimal
-                            def z = com.zenith.Fmt.INSTANCE
-                            oldStr = '₹' + z.inr(ec.l10n.format(prev, '#,##0.00'))
-                            newStr = '₹' + z.inr(ec.l10n.format(nw, '#,##0.00'))
-                            if (prev > 0) { def p = ((nw - prev) / prev * 100).setScale(2, java.math.RoundingMode.HALF_UP)
+                            def prev = rc.previousPrice as BigDecimal
+                            def nw = rc.newPrice as BigDecimal
+                            oldStr = prev==null ? 'Not recorded' : ec.l10n.format(prev, '#,##0.00')
+                            newStr = nw==null ? 'Not recorded' : ec.l10n.format(nw, '#,##0.00')
+                            if(prev==null || nw==null) {chgStr='Not recorded';chgColor='text-grey-6'}
+                            else if (prev > 0) { def p = ((nw - prev) / prev * 100).setScale(2, java.math.RoundingMode.HALF_UP)
                                 chgStr = (p >= 0 ? '▲ ' : '▼ ') + p + '%'; chgColor = (p >= 0 ? 'z-amt-green' : 'z-txt-red') }
                             else if (nw > 0) { chgStr = '▲ New'; chgColor = 'z-amt-green' }
                             else { chgStr = '—'; chgColor = 'text-grey-6' }
@@ -177,9 +177,9 @@
             <row-col lg="5" md="12" sm="12">
                 <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-lg q-mb-md">
                     <render-mode><text type="html,qvt" template="true"><![CDATA[
-<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+<div class="zprd-chart-header" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
   <div style="font-size:15px;font-weight:600;color:#111827">Price Change Trends</div>
-  <div style="font-size:12.5px;color:#111827;border:1px solid #E5E7EB;border-radius:8px;padding:5px 10px;background:#fff">Last 8 weeks &#9662;</div>
+  <div style="font-size:12.5px;color:#111827;border:1px solid #E5E7EB;border-radius:8px;padding:5px 10px;background:#fff">Last 8 weeks</div>
 </div>
 <div style="width:100%;overflow-x:auto">${chartSvg}</div>
                     ]]></text></render-mode>
