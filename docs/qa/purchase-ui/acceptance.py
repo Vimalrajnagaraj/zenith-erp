@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Read-only Purchase render checks around explicit, guarded fixture setup/cleanup."""
-import base64, http.cookiejar, json, os, re, urllib.parse, urllib.request
+import base64, csv, html as html_module, http.cookiejar, io, json, os, re, urllib.parse, urllib.request
 from pathlib import Path
 BASE=os.environ.get('PURCHASE_UI_QA_BASE','http://localhost:8088').rstrip('/')
 u=urllib.parse.urlsplit(BASE)
@@ -35,6 +35,17 @@ if __name__=='__main__':
    html=http.open(BASE+path+query,timeout=60).read().decode()
    passed=title in html and 'zc-purchase-page' in html and 'Error rendering screen' not in html
    results.append({'surface':surface,'page':route,'passed':passed})
+   exports=re.findall(r'href="([^"]*renderMode=csv[^"]*)"',html)
+   for export in dict.fromkeys(exports):
+    path=html_module.unescape(export)
+    parsed=urllib.parse.urlsplit(urllib.parse.urljoin(BASE,path))
+    assert parsed.hostname==u.hostname and parsed.port==u.port,'Local export only'
+    content=http.open(urllib.parse.urlunsplit(parsed),timeout=60).read().decode('utf-8-sig')
+    rows=list(csv.reader(io.StringIO(content)))
+    assert rows and title.replace('&amp;','&') not in rows[0][0],route+' leaked page chrome into CSV'
+    assert all(len(row)==len(rows[0]) for row in rows[1:]),route+' CSV column mismatch'
+    OUT.joinpath(route+'.csv').write_text(content,encoding='utf-8')
+    print('PASS CSV '+route+' ('+str(len(rows)-1)+' rows, '+str(len(rows[0]))+' columns)')
    print(('PASS' if passed else 'FAIL')+' '+surface+' '+route)
  OUT.joinpath('renders.json').write_text(json.dumps(results,indent=2))
  assert all(r['passed'] for r in results),'Render failure; see renders.json'
