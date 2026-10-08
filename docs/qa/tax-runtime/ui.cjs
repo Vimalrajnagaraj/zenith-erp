@@ -72,6 +72,7 @@ async function submit(id){await Promise.all([page.waitForNavigation({waitUntil:'
    await page.screenshot({path:out+'/'+shell+'-registration-edit-mobile.png',fullPage:false});await page.setViewport({width:1366,height:900});
    await fill('.zc-tax-form [name=description]',"Synthetic UI O'Brien edited");
    const button=await page.$('.zc-tax-form button[type=submit]');assert(button,'Edit button');await Promise.all([page.waitForNavigation({waitUntil:'networkidle2'}),button.click()]);
+   await page.waitForSelector('.zc-tax-form [name=description]',{timeout:15000});
    assert(await page.$eval('.zc-tax-form [name=description]',e=>e.value==="Synthetic UI O'Brien edited"),'Description did not persist');assert(!await page.$('.zc-tax-form img[src="x"]'),'XSS markup executed');
   });
   await record(shell+' exemption filter and native create/edit',async()=>{
