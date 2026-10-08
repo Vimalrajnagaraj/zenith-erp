@@ -80,7 +80,10 @@
       clear.setAttribute('aria-label', 'Clear ' + (label ? label.textContent.replace('*', '').trim() : 'selection'));
       function update() { clear.style.display = select.value ? 'flex' : 'none'; }
       select.addEventListener('change', update); update();
-      clear.addEventListener('click', function () { select.value = ''; select.dispatchEvent(new Event('change', { bubbles: true })); });
+      clear.addEventListener('click', function () {
+        select.value = ''; select.dispatchEvent(new Event('change', { bubbles: true }));
+        select.focus();
+      });
     });
     var search = document.getElementById('te-search');
     if (search && !search.dataset.ready) {

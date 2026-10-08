@@ -37,6 +37,10 @@ async function submit(id){await Promise.all([page.waitForNavigation({waitUntil:'
     assert(await page.$eval(`#${prefix}-overlay`,e=>e.getAttribute('role')==='dialog'&&e.getAttribute('aria-modal')==='true'),'Accessible dialog missing');
     await select(`#${prefix}-party`,party);const clear=`button[data-for="${prefix}-party"]`;await page.focus(clear);await page.keyboard.press('Enter');
     assert(await page.$eval(`#${prefix}-party`,e=>e.value===''),'Keyboard clear failed');
+    assert(await page.$eval(`#${prefix}-party`,e=>document.activeElement===e),'Clearing lost keyboard focus');
+    await page.keyboard.press('Escape');assert(await page.$eval(`#${prefix}-overlay`,e=>getComputedStyle(e).display==='none'),'Escape after clearing did not close modal');
+    assert(await page.$eval(`[data-tax-open="${prefix}-overlay"]`,e=>document.activeElement===e),'Clear/Escape did not restore opener focus');
+    await clickText('button',opener);
     await fill(`#${prefix}-efffrom`,'2026-07-01');assert(await page.$eval(`#${prefix}-efffrom`,e=>e.labels.length===1&&getComputedStyle(e).opacity==='1'),'Native date is unlabelled or invisible');
     for(const width of [1366,800,390,320]) {
      await page.setViewport({width,height:900});
