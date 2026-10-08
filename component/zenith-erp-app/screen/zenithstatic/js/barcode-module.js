@@ -10,7 +10,7 @@ if(page.querySelector('#bm-lookup')){
             var base=location.pathname.split('/zenith/')[0];
             location.href = base + '/zenith/barcode/BarcodeDashboard?barcodeValue=' + encodeURIComponent(v);
         };
-        
+
 }
 if(page.querySelector('#ab-overlay')){
 
@@ -33,7 +33,7 @@ if(page.querySelector('#ab-overlay')){
                     .catch(function(){ create.disabled=false; create.textContent='Generate'; alert('Generate failed — please try again.'); });
             }); }
         })();
-        
+
 }
 if(page.querySelector('#ab-overlay')){
 
@@ -67,7 +67,7 @@ if(page.querySelector('#ab-overlay')){
                     .catch(function(){ create.disabled=false; create.textContent='Add Barcode'; alert('Add failed — please try again.'); });
             }); }
         })();
-        
+
 }
 if(page.querySelector('#lt-token')){
 
@@ -100,7 +100,7 @@ if(page.querySelector('#lt-token')){
                 });
             });
         })();
-        
+
 }
 if(page.querySelector('#lt-token')){
 
@@ -172,7 +172,7 @@ if(page.querySelector('#lt-token')){
                     .catch(function(){ create.disabled=false; create.textContent='Create Template'; alert('Create failed — please try again.'); });
             }); }
         })();
-        
+
 }
 if(page.querySelector('#npj-overlay')){
 if(document.getElementById('epj-token')){
@@ -200,7 +200,7 @@ if(document.getElementById('epj-token')){
                         mark.disabled=true; post('completePrintJob',{}).then(function(r){ if(!r.ok) throw new Error('Request failed'); location.href=r.url||location.href; }).catch(function(){ mark.disabled=false; alert('Mark failed.'); });
                     }); }
                 })();
-                
+
 }
 }
 if(page.querySelector('#npj-overlay')){
@@ -245,7 +245,7 @@ if(page.querySelector('#npj-overlay')){
                     .catch(function(){ create.disabled=false; create.textContent='Create & Add Products'; alert('Create failed — please try again.'); });
             }); }
         })();
-        
+
 }
 // Inline open/close handlers work on both shells; keep keyboard focus inside the active dialog.
 page.addEventListener('click',function(event){

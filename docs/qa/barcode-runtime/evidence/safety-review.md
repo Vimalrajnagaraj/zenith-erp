@@ -1,6 +1,6 @@
 # Barcode safety self-review
 
-This is the author’s evidence-backed self-review against the repository’s nine-item safety checklist, not a certification by the GitHub review bot. Review range: master `ba5143a3d1d5e97d2182ff7ba535f36862690a2f` to code candidate `b9d765b20f30125a32ed3b49e6b007002938ebe5`.
+This is the author’s evidence-backed self-review against the repository’s nine-item safety checklist, not a certification by the GitHub review bot. Review range: master `ba5143a3d1d5e97d2182ff7ba535f36862690a2f` to code candidate `2ab9a4d3edaca412415ec0883df399cc60720b02` plus verified whitespace-only JS cleanup. Tested component tree: `13e6b7c6cd2381dbd3b51415e3184006c93aca95`.
 
 1. Secrets — PASS for new diff/evidence. No production passwords/tokens/keys. Disposable public demo authentication initializes synthetic QA only; helpers require the disposable JVM flag. Pre-existing references in unchanged lines are outside this change.
 2. Customer/security data — PASS for new diff. Synthetic identities, roles, mechanical codes and pixel screenshots only. No live customer data or production screenshots.
