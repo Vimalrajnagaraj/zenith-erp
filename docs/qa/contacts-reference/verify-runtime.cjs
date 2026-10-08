@@ -81,5 +81,3 @@ async function modal(page,shell,label){await page.locator('.cust-nc-solo').filte
  check('No browser page errors',report.pageErrors.length===0,report.pageErrors);
  report.completedAt=new Date().toISOString();report.success=true;
 }catch(error){report.success=false;report.error=error.message;process.exitCode=1;}finally{if(browser)await browser.close();fs.writeFileSync(path.join(out,'checks.json'),JSON.stringify(report,null,2));console.log(JSON.stringify({success:report.success,checks:report.checks.length,layouts:report.layouts.length,error:report.error}));}})();
-
-
