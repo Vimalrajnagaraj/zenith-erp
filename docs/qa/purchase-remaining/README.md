@@ -16,4 +16,6 @@ Live inspection was read-only: list screens/dialogs and existing PO detail, incl
 
 DRAFT / DEPLOY-GATE: obtain the SOP owner MARUTHI100000 before/after no-op DB report. Retain the statutory TDS limitation and the approved positive GSTR-2B sample / Margin on Cost gates in related PRs. Rebase and reverify after related PRs merge; preserve every org/type/write guard and all leaf asset registrations. Vendor Bills #34 / GSTR-2B #35 require combined review. Amal owns deployment order. No merge or deployment is performed here.
 
-The complete functional/UI report has 368 passing checks, zero failed checks and zero runner errors. PO print verification has its own runner/report: authorized PDF output, 403 for foreign/mixed/sales/no-org requests, unchanged headers and independent exact cleanup.
+The complete functional/UI report has 368 passing checks, zero failed checks and zero runner errors. PO print verification has 17 passing checks in its own runner/report: authorized PDF output and extracted text for recorded INR/USD amounts, 403 for foreign/mixed/sales/no-org requests, unchanged headers and independent exact cleanup.
+
+For verify-print.cjs also set PURCHASE_QA_PYTHON to a Python runtime with pypdf. The extra owned INR fixture is a zero arithmetic currency control. Prints never infer INR for a missing recorded currency. The original hardcoded Rs. amount prefix was corrected; ordinary operations and payment service code are unchanged from the 368-check run.
