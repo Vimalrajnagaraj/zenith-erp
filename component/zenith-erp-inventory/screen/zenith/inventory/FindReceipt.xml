@@ -3,55 +3,63 @@
         xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
         default-menu-title="Receiving" default-menu-index="3">
 
-    <transition name="receiveInventory"><default-response url="../ReceiveInventory"/></transition>
+    <transition name="receiveInventory" read-only="true"><default-response url="../ReceiveInventory"/></transition>
 
-    <!-- XF-002: receive incoming stock DIRECTLY, without a purchase order (opening stock, walk-in
-         supplier delivery, or a branch transfer). Adds the qty to the chosen store via the canonical
-         adjust#AssetOnHand (find-or-create org asset + on-hand + AssetDetail ledger). Does NOT flip
-         Product.inventoryTracked, so it never changes POS depletion for non-tracking tenants (MARUTHI-safe). -->
+    <!-- Quasar resolves form/link targets while rendering a GET. Keep the transition discoverable,
+         then enforce POST before any write (otherwise the native renderer chooses m-form-link). -->
     <transition name="receiveDirectStock">
         <actions>
-            <!-- ZE-INV-010: enforce Inventory write access (defense-in-depth; the central gate is fail-open) -->
-            <service-call name="zenith.base.SecurityServices.check#ModuleWriteAccess" out-map="_wac" in-map="[moduleId:'inventory']"/>
-            <if condition="!(_wac?.canWrite)"><return error="true" message="You have view-only access to Inventory — you can't receive stock here."/></if>
-            <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-            <if condition="!productId"><return error="true" message="Please select a product to receive."/></if>
-            <if condition="!facilityId"><return error="true" message="Please choose the store / warehouse to receive into."/></if>
-            <script><![CDATA[
-                def _numOk = { v -> v != null && v.toString().trim() != '' && (v.toString().trim() ==~ /\d*\.?\d+/) }
-                if (!_numOk(quantityDiff)) { ec.message.addError("Quantity received must be a number greater than zero."); return }
-                def _qty = new BigDecimal(quantityDiff.toString().trim())
-                if (_qty.signum() <= 0) { ec.message.addError("Quantity received must be greater than zero."); return }
-                def _org = (activeOrg && activeOrg != '_NA_') ? activeOrg : null
-                if (!_org) { ec.message.addError("No active organization is selected — cannot receive stock."); return }
-                def inMap = [organizationPartyId:_org, productId:productId, quantityDiff:_qty,
-                             facilityId:facilityId, reason:'Direct goods receipt']
-                if (batchNumber) inMap.batchNumber = batchNumber
-                if (expiryDate) inMap.expiryDate = expiryDate
-                if (manufacturingDate) inMap.manufacturingDate = manufacturingDate
-                if (_numOk(mrpAmount)) inMap.mrpAmount = new BigDecimal(mrpAmount.toString().trim())
-                if (_numOk(valuationRate)) inMap.valuationRate = new BigDecimal(valuationRate.toString().trim())
-                ec.service.sync().name("zenith.inventory.InventoryStockServices.adjust#AssetOnHand").parameters(inMap).call()
-                if (!ec.message.hasError()) ec.message.addMessage("Received ${_qty} units into stock. Open Stock Levels to verify the updated quantity.")
-            ]]></script>
-        </actions>
-        <default-response url="."/>
+            <if condition="ec.web.request.method != 'POST'"><return error="true" message="Receiving stock requires a form submission."/></if>
+            <if condition="!ec.web.parameters.moquiSessionToken || ec.web.parameters.moquiSessionToken != ec.web.sessionToken"><return error="true" message="Your session expired. Reload Receiving and try again."/></if>
+            <service-call name="zenith.inventory.ReceiptServices.receive#Stock"
+                in-map="[productId:productId, facilityId:facilityId, quantityAccepted:quantityDiff,
+                    valuationRate:valuationRate, mrpAmount:mrpAmount, batchNumber:batchNumber,
+                    manufacturingDate:manufacturingDate, expiryDate:expiryDate]"/>
+        </actions><default-response url="."/>
     </transition>
-
-    <!-- XF-002 f/u: receive an in-transit stock transfer straight from Receiving (mirrors the
-         StockTransfers screen's receiveTransfer) so branch / inter-state transfers are received
-         from the same "incoming stock" place, not only under the Stock Transfers menu. -->
     <transition name="receiveTransfer">
-        <service-call name="zenith.inventory.InventoryServices.receive#StockTransfer"/>
-        <default-response url="."/>
+        <actions>
+            <if condition="ec.web.request.method != 'POST'"><return error="true" message="Receiving a transfer requires a form submission."/></if>
+            <if condition="!ec.web.parameters.moquiSessionToken || ec.web.parameters.moquiSessionToken != ec.web.sessionToken"><return error="true" message="Your session expired. Reload Receiving and try again."/></if>
+            <service-call name="zenith.base.SecurityServices.check#ModuleWriteAccess" in-map="[moduleId:'inventory']" out-map="writeAccess"/>
+            <if condition="!writeAccess.canWrite"><return error="true" message="You have view-only access to Inventory."/></if>
+            <entity-find-one entity-name="zenith.erp.inventory.StockTransfer" value-field="incomingTransfer" for-update="true"/>
+            <if condition="!incomingTransfer || !ec.user.getPreference('ACTIVE_ORGANIZATION') || ec.user.getPreference('ACTIVE_ORGANIZATION') == '_NA_' || incomingTransfer.organizationPartyId != ec.user.getPreference('ACTIVE_ORGANIZATION')">
+                <return error="true" message="Select a stock transfer from your organization."/>
+            </if>
+            <script><![CDATA[
+                def orgId = ec.user.getPreference('ACTIVE_ORGANIZATION')
+                def destination = ec.entity.find('mantle.facility.Facility').condition('facilityId', incomingTransfer.toFacilityId).one()
+                def source = ec.entity.find('mantle.facility.Facility').condition('facilityId', incomingTransfer.fromFacilityId).one()
+                if (destination?.ownerPartyId != orgId || source?.ownerPartyId != orgId) {
+                    ec.message.addError('Transfer stores must belong to your organization.'); return
+                }
+                def items = ec.entity.find('zenith.erp.inventory.StockTransferItem').condition('stockTransferId', stockTransferId).list()
+                if (!items) ec.message.addError('This transfer has no items to receive.')
+                for (item in items) {
+                    def product = ec.entity.find('mantle.product.Product').condition('productId', item.productId).one()
+                    def qty = item.quantityReceived != null ? item.quantityReceived : item.quantity
+                    if (product?.ownerPartyId != orgId || qty == null || qty <= 0G || qty > (item.quantity ?: 0G))
+                        ec.message.addError('Transfer items must be valid products with a positive received quantity no greater than shipped.')
+                }
+            ]]></script>
+            <if condition="ec.message.hasError()"><return/></if>
+            <service-call name="zenith.inventory.InventoryServices.receive#StockTransfer" in-map="[stockTransferId:stockTransferId]"/>
+        </actions><default-response url="."/>
     </transition>
 
     <actions>
-        <entity-find entity-name="mantle.party.PartyRole" list="internalOrgRoles">
-            <econdition field-name="roleTypeId" value="InternalOrganization"/>
-        </entity-find>
-        <set field="internalOrgIdList" from="internalOrgRoles.partyId"/>
-        <set field="activeOrgId" from="ec.user.getPreference('ACTIVE_ORGANIZATION') ?: (internalOrgIdList ? internalOrgIdList[0] : null)"/>
+        <set field="activeOrgId" from="ec.user.getPreference('ACTIVE_ORGANIZATION') ?: '__NO_ORGANIZATION__'"/>
+        <script><![CDATA[
+            if (activeOrgId == '_NA_') activeOrgId = '__NO_ORGANIZATION__'
+            receiptSearch = [pageNoLimit:'true']
+            for (key in ['orderId','orderId_op','orderId_ic','entryDate_from','entryDate_thru','vendorPartyId']) {
+                def value = ec.web.requestParameters[key]
+                if (value instanceof String) receiptSearch[key] = value
+            }
+            def sort = ec.web.requestParameters.orderByField?.toString()
+            if (sort in ['orderId','-orderId','entryDate','-entryDate']) receiptSearch.orderByField = sort == 'orderId' || sort == '-orderId' ? sort : sort + ',orderId'
+        ]]></script>
 
         <set field="statusColorMap" from="[
             'OrderApproved': 'primary',
@@ -61,45 +69,125 @@
         <!-- XF-001: lift the search out of the form-list into actions so `poList` is available for
              the empty-state below (an empty list otherwise just showed a bare filter with no cue). -->
         <entity-find entity-name="mantle.order.OrderHeaderAndPart" list="poList">
-            <econdition field-name="customerPartyId" from="activeOrgId" ignore-if-empty="true"/>
+            <econdition field-name="customerPartyId" from="activeOrgId"/>
             <econdition field-name="vendorPartyId" operator="is-not-null"/>
             <econdition field-name="statusId" operator="in" value="OrderApproved,OrderCompleted"/>
-            <search-form-inputs default-order-by="-orderDate,orderId"/>
+            <search-form-inputs input-fields-map="receiptSearch" default-order-by="-entryDate,-orderId"/>
         </entity-find>
+
+        <script><![CDATA[
+            // Remove fully delivered orders BEFORE pagination; sales do not reopen delivered lines.
+            def pending = []
+            receivingViewByOrder = [:]
+            def checked = new HashSet()
+            for (po in poList) {
+                if (!checked.add(po.orderId)) continue
+                def access = ec.service.sync().name('zenith.inventory.ReceiptServices.get#PurchaseOrderAccess').parameters([orderId:po.orderId]).call()
+                if (!access.allowed) continue
+                def totals = ec.service.sync().name('zenith.inventory.ReceiptServices.get#OrderReceiptQuantities').parameters([orderId:po.orderId]).call().receivedByItem
+                def items = ec.entity.find('mantle.order.OrderItem').condition('orderId', po.orderId).list()
+                if (items.any { it.productId && (it.quantity ?: 0G) - (it.quantityCancelled ?: 0G) > (totals[it.orderItemSeqId] ?: 0G) }) {
+                    def productItems = items.findAll { it.productId != null }
+                    def outstanding = productItems.sum { ((it.quantity ?: 0G) - (it.quantityCancelled ?: 0G) - (totals[it.orderItemSeqId] ?: 0G)).max(0G) } ?: 0G
+                    def partial = productItems.any { (totals[it.orderItemSeqId] ?: 0G) > 0G }
+                    def supplier = ec.entity.find('mantle.party.PartyDetail').condition('partyId', po.vendorPartyId).one()
+                    def state = partial ? 'Partial' : po.statusId.replace('Order', '')
+                    receivingViewByOrder[po.orderId] = [supplier:supplier?.organizationName ?: [supplier?.firstName,supplier?.lastName].findAll { it }.join(' '), itemCount:productItems.size(), expectedQuantity:outstanding, status:state, statusClass:partial ? 'partial' : po.statusId == 'OrderCompleted' ? 'completed' : 'approved']
+                    pending.add(po)
+                }
+            }
+            // Filter only the read model; never modify the stored purchase-order status.
+            receivingStatus = ec.web.requestParameters.receivingStatus?.toString()
+            if (!(receivingStatus in ['Approved','Completed','Partial'])) receivingStatus = ''
+            if (receivingStatus) pending = pending.findAll { receivingViewByOrder[it.orderId].status == receivingStatus }
+            receivingExportRows = pending.collect { po ->
+                def view = receivingViewByOrder[po.orderId]
+                [po.orderId, ec.l10n.format(po.entryDate,'dd MMM yyyy'), view.supplier, view.itemCount, view.expectedQuantity, view.status]
+            }
+            pending.eachWithIndex { po, index -> receivingViewByOrder[po.orderId].rowNumber = index + 1 }
+            def positiveInt = { value, fallback ->
+                try { return Math.max(0, Integer.parseInt(value?.toString() ?: fallback.toString())) }
+                catch (Exception ignored) { return fallback }
+            }
+            poListCount = pending.size()
+            poListPageSize = Math.min(100, Math.max(1, positiveInt(ec.web.requestParameters.pageSize, 10)))
+            poListPageMaxIndex = Math.max(0, (int)Math.ceil(poListCount / (double)poListPageSize) - 1)
+            poListPageIndex = Math.min(poListPageMaxIndex, positiveInt(ec.web.requestParameters.pageIndex, 0))
+            poListPageRangeLow = poListPageIndex * poListPageSize + 1
+            poListPageRangeHigh = Math.min(poListCount, (poListPageIndex + 1) * poListPageSize)
+            poList = pending.subList(Math.min(poListCount, poListPageIndex * poListPageSize), poListPageRangeHigh)
+        ]]></script>
 
         <!-- XF-002: options for the direct-receive dialog (org-scoped). -->
         <entity-find entity-name="mantle.product.Product" list="prodList">
-            <econdition field-name="ownerPartyId" from="activeOrgId" ignore-if-empty="true"/>
+            <econdition field-name="ownerPartyId" from="activeOrgId"/>
             <order-by field-name="productName"/>
         </entity-find>
         <entity-find entity-name="mantle.facility.Facility" list="facilityList">
-            <econdition field-name="ownerPartyId" from="activeOrgId" ignore-if-empty="true"/>
+            <econdition field-name="ownerPartyId" from="activeOrgId"/>
             <order-by field-name="facilityName"/>
         </entity-find>
 
         <!-- XF-002 f/u: stock transfers shipped to this org's stores and awaiting receipt (incoming stock). -->
         <entity-find entity-name="zenith.erp.inventory.StockTransferView" list="inTransitList">
-            <econdition field-name="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+            <econdition field-name="organizationPartyId" from="activeOrgId"/>
             <econdition field-name="statusId" value="StxInTransit"/>
             <order-by field-name="-transferDate"/>
         </entity-find>
+
+        <script><![CDATA[
+            // Escape every request/database value before embedding the presentation-only GET controls.
+            receivingOrderNoun = poListCount == 1 ? 'order' : 'orders'
+            def html = { value -> (value == null ? '' : value.toString()).replace('&','&amp;').replace('<','&lt;').replace('>','&gt;').replace('"','&quot;').replace("'",'&#39;') }
+            def selected = { value, expected -> value == expected ? ' selected' : '' }
+            def suppliers = ec.entity.find('mantle.party.PartyDetailAndRole').condition('ownerPartyId', activeOrgId).condition('roleTypeId','Supplier').orderBy('organizationName,partyId').list()
+            def supplierOptions = '<option value="">Select supplier</option>' + suppliers.unique { it.partyId }.collect { '<option value="' + html(it.partyId) + '"' + selected(receiptSearch.vendorPartyId,it.partyId) + '>' + html(it.organizationName ?: [it.firstName,it.lastName].findAll { it }.join(' ')) + '</option>' }.join('')
+            def statusOptions = '<option value="">Select status</option>' + ['Approved','Completed','Partial'].collect { '<option' + selected(receivingStatus,it) + '>' + it + '</option>' }.join('')
+            def fromDate = receiptSearch.entryDate_from?.take(10) ?: ''
+            def toDate = receiptSearch.entryDate_thru?.take(10) ?: ''
+            def sortValue = ec.web.requestParameters.orderByField?.toString() ?: '-entryDate'
+            def sortOptions = ['-entryDate':'Newest first','entryDate':'Oldest first','orderId':'Order number ascending','-orderId':'Order number descending'].collect { key, title -> '<option value="' + key + '"' + selected(sortValue,key) + '>' + title + '</option>' }.join('')
+            receivingFilterHtml = """<section class="receiving-filters" aria-labelledby="receiving-filters-title">
+<div class="receiving-filter-heading"><h2 id="receiving-filters-title"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M3 4h18l-7 8v8l-4 1v-9z"/></svg> Filters</h2><a class="receiving-secondary" href="FindReceipt">↶ &nbsp;Clear Filters</a></div>
+<form id="ReceivingFilters" action="FindReceipt" method="get"><input type="hidden" name="pageSize" value="${poListPageSize}"/>
+<div class="receiving-filter-grid">
+<label for="receiving-order">Order #<input id="receiving-order" name="orderId" value="${html(receiptSearch.orderId)}" placeholder="Search order #..."/></label>
+<label for="receiving-date-from">Date From<input id="receiving-date-from" name="entryDate_from" type="date" value="${html(fromDate)}"/></label>
+<label for="receiving-date-to">Date To<input id="receiving-date-to" name="entryDate_thru" type="date" value="${html(toDate)}"/></label>
+<label for="receiving-supplier">Supplier<select id="receiving-supplier" name="vendorPartyId">${supplierOptions}</select></label>
+<label for="receiving-status">Status<select id="receiving-status" name="receivingStatus">${statusOptions}</select></label></div>
+<div class="receiving-filter-bottom"><details><summary>More Filters</summary><div class="receiving-more-grid"><label for="receiving-match">Order number match<select id="receiving-match" name="orderId_op"><option value="contains"${selected(receiptSearch.orderId_op ?: 'contains','contains')}>Contains</option><option value="equals"${selected(receiptSearch.orderId_op,'equals')}>Exact match</option></select></label><label for="receiving-sort">Sort by<select id="receiving-sort" name="orderByField">${sortOptions}</select></label></div></details><div class="receiving-filter-buttons"><button type="reset" class="receiving-secondary">Cancel</button><button type="submit" class="receiving-apply"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="10" cy="10" r="6"/><path d="m15 15 5 5"/></svg> Apply Filters</button></div></div></form></section>"""
+            def parameters = [:] + receiptSearch
+            parameters.remove('pageNoLimit'); parameters.orderByField = sortValue
+            if (receivingStatus) parameters.receivingStatus = receivingStatus
+            def hiddenInputs = parameters.collect { key, value -> '<input type="hidden" name="' + html(key) + '" value="' + html(value) + '"/>' }.join('')
+            def pageLink = { index -> 'FindReceipt?' + (parameters + [pageSize:poListPageSize,pageIndex:index]).collect { key,value -> java.net.URLEncoder.encode(key.toString(),'UTF-8') + '=' + java.net.URLEncoder.encode(value.toString(),'UTF-8') }.join('&amp;') }
+            def pageSizes = ([10,20,50,100] + poListPageSize).unique().sort().collect { '<option' + selected(poListPageSize,it) + '>' + it + '</option>' }.join('')
+            def previous = poListPageIndex > 0 ? '<a class="receiving-page-arrow" aria-label="Previous page" href="' + pageLink(poListPageIndex-1) + '">‹</a>' : '<button class="receiving-page-arrow" aria-label="Previous page" disabled>‹</button>'
+            def next = poListPageIndex < poListPageMaxIndex ? '<a class="receiving-page-arrow" aria-label="Next page" href="' + pageLink(poListPageIndex+1) + '">›</a>' : '<button class="receiving-page-arrow" aria-label="Next page" disabled>›</button>'
+            receivingPaginationHtml = '<div class="receiving-pagination"><form action="FindReceipt" method="get">' + hiddenInputs + '<label for="receiving-page-size">Rows per page:</label><select id="receiving-page-size" name="pageSize" onchange="this.form.requestSubmit()">' + pageSizes + '</select><noscript><button type="submit">Update</button></noscript></form><span>' + (poListCount ? poListPageRangeLow : 0) + '–' + poListPageRangeHigh + ' of ' + poListCount + '</span>' + previous + next + '</div>'
+            def csvCell = { value -> def text = value == null ? '' : value.toString(); if (text ==~ /^[=+@\-].*/) text = "'" + text; '"' + text.replace('"','""') + '"' }
+            receivingCsvText = ([['Order #','Order Date','Supplier','Items','Expected Qty','Status']] + receivingExportRows).collect { row -> row.collect(csvCell).join(',') }.join('\r\n')
+            receivingExportHref = html(sri.getScreenUrlInstance().cloneUrlInstance().addParameter('renderMode','csv').addParameter('lastStandalone','true').addParameter('saveFilename','receiving-orders.csv').pathWithParams)
+        ]]></script>
     </actions>
 
     <widgets>
-        <container style="q-mb-md">
-            <label text="Receiving (Incoming Stock)" type="h3" style="text-primary text-weight-bold q-my-none"/>
-            <label text="Record incoming stock — from a purchase order, a supplier delivery with no PO, or a branch / inter-state transfer." type="p" style="text-grey-7 q-mt-sm q-mb-none"/>
+        <render-mode><text type="csv"><![CDATA[${receivingCsvText}]]></text></render-mode>
+        <section name="ReceivingPage">
+        <condition><expression>ec.web.requestParameters.renderMode != 'csv'</expression></condition>
+        <widgets>
+        <render-mode><text type="html,qvt,vuet"><![CDATA[<link rel="stylesheet" href="/zenithstatic/css/receiving-stock.css?v=14"/>]]></text></render-mode>
+        <container id="receivingStocks" style="receiving-page">
+        <container style="receiving-header">
+            <label text="Receiving (Incoming Stock)" type="h1" style="receiving-title"/>
+            <label text="Record incoming stock — from a purchase order, a supplier delivery with no PO, or a branch / inter-state transfer." type="p" style="receiving-subtitle"/>
         </container>
 
-        <!-- XF-002: the primary, always-available Save/Receive action — a prominent call-to-action at the top
-             (not tucked in the header) so it can't be missed. No purchase order required. -->
         <section name="DirectReceiveToolbar">
-            <condition><expression>invCanWrite</expression></condition>
-            <widgets>
-                <container style="zenith-card bg-green-1 border-radius-lg q-pa-md q-mb-md">
-                    <label text="Receive stock now" type="h6" style="text-weight-bold text-grey-9 q-mt-none q-mb-xs"/>
-                    <label text="Goods just arrived? Record them straight into a store — with or without a purchase order — and they appear in Stock Levels immediately." type="p" style="text-grey-7 q-mb-md"/>
-                    <container-dialog id="DirectReceiveDialog" button-text="Receive Stock Directly" button-class="btn btn-success btn-lg text-weight-bold">
+            <condition><expression>invCanWrite &amp;&amp; activeOrgId != '__NO_ORGANIZATION__'</expression></condition>
+            <widgets><container style="receiving-header-action">
+                    <container-dialog id="DirectReceiveDialog" button-text="Receive Stock Directly" button-class="receiving-primary" button-icon="add">
                         <label text="Receive Stock Directly (no purchase order)" type="h5" style="text-primary text-weight-bold q-mb-xs"/>
                         <label text="Use this when goods arrive without a matching purchase order — opening stock, a walk-in supplier delivery, or a branch transfer. The quantity is added to the chosen store and shows immediately in Stock Levels." type="p" style="text-grey-7 q-mb-md"/>
                         <form-single name="DirectReceiveForm" transition="receiveDirectStock">
@@ -118,119 +206,71 @@
                             <field name="submitButton"><default-field title="Receive into stock"><submit text="Receive Stock" icon="login"/></default-field></field>
                         </form-single>
                     </container-dialog>
-                </container>
-            </widgets>
+            </container></widgets>
         </section>
+        <render-mode><text type="html,qvt,vuet"><![CDATA[${receivingFilterHtml}]]></text></render-mode>
 
-        <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md">
-            <label text="Orders waiting to be received (purchase orders)" type="h5" style="text-primary text-weight-bold q-mb-md border-bottom q-pb-sm"/>
+        <container style="receiving-orders ${poListPageMaxIndex == 0 ? 'receiving-single-page' : ''}">
+            <container style="receiving-orders-heading">
+                <label text="Orders waiting to be received (Purchase Orders)" type="h2" style="receiving-orders-title"/>
+                <render-mode><text type="html,qvt,vuet"><![CDATA[<div class="receiving-orders-tools"><span>Total: ${poListCount} ${receivingOrderNoun}</span><a class="receiving-secondary receiving-export" href="${receivingExportHref}" download="receiving-orders.csv"><span aria-hidden="true">↓</span> Export</a></div>]]></text></render-mode>
+            </container>
             
+            <container style="receiving-table-scroll">
             <form-list name="FindPendingReceiptsList" list="poList" skip-form="true" show-csv-button="false">
                 <row-actions>
-                    <entity-find-one entity-name="mantle.party.PartyDetail" value-field="vendorParty">
-                        <field-map field-name="partyId" from="vendorPartyId"/>
-                    </entity-find-one>
-                    <set field="statusColor" from="statusColorMap[statusId] ?: 'dark'"/>
+                    <set field="receiptView" from="receivingViewByOrder[orderId]"/>
                 </row-actions>
-
-                <field name="orderId">
-                    <header-field title="Order #" show-order-by="true"><text-find hide-options="true" size="12"/></header-field>
-                    <default-field><label text="${orderId}" type="strong"/></default-field>
-                </field>
-
-                <!-- XF-001: Receive action promoted to column 2 so it is ALWAYS visible. The wide
-                     filter header made the table overflow, pushing the last column (the action) off
-                     the right edge — which is why testers reported "no Save/Receive action". -->
+                <field name="rowNumber"><header-field title="#"/><default-field><label text="${receiptView.rowNumber}"/></default-field></field>
+                <field name="orderId"><header-field title="Order #" show-order-by="true"/><default-field><label text="${orderId}"/></default-field></field>
+                <field name="entryDate"><header-field title="Order Date" show-order-by="true"/><default-field><label text="${ec.l10n.format(entryDate, 'dd MMM yyyy')}"/></default-field></field>
+                <field name="vendorPartyId"><header-field title="Supplier"/><default-field><label text="${receiptView.supplier}"/></default-field></field>
+                <field name="itemCount"><header-field title="Items"/><default-field><label text="${receiptView.itemCount}"/></default-field></field>
+                <field name="expectedQuantity"><header-field title="Expected Qty"/><default-field><label text="${ec.l10n.format(receiptView.expectedQuantity, '#,##0.######')}"/></default-field></field>
+                <field name="receiptStatus"><header-field title="Status"/><default-field><label text="${receiptView.status}" type="span" style="receiving-status ${receiptView.statusClass}"/></default-field></field>
                 <field name="receiveAction">
                     <header-field title="Action"/>
-                    <!-- ZE-INV-010 (IV-110): the Receive action only for users with full Inventory write access;
-                         XF-001: was a faint flat text link that testers missed — now a solid, labelled button. -->
                     <conditional-field name="receive_write" condition="invCanWrite">
-                        <link url="receiveInventory" text="Receive Stock" parameter-map="[orderId:orderId]" icon="login" btn-type="primary" style="text-weight-bold"/>
+                        <link url="receiveInventory" text="Receive Stock" parameter-map="[orderId:orderId]" btn-type="primary" style="receiving-receive-link"/>
                     </conditional-field>
                     <default-field><label text="View only" type="span" style="text-grey-6 text-caption"/></default-field>
                 </field>
-
-                <field name="orderDate">
-                    <header-field title="Order Date" show-order-by="true"><date-find/></header-field>
-                    <default-field><label text="${ec.l10n.format(orderDate, 'dd MMM yyyy')}" type="span" style="text-dark"/></default-field>
-                </field>
-
-                <field name="vendorPartyId">
-                    <header-field title="Supplier">
-                        <drop-down allow-empty="true">
-                            <entity-options key="${partyId}" text="${organizationName?:firstName} ${lastName?:''} [${partyId}]">
-                                <entity-find entity-name="mantle.party.PartyDetailAndRole">
-                                    <econdition field-name="roleTypeId" value="Supplier"/>
-                                    <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
-                                </entity-find>
-                            </entity-options>
-                        </drop-down>
-                    </header-field>
-                    <default-field><label text="${vendorParty?.organizationName ?: (vendorParty?.firstName ?: '') + ' ' + (vendorParty?.lastName ?: '')}" type="span" style="text-dark"/></default-field>
-                </field>
-
-                <field name="statusId">
-                    <header-field title="Status"/>
-                    <default-field>
-                        <label text="${statusId ? statusId.replace('Order', '') : 'Approved'}" type="span" style="zenith-badge ${statusColor}"/>
-                    </default-field>
-                </field>
-                
-                <field name="findButton"><header-field title="Find"><submit/></header-field></field>
             </form-list>
+            </container>
+            <render-mode><text type="html,qvt,vuet"><![CDATA[${receivingPaginationHtml}]]></text></render-mode>
 
             <!-- XF-001: guide the user when nothing is waiting, instead of a bare filter with no visible action. -->
             <section name="NoOrdersWaiting">
                 <condition><expression>!poList</expression></condition>
                 <widgets>
-                    <container style="text-center q-pa-xl">
-                        <label text="No purchase orders are waiting to be received right now." type="h6" style="text-grey-8 text-weight-bold q-mb-xs"/>
-                        <label text="Approve a purchase order in the Purchase module and it shows up here — or use the green “Receive stock now” box above to record incoming goods that have no purchase order." type="p" style="text-grey-6 q-mb-none"/>
+                    <container style="receiving-empty">
+                        <render-mode><text type="html,qvt,vuet"><![CDATA[
+<svg class="receiving-empty-art" viewBox="0 0 150 110" fill="none" aria-hidden="true">
+  <g stroke="currentColor" stroke-width="2" opacity=".3"><path d="M22 44v8m-4-4h8M128 58v8m-4-4h8M120 18v6m-3-3h6M40 9v6m-3-3h6"/></g>
+  <rect x="48" y="23" width="55" height="68" rx="10" fill="var(--primary-light)" stroke="currentColor" stroke-opacity=".25" stroke-width="2"/>
+  <rect x="61" y="15" width="30" height="14" rx="6" fill="currentColor" opacity=".35"/>
+  <circle cx="76" cy="14" r="5" fill="currentColor" opacity=".35"/>
+  <g fill="currentColor" opacity=".3"><circle cx="62" cy="44" r="4"/><circle cx="62" cy="59" r="4"/><circle cx="62" cy="74" r="4"/><rect x="73" y="41" width="20" height="5" rx="2"/><rect x="73" y="56" width="20" height="5" rx="2"/><rect x="73" y="71" width="17" height="5" rx="2"/></g>
+  <circle cx="108" cy="76" r="15" fill="var(--white)" fill-opacity=".8" stroke="currentColor" stroke-opacity=".5" stroke-width="5"/>
+  <path d="m120 87 12 12" stroke="currentColor" stroke-opacity=".5" stroke-width="6" stroke-linecap="round"/>
+</svg>]]></text></render-mode>
+                        <label text="No purchase orders are waiting to be received right now." type="h3" style="receiving-empty-title"/>
+                        <label text="Approve a purchase order in the Purchase module and it shows up here — or select “Receive Stock Directly” above to record incoming goods that have no purchase order." type="p" style="receiving-empty-description"/>
                     </container>
                 </widgets>
             </section>
         </container>
 
-        <!-- XF-002 f/u: incoming STOCK TRANSFERS (branch / inter-state moves) awaiting receipt at this org's
-             stores — shown here so all "incoming stock" lives in one place, with a Receive action + a link
-             to the full Stock Transfers screen. Section only renders when something is actually in transit. -->
-        <section name="InTransitTransfers">
-            <condition><expression>inTransitList</expression></condition>
-            <widgets>
-                <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md q-mt-lg">
-                    <label text="Stock transfers on the way to your stores" type="h5" style="text-primary text-weight-bold q-mb-xs border-bottom q-pb-sm"/>
-                    <label text="These were shipped from another of your warehouses (a branch or inter-state move) and are waiting to be received. Receiving adds the stock to the destination store." type="p" style="text-grey-7 q-mb-md"/>
-                    <form-list name="InTransitList" list="inTransitList" skip-form="true" show-csv-button="false">
-                        <field name="transferNumber">
-                            <default-field title="Transfer #">
-                                <link url="../EditStockTransfer" text="${transferNumber ?: stockTransferId}" parameter-map="[stockTransferId:stockTransferId]" style="text-indigo-8 text-weight-bold"/>
-                            </default-field>
-                        </field>
-                        <field name="recvAction">
-                            <header-field title="Action"/>
-                            <conditional-field name="recv_write" condition="invCanWrite">
-                                <link url="receiveTransfer" text="Receive Transfer" parameter-map="[stockTransferId:stockTransferId]" icon="login"
-                                      btn-type="primary" style="text-weight-bold"
-                                      confirmation="Receive this transfer? The stock will be added to the destination store."/>
-                            </conditional-field>
-                            <default-field><label text="View only" type="span" style="text-grey-6 text-caption"/></default-field>
-                        </field>
-                        <field name="fromFacilityName"><default-field title="From"><display/></default-field></field>
-                        <field name="toFacilityName"><default-field title="To (destination)"><display/></default-field></field>
-                        <field name="transferDate"><default-field title="Shipped"><display format="dd MMM yyyy"/></default-field></field>
-                        <field name="totalValue"><default-field title="Value"><display format="#,##,##0.00"/></default-field></field>
-                        <field name="igstInvoiceId"><default-field title="Inter-state">
-                            <label text="IGST ${igstInvoiceId}" type="span" style="zenith-badge warning" condition="igstInvoiceId"/>
-                        </default-field></field>
-                    </form-list>
-                </container>
-            </widgets>
-        </section>
-
         <!-- Always-visible pointer so the transfer-receive path is discoverable even with nothing in transit. -->
-        <container style="q-mt-md q-mb-lg">
+        <container style="receiving-transfer-link">
             <link url="../StockTransfers" text="Receiving a branch or inter-state transfer? Open Stock Transfers →" link-type="anchor" style="text-primary text-weight-bold"/>
         </container>
+        <container style="receiving-footer">
+            <label text="© 2024-${ec.l10n.format(ec.user.nowTimestamp, 'yyyy')} ZetaERP · Cloud ERP Platform" type="span"/>
+            <render-mode><text type="html,qvt,vuet"><![CDATA[<a href="mailto:support@zetaclantech.com">Support</a>]]></text></render-mode>
+        </container>
+        </container>
+        </widgets>
+        </section>
     </widgets>
 </screen>
