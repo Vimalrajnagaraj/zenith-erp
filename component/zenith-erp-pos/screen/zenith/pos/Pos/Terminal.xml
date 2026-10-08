@@ -1599,54 +1599,90 @@
         <default-response type="none"/>
     </transition>
 
-    <transition name="setCustomer" begin-transaction="true">
+    <!-- Changing a destination after lines/tenders exist must never silently retax a bill. -->
+    <transition name="setCustomer" method="post" begin-transaction="true">
         <actions><script><![CDATA[
             def txId = ec.web.parameters.transactionId
             def cpid = ec.web.parameters.customerPartyId
             if (!txId || !cpid) { ec.web.sendJsonResponse([success:false, error:'Missing customer or bill']); return }
-            def txn = ec.entity.find("zenith.erp.pos.PosTransaction").condition("transactionId", txId).one()
-            if (!txn) { ec.web.sendJsonResponse([success:false, error:'No open bill — add an item first']); return }
-            if (txn.statusId != 'PtCreated') { ec.web.sendJsonResponse([success:false, error:'This bill is already finalized']); return }
-            // Org isolation: a customer may only be attached to a bill of the same organization.
-            def custParty = ec.entity.find("mantle.party.Party").condition("partyId", cpid).one()
-            if (txn.organizationPartyId && custParty?.ownerPartyId && custParty.ownerPartyId != txn.organizationPartyId) {
-                ec.web.sendJsonResponse([success:false, error:'That customer belongs to a different organization']); return }
-            def pdr = ec.entity.find("mantle.party.PartyDetailAndRole").condition("partyId", cpid).limit(1).list()
-            def nm = null
-            if (pdr) { def r = pdr[0]; nm = (r.organizationName ?: (((r.firstName ?: '') + ' ' + (r.lastName ?: '')).trim())) }
-            if (!nm) { def per = ec.entity.find("mantle.party.Person").condition("partyId", cpid).one()
-                if (per) nm = (((per.firstName ?: '') + ' ' + (per.lastName ?: '')).trim())
-                else nm = ec.entity.find("mantle.party.Organization").condition("partyId", cpid).one()?.organizationName }
-            nm = nm ?: cpid
-            def phone = null
-            def pcms = ec.entity.find("mantle.party.contact.PartyContactMech").condition("partyId", cpid).conditionDate("fromDate","thruDate", ec.user.nowTimestamp).list()
-            for (pcm in pcms) {
-                def tn = ec.entity.find("mantle.party.contact.TelecomNumber").condition("contactMechId", pcm.contactMechId).one()
-                if (tn) { phone = ((tn.countryCode ? ('+' + tn.countryCode + ' ') : '') + (tn.areaCode ?: '') + ' ' + (tn.contactNumber ?: '')).replaceAll("\\s+", " ").trim(); if (phone) break }
-            }
-            def registration = ec.service.sync().name("zenith.tax.TaxServices.get#PartyTaxRegistration").parameter("partyId",cpid).call()
+            def access = ec.service.sync().name('zenith.pos.PosAccessServices.assert#PosAccess')
+                .parameters([transactionId:txId,customerPartyId:cpid]).call()
+            if (!access?.allowed) { ec.web.sendJsonResponse([success:false,error:'Customer or bill unavailable in this organization.']); return }
+            def txn = ec.entity.find('zenith.erp.pos.PosTransaction').condition('transactionId',txId).forUpdate(true).one()
+            if (txn.statusId != 'PtCreated') { ec.web.sendJsonResponse([success:false,error:'This bill is already finalized']); return }
+            def registration = ec.service.sync().name('zenith.tax.TaxServices.get#PartyTaxRegistration').parameter('partyId',cpid).call()
+            if (ec.message.hasError()) { ec.web.sendJsonResponse([success:false,error:'Customer tax registration is unavailable.']); return }
             def destination = registration?.regionGeoId ?: txn.originRegionGeoId
+            def currentDestination = txn.destinationRegionGeoId ?: txn.originRegionGeoId
+            boolean hasContents = txn.transactionNumber || ((txn.paidAmount ?: 0) > 0) ||
+                ec.entity.find('zenith.erp.pos.PosTransactionItem').condition('transactionId',txId).count() > 0 ||
+                ec.entity.find('zenith.erp.pos.PosPayment').condition('transactionId',txId).count() > 0
+            if (destination != currentDestination && hasContents) {
+                ec.web.sendJsonResponse([success:false,error:'Choose a different tax destination before adding items or taking payment. Start a new bill to change it.']); return
+            }
+            def details = ec.entity.find('mantle.party.PartyDetailAndRole').condition('partyId',cpid).limit(1).list()
+            def person = details ? details[0] : null
+            def name = person?.organizationName ?: (((person?.firstName ?: '')+' '+(person?.lastName ?: '')).trim()) ?: cpid
+            def phone = null
+            def mechanisms = ec.entity.find('mantle.party.contact.PartyContactMech').condition('partyId',cpid)
+                .conditionDate('fromDate','thruDate',ec.user.nowTimestamp).list()
+            for (mechanism in mechanisms) {
+                def number = ec.entity.find('mantle.party.contact.TelecomNumber').condition('contactMechId',mechanism.contactMechId).one()
+                if (number) { phone = ((number.countryCode ? ('+'+number.countryCode+' ') : '')+(number.areaCode ?: '')+' '+(number.contactNumber ?: '')).replaceAll('\\s+',' ').trim(); if (phone) break }
+            }
             def gstin = registration?.registrationNumber
-            ec.service.sync().name("update#zenith.erp.pos.PosTransaction")
-                .parameters([transactionId:txId, customerPartyId:cpid, customerName:nm, customerPhone:phone, customerGstin:gstin, customerTaxRegNumber:gstin, destinationRegionGeoId:destination]).call()
-            ec.service.sync().name("zenith.pos.PosServices.refresh#PosTransactionTax").parameters([transactionId:txId, taxOn:ec.web.parameters.taxOn]).call()
-            ec.web.sendJsonResponse([success:true, customer:nm, customerPhone:(phone ?: ''), customerPartyId:cpid, customerGstin:(gstin ?: '')])
-        ]]></script></actions>
-        <default-response type="none"/>
+            ec.service.sync().name('update#zenith.erp.pos.PosTransaction').parameters([
+                transactionId:txId,customerPartyId:cpid,customerName:name,customerPhone:phone,
+                customerGstin:gstin,customerTaxRegNumber:gstin,destinationRegionGeoId:destination]).call()
+            if (ec.message.hasError()) { ec.web.sendJsonResponse([success:false,error:'Customer could not be changed.']); return }
+            ec.web.sendJsonResponse([success:true,customer:name,customerPhone:phone ?: '',customerPartyId:cpid,customerGstin:gstin ?: ''])
+        ]]></script></actions><default-response type="none"/>
     </transition>
-
-    <transition name="clearCustomer" begin-transaction="true">
+    <transition name="clearCustomer" method="post" begin-transaction="true">
         <actions><script><![CDATA[
             def txId = ec.web.parameters.transactionId
-            def v = txId ? ec.entity.find("zenith.erp.pos.PosTransaction").condition("transactionId", txId).one() : null
-            if (v && v.statusId == 'PtCreated') {
-                v.customerPartyId = null; v.customerName = null; v.customerPhone = null
-                v.customerGstin = null; v.customerTaxRegNumber = null; v.destinationRegionGeoId = v.originRegionGeoId; v.update()
-                ec.service.sync().name("zenith.pos.PosServices.refresh#PosTransactionTax").parameters([transactionId:txId,taxOn:ec.web.parameters.taxOn]).call()
+            if (!txId) { ec.web.sendJsonResponse([success:false,error:'Missing bill']); return }
+            def access = ec.service.sync().name('zenith.pos.PosAccessServices.assert#PosAccess').parameter('transactionId',txId).call()
+            if (!access?.allowed) { ec.web.sendJsonResponse([success:false,error:'Bill unavailable in this organization.']); return }
+            def txn = ec.entity.find('zenith.erp.pos.PosTransaction').condition('transactionId',txId).forUpdate(true).one()
+            if (txn.statusId != 'PtCreated') { ec.web.sendJsonResponse([success:false,error:'This bill is already finalized']); return }
+            boolean hasContents = txn.transactionNumber || ((txn.paidAmount ?: 0) > 0) ||
+                ec.entity.find('zenith.erp.pos.PosTransactionItem').condition('transactionId',txId).count() > 0 ||
+                ec.entity.find('zenith.erp.pos.PosPayment').condition('transactionId',txId).count() > 0
+            if ((txn.destinationRegionGeoId ?: txn.originRegionGeoId) != txn.originRegionGeoId && hasContents) {
+                ec.web.sendJsonResponse([success:false,error:'Start a new bill to clear a customer with a different tax destination. Existing bill amounts are preserved.']); return
             }
-            ec.web.sendJsonResponse([success:true, customer:'', customerPhone:'', customerPartyId:''])
-        ]]></script></actions>
-        <default-response type="none"/>
+            txn.customerPartyId = null; txn.customerName = null; txn.customerPhone = null
+            txn.customerGstin = null; txn.customerTaxRegNumber = null; txn.destinationRegionGeoId = txn.originRegionGeoId; txn.update()
+            ec.web.sendJsonResponse([success:true,customer:'',customerPhone:'',customerPartyId:''])
+        ]]></script></actions><default-response type="none"/>
+    </transition>
+    <!-- Ownership resolution reads metadata only; it does not import, retax or settle a sale. -->
+    <transition name="resolveLegacyOfflineScope" method="post">
+        <actions><script><![CDATA[
+            def access = ec.service.sync().name('zenith.pos.PosAccessServices.assert#PosAccess').call()
+            if (!access?.allowed || ec.web.parameters.organizationPartyId != access.organizationPartyId) {
+                ec.web.response.setStatus(403); ec.web.sendJsonResponse([eligibleIds:[]]); return
+            }
+            def candidates
+            try { candidates = new groovy.json.JsonSlurper().parseText(ec.web.parameters.candidates ?: '[]') }
+            catch (Exception ignored) { ec.web.response.setStatus(400); ec.web.sendJsonResponse([eligibleIds:[]]); return }
+            if (!(candidates instanceof List) || candidates.size() > 200) {
+                ec.web.response.setStatus(400); ec.web.sendJsonResponse([eligibleIds:[]]); return
+            }
+            def eligible = []
+            for (candidate in candidates) {
+                if (!(candidate instanceof Map) || !(candidate.offlineId instanceof String) || !candidate.offlineId || candidate.offlineId.length() > 255 ||
+                    !(candidate.sessionId instanceof String) || !(candidate.terminalId instanceof String)) continue
+                if (candidate.organizationPartyId && candidate.organizationPartyId != access.organizationPartyId) continue
+                def session = ec.entity.find('zenith.erp.pos.PosSession').condition('sessionId',candidate.sessionId)
+                    .condition('organizationPartyId',access.organizationPartyId).one()
+                def terminal = ec.entity.find('zenith.erp.pos.PosTerminal').condition('terminalId',candidate.terminalId)
+                    .condition('organizationPartyId',access.organizationPartyId).one()
+                if (session && terminal && session.terminalId == terminal.terminalId) eligible.add(candidate.offlineId)
+            }
+            ec.web.sendJsonResponse([organizationPartyId:access.organizationPartyId,eligibleIds:eligible.unique()])
+        ]]></script></actions><default-response type="none"/>
     </transition>
 
     <transition name="closeSession" begin-transaction="true">
@@ -4396,7 +4432,7 @@
 
 
                         </form-single>
-                        <render-mode><text type="html,qvt" template="true"><![CDATA[<img src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" alt="" style="display:none" onload="try{if(location.pathname.indexOf('/qapps/')===0){location.replace(location.href.replace('/qapps/','/apps/'));}}catch(e){}"/><div style="text-align:center;margin-top:18px"><button id="pos-history-btn-ns" type="button" onclick="window.posOpenHistory&amp;&amp;window.posOpenHistory()" style="padding:10px 24px;border-radius:8px;font-size:14px;font-weight:bold;cursor:pointer;background:#7C3AED;color:#fff;border:1px solid #A78BFA">&#128196; View Bill History<span style="margin-left:7px;padding:1px 6px;border:1px solid rgba(255,255,255,0.7);border-radius:4px;font-size:11px;font-weight:700;opacity:0.9">F9</span></button></div><script src="/zenithstatic/js/pos-terminal.js?v=153"></script>]]></text></render-mode>
+                        <render-mode><text type="html,qvt" template="true"><![CDATA[<img src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" alt="" style="display:none" onload="try{if(location.pathname.indexOf('/qapps/')===0){location.replace(location.href.replace('/qapps/','/apps/'));}}catch(e){}"/><div style="text-align:center;margin-top:18px"><button id="pos-history-btn-ns" type="button" onclick="window.posOpenHistory&amp;&amp;window.posOpenHistory()" style="padding:10px 24px;border-radius:8px;font-size:14px;font-weight:bold;cursor:pointer;background:#7C3AED;color:#fff;border:1px solid #A78BFA">&#128196; View Bill History<span style="margin-left:7px;padding:1px 6px;border:1px solid rgba(255,255,255,0.7);border-radius:4px;font-size:11px;font-weight:700;opacity:0.9">F9</span></button></div><script src="/zenithstatic/js/pos-terminal.js?v=154"></script>]]></text></render-mode>
 
 
 
@@ -6870,7 +6906,7 @@ body.Terminal .nb-layout:hover{background:#F4F7FC}
 <script src="https://cdn.jsdelivr.net/npm/qz-tray@2.2.4/qz-tray.js"></script>
 
 
-<script src="/zenithstatic/js/pos-terminal.js?v=153"></script>
+<script src="/zenithstatic/js/pos-terminal.js?v=154"></script>
 
 
 

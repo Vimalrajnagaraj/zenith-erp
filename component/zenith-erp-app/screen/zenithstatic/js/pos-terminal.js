@@ -136,7 +136,7 @@ window._posOffline = (function() {
     var orgScope=afScope && afScope.querySelector('[name=posOrganizationPartyId]');
     var orgFallback=document.getElementById('pos-offline-org');
     var orgId=orgScope ? orgScope.value : (orgFallback ? orgFallback.value : '');
-    // Legacy unscoped queues remain untouched; only this tenant's new database is opened.
+    // New queues are per organization; verified legacy sales are copied without changing amounts.
     var DBN = 'ZenithPosOffline-'+encodeURIComponent(orgId), DBV = 1, db = null;
     var catalog = {};   // productId -> {productId,name,price,uom,taxCode,barcode}
     var cart = [];
@@ -147,6 +147,102 @@ window._posOffline = (function() {
     function f2(x){ return Number(x||0).toFixed(2); }
     function tCtx(){ var af=document.getElementById('cartInlineAddForm'); function v(n){ var el=af&&af.querySelector?af.querySelector('[name='+n+']'):null; return el?el.value:''; } var tEl=document.querySelector('input[name=posTerminalId]'); return { sessionId:v('sessionId'), terminalId: tEl?tEl.value:'' }; }
     function openDB(){ if(!orgId) return Promise.reject(new Error('No active POS organization')); return new Promise(function(res,rej){ var rq=indexedDB.open(DBN,DBV); rq.onupgradeneeded=function(e){ var d=e.target.result; if(!d.objectStoreNames.contains('catalog'))d.createObjectStore('catalog',{keyPath:'productId'}); if(!d.objectStoreNames.contains('queue'))d.createObjectStore('queue',{keyPath:'offlineId'}); }; rq.onsuccess=function(e){db=e.target.result;res(db);}; rq.onerror=function(e){rej(e);}; }); }
+    // Copy only sales whose original terminal/session ownership the server verifies.
+    // Original values remain in the legacy DB until that exact sale is acknowledged.
+    var legacyDb = null, legacyCopied = Object.create(null), recoveryInFlight = null;
+    function legacyNotice(show) {
+        var notice = document.getElementById('pos-legacy-offline-notice');
+        if (!notice && show) {
+            notice = document.createElement('div'); notice.id = 'pos-legacy-offline-notice';
+            notice.setAttribute('role','status');
+            notice.style.cssText = 'padding:10px;margin:8px;border:1px solid #b7791f;background:#fffbeb;color:#744210';
+            notice.textContent = 'Older offline sales remain on this device. Verified sales are available in this organization\'s pending queue. Keep this device available for the owner to reconcile any unresolved sales; do not clear browser storage.';
+            var parent = document.querySelector('.pos-cart') || document.body;
+            parent.parentNode.insertBefore(notice,parent);
+        }
+        if (notice) notice.hidden = !show;
+    }
+    function readLegacy() {
+        return new Promise(function(resolve,reject) {
+            if (legacyDb) { read(); return; }
+            var request = indexedDB.open('ZenithPosOffline');
+            // Abort creation if this till never had a legacy database.
+            request.onupgradeneeded = function() { request.transaction.abort(); };
+            request.onerror = function() {
+                if (request.error && request.error.name === 'AbortError') resolve([]);
+                else reject(new Error('Legacy offline storage could not be read'));
+            };
+            request.onblocked = function() { reject(new Error('Legacy offline storage is busy')); };
+            request.onsuccess = function() { legacyDb = request.result; read(); };
+            function read() {
+                if (!legacyDb.objectStoreNames.contains('queue')) { resolve([]); return; }
+                var transaction = legacyDb.transaction('queue','readonly');
+                var rows = transaction.objectStore('queue').getAll();
+                rows.onsuccess = function() { resolve(rows.result || []); };
+                rows.onerror = function() { reject(new Error('Legacy offline queue could not be read')); };
+            }
+        });
+    }
+    function copyVerifiedLegacy(sales) {
+        return ensureDb().then(function(database) {
+            if (!database) throw new Error('Offline storage unavailable');
+            return new Promise(function(resolve,reject) {
+                var copied = [], transaction = database.transaction('queue','readwrite');
+                var store = transaction.objectStore('queue');
+                sales.forEach(function(sale) {
+                    var row = Object.assign({},sale,{organizationPartyId:orgId});
+                    var existing = store.get(row.offlineId);
+                    existing.onsuccess = function() {
+                        // Never overwrite a newer or different sale that happens to reuse the id.
+                        if (!existing.result) { store.add(row); copied.push({id:row.offlineId,source:JSON.stringify(sale)}); }
+                        else if (JSON.stringify(existing.result) === JSON.stringify(row)) copied.push({id:row.offlineId,source:JSON.stringify(sale)});
+                    };
+                });
+                transaction.oncomplete = function() { copied.forEach(function(copy) { legacyCopied[copy.id] = copy.source; }); resolve(copied.length); };
+                transaction.onerror = transaction.onabort = function() { reject(new Error('Legacy sales were not copied')); };
+            });
+        });
+    }
+    function recoverLegacy() {
+        if (recoveryInFlight) return recoveryInFlight;
+        recoveryInFlight = readLegacy().then(function(sales) {
+            legacyNotice(sales.length > 0);
+            if (!sales.length || !navigator.onLine || !orgId) return 0;
+            var token = document.querySelector('[name=moquiSessionToken]');
+            if (!token || !token.value) return 0;
+            var eligible = Object.create(null), batches = [], candidates = sales.filter(function(sale) {
+                return sale && sale.offlineId && sale.sessionId && sale.terminalId && (!sale.organizationPartyId || sale.organizationPartyId === orgId);
+            });
+            for (var i=0;i<candidates.length;i+=200) batches.push(candidates.slice(i,i+200));
+            return batches.reduce(function(previous,batch) {
+                return previous.then(function() {
+                    return fetch('Terminal/resolveLegacyOfflineScope',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+                        moquiSessionToken:token.value,organizationPartyId:orgId,
+                        candidates:JSON.stringify(batch.map(function(sale) { return {offlineId:sale.offlineId,organizationPartyId:sale.organizationPartyId,sessionId:sale.sessionId,terminalId:sale.terminalId}; }))
+                    })}).then(function(response) { if (!response.ok) throw new Error('Legacy ownership could not be verified'); return response.json(); })
+                    .then(function(result) {
+                        if (result.organizationPartyId !== orgId || !Array.isArray(result.eligibleIds)) throw new Error('Organization changed during recovery');
+                        result.eligibleIds.forEach(function(id) { if (batch.some(function(sale) { return sale.offlineId === id; })) eligible[id] = true; });
+                    });
+                });
+            },Promise.resolve()).then(function() { return copyVerifiedLegacy(candidates.filter(function(sale) { return eligible[sale.offlineId]; })); });
+        }).catch(function() { legacyNotice(true); return 0; });
+        return recoveryInFlight.then(function(count) { recoveryInFlight = null; return count; },function(error) { recoveryInFlight = null; throw error; });
+    }
+    function acknowledgeLegacy(ids) {
+        var acknowledged = ids.filter(function(id) { return legacyCopied[id]; });
+        if (!legacyDb || !acknowledged.length) return Promise.resolve();
+        return new Promise(function(resolve,reject) {
+            var transaction = legacyDb.transaction('queue','readwrite'), store = transaction.objectStore('queue');
+            acknowledged.forEach(function(id) {
+                var current = store.get(id);
+                current.onsuccess = function() { if (current.result && JSON.stringify(current.result) === legacyCopied[id]) store.delete(id); };
+            });
+            transaction.oncomplete = function() { acknowledged.forEach(function(id) { delete legacyCopied[id]; }); readLegacy().then(function(rows) { legacyNotice(rows.length > 0); }); resolve(); };
+            transaction.onerror = transaction.onabort = function() { reject(new Error('Acknowledged legacy rows remain on the device')); };
+        });
+    }
+
     function putCatalog(items){ return new Promise(function(res){ if(!db){res(0);return;} var tx=db.transaction(['catalog'],'readwrite'); var s=tx.objectStore('catalog'); s.clear(); catalog={}; items.forEach(function(p){ s.put(p); catalog[p.productId]=p; }); tx.oncomplete=function(){res(items.length);}; tx.onerror=function(){res(0);}; }); }
     function loadCatalog(){ return new Promise(function(res){ if(!db){res();return;} var tx=db.transaction(['catalog'],'readonly'); var rq=tx.objectStore('catalog').getAll(); rq.onsuccess=function(){ catalog={}; (rq.result||[]).forEach(function(p){catalog[p.productId]=p;}); res(); }; rq.onerror=function(){res();}; }); }
     function cacheCatalog(){ return fetch('Terminal/exportPosCatalog',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({terminalId:tCtx().terminalId}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){ var prods=(d.products||[]).map(function(p){ return {productId:p.productId, name:p.productName||p.productId, price:Number(p.listPrice||0), uom:p.uom||'', taxCode:p.taxCode||'', taxRate:p.taxRate, barcode:p.barcode||''}; }); return putCatalog(prods); }).catch(function(){ return 0; }); }
@@ -206,13 +302,13 @@ window._posOffline = (function() {
         var sale={ offlineId:'OFL-'+Date.now()+'-'+Math.floor(Math.random()*100000), organizationPartyId:orgId, taxOn:taxEnabled()?'Y':'N', terminalId:c.terminalId, sessionId:c.sessionId, items:cart.map(function(it){return {productId:it.productId,name:it.name,qty:it.qty,price:it.price,uom:it.uom};}), total:total, taxAmount:cart.reduce(function(a,it){return a+taxAmount(it);},0), roundOff:total-cart.reduce(function(a,it){return a+it.qty*it.price+taxAmount(it);},0), paymentMethod:method, ts:new Date().toISOString() };
         enqueue(sale).then(function(){ printReceipt(sale); cart=[]; render(); banner(true); toast('✔ Sale saved offline ('+method+') — will sync when online','#2e7d32'); }).catch(function(){toast('Sale NOT saved. Keep this cart and retry.','#c62828');}); }
     function removeSynced(ids){ return ensureDb().then(function(d){ if(!d) return; return new Promise(function(res,rej){ var tx=d.transaction(['queue'],'readwrite'); ids.forEach(function(id){tx.objectStore('queue').delete(id);}); tx.oncomplete=function(){res();};tx.onerror=function(){rej(new Error('Queue update failed'));}; }); }); }
-    function sync(){ if(syncing) return Promise.resolve(0); syncing=true; return getQueue().then(function(q){ if(!q.length) return 0; var c=tCtx(), af=document.getElementById('cartInlineAddForm'), tk=af&&af.querySelector('[name=moquiSessionToken]'); var body=JSON.stringify({moquiSessionToken:tk?tk.value:'', terminalId:c.terminalId, transactions:q.map(function(s){return JSON.stringify(s);})}); return fetch('Terminal/syncOfflineTransactions',{method:'POST',headers:{'Content-Type':'application/json'},body:body,credentials:'same-origin'}).then(function(r){if(!r.ok)throw new Error('Sync rejected');return r.json();}).then(function(d){ var ack=Array.isArray(d.syncedIds)?d.syncedIds.filter(function(id){return q.some(function(s){return s.offlineId===id;});}):[]; return removeSynced(ack).then(function(){ if(q.length>ack.length)toast('Some offline sales remain pending. Review and retry.','#c62828'); return ack.length; }); }); }).catch(function(){return 0;}).then(function(n){syncing=false;return n;}); }
+    function sync(){ if(syncing) return Promise.resolve(0); syncing=true; return recoverLegacy().then(function(){ return getQueue(); }).then(function(q){ if(!q.length) return 0; var c=tCtx(), af=document.getElementById('cartInlineAddForm'), tk=af&&af.querySelector('[name=moquiSessionToken]'); var body=JSON.stringify({moquiSessionToken:tk?tk.value:'', terminalId:c.terminalId, transactions:q.map(function(s){return JSON.stringify(s);})}); return fetch('Terminal/syncOfflineTransactions',{method:'POST',headers:{'Content-Type':'application/json'},body:body,credentials:'same-origin'}).then(function(r){if(!r.ok)throw new Error('Sync rejected');return r.json();}).then(function(d){ var ack=Array.isArray(d.syncedIds)?d.syncedIds.filter(function(id){return q.some(function(s){return s.offlineId===id;});}):[]; return removeSynced(ack).then(function(){ return acknowledgeLegacy(ack); }).then(function(){ if(q.length>ack.length)toast('Some offline sales remain pending. Review and retry.','#c62828'); return ack.length; }); }); }).catch(function(){return 0;}).then(function(n){syncing=false;return n;}); }
     // Instant local-first reads against the cached master data (no server round-trip)
     function search(term){ var lc=(term||'').toLowerCase().trim(); if(!lc) return []; var out=[]; for(var k in catalog){ var p=catalog[k]; if((p.name||'').toLowerCase().indexOf(lc)!==-1 || (p.barcode||'').toLowerCase().indexOf(lc)===0 || (p.productId||'').toLowerCase()===lc){ out.push(p); if(out.length>=30) break; } } return out; }
     function lookup(pid){ return catalog[pid] || null; }
     function catalogSize(){ var n=0; for(var k in catalog) n++; return n; }
     function boot(){ if(booted || !orgId || location.pathname.indexOf('/pos/Terminal')<0) return; booted=true;
-        openDB().then(function(){ return loadCatalog(); }).then(function(){ if(navigator.onLine) cacheCatalog(); banner(!navigator.onLine); if(!navigator.onLine) render(); }).catch(function(){toast('Offline storage unavailable. Use online checkout.','#c62828');});
+        openDB().then(function(){ return recoverLegacy(); }).then(function(){ return loadCatalog(); }).then(function(){ if(navigator.onLine) cacheCatalog(); banner(!navigator.onLine); if(!navigator.onLine) render(); }).catch(function(){toast('Offline storage unavailable. Use online checkout.','#c62828');});
         window.addEventListener('offline', function(){ banner(true); render(); });
         window.addEventListener('online', function(){ banner(false); sync().then(function(nn){ if(nn>0) toast('✔ '+nn+' offline sale(s) synced','#2e7d32'); setTimeout(function(){ try{location.reload();}catch(e){} }, nn>0?1600:300); }); });
         // Stale-while-revalidate: refresh the local master-data cache in the background so local reads stay current
@@ -225,7 +321,7 @@ window._posOffline = (function() {
         document.addEventListener('change', function(e){ if(e.target.classList&&e.target.classList.contains('ofl-qi')){ var i=+e.target.dataset.i; var nq=Number(e.target.value); if(!Number.isFinite(nq)||nq<=0){toast('Quantity must be greater than zero. Use remove to delete a line.','#c62828');} else cart[i].qty=nq; render(); } });
     }
     setTimeout(boot, 1500);
-    return { boot:boot, active:active, add:add, scan:scan, sync:sync, render:render, cacheCatalog:cacheCatalog, search:search, lookup:lookup, catalogSize:catalogSize, getQueue:getQueue };
+    return { boot:boot, active:active, add:add, scan:scan, sync:sync, render:render, cacheCatalog:cacheCatalog, search:search, lookup:lookup, catalogSize:catalogSize, getQueue:getQueue, recoverLegacy:recoverLegacy };
 })();
 
 /* === Product Import screen: manual add + search auto-fill + CSV (external JS, so the

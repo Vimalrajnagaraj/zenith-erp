@@ -42,8 +42,10 @@ deployment claim. Never reuse a database containing customer records.
   and count distinct bills for each method, retaining the billing-date filter contract.
 - Preserve recorded partial tenders and held carts at session boundaries.
 - Preserve held sale identity, customer, manual price, line mode and tax toggle.
-- Calculate customer place-of-supply GST without repricing the cart; clearing the
-  customer restores the terminal region. Assert invoice header totals and GST.
+- Choose customer place-of-supply before the first line. Once lines or tenders exist,
+  changing/clearing to a different destination is rejected without changing any rows.
+  Same-destination changes preserve existing line taxes; choosing a customer never
+  calls the tax refresh service. Assert normal new-line GST and invoice headers.
 - Independent, idempotent offline imports, partial acknowledgements, rollback of
   invalid items/money, and preservation of the interactive cart. Browser checks retain
   unacknowledged queue entries after partial/legacy/failed responses, check GST cache
@@ -92,13 +94,18 @@ may be tested on a real tenant. Production database proof is still pending;
 the author's workstation has website access but no configured SSH/database
 connection. Do not mark this requirement passed from a green synthetic CI run.
 
-Before deploying the offline change, preserve any pending legacy
-`ZenithPosOffline` IndexedDB queue on each till. New queues/catalogs are stored in
-an organization-specific database. Legacy data is deliberately retained and is
-not automatically assigned to whoever next logs in; owner-assisted review/import
-must confirm its original terminal, session and collected total. Failed imports
-remain on the device. Validate each till's pending queue before closing its shift.
+Before deploying the offline change, preserve each till's pending legacy
+`ZenithPosOffline` queue. The candidate now resolves each legacy record's original
+terminal/session against the authenticated organization through a POST/CSRF-protected,
+read-only endpoint. Only verified records are copied to the org-specific queue;
+original amounts, tax flags and captured item values are not recalculated. The
+original remains until the server acknowledges that exact verified offline id.
+Foreign, unidentifiable, conflicting, changed or failed records remain on the device
+with a visible owner-recovery notice. No legacy data is assigned to whoever logs in
+next and there is no automatic assumption that an old collected total matches a new
+billing total. Repeated recovery and sync must remain idempotent.
 
-After deployment, use a disposable organization for write acceptance, verify
-both shells and direct PDF permissions, and have the owner validate actual till
-hardware. PR checks passing do not automatically deploy or replace this step.
+The current-master rebase and review fixes require fresh runtime/CI proof. Historical
+reports and run links are not acceptance evidence for the revised head. #54 is not a
+dependency; no SaaS billing protections are reverted here. Pure reference/topbar and
+Tables control changes are being separated from this billing candidate.
