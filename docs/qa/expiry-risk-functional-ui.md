@@ -17,6 +17,8 @@ Scope: Inventory → Expiry Risk (`ExpiryDashboard.xml`) and its receipt/edit, r
 
 The supplied reference guides the header, two cards, four filters, date chips, saved-view controls, export toolbar, table columns, day/status badges, row controls and pager. All counts/dates/identity remain real. The reference's expired rows and zero expired KPI contradict each other; this implementation shows correct independent totals.
 
+Following the user's visual review, the primary accent uses the earlier pages' violet (`#7C3AED`) instead of the initial indigo. Semantic expiry status colors remain separate.
+
 CSS and enhancement scripts are scoped to `#expiryRisk`. Both Bootstrap `/apps` and Quasar `/qapps` have selection, saved columns and native dialogs. Filter submissions navigate with the complete filter state; page-size/sort/chip links retain the relevant state. Wide tables scroll inside their card. Native shell identity and other module navigation stay available. Assets are versioned in ZenithApp.
 
 Browser verification covered a 1537×1023 reference viewport, 768×1024 Bootstrap tablet view and 390×844 Quasar phone view. The phone document remained within the viewport (375 ≤ 390 CSS pixels); its receipt dialog was 311 pixels wide. The tablet document also stayed within its viewport (753 ≤ 768). Search returned the two matching sample lots, select-all/clear worked, and the second-row Edit dialog showed that lot's own ID, date, quantity and value. Browser checks additionally caught and corrected Quasar's swallowed filter submission and missing/native action styling.
