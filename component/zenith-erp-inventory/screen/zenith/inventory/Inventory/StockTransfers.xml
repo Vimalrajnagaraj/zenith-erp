@@ -3,13 +3,15 @@
         xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
         default-menu-title="Stock Transfers" default-menu-index="3">
 
+    <parameter name="quickSearch"/>
+
     <!-- stock-creation: New Transfer is now the full-page ../NewStockTransfer screen (which owns createTransfer). -->
     <transition name="updateTransfer">
         <actions>
             <!-- ZE-INV-IV-06A: block editing another tenant's transfer via a forged list POST -->
             <service-call name="zenith.inventory.InventoryServices.assert#StockTransferAccess" in-map="[stockTransferId:stockTransferId]" out-map="_acc"/>
             <if condition="!_acc.allowed"><return error="true" message="You do not have access to this stock transfer."/></if>
-            <service-call name="update#zenith.erp.inventory.StockTransfer" in-map="context"/>
+            <service-call name="zenith.inventory.StockTransferServices.update#StockTransferLogistics" in-map="context"/>
         </actions>
         <default-response url="."/>
     </transition>
@@ -50,13 +52,32 @@
     </transition>
 
     <actions>
+        <set field="transferOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+        <set field="transferOrg" from="transferOrg &amp;&amp; transferOrg != '_NA_' ? transferOrg : '_NA_'"/>
+        <script><![CDATA[
+            quickTransferIds = []
+            def term = quickSearch?.toString()?.trim()
+            if (term && transferOrg != '_NA_') {
+                def products = ec.entity.find('mantle.product.Product').condition('ownerPartyId', transferOrg)
+                    .condition(ec.entity.conditionFactory.makeCondition([
+                        ec.entity.conditionFactory.makeCondition('productName', org.moqui.entity.EntityCondition.LIKE, '%' + term + '%').ignoreCase(),
+                        ec.entity.conditionFactory.makeCondition('pseudoId', org.moqui.entity.EntityCondition.LIKE, '%' + term + '%').ignoreCase()
+                    ], org.moqui.entity.EntityCondition.OR)).selectField('productId').list().collect { it.productId }
+                if (products) quickTransferIds = ec.entity.find('zenith.erp.inventory.StockTransferItem').condition('productId', 'in', products)
+                    .selectField('stockTransferId').distinct(true).list().collect { it.stockTransferId }
+            }
+        ]]></script>
         <entity-find entity-name="zenith.erp.inventory.StockTransferView" list="transferList">
-            <search-form-inputs default-order-by="-transferDate"/>
-            <econdition field-name="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+            <search-form-inputs default-order-by="-transferDate,-stockTransferId"/>
+            <order-by field-name="-stockTransferId"/>
+            <econdition field-name="organizationPartyId" from="transferOrg"/>
             <!-- ZE-INV-STK-SEARCH (stock-transfers §6): quick-search box — case-insensitive OR across transfer #,
                  from- and to-warehouse names. Each term is ignore-if-empty, so an empty box is a full no-op
                  (the whole OR group contributes nothing) and the list is byte-identical to before. -->
             <econditions combine="or">
+                <econdition field-name="stockTransferId" operator="in" from="quickTransferIds ?: ['_NO_MATCH_']" ignore-if-empty="true" ignore="!quickSearch?.toString()?.trim()"/>
+                <econdition field-name="stockTransferId" operator="like" ignore-case="true" ignore-if-empty="true"
+                            from="ec.context.quickSearch ? ('%' + ec.context.quickSearch.toString().trim() + '%') : null"/>
                 <econdition field-name="transferNumber" operator="like" ignore-case="true" ignore-if-empty="true"
                             from="ec.context.quickSearch ? ('%' + ec.context.quickSearch.toString().trim() + '%') : null"/>
                 <econdition field-name="fromFacilityName" operator="like" ignore-case="true" ignore-if-empty="true"
@@ -66,7 +87,7 @@
             </econditions>
         </entity-find>
         <entity-find entity-name="mantle.facility.Facility" list="facilityList">
-            <order-by field-name="facilityName"/></entity-find>
+            <econdition field-name="ownerPartyId" from="transferOrg"/><order-by field-name="facilityName"/></entity-find>
         <!-- ZE-INV-IV-070: the Organization is ALWAYS the tenant's own active org (a transfer is within one org).
              The IV-031 picker (get#ActiveOrgList -> list-options) rendered EMPTY on /qapps — the Vue m-drop-down
              got "no options and no options-url" — so the required field couldn't be selected and New Transfer was
@@ -75,14 +96,14 @@
         <set field="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
         <if condition="organizationPartyId == '_NA_'"><set field="organizationPartyId" from="null"/></if>
 
-        <!-- ZE-INV-STK-KPI: five summary counts for the KPI row (org-scoped like the list; a no-org admin sees all).
+        <!-- ZE-INV-STK-KPI: five summary counts for the KPI row (org-scoped like the list; no active org returns zero).
              Real data — NOT the mockup's illustrative 24/6/18/2/1. Total = all transfers; Pending = Draft (awaiting
              ship); In Transit = shipped-not-received; Completed = Received; Today = transferDate is today. -->
         <script><![CDATA[
             def _org = ec.user.getPreference('ACTIVE_ORGANIZATION')
             def _stCount = { st ->
                 def f = ec.entity.find("zenith.erp.inventory.StockTransfer")
-                if (_org && _org != '_NA_') f.condition("organizationPartyId", _org)
+                f.condition("organizationPartyId", transferOrg)
                 if (st) f.condition("statusId", st)
                 f.count()
             }
@@ -90,12 +111,12 @@
             kpiInTransit = _stCount('StxInTransit')
             kpiCompleted = _stCount('StxReceived')
             kpiPending   = _stCount('StxDraft')
-            def _cal = java.util.Calendar.getInstance(); _cal.setTime(ec.user.nowTimestamp)
+            def _cal = java.util.Calendar.getInstance(ec.user.timeZone); _cal.setTime(ec.user.nowTimestamp)
             _cal.set(java.util.Calendar.HOUR_OF_DAY,0); _cal.set(java.util.Calendar.MINUTE,0); _cal.set(java.util.Calendar.SECOND,0); _cal.set(java.util.Calendar.MILLISECOND,0)
             def _t0 = new java.sql.Timestamp(_cal.getTimeInMillis())
             _cal.add(java.util.Calendar.DAY_OF_MONTH,1); def _t1 = new java.sql.Timestamp(_cal.getTimeInMillis())
             def _ft = ec.entity.find("zenith.erp.inventory.StockTransfer")
-            if (_org && _org != '_NA_') _ft.condition("organizationPartyId", _org)
+            _ft.condition("organizationPartyId", transferOrg)
             _ft.condition("transferDate", org.moqui.entity.EntityCondition.GREATER_THAN_EQUAL_TO, _t0).condition("transferDate", org.moqui.entity.EntityCondition.LESS_THAN, _t1)
             kpiToday = _ft.count()
         ]]></script>
@@ -135,9 +156,13 @@
             <render-mode><text type="html,qvt,vuet" template="true"><![CDATA[
                 <#assign _q0 = (quickSearch)!''>
                 <form class="sup-searchrow" method="get">
+                  <#list ['statusId','fromFacilityId','toFacilityId','transferNumber','transferNumber_op','transferDate_from','transferDate_thru','pageSize','orderByField'] as filterName>
+                    <#assign filterValue = (ec.web.requestParameters[filterName])!''>
+                    <#if filterValue?has_content><input type="hidden" name="${filterName}" value="${filterValue?string?html}"/></#if>
+                  </#list>
                   <div class="sup-search">
                     <svg class="sup-search-ico" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M15.5 14h-.79l-.28-.27a6.5 6.5 0 1 0-.7.7l.27.28v.79l5 4.99L20.49 19zm-6 0A4.5 4.5 0 1 1 14 9.5 4.5 4.5 0 0 1 9.5 14z"/></svg>
-                    <input type="text" name="quickSearch" class="sup-search-input" value="${_q0?html}" placeholder="Search by transfer no., from or to warehouse..." autocomplete="off" style="padding-right:16px"/>
+                    <input type="text" name="quickSearch" class="sup-search-input" value="${_q0?html}" placeholder="Search by transfer no., from, to or product..." autocomplete="off" style="padding-right:16px"/>
                   </div>
                   <button type="submit" class="stk-search-go">Search</button>
                   <button type="button" class="sup-filters-btn sup-filters-primary"><svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M10 18h4v-2h-4zM3 6v2h18V6zm3 7h12v-2H6z"/></svg>Filters</button>
@@ -192,7 +217,7 @@
                                 <field name="transporterGstin"><default-field title="Transporter GSTIN"><text-line size="15" default-value="${transporterGstin ?: ''}"/></default-field></field>
                                 <field name="lrNumber"><default-field title="LR Number"><text-line size="20" default-value="${lrNumber ?: ''}"/></default-field></field>
                                 <field name="vehicleNumber"><default-field title="Vehicle No."><text-line size="15" default-value="${vehicleNumber ?: ''}"/></default-field></field>
-                                <field name="submitButton"><default-field title="Save &amp; Generate E-Way Bill"><submit/></default-field></field>
+                                <field name="submitButton"><default-field title="Save logistics"><submit/></default-field></field>
                             </form-single>
                         </container-dialog>
                         <!-- Show them if present -->
