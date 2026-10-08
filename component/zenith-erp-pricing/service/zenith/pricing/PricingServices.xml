@@ -12,17 +12,10 @@
         <out-parameters><parameter name="allowed" type="Boolean"/></out-parameters>
         <actions>
             <script><![CDATA[
-                allowed = true
-                if (!ec.user.isInGroup('ADMIN')) {
-                    def activeOrg = ec.user.getPreference('ACTIVE_ORGANIZATION')
-                    if (!activeOrg || activeOrg == '_NA_' || !priceListId) {
-                        allowed = false
-                    } else {
-                        def pl = ec.entity.find('zenith.erp.pricing.PriceList').condition('priceListId', priceListId).disableAuthz().one()
-                        if (pl == null || pl.organizationPartyId != activeOrg) allowed = false
-                    }
-                    if (!allowed) ec.message.addError("You do not have access to this price list.")
-                }
+                def activeOrg=ec.user.getPreference('ACTIVE_ORGANIZATION')
+                def list=priceListId ? ec.entity.find('zenith.erp.pricing.PriceList').condition('priceListId',priceListId).disableAuthz().one() : null
+                allowed=list != null && (ec.user.isInGroup('ADMIN') || (activeOrg && activeOrg != '_NA_' && list.organizationPartyId==activeOrg))
+                if(!allowed) ec.message.addError("You do not have access to this price list.")
             ]]></script>
         </actions>
     </service>
@@ -121,6 +114,10 @@
             <parameter name="priceListId"/>
         </out-parameters>
         <actions>
+            <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <if condition="!organizationPartyId || organizationPartyId == '_NA_' || (!ec.user.isInGroup('ADMIN') &amp;&amp; organizationPartyId != activeOrg)"><return error="true" message="Choose your active organization before creating a price list."/></if>
+            <service-call name="zenith.pricing.PriceListServices.assert#ListSettings" in-map="context" out-map="settings"/>
+            <if condition="!settings.valid"><return/></if>
             <!-- ZE-PRC-002: reject an inverted validity window before creating anything. -->
             <service-call name="zenith.pricing.PricingServices.assert#ValidDateRange"
                           in-map="[validFromDate:validFromDate, validThruDate:validThruDate]" out-map="_dr"/>
@@ -226,6 +223,13 @@
             <parameter name="priceListItemId"/>
         </out-parameters>
         <actions>
+            <service-call name="zenith.pricing.PricingServices.assert#PriceListAccess" in-map="[priceListId:priceListId]" out-map="access"/>
+            <if condition="!access.allowed"><return/></if>
+            <entity-find-one entity-name="zenith.erp.pricing.PriceList" value-field="listOwner"/>
+            <entity-find-one entity-name="mantle.product.Product" value-field="listProduct"/>
+            <if condition="!listProduct || listProduct.ownerPartyId != listOwner.organizationPartyId"><return error="true" message="Select a product from this price list's organization."/></if>
+            <if condition="minQuantity == null || minQuantity &lt;= 0 || (maxQuantity != null &amp;&amp; maxQuantity &lt; minQuantity)"><return error="true" message="Minimum quantity must be positive and maximum quantity cannot be smaller."/></if>
+            <if condition="!['PtpFixed','PtpDiscount','PtpMargin'].contains(priceTypeEnumId)"><return error="true" message="Choose a valid price type."/></if>
             <!-- ZE-SB-013 (Tier 2): the product this price-list item is for must belong to this org. -->
             <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" out-map="_pa"
                           in-map="[entityName:'mantle.product.Product', idField:'productId', idValue:productId, orgField:'ownerPartyId']"/>
@@ -321,18 +325,26 @@
         <actions>
             <set field="importedCount" from="0" type="Integer"/>
             <set field="errorCount" from="0" type="Integer"/>
-            <iterate list="items" entry="item">
-                <service-call name="zenith.pricing.PricingServices.set#PriceListItem" ignore-error="true"
-                              in-map="[priceListId:priceListId, productId:item.productId,
-                                       unitPrice:item.unitPrice, minQuantity:(item.minQuantity ?: 1),
-                                       maxQuantity:item.maxQuantity, changeReason:changeReason]"
-                              out-map="setOut"/>
-                <if condition="setOut?._errorMessage">
-                    <set field="errorCount" from="errorCount + 1"/>
-                <else>
-                    <set field="importedCount" from="importedCount + 1"/>
-                </else></if>
-            </iterate>
+            <service-call name="zenith.pricing.PricingServices.assert#PriceListAccess" in-map="[priceListId:priceListId]" out-map="access"/>
+            <if condition="!access.allowed"><return/></if>
+            <script><![CDATA[
+                // The import reports partial success: isolate each row's rollback and count only a committed result.
+                items.each { item ->
+                    ec.message.pushErrors()
+                    try {
+                        def result=ec.service.sync().name('zenith.pricing.PricingServices.set#PriceListItem')
+                            .parameters([priceListId:priceListId,productId:item.productId,unitPrice:item.unitPrice,
+                                minQuantity:item.minQuantity != null ? item.minQuantity : 1,
+                                maxQuantity:item.maxQuantity,changeReason:changeReason])
+                            .requireNewTransaction(true).call()
+                        if(!ec.message.hasError() && result?.priceListItemId) importedCount++
+                        else errorCount++
+                    } finally {
+                        ec.message.clearErrors()
+                        ec.message.popErrors()
+                    }
+                }
+            ]]></script>
         </actions>
     </service>
 
@@ -353,6 +365,14 @@
             <parameter name="volumePricingId"/>
         </out-parameters>
         <actions>
+            <service-call name="zenith.pricing.PricingServices.assert#PriceListAccess" in-map="[priceListId:priceListId]" out-map="access"/>
+            <if condition="!access.allowed"><return/></if>
+            <entity-find-one entity-name="zenith.erp.pricing.PriceList" value-field="listOwner"/>
+            <entity-find-one entity-name="mantle.product.Product" value-field="listProduct"/>
+            <if condition="!listProduct || listProduct.ownerPartyId != listOwner.organizationPartyId"><return error="true" message="Select a product from this price list's organization."/></if>
+            <if condition="minQuantity == null || minQuantity &lt;= 0 || (maxQuantity != null &amp;&amp; maxQuantity &lt; minQuantity)"><return error="true" message="Minimum quantity must be positive and maximum quantity cannot be smaller."/></if>
+            <if condition="unitPrice == null &amp;&amp; discountPercent == null"><return error="true" message="Enter a unit price or discount percentage."/></if>
+            <if condition="(unitPrice != null &amp;&amp; unitPrice &lt; 0) || (discountPercent != null &amp;&amp; (discountPercent &lt; 0 || discountPercent > 100))"><return error="true" message="Price cannot be negative and discount must be between 0 and 100."/></if>
             <!-- ZE-SB-013 (Tier 2): the product this volume-pricing tier is for must belong to this org. -->
             <service-call name="zenith.base.SecurityServices.assert#RecordOrgAccess" out-map="_pa"
                           in-map="[entityName:'mantle.product.Product', idField:'productId', idValue:productId, orgField:'ownerPartyId']"/>

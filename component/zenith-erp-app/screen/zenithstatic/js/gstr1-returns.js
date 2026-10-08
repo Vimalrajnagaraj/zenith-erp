@@ -40,8 +40,10 @@
     if (sh) sh.textContent = total === 0 ? 'No entries' : ('Showing ' + (start + 1) + ' to ' + end + ' of ' + total + ' entries');
     var pager = document.getElementById('gstr1-pager'); if (!pager) return;
     pager.innerHTML = '';
-    function btn(html, disabled, active, go) {
-      var b = document.createElement('button'); b.innerHTML = html;
+    function btn(html, disabled, active, go, label) {
+      var b = document.createElement('button'); b.type = 'button'; b.innerHTML = html;
+      b.setAttribute('aria-label', label);
+      if (active) b.setAttribute('aria-current', 'page');
       b.style.cssText = 'min-width:32px;height:32px;padding:0 8px;border-radius:8px;font-size:13px;cursor:pointer;'
         + (active ? 'background:#7C3AED;color:#fff;border:1px solid #7C3AED;' : 'background:#fff;color:#6B7280;border:1px solid #E5E7EB;')
         + (disabled ? 'opacity:.4;cursor:default;' : '');
@@ -49,11 +51,11 @@
       if (!disabled && !active && go != null) b.addEventListener('click', function () { state.page = go; paginate(); });
       return b;
     }
-    pager.appendChild(btn('&#124;&lt;', state.page <= 1, false, 1));
-    pager.appendChild(btn('&lsaquo;', state.page <= 1, false, state.page - 1));
-    pager.appendChild(btn(String(state.page), false, true, null));
-    pager.appendChild(btn('&rsaquo;', state.page >= tp, false, state.page + 1));
-    pager.appendChild(btn('&gt;&#124;', state.page >= tp, false, tp));
+    pager.appendChild(btn('&#124;&lt;', state.page <= 1, false, 1, 'First filing page'));
+    pager.appendChild(btn('&lsaquo;', state.page <= 1, false, state.page - 1, 'Previous filing page'));
+    pager.appendChild(btn(String(state.page), false, true, null, 'Page ' + state.page));
+    pager.appendChild(btn('&rsaquo;', state.page >= tp, false, state.page + 1, 'Next filing page'));
+    pager.appendChild(btn('&gt;&#124;', state.page >= tp, false, tp, 'Last filing page'));
   }
 
   function init() {

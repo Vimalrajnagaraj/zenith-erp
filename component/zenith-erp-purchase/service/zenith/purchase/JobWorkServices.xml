@@ -1,0 +1,109 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+    <service verb="assert" noun="ChallanAccess">
+        <in-parameters><parameter name="challanId" required="true"/></in-parameters>
+        <out-parameters><parameter name="allowed" type="Boolean"/></out-parameters>
+        <actions><script><![CDATA[
+            def challan = ec.entity.find('zenith.erp.india.JobWorkChallan').condition('challanId',challanId).disableAuthz().one()
+            def org = ec.user.getPreference('ACTIVE_ORGANIZATION')
+            allowed = challan != null && (ec.user.isInGroup('ADMIN') || (org && org != '_NA_' && challan.organizationPartyId == org))
+        ]]></script></actions>
+    </service>
+
+    <service verb="create" noun="Challan">
+        <in-parameters>
+            <parameter name="jobWorkerPartyId" required="true"/>
+            <parameter name="issueDate" type="Timestamp" default="ec.user.nowTimestamp"/>
+        </in-parameters>
+        <out-parameters><parameter name="challanId"/></out-parameters>
+        <actions>
+            <set field="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <if condition="!organizationPartyId || organizationPartyId == '_NA_'"><return error="true" message="Choose an active organization before creating a challan."/></if>
+            <entity-find-one entity-name="mantle.party.Party" value-field="worker"><field-map field-name="partyId" from="jobWorkerPartyId"/></entity-find-one>
+            <if condition="!worker || worker.ownerPartyId != organizationPartyId"><return error="true" message="Please select a job worker from your account."/></if>
+            <script><![CDATA[
+                def calendar = java.util.Calendar.getInstance()
+                calendar.setTime(issueDate)
+                calendar.add(java.util.Calendar.YEAR,1)
+                def challan = ec.entity.makeValue('zenith.erp.india.JobWorkChallan')
+                challan.setSequencedIdPrimary()
+                challan.setAll([organizationPartyId:organizationPartyId,jobWorkerPartyId:jobWorkerPartyId,
+                    issueDate:issueDate,expectedReturnDate:new java.sql.Timestamp(calendar.timeInMillis),
+                    challanNumber:'JWC-'+challan.challanId,isDeemedSale:'N'])
+                challan.create()
+                challanId = challan.challanId
+            ]]></script>
+        </actions>
+    </service>
+
+    <service verb="update" noun="ChallanStatus">
+        <in-parameters>
+            <parameter name="challanId" required="true"/>
+            <parameter name="actualReturnDate" type="Timestamp"/>
+            <parameter name="isDeemedSale"/>
+        </in-parameters>
+        <actions>
+            <service-call name="zenith.purchase.JobWorkServices.assert#ChallanAccess" in-map="[challanId:challanId]" out-map="access"/>
+            <if condition="!access.allowed"><return error="true" message="Challan not found for your account."/></if>
+            <entity-find-one entity-name="zenith.erp.india.JobWorkChallan" value-field="challan"/>
+            <if condition="actualReturnDate != null &amp;&amp; challan.issueDate != null &amp;&amp; actualReturnDate &lt; challan.issueDate"><return error="true" message="Return date cannot be before the issue date."/></if>
+            <if condition="isDeemedSale &amp;&amp; !['Y','N'].contains(isDeemedSale)"><return error="true" message="Please select a valid overdue flag."/></if>
+            <service-call name="update#zenith.erp.india.JobWorkChallan" in-map="[challanId:challanId,actualReturnDate:actualReturnDate,isDeemedSale:isDeemedSale ?: challan.isDeemedSale]"/>
+        </actions>
+    </service>
+
+    <service verb="add" noun="ChallanItem">
+        <in-parameters>
+            <parameter name="challanId" required="true"/>
+            <parameter name="productId" required="true"/>
+            <parameter name="issuedQuantity" type="BigDecimal" required="true"/>
+            <parameter name="uomId"/>
+        </in-parameters>
+        <out-parameters><parameter name="itemSeqId"/></out-parameters>
+        <actions>
+            <service-call name="zenith.purchase.JobWorkServices.assert#ChallanAccess" in-map="[challanId:challanId]" out-map="access"/>
+            <if condition="!access.allowed"><return error="true" message="Challan not found for your account."/></if>
+            <entity-find-one entity-name="zenith.erp.india.JobWorkChallan" value-field="challan"/>
+            <entity-find-one entity-name="mantle.product.Product" value-field="product"/>
+            <if condition="!product || product.ownerPartyId != challan.organizationPartyId"><return error="true" message="Please select a product from this challan's organization."/></if>
+            <if condition="issuedQuantity &lt;= 0"><return error="true" message="Issued quantity must be greater than zero."/></if>
+            <if condition="uomId">
+                <entity-find-one entity-name="moqui.basic.Uom" value-field="unit"/>
+                <if condition="!unit"><return error="true" message="Please select a valid unit of measure."/></if>
+            </if>
+            <service-call name="create#zenith.erp.india.JobWorkChallanItem" out-map="itemOut" in-map="[challanId:challanId,productId:productId,issuedQuantity:issuedQuantity,returnedQuantity:0,scrapQuantity:0,uomId:uomId]"/>
+            <set field="itemSeqId" from="itemOut.itemSeqId"/>
+        </actions>
+    </service>
+
+    <service verb="update" noun="ChallanItem">
+        <in-parameters>
+            <parameter name="challanId" required="true"/>
+            <parameter name="itemSeqId" required="true"/>
+            <parameter name="returnedQuantity" type="BigDecimal" default-value="0"/>
+            <parameter name="scrapQuantity" type="BigDecimal" default-value="0"/>
+        </in-parameters>
+        <actions>
+            <service-call name="zenith.purchase.JobWorkServices.assert#ChallanAccess" in-map="[challanId:challanId]" out-map="access"/>
+            <if condition="!access.allowed"><return error="true" message="Challan not found for your account."/></if>
+            <entity-find-one entity-name="zenith.erp.india.JobWorkChallanItem" value-field="item"/>
+            <if condition="!item"><return error="true" message="Challan item not found."/></if>
+            <set field="returnedQuantity" from="returnedQuantity ?: 0"/>
+            <set field="scrapQuantity" from="scrapQuantity ?: 0"/>
+            <if condition="returnedQuantity &lt; 0 || scrapQuantity &lt; 0 || returnedQuantity + scrapQuantity > item.issuedQuantity"><return error="true" message="Returned and scrap quantities must be nonnegative and cannot exceed the issued quantity."/></if>
+            <service-call name="update#zenith.erp.india.JobWorkChallanItem" in-map="[challanId:challanId,itemSeqId:itemSeqId,returnedQuantity:returnedQuantity,scrapQuantity:scrapQuantity]"/>
+        </actions>
+    </service>
+
+    <service verb="delete" noun="ChallanItem">
+        <in-parameters><parameter name="challanId" required="true"/><parameter name="itemSeqId" required="true"/></in-parameters>
+        <actions>
+            <service-call name="zenith.purchase.JobWorkServices.assert#ChallanAccess" in-map="[challanId:challanId]" out-map="access"/>
+            <if condition="!access.allowed"><return error="true" message="Challan not found for your account."/></if>
+            <entity-find-one entity-name="zenith.erp.india.JobWorkChallanItem" value-field="item"/>
+            <if condition="!item"><return error="true" message="Challan item not found."/></if>
+            <if condition="(item.returnedQuantity ?: 0) > 0 || (item.scrapQuantity ?: 0) > 0"><return error="true" message="An item with recorded returns or scrap cannot be deleted."/></if>
+            <service-call name="delete#zenith.erp.india.JobWorkChallanItem" in-map="[challanId:challanId,itemSeqId:itemSeqId]"/>
+        </actions>
+    </service>
+</services>

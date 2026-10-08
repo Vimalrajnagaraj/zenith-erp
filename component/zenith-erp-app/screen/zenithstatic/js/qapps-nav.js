@@ -18,7 +18,7 @@
     // per-module sub-nav tabs — [moduleTitle, 'segment:label', …]; href = /qapps/zenith/<mount>/<segment>
     // (POS Terminal → /apps billing surface). Mirrors the /apps #z-subnav route map.
     var SUBNAV = {
-        '/Contacts': ['Contacts', 'FindContact:All Contacts', 'Customers:Customers', 'ContactsDashboard:Dashboard', 'Vendors:Suppliers', 'CustomerGroups:Customer Groups', 'MergeContacts:Merge Contacts'],
+        '/Contacts': ['Contacts', 'ContactsDashboard:Dashboard', 'FindContact:All Contacts', 'Customers:Customers', 'Vendors:Suppliers', 'CustomerGroups:Customer Groups', 'MergeContacts:Merge'],
         '/sales': ['Sales', 'SalesDashboard:Dashboard', 'FindQuotation:Quotations', 'FindOrder:Orders', 'FindDeliveryChallan:Delivery Challans', 'FindInvoice:Invoices', 'FindCreditNote:Credit / Debit Notes', 'PosSalesRegister:POS Sales', 'WarrantyPolicies:Warranty', 'Commissions:Commissions', 'SalesForecast:Forecast'],
         '/Purchase': ['Purchase', 'GoodsReceipt:Goods Receipt (GRN)', 'FindPurchaseOrder:Purchase Orders', 'FindPurchaseInvoice:Vendor Bills (ITC)', 'CreatePurchaseInvoice:Log Vendor Bill', 'PurchaseInvoices:Purchase Invoices', 'PurchaseReturns:Purchase Returns', 'JobWorkChallan:Job Work Challan', 'RfqList:RFQs', 'Gstr2bRecon:GSTR-2B Recon', 'VendorEvaluation:Vendor Evaluation'],
         '/Crm': ['CRM', 'Leads:Leads', 'Pipeline:Pipeline', 'Activities:Activities', 'Segments:Segments'],
@@ -312,7 +312,16 @@
         var header = document.querySelector('.q-header');
         if (header) document.body.style.setProperty('--zq-contacts-header-height', (header.offsetHeight || 51) + 'px');
     }
+    // My Subscription keeps the content below its wrapped mobile toolbar.
+    function syncMySubscriptionHeader() {
+        if (!document.querySelector('.mysub-wrap')) {
+            document.body.style.removeProperty('--zq-mysub-header-height'); return;
+        }
+        var header = document.querySelector('.q-header');
+        if (header) document.body.style.setProperty('--zq-mysub-header-height', (header.offsetHeight || 51) + 'px');
+    }
     function updateSubnav() {
+        syncMySubscriptionHeader();
         if (!subBar) return;
         var rel = location.pathname.replace(/^\/qapps\/zenith/, '') || '/';
         // Home/Dashboard landing → the "Dashboards" hub (every ERP dashboard)
@@ -381,6 +390,8 @@
         else window.addEventListener('resize', syncContactsHeader);
         if (window.ResizeObserver) new ResizeObserver(syncSalesHeader).observe(header);
         else window.addEventListener('resize', syncSalesHeader);
+        if (window.ResizeObserver) new ResizeObserver(syncMySubscriptionHeader).observe(header);
+        else window.addEventListener('resize', syncMySubscriptionHeader);
         // collapse (persisted)
         try { if (localStorage.getItem('zqSideCollapsed') === '1') body.classList.add('zq-side-collapsed'); } catch (_e) {}
         var tgl = document.getElementById('zq-side-toggle');

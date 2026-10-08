@@ -7,71 +7,22 @@
 
     <transition name="findReceipt"><default-response url="../FindReceipt"/></transition>
     
+    <!-- The GET-time Quasar renderer must discover this as an action form; writes remain POST-only. -->
     <transition name="receiveItem">
         <actions>
-        <!-- ZE-INV-IV-06A: block receiving against another tenant's purchase order via a forged POST -->
-        <service-call name="zenith.purchase.PurchaseServices.assert#PurchaseOrderAccess" in-map="[orderId:orderId]" out-map="_acc"/>
-        <if condition="!_acc.allowed"><return error="true" message="You do not have access to this purchase order."/></if>
-        <!-- ZE-INV-001 f/u: the receive logic was a bare <script> directly under <transition>, which Moqui does
-             not run as the transition actions, so receiving silently did nothing (0 PO receipts ever). Wrapped in
-             <actions> (the transition's action container) so it actually executes. -->
-        <script>
-            // Simple retail flow: received stock is immediately in-stock and sellable
-            // ZE-INV-001 f/u: reject a negative unit cost up front with a clear message. A negative would make
-            // stock value negative AND would otherwise trip the Asset-cost SECA mid-script (messy). Blank/0 = fine.
-            if (unitAmount != null &amp;&amp; unitAmount.toString().trim() != '') {
-                def _uc = null; try { _uc = new BigDecimal(unitAmount.toString().trim()) } catch (ex) { _uc = null }
-                if (_uc != null &amp;&amp; _uc.signum() &lt; 0) { ec.message.addError("Unit cost can't be negative — enter 0 or a positive amount."); return }
-            }
-            def rcvQty = new BigDecimal(quantityAccepted ?: 0)
-            if (rcvQty > 0 &amp;&amp; facilityId &amp;&amp; productId) {
-                def inMap = [
-                    assetTypeEnumId: 'AstTpInventory',
-                    classEnumId: 'AsClsInventory',
-                    statusId: 'AstAvailable', // In stock and ready to sell
-                    productId: productId,
-                    facilityId: facilityId,
-                    quantityOnHandTotal: rcvQty,
-                    availableToPromiseTotal: rcvQty,
-                    acquireCost: new BigDecimal(unitAmount ?: 0),
-                    valuationRate: new BigDecimal(unitAmount ?: 0),
-                    acquireCostUomId: (ec.entity.find('mantle.order.OrderHeader').condition('orderId', orderId).one()?.currencyUomId ?: 'USD'),
-                    acquireOrderId: orderId,
-                    acquireOrderItemSeqId: orderItemSeqId,
-                    receivedDate: ec.user.nowTimestamp
-                ]
-                
-                // ZE-INV-001 f/u: own the received stock by the receiving org so it shows in that tenant's Expiry
-                // dashboard (which filters by ownerPartyId); valuationRate above lets the dashboard value it (it
-                // values by valuationRate, not acquireCost).
-                def _rcvOrg = ec.user.getPreference('ACTIVE_ORGANIZATION')
-                if (_rcvOrg &amp;&amp; _rcvOrg != '_NA_') inMap.ownerPartyId = _rcvOrg
-                // Add batch info if provided
-                if (batchNumber) inMap.batchNumber = batchNumber
-                if (mrpAmount) inMap.mrpAmount = new BigDecimal(mrpAmount)
-                if (manufacturingDate) inMap.manufacturingDate = manufacturingDate
-                if (expiryDate) inMap.expiryDate = expiryDate
-                
-                def _rcvAsset = ec.service.sync().name("create#mantle.product.asset.Asset").parameters(inMap).call()
-                // Record the receipt in the asset ledger. Mantle recomputes on-hand from AssetDetail entries on each
-                // change, so an asset with a direct qoh but no ledger receipt gets zeroed on the first sale.
-                ec.service.sync().name("create#mantle.product.asset.AssetDetail").parameters([
-                    assetId:_rcvAsset.assetId, productId:productId, effectiveDate:ec.user.nowTimestamp,
-                    quantityOnHandDiff:rcvQty, availableToPromiseDiff:rcvQty,
-                    description:('Goods received ' + (orderId ?: ''))]).call()
-                ec.message.addMessage("Received ${rcvQty} units of ${productId}. They are now in stock at this location and ready to sell.")
-            } else {
-                ec.message.addError("Quantity Accepted and Facility are required.")
-            }
-        </script>
-        </actions>
-        <default-response url="."/>
+            <if condition="ec.web.request.method != 'POST'"><return error="true" message="Receiving stock requires a form submission."/></if>
+            <if condition="!ec.web.parameters.moquiSessionToken || ec.web.parameters.moquiSessionToken != ec.web.sessionToken"><return error="true" message="Your session expired. Reload Receiving and try again."/></if>
+            <service-call name="zenith.inventory.ReceiptServices.receive#Stock"
+                in-map="[orderId:orderId, orderItemSeqId:orderItemSeqId, facilityId:facilityId,
+                    quantityAccepted:quantityAccepted, batchNumber:batchNumber, mrpAmount:mrpAmount,
+                    manufacturingDate:manufacturingDate, expiryDate:expiryDate]"/>
+        </actions><default-response url="."/>
     </transition>
 
     <actions>
         <!-- ZE-INV-IV-06A: org-isolation guard — don't render another tenant's PO (items/vendor/costs).
              A PO's owner is OrderPart.customerPartyId; block unless it's the caller's active org. -->
-        <service-call name="zenith.purchase.PurchaseServices.assert#PurchaseOrderAccess" in-map="[orderId:orderId]" out-map="_acc"/>
+        <service-call name="zenith.inventory.ReceiptServices.get#PurchaseOrderAccess" in-map="[orderId:orderId]" out-map="_acc"/>
         <set field="noAccess" from="!_acc.allowed"/>
         <if condition="_acc.allowed">
         <entity-find-one entity-name="mantle.order.OrderHeader" value-field="order"/>
@@ -91,15 +42,19 @@
             <field-map field-name="partyId" from="orderPart?.vendorPartyId"/>
         </entity-find-one>
 
-        <!-- Pre-fetch facilities for dropdown -->
+        <service-call name="zenith.inventory.ReceiptServices.get#OrderReceiptQuantities" in-map="[orderId:orderId]" out-map="receiptTotals"/>
+        <!-- Only destinations in the active organization may receive its goods. -->
         <entity-find entity-name="mantle.facility.Facility" list="facilityList">
+            <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION') ?: '__NO_ORGANIZATION__'"/>
             <order-by field-name="facilityName"/>
         </entity-find>
         </if>
     </actions>
 
     <widgets>
-        <container style="row items-center justify-between no-wrap q-mb-md">
+        <render-mode><text type="html,qvt,vuet"><![CDATA[<link rel="stylesheet" href="/zenithstatic/css/receiving-stock.css?v=14"/>]]></text></render-mode>
+        <container id="receivingStockDetail" style="receiving-page">
+        <container style="receiving-detail-back">
             <link url="findReceipt" text="← Back to Receiving List" link-type="anchor"/>
             <label text="Received items go straight into stock and are ready to sell." type="span" style="text-grey-7 text-caption"/>
         </container>
@@ -144,18 +99,9 @@
                         <field-map field-name="productId"/>
                     </entity-find-one>
                     
-                    <!-- Calculate how many have already been received against this PO line -->
-                    <entity-find entity-name="mantle.product.asset.Asset" list="existingAssets">
-                        <econdition field-name="acquireOrderId" from="orderId"/>
-                        <econdition field-name="acquireOrderItemSeqId" from="orderItemSeqId"/>
-                    </entity-find>
-                    
-                    <set field="qtyReceived" from="0"/>
-                    <script>
-                        for (def a : existingAssets) { qtyReceived += (a.quantityOnHandTotal ?: 0) }
-                        qtyRemaining = (quantity ?: 0) - qtyReceived
-                        if (qtyRemaining &lt; 0) qtyRemaining = 0
-                    </script>
+                    <set field="qtyReceived" from="receiptTotals.receivedByItem[orderItemSeqId] ?: 0G"/>
+                    <set field="qtyRemaining" from="((quantity ?: 0G) - (quantityCancelled ?: 0G) - qtyReceived).max(0G)"/>
+                    <set field="canReceiveLine" from="qtyRemaining > 0 &amp;&amp; (order.statusId in ['OrderApproved','OrderCompleted'])"/>
                 </row-actions>
 
                 <field name="orderItemSeqId"><default-field title="#"><label text="${orderItemSeqId}" type="span" style="text-grey-7"/></default-field></field>
@@ -176,7 +122,7 @@
                     <!-- ZE-INV-010 (IV-110): the receive form only for users with full Inventory write access; the
                          "Fully Received" status stays visible to everyone (read-only). Form name/transition untouched. -->
                     <conditional-field name="receive_write" condition="invCanWrite" title="Receive">
-                        <container-dialog id="ReceiveDialog_${orderItemSeqId}" button-text="Process Receipt" button-class="q-btn--flat bg-primary text-white border-radius-md" condition="qtyRemaining > 0">
+                        <container-dialog id="ReceiveDialog_${orderItemSeqId}" button-text="Process Receipt" button-class="q-btn--flat bg-primary text-white border-radius-md" condition="canReceiveLine">
                             <!-- ZE-INV-001 f/u: form-single name must be a STATIC identifier — Moqui does NOT
                                  interpolate ${} in it (the container-dialog id above does), so the old
                                  name="ReceiveForm_${orderItemSeqId}" left moquiFormName as that literal string and
@@ -185,8 +131,6 @@
                             <form-single name="ReceiveForm" transition="receiveItem">
                                 <field name="orderId"><default-field><hidden/></default-field></field>
                                 <field name="orderItemSeqId"><default-field><hidden/></default-field></field>
-                                <field name="productId"><default-field><hidden/></default-field></field>
-                                <field name="unitAmount"><default-field><hidden/></default-field></field>
                                 
                                 <field name="facilityId">
                                     <default-field title="Put stock into (store / warehouse)">
@@ -237,5 +181,10 @@
         </widgets>
         </section>
 
+        <container style="receiving-footer">
+            <label text="© 2024-${ec.l10n.format(ec.user.nowTimestamp, 'yyyy')} ZetaERP · Cloud ERP Platform" type="span"/>
+            <render-mode><text type="html,qvt,vuet"><![CDATA[<a href="mailto:support@zetaclantech.com">Support</a>]]></text></render-mode>
+        </container>
+        </container>
     </widgets>
 </screen>
