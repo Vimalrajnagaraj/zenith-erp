@@ -109,3 +109,12 @@ The current-master rebase and review fixes require fresh runtime/CI proof. Histo
 reports and run links are not acceptance evidence for the revised head. #54 is not a
 dependency; no SaaS billing protections are reverted here. Pure reference/topbar and
 Tables control changes are being separated from this billing candidate.
+
+Current-master verification is recorded in `review-reverification.json`. A fresh
+run also checks Payment Wise's user-timezone report window against a runtime whose
+JVM defaults to UTC: completed synthetic cash bills at 00:30 and 23:59:59.999 must
+appear in that user's selected day on both CSV interfaces. The test restores the
+captured original timestamp and independently asserts unchanged grand total, tax
+and change. The screen, CSV and PDF use the same user-timezone parsing. This changes
+report date buckets, not stored bill figures; owner financial acceptance remains
+mandatory. Helpers remain under docs/qa and must never be installed on production.
