@@ -44,6 +44,8 @@ async function submit(id){await Promise.all([page.waitForNavigation({waitUntil:'
     await fill(`#${prefix}-efffrom`,'2026-07-01');assert(await page.$eval(`#${prefix}-efffrom`,e=>e.labels.length===1&&getComputedStyle(e).opacity==='1'),'Native date is unlabelled or invisible');
     for(const width of [1366,800,390,320]) {
      await page.setViewport({width,height:900});
+     await page.waitForSelector(`#${prefix}-overlay .zc-tax-form`,{visible:true});
+     assert(await page.$eval(`#${prefix}-overlay .zc-tax-form`,e=>getComputedStyle(e).display!=='contents'&&parseFloat(getComputedStyle(e).paddingLeft)>=16),'Modal form spacing lost');
      assert(await page.$eval(`#${prefix}-overlay > div`,e=>e.scrollWidth<=e.clientWidth+1),'Modal overflows horizontally');
     }
     await page.keyboard.press('Escape');assert(await page.$eval(`#${prefix}-overlay`,e=>getComputedStyle(e).display==='none'),'Escape did not close modal');
