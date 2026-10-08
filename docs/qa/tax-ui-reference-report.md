@@ -1,6 +1,6 @@
 # Tax reference UI and control repairs
 
-Base: freshly fetched `master` (`ba5143a3d1d5e97d2182ff7ba535f36862690a2f`). Scope: Tax content on `/apps` and `/qapps`.
+Base: freshly fetched `master` (`d8707b64272fdda8d2cd9619e091ca7e0c281017`). Scope: Tax content on `/apps` and `/qapps`.
 
 References: [Tax reports](https://drive.google.com/drive/folders/12rh2AstPHWVo25lKT_69KJyDxUgYcqt0) and [fixed Tax samples](https://drive.google.com/drive/folders/1fOPcbN6SNUWtZM54yex1xVZm787bnyIK). Reviewed all 20 Markdown reports and 10 fixed samples. Existing matching list markup and working shared shell controls are retained.
 
