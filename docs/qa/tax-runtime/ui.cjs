@@ -73,7 +73,8 @@ async function submit(id){await Promise.all([page.waitForNavigation({waitUntil:'
    for(const width of [1366,800,390,320]) {await page.setViewport({width,height:900});await page.evaluate(()=>new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r))));assert(await page.$eval('.zc-tax-form',e=>e.clientWidth>0&&e.scrollWidth<=e.clientWidth+1),'Edit form horizontal overflow or missing layout');}
    await page.screenshot({path:out+'/'+shell+'-registration-edit-mobile.png',fullPage:false});await page.setViewport({width:1366,height:900});await page.evaluate(()=>new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r))));
    await fill('.zc-tax-form [name=description]',"Synthetic UI O'Brien edited");
-   const button=await page.$('.zc-tax-form button[type=submit]');assert(button,'Edit button');await Promise.all([page.waitForNavigation({waitUntil:'networkidle2'}),button.click()]);
+   const button=await page.$('.zc-tax-form button[type=submit]');assert(button,'Edit button');await button.focus();
+   await Promise.all([page.waitForNavigation({waitUntil:'networkidle2'}),page.waitForRequest(r=>r.method()==='POST'&&r.url().endsWith('/EditTaxRegistration/updateTaxRegistration')),page.keyboard.press('Enter')]);
    await page.waitForSelector('.zc-tax-form [name=description]',{timeout:15000});
    assert(await page.$eval('.zc-tax-form [name=description]',e=>e.value==="Synthetic UI O'Brien edited"),'Description did not persist');assert(!await page.$('.zc-tax-form img[src="x"]'),'XSS markup executed');
   });
