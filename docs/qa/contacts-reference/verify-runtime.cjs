@@ -57,6 +57,10 @@ async function modal(page,shell,label){await page.locator('.cust-nc-solo').filte
          await page.locator('[data-cpesave]').scrollIntoViewIfNeeded();const hit=await page.locator('[data-cpesave]').evaluate(e=>{const r=e.getBoundingClientRect(), top=document.elementFromPoint(r.x+r.width/2,r.y+r.height/2);return top===e||e.contains(top);});check(`${shell} ${width}: Save receives actual pointer hit`,hit);
        }
        if(screen==='MergeContacts')check(`${shell} ${width}: Merge action has reference primary colors`,await page.locator('#MergeForm_submitBtn').evaluate(e=>getComputedStyle(e).backgroundColor==='rgb(124, 58, 237)'&&getComputedStyle(e).color==='rgb(255, 255, 255)'));
+       if(screen==='FindContact'&&[1440,390].includes(width)){
+         const menu=page.locator('.sup-act-kebab').last();await menu.locator('summary').click();
+         check(`${shell} ${width}: last-row menu receives pointer hit`,await menu.locator('.sup-act-menu a').first().evaluate(e=>{const r=e.getBoundingClientRect(),hit=document.elementFromPoint(r.x+r.width/2,r.y+r.height/2);return !!hit&&(hit===e||e.contains(hit));}));await menu.locator('summary').click();
+       }
        if([1440,390].includes(width))await page.screenshot({path:path.join(out,`${shell}-${screen}-${width}.png`),fullPage:true});
      }
    }

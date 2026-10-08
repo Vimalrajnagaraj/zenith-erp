@@ -8,7 +8,7 @@ The implementation uses existing services, dialogs and database values. It does 
 
 - Real profile Edit and directory breadcrumbs, with the selected contact ID retained.
 - Footer Save from all six editor tabs on both renderers, independently confirmed in the database; Discard does not persist unsaved input. Pointer-hit checks cover desktop and mobile, including the Copilot overlay.
-- Native Add Person/Company dialogs, accessible New menu close behavior, list selection with no POST, and partial selection state.
+- Native Add Person/Company dialogs, accessible New menu close behavior, list selection with no POST, partial selection state, and actual pointer hits on the last row's menu on desktop/mobile.
 - Authorized server search across pages and first/last name fields; changing type retains search and resets pagination.
 - Supplier inactive filtering and matching CSV output, checked against an independent owner-scoped database query.
 - Existing Edit Group Update, editable payment terms and active toggle, with actual database persistence and restoration.
@@ -16,7 +16,9 @@ The implementation uses existing services, dialogs and database values. It does 
 - Nine screens at 1440, 1024, 768, 390 and 320 pixels on both `/apps` and `/qapps`. Layout and runtime error checks supplement visual review; they are not a pixel comparison of the shared application shell.
 - Before/after row counts and SHA-256 digests for the existing invoice, payment, order, POS and ledger tables.
 
-`evidence/checks.json` records **212 passing checks, 90 layouts and zero browser errors** in the final native run. `evidence/source-parity.json` identifies all 12 changed application files installed in that runtime; `evidence/cleanup.json` records destruction of the whole task-owned in-memory database. Screenshots contain only disposable fixture data. Trusted clean-image UI/security workflow links belong in the PR, and are separate from this native report.
+`evidence/checks.json` records **216 passing checks, 90 layouts and zero browser errors** in the final native run. `evidence/source-parity.json` identifies all 12 changed application files installed in that runtime; `evidence/cleanup.json` records destruction of the whole task-owned in-memory database. Screenshots contain only disposable fixture data. Trusted clean-image UI/security workflow links belong in the PR, and are separate from this native report.
+
+The first trusted UI run caught a padding regression: compact-card padding overrode the All Contacts list's reserved space for its last-row menu. The final CSS preserves that space explicitly, and this profile adds pointer-hit coverage for that case. No acceptance assertion was removed or relaxed.
 
 ## Reproduce in a new disposable native runtime
 
