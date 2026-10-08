@@ -55,3 +55,18 @@ An earlier repeat run failed because the local rebuilt framework rendered raw Fr
 The [native report](evidence/native-report.json), [no-op fingerprints](evidence/billing-no-op.json), [parity](evidence/source-parity.json), [cleanup summary](evidence/cleanup.json), and [eight supplemental modal/focus checks](evidence/supplemental-ui.json) contain synthetic evidence only. Wide `/apps` and `/qapps` template screenshots and the final mobile screenshot are in `evidence/`. Page bounds passing does not certify all shared shell chrome: the narrow `/qapps` screenshot shows pre-existing global header overlap, and the `/apps` shell can open its sidebar over content. Those shared-shell observations are disclosed rather than claimed fixed by scoped Barcode CSS.
 
 These software results do not close the production/physical gates above or guarantee absence of unknown bugs.
+
+## Current-master re-verification
+
+`review-reverification.json` supersedes the historical source-head evidence above.
+The parent is rebased on master `bd35795bf31594502acbe59fb8ad3289bd9a73e1`, retains
+theme v277 and the current module registrations, and registers Barcode CSS once in
+each HTML/Quasar asset block. Its fresh native run passed 291 checks with all 987
+component files matching, unchanged billing/stock/payment fingerprints and zero
+captured-key residue. The named memory runtime was stopped; both listeners closed
+and an independent IFEXISTS reconnect failed. All four local guards pass.
+
+The PR is open for human review at the user's request. Required GitHub acceptance
+cannot currently start because of the repository account billing/spending limit.
+Owner MARUTHI database/cashier acceptance and physical scanner/printer checks remain
+deployment gates. No merge, deployment or production write was performed.
