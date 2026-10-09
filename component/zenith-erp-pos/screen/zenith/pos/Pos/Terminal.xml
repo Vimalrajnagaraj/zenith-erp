@@ -1483,20 +1483,20 @@
 
 
                 if (term) {
-                    def termLower = term.toLowerCase()
-                    def posOrg = ec.user.getPreference('ACTIVE_ORGANIZATION')
-                    def allP = ec.entity.find("mantle.product.Product")
-                        .condition([productTypeEnumId:'PtAsset', ownerPartyId: posOrg])
-                        .orderBy("productName").limit(3000).list()
-                    def products = allP.findAll { pr ->
-                        (pr.productName ?: '').toLowerCase().contains(termLower) ||
-                        (pr.pseudoId ?: '').toLowerCase().contains(termLower) ||
-                        (pr.productId ?: '').toLowerCase().contains(termLower)
+                    def posOrg = ec.service.sync().name('zenith.barcode.BarcodeServices.get#AuthorizedActiveOrganization').call().activeOrgId
+                    // Match in SQL before limiting suggestions, so catalogue order cannot hide a valid code.
+                    def products=[]
+                    if(posOrg){
+                        def cf=ec.entity.conditionFactory;def EC=org.moqui.entity.EntityCondition
+                        def like='%'+term.toString().trim().replace('\\','\\\\').replace('%','\\%').replace('_','\\_')+'%'
+                        def codes=ec.service.sync().name('zenith.barcode.BarcodeServices.get#ScanAliases').parameters([code:term.toString().trim()]).call().aliases
+                        def aliases=ec.entity.find('zenith.erp.barcode.ProductBarcode').condition('organizationPartyId',posOrg).condition('isActive','Y')
+                            .condition(cf.makeCondition([cf.makeCondition('barcodeValue',EC.LIKE,like).ignoreCase(),cf.makeCondition('barcodeValue',EC.IN,codes)],EC.OR)).list().collect{it.productId}
+                        def parts=['productName','pseudoId','productId'].collect{cf.makeCondition(it,EC.LIKE,like).ignoreCase()}
+                        if(aliases)parts.add(cf.makeCondition('productId',EC.IN,aliases))
+                        products=ec.entity.find('mantle.product.Product').condition('ownerPartyId',posOrg).condition('productTypeEnumId','PtAsset')
+                            .condition(cf.makeCondition(parts,EC.OR)).orderBy('productName').limit(10).list()
                     }
-                    if (products.size() > 10) products = products.subList(0, 10)
-
-
-
                     products.each { p ->
 
 
@@ -2162,41 +2162,10 @@
 
 
 
-                            // Duplicate-safe exact match on the scan code (pseudoId). Use list(), not one():
-                            // one() throws when two products share a code, and we must never guess which to bill.
-                            def _pm = ec.entity.find("mantle.product.Product").condition("pseudoId", code).list()
-                            if (_pm.size() == 1) { foundProduct = _pm[0] } else if (_pm.size() > 1) { dupCode = true }
-
-
-
-                            if (!foundProduct && !dupCode) foundProduct = ec.entity.find("mantle.product.Product").condition("productId", code).one()
-
-                            // Rich ProductBarcode (EAN/UPC/Code128/etc.) so a barcode from the Barcode module
-                            // also resolves at the till, not just Product.pseudoId. Org-scoped + active only.
-                            if (!foundProduct && !dupCode) {
-                                def _bcm = ec.entity.find("zenith.erp.barcode.ProductBarcode")
-                                    .condition("barcodeValue", code).condition("isActive", "Y")
-                                    .condition("organizationPartyId", ec.user.getPreference('ACTIVE_ORGANIZATION')).list()
-                                if (_bcm.size() == 1) { foundProduct = ec.entity.find("mantle.product.Product").condition("productId", _bcm[0].productId).one() }
-                                else if (_bcm.size() > 1) { dupCode = true }
-                            }
-
-
-
-                            if (!foundProduct && !dupCode) {
-                                def codeLower = code.toLowerCase()
-                                def scanAll = ec.entity.find("mantle.product.Product")
-                                    .condition("productTypeEnumId", "PtAsset").limit(500).list()
-                                foundProduct = scanAll.find { pr ->
-                                    (pr.productName ?: '').toLowerCase().contains(codeLower) ||
-                                    (pr.pseudoId ?: '').toLowerCase().contains(codeLower)
-                                }
-
-
-
-                            }
-
-
+                            def match=ec.service.sync().name('zenith.barcode.BarcodeServices.resolve#ScanProduct').parameters([code:code]).call()
+                            dupCode=match?.ambiguous ?: false
+                            if(match?.found)foundProduct=ec.entity.find('mantle.product.Product').condition('productId',match.productId).one()
+                            // Partial text belongs to type-ahead selection; a scanner Enter never guesses a product.
 
                         }
 

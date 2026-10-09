@@ -1,396 +1,396 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+<!-- Barcode lifecycle boundaries validate the stored owner before writes; caller-supplied owners are never mapped. -->
+<service verb="get" noun="AuthorizedActiveOrganization" authenticate="true" authz-action="view"><in-parameters></in-parameters><out-parameters><parameter name="activeOrgId"/></out-parameters><actions><script><![CDATA[
 
-    <!-- ========== Product Barcode CRUD ========== -->
+activeOrgId=null
+if(!ec.user.isInGroup('ADMIN')){ec.user.context.activeOrgId=null;ec.user.context.userOrgIds=[];ec.user.context.filterOrgIds=[]}
+def pref=ec.user.getPreference('ACTIVE_ORGANIZATION')
+if(!pref || pref=='_NA_') return
+if(ec.user.isInGroup('ADMIN')) {activeOrgId=pref;return}
+ec.user.context.activeOrgId=null;ec.user.context.userOrgIds=[];ec.user.context.filterOrgIds=[]
+def partyId=ec.user.userAccount?.partyId
+if(!partyId) return
+def info=ec.service.sync().name('mantle.party.PartyServices.get#PartyOrganizationInfo').parameters([partyId:partyId]).disableAuthz().call()
+if(ec.message.hasError())return
+def ids=info?.userOrgIds ?: []
+activeOrgId=ids.contains(pref) && info?.activeOrgId==pref ? pref : null
+ec.user.context.activeOrgId=activeOrgId;ec.user.context.userOrgIds=ids;ec.user.context.filterOrgIds=activeOrgId ? [activeOrgId] : []
 
-    <service verb="add" noun="ProductBarcode">
-        <in-parameters>
-            <parameter name="productId" required="true"/>
-            <parameter name="barcodeTypeEnumId" required="true"/>
-            <parameter name="barcodeValue" required="true"/>
-            <parameter name="isPrimary" default-value="N"/>
-        </in-parameters>
-        <out-parameters><parameter name="barcodeId"/></out-parameters>
-        <actions>
-            <entity-find-one entity-name="mantle.product.Product" value-field="_prd"><field-map field-name="productId"/></entity-find-one>
-            <set field="organizationPartyId" from="_prd?.ownerPartyId ?: ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-            <script><![CDATA[
-                def bv = (barcodeValue ?: '').trim()
-                def checkEan = { String x ->
-                    int n = x.length(); int sum = 0
-                    for (int i = 0; i < n-1; i++) { int d = Character.getNumericValue(x.charAt(n-2-i)); sum += (i % 2 == 0) ? d*3 : d }
-                    return ((10 - (sum % 10)) % 10) == Character.getNumericValue(x.charAt(n-1))
+]]></script></actions></service>
+<service verb="assert" noun="RecordAccess" authenticate="true" authz-action="view"><in-parameters><parameter name="kind"/><parameter name="recordId"/><parameter name="write" type="Boolean"/></in-parameters><out-parameters><parameter name="allowed" type="Boolean"/><parameter name="record" type="Map"/></out-parameters><actions><script><![CDATA[
+def scope=ec.service.sync().name('zenith.barcode.BarcodeServices.get#AuthorizedActiveOrganization').call(); def org=scope.activeOrgId
+
+allowed=false
+def types=[product:['mantle.product.Product','productId','ownerPartyId'],barcode:['zenith.erp.barcode.ProductBarcode','barcodeId','organizationPartyId'],label:['zenith.erp.barcode.BarcodeLabel','labelId','organizationPartyId'],job:['zenith.erp.barcode.BarcodePrintJob','printJobId','organizationPartyId']]
+def type=types[kind]
+if(!type || !recordId){ec.message.addError('Select an existing barcode record.');return}
+def row=ec.entity.find(type[0]).condition(type[1],recordId).disableAuthz().one()
+if(!row || (!ec.user.isInGroup('ADMIN') && (!org || !row[type[2]] || row[type[2]]!=org))){ec.message.addError('You do not have access to this barcode record.');return}
+if(write){
+ def permission=ec.service.sync().name('zenith.base.SecurityServices.check#ModuleWriteAccess').parameters([moduleId:'barcode']).disableAuthz().call()
+ if(!permission.canWrite){ec.message.addError('Barcode write access is required.');return}
+}
+record=row;allowed=true
+
+]]></script></actions></service>
+<service verb="validate" noun="BarcodeValue" authenticate="true" authz-action="view"><in-parameters><parameter name="barcodeValue" allow-html="any"/><parameter name="barcodeTypeEnumId"/></in-parameters><out-parameters><parameter name="valid" type="Boolean"/><parameter name="value"/></out-parameters><actions><script><![CDATA[
+
+valid=false;value=(barcodeValue ?: '').toString().trim()
+def types=['BctEan13','BctEan8','BctUpcA','BctUpcE','BctCode128','BctCode39','BctQrCode','BctInternal']
+def checkDigit={String v -> int sum=0;for(int i=v.length()-2,j=0;i>=0;i--,j++)sum+=Character.getNumericValue(v.charAt(i))*(j%2==0?3:1);((10-sum%10)%10)==Character.getNumericValue(v.charAt(v.length()-1))}
+def error=null
+if(!types.contains(barcodeTypeEnumId))error='Choose a supported barcode type.'
+else if(!value || value.length()>2048 || value.indexOf(0)>=0)error='Enter a barcode value of at most 2048 characters.'
+else if(barcodeTypeEnumId in ['BctEan13','BctEan8','BctUpcA']){
+ int length=[BctEan13:13,BctEan8:8,BctUpcA:12][barcodeTypeEnumId]
+ if(!(value==~ /[0-9]+/) || value.length()!=length || !checkDigit(value))error='Enter the required digits with a valid EAN/UPC check digit.'
+}else if(barcodeTypeEnumId=='BctUpcE'){
+ if(!(value==~ /[01][0-9]{7}/))error='UPC-E requires eight digits including number system 0 or 1 and a check digit.'
+ else {
+  def d=value.substring(1,7); def last=d[5];def expanded
+  if(last in ['0','1','2'])expanded=value[0]+d.substring(0,2)+last+'0000'+d.substring(2,5)+value[7]
+  else if(last=='3')expanded=value[0]+d.substring(0,3)+'00000'+d.substring(3,5)+value[7]
+  else if(last=='4')expanded=value[0]+d.substring(0,4)+'00000'+d[4]+value[7]
+  else expanded=value[0]+d.substring(0,5)+'0000'+last+value[7]
+  if(!checkDigit(expanded))error='UPC-E check digit is invalid.'
+ }
+}else if(barcodeTypeEnumId=='BctCode39' && !(value==~ /[0-9A-Z .\$\/+%\-]+/))error='Code 39 accepts uppercase letters, digits, spaces and - . $ / + %.'
+else if(barcodeTypeEnumId=='BctQrCode' && (!java.nio.charset.StandardCharsets.UTF_8.newEncoder().canEncode(value) || value.getBytes('UTF-8').length>2048))error='QR requires valid Unicode text of at most 2048 UTF-8 bytes.'
+else if(barcodeTypeEnumId in ['BctCode128','BctInternal'] && (!(value==~ /[ -~]+/) || value.length()>256))error='Code 128/Internal requires 1–256 printable ASCII characters.'
+if(error){ec.message.addError(error);return};valid=true
+
+]]></script></actions></service>
+<service verb="add" noun="ProductBarcode" authenticate="true"><in-parameters><parameter name="productId"/><parameter name="barcodeTypeEnumId"/><parameter name="barcodeValue" allow-html="any"/><parameter name="isPrimary"/></in-parameters><out-parameters><parameter name="barcodeId"/></out-parameters><actions><script><![CDATA[
+def access=ec.service.sync().name('zenith.barcode.BarcodeServices.assert#RecordAccess').parameters([kind:'product',recordId:productId,write:true]).call(); if(!access.allowed) return; def record=access.record
+
+if(!record.ownerPartyId){ec.message.addError('Select an organization-owned product.');return}
+def owner=record.ownerPartyId
+// Serialize organization-wide code/GTIN reservations before the product-primary lock.
+ec.entity.find('mantle.party.Party').condition('partyId',owner).forUpdate(true).disableAuthz().one()
+ec.entity.find('mantle.product.Product').condition('productId',productId).forUpdate(true).one()
+def checked=ec.service.sync().name('zenith.barcode.BarcodeServices.validate#BarcodeValue').parameters([barcodeTypeEnumId:barcodeTypeEnumId,barcodeValue:barcodeValue]).call()
+if(!checked.valid)return
+barcodeValue=checked.value;isPrimary=isPrimary ?: 'N'
+if(!(isPrimary in ['Y','N'])){ec.message.addError('Choose Yes or No for Primary.');return}
+def aliases=ec.service.sync().name('zenith.barcode.BarcodeServices.get#ScanAliases').parameters([code:barcodeValue]).call().aliases
+def collision=ec.entity.find('zenith.erp.barcode.ProductBarcode').condition('organizationPartyId',owner).condition('barcodeValue','in',aliases).disableAuthz().count()
+def pseudoCollision=ec.entity.find('mantle.product.Product').condition('ownerPartyId',owner).condition('pseudoId','in',aliases).condition('productId','not-equals',productId).disableAuthz().count()
+def idCollision=ec.entity.find('mantle.product.Product').condition('ownerPartyId',owner).condition('productId','in',aliases).condition('productId','not-equals',productId).disableAuthz().count()
+if(collision || pseudoCollision || idCollision){ec.message.addError('This barcode is already assigned in this organization.');return}
+if(!record.pseudoId && !ec.entity.find('zenith.erp.barcode.ProductBarcode').condition('productId',productId).condition('organizationPartyId',owner).condition('isPrimary','Y').count())isPrimary='Y'
+if(isPrimary=='Y')ec.entity.find('zenith.erp.barcode.ProductBarcode').condition('productId',productId).condition('organizationPartyId',owner).condition('isPrimary','Y').list().each{ec.service.sync().name('update#zenith.erp.barcode.ProductBarcode').parameters([barcodeId:it.barcodeId,isPrimary:'N']).call()}
+def result=ec.service.sync().name('create#zenith.erp.barcode.ProductBarcode').parameters([productId:productId,organizationPartyId:owner,barcodeTypeEnumId:barcodeTypeEnumId,barcodeValue:barcodeValue,isPrimary:isPrimary,isActive:'Y']).call()
+barcodeId=result?.barcodeId
+if(isPrimary=='Y' && !ec.message.hasError())ec.service.sync().name('update#mantle.product.Product').parameters([productId:productId,pseudoId:barcodeValue]).call()
+
+]]></script></actions></service>
+<service verb="sync" noun="PseudoIdFromBarcode" authenticate="true"><in-parameters><parameter name="productId"/><parameter name="barcodeValue" allow-html="any"/></in-parameters><out-parameters></out-parameters><actions><script><![CDATA[
+def scope=ec.service.sync().name('zenith.barcode.BarcodeServices.get#AuthorizedActiveOrganization').call(); def org=scope.activeOrgId
+
+def prd=ec.entity.find('mantle.product.Product').condition('productId',productId).disableAuthz().one()
+if(!prd || !prd.ownerPartyId || (!ec.user.isInGroup('ADMIN') && (!org || prd.ownerPartyId!=org))){ec.message.addError('You do not have access to this product.');return}
+def writable=['barcode','pos','inventory'].any {module -> ec.service.sync().name('zenith.base.SecurityServices.check#ModuleWriteAccess').parameters([moduleId:module]).call().canWrite }
+if(!writable){ec.message.addError('Product code write access is required.');return}
+
+ec.entity.find('mantle.party.Party').condition('partyId',prd.ownerPartyId).forUpdate(true).disableAuthz().one()
+ec.entity.find('mantle.product.Product').condition('productId',productId).forUpdate(true).disableAuthz().one()
+
+def code=barcodeValue?.trim()
+if(!code || prd.pseudoId==code)return
+def aliases=ec.service.sync().name('zenith.barcode.BarcodeServices.get#ScanAliases').parameters([code:code]).call().aliases
+if(ec.entity.find('mantle.product.Product').condition('ownerPartyId',prd.ownerPartyId).condition('pseudoId','in',aliases).condition('productId','not-equals',productId).disableAuthz().count() || ec.entity.find('zenith.erp.barcode.ProductBarcode').condition('organizationPartyId',prd.ownerPartyId).condition('barcodeValue','in',aliases).condition('productId','not-equals',productId).disableAuthz().count()){ec.message.addError('This code belongs to another product.');return}
+ec.service.sync().name('update#mantle.product.Product').parameters([productId:productId,pseudoId:code]).call()
+
+]]></script></actions></service>
+<service verb="sync" noun="BarcodeFromPseudoId" authenticate="true"><in-parameters><parameter name="productId"/><parameter name="code" allow-html="any"/></in-parameters><out-parameters></out-parameters><actions><script><![CDATA[
+def scope=ec.service.sync().name('zenith.barcode.BarcodeServices.get#AuthorizedActiveOrganization').call(); def org=scope.activeOrgId
+
+def prd=ec.entity.find('mantle.product.Product').condition('productId',productId).disableAuthz().one()
+if(!prd || !prd.ownerPartyId || (!ec.user.isInGroup('ADMIN') && (!org || prd.ownerPartyId!=org))){ec.message.addError('You do not have access to this product.');return}
+def writable=['barcode','pos','inventory'].any {module -> ec.service.sync().name('zenith.base.SecurityServices.check#ModuleWriteAccess').parameters([moduleId:module]).call().canWrite }
+if(!writable){ec.message.addError('Product code write access is required.');return}
+
+ec.entity.find('mantle.party.Party').condition('partyId',prd.ownerPartyId).forUpdate(true).disableAuthz().one()
+ec.entity.find('mantle.product.Product').condition('productId',productId).forUpdate(true).disableAuthz().one()
+
+def value=code?.trim()
+if(!value)return // Clearing pseudoId does not delete independently assigned secondary barcodes.
+if(ec.entity.find('mantle.product.Product').condition('ownerPartyId',prd.ownerPartyId).condition('productId',value).condition('productId','not-equals',productId).disableAuthz().count()){ec.message.addError('This code matches another product ID.');return}
+def aliases=ec.service.sync().name('zenith.barcode.BarcodeServices.get#ScanAliases').parameters([code:value]).call().aliases
+if(ec.entity.find('zenith.erp.barcode.ProductBarcode').condition('organizationPartyId',prd.ownerPartyId).condition('barcodeValue','in',aliases).condition('productId','not-equals',productId).disableAuthz().count() || ec.entity.find('mantle.product.Product').condition('ownerPartyId',prd.ownerPartyId).condition('pseudoId','in',aliases).condition('productId','not-equals',productId).disableAuthz().count()){ec.message.addError('This code belongs to another product barcode.');return}
+ec.entity.find('zenith.erp.barcode.ProductBarcode').condition('productId',productId).condition('organizationPartyId',prd.ownerPartyId).condition('isPrimary','Y').list().each {if(it.barcodeValue!=value)ec.service.sync().name('update#zenith.erp.barcode.ProductBarcode').parameters([barcodeId:it.barcodeId,isPrimary:'N']).call()}
+def mine=ec.entity.find('zenith.erp.barcode.ProductBarcode').condition('organizationPartyId',prd.ownerPartyId).condition('productId',productId).condition('barcodeValue',value).one()
+if(mine)ec.service.sync().name('update#zenith.erp.barcode.ProductBarcode').parameters([barcodeId:mine.barcodeId,isPrimary:'Y',isActive:'Y']).call()
+else ec.service.sync().name('create#zenith.erp.barcode.ProductBarcode').parameters([productId:productId,organizationPartyId:prd.ownerPartyId,barcodeValue:value,barcodeTypeEnumId:'BctInternal',isPrimary:'Y',isActive:'Y']).call()
+
+]]></script></actions></service>
+<service verb="clear" noun="ProductCode" authenticate="true"><in-parameters><parameter name="productId"/></in-parameters><out-parameters><parameter name="code"/></out-parameters><actions><script><![CDATA[
+    def org=ec.service.sync().name('zenith.barcode.BarcodeServices.get#AuthorizedActiveOrganization').call().activeOrgId
+    def product=ec.entity.find('mantle.product.Product').condition('productId',productId).disableAuthz().one()
+    if(!product || !product.ownerPartyId || (!ec.user.isInGroup('ADMIN') && (!org || product.ownerPartyId!=org))){ec.message.addError('You do not have access to this product.');return}
+    def writable=['barcode','pos','inventory'].any {module -> ec.service.sync().name('zenith.base.SecurityServices.check#ModuleWriteAccess').parameters([moduleId:module]).disableAuthz().call().canWrite}
+    if(!writable){ec.message.addError('Product code write access is required.');return}
+    ec.entity.find('mantle.party.Party').condition('partyId',product.ownerPartyId).forUpdate(true).disableAuthz().one()
+    ec.entity.find('mantle.product.Product').condition('productId',productId).forUpdate(true).one()
+    def primary=ec.entity.find('zenith.erp.barcode.ProductBarcode').condition('productId',productId).condition('organizationPartyId',product.ownerPartyId).condition('isPrimary','Y').list()
+    if(primary.any{it.organizationPartyId!=product.ownerPartyId}){ec.message.addError('Barcode ownership is inconsistent.');return}
+    primary.each{it.delete()}
+    def next=ec.entity.find('zenith.erp.barcode.ProductBarcode').condition('productId',productId).condition('organizationPartyId',product.ownerPartyId).condition('isActive','Y').orderBy('barcodeId').list()
+    code=next ? next[0].barcodeValue : ''
+    if(next)ec.service.sync().name('update#zenith.erp.barcode.ProductBarcode').parameters([barcodeId:next[0].barcodeId,isPrimary:'Y']).call()
+    ec.service.sync().name('update#mantle.product.Product').parameters([productId:productId,pseudoId:code ?: null]).call()
+]]></script></actions></service>
+<service verb="lookup" noun="ProductByBarcode" authenticate="true" authz-action="view"><in-parameters><parameter name="barcodeValue" allow-html="any"/></in-parameters><out-parameters><parameter name="productId"/><parameter name="productName"/><parameter name="barcodeTypeEnumId"/><parameter name="found" type="Boolean"/><parameter name="listPrice" type="BigDecimal"/></out-parameters><actions><script><![CDATA[
+def scope=ec.service.sync().name('zenith.barcode.BarcodeServices.get#AuthorizedActiveOrganization').call(); def org=scope.activeOrgId
+
+found=false;if(!org)return
+def value=barcodeValue?.trim();if(!value)return
+def aliases=ec.service.sync().name('zenith.barcode.BarcodeServices.get#ScanAliases').parameters([code:value]).call().aliases
+def matches=ec.entity.find('zenith.erp.barcode.ProductBarcode').condition('organizationPartyId',org).condition('barcodeValue','in',aliases).condition('isActive','Y').list()
+def ids=matches.collect{it.productId} as Set
+def disabled=ec.entity.find('zenith.erp.barcode.ProductBarcode').condition('organizationPartyId',org).condition('barcodeValue','in',aliases).condition('isActive','N').list().collect{it.productId} as Set
+ec.entity.find('mantle.product.Product').condition('ownerPartyId',org).condition('pseudoId','in',aliases).list().each{if(!disabled.contains(it.productId))ids.add(it.productId)}
+if(ids.size()!=1)return // Ambiguous legacy data must not choose a product arbitrarily.
+def prd=ec.entity.find('mantle.product.Product').condition('ownerPartyId',org).condition('productId',ids.first()).one()
+if(!prd || prd.ownerPartyId!=org)return
+found=true;productId=prd.productId;productName=prd.productName;listPrice=prd.mrpAmount;barcodeTypeEnumId=matches ? matches[0].barcodeTypeEnumId : 'BctInternal'
+
+]]></script></actions></service>
+<service verb="generate" noun="InternalBarcode" authenticate="true"><in-parameters><parameter name="productId"/><parameter name="prefix"/></in-parameters><out-parameters><parameter name="barcodeId"/><parameter name="barcodeValue" allow-html="any"/></out-parameters><actions><script><![CDATA[
+def access=ec.service.sync().name('zenith.barcode.BarcodeServices.assert#RecordAccess').parameters([kind:'product',recordId:productId,write:true]).call(); if(!access.allowed) return; def record=access.record
+
+def pre=prefix ?: 'ZEN'
+if(!(pre==~ /[A-Z0-9-]{1,20}/)){ec.message.addError('Use 1–20 uppercase letters, digits or hyphens for the prefix.');return}
+def rng=new java.security.SecureRandom();def owner=record.ownerPartyId
+for(int attempt=0;attempt<20;attempt++){
+ def value=pre+String.format('%09d',rng.nextInt(1000000000))
+ if(!ec.entity.find('zenith.erp.barcode.ProductBarcode').condition('organizationPartyId',owner).condition('barcodeValue',value).disableAuthz().count() && !ec.entity.find('mantle.product.Product').condition('ownerPartyId',owner).condition('pseudoId',value).disableAuthz().count()){barcodeValue=value;break}
+}
+if(!barcodeValue){ec.message.addError('Could not allocate a unique barcode. Please retry.');return}
+def result=ec.service.sync().name('zenith.barcode.BarcodeServices.add#ProductBarcode').parameters([productId:productId,barcodeTypeEnumId:'BctInternal',barcodeValue:barcodeValue,isPrimary:'N']).call();barcodeId=result?.barcodeId
+
+]]></script></actions></service>
+<service verb="delete" noun="ProductBarcode" authenticate="true"><in-parameters><parameter name="barcodeId"/></in-parameters><out-parameters></out-parameters><actions><script><![CDATA[
+def access=ec.service.sync().name('zenith.barcode.BarcodeServices.assert#RecordAccess').parameters([kind:'barcode',recordId:barcodeId,write:true]).call(); if(!access.allowed) return; def record=access.record
+
+def prd=ec.entity.find('mantle.product.Product').condition('productId',record.productId).forUpdate(true).one()
+if(!prd || prd.ownerPartyId!=record.organizationPartyId){ec.message.addError('Barcode product ownership is inconsistent.');return}
+ec.service.sync().name('delete#zenith.erp.barcode.ProductBarcode').parameters([barcodeId:barcodeId]).call()
+if(record.isPrimary=='Y'){
+ def next=ec.entity.find('zenith.erp.barcode.ProductBarcode').condition('productId',record.productId).condition('organizationPartyId',record.organizationPartyId).condition('isActive','Y').orderBy('barcodeId').list()
+ if(next){ec.service.sync().name('update#zenith.erp.barcode.ProductBarcode').parameters([barcodeId:next[0].barcodeId,isPrimary:'Y']).call();ec.service.sync().name('update#mantle.product.Product').parameters([productId:record.productId,pseudoId:next[0].barcodeValue]).call()}
+ else if(prd.pseudoId==record.barcodeValue)ec.service.sync().name('update#mantle.product.Product').parameters([productId:record.productId,pseudoId:null]).call()
+}
+
+]]></script></actions></service>
+<service verb="get" noun="ProductBarcodes" authenticate="true" authz-action="view"><in-parameters><parameter name="productId"/></in-parameters><out-parameters><parameter name="barcodes" type="List"/></out-parameters><actions><script><![CDATA[
+def access=ec.service.sync().name('zenith.barcode.BarcodeServices.assert#RecordAccess').parameters([kind:'product',recordId:productId,write:false]).call(); if(!access.allowed) return; def record=access.record
+barcodes=ec.entity.find('zenith.erp.barcode.ProductBarcode').condition('productId',productId).condition('organizationPartyId',record.ownerPartyId).condition('isActive','Y').orderBy('-isPrimary,barcodeId').list()
+]]></script></actions></service>
+<service verb="get" noun="ProductLabel" authenticate="true" authz-action="view"><in-parameters><parameter name="productId"/></in-parameters><out-parameters><parameter name="label" type="Map"/></out-parameters><actions><script><![CDATA[
+def access=ec.service.sync().name('zenith.barcode.BarcodeServices.assert#RecordAccess').parameters([kind:'product',recordId:productId,write:false]).call(); if(!access.allowed) return; def record=access.record
+
+def rows=ec.entity.find('zenith.erp.barcode.ProductBarcode').condition('organizationPartyId',record.ownerPartyId).condition('productId',productId).condition('isActive','Y').orderBy('-isPrimary,barcodeId').list()
+def primary=rows.find{it.isPrimary=='Y'}
+// A disabled rich barcode must not re-enter the label pipeline through its pseudoId mirror.
+def inactiveMirror=record.pseudoId && ec.entity.find('zenith.erp.barcode.ProductBarcode').condition('organizationPartyId',record.ownerPartyId).condition('productId',productId).condition('barcodeValue',record.pseudoId).condition('isActive','N').count()
+def value=primary?.barcodeValue ?: (!inactiveMirror && record.pseudoId!=productId ? record.pseudoId : null) ?: (rows ? rows[0].barcodeValue : productId)
+def bc=rows.find{it.barcodeValue==value}
+label=[value:value,type:bc?.barcodeTypeEnumId ?: 'BctInternal',name:record.productName ?: productId,sku:record.pseudoId ?: '',price:record.mrpAmount,owner:record.ownerPartyId]
+
+]]></script></actions></service>
+<service verb="create" noun="PrintJob" authenticate="true"><in-parameters><parameter name="labelId"/><parameter name="items" type="List"/></in-parameters><out-parameters><parameter name="printJobId"/></out-parameters><actions><script><![CDATA[
+def permission=ec.service.sync().name('zenith.base.SecurityServices.check#ModuleWriteAccess').parameters([moduleId:'barcode']).disableAuthz().call(); if(!permission.canWrite){ec.message.addError('Barcode write access is required.');return}
+def scope=ec.service.sync().name('zenith.barcode.BarcodeServices.get#AuthorizedActiveOrganization').call(); def org=scope.activeOrgId
+
+if(!org){ec.message.addError('Select an active organization before creating a print job.');return}
+if(labelId){def access=ec.service.sync().name('zenith.barcode.BarcodeServices.assert#RecordAccess').parameters([kind:'label',recordId:labelId]).call();if(!access.allowed)return;if(access.record.organizationPartyId!=org){ec.message.addError('Choose a template from the active organization.');return}}
+if(!items || items.size()>500){ec.message.addError('Select between 1 and 500 product rows.');return}
+def built=[:];int total=0
+for(def item in items){
+ def text=item.quantity?.toString()
+ if(!text || !(text==~ /[0-9]{1,4}/) || text.toInteger()<1 || text.toInteger()>2000){ec.message.addError('Quantity must be a whole number from 1 to 2000.');return}
+ int qty=text.toInteger();total+=qty
+ if(total>2000){ec.message.addError('A print job can contain at most 2000 labels.');return}
+ def product=ec.service.sync().name('zenith.barcode.BarcodeServices.get#ProductLabel').parameters([productId:item.productId]).call()
+ if(ec.message.hasError())return
+ if(product.label?.owner!=org){ec.message.addError('Choose products from the print job organization.');return}
+ def row=built[item.productId]
+ if(row)row.quantity+=qty;else built[item.productId]=[productId:item.productId,quantity:qty,barcodeValue:product.label.value]
+}
+def job=ec.service.sync().name('create#zenith.erp.barcode.BarcodePrintJob').parameters([organizationPartyId:org,labelId:labelId,statusId:'BpPending',createdDate:ec.user.nowTimestamp,createdByUserId:ec.user.userId,totalLabels:total]).call();printJobId=job?.printJobId
+if(ec.message.hasError())return
+built.values().each{ec.service.sync().name('create#zenith.erp.barcode.BarcodePrintJobItem').parameters(it+[printJobId:printJobId,organizationPartyId:org]).call()}
+
+]]></script></actions></service>
+<service verb="add" noun="PrintJobItem" authenticate="true"><in-parameters><parameter name="printJobId"/><parameter name="productId"/><parameter name="quantity"/></in-parameters><out-parameters><parameter name="printJobId"/></out-parameters><actions><script><![CDATA[
+def access=ec.service.sync().name('zenith.barcode.BarcodeServices.assert#RecordAccess').parameters([kind:'job',recordId:printJobId,write:true]).call(); if(!access.allowed) return; def record=access.record
+
+def job=ec.entity.find('zenith.erp.barcode.BarcodePrintJob').condition('printJobId',printJobId).forUpdate(true).one()
+if(job.statusId!='BpPending'){ec.message.addError('Only pending print jobs can be edited.');return}
+
+def text=quantity?.toString()
+if(!text || !(text==~ /[0-9]{1,4}/) || text.toInteger()<1 || text.toInteger()>2000){ec.message.addError('Quantity must be a whole number from 1 to 2000.');return}
+int qty=text.toInteger()
+def product=ec.service.sync().name('zenith.barcode.BarcodeServices.get#ProductLabel').parameters([productId:productId]).call()
+if(ec.message.hasError())return
+if(product.label?.owner!=job.organizationPartyId){ec.message.addError('Choose a product from the print job organization.');return}
+def rows=ec.entity.find('zenith.erp.barcode.BarcodePrintJobItem').condition('printJobId',printJobId).list()
+int total=rows.sum{it.quantity ?: 0} ?: 0
+if(total+qty>2000){ec.message.addError('A print job can contain at most 2000 labels.');return}
+def line=rows.find{it.productId==productId}
+// Re-adding a line increments quantity without replacing the code captured when the line was created.
+if(line)ec.service.sync().name('update#zenith.erp.barcode.BarcodePrintJobItem').parameters([printJobId:printJobId,productId:productId,quantity:line.quantity+qty]).call()
+else ec.service.sync().name('create#zenith.erp.barcode.BarcodePrintJobItem').parameters([printJobId:printJobId,productId:productId,organizationPartyId:job.organizationPartyId,quantity:qty,barcodeValue:product.label.value]).call()
+ec.service.sync().name('update#zenith.erp.barcode.BarcodePrintJob').parameters([printJobId:printJobId,totalLabels:total+qty]).call()
+
+]]></script></actions></service>
+<service verb="remove" noun="PrintJobItem" authenticate="true"><in-parameters><parameter name="printJobId"/><parameter name="productId"/></in-parameters><out-parameters></out-parameters><actions><script><![CDATA[
+def access=ec.service.sync().name('zenith.barcode.BarcodeServices.assert#RecordAccess').parameters([kind:'job',recordId:printJobId,write:true]).call(); if(!access.allowed) return; def record=access.record
+
+def job=ec.entity.find('zenith.erp.barcode.BarcodePrintJob').condition('printJobId',printJobId).forUpdate(true).one()
+if(job.statusId!='BpPending'){ec.message.addError('Only pending print jobs can be edited.');return}
+
+def line=ec.entity.find('zenith.erp.barcode.BarcodePrintJobItem').condition('printJobId',printJobId).condition('productId',productId).one()
+if(!line || line.organizationPartyId!=job.organizationPartyId){ec.message.addError('Print job item not found.');return}
+ec.service.sync().name('delete#zenith.erp.barcode.BarcodePrintJobItem').parameters([printJobId:printJobId,productId:productId]).call()
+ec.service.sync().name('zenith.barcode.BarcodeServices.recompute#PrintJobTotal').parameters([printJobId:printJobId]).call()
+
+]]></script></actions></service>
+<service verb="recompute" noun="PrintJobTotal" authenticate="true"><in-parameters><parameter name="printJobId"/></in-parameters><out-parameters></out-parameters><actions><script><![CDATA[
+def access=ec.service.sync().name('zenith.barcode.BarcodeServices.assert#RecordAccess').parameters([kind:'job',recordId:printJobId,write:true]).call(); if(!access.allowed) return; def record=access.record
+
+def job=ec.entity.find('zenith.erp.barcode.BarcodePrintJob').condition('printJobId',printJobId).forUpdate(true).one()
+if(job.statusId!='BpPending'){ec.message.addError('Only pending print jobs can be edited.');return}
+
+def rows=ec.entity.find('zenith.erp.barcode.BarcodePrintJobItem').condition('printJobId',printJobId).list()
+if(rows.any{it.organizationPartyId!=job.organizationPartyId}){ec.message.addError('Print job item ownership is inconsistent.');return}
+ec.service.sync().name('update#zenith.erp.barcode.BarcodePrintJob').parameters([printJobId:printJobId,totalLabels:rows.sum{it.quantity ?: 0} ?: 0]).call()
+
+]]></script></actions></service>
+<service verb="complete" noun="PrintJob" authenticate="true"><in-parameters><parameter name="printJobId"/></in-parameters><out-parameters></out-parameters><actions><script><![CDATA[
+def access=ec.service.sync().name('zenith.barcode.BarcodeServices.assert#RecordAccess').parameters([kind:'job',recordId:printJobId,write:true]).call(); if(!access.allowed) return; def record=access.record
+
+def job=ec.entity.find('zenith.erp.barcode.BarcodePrintJob').condition('printJobId',printJobId).forUpdate(true).one()
+if(job.statusId=='BpCompleted')return // Repeating a successful acknowledgement is a no-op.
+if(!(job.statusId in ['BpPending','BpPrinting'])){ec.message.addError('This print job cannot be marked printed.');return}
+def rows=ec.entity.find('zenith.erp.barcode.BarcodePrintJobItem').condition('printJobId',printJobId).list()
+if(!rows || rows.any{it.organizationPartyId!=job.organizationPartyId || !it.quantity || it.quantity<1}){ec.message.addError('Add valid labels before marking this job printed.');return}
+if(job.statusId=='BpPending')ec.service.sync().name('update#zenith.erp.barcode.BarcodePrintJob').parameters([printJobId:printJobId,statusId:'BpPrinting']).call()
+ec.service.sync().name('update#zenith.erp.barcode.BarcodePrintJob').parameters([printJobId:printJobId,statusId:'BpCompleted',completedDate:ec.user.nowTimestamp]).call()
+
+]]></script></actions></service>
+<service verb="create" noun="LabelTemplate" authenticate="true"><in-parameters><parameter name="labelId"/><parameter name="labelName"/><parameter name="labelWidth"/><parameter name="labelHeight"/><parameter name="columnsPerRow"/><parameter name="barcodeTypeEnumId"/><parameter name="showProductName"/><parameter name="showPrice"/><parameter name="showSku"/><parameter name="showMrp"/><parameter name="isDefault"/></in-parameters><out-parameters><parameter name="labelId"/></out-parameters><actions><script><![CDATA[
+def permission=ec.service.sync().name('zenith.base.SecurityServices.check#ModuleWriteAccess').parameters([moduleId:'barcode']).disableAuthz().call(); if(!permission.canWrite){ec.message.addError('Barcode write access is required.');return}
+def scope=ec.service.sync().name('zenith.barcode.BarcodeServices.get#AuthorizedActiveOrganization').call(); def org=scope.activeOrgId
+
+if(!org){ec.message.addError('Select an active organization before creating a template.');return}
+def existing=[barcodeTypeEnumId:'BctCode128',columnsPerRow:3];def owner=org
+
+def values=[:]
+['labelName','labelWidth','labelHeight','columnsPerRow','barcodeTypeEnumId','showProductName','showPrice','showSku','showMrp','isDefault'].each {key -> if(context[key]!=null && context[key].toString()!='')values[key]=context[key]}
+def proposed=(existing ?: [:])+values
+if(!proposed.labelName?.toString()?.trim() || proposed.labelName.toString().trim().length()>255){ec.message.addError('Enter a template name of at most 255 characters.');return}
+values.labelName=proposed.labelName.toString().trim()
+try{
+ for(def key in ['labelWidth','labelHeight']){def n=new BigDecimal(proposed[key]?.toString() ?: '');if(n<=0 || n>300)throw new IllegalArgumentException();values[key]=n}
+ def n=proposed.columnsPerRow?.toString();if(!(n==~ /[0-9]{1,2}/) || n.toInteger()<1 || n.toInteger()>10)throw new IllegalArgumentException();values.columnsPerRow=n.toInteger()
+}catch(Exception e){ec.message.addError('Enter positive dimensions up to 300 mm and 1–10 columns.');return}
+if(!(proposed.barcodeTypeEnumId in ['BctEan13','BctEan8','BctUpcA','BctUpcE','BctCode128','BctCode39','BctQrCode','BctInternal'])){ec.message.addError('Choose a supported template barcode format.');return}
+for(def key in ['showProductName','showPrice','showSku','showMrp','isDefault'])if(values.containsKey(key) && !(values[key] in ['Y','N'])){ec.message.addError('Choose Yes or No for template options.');return}
+
+ec.entity.find('mantle.party.Party').condition('partyId',owner).forUpdate(true).disableAuthz().one()
+def result=ec.service.sync().name('create#zenith.erp.barcode.BarcodeLabel').parameters(values+[organizationPartyId:owner]).call();labelId=result?.labelId
+if(ec.message.hasError())return
+
+if(values.isDefault=='Y')ec.service.sync().name('zenith.barcode.BarcodeServices.enforce#SingleDefaultTemplate').parameters([organizationPartyId:owner,keepLabelId:labelId]).call()
+
+]]></script></actions></service>
+<service verb="update" noun="LabelTemplate" authenticate="true"><in-parameters><parameter name="labelId"/><parameter name="labelName"/><parameter name="labelWidth"/><parameter name="labelHeight"/><parameter name="columnsPerRow"/><parameter name="barcodeTypeEnumId"/><parameter name="showProductName"/><parameter name="showPrice"/><parameter name="showSku"/><parameter name="showMrp"/><parameter name="isDefault"/></in-parameters><out-parameters></out-parameters><actions><script><![CDATA[
+def access=ec.service.sync().name('zenith.barcode.BarcodeServices.assert#RecordAccess').parameters([kind:'label',recordId:labelId,write:true]).call(); if(!access.allowed) return; def record=access.record
+def existing=record;def owner=record.organizationPartyId
+
+def values=[:]
+['labelName','labelWidth','labelHeight','columnsPerRow','barcodeTypeEnumId','showProductName','showPrice','showSku','showMrp','isDefault'].each {key -> if(context[key]!=null && context[key].toString()!='')values[key]=context[key]}
+def proposed=(existing ?: [:])+values
+if(!proposed.labelName?.toString()?.trim() || proposed.labelName.toString().trim().length()>255){ec.message.addError('Enter a template name of at most 255 characters.');return}
+values.labelName=proposed.labelName.toString().trim()
+try{
+ for(def key in ['labelWidth','labelHeight']){def n=new BigDecimal(proposed[key]?.toString() ?: '');if(n<=0 || n>300)throw new IllegalArgumentException();values[key]=n}
+ def n=proposed.columnsPerRow?.toString();if(!(n==~ /[0-9]{1,2}/) || n.toInteger()<1 || n.toInteger()>10)throw new IllegalArgumentException();values.columnsPerRow=n.toInteger()
+}catch(Exception e){ec.message.addError('Enter positive dimensions up to 300 mm and 1–10 columns.');return}
+if(!(proposed.barcodeTypeEnumId in ['BctEan13','BctEan8','BctUpcA','BctUpcE','BctCode128','BctCode39','BctQrCode','BctInternal'])){ec.message.addError('Choose a supported template barcode format.');return}
+for(def key in ['showProductName','showPrice','showSku','showMrp','isDefault'])if(values.containsKey(key) && !(values[key] in ['Y','N'])){ec.message.addError('Choose Yes or No for template options.');return}
+ec.entity.find('mantle.party.Party').condition('partyId',owner).forUpdate(true).disableAuthz().one()
+ec.service.sync().name('update#zenith.erp.barcode.BarcodeLabel').parameters(values+[labelId:labelId]).call()
+
+if(values.isDefault=='Y')ec.service.sync().name('zenith.barcode.BarcodeServices.enforce#SingleDefaultTemplate').parameters([organizationPartyId:owner,keepLabelId:labelId]).call()
+
+]]></script></actions></service>
+<service verb="enforce" noun="SingleDefaultTemplate" authenticate="true"><in-parameters><parameter name="organizationPartyId"/><parameter name="keepLabelId"/></in-parameters><out-parameters></out-parameters><actions><script><![CDATA[
+def access=ec.service.sync().name('zenith.barcode.BarcodeServices.assert#RecordAccess').parameters([kind:'label',recordId:keepLabelId,write:true]).call(); if(!access.allowed) return; def record=access.record
+
+if(record.organizationPartyId!=organizationPartyId){ec.message.addError('Template organization cannot be changed.');return}
+// Serialize default changes on the owning organization, preserving exactly one default under concurrency.
+ec.entity.find('mantle.party.Party').condition('partyId',organizationPartyId).forUpdate(true).disableAuthz().one()
+ec.entity.find('zenith.erp.barcode.BarcodeLabel').condition('organizationPartyId',organizationPartyId).condition('isDefault','Y').condition('labelId','not-equals',keepLabelId).list().each {ec.service.sync().name('update#zenith.erp.barcode.BarcodeLabel').parameters([labelId:it.labelId,isDefault:'N']).call()}
+
+]]></script></actions></service>
+
+    <!-- Exact scanner resolution is shared by the dashboard/labels and the POS cart boundary.
+         Ambiguous legacy aliases and inactive rich codes never select an arbitrary product. -->
+    <service verb="resolve" noun="ScanProduct" authenticate="true" authz-action="view">
+        <in-parameters><parameter name="code" allow-html="any"/></in-parameters>
+        <out-parameters><parameter name="productId"/><parameter name="found" type="Boolean"/><parameter name="ambiguous" type="Boolean"/></out-parameters>
+        <actions><script><![CDATA[
+            found=false;ambiguous=false
+            def org=ec.service.sync().name('zenith.barcode.BarcodeServices.get#AuthorizedActiveOrganization').call().activeOrgId
+            def value=code?.toString()?.trim();if(!org || !value)return
+            def codes=ec.service.sync().name('zenith.barcode.BarcodeServices.get#ScanAliases').parameters([code:value]).call().aliases
+            def aliases=ec.entity.find('zenith.erp.barcode.ProductBarcode').condition('organizationPartyId',org).condition('barcodeValue','in',codes).list()
+            def disabled=aliases.findAll{it.isActive!='Y'}.collect{it.productId} as Set
+            def ids=aliases.findAll{it.isActive=='Y'}.collect{it.productId} as Set
+            ec.entity.find('mantle.product.Product').condition('ownerPartyId',org).condition('pseudoId','in',codes).list().each{if(!disabled.contains(it.productId))ids.add(it.productId)}
+            ec.entity.find('mantle.product.Product').condition('ownerPartyId',org).condition('productId',value).list().each{if(!disabled.contains(it.productId))ids.add(it.productId)}
+            if(ids.size()>1){ambiguous=true;return}
+            if(ids.size()!=1)return
+            def product=ec.entity.find('mantle.product.Product').condition('ownerPartyId',org).condition('productId',ids.first()).one()
+            if(!product || product.ownerPartyId!=org)return
+            found=true;productId=product.productId
+        ]]></script></actions>
+    </service>
+
+    <!-- Scanners may report UPC-A as a zero-prefixed EAN-13 and expand UPC-E to UPC-A.
+         Treat these checksummed GTIN representations as aliases so printing and exact scan agree. -->
+    <service verb="get" noun="ScanAliases" authenticate="true" authz-action="view">
+        <in-parameters><parameter name="code" allow-html="any"/></in-parameters>
+        <out-parameters><parameter name="aliases" type="List"/></out-parameters>
+        <actions><script><![CDATA[
+            def value=(code ?: '').toString().trim();def codes=[value] as Set;def upca=null
+            def checked={String v -> int sum=0;for(int i=v.length()-2,j=0;i>=0;i--,j++)sum+=Character.getNumericValue(v.charAt(i))*(j%2==0?3:1);((10-sum%10)%10)==Character.getNumericValue(v.charAt(v.length()-1))}
+            if(value==~ /0[0-9]{12}/ && checked(value))upca=value.substring(1)
+            else if(value==~ /[0-9]{12}/ && checked(value))upca=value
+            else if(value==~ /[01][0-9]{7}/){
+                def d=value.substring(1,7);def last=d[5];def expanded
+                if(last in ['0','1','2'])expanded=value[0]+d.substring(0,2)+last+'0000'+d.substring(2,5)+value[7]
+                else if(last=='3')expanded=value[0]+d.substring(0,3)+'00000'+d.substring(3,5)+value[7]
+                else if(last=='4')expanded=value[0]+d.substring(0,4)+'00000'+d[4]+value[7]
+                else expanded=value[0]+d.substring(0,5)+'0000'+last+value[7]
+                if(checked(expanded))upca=expanded
+            }
+            if(upca){
+                codes.add(upca);codes.add('0'+upca)
+                if(upca[0] in ['0','1']){
+                    def manufacturer=upca.substring(1,6);def product=upca.substring(6,11);def middle=null
+                    if(manufacturer.substring(3)=='00' && manufacturer[2] in ['0','1','2'] && product.startsWith('00'))middle=manufacturer.substring(0,2)+product.substring(2)+manufacturer[2]
+                    else if(manufacturer.endsWith('00') && product.startsWith('000'))middle=manufacturer.substring(0,3)+product.substring(3)+'3'
+                    else if(manufacturer.endsWith('0') && product.startsWith('0000'))middle=manufacturer.substring(0,4)+product.substring(4)+'4'
+                    else if(product.startsWith('0000') && product[4] in ['5','6','7','8','9'])middle=manufacturer+product[4]
+                    if(middle)codes.add(upca[0]+middle+upca[11])
                 }
-                validationError = null
-                if (!bv) validationError = 'Barcode value is required'
-                else if (barcodeTypeEnumId == 'BctEan13' && !(bv ==~ /[0-9]{13}/ && checkEan(bv))) validationError = 'EAN-13 must be 13 digits with a valid check digit'
-                else if (barcodeTypeEnumId == 'BctEan8' && !(bv ==~ /[0-9]{8}/ && checkEan(bv))) validationError = 'EAN-8 must be 8 digits with a valid check digit'
-                else if (barcodeTypeEnumId == 'BctUpcA' && !(bv ==~ /[0-9]{12}/ && checkEan(bv))) validationError = 'UPC-A must be 12 digits with a valid check digit'
-            ]]></script>
-            <if condition="validationError"><return error="true" message="${validationError}"/></if>
-
-            <!-- Check uniqueness within this organization -->
-            <entity-find entity-name="zenith.erp.barcode.ProductBarcode" list="existing" limit="1">
-                <econdition field-name="organizationPartyId"/>
-                <econdition field-name="barcodeValue"/>
-            </entity-find>
-            <if condition="existing">
-                <return error="true" message="Barcode value '${barcodeValue}' is already in use"/>
-            </if>
-
-            <!-- If setting as primary, unset any existing primary for this product -->
-            <if condition="isPrimary == 'Y'">
-                <entity-find entity-name="zenith.erp.barcode.ProductBarcode" list="primaries">
-                    <econdition field-name="productId"/>
-                    <econdition field-name="isPrimary" value="Y"/>
-                </entity-find>
-                <iterate list="primaries" entry="p">
-                    <service-call name="update#zenith.erp.barcode.ProductBarcode"
-                                  in-map="[barcodeId:p.barcodeId, isPrimary:'N']"/>
-                </iterate>
-            </if>
-
-            <service-call name="create#zenith.erp.barcode.ProductBarcode" out-map="context"
-                          in-map="[productId:productId, barcodeTypeEnumId:barcodeTypeEnumId,
-                                   barcodeValue:barcodeValue, isPrimary:isPrimary, organizationPartyId:organizationPartyId]"/>
-
-            <!-- Single source of truth: the PRIMARY barcode is mirrored into Product.pseudoId (the code the
-                 till, exact-scan and label printing use). Also seed pseudoId if the product has none yet.
-                 Non-fatal — a mirror clash never blocks adding the barcode. -->
-            <if condition="isPrimary == 'Y' || !_prd?.pseudoId">
-                <service-call name="zenith.barcode.BarcodeServices.sync#PseudoIdFromBarcode" ignore-error="true"
-                              in-map="[productId:productId, barcodeValue:barcodeValue]"/>
-            </if>
-        </actions>
+            }
+            aliases=codes as List
+        ]]></script></actions>
     </service>
-
-    <!-- ===== Keep Product.pseudoId (billing code) and the primary ProductBarcode in sync (both ways) ===== -->
-    <service verb="sync" noun="PseudoIdFromBarcode">
-        <description>Mirror a (primary) barcode value into Product.pseudoId, unless it clashes with another product's code.</description>
-        <in-parameters>
-            <parameter name="productId" required="true"/>
-            <parameter name="barcodeValue" required="true"/>
-        </in-parameters>
-        <actions>
-            <entity-find-one entity-name="mantle.product.Product" value-field="prd"><field-map field-name="productId"/></entity-find-one>
-            <if condition="prd == null"><return/></if>
-            <set field="code" from="barcodeValue?.trim()"/>
-            <if condition="!code || prd.pseudoId == code"><return/></if>
-            <!-- Don't collide with another product's pseudoId in the same org (unique pseudo_id+owner). -->
-            <entity-find entity-name="mantle.product.Product" list="clash" limit="1">
-                <econdition field-name="pseudoId" from="code"/>
-                <econdition field-name="ownerPartyId" from="prd.ownerPartyId" ignore-if-empty="true"/>
-                <econdition field-name="productId" operator="not-equals" from="productId"/>
-            </entity-find>
-            <if condition="clash">
-                <return/> <!-- can't mirror; leave pseudoId as-is (the scan already reads ProductBarcode too) -->
-            </if>
-            <service-call name="update#mantle.product.Product" in-map="[productId:productId, pseudoId:code]"/>
-        </actions>
-    </service>
-
-    <service verb="sync" noun="BarcodeFromPseudoId">
-        <description>Reflect a directly-set Product.pseudoId back into the ProductBarcode table as the primary barcode.</description>
-        <in-parameters>
-            <parameter name="productId" required="true"/>
-            <parameter name="code"/>
-        </in-parameters>
-        <actions>
-            <entity-find-one entity-name="mantle.product.Product" value-field="prd"><field-map field-name="productId"/></entity-find-one>
-            <if condition="prd == null"><return/></if>
-            <set field="org" from="prd.ownerPartyId ?: ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-            <set field="c" from="code?.trim()"/>
-            <if condition="!c"><return/></if> <!-- blank code: leave the rich table untouched -->
-            <!-- If another product in the org already owns this barcode value, we can't mirror it (unique). -->
-            <entity-find entity-name="zenith.erp.barcode.ProductBarcode" list="other" limit="1">
-                <econdition field-name="organizationPartyId" from="org"/>
-                <econdition field-name="barcodeValue" from="c"/>
-                <econdition field-name="productId" operator="not-equals" from="productId"/>
-            </entity-find>
-            <if condition="other"><return/></if>
-            <!-- Demote this product's other primaries, then set/create this value as the primary barcode. -->
-            <entity-find entity-name="zenith.erp.barcode.ProductBarcode" list="prims">
-                <econdition field-name="productId"/>
-                <econdition field-name="isPrimary" value="Y"/>
-            </entity-find>
-            <iterate list="prims" entry="pp">
-                <if condition="pp.barcodeValue != c">
-                    <service-call name="update#zenith.erp.barcode.ProductBarcode" in-map="[barcodeId:pp.barcodeId, isPrimary:'N']"/>
-                </if>
-            </iterate>
-            <entity-find entity-name="zenith.erp.barcode.ProductBarcode" list="mine" limit="1">
-                <econdition field-name="productId"/>
-                <econdition field-name="barcodeValue" from="c"/>
-            </entity-find>
-            <if condition="mine">
-                <service-call name="update#zenith.erp.barcode.ProductBarcode" in-map="[barcodeId:mine[0].barcodeId, isPrimary:'Y', isActive:'Y']"/>
-            <else>
-                <service-call name="create#zenith.erp.barcode.ProductBarcode"
-                              in-map="[productId:productId, organizationPartyId:org, barcodeTypeEnumId:'BctInternal',
-                                       barcodeValue:c, isPrimary:'Y', isActive:'Y']"/>
-            </else></if>
-        </actions>
-    </service>
-
-    <service verb="lookup" noun="ProductByBarcode">
-        <in-parameters><parameter name="barcodeValue" required="true"/></in-parameters>
-        <out-parameters>
-            <parameter name="productId"/>
-            <parameter name="productName"/>
-            <parameter name="listPrice" type="BigDecimal"/>
-            <parameter name="barcodeTypeEnumId"/>
-            <parameter name="found" type="Boolean"/>
-        </out-parameters>
-        <actions>
-            <entity-find entity-name="zenith.erp.barcode.ProductBarcodeDetail" list="results" limit="1">
-                <econdition field-name="barcodeValue"/>
-                <econdition field-name="isActive" value="Y"/>
-            </entity-find>
-            <if condition="results">
-                <set field="found" from="true"/>
-                <set field="productId" from="results[0].productId"/>
-                <set field="productName" from="results[0].productName"/>
-                <set field="listPrice" from="results[0].listPrice"/>
-                <set field="barcodeTypeEnumId" from="results[0].barcodeTypeEnumId"/>
-            <else>
-                <!-- Fallback: try product pseudoId -->
-                <entity-find entity-name="mantle.product.Product" list="products" limit="1">
-                    <econdition field-name="pseudoId" from="barcodeValue"/>
-                </entity-find>
-                <if condition="products">
-                    <set field="found" from="true"/>
-                    <set field="productId" from="products[0].productId"/>
-                    <set field="productName" from="products[0].productName"/>
-                    <set field="listPrice" from="products[0].mrpAmount"/>
-                <else>
-                    <set field="found" from="false"/>
-                </else></if>
-            </else></if>
-        </actions>
-    </service>
-
-    <service verb="generate" noun="InternalBarcode">
-        <description>Generate a unique internal barcode for a product</description>
-        <in-parameters>
-            <parameter name="productId" required="true"/>
-            <parameter name="prefix" default-value="ZEN"/>
-        </in-parameters>
-        <out-parameters>
-            <parameter name="barcodeId"/>
-            <parameter name="barcodeValue"/>
-        </out-parameters>
-        <actions>
-            <script><![CDATA[
-                def rng = new java.security.SecureRandom()
-                barcodeValue = prefix + String.format("%09d", rng.nextLong().abs() % 1000000000L)
-            ]]></script>
-
-            <service-call name="zenith.barcode.BarcodeServices.add#ProductBarcode" out-map="context"
-                          in-map="[productId:productId, barcodeTypeEnumId:'BctInternal',
-                                   barcodeValue:barcodeValue, isPrimary:'N']"/>
-        </actions>
-    </service>
-
-    <!-- ========== Print Job Services ========== -->
-
-    <service verb="create" noun="PrintJob">
-        <in-parameters>
-            <parameter name="labelId" required="true"/>
-            <parameter name="items" type="List"><description>List of maps: productId, quantity</description></parameter>
-        </in-parameters>
-        <out-parameters><parameter name="printJobId"/></out-parameters>
-        <actions>
-            <set field="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-            <if condition="organizationPartyId == '_NA_'"><set field="organizationPartyId" from="null"/></if>
-
-            <service-call name="create#zenith.erp.barcode.BarcodePrintJob" out-map="jobOut"
-                          in-map="[labelId:labelId, organizationPartyId:organizationPartyId, statusId:'BpPending', createdDate:ec.user.nowTimestamp,
-                                   totalLabels:0, createdByUserId:ec.user.userId]"/>
-            <set field="printJobId" from="jobOut.printJobId"/>
-
-            <if condition="items">
-                <iterate list="items" entry="item">
-                    <entity-find-one entity-name="mantle.product.Product" value-field="_ip">
-                        <field-map field-name="productId" from="item.productId"/></entity-find-one>
-                    <!-- Only add real products the caller's org owns (super-admin exempt); silently skip foreign/unknown. -->
-                    <if condition="_ip != null &amp;&amp; (ec.user.isInGroup('ADMIN') || _ip.ownerPartyId == null || organizationPartyId == null || _ip.ownerPartyId == organizationPartyId)">
-                        <set field="qty" from="(item.quantity?.toString()?.isInteger()) ? (item.quantity as Integer) : 1"/>
-                        <if condition="qty &lt; 1"><set field="qty" from="1"/></if>
-                        <!-- Get primary barcode; fall back to the product code, then the id -->
-                        <entity-find entity-name="zenith.erp.barcode.ProductBarcode" list="barcodes" limit="1">
-                            <econdition field-name="productId" from="item.productId"/>
-                            <econdition field-name="isActive" value="Y"/>
-                            <order-by field-name="-isPrimary"/>
-                        </entity-find>
-                        <set field="bcValue" from="barcodes ? barcodes[0].barcodeValue : (_ip.pseudoId ?: item.productId)"/>
-                        <service-call name="create#zenith.erp.barcode.BarcodePrintJobItem"
-                                      in-map="[printJobId:printJobId, organizationPartyId:organizationPartyId, productId:item.productId,
-                                               quantity:qty, barcodeValue:bcValue]"/>
-                    </if>
-                </iterate>
-                <service-call name="zenith.barcode.BarcodeServices.recompute#PrintJobTotal" in-map="[printJobId:printJobId]"/>
-            </if>
-        </actions>
-    </service>
-
-    <!-- Recompute a print job's label total from its items (single source of truth for totalLabels). -->
-    <service verb="recompute" noun="PrintJobTotal">
-        <in-parameters><parameter name="printJobId" required="true"/></in-parameters>
-        <actions>
-            <entity-find entity-name="zenith.erp.barcode.BarcodePrintJobItem" list="items">
-                <econdition field-name="printJobId"/>
-            </entity-find>
-            <set field="total" from="0" type="Integer"/>
-            <iterate list="items" entry="it">
-                <set field="total" from="total + ((it.quantity ?: 0) as Integer)" type="Integer"/>
-            </iterate>
-            <service-call name="update#zenith.erp.barcode.BarcodePrintJob" in-map="[printJobId:printJobId, totalLabels:total]"/>
-        </actions>
-    </service>
-
-    <!-- Add (or increment) a product line on a print job. Org-guarded: only the owning org (super-admin
-         exempt) may touch the job, and only its own products can be added (no cross-tenant product/leak). -->
-    <service verb="add" noun="PrintJobItem">
-        <in-parameters>
-            <parameter name="printJobId" required="true"/>
-            <parameter name="productId" required="true"/>
-            <parameter name="quantity" default-value="1"/>
-        </in-parameters>
-        <out-parameters><parameter name="printJobId"/></out-parameters>
-        <actions>
-            <entity-find-one entity-name="zenith.erp.barcode.BarcodePrintJob" value-field="job"/>
-            <if condition="job == null"><return error="true" message="Print job not found."/></if>
-            <set field="_ao" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-            <if condition="_ao == '_NA_'"><set field="_ao" from="null"/></if>
-            <set field="_isAdmin" from="ec.user.isInGroup('ADMIN')"/>
-            <if condition="!_isAdmin &amp;&amp; (job.organizationPartyId == null || !_ao || job.organizationPartyId != _ao)">
-                <return error="true" message="You do not have access to this print job."/></if>
-
-            <entity-find-one entity-name="mantle.product.Product" value-field="_prd"><field-map field-name="productId"/></entity-find-one>
-            <if condition="_prd == null"><return error="true" message="Product not found."/></if>
-            <if condition="!_isAdmin &amp;&amp; _prd.ownerPartyId != null &amp;&amp; _ao != null &amp;&amp; _prd.ownerPartyId != _ao">
-                <return error="true" message="You do not have access to this product."/></if>
-
-            <set field="qty" from="(quantity?.toString()?.isInteger()) ? (quantity as Integer) : 1"/>
-            <if condition="qty &lt; 1"><set field="qty" from="1"/></if>
-
-            <entity-find entity-name="zenith.erp.barcode.ProductBarcode" list="barcodes" limit="1">
-                <econdition field-name="productId"/>
-                <econdition field-name="isActive" value="Y"/>
-                <order-by field-name="-isPrimary"/>
-            </entity-find>
-            <set field="bcValue" from="barcodes ? barcodes[0].barcodeValue : (_prd.pseudoId ?: productId)"/>
-
-            <!-- PK is (printJobId, productId): re-adding the same product increments its quantity -->
-            <entity-find-one entity-name="zenith.erp.barcode.BarcodePrintJobItem" value-field="existingItem"/>
-            <if condition="existingItem != null">
-                <service-call name="update#zenith.erp.barcode.BarcodePrintJobItem"
-                              in-map="[printJobId:printJobId, productId:productId,
-                                       quantity:((existingItem.quantity ?: 0) as Integer) + qty, barcodeValue:bcValue]"/>
-            <else>
-                <service-call name="create#zenith.erp.barcode.BarcodePrintJobItem"
-                              in-map="[printJobId:printJobId, productId:productId, organizationPartyId:job.organizationPartyId,
-                                       quantity:qty, barcodeValue:bcValue]"/>
-            </else></if>
-            <service-call name="zenith.barcode.BarcodeServices.recompute#PrintJobTotal" in-map="[printJobId:printJobId]"/>
-        </actions>
-    </service>
-
-    <!-- Remove a product line from a print job (org-guarded). -->
-    <service verb="remove" noun="PrintJobItem">
-        <in-parameters>
-            <parameter name="printJobId" required="true"/>
-            <parameter name="productId" required="true"/>
-        </in-parameters>
-        <actions>
-            <entity-find-one entity-name="zenith.erp.barcode.BarcodePrintJob" value-field="job"/>
-            <if condition="job == null"><return error="true" message="Print job not found."/></if>
-            <set field="_ao" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-            <if condition="_ao == '_NA_'"><set field="_ao" from="null"/></if>
-            <if condition="!ec.user.isInGroup('ADMIN') &amp;&amp; (job.organizationPartyId == null || !_ao || job.organizationPartyId != _ao)">
-                <return error="true" message="You do not have access to this print job."/></if>
-            <service-call name="delete#zenith.erp.barcode.BarcodePrintJobItem" in-map="[printJobId:printJobId, productId:productId]"/>
-            <service-call name="zenith.barcode.BarcodeServices.recompute#PrintJobTotal" in-map="[printJobId:printJobId]"/>
-        </actions>
-    </service>
-
-    <!-- BC-031: enforce ONE default label template per org. After a template is set default, demote every
-         OTHER default in the same org to isDefault='N' (mirrors the primary-barcode demotion pattern). -->
-    <service verb="enforce" noun="SingleDefaultTemplate">
-        <in-parameters>
-            <parameter name="organizationPartyId" required="true"/>
-            <parameter name="keepLabelId" required="true"/>
-        </in-parameters>
-        <actions>
-            <entity-find entity-name="zenith.erp.barcode.BarcodeLabel" list="others">
-                <econdition field-name="organizationPartyId"/>
-                <econdition field-name="isDefault" value="Y"/>
-                <econdition field-name="labelId" operator="not-equals" from="keepLabelId"/>
-            </entity-find>
-            <iterate list="others" entry="o">
-                <service-call name="update#zenith.erp.barcode.BarcodeLabel" in-map="[labelId:o.labelId, isDefault:'N']"/>
-            </iterate>
-        </actions>
-    </service>
-
-    <!-- Mark a print job completed (org-guarded — replaces the unguarded inline update in the screen). -->
-    <service verb="complete" noun="PrintJob">
-        <in-parameters><parameter name="printJobId" required="true"/></in-parameters>
-        <actions>
-            <entity-find-one entity-name="zenith.erp.barcode.BarcodePrintJob" value-field="job"/>
-            <if condition="job == null"><return error="true" message="Print job not found."/></if>
-            <set field="_ao" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-            <if condition="_ao == '_NA_'"><set field="_ao" from="null"/></if>
-            <if condition="!ec.user.isInGroup('ADMIN') &amp;&amp; (job.organizationPartyId == null || !_ao || job.organizationPartyId != _ao)">
-                <return error="true" message="You do not have access to this print job."/></if>
-            <!-- BC-COMPLETE-001: the BarcodePrintJob status flow is Pending->Printing->Completed, so a direct
-                 Pending->Completed update is rejected ("Status change not allowed") and rolls back. Step through
-                 Printing first when still Pending so "Mark Printed" actually completes the job. -->
-            <if condition="job.statusId == 'BpPending'">
-                <service-call name="update#zenith.erp.barcode.BarcodePrintJob" in-map="[printJobId:printJobId, statusId:'BpPrinting']"/>
-            </if>
-            <service-call name="update#zenith.erp.barcode.BarcodePrintJob"
-                          in-map="[printJobId:printJobId, statusId:'BpCompleted', completedDate:ec.user.nowTimestamp]"/>
-        </actions>
-    </service>
-
-    <service verb="get" noun="ProductBarcodes">
-        <in-parameters><parameter name="productId" required="true"/></in-parameters>
-        <out-parameters><parameter name="barcodes" type="List"/></out-parameters>
-        <actions>
-            <entity-find entity-name="zenith.erp.barcode.ProductBarcode" list="barcodes">
-                <econdition field-name="productId"/>
-                <econdition field-name="isActive" value="Y"/>
-                <order-by field-name="-isPrimary,barcodeTypeEnumId"/>
-            </entity-find>
-        </actions>
-    </service>
-
-    <!-- ZE-BC-091: delete a product barcode. The Barcode module had add/generate but NO remove, so obsolete
-         barcodes couldn't be cleaned up (reported). Org-guarded: only the owning org may delete its barcode
-         (super-admins exempt). If the removed one was the primary and another active barcode remains for the
-         product, promote it so the product keeps a primary. -->
-    <service verb="delete" noun="ProductBarcode">
-        <in-parameters><parameter name="barcodeId" required="true"/></in-parameters>
-        <actions>
-            <entity-find-one entity-name="zenith.erp.barcode.ProductBarcode" value-field="bc"/>
-            <if condition="bc == null"><return error="true" message="Barcode not found."/></if>
-            <set field="_ao" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-            <if condition="!ec.user.isInGroup('ADMIN') &amp;&amp; (bc.organizationPartyId == null || !_ao || _ao == '_NA_' || bc.organizationPartyId != _ao)">
-                <return error="true" message="You do not have access to this barcode."/>
-            </if>
-            <service-call name="delete#zenith.erp.barcode.ProductBarcode" in-map="[barcodeId:barcodeId]"/>
-            <if condition="bc.isPrimary == 'Y'">
-                <entity-find entity-name="zenith.erp.barcode.ProductBarcode" list="_rest" limit="1">
-                    <econdition field-name="productId" from="bc.productId"/>
-                    <econdition field-name="isActive" value="Y"/>
-                </entity-find>
-                <if condition="_rest">
-                    <service-call name="update#zenith.erp.barcode.ProductBarcode" in-map="[barcodeId:_rest[0].barcodeId, isPrimary:'Y']"/>
-                </if>
-            </if>
-        </actions>
-    </service>
-
 </services>

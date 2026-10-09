@@ -17,12 +17,18 @@
     
     <transition name="updateProduct">
         <actions>
-            <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <service-call name="zenith.barcode.BarcodeServices.get#AuthorizedActiveOrganization" out-map="barcodeScope"/>
+            <set field="activeOrg" from="barcodeScope.activeOrgId"/>
             <entity-find-one entity-name="mantle.product.Product" value-field="curProd"/>
             <!-- Org-isolation: only your own org's product is editable (ADMIN exempt). -->
-            <if condition="curProd == null || (activeOrg &amp;&amp; curProd.ownerPartyId != activeOrg &amp;&amp; !ec.user.isInGroup('ADMIN'))">
+            <if condition="curProd == null || (!ec.user.isInGroup('ADMIN') &amp;&amp; (!activeOrg || curProd.ownerPartyId != activeOrg))">
                 <return error="true" message="Product not found for your account."/>
             </if>
+            <script><![CDATA[
+                // Acquire the Barcode/POS organization -> product lock order before updating pseudoId.
+                if (curProd.ownerPartyId) ec.entity.find('mantle.party.Party').condition('partyId',curProd.ownerPartyId).forUpdate(true).disableAuthz().one()
+                ec.entity.find('mantle.product.Product').condition('productId',productId).forUpdate(true).one()
+            ]]></script>
             <!-- ZE-INV-001 f/u: reject a negative selling price (a -10 typo makes stock value negative
                  everywhere). Blank stays allowed; non-numeric falls through to framework coercion. -->
             <script><![CDATA[
@@ -57,7 +63,7 @@
                     }
                 ]]></script>
             </if>
-            <service-call name="update#mantle.product.Product" in-map="context"/>
+            <service-call name="update#mantle.product.Product" in-map="context + [ownerPartyId:curProd.ownerPartyId]"/>
             <!-- ZE-PRC-008 (PRC-031): record a Price History (PriceChangeLog) row when the Selling Price (mrpAmount)
                  changes on the product screen, so the change is auditable like a price-list edit. priceListId is
                  null (this is the product-level MRP, not a price-list item). Best-effort — a log failure must never
@@ -79,10 +85,13 @@
                 } catch (Throwable e) { ec.logger.warn("Price history log skipped for product " + productId + ": " + e.message) }
             ]]></script>
             <!-- Keep the rich ProductBarcode table in sync (mirror the code as the primary barcode).
-                 Best-effort; never blocks the product save. -->
+                 Mirror conflicts roll back the product update, preventing ambiguous scan codes. -->
             <if condition="pseudoId">
-                <service-call name="zenith.barcode.BarcodeServices.sync#BarcodeFromPseudoId" ignore-error="true"
+                <service-call name="zenith.barcode.BarcodeServices.sync#BarcodeFromPseudoId"
                               in-map="[productId:productId, code:pseudoId]"/>
+                <else-if condition="ec.web.parameters.containsKey('pseudoId')">
+                    <service-call name="zenith.barcode.BarcodeServices.clear#ProductCode" in-map="[productId:productId]"/>
+                </else-if>
             </if>
         </actions>
         <default-response url="."/>

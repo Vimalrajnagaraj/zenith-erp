@@ -1,0 +1,11 @@
+const fs=require('fs'),path=require('path'),{chromium}=require('playwright');
+const base='http://127.0.0.1:18085',out=path.resolve(process.env.BARCODE_QA_OUT||'barcode-ui-proof');fs.mkdirSync(out,{recursive:true});
+(async()=>{const browser=await chromium.launch({executablePath:'C:/Program Files/Google/Chrome/Application/chrome.exe',headless:true});const checks=[];try{
+const ctx=await browser.newContext();await ctx.request.get(base+'/apps/zenith/barcode/FindBarcode',{headers:{Authorization:'Basic '+Buffer.from('barcode.qa:moqui').toString('base64')}});
+const p=await ctx.newPage();const check=(name,passed)=>{checks.push({name,passed:!!passed});console.log((passed?'PASS ':'FAIL ')+name)};
+for(const shell of ['apps','qapps']){for(const screen of ['barcode/BarcodeDashboard','barcode/FindBarcode','barcode/LabelTemplates','barcode/PrintJobs','pos/Barcodes','pos/BarcodeLabels']){
+await p.goto(`${base}/${shell}/zenith/${screen}`,{waitUntil:'networkidle'});for(const width of [1366,360]){await p.setViewportSize({width,height:900});await p.screenshot({path:path.join(out,shell+'-'+screen.replace('/','-')+'-'+width+'.png')});}
+if(screen==='barcode/FindBarcode'){await p.getByRole('button',{name:/^add\s*Add Barcode$/}).click();check(shell+' dialog moves keyboard focus inside',await p.locator('#ab-overlay').evaluate(e=>e.contains(document.activeElement)));await p.keyboard.press('Escape');check(shell+' Escape closes and returns focus to opener',await p.locator('#ab-overlay').evaluate(e=>e.style.display==='none')&&(await p.locator(':focus').innerText()).includes('Add Barcode'));}
+if(screen==='barcode/LabelTemplates'){await p.getByRole('button',{name:/New Template/}).click();check(shell+' new template resets editable metadata',await p.locator('#nlt-name').inputValue()===''&&await p.locator('#nlt-cval').innerText()==='3');await p.keyboard.press('Escape');check(shell+' template Escape closes dialog',await p.locator('#nlt-overlay').evaluate(e=>e.style.display==='none'));}
+}}
+}catch(e){checks.push({name:'UI proof completed',passed:false,error:e.stack})}finally{await browser.close();fs.writeFileSync(path.join(out,'report.json'),JSON.stringify({productionAccess:false,checks},null,2));if(checks.some(c=>!c.passed))process.exitCode=1;}})();
