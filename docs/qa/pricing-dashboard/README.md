@@ -1,0 +1,11 @@
+# Pricing Dashboard verification
+
+Use only in an explicitly disposable loopback Moqui runtime. Copy the complete candidate components with the repository's canonical staging overrides and framework patches. Enable `-Dpurchase.pricing.qa.disposable=true`, isolate H2 TCP `127.0.0.1:19097` with `mem:purchase-pricing-qa`, bind HTTP `127.0.0.1:18085`, and disable background jobs and external delivery.
+
+Copy `fixture.xml` to `runtime/component/zenith-erp-pricing/PricingDashboardQaFixture.xml` and `qa-screen.xml` to its pricing screen directory as `PricingDashboardQaAcceptance.xml`. Set `DASHBOARD_QA_RUNTIME`, `DASHBOARD_QA_JAVA` and `DASHBOARD_QA_OUT`, then run `node docs/qa/pricing-dashboard/verify.cjs`. Initialization refuses stale fixtures. Public demo authentication is copied only to synthetic QA users. Fixtures have metadata-only lists and foreign count controls, missing audit amounts and a zero arithmetic boundary; no effective product prices, legal registrations or inventory stock.
+
+The baseline reproduced 11 failed checks: raw no-org KPIs/month counts/log/chart exposure, missing amounts rendered as zero, invented rupee amounts, and the Quasar dashboard tools switching to `/apps` after real module navigation. The existing chart boundary check passed baseline; calendar arithmetic is now explicitly expressed in the user's timezone without claiming a reproduced timezone failure.
+
+Final evidence: 69 passing checks, both interfaces, five widths (1920/1366/768/390/360), actual tool and wrapped-header tab clicks across all four native Pricing landings, independently queried KPI totals, inclusive chart bounds, no browser errors, six unchanged business-table snapshots, exact cleanup, and zero fixture residue across 13 tables. Mobile screenshots contain synthetic records only. Local public-framework rebuild is not claimed byte-identical to production; trusted master staging supplies separate verification. The SOP owner MARUTHI before/after no-op DB proof remains a deployment gate.
+
+The remaining UI pass removes the unimplemented Import Prices card and labels the history destination accurately; live inspection confirmed those misleading tool links. Wrapped Bootstrap header correction is scoped to the active Pricing module, including History/Lists/Rules, and both assets use a new cache version.

@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+    <service verb="assign" noun="CustomerPriceList">
+        <in-parameters>
+            <parameter name="partyId"/><parameter name="customerGroupId"/><parameter name="priceListId" required="true"/>
+            <parameter name="priority" default-value="10"/><parameter name="validFromDate"/><parameter name="validThruDate"/>
+        </in-parameters>
+        <out-parameters><parameter name="customerPriceListId"/></out-parameters>
+        <actions>
+            <service-call name="zenith.base.SecurityServices.check#ModuleWriteAccess" in-map="[moduleId:'pricing']" out-map="write"/>
+            <if condition="!write.canWrite"><return error="true" message="You have view-only access to pricing assignments."/></if>
+            <service-call name="zenith.pricing.DashboardServices.get#DashboardOrganization" out-map="scope"/>
+            <if condition="!scope.organizationPartyId"><return error="true" message="Select your authorized active organization before assigning a price list."/></if>
+            <script><![CDATA[
+                def list=ec.entity.find('zenith.erp.pricing.PriceList').condition('priceListId',priceListId).disableAuthz().one()
+                if(!list || list.organizationPartyId!=scope.organizationPartyId) {
+                    ec.message.addError('Select a price list from your active organization.');return
+                }
+                if((partyId && customerGroupId) || (!partyId && !customerGroupId)) {
+                    ec.message.addError('Select exactly one customer or customer group.');return
+                }
+                if(partyId) {
+                    def party=ec.entity.find('mantle.party.Party').condition('partyId',partyId).disableAuthz().one()
+                    def customer=ec.entity.find('mantle.party.PartyRole').condition('partyId',partyId).condition('roleTypeId','Customer').disableAuthz().count()
+                    if(!party || party.ownerPartyId!=list.organizationPartyId || party.disabled=='Y' || !customer) {
+                        ec.message.addError('Select an enabled customer from the price list organization.');return
+                    }
+                } else {
+                    def group=ec.entity.find('zenith.erp.contacts.CustomerGroup').condition('customerGroupId',customerGroupId).disableAuthz().one()
+                    if(!group || group.organizationPartyId!=list.organizationPartyId) {
+                        ec.message.addError('Select a customer group from the price list organization.');return
+                    }
+                }
+                def rank,from,thru
+                try {
+                    rank=new BigDecimal((priority==null || priority=='') ? '10' : priority.toString().trim()).intValueExact()
+                    def stamp={v -> v==null || v=='' ? null : (v instanceof java.sql.Timestamp ? v : ec.l10n.parseTimestamp(v.toString(),null))}
+                    from=stamp(validFromDate);thru=stamp(validThruDate)
+                    if((validFromDate && !from) || (validThruDate && !thru) || (from && thru && thru.before(from))) throw new IllegalArgumentException()
+                } catch(Exception ignored) {ec.message.addError('Enter a whole priority and an ordered, valid date range.');return}
+                // Assign inactive lists for planned configuration without activating prices or mutating the target.
+                def row=ec.entity.makeValue('zenith.erp.pricing.CustomerPriceList').setAll([
+                    organizationPartyId:list.organizationPartyId,priceListId:list.priceListId,
+                    partyId:partyId ?: null,customerGroupId:customerGroupId ?: null,priority:rank,
+                    validFromDate:from,validThruDate:thru]).setSequencedIdPrimary().create()
+                customerPriceListId=row.customerPriceListId
+            ]]></script>
+        </actions>
+    </service>
+</services>
