@@ -5,6 +5,23 @@
         var root = document.querySelector('.zc-shops-page');
         if (!root || root.dataset.initialized) return;
         root.dataset.initialized = 'true';
+        // The narrow Quasar toolbar wraps; keep content below its measured height.
+        if (window.zcShopsHeaderObserver) window.zcShopsHeaderObserver.disconnect();
+        var header = document.querySelector('body.zq-nav .q-header');
+        if (header) {
+            var syncHeader = function () {
+                if (root.isConnected) document.body.style.setProperty('--zq-shops-header-height', header.offsetHeight + 'px');
+                else {
+                    if (window.zcShopsHeaderObserver === headerObserver) document.body.style.removeProperty('--zq-shops-header-height');
+                    if (headerObserver) headerObserver.disconnect();
+                }
+            };
+            var headerObserver = window.ResizeObserver ? new ResizeObserver(syncHeader) : null;
+            window.zcShopsHeaderObserver = headerObserver;
+            syncHeader();
+            if (headerObserver) headerObserver.observe(header);
+        }
+
         if (!document.getElementById('zc-shops-css')) {
             var css = document.createElement('link');
             css.id = 'zc-shops-css'; css.rel = 'stylesheet'; css.href = '/zenithstatic/css/shops.css?v=5';
