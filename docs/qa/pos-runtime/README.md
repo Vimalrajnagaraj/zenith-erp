@@ -70,7 +70,7 @@ unverified steps are not recorded as passes.
 
 Merge and deployment are separate. Only Amal deploys, following
 [`SOP-commit-and-deploy.md`](../../SOP-commit-and-deploy.md). This candidate depends
-on master `1997a90f97fb1743b88c8d51a4e2aee418aab2b5`, retaining the merged
+on master `d9dca975d4f22a74470ae0a3b8bebe16fc57b1a3`, retaining the merged
 Sales tax-inclusive invoice contract, Tax safeguards, Inventory styles and
 Contacts/dashboard asset registrations. Deploy the reviewed,
 complete component tree in one maintenance operation and restart Moqui so the new
@@ -118,3 +118,5 @@ captured original timestamp and independently asserts unchanged grand total, tax
 and change. The screen, CSV and PDF use the same user-timezone parsing. This changes
 report date buckets, not stored bill figures; owner financial acceptance remains
 mandatory. Helpers remain under docs/qa and must never be installed on production.
+
+Latest author audit: refreshed master, all 522 native checks passed (56 pages, 100 layouts), tracked runtime components matched exactly and disposable listeners/database were removed. The product-search test waits for the rendered suggestion and response instead of an arbitrary delay. Required exact-image CI and owner financial/device acceptance remain pending; see `review-reverification.json`.
