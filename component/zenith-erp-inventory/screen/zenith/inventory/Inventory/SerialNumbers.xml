@@ -4,36 +4,107 @@
         default-menu-title="Serial Numbers" default-menu-index="8">
 
     <transition name="registerSerial">
-        <service-call name="create#zenith.erp.inventory.ProductSerialNumber"/>
+        <actions>
+            <if condition="ec.web.request.method != 'POST'"><return error="true" message="Registration requires POST."/></if>
+            <if condition="newSerialNumber"><set field="serialNumber" from="newSerialNumber"/></if>
+            <service-call name="zenith.inventory.SerialTrackingServices.register#TrackedSerial" in-map="context"/>
+        </actions>
         <default-response url="."/>
     </transition>
     <transition name="updateSerialStatus">
-        <service-call name="update#zenith.erp.inventory.ProductSerialNumber"/>
+        <actions>
+            <if condition="ec.web.request.method != 'POST'"><return error="true" message="Serial changes require POST."/></if>
+            <service-call name="zenith.inventory.SerialTrackingServices.update#TrackedSerialStatus" in-map="context"/>
+        </actions>
         <default-response url="."/>
+    </transition>
+    <transition name="exportCsv" read-only="true">
+        <actions>
+            <service-call name="zenith.inventory.SerialTrackingServices.prepare#SerialSearch" in-map="[filters:context]" out-map="exportSearch"/>
+            <entity-find entity-name="zenith.erp.inventory.ProductSerialNumberView" list="exportSerials">
+                <search-form-inputs input-fields-map="exportSearch.serialSearchParams + [pageIndex:null,pageSize:null]" paginate="false" default-order-by="-receivedDate,serialNumberId"/>
+                <econdition-object field="exportSearch.serialFilterCondition"/>
+                <econdition field-name="ownerPartyId" from="exportSearch.organizationPartyId"/>
+            <econditions combine="or">
+                <econdition field-name="facilityId" operator="is-null"/>
+                <econdition field-name="facilityOwnerPartyId" from="exportSearch.organizationPartyId"/>
+            </econditions>
+            </entity-find>
+            <script><![CDATA[
+                def esc = { s -> def v = s == null ? '' : s.toString(); if (v ==~ /(?s)^[\s]*[=+@-].*/) v = "'" + v; '"' + v.replace('"','""') + '"' }
+                def date = { value -> value ? ec.l10n.format(value,'dd-MMM-yyyy') : '' }
+                def result = new StringBuilder('Serial #,Product,Status,Location,Received,Sold,Warranty,Batch\r\n')
+                for (def row : exportSerials) {
+                    def status = ec.entity.find('moqui.basic.StatusItem').condition('statusId',row.statusId).one()?.description ?: row.statusId
+                    result.append([row.serialNumber,(row.pseudoId ?: row.productId)+': '+(row.productName ?: ''),status,row.facilityName,date(row.receivedDate),date(row.soldDate),date(row.warrantyExpiryDate),row.batchNumber].collect(esc).join(',')).append('\r\n')
+                }
+                ec.web.response.setContentType('text/csv; charset=UTF-8')
+                ec.web.response.addHeader('Content-Disposition','attachment; filename="tracked-serials.csv"')
+                ec.web.response.writer.write(result.toString()); ec.web.response.writer.flush()
+            ]]></script>
+        </actions>
+        <default-response type="none"/>
     </transition>
 
     <actions>
+        <service-call name="zenith.inventory.SerialTrackingServices.prepare#SerialSearch" in-map="[filters:context.formListFindId ? new HashMap(context) + new HashMap(ec.web.parameters) : new HashMap(ec.web.parameters)]" out-map="serialSearch"/>
         <entity-find entity-name="zenith.erp.inventory.ProductSerialNumberView" list="serialList">
-            <search-form-inputs default-order-by="-receivedDate"/>
+            <search-form-inputs input-fields-map="serialSearch.serialSearchParams" default-order-by="-receivedDate,serialNumberId"/>
+            <econdition-object field="serialSearch.serialFilterCondition"/>
             <!-- ZE-SALES-014 f/u: org-isolate CSV/XLSX export (standalone render bypasses the MANTLE_ACTIVE_ORG authz filter) -->
-            <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+            <econdition field-name="ownerPartyId" from="serialSearch.organizationPartyId"/>
+            <econditions combine="or">
+                <econdition field-name="facilityId" operator="is-null"/>
+                <econdition field-name="facilityOwnerPartyId" from="serialSearch.organizationPartyId"/>
+            </econditions>
         </entity-find>
 
         <!-- Summary counts -->
-        <entity-find-count entity-name="zenith.erp.inventory.ProductSerialNumberView" count-field="totalSerials"></entity-find-count>
+        <entity-find-count entity-name="zenith.erp.inventory.ProductSerialNumberView" count-field="totalSerials"><econdition field-name="ownerPartyId" from="serialSearch.organizationPartyId"/>
+            <econditions combine="or">
+                <econdition field-name="facilityId" operator="is-null"/>
+                <econdition field-name="facilityOwnerPartyId" from="serialSearch.organizationPartyId"/>
+            </econditions></entity-find-count>
         <entity-find-count entity-name="zenith.erp.inventory.ProductSerialNumberView" count-field="inStockCount">
+            <econdition field-name="ownerPartyId" from="serialSearch.organizationPartyId"/>
+            <econditions combine="or">
+                <econdition field-name="facilityId" operator="is-null"/>
+                <econdition field-name="facilityOwnerPartyId" from="serialSearch.organizationPartyId"/>
+            </econditions>
             <econdition field-name="statusId" value="SnInStock"/></entity-find-count>
         <entity-find-count entity-name="zenith.erp.inventory.ProductSerialNumberView" count-field="soldCount">
+            <econdition field-name="ownerPartyId" from="serialSearch.organizationPartyId"/>
+            <econditions combine="or">
+                <econdition field-name="facilityId" operator="is-null"/>
+                <econdition field-name="facilityOwnerPartyId" from="serialSearch.organizationPartyId"/>
+            </econditions>
             <econdition field-name="statusId" value="SnSold"/></entity-find-count>
         <entity-find-count entity-name="zenith.erp.inventory.ProductSerialNumberView" count-field="defectiveCount">
+            <econdition field-name="ownerPartyId" from="serialSearch.organizationPartyId"/>
+            <econditions combine="or">
+                <econdition field-name="facilityId" operator="is-null"/>
+                <econdition field-name="facilityOwnerPartyId" from="serialSearch.organizationPartyId"/>
+            </econditions>
             <econdition field-name="statusId" operator="in" value="SnDefective,SnInWarranty"/></entity-find-count>
+        <script><![CDATA[
+            snPagePath = (ec.web.request.requestURI.startsWith('/qapps/') ? '/qapps' : '/apps') + '/zenith/Inventory/SerialNumbers'
+            def filters = new LinkedHashMap(serialSearch.serialSearchParams)
+            filters.remove('pageIndex')
+            filters.orderByField = filters.orderByField.toString().split(',')[0]
+            snFilterFields = filters.collect { key,value -> [paramName:key.toString(),paramValue:value.toString()] }
+            def query = { map -> map.collect { key,value -> java.net.URLEncoder.encode(key.toString(),'UTF-8')+'='+java.net.URLEncoder.encode(value.toString(),'UTF-8') }.join('&') }
+            snFilterQuery = query(filters)
+            snExportUrl = '/apps/zenith/Inventory/SerialNumbers/exportCsv?' + snFilterQuery
+            serialStatusNames = [SnInStock:'In Stock',SnReserved:'Reserved',SnSold:'Sold',SnReturned:'Returned',SnInWarranty:'Under Warranty',SnDefective:'Defective',SnScrapped:'Scrapped']
+        ]]></script>
     </actions>
 
     <widgets>
-        <container style="row items-center justify-between q-mb-lg">
+      <container id="serialTracking">
+        <container style="sn-header">
             <container>
-                <label text="Serial Number Tracking" type="h3" style="text-primary text-weight-bold q-my-none"/>
-                <label text="For items you track one-by-one (like electronics): record each serial number and follow it from received → sold → warranty." type="p" style="text-grey-7 q-mt-sm q-mb-none"/>
+                <label text="Serial Number Tracking" type="h3" style="sn-title"/>
+                <label text="For items you track one-by-one (like electronics): record each serial number and follow it from received &#8594; sold &#8594; warranty." type="p" style="sn-subtitle"/>
             </container>
             <!-- ZE-INV-010 (IV-110): write features only for users with full Inventory access -->
             <section name="SerialWriteButton">
@@ -46,21 +117,23 @@
                         <drop-down allow-empty="false">
                             <entity-options key="${productId}" text="${pseudoId}: ${productName}">
                                 <entity-find entity-name="mantle.product.Product">
-                                    <econdition field-name="enableSerialTracking" value="Y" ignore-if-empty="true"/>
-                                    <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+                                    <econdition field-name="enableSerialTracking" value="Y"/>
+                                    <econdition field-name="productTypeEnumId" value="PtAsset"/>
+                                    <econdition field-name="ownerPartyId" from="serialSearch.organizationPartyId"/>
                                     <order-by field-name="productName"/>
                                 </entity-find>
                             </entity-options>
                         </drop-down>
                         <!-- ZE-INV-IV-090: only products with "Track by serial number?" = Yes appear here. If this
-                             list is empty, turn that on for a product first (Inventory → Products → Edit). -->
-                        <label text="Only products marked &quot;Track by serial number&quot; appear here. If empty, open the product in Products and turn that on first." style="text-grey-6 text-caption" type="p"/>
+                             list is empty, turn that on for a product first (Inventory Ã¢â€ â€™ Products Ã¢â€ â€™ Edit). -->
+                        <label text="Only serial-tracked products appear here. Registration records the serial identity; receive stock through Receiving." style="text-grey-6 text-caption" type="p"/>
                     </default-field></field>
-                    <field name="serialNumber"><default-field title="Serial Number"><text-line size="25"/></default-field></field>
+                    <field name="newSerialNumber"><default-field title="Serial Number"><text-line size="25"/></default-field></field>
                     <field name="facilityId"><default-field title="Location">
-                        <drop-down allow-empty="true">
+                        <drop-down allow-empty="false">
                             <entity-options key="${facilityId}" text="${facilityName}">
                                 <entity-find entity-name="mantle.facility.Facility">
+                                    <econdition field-name="ownerPartyId" from="serialSearch.organizationPartyId"/>
                                     <order-by field-name="facilityName"/>
                                 </entity-find>
                             </entity-options>
@@ -74,7 +147,7 @@
                             <entity-options key="${partyId}" text="${organizationName ?: (firstName + ' ' + lastName)}">
                                 <entity-find entity-name="mantle.party.PartyDetailAndRole">
                                     <econdition field-name="roleTypeId" value="Supplier"/>
-                                    <econdition field-name="ownerPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')" ignore-if-empty="true"/>
+                                    <econdition field-name="ownerPartyId" from="serialSearch.organizationPartyId"/>
                                     <order-by field-name="organizationName,firstName"/>
                                 </entity-find>
                             </entity-options>
@@ -89,42 +162,18 @@
             </section>
         </container>
 
-        <!-- Summary Cards -->
-        <container-row>
-            <row-col lg="3">
-                <container style="bg-white shadow-3 q-pa-lg text-center q-mb-md">
-                    <label text="Total Serials" type="p" style="text-grey-7 text-weight-bold q-mb-sm"/>
-                    <label text="${totalSerials ?: 0}" type="h3" style="text-primary text-weight-bolder q-my-none"/>
-                </container>
-            </row-col>
-            <row-col lg="3">
-                <container style="bg-white shadow-3 q-pa-lg text-center q-mb-md">
-                    <label text="In Stock" type="p" style="text-grey-7 text-weight-bold q-mb-sm"/>
-                    <label text="${inStockCount ?: 0}" type="h3" style="text-positive text-weight-bolder q-my-none"/>
-                </container>
-            </row-col>
-            <row-col lg="3">
-                <container style="bg-white shadow-3 q-pa-lg text-center q-mb-md">
-                    <label text="Sold" type="p" style="text-grey-7 text-weight-bold q-mb-sm"/>
-                    <label text="${soldCount ?: 0}" type="h3" style="text-info text-weight-bolder q-my-none"/>
-                </container>
-            </row-col>
-            <row-col lg="3">
-                <container style="bg-white shadow-3 q-pa-lg text-center q-mb-md">
-                    <label text="Defective / Warranty" type="p" style="text-grey-7 text-weight-bold q-mb-sm"/>
-                    <label text="${defectiveCount ?: 0}" type="h3" style="text-negative text-weight-bolder q-my-none"/>
-                </container>
-            </row-col>
-        </container-row>
+        <render-mode><text type="html,qvt" location="component://zenith-erp-inventory/template/inventory/SerialTrackingCards.ftl"/></render-mode>
+        <render-mode><text type="html,qvt" location="component://zenith-erp-inventory/template/inventory/SerialTrackingToolbar.ftl"/></render-mode>
 
         <!-- Serial Number List -->
-        <container style="zenith-card bg-white shadow-2 border-radius-lg q-pa-md z-listchrome">
-            <render-mode><text type="html,qvt"><![CDATA[<span class="zlc-ph" data-ph="Search Serial Numbers..." style="display:none"></span>]]></text></render-mode>
+        <container style="sn-table-card">
+            <label text="Tracked Serials" type="h3" style="sn-table-title"/>
+            <container style="sn-table-scroll">
             <form-list name="SerialListForm" list="serialList" skip-form="true"
-                       header-dialog="true" select-columns="true" saved-finds="true" show-csv-button="true" show-xlsx-button="true"
-                       show-all-button="true">
+                       header-dialog="true" select-columns="true" saved-finds="true" show-csv-button="false" show-xlsx-button="false"
+                       show-all-button="false">
                 <field name="serialNumber"><header-field title="Serial #" show-order-by="true"><text-find size="15" hide-options="true"/></header-field>
-                    <default-field title="Serial #"><display style="text-weight-bold"/></default-field></field>
+                    <default-field title="Serial #"><display style="sn-serial"/></default-field></field>
                 <field name="productId"><header-field title="Product" show-order-by="true"/>
                     <default-field title="Product"><display text="${pseudoId}: ${productName}"/></default-field></field>
                 <field name="statusId"><header-field title="Status" show-order-by="true">
@@ -132,19 +181,22 @@
                         <entity-find entity-name="moqui.basic.StatusItem">
                             <econdition field-name="statusTypeId" value="SerialNumber"/></entity-find>
                     </entity-options></drop-down></header-field>
-                    <default-field title="Status"><display-entity entity-name="moqui.basic.StatusItem" text="${description}"/></default-field></field>
-                <field name="facilityName"><header-field title="Location"/>
-                    <default-field title="Location"><display/></default-field></field>
+                    <default-field title="Status"><display text="${serialStatusNames[statusId] ?: statusId}" style="sn-status sn-${statusId}"/></default-field></field>
+                <field name="facilityName"><header-field title="Location" show-order-by="true"/>
+                    <default-field title="Location"><display text="${facilityName ?: '—'}"/></default-field></field>
                 <field name="receivedDate"><header-field title="Received" show-order-by="true"><date-period/></header-field>
-                    <default-field title="Received"><display format="dd-MMM-yyyy"/></default-field></field>
-                <field name="soldDate"><header-field title="Sold"/>
-                    <default-field title="Sold"><display format="dd-MMM-yyyy"/></default-field></field>
-                <field name="warrantyExpiryDate"><header-field title="Warranty"/>
-                    <default-field title="Warranty"><display format="dd-MMM-yyyy"/></default-field></field>
-                <field name="batchNumber"><header-field title="Batch"><text-find size="10" hide-options="true"/></header-field>
-                    <default-field title="Batch"><display/></default-field></field>
+                    <default-field title="Received"><display text="${receivedDate ? ec.l10n.format(receivedDate,'dd-MMM-yyyy') : '—'}"/></default-field></field>
+                <field name="soldDate"><header-field title="Sold" show-order-by="true"/>
+                    <default-field title="Sold"><display text="${soldDate ? ec.l10n.format(soldDate,'dd-MMM-yyyy') : '—'}"/></default-field></field>
+                <field name="warrantyExpiryDate"><header-field title="Warranty" show-order-by="true"/>
+                    <default-field title="Warranty"><display text="${warrantyExpiryDate ? ec.l10n.format(warrantyExpiryDate,'dd-MMM-yyyy') : '—'}"/></default-field></field>
+                <field name="batchNumber"><header-field title="Batch" show-order-by="true"><text-find size="10" hide-options="true"/></header-field>
+                    <default-field title="Batch"><display text="${batchNumber ?: '—'}"/></default-field></field>
                 <field name="searchButton"><header-field title="Find"><submit/></header-field></field>
             </form-list>
+            </container>
+            <render-mode><text type="html,qvt" location="component://zenith-erp-inventory/template/inventory/SerialTrackingPager.ftl"/></render-mode>
         </container>
+      </container>
     </widgets>
 </screen>
