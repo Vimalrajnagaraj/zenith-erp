@@ -3,21 +3,41 @@
         xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
         default-menu-title="Demand Forecast" default-menu-index="8">
 
+    <always-actions>
+        <set field="selectedOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+        <service-call name="zenith.base.SecurityServices.get#ActiveOrgList" out-map="dfOrgScope"/>
+        <set field="dfOrgValid" from="selectedOrg &amp;&amp; !(selectedOrg in ['_NA_', '__NO_ORGANIZATION__']) &amp;&amp; dfOrgScope.orgList.any { it.partyId == selectedOrg }"/>
+        <set field="orgId" from="dfOrgValid ? selectedOrg : '__NO_ORGANIZATION__'"/>
+        <service-call name="zenith.base.SecurityServices.check#ModuleWriteAccess" out-map="dfWriteScope" in-map="[moduleId:'inventory']"/>
+        <set field="invCanWrite" from="dfOrgValid &amp;&amp; dfWriteScope.canWrite"/>
+    </always-actions>
     <transition name="runCycle">
         <actions>
-            <set field="orgId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <if condition="ec.web.request.method != 'POST' || !ec.web.parameters.moquiSessionToken || ec.web.parameters.moquiSessionToken != ec.web.sessionToken">
+                <return error="true" message="Submit this change using the secure form."/>
+            </if>
+            <if condition="!dfOrgValid"><return error="true" message="Select an organization before making changes."/></if>
+            <if condition="!invCanWrite"><return error="true" message="You have view-only access to Inventory."/></if>
+
             <service-call name="zenith.inventory.AdvancedForecastServices.cycle#DemandForecast"
                           in-map="[organizationPartyId: orgId, periodDays: 7]" async="true"/>
-            <script>ec.message.addMessage("Updating your forecast in the background — it predicts every product, checks how the last predictions did, and flags anything to restock. Give it a minute, then reload this page.", "info")</script>
+            <script>ec.message.addMessage("Updating forecasts in the background using completed sales, checking past predictions and looking for demand and stock alerts. Give it a minute, then reload this page.", "info")</script>
         </actions>
         <default-response url="."/>
     </transition>
     <transition name="acknowledgeAlert">
         <actions>
+            <if condition="ec.web.request.method != 'POST' || !ec.web.parameters.moquiSessionToken || ec.web.parameters.moquiSessionToken != ec.web.sessionToken">
+                <return error="true" message="Submit this change using the secure form."/>
+            </if>
+            <if condition="!dfOrgValid"><return error="true" message="Select an organization before making changes."/></if>
+            <if condition="!invCanWrite"><return error="true" message="You have view-only access to Inventory."/></if>
+
             <!-- These alert statuses are ad-hoc strings, not managed StatusItems, so the auto update# service's
                  status-flow check wrongly blocks AlertNew->AlertAck. Update the row directly to skip that check. -->
             <entity-find-one entity-name="zenith.erp.inventory.DemandAlert" value-field="alertRec"><field-map field-name="alertId"/></entity-find-one>
-            <if condition="alertRec">
+            <if condition="!alertRec || alertRec.organizationPartyId != orgId"><return error="true" message="This alert is not available in the selected organization."/></if>
+            <if condition="alertRec.statusId == 'AlertNew'">
                 <set field="alertRec.statusId" value="AlertAck"/>
                 <entity-update value-field="alertRec"/>
             </if>
@@ -26,7 +46,6 @@
     </transition>
     <transition name="exportCsv" read-only="true">
         <actions>
-            <set field="orgId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
             <entity-find entity-name="mantle.product.Product" list="myProducts"><econdition field-name="ownerPartyId" from="orgId"/><select-field field-name="productId"/></entity-find>
             <set field="myProductIds" from="(myProducts*.productId) ?: ['__none__']"/>
             <entity-find entity-name="zenith.erp.inventory.DemandForecast" list="exportList">
@@ -39,13 +58,13 @@
                 // regional list-separator. Also stream via getWriter + <default-response type="none"/> below
                 // (was url="." which re-rendered the screen after the response was committed -> a "500 Committed"
                 // error string got appended to the downloaded file).
-                def esc = { v -> '"' + (v == null ? '' : v.toString()).replace('"', '""') + '"' }
+                def esc = { v -> def text = v == null ? '' : v.toString(); if (!(v instanceof Number) && text.length() > 1 && text ==~ /(?s)^[=+@\-\t\r].*/) text = "'" + text; '"' + text.replace('"', '""') + '"' }
                 def sb = new StringBuilder()
                 sb.append("sep=,\r\n")
                 sb.append("Product ID,Period Start,Period End,Method,Forecast Qty,Actual Qty,Accuracy %\r\n")
                 for (def f : exportList) {
                     sb.append([esc(f.productId), esc(f.periodStart), esc(f.periodEnd), esc(f.forecastMethodEnumId),
-                               esc(f.forecastQuantity ?: 0), esc(f.actualQuantity ?: '-'), esc(f.accuracyPercent ?: '-')].join(',')).append("\r\n")
+                               esc(f.forecastQuantity ?: 0), esc(f.actualQuantity != null ? f.actualQuantity : '-'), esc(f.accuracyPercent != null ? f.accuracyPercent : '-')].join(',')).append("\r\n")
                 }
                 ec.web.response.setContentType("text/csv; charset=UTF-8")
                 ec.web.response.setHeader("Content-Disposition", "attachment; filename=\"demand_forecast.csv\"")
@@ -57,219 +76,160 @@
     <!-- ZE-DF-007 (IV-111): set this tenant's business hours; the reorder-alert cron only checks during them -->
     <transition name="saveReorderHours">
         <actions>
+            <if condition="ec.web.request.method != 'POST' || !ec.web.parameters.moquiSessionToken || ec.web.parameters.moquiSessionToken != ec.web.sessionToken">
+                <return error="true" message="Submit this change using the secure form."/>
+            </if>
+            <if condition="!dfOrgValid"><return error="true" message="Select an organization before making changes."/></if>
+            <if condition="!invCanWrite"><return error="true" message="You have view-only access to Inventory."/></if>
+
             <service-call name="zenith.base.SecurityServices.check#ModuleWriteAccess" out-map="_wac" in-map="[moduleId:'inventory']"/>
             <if condition="!(_wac?.canWrite)"><return error="true" message="You have view-only access to Inventory — you can't make changes here."/></if>
             <set field="_org" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
             <if condition="!_org || _org == '_NA_'"><return error="true" message="Select an organization before changing business hours."/></if>
             <service-call name="zenith.inventory.AdvancedForecastServices.set#ReorderCheckConfig"
                 in-map="[organizationPartyId: _org, openHour: reorderOpenHour, closeHour: reorderCloseHour]"/>
-            <script>ec.message.addMessage("Business hours saved — reorder alerts will be checked hourly within them.")</script>
+            <script>if (!ec.message.hasError()) ec.message.addMessage("Business hours saved — reorder alerts will be checked hourly within them.", "info")</script>
         </actions>
         <default-response url="."/>
     </transition>
+    <transition name="findForecasts" read-only="true">
+        <actions><script><![CDATA[
+            context.forecastSearchParams = [dfView:'history']
+            ec.web.parameters.each { key, value ->
+                if (key in ['pageIndex','pageSize','orderByField'] || key ==~ /^(productId|periodStart|periodEnd)(_.+)?$/)
+                    context.forecastSearchParams[key] = value
+            }
+        ]]></script></actions>
+        <default-response url="." parameter-map="forecastSearchParams"/>
+    </transition>
     <!-- IV-113 (ZE-DF-009): submit a product name/id -> re-render with its forecast + sales history (below) -->
-    <transition name="checkProduct">
-        <default-response url="."/>
+    <transition name="checkProduct" read-only="true">
+        <default-response url="."><parameter name="checkProductName"/><parameter name="dfMode"/><parameter name="dfSpan"/></default-response>
     </transition>
     <!-- IV-113 (ZE-DF-009 f/u): type-ahead product search (loads matches on demand — no full product list on
          page load). Org-scoped; returns productId as the value so the check below is an EXACT lookup, not a
          first-LIKE guess. Mirrors the proven getDeducteeList pattern (Accounting/TdsRegister). -->
     <transition name="getProductOptions" read-only="true">
         <parameter name="term"/>
-        <actions>
-            <set field="orgId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-            <!-- value-resolution first (the app-wide server-search re-display convention, cf. SimpleScreens
-                 searchPartyList): if term is an EXACT productId — as when the macro re-displays a submitted
-                 value on load — return that one option so the picker shows its label, not the raw id. -->
-            <entity-find entity-name="mantle.product.Product" list="_exactList" limit="1">
-                <econdition field-name="productId" from="term"/>
-                <econdition field-name="ownerPartyId" from="orgId"/>
-                <select-field field-name="productId,pseudoId,productName"/>
-            </entity-find>
-            <if condition="_exactList"><then>
-                <script><![CDATA[
-                    def p = _exactList[0]
-                    ec.web.sendJsonResponse([[value: p.productId, label: (p.pseudoId ? (p.pseudoId + " - ") : "") + (p.productName ?: p.productId)]])
-                ]]></script>
-            </then><else>
-                <entity-find entity-name="mantle.product.Product" list="prodList" limit="50">
-                    <econdition field-name="ownerPartyId" from="orgId"/>
-                    <econditions combine="or">
-                        <econdition field-name="productName" operator="like" value="%${term}%" ignore-case="true"/>
-                        <econdition field-name="pseudoId" operator="like" value="%${term}%" ignore-case="true"/>
-                    </econditions>
-                    <select-field field-name="productId,pseudoId,productName"/>
-                    <order-by field-name="productName"/>
-                </entity-find>
-                <script><![CDATA[
-                    def outList = []
-                    for (p in prodList) {
-                        def lbl = (p.pseudoId ? (p.pseudoId + " - ") : "") + (p.productName ?: p.productId)
-                        outList.add([value: p.productId, label: lbl])
-                    }
-                    ec.web.sendJsonResponse(outList)
-                ]]></script>
-            </else></if>
-        </actions>
+        <actions><script><![CDATA[
+            def term = (ec.web.parameters.term ?: '').toString().trim().take(150)
+            def result = []
+            if (dfOrgValid && term) {
+                def kind = term.startsWith('g:') ? 'group' : 'product'
+                def key = term.startsWith('g:') || term.startsWith('p:') ? term.substring(2) : term
+                def exactP = ec.entity.find('mantle.product.Product').condition('productId', key).disableAuthz().one()
+                def exactG = ec.entity.find('mantle.product.category.ProductCategory').condition('productCategoryId', key).disableAuthz().one()
+                if (kind == 'product' && exactP?.ownerPartyId == orgId) result.add([value: 'p:' + exactP.productId, label: exactP.productName ?: exactP.productId])
+                else if (kind == 'group' && exactG?.ownerPartyId == orgId) result.add([value: 'g:' + exactG.productCategoryId, label: 'Group: ' + (exactG.categoryName ?: exactG.productCategoryId)])
+                else if (term.length() >= 2 && !term.startsWith('p:') && !term.startsWith('g:')) {
+                    // Bounded, literal search; wildcard input must not enumerate another tenant.
+                    def cf = ec.entity.conditionFactory
+                    def pattern = '%' + term.replace('\\','\\\\').replace('%','\\%').replace('_','\\_') + '%'
+                    def productMatch = cf.makeCondition(['productId','pseudoId','productName'].collect { cf.makeCondition(it, org.moqui.entity.EntityCondition.LIKE, pattern).ignoreCase() }, org.moqui.entity.EntityCondition.OR)
+                    def products = ec.entity.find('mantle.product.Product').condition('ownerPartyId', orgId).condition(productMatch).disableAuthz()
+                        .orderBy('productName,productId').limit(35).list()
+                    products.each { result.add([value: 'p:' + it.productId, label: (it.pseudoId ? it.pseudoId + ' — ' : '') + (it.productName ?: it.productId)]) }
+                    def groupMatch = cf.makeCondition(['productCategoryId','categoryName'].collect { cf.makeCondition(it,org.moqui.entity.EntityCondition.LIKE,pattern).ignoreCase() }, org.moqui.entity.EntityCondition.OR)
+                    ec.entity.find('mantle.product.category.ProductCategory').condition('ownerPartyId', orgId).condition(groupMatch).disableAuthz()
+                        .orderBy('categoryName,productCategoryId').limit(15).list()
+                        .each { result.add([value: 'g:' + it.productCategoryId, label: 'Group: ' + (it.categoryName ?: it.productCategoryId)]) }
+                }
+            }
+            ec.web.sendJsonResponse(result)
+        ]]></script></actions>
         <default-response type="none"/>
     </transition>
 
     <actions>
-        <set field="orgId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-        <set field="today" from="new java.sql.Date(System.currentTimeMillis())"/>
-        <entity-find entity-name="mantle.product.Product" list="myProducts"><econdition field-name="ownerPartyId" from="orgId"/><select-field field-name="productId"/></entity-find>
+        <set field="today" from="java.sql.Date.valueOf(ec.user.nowTimestamp.toInstant().atZone(java.time.ZoneId.of('Asia/Kolkata')).toLocalDate())"/>
+        <entity-find entity-name="mantle.product.Product" list="myProducts"><econdition field-name="ownerPartyId" from="orgId"/><select-field field-name="productId,productName"/></entity-find>
         <set field="myProductIds" from="(myProducts*.productId) ?: ['__none__']"/>
-
         <entity-find entity-name="zenith.erp.inventory.DemandForecast" list="forecastList">
-            <search-form-inputs default-order-by="-periodStart"/>
+            <search-form-inputs default-order-by="-periodStart,productId,forecastId"/>
             <econdition field-name="productId" operator="in" from="myProductIds"/>
         </entity-find>
-
         <entity-find entity-name="zenith.erp.inventory.DemandAlert" list="alertList">
-            <econdition field-name="organizationPartyId" from="orgId"/>
-            <econdition field-name="statusId" value="AlertNew"/>
-            <order-by field-name="alertType,-alertDate"/>
-        </entity-find>
-
-        <entity-find-count entity-name="zenith.erp.inventory.DemandForecast" count-field="activeForecasts">
-            <econdition field-name="periodEnd" operator="greater-equals" from="today"/>
-            <econdition field-name="productId" operator="in" from="myProductIds"/>
-        </entity-find-count>
-        <entity-find-count entity-name="zenith.erp.inventory.DemandAlert" count-field="alertCount">
             <econdition field-name="organizationPartyId" from="orgId"/><econdition field-name="statusId" value="AlertNew"/>
-        </entity-find-count>
-        <entity-find entity-name="zenith.erp.inventory.DemandForecast" list="pastWithAccuracy">
-            <econdition field-name="accuracyPercent" operator="is-not-null"/>
-            <econdition field-name="productId" operator="in" from="myProductIds"/>
-            <select-field field-name="accuracyPercent"/>
+            <order-by field-name="alertType,-alertDate,alertId"/>
         </entity-find>
-        <entity-find entity-name="zenith.erp.inventory.DemandForecast" list="allForecastPids"><econdition field-name="productId" operator="in" from="myProductIds"/><select-field field-name="productId"/></entity-find>
-        <set field="avgAccuracy" from="0" type="BigDecimal"/>
         <script><![CDATA[
-            context.hasAcc = (pastWithAccuracy != null && pastWithAccuracy.size() > 0)
-            if (hasAcc) {
-                def total = 0.0
-                for (def f : pastWithAccuracy) total += (f.accuracyPercent ?: 0)
-                avgAccuracy = (total / pastWithAccuracy.size()).setScale(0, java.math.RoundingMode.HALF_UP)
+            // Overview is independent of history filters and pagination. Facility forecasts do not
+            // represent an organization total, and must not be added to the global forecast.
+            def all = ec.entity.find('zenith.erp.inventory.DemandForecast').condition('productId','in',myProductIds)
+                .condition('facilityId',null).orderBy('-periodStart,-lastUpdatedStamp,forecastId').list()
+            def live = all.findAll { it.periodStart != null && it.periodEnd != null && it.periodStart <= today && it.periodEnd >= today }
+            def byProduct = [:]; live.each { if (!byProduct.containsKey(it.productId)) byProduct[it.productId] = it }
+            context.activeForecasts = byProduct.size(); context.forecastProductCount = byProduct.size()
+            context.alertCount = alertList.size()
+            def past = all.findAll { it.periodEnd != null && it.periodEnd < today && it.accuracyPercent != null }
+            context.hasAcc = !past.isEmpty()
+            context.avgAccuracy = past ? Math.round(past.collect { (it.accuracyPercent as BigDecimal) }.sum() / past.size()) : 0
+            context.accWord = !hasAcc ? 'Building up' : (avgAccuracy >= 75 ? 'Strong' : (avgAccuracy >= 60 ? 'Good' : (avgAccuracy >= 45 ? 'Fair' : 'Still learning')))
+            def updated = all.findAll { it.lastUpdatedStamp != null }.collect { it.lastUpdatedStamp }.max()
+            def horizonEnd = live.collect { it.periodEnd }.max()
+            context.fcUpdatedDisp = updated ? ec.l10n.format(updated, 'dd MMM yyyy') : '—'
+            context.fcHorizonDays = horizonEnd ? java.time.temporal.ChronoUnit.DAYS.between(today.toLocalDate(), horizonEnd.toLocalDate()) + 1 : 0
+            context.fcHorizonDisp = fcHorizonDays ? fcHorizonDays + ' days' : '—'
+            context.fcModelActive = !byProduct.isEmpty()
+            def names = myProducts.collectEntries { [(it.productId): it.productName ?: it.productId] }
+            context.dfMode = ec.context.dfMode == 'group' ? 'group' : 'product'
+            context.dfSpan = ec.context.dfSpan == 'month' ? 'month' : 'week'
+            int span = dfSpan == 'month' ? 30 : 7
+            context.dfSpanCap = dfSpan == 'month' ? 'Month' : 'Week'
+            context.dfSpanLower = dfSpan
+            context.dfModeNoun = dfMode == 'group' ? 'groups' : 'products'
+            def normalized = byProduct.values().collect { f ->
+                long days = java.time.temporal.ChronoUnit.DAYS.between(f.periodStart.toLocalDate(), f.periodEnd.toLocalDate()) + 1
+                [productId:f.productId, quantity: ((f.forecastQuantity ?: 0G) as BigDecimal).multiply(30G).divide(days as BigDecimal, 2, java.math.RoundingMode.HALF_UP)]
             }
-            def fpset = new HashSet(); for (def f : allForecastPids) fpset.add(f.productId)
-            context.forecastProductCount = fpset.size()
-
-            // ZE-INV demand-forecast §8.1: Forecast health card — real derived values (latest compute time +
-            // furthest horizon from the loaded forecasts; model is "Active" when any product is being forecast).
-            def _fcLu = null; def _fcPe = null
-            for (def f : forecastList) {
-                if (f.lastUpdatedStamp != null && (_fcLu == null || f.lastUpdatedStamp.time > _fcLu.time)) _fcLu = f.lastUpdatedStamp
-                if (f.periodEnd != null && (_fcPe == null || f.periodEnd.time > _fcPe.time)) _fcPe = f.periodEnd
-            }
-            context.fcUpdatedDisp = _fcLu ? ec.l10n.format(_fcLu, 'dd MMM yyyy, HH:mm') : '—'
-            context.fcHorizonDisp = _fcPe ? ('through ' + ec.l10n.format(_fcPe, 'dd MMM yyyy')) : '—'
-            context.fcModelActive = (forecastProductCount > 0)
-
-            // ZE-INV demand-forecast §7 + §8.2: top-5 products by forecast demand + demand-tier distribution,
-            // from the FRESHEST forecast per product (real data). Tiers = tertiles of the actual quantity
-            // distribution (data-driven, not invented thresholds); No-demand = zero forecast.
-            def _dfAll = ec.entity.find("zenith.erp.inventory.DemandForecast").condition("productId", "in", myProductIds).selectField("productId").selectField("forecastQuantity").selectField("periodStart").list()
-            def _dfByProd = [:]
-            for (def f : _dfAll) {
-                def ex = _dfByProd[f.productId]
-                if (ex == null || (f.periodStart != null && (ex.periodStart == null || f.periodStart > ex.periodStart))) _dfByProd[f.productId] = f
-            }
-            def _dfQs = _dfByProd.values().collect { (it.forecastQuantity ?: 0G) as BigDecimal }
-            def _dfPos = _dfQs.findAll { it > 0G }.sort()
-            distNone = _dfQs.count { it <= 0G }
-            int _dfHi = 0, _dfMd = 0, _dfLo = 0
-            if (_dfPos) {
-                def _t1 = _dfPos[(int)(_dfPos.size() / 3)]; def _t2 = _dfPos[(int)(_dfPos.size() * 2 / 3)]
-                for (def q : _dfPos) { if (q >= _t2) _dfHi++ else if (q >= _t1) _dfMd++ else _dfLo++ }
-            }
-            distHi = _dfHi; distMd = _dfMd; distLo = _dfLo; distTotal = _dfQs.size()
-            distPctHi = distTotal > 0 ? (int)(distHi * 100 / distTotal) : 0
-            distPctMd = distTotal > 0 ? (int)(distMd * 100 / distTotal) : 0
-            distPctLo = distTotal > 0 ? (int)(distLo * 100 / distTotal) : 0
-            distPctNone = distTotal > 0 ? (100 - distPctHi - distPctMd - distPctLo) : 0
-            def _dfTop = new ArrayList(_dfByProd.values()).sort { a, b -> ((b.forecastQuantity ?: 0G) <=> (a.forecastQuantity ?: 0G)) }
-            if (_dfTop.size() > 5) _dfTop = new ArrayList(_dfTop.subList(0, 5))
-            def _dfMax = _dfTop ? ((_dfTop[0].forecastQuantity ?: 0G) as BigDecimal) : 0G
-            def _dfNames = [:]
-            if (_dfTop) ec.entity.find("mantle.product.Product").condition("productId", "in", _dfTop.collect { it.productId }).selectField("productId").selectField("productName").list().each { _dfNames[it.productId] = it.productName }
-            def _dfBars = []
-            for (def r : _dfTop) {
-                def q = (r.forecastQuantity ?: 0G) as BigDecimal
-                def pct = (_dfMax > 0G) ? q.multiply(100G).divide(_dfMax, 0, java.math.RoundingMode.HALF_UP).intValue() : 0
-                _dfBars.add([name: (_dfNames[r.productId] ?: r.productId), qty: ec.l10n.format(q, '#,##0.##'), pct: pct])
-            }
-            topDemandBars = _dfBars
-
-            // ===== demand-forecast §7: grouped "This vs Next period" comparison — REAL on-demand forecasts
-            // (forecast#ProductDemand / forecast#CategoryDemand: avgDailyDemand = recent actual rate, forecastDemand
-            // = model prediction). Toggles: dfMode product|group, dfSpan week|month. Bounded to top 5 (<=5 calls). =====
-            def _dfMode = (ec.context.dfMode ?: 'product').toString()
-            def _dfSpan = (ec.context.dfSpan ?: 'week').toString()
-            int _spanDays = (_dfSpan == 'month') ? 30 : 7
-            context.dfMode = _dfMode; context.dfSpan = _dfSpan
-            context.dfSpanCap = (_dfSpan == 'month') ? 'Month' : 'Week'
-            context.dfSpanLower = (_dfSpan == 'month') ? 'month' : 'week'
-            context.dfModeNoun = (_dfMode == 'group') ? 'groups' : 'products'
-            def _cmpLbls = []; def _cmpThis = []; def _cmpNext = []
-            if (orgId && orgId != '_NA_' && _dfByProd) {
-                if (_dfMode == 'group') {
-                    def _allPidCat = [:]; def _allPids = new ArrayList(_dfByProd.keySet())
-                    ec.entity.find("mantle.product.category.ProductCategoryMember").condition("productId", "in", _allPids).disableAuthz().list().each { if (!_allPidCat.containsKey(it.productId)) _allPidCat[it.productId] = it.productCategoryId }
-                    def _catSum = [:]
-                    for (def e : _dfByProd.entrySet()) { def cid = _allPidCat[e.key]; if (cid) _catSum[cid] = ((_catSum[cid] ?: 0G) as BigDecimal) + ((e.value.forecastQuantity ?: 0G) as BigDecimal) }
-                    def _topCats = new ArrayList(_catSum.entrySet()).sort { a, b -> (b.value <=> a.value) }
-                    if (_topCats.size() > 5) _topCats = new ArrayList(_topCats.subList(0, 5))
-                    for (def c : _topCats) {
-                        def _cf = null
-                        try { _cf = ec.service.sync().name("zenith.inventory.AdvancedForecastServices.forecast#CategoryDemand").parameters([categoryId: c.key, organizationPartyId: orgId, horizonDays: _spanDays]).call() } catch (Exception _ce) {}
-                        def _r = _cf?.result
-                        def _tv = (((_r?.avgDailyDemand ?: 0) as BigDecimal).multiply(_spanDays as BigDecimal)).setScale(0, java.math.RoundingMode.HALF_UP)
-                        def _nv = ((_r?.forecastDemand ?: 0) as BigDecimal).setScale(0, java.math.RoundingMode.HALF_UP)
-                        _cmpLbls.add("'" + (_r?.categoryName ?: c.key).toString().replace("'", " ").replace("\"", " ") + "'"); _cmpThis.add(_tv); _cmpNext.add(_nv)
-                    }
-                } else {
-                    def _cmpP = new ArrayList(_dfByProd.values()).sort { a, b -> ((b.forecastQuantity ?: 0G) <=> (a.forecastQuantity ?: 0G)) }
-                    if (_cmpP.size() > 5) _cmpP = new ArrayList(_cmpP.subList(0, 5))
-                    for (def r : _cmpP) {
-                        def _pf = null
-                        try { _pf = ec.service.sync().name("zenith.inventory.AdvancedForecastServices.forecast#ProductDemand").parameters([productId: r.productId, organizationPartyId: orgId, horizonDays: _spanDays]).call() } catch (Exception _pe) {}
-                        def _r = _pf?.result
-                        def _tv = (((_r?.avgDailyDemand ?: 0) as BigDecimal).multiply(_spanDays as BigDecimal)).setScale(0, java.math.RoundingMode.HALF_UP)
-                        def _nv = ((_r?.forecastDemand ?: 0) as BigDecimal).setScale(0, java.math.RoundingMode.HALF_UP)
-                        _cmpLbls.add("'" + (_dfNames[r.productId] ?: r.productId).toString().replace("'", " ").replace("\"", " ") + "'"); _cmpThis.add(_tv); _cmpNext.add(_nv)
-                    }
+            def positive = normalized.collect { it.quantity }.findAll { it > 0G }.sort()
+            def counts = [0,0,0,normalized.count { it.quantity <= 0G }]
+            if (positive) { def low = positive[positive.size().intdiv(3)]; def high = positive[(positive.size()*2).intdiv(3)]
+                positive.each { if(it >= high) counts[0]++ else if(it >= low) counts[1]++ else counts[2]++ } }
+            // Largest-remainder percentages total 100 without assigning rounding to a zero-count tier.
+            def percentages = counts.collect { normalized ? Math.floor(it * 100.0 / normalized.size()) as int : 0 }
+            int remainder = normalized ? 100 - percentages.sum() : 0
+            def order = (0..3).toList().sort { a,b -> ((counts[b] * 100.0 / Math.max(1,normalized.size()) - percentages[b]) <=> (counts[a] * 100.0 / Math.max(1,normalized.size()) - percentages[a])) ?: (a <=> b) }
+            order.take(remainder).each { percentages[it]++ }
+            context.distHi=counts[0];context.distMd=counts[1];context.distLo=counts[2];context.distNone=counts[3];context.distTotal=counts.sum()
+            context.distPctHi=percentages[0];context.distPctMd=percentages[1];context.distPctLo=percentages[2];context.distPctNone=percentages[3]
+            def candidates = normalized.sort { a,b -> (b.quantity <=> a.quantity) ?: (a.productId <=> b.productId) }
+            if (dfMode == 'group') {
+                def categories = ec.entity.find('mantle.product.category.ProductCategory').condition('ownerPartyId',orgId).disableAuthz().list()
+                def catNames = categories.collectEntries { [(it.productCategoryId): it.categoryName] }
+                def memberships = ec.entity.find('mantle.product.category.ProductCategoryMember').condition('productId','in',myProductIds)
+                    .condition('productCategoryId','in',catNames.keySet() ?: ['__none__']).disableAuthz().list().findAll { (it.fromDate == null || it.fromDate <= ec.user.nowTimestamp) && (it.thruDate == null || it.thruDate > ec.user.nowTimestamp) }
+                def weights = [:]
+                memberships.collect { [pid:it.productId,cid:it.productCategoryId] }.unique().each { m ->
+                    def qty = normalized.find { it.productId == m.pid }?.quantity
+                    if (qty != null) weights[m.cid] = (weights[m.cid] ?: 0G) + qty
                 }
+                candidates = weights.entrySet().sort { a,b -> (b.value <=> a.value) ?: (a.key <=> b.key) }.collect { [categoryId:it.key,name:catNames[it.key]] }
             }
-            context.dfCmpLabels = "[" + _cmpLbls.join(",") + "]"
-            context.dfCmpThis = "[" + _cmpThis.join(",") + "]"
-            context.dfCmpNext = "[" + _cmpNext.join(",") + "]"
-            context.dfCmpHas = (_cmpLbls.size() > 0)
-
-            def confWord = { p -> p == null ? "Still learning" : (p >= 75 ? "Strong" : (p >= 60 ? "Good" : (p >= 45 ? "Fair" : "Still learning"))) }
-            context.accWord = hasAcc ? confWord(avgAccuracy) : "Building up"
-            context.accColor = !hasAcc ? "grey" : (avgAccuracy >= 60 ? "success" : (avgAccuracy >= 45 ? "warning" : "grey"))
-            context.alertColor = (alertCount > 0) ? "danger" : "success"
-            context.plain = "We're predicting how much of each product you'll sell, so you can restock at the right time. " +
-                "We're keeping an eye on " + forecastProductCount + " products. " +
-                (alertCount > 0 ? (alertCount + (alertCount == 1 ? " item needs" : " items need") + " your attention right now — see the list just below.") :
-                                  "Nothing needs attention right now — everything is selling normally and stock looks healthy.") +
-                (hasAcc ? (" When we check our past predictions against what really sold, we've been about " + avgAccuracy + "% accurate (" + accWord.toLowerCase() + ").") :
-                          " Once a few predictions have been checked against real sales, you'll see how accurate we are here.")
+            def comparisons = []
+            candidates.take(5).each { item ->
+                def out = ec.service.sync().name('zenith.inventory.AdvancedForecastServices.forecast#' + (dfMode == 'group' ? 'CategoryDemand' : 'ProductDemand'))
+                    .parameters([organizationPartyId:orgId,productId:item.productId,categoryId:item.categoryId,horizonDays:span]).call()
+                def r = out?.result
+                if (r?.forecastDemand != null) comparisons.add([name: item.name ?: names[item.productId], current: Math.round((r.recentActualDemand ?: 0) as double), next: r.forecastDemand])
+            }
+            context.dfCmpRows = comparisons
+            def json = { value -> groovy.json.JsonOutput.toJson(value).replace('<','\u003c').replace('>','\u003e').replace('&','\u0026') }
+            context.dfCmpLabels=json(comparisons.collect { it.name });context.dfCmpThis=json(comparisons.collect { it.current });context.dfCmpNext=json(comparisons.collect { it.next })
+            context.dfCmpHas = !comparisons.isEmpty()
+            context.dfChartMax = Math.max(50, Math.ceil((comparisons.collect { Math.max(it.current as double,it.next as double) }.max() ?: 0) / 50.0) * 50) as int
+            context.plain = 'Forecasts use completed sales and exclude incomplete, voided and future transactions.'
+            context.checkGroup = false; context.checkPseudo = ''
         ]]></script>
-        <!-- ZE-DF-007 (IV-111): this tenant's reorder-alert business hours (default 8-22) + dropdown options for the dialog -->
         <service-call name="zenith.inventory.AdvancedForecastServices.get#ReorderCheckConfig" out-map="reorderCfg" in-map="[organizationPartyId: orgId]"/>
         <script><![CDATA[
-            int _oh = (reorderCfg?.openHour ?: 8) as int
-            int _ch = (reorderCfg?.closeHour ?: 22) as int
-            context.reorderOpenHour = _oh.toString()
-            context.reorderCloseHour = _ch.toString()
-            def _lbl = { int h -> h == 0 ? "12 AM (midnight)" : (h == 24 ? "12 AM (next day)" : (h == 12 ? "12 noon" : (h < 12 ? (h + " AM") : (h - 12) + " PM"))) }
-            def _open = []; for (int h = 0; h <= 23; h++) _open.add([h: h.toString(), label: _lbl(h)])
-            def _close = []; for (int h = 1; h <= 24; h++) _close.add([h: h.toString(), label: _lbl(h)])
-            context.openHourOptions = _open
-            context.closeHourOptions = _close
-            context.reorderHoursText = _lbl(_oh) + " – " + _lbl(_ch)
+            int _oh = reorderCfg.openHour != null ? reorderCfg.openHour as int : 8
+            int _ch = reorderCfg.closeHour != null ? reorderCfg.closeHour as int : 22
+            context.reorderOpenHour = _oh.toString(); context.reorderCloseHour = _ch.toString()
+            def _lbl = { int h -> h == 0 ? '12 AM (midnight)' : (h == 24 ? '12 AM (next day)' : (h == 12 ? '12 noon' : (h < 12 ? h + ' AM' : (h-12) + ' PM'))) }
+            context.openHourOptions = (0..23).collect { [h:it.toString(),label:_lbl(it)] }
+            context.closeHourOptions = (1..24).collect { [h:it.toString(),label:_lbl(it)] }
+            context.reorderHoursText = _lbl(_oh) + ' – ' + _lbl(_ch)
             // IV-113 (ZE-DF-009): "Check a product" — look up ANY product (incl. a brand-new one with no sales)
             // and show its forecast + sales history. forecast#ProductDemand returns a plain-English summary that
             // already distinguishes has-sales vs "No sales history found ... a forecast cannot be produced yet".
@@ -277,13 +237,22 @@
             context.checkTracked = false; context.checkSoh = 0; context.checkMaintained = false; context.checkReorderEligible = false
             def _cn = ec.context.checkProductName
             if (_cn != null) _cn = _cn.toString().trim()
-            if (_cn && orgId && orgId != '_NA_') {
+            if (_cn && dfOrgValid) {
                 context.checkDone = true
                 context.checkQuery = _cn
-                def _prod = ec.entity.find("mantle.product.Product").condition("productId", _cn).condition("ownerPartyId", orgId).disableAuthz().one()
-                if (_prod == null) {
-                    def _pl = ec.entity.find("mantle.product.Product").condition("ownerPartyId", orgId).condition("productName", "like", "%" + _cn + "%").disableAuthz().orderBy("productName").limit(1).list()
-                    if (_pl) _prod = _pl[0]
+                boolean _group = _cn.startsWith('g:')
+                def _key = (_group || _cn.startsWith('p:')) ? _cn.substring(2) : _cn
+                def _prod = ec.entity.find("mantle.product.Product").condition("productId", _key).condition("ownerPartyId", orgId).disableAuthz().one()
+                if (_prod?.ownerPartyId != orgId || _group) _prod = null
+                if (_group) {
+                    def cat = ec.entity.find('mantle.product.category.ProductCategory').condition('productCategoryId', _key).disableAuthz().one()
+                    if (cat?.ownerPartyId == orgId) {
+                        context.checkFound = true; context.checkGroup = true; context.checkPName = cat.categoryName
+                        def out = ec.service.sync().name('zenith.inventory.AdvancedForecastServices.forecast#CategoryDemand')
+                            .parameters([categoryId: _key, organizationPartyId: orgId, horizonDays: 14]).call()
+                        context.checkSummary = out.summary; context.checkResult = out.result
+                        context.checkHasForecast = out.result?.forecastDemand != null
+                    }
                 }
                 if (_prod != null) {
                     context.checkFound = true
@@ -315,32 +284,50 @@
                     context.checkReorderEligible = (_tracked && (_soh > 0 || _maintained))
                 }
             }
-            // ZE-DF-008 f/u: does this org have Store operating hours? If so they OVERRIDE the setting below,
-            // so show a note. Stays false (note hidden) until the stores module is actually used -> no dead pointer.
+
             context.hasStoreHours = false
-            if (orgId && orgId != '_NA_') {
-                def _stids = ec.entity.find("zenith.erp.stores.Store").condition("organizationPartyId", orgId).disableAuthz().selectField("storeId").list()*.storeId
-                if (_stids) context.hasStoreHours = ec.entity.find("zenith.erp.stores.StoreOperatingHours").condition("storeId", "in", _stids).disableAuthz().count() > 0
+            if (dfOrgValid) {
+                def hours = ec.service.sync().name('zenith.inventory.AdvancedForecastServices.check#OrgReorderOpen')
+                    .parameter('organizationPartyId',orgId).call()
+                context.hasStoreHours = hours.source == 'store'
             }
-            // demand-forecast §6: surface-correct URL for the "View all products" stat-card link.
-            def _dfB = (ec.web?.request?.requestURI ?: '').replaceAll('/+$','')
-            context.dfProdUrl = _dfB.contains('/') ? (_dfB.substring(0, _dfB.lastIndexOf('/')) + '/FindProduct') : '/apps/zenith/Inventory/FindProduct'
+            context.dfProdUrl = 'FindProduct'
         ]]></script>
     </actions>
 
     <widgets>
-        <container style="row items-center justify-between q-mb-sm">
-            <container style="column">
-                <label text="Demand Forecast" type="h4" style="text-primary text-weight-bold q-my-none"/>
-                <label text="A simple prediction of how much of each product you'll sell — so you know what to restock and when. It updates by itself every night." type="p" style="text-grey-7 q-mb-none"/>
-            </container>
-            <container style="row q-gutter-sm items-center">
-                <link url="exportCsv" text="Download" icon="download" btn-type="secondary" style="cust-export q-btn--dense"/>
-                <!-- ZE-INV-010 (IV-110): recompute triggers a write (stores forecasts) + is gate-blocked for view-only -->
+        <render-mode><text type="html,qvt"><![CDATA[<link rel="stylesheet" href="/zenithstatic/css/demand-forecast.css?v=5"/>]]></text></render-mode>
+        <container id="demandForecastPage" style="df-page">
+<render-mode><text type="html,qvt,vuet"><![CDATA[<div class="df-banner" role="status"><span class="df-info-icon">i</span><span><#if hasStoreHours>Store operating hours determine today's hourly reorder checks. Business hours (${reorderHoursText?html}, IST) are the fallback.<#else>Reorder alerts are checked hourly within your business hours: ${reorderHoursText?html} (IST).</#if></span><button type="button" aria-label="Dismiss business hours notice" onclick="this.closest('.df-banner').hidden=true">×</button></div>]]></text></render-mode>        <section name="SelectForecastOrg"><condition><expression>!dfOrgValid</expression></condition><widgets><label text="Select an organization to view its demand forecasts." type="p" style="df-org-notice"/></widgets></section>
+        <container style="df-heading">
+            <label text="Demand Forecast" type="h1"/>
+            <label text="A simple prediction of how much of each product you'll sell — so you know what to restock and when. It updates by itself every night." type="p" style="df-subtitle"/>
+            <container style="df-header-actions">
+                <link url="exportCsv" text="Download" icon="download" btn-type="secondary" style="df-secondary"/>
                 <section name="ForecastRunWrite"><condition><expression>invCanWrite</expression></condition><widgets>
-                <!-- ZE-DF-007 (IV-111): set the hours during which reorder alerts are checked (write-gated) -->
+                    <link url="runCycle" text="Update Now" icon="refresh" btn-type="primary" style="df-primary" confirmation="Update your forecasts using completed sales? This runs in the background. Reload this page after the update finishes."/>
+                </widgets></section>
+            </container>
+        </container>
+<render-mode><text type="html,qvt,vuet"><![CDATA[<div class="df-stat-grid">
+<article class="df-stat df-red"><div class="df-stat-label">Needs your attention</div><span class="df-chip"><svg class="df-icon " viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 8v5m0 3v.01M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18"/></svg></span><div class="df-stat-value">${alertCount}</div><p>${(alertCount gt 0)?string('items to restock or look at','no active alerts')}</p><a href="?dfView=alerts&amp;dfMode=${dfMode}&amp;dfSpan=${dfSpan}#df-attention">View details →</a></article>
+<article class="df-stat df-purple"><div class="df-stat-label">+ Products we're tracking</div><span class="df-chip"><svg class="df-icon " viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 3 8v9l9 5 9-5V8L12 3Zm0 9v10M3 8l9 4 9-4M7.5 5.5l9 5"/></svg></span><div class="df-stat-value">${forecastProductCount}</div><p>predictions are running for these</p><a href="${dfProdUrl?html}">View all products →</a></article>
+<article class="df-stat df-orange"><div class="df-stat-label">How accurate we've been</div><span class="df-chip"><svg class="df-icon " viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-9-9m5 9a5 5 0 1 1-5-5m0 5 9-9m-5 0h5v5"/></svg></span><div class="df-stat-value"><#if hasAcc>${avgAccuracy}%<#else>—</#if></div><p><#if hasAcc>${accWord} — checked against real sales<#else>Waiting for the first completed check</#if></p><a href="?dfView=history&amp;dfMode=${dfMode}&amp;dfSpan=${dfSpan}#df-accuracy">View accuracy report →</a></article>
+<article class="df-stat df-blue"><div class="df-stat-label">+ Live predictions</div><span class="df-chip"><svg class="df-icon " viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 18 9 9l6 4 6-9M3 18h.01M9 9h.01M15 13h.01M21 4h.01"/></svg></span><div class="df-stat-value">${activeForecasts}</div><p>forecasts covering the days ahead</p><a href="?dfView=history&amp;dfMode=${dfMode}&amp;dfSpan=${dfSpan}#df-accuracy">View forecasts →</a></article>
+</div>]]></text></render-mode><render-mode><text type="html,qvt,vuet"><![CDATA[<section class="df-card df-chart-card" aria-labelledby="df-chart-heading"><div class="df-chart-header"><h2 id="df-chart-heading"><svg class="df-icon " viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 20V9h4v11m4 0V4h4v16m4 0v-7h3M2 22h21"/></svg>Demand comparison: Top 5 ${dfModeNoun} (This ${dfSpanLower} vs Next ${dfSpanLower})</h2><div class="df-chart-toggles"><div class="df-segments" aria-label="Demand type"><a href="?dfMode=product&amp;dfSpan=${dfSpan}" class="${(dfMode=='product')?string('active','')}" aria-current="${(dfMode=='product')?string('true','false')}">Product Demand</a><a href="?dfMode=group&amp;dfSpan=${dfSpan}" class="${(dfMode=='group')?string('active','')}" aria-current="${(dfMode=='group')?string('true','false')}">Group Demand</a></div><div class="df-segments" aria-label="Forecast period"><a href="?dfMode=${dfMode}&amp;dfSpan=week" class="${(dfSpan=='week')?string('active','')}" aria-current="${(dfSpan=='week')?string('true','false')}">Week</a><a href="?dfMode=${dfMode}&amp;dfSpan=month" class="${(dfSpan=='month')?string('active','')}" aria-current="${(dfSpan=='month')?string('true','false')}">Month</a></div></div></div>
+<#if dfCmpHas><div class="df-chart-legend"><span><i class="df-current"></i>This ${dfSpanLower}</span><span><i class="df-next"></i>Next ${dfSpanLower}</span></div><div class="df-chart-scroll" tabindex="0" aria-label="Demand comparison chart. Scroll horizontally on smaller screens."><svg class="df-chart" viewBox="0 0 1200 265" role="img" aria-labelledby="df-chart-description"><title id="df-chart-description">Completed sales in the previous ${(dfSpan=='month')?string('30','7')} days compared with predicted demand starting today.</title>
+<#list 0..5 as tick><#assign y=225-tick*40><line class="df-grid-line" x1="52" y1="${y?c}" x2="1190" y2="${y?c}"/><text class="df-axis-tick" x="43" y="${(y+4)?c}" text-anchor="end">${(dfChartMax*tick/5)?string('0')}</text></#list><text class="df-y-title" transform="translate(12 140) rotate(-90)" text-anchor="middle">Demand (Units)</text>
+<#list dfCmpRows as row><#assign x=52+(row?index+0.5)*1138/dfCmpRows?size><#assign currentHeight=row.current/dfChartMax*200><#assign nextHeight=row.next/dfChartMax*200>
+<g><title>${row.name?html}: this ${dfSpanLower} ${row.current}, next ${dfSpanLower} ${row.next}</title><rect class="df-current-bar" x="${(x-53)?c}" y="${(225-currentHeight)?c}" width="46" height="${currentHeight?c}" rx="2"/><rect class="df-next-bar" x="${(x+7)?c}" y="${(225-nextHeight)?c}" width="46" height="${nextHeight?c}" rx="2"/>
+<text class="df-bar-value" x="${(x-30)?c}" y="${(217-currentHeight)?c}" text-anchor="middle">${row.current}</text><text class="df-bar-value" x="${(x+30)?c}" y="${(217-nextHeight)?c}" text-anchor="middle">${row.next}</text><text class="df-category-label" x="${x?c}" y="245" text-anchor="middle">${row?index+1}. ${row.name?html}</text></g></#list></svg></div>
+<#else><div class="df-empty-chart">No comparable predictions yet. Generate forecasts after products have sold on at least five days.</div></#if></section>]]></text></render-mode>        <container style="df-bottom">
+            <container style="df-card df-health-combined">
+                <container style="df-health">
+<render-mode><text type="html,qvt,vuet"><![CDATA[<h2><svg class="df-icon " viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20.8 4.6a5.5 5.5 0 0 0-8.8 1.4 5.5 5.5 0 0 0-8.8-1.4c-2.1 2.1-1.6 5.4.7 7.7L12 20l8.1-7.7c2.3-2.3 2.8-5.6.7-7.7"/></svg>Forecast health overview</h2><p class="df-helper">A quick look at the current state of your demand forecast.</p><div class="df-health-grid"><div><span>Data updated</span><strong><em>${fcUpdatedDisp?keep_before(' ')?html}</em><span class="df-unit">${fcUpdatedDisp?keep_after(' ')?html}</span></strong><small>Last updated</small></div><div><span>Total SKUs</span><strong>${forecastProductCount}</strong><small>In forecast</small></div><div><span>Forecast horizon</span><strong><em>${fcHorizonDisp?keep_before(' ')?html}</em><span class="df-unit">${fcHorizonDisp?keep_after(' ')?html}</span></strong><small>Days ahead</small></div><div><span>Model status</span><strong><b class="df-status ${fcModelActive?string('is-active','is-idle')}">${fcModelActive?string('Active','Idle')}</b></strong><small>${fcModelActive?string('Current predictions','No current predictions')}</small></div></div>]]></text></render-mode>
+                    <section name="ForecastHoursWrite"><condition><expression>invCanWrite</expression></condition><widgets>
+                <container style="df-hours-control">
                 <container-dialog id="ReorderHoursDialog" button-text="Business Hours" button-icon="fa fa-clock-o"
-                                  button-class="q-btn bg-grey-3 text-dark text-weight-bold border-radius-md q-px-md q-btn--dense">
+                                  button-class="df-secondary df-hours-button">
                     <label text="Reorder alerts are checked every hour while your shop is open. Set your hours below (times are IST)." type="p" style="text-grey-8 q-mb-sm"/>
                     <!-- ZE-DF-008 f/u: only shown once Store operating hours exist for this org (they take precedence) -->
                     <section name="StoreHoursOverrideNote"><condition><expression>hasStoreHours</expression></condition><widgets>
@@ -356,72 +343,24 @@
                         <field name="submitButton"><default-field title=""><submit text="Save Hours"/></default-field></field>
                     </form-single>
                 </container-dialog>
-                <link url="runCycle" text="Update Now" icon="refresh" btn-type="primary" style="q-btn--dense text-weight-bold"
-                      confirmation="Update the forecast now? It checks your latest sales, predicts every product, and flags anything to restock. Takes up to a minute."/>
-                </widgets></section>
+                </container>
+                    </widgets></section>
+                </container>
+                <container style="df-distribution">
+<render-mode><text type="html,qvt,vuet"><![CDATA[<h2>Demand distribution (next 30 days)</h2><#if distTotal gt 0><div class="df-stacked" role="img" aria-label="Demand distribution: high ${distHi}, medium ${distMd}, low ${distLo}, no demand ${distNone}"><span class="df-high" style="width:${distPctHi}%"></span><span class="df-medium" style="width:${distPctMd}%"></span><span class="df-low" style="width:${distPctLo}%"></span><span class="df-none" style="width:${distPctNone}%"></span></div><div class="df-distribution-legend"><div><span><i class="df-high"></i>High demand</span><small>${distHi} (${distPctHi}%)</small></div><div><span><i class="df-medium"></i>Medium demand</span><small>${distMd} (${distPctMd}%)</small></div><div><span><i class="df-low"></i>Low demand</span><small>${distLo} (${distPctLo}%)</small></div><div><span><i class="df-none"></i>No demand</span><small>${distNone} (${distPctNone}%)</small></div></div><p class="df-distribution-note">30-day estimate from current forecast rates; tiers follow the demand distribution.</p><#else><p class="df-helper df-distribution-empty">No current forecast data yet.</p></#if>]]></text></render-mode>
+                </container>
+            </container>
+            <container style="df-card df-lookup">
+<render-mode><text type="html,qvt,vuet"><![CDATA[<h2><svg class="df-icon " viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 3h6l1 3 3 1 2 5-2 5-3 1-1 3H9l-1-3-3-1-2-5 2-5 3-1 1-3Zm3 5a4 4 0 1 0 0 8 4 4 0 0 0 0-8"/></svg>Product / Group forecast</h2><p class="df-helper">Start typing a product or group's name (or ID) and pick it from the list — then see its sales history and forecast.</p>]]></text></render-mode>
+                <form-single name="CheckProductForm" transition="checkProduct">
+                    <field name="checkProductName"><default-field title="Search product / group by name or ID...">
+                        <drop-down current-description="${checkPName ?: ''}" allow-empty="true"><dynamic-options transition="getProductOptions" server-search="true" min-length="2"/></drop-down>
+                    </default-field></field>
+                    <field name="submitButton"><default-field title=""><submit text="Check forecast" icon="apps" style="df-primary"/></default-field></field>
+                </form-single>
             </container>
         </container>
-
-        <container style="zenith-card q-pa-md bg-indigo-1 border-radius-md q-mb-md">
-            <label text="In plain words" type="p" style="text-indigo-9 text-uppercase text-weight-bold text-caption q-mb-xs"/>
-            <label text="${plain}" type="p" style="text-grey-9 text-subtitle1 q-mb-none"/>
-        </container>
-
-        <!-- demand-forecast §6: four stat cards — icon chip (top-right) + big value + caption + "View →" link.
-             Card 1 (Needs your attention) tints red when there are alerts (green all-good state at 0). Real data. -->
-        <render-mode><text type="html,vuet,qvt"><![CDATA[<#assign _a0 = (alertCount)!0>
-        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:16px;margin-bottom:16px">
-          <div style="background:${(_a0 gt 0)?string('#FEF2F2','#FFFFFF')};border:1px solid ${(_a0 gt 0)?string('#FECACA','#E5E7EB')};border-radius:12px;padding:20px">
-            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px"><span style="font-size:13px;font-weight:500;color:#374151">Needs your attention</span><span style="flex:0 0 auto;width:38px;height:38px;border-radius:50%;background:${(_a0 gt 0)?string('#FEE2E2','#D1FAE5')};color:${(_a0 gt 0)?string('#DC2626','#059669')};display:inline-flex;align-items:center;justify-content:center"><svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M1 21h22L12 2 1 21zm12-3h-2v-2h2v2zm0-4h-2v-4h2v4z"/></svg></span></div>
-            <div style="font-size:30px;font-weight:700;color:${(_a0 gt 0)?string('#DC2626','#059669')};margin-top:6px;line-height:1.1">${_a0}</div>
-            <div style="font-size:12px;color:#6B7280;margin-top:2px">${(_a0 gt 0)?string('items to restock or look at','all good right now')}</div>
-            <a href="#df-attention" style="font-size:12.5px;font-weight:600;color:${(_a0 gt 0)?string('#DC2626','#059669')};text-decoration:none;margin-top:10px;display:inline-block">View details &#8594;</a>
-          </div>
-          <div style="background:#fff;border:1px solid #E5E7EB;border-radius:12px;padding:20px">
-            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px"><span style="font-size:13px;font-weight:500;color:#374151">Products we're tracking</span><span style="flex:0 0 auto;width:38px;height:38px;border-radius:10px;background:#F5F3FF;color:#7C3AED;display:inline-flex;align-items:center;justify-content:center"><svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M12 2 4 6v12l8 4 8-4V6l-8-4zm0 2.2 5.5 2.8L12 9.8 6.5 7 12 4.2zM6 8.6l5 2.5v6.8l-5-2.5V8.6zm12 0v6.8l-5 2.5v-6.8l5-2.5z"/></svg></span></div>
-            <div style="font-size:30px;font-weight:700;color:#7C3AED;margin-top:6px;line-height:1.1">${(forecastProductCount)!0}</div>
-            <div style="font-size:12px;color:#6B7280;margin-top:2px">predictions are running for these</div>
-            <a href="${(dfProdUrl)!'#'}" style="font-size:12.5px;font-weight:600;color:#7C3AED;text-decoration:none;margin-top:10px;display:inline-block">View all products &#8594;</a>
-          </div>
-          <div style="background:#fff;border:1px solid #E5E7EB;border-radius:12px;padding:20px">
-            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px"><span style="font-size:13px;font-weight:500;color:#374151">How accurate we've been</span><span style="flex:0 0 auto;width:38px;height:38px;border-radius:10px;background:#FFF7ED;color:#C2410C;display:inline-flex;align-items:center;justify-content:center"><svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M12 2a10 10 0 1 0 10 10h-2a8 8 0 1 1-8-8V2zm0 4a6 6 0 1 0 6 6h-2a4 4 0 1 1-4-4V6zm0 4a2 2 0 1 0 2 2h-2v-2z"/></svg></span></div>
-            <div style="font-size:30px;font-weight:700;color:#C2410C;margin-top:6px;line-height:1.1"><#if (hasAcc)!false>${(avgAccuracy)!0}%<#else>${(accWord)!'Building up'}</#if></div>
-            <div style="font-size:12px;color:#6B7280;margin-top:2px"><#if (hasAcc)!false>${(accWord)!''} — checked against real sales<#else>shows up after the first check</#if></div>
-            <a href="#df-accuracy" style="font-size:12.5px;font-weight:600;color:#C2410C;text-decoration:none;margin-top:10px;display:inline-block">View accuracy report &#8594;</a>
-          </div>
-          <div style="background:#fff;border:1px solid #E5E7EB;border-radius:12px;padding:20px">
-            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px"><span style="font-size:13px;font-weight:500;color:#374151">Live predictions</span><span style="flex:0 0 auto;width:38px;height:38px;border-radius:10px;background:#EFF6FF;color:#2563EB;display:inline-flex;align-items:center;justify-content:center"><svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M16 6l2.29 2.29-4.88 4.88-4-4L2 16.59 3.41 18l6-6 4 4 6.3-6.29L22 12V6z"/></svg></span></div>
-            <div style="font-size:30px;font-weight:700;color:#2563EB;margin-top:6px;line-height:1.1">${(activeForecasts)!0}</div>
-            <div style="font-size:12px;color:#6B7280;margin-top:2px">forecasts covering the days ahead</div>
-            <a href="#df-accuracy" style="font-size:12.5px;font-weight:600;color:#2563EB;text-decoration:none;margin-top:10px;display:inline-block">View forecasts &#8594;</a>
-          </div>
-        </div>]]></text></render-mode>
-
-        <!-- ZE-INV demand-forecast §8.1: Forecast health mini-grid — real derived values (last compute time,
-             SKUs tracked, furthest horizon, model status), inline flex so it renders on /apps AND /qapps. -->
-        <render-mode><text type="html,qvt,vuet"><![CDATA[<div style="background:#fff;border:1px solid #E5E7EB;border-radius:10px;padding:14px 16px;margin-bottom:16px"><div style="font-size:13px;font-weight:700;color:#374151;margin-bottom:10px">Forecast health</div><div style="display:flex;flex-wrap:wrap;gap:28px"><div><div style="font-size:11px;color:#6B7280;margin-bottom:2px">Data updated</div><div style="font-size:14px;font-weight:700;color:#111827">${fcUpdatedDisp}</div></div><div><div style="font-size:11px;color:#6B7280;margin-bottom:2px">Total SKUs</div><div style="font-size:14px;font-weight:700;color:#111827">${forecastProductCount}</div></div><div><div style="font-size:11px;color:#6B7280;margin-bottom:2px">Forecast horizon</div><div style="font-size:14px;font-weight:700;color:#111827">${fcHorizonDisp}</div></div><div><div style="font-size:11px;color:#6B7280;margin-bottom:2px">Model status</div><div><span style="display:inline-block;padding:2px 10px;border-radius:12px;font-size:12px;font-weight:700;background:${fcModelActive?string('#D1FAE5','#F1F1F2')};color:${fcModelActive?string('#059669','#6B7280')}">${fcModelActive?string('Active','Idle')}</span></div></div></div></div>]]></text></render-mode>
-
-        <!-- demand-forecast §7: grouped "This vs Next period" comparison chart. Segmented toggles (Product/Group,
-             Week/Month) re-render with dfMode/dfSpan. Bars use REAL on-demand forecasts. ApexCharts via zChart
-             (renders /apps + /qapps). Teal = this period (actual rate), lavender = next period (predicted). -->
-        <render-mode><text type="html,vuet,qvt"><![CDATA[<div style="background:#fff;border:1px solid #E5E7EB;border-radius:12px;padding:16px 18px;margin-bottom:16px"><div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:8px"><div style="display:flex;align-items:center;gap:8px;font-size:15px;font-weight:700;color:#111827"><svg viewBox="0 0 24 24" width="18" height="18" style="color:#7C3AED" aria-hidden="true"><path fill="currentColor" d="M5 9.2h3V19H5zM10.6 5h2.8v14h-2.8zm5.6 8H19v6h-2.8z"/></svg>Demand comparison: Top 5 ${dfModeNoun} (This ${dfSpanLower} vs Next ${dfSpanLower})</div><div style="display:flex;gap:8px;flex-wrap:wrap"><div style="display:inline-flex;border:1px solid #E5E7EB;border-radius:8px;overflow:hidden"><a href="?dfMode=product&amp;dfSpan=${dfSpan}" style="padding:5px 12px;font-size:12.5px;text-decoration:none;${(dfMode=='product')?string('background:#7C3AED;color:#fff;font-weight:600','background:#fff;color:#6B7280')}">Product Demand</a><a href="?dfMode=group&amp;dfSpan=${dfSpan}" style="padding:5px 12px;font-size:12.5px;text-decoration:none;${(dfMode=='group')?string('background:#7C3AED;color:#fff;font-weight:600','background:#fff;color:#6B7280')}">Group Demand</a></div><div style="display:inline-flex;border:1px solid #E5E7EB;border-radius:8px;overflow:hidden"><a href="?dfMode=${dfMode}&amp;dfSpan=week" style="padding:5px 12px;font-size:12.5px;text-decoration:none;${(dfSpan=='week')?string('background:#7C3AED;color:#fff;font-weight:600','background:#fff;color:#6B7280')}">Week</a><a href="?dfMode=${dfMode}&amp;dfSpan=month" style="padding:5px 12px;font-size:12.5px;text-decoration:none;${(dfSpan=='month')?string('background:#7C3AED;color:#fff;font-weight:600','background:#fff;color:#6B7280')}">Month</a></div></div></div><#if dfCmpHas><div id="dfCmpChart"></div><img alt="" style="display:none" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" onload="zChart(this,function(){(function(){new ApexCharts(document.querySelector(&quot;#dfCmpChart&quot;),{chart:{type:'bar',height:340,toolbar:{show:false},fontFamily:'Roboto, sans-serif'},series:[{name:'This ${dfSpanCap}',data:${dfCmpThis}},{name:'Next ${dfSpanCap}',data:${dfCmpNext}}],xaxis:{categories:${dfCmpLabels}},colors:['#14B8A6','#A78BFA'],plotOptions:{bar:{borderRadius:4,columnWidth:'55%'}},dataLabels:{enabled:true},stroke:{show:true,width:2,colors:['transparent']},legend:{position:'top'},yaxis:{title:{text:'Demand (Units)'}}}).render();})();})"/><#else><div style="color:#6B7280;font-size:13px;padding:10px 0">No forecast data yet — use &ldquo;Update Now&rdquo; above to generate predictions, then this compares recent demand with what&rsquo;s expected next.</div></#if></div>]]></text></render-mode>
-
-        <!-- demand-forecast §8.2: demand-tier distribution (tertiles of the freshest forecast quantities). -->
-        <render-mode><text type="html,vuet,qvt"><![CDATA[<div style="background:#fff;border:1px solid #E5E7EB;border-radius:12px;padding:16px 18px;margin-bottom:16px"><div style="font-size:15px;font-weight:700;color:#111827;margin-bottom:12px">Demand distribution</div><#if (distTotal gt 0)><div style="display:flex;height:14px;border-radius:7px;overflow:hidden;margin-bottom:12px"><div style="width:${distPctHi}%;background:#059669"></div><div style="width:${distPctMd}%;background:#D97706"></div><div style="width:${distPctLo}%;background:#DC2626"></div><div style="width:${distPctNone}%;background:#E5E7EB"></div></div><div style="display:flex;flex-wrap:wrap;gap:16px;font-size:12px;color:#6B7280"><span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#059669;margin-right:5px"></span>High demand ${distHi} (${distPctHi}%)</span><span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#D97706;margin-right:5px"></span>Medium demand ${distMd} (${distPctMd}%)</span><span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#DC2626;margin-right:5px"></span>Low demand ${distLo} (${distPctLo}%)</span><span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#E5E7EB;margin-right:5px"></span>No demand ${distNone} (${distPctNone}%)</span></div><#else><div style="color:#6B7280;font-size:13px">No forecast data yet.</div></#if></div>]]></text></render-mode>
-
-        <!-- IV-113 (ZE-DF-009): check any single product's forecast + sales history, incl. a brand-new no-sales product -->
-        <container style="zenith-card bg-white shadow-2 border-radius-md q-pa-md q-mb-md">
-            <label text="Check a product's forecast" type="h6" style="text-primary text-weight-bold q-my-none"/>
-            <label text="Start typing a product's name (or ID) and pick it from the list — then see its sales history and forecast. A brand-new product that hasn't sold yet is included." type="p" style="text-grey-6 text-caption q-mb-sm"/>
-            <form-single name="CheckProductForm" transition="checkProduct">
-                <field name="checkProductName"><default-field title="Product">
-                    <!-- IV-113 (ZE-DF-009 f/u): after submit, a server-search select2 knows only the raw value (productId),
-                         so re-display the friendly label via current-description = the product name the actions already
-                         resolved (checkPName). Moqui's sanctioned per-field mechanism (DefaultScreenMacros drop-down). -->
-                    <drop-down current-description="${checkPName ?: ''}"><dynamic-options transition="getProductOptions" server-search="true" min-length="2"/></drop-down>
-                </default-field></field>
-                <field name="submitButton"><default-field title=""><submit text="Check forecast" icon="search"/></default-field></field>
-            </form-single>
+        <container style="df-lookup-result">
             <section name="CheckResult"><condition><expression>checkDone</expression></condition><widgets>
                 <section name="CheckNotFound"><condition><expression>!checkFound</expression></condition><widgets>
                     <container style="bg-yellow-1 q-pa-md border-radius-md q-mt-sm">
@@ -448,7 +387,7 @@
                                 <label text="This product is set up for stock tracking, but no stock has been counted for it yet (0 on hand, no stock movements). Low-stock alerts will begin once you record its stock." type="p" style="text-grey-9 q-mb-none"/>
                             </container>
                         </widgets></section>
-                        <section name="CheckUntracked"><condition><expression>!checkTracked</expression></condition><widgets>
+                        <section name="CheckUntracked"><condition><expression>!checkGroup &amp;&amp; !checkTracked</expression></condition><widgets>
                             <container style="bg-grey-2 q-pa-md border-radius-md q-mb-sm">
                                 <label text="Stock tracking: Off" type="p" style="text-grey-9 text-weight-bold q-mb-none"/>
                                 <label text="This product isn't stock-tracked, so it's excluded from low-stock and reorder alerts — only unusual-selling (demand-shift) alerts apply. Set up its stock in Inventory to enable low-stock alerts." type="p" style="text-grey-8 q-mb-none"/>
@@ -476,16 +415,17 @@
                         </widgets></section>
                         <section name="CheckNoSales"><condition><expression>!checkHasForecast</expression></condition><widgets>
                             <container style="bg-blue-1 q-pa-md border-radius-md">
-                                <label text="No sales history yet — so no forecast can be made for this product. It will appear here (and in the “How our past predictions did” list below) automatically once it starts selling." type="p" style="text-blue-9 q-mb-none"/>
+                                <label text="${checkSummary}" type="p" style="text-blue-9 q-mb-none"/>
                             </container>
                         </widgets></section>
                     </container>
                 </widgets></section>
             </widgets></section>
-        </container>
 
+        </container>
+        <section name="ForecastAttentionDetails"><condition><expression>ec.context.dfView == 'alerts'</expression></condition><widgets>
         <render-mode><text type="html,qvt,vuet"><![CDATA[<span id="df-attention"></span>]]></text></render-mode>
-        <container style="zenith-card bg-white shadow-2 border-radius-md q-pa-md q-mb-md">
+        <container style="df-card df-details">
             <label text="What needs your attention" type="h6" style="text-primary text-weight-bold q-my-none"/>
             <label text="Items selling unusually fast or slow, or running low on stock. Tap “Done” once you've handled one." type="p" style="text-grey-6 text-caption q-mb-none"/>
             <label text="Low-stock alerts are re-checked every hour during your business hours (${reorderHoursText}, IST). Change them with “Business Hours” above." type="p" style="text-grey-6 text-caption q-mb-sm"/>
@@ -512,26 +452,30 @@
                 <fail-widgets>
                     <container style="q-pa-lg text-center">
                         <label text="✓ All good!" type="h6" style="text-success text-weight-bold q-mb-xs"/>
-                        <label text="Every product is selling normally and nothing is running low on stock." type="p" style="text-grey-6 q-mb-none"/>
+                        <label text="No active alerts. Untracked products and products without enough history may not generate alerts." type="p" style="text-grey-6 q-mb-none"/>
                     </container>
                 </fail-widgets>
             </section>
         </container>
 
+
+        </widgets></section>
+        <section name="ForecastHistoryDetails"><condition><expression>ec.context.dfView == 'history'</expression></condition><widgets>
         <render-mode><text type="html,qvt,vuet"><![CDATA[<span id="df-accuracy"></span>]]></text></render-mode>
-        <container style="zenith-card bg-white shadow-2 border-radius-md q-pa-md">
+        <container style="df-card df-details">
             <label text="How our past predictions did" type="h6" style="text-primary text-weight-bold q-my-none"/>
             <label text="For each product and time period: what we predicted, what actually sold, and how close we were." type="p" style="text-grey-6 text-caption q-mb-sm"/>
             <render-mode><text type="html,qvt"><![CDATA[<span class="zlc-ph" data-ph="Search Demand Forecast..." style="display:none"></span>]]></text></render-mode>
-            <form-list name="ForecastListForm" list="forecastList" skip-form="true"
-                       header-dialog="true" select-columns="true" show-csv-button="true">
-                <field name="productId"><header-field title="Product" show-order-by="true"/>
+            <form-list name="ForecastListForm" list="forecastList" transition="findForecasts" skip-form="false"
+                       header-dialog="true" select-columns="true" show-csv-button="false">
+                <field name="dfView"><default-field><hidden default-value="history"/></default-field></field>
+                <field name="productId"><header-field title="Product" show-order-by="true"><text-find/></header-field>
                     <default-field title="Product">
                         <display-entity entity-name="mantle.product.Product" text="${pseudoId} - ${productName}"/>
                     </default-field></field>
-                <field name="periodStart"><header-field title="From" show-order-by="true"/>
+                <field name="periodStart"><header-field title="From" show-order-by="true"><date-find type="date"/></header-field>
                     <default-field title="From"><display format="dd-MMM-yyyy"/></default-field></field>
-                <field name="periodEnd"><default-field title="To"><display format="dd-MMM-yyyy"/></default-field></field>
+                <field name="periodEnd"><header-field title="To" show-order-by="true"><date-find type="date"/></header-field><default-field title="To"><display format="dd-MMM-yyyy"/></default-field></field>
                 <field name="forecastQuantity"><default-field title="We expected"><display format="#,##0" text="${forecastQuantity != null ? zinr.inr(ec.l10n.format(forecastQuantity,'#,##0')) + ' units' : '—'}"/></default-field></field>
                 <field name="actualQuantity"><default-field title="Actually sold"><display text="${actualQuantity != null ? zinr.inr(ec.l10n.format(actualQuantity,'#,##0')) + ' units' : 'not yet'}"/></default-field></field>
                 <field name="accuracyPercent"><default-field title="How close">
@@ -541,9 +485,9 @@
             </form-list>
         </container>
 
-        <container style="bg-blue-1 q-pa-md border-radius-md q-mt-md">
-            <label text="How to read this" type="p" style="text-blue-9 text-weight-bold q-mb-xs"/>
-            <label text="• &quot;Needs your attention&quot; lists products running low (restock them) or selling unusually fast/slow. • &quot;How accurate we've been&quot; grows as the system learns from your real sales each night. • Everything here comes from your actual sales — you don't have to enter anything. • Want a quick answer? Ask the AI Copilot, e.g. “how many Pen Cartridges should I order?”" type="p" style="text-grey-8 text-caption q-mb-none"/>
+
+        </widgets></section>
+        <container style="df-footer"><label text="© 2024–2026 ZcERP · Cloud ERP Platform" type="span"/><container-dialog id="ForecastSupport" button-text="Support" button-class="df-support"><label text="For help interpreting forecasts, contact your ERP administrator. Predictions depend on completed sales history and improve as more periods are checked." type="p"/></container-dialog></container>
         </container>
     </widgets>
 </screen>
