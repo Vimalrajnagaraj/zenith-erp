@@ -1,0 +1,21 @@
+-- Local disposable Serial Number Tracking verification only. No production imports.
+BEGIN;
+DO $$ BEGIN
+ IF current_database() !~ '^moqui_serial_number_tracking_[a-z0-9_]+$' THEN RAISE EXCEPTION 'Dedicated disposable serial database required'; END IF;
+END $$;
+INSERT INTO party (party_id,party_type_enum_id,owner_party_id) VALUES ('SNFIX_ORG','PtyOrganization','_NA_'),('SNFIX_OTHER','PtyOrganization','_NA_'),('SNFIX_PERSON','PtyPerson','_NA_'),('SNFIX_SUP','PtyOrganization','SNFIX_ORG');
+INSERT INTO organization (party_id,organization_name) VALUES ('SNFIX_ORG','Serial Tracking Sample Review'),('SNFIX_OTHER','Foreign serial audit'),('SNFIX_SUP','Sample Serial Supplier');
+INSERT INTO party_role (party_id,role_type_id) VALUES ('SNFIX_ORG','OrgInternal'),('SNFIX_OTHER','OrgInternal'),('SNFIX_PERSON','Employee'),('SNFIX_SUP','Supplier');
+INSERT INTO party_relationship (party_relationship_id,from_party_id,to_party_id,from_role_type_id,to_role_type_id,relationship_type_enum_id,from_date) VALUES ('SNFIX_MEMBERSHIP','SNFIX_PERSON','SNFIX_ORG','Employee','OrgInternal','PrtEmployee','2024-01-01');
+INSERT INTO facility (facility_id,facility_name,owner_party_id,facility_type_enum_id) VALUES ('SNFIX_A','Sample Main Warehouse','SNFIX_ORG','FcTpRetailStore'),('SNFIX_FOREIGN','Foreign Serial Warehouse','SNFIX_OTHER','FcTpRetailStore');
+INSERT INTO product (product_id,pseudo_id,product_name,owner_party_id,product_type_enum_id,enable_serial_tracking,enable_batch_tracking) VALUES ('SNFIX_P','SAMPLE-SERIAL','Sample Tracked Device','SNFIX_ORG','PtAsset','Y','N'),('SNFIX_BATCH','SAMPLE-BATCH','Sample Batch Device','SNFIX_ORG','PtAsset','Y','Y'),('SNFIX_OFF','SAMPLE-PLAIN','Sample Untracked Item','SNFIX_ORG','PtAsset','N','N'),('SNFIX_FOREIGN','FOREIGN-SERIAL','Foreign Serial Product','SNFIX_OTHER','PtAsset','Y','N');
+INSERT INTO product_serial_number (serial_number_id,serial_number,product_id,facility_id,status_id,received_date,warranty_expiry_date,batch_number) VALUES ('SNFIX_1','SAMPLE-SR-001','SNFIX_P','SNFIX_A','SnInStock',CURRENT_DATE,CURRENT_DATE+365,'SAMPLE-B1'),('SNFIX_2','SAMPLE-SR-002','SNFIX_P','SNFIX_A','SnInStock',CURRENT_DATE,CURRENT_DATE+365,'SAMPLE-B1'),('SNFIX_F','FOREIGN-SR-001','SNFIX_FOREIGN','SNFIX_FOREIGN','SnSold',CURRENT_DATE,NULL,NULL);
+INSERT INTO user_account (user_id,username,user_full_name,current_password,password_salt,password_hash_type,password_base64,password_set_date,disabled,require_password_change,locale,time_zone,party_id)
+SELECT id,audit_username,'Serial Tracking Sample Review',current_password,password_salt,password_hash_type,password_base64,password_set_date,'N','N',locale,time_zone,'SNFIX_PERSON' FROM user_account CROSS JOIN (VALUES ('SNFIX_USER','serial.tracking.audit'),('SNFIX_VIEW','serial.tracking.viewer'),('SNFIX_NOORG','serial.tracking.noorg'),('SNFIX_MANAGER','serial.tracking.manager')) AS users(id,audit_username) WHERE username='john.doe';
+INSERT INTO user_group_member (user_group_id,user_id,from_date) SELECT user_group_id,id,from_date FROM user_group_member CROSS JOIN (VALUES ('SNFIX_USER'),('SNFIX_NOORG')) AS users(id) WHERE user_id='EX_JOHN_DOE';
+INSERT INTO user_group_member (user_group_id,user_id,from_date) VALUES ('ZENITH_ALL','SNFIX_VIEW',CURRENT_TIMESTAMP),('ZENITH_AUDITOR','SNFIX_VIEW',CURRENT_TIMESTAMP),('ZENITH_ALL','SNFIX_MANAGER','2024-01-01'),('ZENITH_INVENTORY_MGR','SNFIX_MANAGER','2024-01-01');
+INSERT INTO user_preference (user_id,preference_key,preference_value) VALUES ('SNFIX_USER','ACTIVE_ORGANIZATION','SNFIX_ORG'),('SNFIX_VIEW','ACTIVE_ORGANIZATION','SNFIX_ORG'),('SNFIX_NOORG','ACTIVE_ORGANIZATION','_NA_'),('SNFIX_MANAGER','ACTIVE_ORGANIZATION','SNFIX_ORG');
+INSERT INTO form_list_find (form_list_find_id,description,form_location,order_by_field) VALUES ('SNFIX_FIND','Sample serial filter','component://zenith-erp-inventory/screen/zenith/inventory/Inventory/SerialNumbers.xml.form_list$SerialListForm','serialNumber');
+INSERT INTO form_list_find_user (form_list_find_id,user_id) VALUES ('SNFIX_FIND','SNFIX_USER');
+INSERT INTO form_list_find_field (form_list_find_id,field_name,field_value,field_operator,field_ignore_case) VALUES ('SNFIX_FIND','serialNumber','SAMPLE-SR-001','equals','Y');
+COMMIT;

@@ -2,7 +2,7 @@
 <#assign cellPadding = "3pt">
 <#assign dateFormat = dateFormat!"dd-MMM-yyyy">
 <#macro encodeText textValue>${(Static["org.moqui.util.StringUtilities"].encodeForXmlAttribute(textValue!"", false))!""}</#macro>
-<#macro formatINR amount>Rs. ${Static["com.zenith.Fmt"].regroup(ec.l10n.format(amount!0, "#,##0.00"))}</#macro>
+<#macro formatAmount amount><#if (order.currencyUomId!'')?has_content><@encodeText order.currencyUomId/> </#if><#assign formattedAmount=ec.l10n.format(amount!0, "#,##0.00")><#if (order.currencyUomId!'') == 'INR'>${Static["com.zenith.Fmt"].regroup(formattedAmount)}<#else>${formattedAmount}</#if></#macro>
     <fo:layout-master-set>
         <fo:simple-page-master master-name="A4" page-width="210mm" page-height="297mm"
                                margin-top="10mm" margin-bottom="15mm" margin-left="10mm" margin-right="10mm">
@@ -59,7 +59,7 @@
                                             <fo:table-cell padding="3pt"><fo:block font-weight="bold">Revision</fo:block><fo:block>${order.orderRevision!"1"}</fo:block></fo:table-cell>
                                         </fo:table-row>
                                         <fo:table-row border-bottom="0.5pt solid black">
-                                            <fo:table-cell padding="3pt" border-right="0.5pt solid black"><fo:block font-weight="bold">Currency</fo:block><fo:block><@encodeText order.currencyUomId!"INR"/></fo:block></fo:table-cell>
+                                            <fo:table-cell padding="3pt" border-right="0.5pt solid black"><fo:block font-weight="bold">Currency</fo:block><fo:block><@encodeText order.currencyUomId!"Not recorded"/></fo:block></fo:table-cell>
                                             <fo:table-cell padding="3pt"><fo:block font-weight="bold">Sales Channel</fo:block><fo:block><@encodeText order.salesChannelEnumId!""/></fo:block></fo:table-cell>
                                         </fo:table-row>
                                     </fo:table-body>
@@ -131,15 +131,15 @@
                                 <fo:table-cell padding="3pt" border-right="0.5pt solid black"><fo:block font-weight="bold"><@encodeText (orderItem.itemDescription)!""/></fo:block></fo:table-cell>
                                 <fo:table-cell padding="3pt" border-right="0.5pt solid black"><fo:block text-align="center">${orderItem.hsnSacCode!"-"}</fo:block></fo:table-cell>
                                 <fo:table-cell padding="3pt" border-right="0.5pt solid black"><fo:block text-align="center">${orderItem.quantity!"1"}</fo:block></fo:table-cell>
-                                <fo:table-cell padding="3pt" border-right="0.5pt solid black"><fo:block text-align="right"><@formatINR orderItem.unitAmount/></fo:block></fo:table-cell>
-                                <fo:table-cell padding="3pt" border-right="0.5pt solid black"><fo:block text-align="right"><@formatINR gstTotal/></fo:block></fo:table-cell>
-                                <fo:table-cell padding="3pt"><fo:block text-align="right"><@formatINR itemAmount/></fo:block></fo:table-cell>
+                                <fo:table-cell padding="3pt" border-right="0.5pt solid black"><fo:block text-align="right"><@formatAmount orderItem.unitAmount/></fo:block></fo:table-cell>
+                                <fo:table-cell padding="3pt" border-right="0.5pt solid black"><fo:block text-align="right"><@formatAmount gstTotal/></fo:block></fo:table-cell>
+                                <fo:table-cell padding="3pt"><fo:block text-align="right"><@formatAmount itemAmount/></fo:block></fo:table-cell>
                             </fo:table-row>
                         </#list>
                         
                         <fo:table-row font-size="9pt" font-weight="bold" border-top="0.5pt solid black" border-bottom="0.5pt solid black">
                             <fo:table-cell padding="3pt" border-right="0.5pt solid black" number-columns-spanned="6" text-align="right"><fo:block>Estimated Grand Total (Inc. GST)</fo:block></fo:table-cell>
-                            <fo:table-cell padding="3pt"><fo:block text-align="right"><@formatINR order.grandTotal!totalAmount/></fo:block></fo:table-cell>
+                            <fo:table-cell padding="3pt"><fo:block text-align="right"><@formatAmount order.grandTotal!totalAmount/></fo:block></fo:table-cell>
                         </fo:table-row>
                     </fo:table-body>
                 </fo:table>
