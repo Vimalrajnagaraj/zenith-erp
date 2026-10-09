@@ -1,0 +1,129 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+    <service verb="get" noun="SerialScope">
+        <out-parameters><parameter name="organizationPartyId"/></out-parameters>
+        <actions><script><![CDATA[
+            organizationPartyId = '__NO_ORGANIZATION__'
+            def selected = ec.user.getPreference('ACTIVE_ORGANIZATION')
+            if (!selected || selected == '_NA_') return
+            if (!ec.user.isInGroup('ADMIN')) {
+                def membership = ec.service.sync().name('mantle.party.PartyServices.get#PartyOrganizationInfo').parameters([partyId:ec.user.userAccount?.partyId]).call()
+                if (!membership?.userOrgIds?.contains(selected)) return
+            }
+            if (ec.entity.find('mantle.party.Organization').condition('partyId', selected).one()) organizationPartyId = selected
+        ]]></script></actions>
+    </service>
+    <service verb="require" noun="SerialWrite">
+        <out-parameters><parameter name="organizationPartyId"/></out-parameters>
+        <actions>
+            <service-call name="zenith.inventory.SerialTrackingServices.get#SerialScope" out-map="scope"/>
+            <set field="organizationPartyId" from="scope.organizationPartyId"/>
+            <if condition="organizationPartyId == '__NO_ORGANIZATION__'"><return error="true" message="Select an organization you belong to before changing serial records."/></if>
+            <service-call name="zenith.base.SecurityServices.check#ModuleWriteAccess" in-map="[moduleId:'inventory']" out-map="access"/>
+            <if condition="!access.canWrite"><return error="true" message="You have view-only access to Inventory."/></if>
+        </actions>
+    </service>
+    <service verb="prepare" noun="SerialSearch">
+        <in-parameters><parameter name="filters" type="Map"/></in-parameters>
+        <out-parameters><parameter name="organizationPartyId"/><parameter name="serialSearchParams" type="Map"/><parameter name="serialFilterCondition" type="Object"/></out-parameters>
+        <actions>
+            <service-call name="zenith.inventory.SerialTrackingServices.get#SerialScope" out-map="scope"/>
+            <set field="organizationPartyId" from="scope.organizationPartyId"/>
+            <script><![CDATA[
+                def f = filters ?: [:]
+                serialSearchParams = [:]
+                def parts = []; def cf = ec.entity.conditionFactory; def EC = org.moqui.entity.EntityCondition
+                ['receivedDate_period','receivedDate_poffset','receivedDate_from','receivedDate_thru'].each { key ->
+                    def value = f[key]?.toString()?.trim()
+                    if (value && value.length() <= 32) serialSearchParams[key] = value
+                }
+                ['serialNumber','batchNumber','facilityName'].each { key ->
+                    def text = f[key]?.toString()?.trim()
+                    if (text) {
+                        serialSearchParams[key] = text.take(100)
+                        def op = f[key+'_op']?.toString()
+                        serialSearchParams[key+'_op'] = op in ['equals','contains','begins','ends'] ? op : 'contains'
+                        serialSearchParams[key+'_ic'] = 'Y'
+                        def literal = text.take(100).replace('\\','\\\\').replace('%','\\%').replace('_','\\_')
+                        def pattern = op == 'equals' ? literal : (op == 'begins' ? literal+'%' : (op == 'ends' ? '%'+literal : '%'+literal+'%'))
+                        parts.add(cf.makeCondition(key,EC.LIKE,pattern).ignoreCase())
+                    }
+                }
+                if (f.statusId) {
+                    if (f.statusId in ['SnInStock','SnReserved','SnSold','SnReturned','SnInWarranty','SnDefective','SnScrapped']) serialSearchParams.statusId = f.statusId
+                    else { serialSearchParams.statusId = '__INVALID_STATUS__'; ec.message.addError('Choose a valid serial status.'); }
+                    parts.add(cf.makeCondition('statusId',EC.EQUALS,serialSearchParams.statusId))
+                }
+                serialFilterCondition = parts ? cf.makeCondition(parts,EC.AND) : null
+                def order = f.orderByField?.toString() ?: '-receivedDate'
+                if (!(order in ['serialNumber','-serialNumber','productId','-productId','statusId','-statusId','facilityName','-facilityName','receivedDate','-receivedDate','soldDate','-soldDate','warrantyExpiryDate','-warrantyExpiryDate','batchNumber','-batchNumber'])) order = '-receivedDate'
+                serialSearchParams.orderByField = order + ',serialNumberId'
+                def size = f.pageSize?.toString()
+                serialSearchParams.pageSize = size in ['10','20','50','100'] ? size as Integer : 10
+                def index = f.pageIndex?.toString()
+                serialSearchParams.pageIndex = index ==~ /\d{1,6}/ ? index as Integer : 0
+            ]]></script>
+        </actions>
+    </service>
+    <service verb="register" noun="TrackedSerial">
+        <in-parameters>
+            <parameter name="productId" required="true"/><parameter name="serialNumber" required="true"/>
+            <parameter name="facilityId" required="true"/><parameter name="receivedDate"/><parameter name="warrantyExpiryDate"/>
+            <parameter name="batchNumber"/><parameter name="supplierPartyId"/><parameter name="notes"/>
+        </in-parameters>
+        <out-parameters><parameter name="serialNumberId"/></out-parameters>
+        <actions>
+            <service-call name="zenith.inventory.SerialTrackingServices.require#SerialWrite" out-map="guard"/>
+            <script><![CDATA[
+                // One organization lock serializes duplicate checks across products and users.
+                ec.entity.find('mantle.party.Organization').condition('partyId',guard.organizationPartyId).forUpdate(true).one()
+                def product = ec.entity.find('mantle.product.Product').condition('productId',productId).one()
+                def facility = ec.entity.find('mantle.facility.Facility').condition('facilityId',facilityId).one()
+                if (!product || product.ownerPartyId != guard.organizationPartyId || product.productTypeEnumId != 'PtAsset' || product.enableSerialTracking != 'Y') { ec.message.addError('Choose a serial-tracked physical product from your organization.'); return }
+                if (!facility || facility.ownerPartyId != guard.organizationPartyId) { ec.message.addError('Choose a location from your organization.'); return }
+                def number = serialNumber.toString().trim()
+                if (!number || number.length() > 100 || number.any { Character.isISOControl((char)it) }) { ec.message.addError('Enter a serial number of 1–100 characters without control characters.'); return }
+                def condition = ec.entity.conditionFactory.makeCondition('serialNumber',org.moqui.entity.EntityCondition.EQUALS,number).ignoreCase()
+                if (ec.entity.find('zenith.erp.inventory.ProductSerialNumberView').condition('ownerPartyId',guard.organizationPartyId).condition(condition).count()) { ec.message.addError('This serial number is already registered in your organization.'); return }
+                def parseDate = { value -> value ? java.time.LocalDate.parse(value.toString()) : null }
+                def received; def warranty
+                try { received = parseDate(receivedDate) ?: java.time.LocalDate.now(java.time.ZoneId.of(ec.user.timeZone.ID)); warranty = parseDate(warrantyExpiryDate) }
+                catch (Exception e) { ec.message.addError('Enter valid calendar dates.'); return }
+                def today = java.time.LocalDate.now(java.time.ZoneId.of(ec.user.timeZone.ID))
+                if (received.isAfter(today) || (warranty && warranty.isBefore(received))) { ec.message.addError('Received date cannot be in the future; warranty expiry cannot precede receipt.'); return }
+                def batch = batchNumber?.toString()?.trim()
+                if ((batch?.length() ?: 0) > 100 || (product.enableBatchTracking == 'Y' && !batch) || (notes?.toString()?.length() ?: 0) > 4000) { ec.message.addError('Enter a valid batch and notes. Batch-tracked products require a batch number.'); return }
+                if (supplierPartyId) {
+                    def supplier = ec.entity.find('mantle.party.Party').condition('partyId',supplierPartyId).condition('ownerPartyId',guard.organizationPartyId).one()
+                    if (!supplier || !ec.entity.find('mantle.party.PartyRole').condition('partyId',supplierPartyId).condition('roleTypeId','Supplier').one()) { ec.message.addError('Choose a supplier from your organization.'); return }
+                }
+                def record = ec.entity.makeValue('zenith.erp.inventory.ProductSerialNumber').setAll([productId:productId,serialNumber:number,facilityId:facilityId,statusId:'SnInStock',receivedDate:java.sql.Date.valueOf(received),warrantyExpiryDate:warranty ? java.sql.Date.valueOf(warranty) : null,batchNumber:batch,supplierPartyId:supplierPartyId,notes:notes]).setSequencedIdPrimary().create()
+                serialNumberId = record.serialNumberId
+                ec.entity.makeValue('zenith.erp.inventory.SerialNumberHistory').setAll([serialNumberId:serialNumberId,eventDate:ec.user.nowTimestamp,eventType:'Register',toStatusId:'SnInStock',toFacilityId:facilityId,performedByUserId:ec.user.userId,notes:notes]).setSequencedIdPrimary().create()
+                ec.message.addMessage('Serial number registered. Registration records identity; use Receiving to post stock quantities.')
+            ]]></script>
+        </actions>
+    </service>
+    <service verb="update" noun="TrackedSerialStatus">
+        <in-parameters><parameter name="serialNumberId" required="true"/><parameter name="statusId" required="true"/><parameter name="expectedStatusId" required="true"/><parameter name="notes"/></in-parameters>
+        <actions>
+            <service-call name="zenith.inventory.SerialTrackingServices.require#SerialWrite" out-map="guard"/>
+            <script><![CDATA[
+                def serial = ec.entity.find('zenith.erp.inventory.ProductSerialNumber').condition('serialNumberId',serialNumberId).forUpdate(true).one()
+                def product = serial ? ec.entity.find('mantle.product.Product').condition('productId',serial.productId).one() : null
+                if (!serial || product?.ownerPartyId != guard.organizationPartyId) { ec.message.addError('Serial number not found in your organization.'); return }
+                if (serial.statusId != expectedStatusId) { ec.message.addError('This serial was changed. Refresh before updating it.'); return }
+                if (serial.statusId == statusId) return
+                if (serial.assetId) { ec.message.addError('Use the stock workflow for a serial linked to inventory.'); return }
+                def flow = ec.entity.find('moqui.basic.StatusFlowTransition').condition('statusFlowId','Default').condition('statusId',serial.statusId).condition('toStatusId',statusId).one()
+                if (!flow) { ec.message.addError('That serial status transition is not allowed.'); return }
+                // Stock, reservation and issued-sale movements belong to their existing workflows.
+                if (statusId in ['SnSold','SnReserved','SnReturned','SnInStock','SnScrapped'] || serial.statusId == 'SnReserved') { ec.message.addError('Use the stock, sales or return workflow for this movement.'); return }
+                if ((notes?.toString()?.length() ?: 0) > 4000) { ec.message.addError('Notes must contain at most 4000 characters.'); return }
+                def previous = serial.statusId
+                serial.set('statusId',statusId).update()
+                ec.entity.makeValue('zenith.erp.inventory.SerialNumberHistory').setAll([serialNumberId:serialNumberId,eventDate:ec.user.nowTimestamp,eventType:'StatusChange',fromStatusId:previous,toStatusId:statusId,fromFacilityId:serial.facilityId,toFacilityId:serial.facilityId,performedByUserId:ec.user.userId,notes:notes]).setSequencedIdPrimary().create()
+            ]]></script>
+        </actions>
+    </service>
+</services>
