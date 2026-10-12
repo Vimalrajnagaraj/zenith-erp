@@ -11,6 +11,8 @@ ROOT = Path(__file__).resolve().parents[2]
 WRAPPER = ROOT / "component/zenith-erp-saas/framework-overrides/webroot/screen/webroot/qapps.xml"
 SCREEN = ROOT / "component/zenith-erp-app/screen/zenith/ZenithApp.xml"
 ASSETS = ROOT / "component/zenith-erp-app/screen"
+STAGING = ROOT / ".github/workflows/staging-acceptance.yml"
+QA_WRAPPER = ROOT / "docs/infra/ci/base-overrides/qapps.xml"
 
 
 def pre_actions(path):
@@ -36,6 +38,8 @@ def main():
     assert f"html_scripts.add('{boot}')" in wrapper, "Loading guard must run in the wrapper"
     assert wrapper.index(boot) < wrapper.index("/libs/moment.js/"), "Loading guard must run before framework JS"
     assert "reqPath == '/qapps/zenith' || reqPath.startsWith('/qapps/zenith/')" in wrapper, "Scope assets to Zenith"
+    assert QA_WRAPPER.read_bytes() == WRAPPER.read_bytes(), "QA wrapper snapshot differs from the served wrapper"
+    assert 'component/zenith-erp-saas/framework-overrides/webroot/screen/webroot/qapps.xml' in STAGING.read_text(), "Staging must install the candidate wrapper"
     print(f"qapps first-paint assets match ZenithApp: {len(actual)} styles; loading guard precedes framework JS")
 
 
