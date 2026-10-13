@@ -27,6 +27,7 @@
 
 
     <parameter name="searchTerm"/>
+    <parameter name="productOffset"/>
 
 
 
@@ -1773,9 +1774,9 @@
 
 
 
-                    if (transactionId && ['addItem','setItemMode','updateQty','updatePrice','applyDiscount','removeItem','scanAdd'].contains(action)) {
+                    if (transactionId && ['addItem','setItemMode','updateQty','updatePrice','applyDiscount','removeItem','scanAdd','refresh'].contains(action)) {
                         def editable=ec.entity.find('zenith.erp.pos.PosTransaction').condition('transactionId',transactionId).forUpdate(true).one()
-                        if (!editable || editable.statusId!='PtCreated') { ec.web.sendJsonResponse([success:false,error:'Only an open cart can be edited. Use the audited amendment flow for an issued bill.']);return }
+                        if (!editable || editable.statusId!='PtCreated') { ec.web.sendJsonResponse([success:false,cartClosed:true,transactionId:'',error:'That bill is already issued or no longer open. Starting a fresh cart; use History to amend an issued bill.']);return }
                     }
                     if (action == 'addItem') {
 
@@ -3660,96 +3661,45 @@
 
 
             gridProducts = []
+gridPageSize = 120
+def rawOffset = (productOffset ?: '0').toString()
+def gridOffset = rawOffset ==~ /[0-9]{1,4}/ ? Math.min(rawOffset.toInteger(), 3000) : 0
+gridHasMore = false
+if (searchTerm) {
+    def stLower = searchTerm.toLowerCase()
+    def allProds = ec.entity.find("mantle.product.Product")
+        .condition([productTypeEnumId:'PtAsset', ownerPartyId: posOrg])
+        .orderBy("productName,productId").limit(3000).list()
+    def matches = allProds.findAll { pr ->
+        (pr.productName ?: '').toLowerCase().contains(stLower) ||
+        (pr.pseudoId ?: '').toLowerCase().contains(stLower) ||
+        (pr.productId ?: '').toLowerCase().contains(stLower)
+    }
+    gridProducts = gridOffset < matches.size() ? matches.subList(gridOffset, Math.min(matches.size(), gridOffset + gridPageSize + 1)) : []
+} else if (catId) {
+    def members = ec.entity.find("mantle.product.category.ProductCategoryMember")
+        .condition("productCategoryId", catId)
+        .conditionDate("fromDate", "thruDate", ec.user.nowTimestamp)
+        .orderBy("sequenceNum,productId").list()
+    def pIds = members.collect { it.productId }
+    if (pIds) {
+        gridProducts = ec.entity.find("mantle.product.Product")
+            .condition("productId", org.moqui.entity.EntityCondition.ComparisonOperator.IN, pIds)
+            .condition([ownerPartyId: posOrg])
+            .offset(gridOffset).limit(gridPageSize + 1).orderBy("productName,productId").list()
+    }
+} else {
+    gridProducts = ec.entity.find("mantle.product.Product")
+        .condition([productTypeEnumId:'PtAsset', ownerPartyId: posOrg])
+        .offset(gridOffset).limit(gridPageSize + 1).orderBy("productName,productId").list()
+}
+if (gridProducts.size() > gridPageSize) {
+    gridHasMore = true
+    gridProducts = gridProducts.subList(0, gridPageSize)
+}
+gridNextOffset = gridOffset + gridProducts.size()
 
-
-
-            if (searchTerm) {
-                def stLower = searchTerm.toLowerCase()
-                def allProds = ec.entity.find("mantle.product.Product")
-                    .condition([productTypeEnumId:'PtAsset', ownerPartyId: posOrg])
-                    .orderBy("productName").limit(3000).list()
-                gridProducts = allProds.findAll { pr ->
-                    (pr.productName ?: '').toLowerCase().contains(stLower) ||
-                    (pr.pseudoId ?: '').toLowerCase().contains(stLower) ||
-                    (pr.productId ?: '').toLowerCase().contains(stLower)
-                }
-                if (gridProducts.size() > 300) gridProducts = gridProducts.subList(0, 300)
-
-
-
-            } else if (catId) {
-
-
-
-                def members = ec.entity.find("mantle.product.category.ProductCategoryMember")
-
-
-
-                    .condition("productCategoryId", catId)
-
-
-
-                    .conditionDate("fromDate", "thruDate", ec.user.nowTimestamp)
-
-
-
-                    .orderBy("sequenceNum,productId").list()
-
-
-
-                def pIds = members.collect { it.productId }
-
-
-
-                if (pIds) {
-
-
-
-                    gridProducts = ec.entity.find("mantle.product.Product")
-
-
-
-                        .condition("productId", org.moqui.entity.EntityCondition.ComparisonOperator.IN, pIds)
-
-
-
-                        .condition([ownerPartyId: posOrg])
-
-
-
-                        .limit(3000).orderBy("productName").list()
-
-
-
-                }
-
-
-
-            } else {
-
-
-
-                gridProducts = ec.entity.find("mantle.product.Product")
-
-
-
-                    .condition([productTypeEnumId:'PtAsset', ownerPartyId: posOrg])
-
-
-
-                    .limit(3000).orderBy("productName").list()
-
-
-
-            }
-
-
-
-
-
-
-
-            // Show the live Pricing-module price on grid cards when this shop uses price lists (else the product MRP).
+// Show the live Pricing-module price on grid cards when this shop uses price lists (else the product MRP).
             // No-op (one count query) for shops without price lists, so the POS stays fast and unchanged.
             def _hasPL = ec.entity.find("zenith.erp.pricing.PriceList").condition("organizationPartyId", posOrg).condition("priceListTypeEnumId","PltSelling").count() != 0
             if (_hasPL && gridProducts) {
@@ -4466,7 +4416,7 @@
                           </div>
                           </#if>
                         ]]></text></render-mode>
-                        <render-mode><text type="html,qvt" template="true"><![CDATA[<img src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" alt="" style="display:none" onload="try{if(location.pathname.indexOf('/qapps/')===0){location.replace(location.href.replace('/qapps/','/apps/'));}}catch(e){}"/><div style="text-align:center;margin-top:18px"><button id="pos-history-btn-ns" type="button" onclick="window.posOpenHistory&amp;&amp;window.posOpenHistory()" style="padding:10px 24px;border-radius:8px;font-size:14px;font-weight:bold;cursor:pointer;background:#7C3AED;color:#fff;border:1px solid #A78BFA">&#128196; View Bill History<span style="margin-left:7px;padding:1px 6px;border:1px solid rgba(255,255,255,0.7);border-radius:4px;font-size:11px;font-weight:700;opacity:0.9">F9</span></button></div><script src="/zenithstatic/js/pos-terminal.js?v=154"></script>]]></text></render-mode>
+                        <render-mode><text type="html,qvt" template="true"><![CDATA[<img src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" alt="" style="display:none" onload="try{if(location.pathname.indexOf('/qapps/')===0){location.replace(location.href.replace('/qapps/','/apps/'));}}catch(e){}"/><div style="text-align:center;margin-top:18px"><button id="pos-history-btn-ns" type="button" onclick="window.posOpenHistory&amp;&amp;window.posOpenHistory()" style="padding:10px 24px;border-radius:8px;font-size:14px;font-weight:bold;cursor:pointer;background:#7C3AED;color:#fff;border:1px solid #A78BFA">&#128196; View Bill History<span style="margin-left:7px;padding:1px 6px;border:1px solid rgba(255,255,255,0.7);border-radius:4px;font-size:11px;font-weight:700;opacity:0.9">F9</span></button></div><script src="/zenithstatic/js/pos-terminal.js?v=156"></script>]]></text></render-mode>
 
 
 
@@ -5855,7 +5805,7 @@ body.Terminal:not(.pos-mode-normal) .pos-product-grid button div[style*="#e53935
 
 
 
-            <#if searchTerm?has_content>
+            <#if searchTerm?has_content && gridOffset == 0>
 
 
 
@@ -5946,6 +5896,9 @@ body.Terminal:not(.pos-mode-normal) .pos-product-grid button div[style*="#e53935
 
 
                 </#list>
+            <#if gridHasMore>
+                <button type="button" class="pos-load-more" data-next-offset="${gridNextOffset}" style="grid-column:1/-1;padding:12px;border:1px solid #A78BFA;border-radius:8px;background:#fff;color:#6D28D9;font-weight:700;cursor:pointer">Load more products</button>
+            </#if>
 
 
 
@@ -7006,7 +6959,7 @@ body.Terminal:not(.pos-mode-normal) .pos-product-grid button div[style*="#e53935
 <script src="https://cdn.jsdelivr.net/npm/qz-tray@2.2.4/qz-tray.js"></script>
 
 
-<script src="/zenithstatic/js/pos-terminal.js?v=154"></script>
+<script src="/zenithstatic/js/pos-terminal.js?v=156"></script>
 
 
 
@@ -7869,6 +7822,7 @@ window.numpadQty=function() { /* qty override for next add */ };
 
 
 
+        if(d&&d.cartClosed){var u=new URL(location.href);u.searchParams.delete('transactionId');u.searchParams.delete('lastCompletedId');location.replace(u.href);return}
         if(!d||!d.success){if(d&&d.error)alert(d.error);return}
 
 

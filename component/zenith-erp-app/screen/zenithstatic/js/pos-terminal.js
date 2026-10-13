@@ -2802,7 +2802,21 @@ window.posToggleFullscreen = function() {
 
         function cartText(value) { return window._posReceiptTextData(String(value == null ? '' : value)); }
 
+        function recoverClosedCart() {
+            // A completed/voided transaction must never remain the live cart after a
+            // delayed tab, payment redirect or History action. Reload without its ID;
+            // the server will select this session's open cart, if one exists.
+            TX = '';
+            lastCartData = null;
+            document.querySelectorAll('input[name="transactionId"]').forEach(function(el) { el.value = ''; });
+            var url = new URL(window.location.href);
+            url.searchParams.delete('transactionId');
+            url.searchParams.delete('lastCompletedId');
+            window.location.replace(url.href);
+        }
+
         function renderCart(d) {
+            if (d && d.cartClosed) { recoverClosedCart(); return; }
             if (!d || !d.success) { if (d && d.error) alert(d.error); return; }
             TX = d.transactionId || '';
             document.querySelectorAll('input[name="transactionId"]').forEach(function(el) { el.value = TX; });
@@ -2989,6 +3003,7 @@ window.posToggleFullscreen = function() {
                             applyRealSeqs();
                             if (q.length === 0 && !inputFocused()) renderCart(d);   // settle to authoritative
                         } else {
+                            if (d && d.cartClosed) { q.length = 0; recoverClosedCart(); return; }
                             // server rejected this op (e.g. product has no price in the active sales
                             // mode): undo the purely-optimistic line so the cart can't drift from server.
                             if (done.action === 'addItem' && done.ts) {
@@ -3193,6 +3208,31 @@ window.posToggleFullscreen = function() {
 
         /* --- Product grid: intercept addItem --- */
         var gridRoot = document.querySelector('.pos-product-grid');
+        var loadingMore = false;
+        if (window.__posLoadMoreHandler) document.removeEventListener('click', window.__posLoadMoreHandler, true);
+        window.__posLoadMoreHandler = function(e) {
+            var more = e.target.closest('.pos-product-grid .pos-load-more');
+            if (!more || loadingMore) return;
+            e.preventDefault();
+            loadingMore = true;
+            more.disabled = true;
+            var offset = Number(more.dataset.nextOffset);
+            var input = document.querySelector('.pos-search-bar input[name="searchTerm"]');
+            var term = input ? input.value.trim() : '';
+            var cat = CATID;
+            fetchScreen({productOffset: offset, searchTerm: term, catId: term ? '' : cat})
+                .then(function(doc) {
+                    if (CATID !== cat || (input && input.value.trim() !== term) || !more.isConnected) return;
+                    var next = doc.querySelector('.pos-product-grid');
+                    if (!next) throw new Error('Product page unavailable');
+                    var grid = more.parentElement;
+                    more.remove();
+                    grid.insertAdjacentHTML('beforeend', next.innerHTML);
+                })
+                .catch(function() { if (more.isConnected) more.disabled = false; })
+                .finally(function() { loadingMore = false; });
+        };
+        document.addEventListener('click', window.__posLoadMoreHandler, true);
         if (gridRoot) gridRoot.addEventListener('submit', function(e) {
             var form = e.target.closest('form');
             if (!form || form.action.indexOf('addItem') === -1) return;
