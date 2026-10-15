@@ -182,9 +182,14 @@ const rows=(table,where)=>q(`SELECT * FROM ${table} WHERE ${where}`),count=(tabl
  await p.waitForFunction(()=>document.querySelector('#pos-side-item-count')?.innerText==='Subtotal (1 item)');check('search/Enter adds exactly one line at quantity one',adds===1&&Number(rows('pos_transaction_item',`transaction_id='${uc.transactionId}'`)[0]?.quantity)===1,{adds,items:rows('pos_transaction_item',`transaction_id='${uc.transactionId}'`)});check('search-added cart displays product name',await p.locator('.pos-cart').innerText().then(x=>x.includes('Disposable POS A P18')));check('side Bill Summary follows AJAX cart add',await p.locator('#pos-side-item-count').innerText()==='Subtotal (1 item)'&&await p.locator('#pos-side-subtotal').innerText()==='₹100.00');
   check('unissued cart shows the last issued POS bill and today count',!!(await p.locator('#pos-bill-badge').innerText())&&/^\d+$/.test(await p.locator('#pos-today-bills').innerText())&&!tx(uc.transactionId).transaction_number);
   check('terminal has one search and no removed help or credit-history shortcuts',await p.locator('#cartInlineSearch').count()===1&&await p.locator('.pos-search-bar,#posHelpBtn_terminal,.nb-abtn--credit').count()===0);
+  await p.locator('details.nb-modes summary').click();
+  await p.locator('[data-pos-layout="advanced"]').click();
+  check('advanced billing shows the product grid',await p.locator('.pos-product-grid').isVisible());
   const cardBoxes=await p.locator('.pos-product-grid button[type="submit"]').evaluateAll(cards=>cards.slice(0,12).map(c=>{const r=c.getBoundingClientRect();return {x:r.x,y:r.y,right:r.right,bottom:r.bottom};}));
-  check('product grid cards never overlap',cardBoxes.every((a,i)=>cardBoxes.every((b,j)=>i===j||a.right<=b.x+1||b.right<=a.x+1||a.bottom<=b.y+1||b.bottom<=a.y+1)),{cardBoxes});
+  check('visible product grid cards never overlap',cardBoxes.length>1&&cardBoxes.every(b=>b.right>b.x&&b.bottom>b.y)&&cardBoxes.every((a,i)=>cardBoxes.every((b,j)=>i===j||a.right<=b.x+1||b.right<=a.x+1||a.bottom<=b.y+1||b.bottom<=a.y+1)),{cardBoxes});
   await p.screenshot({path:path.join(out,'terminal-bill-grid.png'),fullPage:false});
+  await p.locator('details.nb-modes summary').click();
+  await p.locator('[data-pos-layout="normal"]').click();
   // Delay a second add so the optimistic cart is visible while its write is still in flight.
   // A mode click must wait for that write, preserve the line, and apply the saved wholesale price.
   let delayedModeAdd=false;

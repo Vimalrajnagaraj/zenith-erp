@@ -2110,7 +2110,7 @@ window.posToggleFullscreen = function() {
             lastGestureAt = Date.now();
             sendSessionTouch();
         }
-        ['pointerdown','keydown','touchstart'].forEach(function(type) {
+        ['pointerdown','keydown','touchstart','wheel'].forEach(function(type) {
             document.addEventListener(type,onCashierGesture,{capture:true,passive:true,signal:idleAbort.signal});
         });
         document.addEventListener('visibilitychange',function(){

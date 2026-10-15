@@ -154,7 +154,7 @@
                 def last = sess.lastActivityDate
                 if (!last || last.time > ec.user.nowTimestamp.time - 3600000L) { reason = 'still_active'; return }
                 def txns = ec.entity.find('zenith.erp.pos.PosTransaction').condition('sessionId',sessionId).list()
-                if (txns.any { it.statusId == 'PtCompleted' || it.transactionNumber || ((it.paidAmount ?: 0) as BigDecimal) > 0 }) return
+                if (txns.any { it.statusId in ['PtCompleted','PtHeld'] || it.transactionNumber || ((it.paidAmount ?: 0) as BigDecimal) > 0 }) return
                 if (txns.any { ec.entity.find('zenith.erp.pos.PosPayment').condition('transactionId',it.transactionId).count() > 0 }) return
                 if (ec.entity.find('zenith.erp.pos.PosHeldTransaction').condition('sessionId',sessionId).condition('statusId','PhHeld').count()) return
                 if (ec.entity.find('zenith.erp.pos.PosCashEntry').condition('sessionId',sessionId).count()) return
@@ -231,7 +231,7 @@
                 // Existing POS/FY/NNNNN bills are retained unchanged. Only newly issued bills use the day key.
                 def billDayFormat = new java.text.SimpleDateFormat('yyyyMMdd')
                 billDayFormat.setTimeZone(java.util.TimeZone.getTimeZone('Asia/Kolkata'))
-                def billDay = billDayFormat.format(ec.user.nowTimestamp)
+                def billDay = billDayFormat.format(txn.completedDate ?: ec.user.nowTimestamp)
                 // Atomic per-(org, day) bill counter: an O(1) row-locked increment instead of a
                 // growing full-table count scan, and race-safe (two registers can never mint the same number).
                 def org = txn?.organizationPartyId ?: '_NA_'
@@ -734,11 +734,12 @@
             <if condition="_nonCashPaid &gt; ((txn.payableAmount ?: 0) as BigDecimal)">
                 <return error="true" message="Card/UPI/non-cash payments (${_nonCashPaid}) exceed the bill total (${txn.payableAmount}). Only cash can be over-tendered for change — reduce the Card/UPI amount."/></if>
 
-            <!-- Mint the bill number now, at payment, so abandoned/voided carts never consume a number. -->
+            <!-- Capture one issue instant for the bill date and number, including a midnight sale. -->
+            <set field="_completedAt" from="ec.user.nowTimestamp"/>
+            <service-call name="update#zenith.erp.pos.PosTransaction"
+                in-map="[transactionId:transactionId, statusId:'PtCompleted', completedDate:_completedAt]"/>
             <service-call name="zenith.pos.PosServices.assign#BillNumber" in-map="[transactionId:transactionId]"/>
             <entity-find-one entity-name="zenith.erp.pos.PosTransaction" value-field="txn"/>
-            <service-call name="update#zenith.erp.pos.PosTransaction"
-                in-map="[transactionId:transactionId, statusId:'PtCompleted', completedDate:ec.user.nowTimestamp]"/>
             <service-call name="update#zenith.erp.pos.PosSession"
                 in-map="[sessionId:txn.sessionId, lastActivityDate:ec.user.nowTimestamp]"/>
             <!-- Auto-sync this sale into a Sales Invoice (async; backlog job catches any miss) -->
@@ -870,12 +871,12 @@
                     in-map="[transactionId:transactionId, paymentMethod:upfrontMethod, amount:upfront, bypassModeRules:true]"/>
                 <if condition="ec.message.hasError()"><return/></if>
             </if>
-            <!-- Mint the bill number now, at completion, so abandoned carts never consume a number. -->
-            <service-call name="zenith.pos.PosServices.assign#BillNumber" in-map="[transactionId:transactionId]"/>
+            <set field="_completedAt" from="ec.user.nowTimestamp"/>
             <service-call name="update#zenith.erp.pos.PosTransaction"
-                in-map="[transactionId:transactionId, statusId:'PtCompleted', isCredit:'Y', completedDate:ec.user.nowTimestamp,
+                in-map="[transactionId:transactionId, statusId:'PtCompleted', isCredit:'Y', completedDate:_completedAt,
                          paidAmount:((txn.paidAmount ?: 0) as BigDecimal) + upfront, changeAmount:0, customerPartyId:custPartyId,
                          customerName:customerName, customerPhone:customerPhone]"/>
+            <service-call name="zenith.pos.PosServices.assign#BillNumber" in-map="[transactionId:transactionId]"/>
             <script>ec.service.async().name("zenith.pos.PosSyncServices.sync#PosTransactionInvoice").parameter("transactionId", transactionId).call()</script>
 
             <!-- A credit sale is still a sale: record its sales total once. The payment row,
@@ -1050,7 +1051,7 @@
                 receiptData = [
                     transactionNumber: txn.transactionNumber,
                     transactionType: txn.transactionType,
-                    date: txn.entryDate,
+                    date: txn.completedDate ?: txn.entryDate,
                     terminalName: terminal?.terminalName,
                     taxRegistrationNumber: terminal?.taxRegistrationNumber ?: "",
                     customerName: txn.customerName ?: "Walk-in Customer",
@@ -1674,7 +1675,7 @@
                         taxReg:rTpl?.taxRegistrationNumber ?: terminal?.taxRegistrationNumber ?: '',
                         headerText:rTpl?.headerText ?: '', footerText:rTpl?.footerText ?: '', termsText:rTpl?.termsText ?: ''],
                     bill:[number:txn.transactionNumber ?: txn.transactionId,
-                        date:ec.l10n.format(txn.entryDate, 'dd/MM/yyyy hh:mm a'),
+                        date:ec.l10n.format(txn.completedDate ?: txn.entryDate, 'dd/MM/yyyy hh:mm a'),
                         cashier:operatorName, customer:txn.customerName ?: 'Walk-In Customer',
                         customerPhone:txn.customerPhone ?: ''],
                     items:items.collect{[name:it.productName ?: it.productId ?: '', qty:it.quantity ?: 0,
