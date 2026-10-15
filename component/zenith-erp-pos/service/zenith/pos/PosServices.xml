@@ -221,7 +221,7 @@
         <in-parameters><parameter name="transactionId" required="true"/></in-parameters>
         <out-parameters><parameter name="transactionNumber"/></out-parameters>
         <actions>
-            <entity-find-one entity-name="zenith.erp.pos.PosTransaction" value-field="txn"/>
+            <entity-find-one entity-name="zenith.erp.pos.PosTransaction" value-field="txn" for-update="true"/>
             <if condition="!txn"><return error="true" message="Transaction not found"/></if>
             <if condition="txn.transactionNumber">
                 <set field="transactionNumber" from="txn.transactionNumber"/>
@@ -232,9 +232,13 @@
                 def billDayFormat = new java.text.SimpleDateFormat('yyyyMMdd')
                 billDayFormat.setTimeZone(java.util.TimeZone.getTimeZone('Asia/Kolkata'))
                 def billDay = billDayFormat.format(txn.completedDate ?: ec.user.nowTimestamp)
-                // Atomic per-(org, day) bill counter: an O(1) row-locked increment instead of a
-                // growing full-table count scan, and race-safe (two registers can never mint the same number).
-                def org = txn?.organizationPartyId ?: '_NA_'
+                // Serialize the first allocation as well as later increments. The organization row
+                // already exists, so it provides a stable lock before the day's counter row is created.
+                // No growing full-table count scan is needed after the first bill of the day.
+                def org = txn.organizationPartyId
+                if (!org || !ec.entity.find('mantle.party.Party').condition('partyId', org).forUpdate(true).one()) {
+                    throw new IllegalStateException('POS bill organization is missing')
+                }
                 def seqKey = org + "_" + billDay
                 def nextNum
                 def counter = ec.entity.find("zenith.erp.pos.PosBillSequence").condition("seqKey", seqKey).forUpdate(true).one()
@@ -251,14 +255,7 @@
                         if (m.find()) { int n = m.group(1) as int; if (n > mx) mx = n }
                     }
                     nextNum = mx + 1
-                    try {
-                        ec.service.sync().name("create#zenith.erp.pos.PosBillSequence").parameters([seqKey:seqKey, lastNumber:nextNum]).call()
-                    } catch (Exception e) {
-                        // concurrent first-bill for this key: another thread seeded it — re-read locked and increment
-                        def c2 = ec.entity.find("zenith.erp.pos.PosBillSequence").condition("seqKey", seqKey).forUpdate(true).one()
-                        nextNum = (((c2?.lastNumber ?: mx) as int)) + 1
-                        ec.service.sync().name("update#zenith.erp.pos.PosBillSequence").parameters([seqKey:seqKey, lastNumber:nextNum]).call()
-                    }
+                    ec.service.sync().name("create#zenith.erp.pos.PosBillSequence").parameters([seqKey:seqKey, lastNumber:nextNum]).call()
                 }
                 def seqNum = String.format("%05d", nextNum)
                 transactionNumber = "POS/${billDay}/${seqNum}"
