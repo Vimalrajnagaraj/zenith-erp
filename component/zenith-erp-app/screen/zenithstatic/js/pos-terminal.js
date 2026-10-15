@@ -558,10 +558,10 @@ window._posOffline = (function() {
             if (s.address) h += '<div class="c hdr">' + s.address + '</div>';
             if (isTax && s.taxReg) h += '<div class="c hdr">GSTIN: ' + s.taxReg + '</div>';
             h += '<div class="sep"></div>';
-            h += '<div class="c b" style="font-size:13px;margin:3px 0">' + (isTax ? 'TAX INVOICE' : 'RECEIPT') + '</div>';
+            h += '<div class="c b" style="font-size:13px;margin:3px 0">' + (isTax ? 'POS TAX RECEIPT' : 'RECEIPT') + '</div>';
             h += '<div class="c b" style="font-size:12px;margin:3px 0;border:1px dashed #000;padding:3px 2px">** EDITED / REVISED BILL **</div>';
             h += '<div class="c hdr" style="margin-bottom:2px">Reprinted after modification</div>';
-            h += '<table><tr><td class="hdr" style="width:30%">Bill No:</td><td class="b">' + (bi.number || '') + '</td></tr>';
+            h += '<table><tr><td class="hdr" style="width:30%">POS Bill No:</td><td class="b">' + (bi.number || '') + '</td></tr>';
             h += '<tr><td class="hdr">Date:</td><td>' + (bi.date || '') + '</td></tr>';
             h += '<tr><td class="hdr">Customer:</td><td>' + (bi.customer || 'Walk-In') + '</td></tr></table>';
             h += '<div class="sep2"></div>';
@@ -2052,6 +2052,75 @@ window.posToggleFullscreen = function() {
         var heldId = '';
         var heldCount = 0;
 
+        // A real cashier gesture or a completed bill resets the 60-minute idle clock.
+        // Polling and background rendering do not. The server sweep also handles closed tabs.
+        if (window.__posIdleCleanup) window.__posIdleCleanup();
+        var idleAbort = new AbortController();
+        var lastGestureAt = Date.now();
+        var lastTouchSentAt = 0;
+        var idleClosePending = false;
+        var lastDayCheckAt = 0;
+        var dayRefreshPending = false;
+        var dayBadge = document.getElementById('pos-today-bills');
+        var dayFormatter;
+        try { if (dayBadge) dayFormatter = new Intl.DateTimeFormat('en-US', {timeZone:dayBadge.dataset.timeZone,
+            year:'numeric',month:'2-digit',day:'2-digit'}); } catch (_) {}
+        function sendSessionTouch() {
+            if (!SI || Date.now() - lastTouchSentAt < 30000) return;
+            lastTouchSentAt = Date.now();
+            fetch('Terminal/touchSession', {method:'POST', credentials:'same-origin',
+                headers:{'Content-Type':'application/x-www-form-urlencoded'},
+                body:new URLSearchParams({sessionId:SI, moquiSessionToken:TK})}).catch(function(){});
+        }
+        function checkSessionIdle() {
+            if (!af.isConnected) return;
+            if (dayFormatter && Date.now() - lastDayCheckAt >= 60000) {
+                lastDayCheckAt = Date.now();
+                var parts = {};
+                dayFormatter.formatToParts(new Date()).forEach(function(p){ parts[p.type] = p.value; });
+                var currentDay = parts.year + parts.month + parts.day;
+                var countBadge = document.getElementById('pos-today-bills');
+                if (countBadge && countBadge.dataset.day !== currentDay && !dayRefreshPending) {
+                    dayRefreshPending = true;
+                    fetchScreen({}).then(syncIssuedBillHeader).catch(function(){}).finally(function(){dayRefreshPending = false;});
+                }
+            }
+            if (!af.isConnected || idleClosePending || Date.now() - lastGestureAt < 3600000) return;
+            idleClosePending = true;
+            fetch('Terminal/closeIdleSession', {method:'POST', credentials:'same-origin',
+                headers:{'Content-Type':'application/x-www-form-urlencoded'},
+                body:new URLSearchParams({sessionId:SI, moquiSessionToken:TK})})
+                .then(function(r){return r.json();})
+                .then(function(d){
+                    if (d.closed || d.reason === 'already_closed') {
+                        window.location.assign('/apps/zenith/pos/Terminal');
+                    } else if (d.reason === 'still_active') {
+                        // Another live tab or a completed bill refreshed server activity.
+                        lastGestureAt = Date.now();
+                        idleClosePending = false;
+                    } else {
+                        showToast('Session idle for an hour. Count the drawer and close it to finish reconciliation.', '#c62828');
+                        // Financial sessions stay open until a cashier verifies the actual cash amount.
+                    }
+                }).catch(function(){ idleClosePending = false; });
+        }
+        function onCashierGesture(e) {
+            if (!e.isTrusted || !af.isConnected) return;
+            if (Date.now() - lastGestureAt >= 3600000) { checkSessionIdle(); return; }
+            lastGestureAt = Date.now();
+            sendSessionTouch();
+        }
+        ['pointerdown','keydown','touchstart'].forEach(function(type) {
+            document.addEventListener(type,onCashierGesture,{capture:true,passive:true,signal:idleAbort.signal});
+        });
+        document.addEventListener('visibilitychange',function(){
+            if (!document.hidden) checkSessionIdle();
+        },{signal:idleAbort.signal});
+        var idleInterval = setInterval(checkSessionIdle,10000);
+        window.__posIdleCleanup = function(){ idleAbort.abort(); clearInterval(idleInterval); };
+        sendSessionTouch();
+
+
         function fmt(n) { return Math.round(Number(n)).toLocaleString('en-IN'); }
         function fmt2(n) { return Number(n).toLocaleString('en-IN', {minimumFractionDigits:2, maximumFractionDigits:2}); }
 
@@ -2517,7 +2586,7 @@ window.posToggleFullscreen = function() {
             if (isTax && s.taxReg) html += '<div class="c hdr">GSTIN: ' + s.taxReg + '</div>';
             html += '<div class="sep"></div>';
             if (isTax) {
-                html += '<div class="c b" style="font-size:13px;margin:3px 0">TAX INVOICE</div>';
+                html += '<div class="c b" style="font-size:13px;margin:3px 0">POS TAX RECEIPT</div>';
             } else {
                 html += '<div class="c b" style="font-size:13px;margin:3px 0">RECEIPT</div>';
             }
@@ -2525,7 +2594,7 @@ window.posToggleFullscreen = function() {
                 html += '<div class="c b" style="font-size:12px;margin:3px 0;border:1px dashed #000;padding:3px 2px">** EDITED / REVISED BILL **</div>';
                 html += '<div class="c hdr" style="margin-bottom:2px">Reprinted after modification</div>';
             }
-            html += '<table><tr><td class="hdr" style="width:30%">' + (isTax ? 'Invoice No:' : 'Bill No:') + '</td><td class="b">' + (bi.number||'') + '</td></tr>';
+            html += '<table><tr><td class="hdr" style="width:30%">POS Bill No:</td><td class="b">' + (bi.number||'') + '</td></tr>';
             html += '<tr><td class="hdr">Date:</td><td>' + (bi.date||'') + '</td></tr>';
             if (bi.cashier) html += '<tr><td class="hdr">Cashier:</td><td>' + bi.cashier + '</td></tr>';
             html += '<tr><td class="hdr">Customer:</td><td>' + (bi.customer||'Walk-In') + '</td></tr>';
@@ -2887,9 +2956,9 @@ window.posToggleFullscreen = function() {
             document.querySelectorAll('.pos-pay-form input[name="transactionId"]').forEach(function(el) { el.value = TX; });
             var bn = document.getElementById('pos-bill-badge');
             if (bn) {
-                bn.textContent = d.txnNum || 'Pending';
-                bn.title = d.txnNum ? 'Issued bill number' : 'Bill number is assigned when payment completes';
-                bn.classList.toggle('nb-billno__new', !d.txnNum);
+                if (d.txnNum) bn.dataset.lastBill = d.txnNum;
+                bn.textContent = bn.dataset.lastBill || '—';
+                bn.classList.toggle('nb-billno__new', !bn.dataset.lastBill);
             }
             lastTxnNum = d.txnNum || '';
             lastPay = d.pay || 0;
@@ -2897,6 +2966,22 @@ window.posToggleFullscreen = function() {
             // Keep the header customer chip in sync with the authoritative cart
             var _cn = document.getElementById('pos-cust-name');
             if (_cn) _cn.textContent = (d.customer && d.customer.length) ? d.customer : 'Walk-In';
+        }
+
+        function syncIssuedBillHeader(doc) {
+            var sourceBill = doc.querySelector('#pos-bill-badge');
+            var bill = document.getElementById('pos-bill-badge');
+            if (sourceBill && bill) {
+                bill.dataset.lastBill = sourceBill.dataset.lastBill || '';
+                bill.textContent = sourceBill.textContent;
+                bill.classList.toggle('nb-billno__new', !bill.dataset.lastBill);
+            }
+            var sourceCount = doc.querySelector('#pos-today-bills');
+            var count = document.getElementById('pos-today-bills');
+            if (sourceCount && count) {
+                count.textContent = sourceCount.textContent;
+                count.dataset.day = sourceCount.dataset.day;
+            }
         }
 
         /* ============================================================
@@ -3217,7 +3302,7 @@ window.posToggleFullscreen = function() {
             loadingMore = true;
             more.disabled = true;
             var offset = Number(more.dataset.nextOffset);
-            var input = document.querySelector('.pos-search-bar input[name="searchTerm"]');
+            var input = document.getElementById('cartInlineSearch');
             var term = input ? input.value.trim() : '';
             var cat = CATID;
             fetchScreen({productOffset: offset, searchTerm: term, catId: term ? '' : cat})
@@ -3263,8 +3348,6 @@ window.posToggleFullscreen = function() {
         }, true);
 
         /* --- Product Grid Search: AJAX --- */
-        var sf = document.querySelector('.pos-search-bar form');
-        var gridSearchTimer;
         window._gridSearch = function(term) {
             var grid = document.querySelector('.pos-product-grid');
             if (grid) { grid.style.opacity = '0.4'; grid.style.pointerEvents = 'none'; }
@@ -3274,25 +3357,6 @@ window.posToggleFullscreen = function() {
                 if (grid) grid.style.pointerEvents = '';
             });
         };
-        if (sf) {
-            var si = sf.querySelector('input[name="searchTerm"]');
-            if (si) {
-                function doSearch() { window._gridSearch(si.value.trim()); }
-                sf.addEventListener('submit', function(e) { e.preventDefault(); clearTimeout(gridSearchTimer); doSearch(); });
-                si.addEventListener('input', function() {
-                    clearTimeout(gridSearchTimer);
-                    gridSearchTimer = setTimeout(doSearch, 600);
-                    if (si.dataset.syncing) return;
-                    var cartInput = document.getElementById('cartInlineSearch');
-                    if (cartInput && cartInput.value !== si.value) {
-                        cartInput.dataset.syncing = '1';
-                        cartInput.value = si.value;
-                        cartInput.dispatchEvent(new Event('input', {bubbles: true}));
-                        setTimeout(function() { delete cartInput.dataset.syncing; }, 50);
-                    }
-                });
-            }
-        }
 
         /* --- Category strip: AJAX. ZE-POS-0204: ALL ITEMS used to grey-out the grid (opacity 0.4 +
            pointer-events none) until a FULL page re-fetch of every tile returned — a 5-10s freeze on
@@ -3313,7 +3377,7 @@ window.posToggleFullscreen = function() {
                 document.querySelectorAll('.pos-cat-strip a').forEach(function(a) { a.style.background = '#455a64'; });
                 this.style.background = '#7C3AED';
                 var grid = document.querySelector('.pos-product-grid');
-                var searchInput = document.querySelector('.pos-search-bar input[name="searchTerm"]');
+                var searchInput = document.getElementById('cartInlineSearch');
                 if (searchInput) searchInput.value = '';
                 if (newCatId === '' && __allGridCache && grid) {
                     grid.innerHTML = __allGridCache;   // instant — the till never waits on the network
@@ -3627,7 +3691,6 @@ window.posToggleFullscreen = function() {
                 fd.set('wantJson', '1'); // get the print-receipt data back in the same response
                 var method = fd.get('paymentMethod') || 'Cash';
                 var paidAmt = fd.get('amount') || '0';
-                var billNum = lastTxnNum || '';
                 var savedTx = TX;
                 var btn = form.querySelector('button');
                 if (btn) { btn.disabled = true; btn.style.opacity = '0.6'; }
@@ -3635,7 +3698,8 @@ window.posToggleFullscreen = function() {
                     .then(function(r) { return r.json().catch(function() { return {success:false, error:'Payment failed'}; }); })
                     .then(function(d) {
                         if (!d || !d.success) throw new Error((d && d.error) || 'Payment failed');
-                        showToast('✔ Sale Complete — BILL-' + billNum + ' — ' + CS + fmt(paidAmt) + ' ' + method.toUpperCase());
+                        var billNum = d.bill && d.bill.number || '';
+                        showToast('✔ Sale Complete' + (billNum ? ' — ' + billNum : '') + ' — ' + CS + fmt(paidAmt) + ' ' + method.toUpperCase());
                         printReceipt(savedTx, billNum, TO, false, d.receiptUnavailable ? null : d);
                         TX = '';
                         lastTxnNum = '';
@@ -3651,6 +3715,7 @@ window.posToggleFullscreen = function() {
                         var ntk = doc.querySelector('input[name="moquiSessionToken"]');
                         if (ntk && ntk.value) TK = ntk.value;
                         swapGrid(doc);
+                        syncIssuedBillHeader(doc);
                         var nb = doc.querySelector('.pos-cart tbody');
                         if (nb) document.querySelector('.pos-cart tbody').innerHTML = nb.innerHTML;
                         var ns = doc.querySelector('.pos-summary');
@@ -3682,7 +3747,6 @@ window.posToggleFullscreen = function() {
                 if (cAmt > 0) splitParts.push(CS + fmt(cAmt) + ' Cash');
                 if (dAmt > 0) splitParts.push(CS + fmt(dAmt) + ' Card');
                 if (uAmt > 0) splitParts.push(CS + fmt(uAmt) + ' UPI');
-                var billNum = lastTxnNum || '';
                 var savedTx = TX;
                 var btn = form.querySelector('button[type="submit"]');
                 if (btn) { btn.disabled = true; btn.style.opacity = '0.6'; btn.textContent = 'Processing...'; }
@@ -3690,7 +3754,8 @@ window.posToggleFullscreen = function() {
                     .then(function(r) { return r.json().catch(function() { return {success:false, error:'Split payment failed'}; }); })
                     .then(function(d) {
                         if (!d || !d.success) throw new Error((d && d.error) || 'Split payment failed');
-                        showToast('✔ Sale Complete — BILL-' + billNum + ' — ' + splitParts.join(' + '));
+                        var billNum = d.bill && d.bill.number || '';
+                        showToast('✔ Sale Complete' + (billNum ? ' — ' + billNum : '') + ' — ' + splitParts.join(' + '));
                         printReceipt(savedTx, billNum, TO, false, d.receiptUnavailable ? null : d);
                         TX = '';
                         lastTxnNum = '';
@@ -3708,6 +3773,7 @@ window.posToggleFullscreen = function() {
                         var ntk = doc.querySelector('input[name="moquiSessionToken"]');
                         if (ntk && ntk.value) TK = ntk.value;
                         swapGrid(doc);
+                        syncIssuedBillHeader(doc);
                         var nb = doc.querySelector('.pos-cart tbody');
                         if (nb) document.querySelector('.pos-cart tbody').innerHTML = nb.innerHTML;
                         var ns = doc.querySelector('.pos-summary');
@@ -3867,17 +3933,9 @@ window.posToggleFullscreen = function() {
         si.addEventListener('keydown', function(e) { if (e.key && e.key.length === 1) { keyTimes.push(Date.now()); if (keyTimes.length > 30) keyTimes.shift(); } });  /* ZE-BC-090: was 'keypress' (deprecated + fires unreliably for HID input in Safari/Edge); keydown fires consistently — track printable keys only. */
         si.addEventListener('input', function() {
             var t = this.value.trim(); clearTimeout(dt); aidx = -1;
-            if (!si.dataset.syncing) {
-                var gridInput = document.querySelector('.pos-search-bar input[name="searchTerm"]');
-                if (gridInput && gridInput.value !== si.value) {
-                    gridInput.dataset.syncing = '1';
-                    gridInput.value = si.value;
-                    setTimeout(function() { delete gridInput.dataset.syncing; }, 50);
-                    if (window._gridSearch) {
-                        clearTimeout(window._gridSyncTimer);
-                        window._gridSyncTimer = setTimeout(function() { window._gridSearch(si.value.trim()); }, 600);
-                    }
-                }
+            if (window._gridSearch) {
+                clearTimeout(window._gridSyncTimer);
+                window._gridSyncTimer = setTimeout(function() { window._gridSearch(si.value.trim()); }, 600);
             }
             if (t.length < 1) { dd.style.display = 'none'; return; }
             dt = setTimeout(function() {
@@ -3919,8 +3977,6 @@ window.posToggleFullscreen = function() {
                     if (window._posAjax) window._posAjax(items[0].dataset.pid, items[0].dataset.price, items[0].dataset.name);
                 }
                 dd.style.display = 'none'; si.value = ''; si.focus();
-                var gi = document.querySelector('.pos-search-bar input[name="searchTerm"]');
-                if (gi) gi.value = '';
                 if (window._gridSearch) window._gridSearch('');
                 keyTimes = [];
             }
@@ -3933,8 +3989,6 @@ window.posToggleFullscreen = function() {
             if (window._posAjax) {
                 window._posAjax(item.dataset.pid, item.dataset.price, item.dataset.name);
                 dd.style.display = 'none'; si.value = ''; si.focus();
-                var gi = document.querySelector('.pos-search-bar input[name="searchTerm"]');
-                if (gi) gi.value = '';
                 if (window._gridSearch) window._gridSearch('');
                 return;
             }

@@ -1776,6 +1776,25 @@
 
 
 
+    <transition name="touchSession" begin-transaction="true">
+        <actions>
+            <service-call name="zenith.pos.PosServices.touch#PosSessionActivity" in-map="[sessionId:sessionId]" out-map="_touch"/>
+            <script>ec.web.sendJsonResponse([open:_touch.open ?: false, success:!ec.message.hasError()])</script>
+        </actions>
+        <default-response type="none"/>
+    </transition>
+
+    <transition name="closeIdleSession" begin-transaction="true">
+        <actions>
+            <service-call name="zenith.pos.PosAccessServices.assert#PosAccess" in-map="[sessionId:sessionId]" out-map="_idleAccess"/>
+            <if condition="!_idleAccess.allowed"><return/></if>
+            <service-call name="zenith.pos.PosServices.close#IdlePosSession" in-map="[sessionId:sessionId]" out-map="_idleClose"/>
+            <script>ec.web.sendJsonResponse([closed:_idleClose.closed ?: false, reason:_idleClose.reason])</script>
+        </actions>
+        <default-response type="none"/>
+    </transition>
+
+
     <transition name="ajaxCart" begin-transaction="true">
 
 
@@ -3853,6 +3872,31 @@ gridNextOffset = gridOffset + gridProducts.size()
 
             }
 
+            // Count completed bills by completion time, including legacy FY-numbered bills issued
+            // earlier on the migration day. India business time is shared by every cashier.
+            def _billDay = java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone('Asia/Kolkata'))
+            _billDay.setTime(ec.user.nowTimestamp)
+            def _billDayFmt = new java.text.SimpleDateFormat('yyyyMMdd')
+            _billDayFmt.setTimeZone(java.util.TimeZone.getTimeZone('Asia/Kolkata'))
+            billDayKey = _billDayFmt.format(ec.user.nowTimestamp)
+            _billDay.set(java.util.Calendar.HOUR_OF_DAY, 0)
+            _billDay.set(java.util.Calendar.MINUTE, 0)
+            _billDay.set(java.util.Calendar.SECOND, 0)
+            _billDay.set(java.util.Calendar.MILLISECOND, 0)
+            def _billStart = new java.sql.Timestamp(_billDay.getTimeInMillis())
+            _billDay.add(java.util.Calendar.DATE, 1)
+            def _billEnd = new java.sql.Timestamp(_billDay.getTimeInMillis())
+            def _billDayQuery = ec.entity.find('zenith.erp.pos.PosTransaction')
+                .condition('organizationPartyId', posOrg).condition('statusId', 'PtCompleted')
+                .condition('completedDate', org.moqui.entity.EntityCondition.GREATER_THAN_EQUAL_TO, _billStart)
+                .condition('completedDate', org.moqui.entity.EntityCondition.LESS_THAN, _billEnd)
+            todayBillCount = _billDayQuery.count()
+            latestIssuedBillNo = ec.entity.find('zenith.erp.pos.PosTransaction')
+                .condition('organizationPartyId', posOrg).condition('statusId', 'PtCompleted')
+                .condition('completedDate', org.moqui.entity.EntityCondition.GREATER_THAN_EQUAL_TO, _billStart)
+                .condition('completedDate', org.moqui.entity.EntityCondition.LESS_THAN, _billEnd)
+                .orderBy('-completedDate').limit(1).one()?.transactionNumber ?: ''
+
 
 
 
@@ -5695,6 +5739,33 @@ body.Terminal:not(.pos-mode-normal) .pos-product-grid button div[style*="#e53935
   body.Terminal.pos-mode-normal .z-pos-page #pos-terminal-root .nb-footer .pos-summary > .pos-sum-total > span:first-child{font-size:20px!important}
   body.Terminal.pos-mode-normal .z-pos-page #pos-terminal-root .nb-footer .pos-summary > .pos-sum-total > span:last-child{padding:7px 20px!important;font-size:24px!important}
 }
+/* One predictable product-card track size prevents the intrinsic-size placeholder from
+   drawing cards over the next row when a long product name wraps. */
+body.Terminal .pos-product-grid{
+  grid-template-columns:repeat(auto-fill,minmax(min(100%,156px),1fr))!important;
+  grid-auto-rows:minmax(104px,auto)!important;
+  align-content:start!important;
+}
+body.Terminal .pos-product-grid button[type="submit"]{
+  box-sizing:border-box!important;width:100%!important;min-width:0!important;
+  min-height:104px!important;height:100%!important;overflow:hidden!important;
+  content-visibility:visible!important;contain:none!important;
+}
+body.Terminal .pos-product-grid button[type="submit"] div:first-child{
+  white-space:normal!important;overflow-wrap:anywhere!important;overflow:hidden!important;
+  display:-webkit-box!important;-webkit-box-orient:vertical!important;-webkit-line-clamp:2;
+  line-height:1.25!important;flex-shrink:1!important;
+}
+@media(max-width:768px){body.Terminal .pos-product-grid{grid-template-columns:repeat(auto-fill,minmax(min(100%,120px),1fr))!important}}
+body.Terminal .nb-header .nb-power{
+  width:auto!important;height:40px!important;min-height:40px!important;
+  padding:0 12px!important;gap:6px!important;border-radius:8px!important;
+  background:#fff!important;color:#374151!important;border:1px solid #D1D5DB!important;
+  box-shadow:none!important;font-size:13px!important;font-weight:600!important;white-space:nowrap;
+}
+body.Terminal .nb-header .nb-power svg{width:17px;height:17px}
+body.Terminal .nb-today-bills{font-size:12px!important;color:#4B5563!important}
+body.Terminal .nb-today-bills strong{color:#4F46E5}
 
 </style>
 <div id="pos-terminal-root" style="display:flex;flex-direction:column;overflow:hidden">
@@ -5718,7 +5789,8 @@ body.Terminal:not(.pos-mode-normal) .pos-product-grid button div[style*="#e53935
     <span class="nb-meta"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2v4"/><path d="M16 2v4"/><rect width="18" height="18" x="3" y="4" rx="2"/><path d="M3 10h18"/></svg><span>${dispDate!''}</span></span>
     <span class="nb-meta"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg><span id="nb-clock">${dispTime!''}</span></span>
     <span class="nb-meta"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="16" height="20" x="4" y="2" rx="2"/><line x1="8" x2="16" y1="6" y2="6"/><line x1="16" x2="16" y1="14" y2="18"/><path d="M12 10h.01"/><path d="M8 10h.01"/><path d="M8 14h.01"/></svg><span>#${(terminal.terminalId)!(sessionId!'')}</span></span>
-    <span class="nb-billno"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M16 13H8"/><path d="M16 17H8"/></svg><span class="nb-billno__lbl">Bill No.</span><#if (txn.transactionNumber)?? && txn.transactionNumber?has_content><span id="pos-bill-badge" class="nb-billno__val">${txn.transactionNumber}</span><#else><span id="pos-bill-badge" class="nb-billno__val nb-billno__new" title="Bill number is assigned when payment completes">Pending</span></#if></span>
+    <span class="nb-billno"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M16 13H8"/><path d="M16 17H8"/></svg><span class="nb-billno__lbl">Last bill</span><span id="pos-bill-badge" class="nb-billno__val<#if !(latestIssuedBillNo!'')?has_content> nb-billno__new</#if>" data-last-bill="${(latestIssuedBillNo!'')?html}" title="POS bill number is assigned on completed payment; invoice numbering is separate">${((latestIssuedBillNo!'')?has_content)?then(latestIssuedBillNo, '—')}</span></span>
+    <span class="nb-meta nb-today-bills" title="Completed POS bills today across this shop (India time)">Today: <strong id="pos-today-bills" data-day="${billDayKey}" data-time-zone="Asia/Kolkata">${todayBillCount!0}</strong> bills</span>
 
     <span class="nb-hspace"></span>
 
@@ -5740,7 +5812,7 @@ body.Terminal:not(.pos-mode-normal) .pos-product-grid button div[style*="#e53935
 
     <span class="nb-cashier" title="Logged-in cashier"><#assign _cn = (ec.user.userAccount.userFullName)!'Cashier'/><span class="nb-cashier__av">${(_cn?length > 0)?then(_cn?substring(0,1)?upper_case,'C')}</span><span class="nb-cashier__nm">${_cn}</span></span>
 
-    <form method="post" action="Terminal/closeSession" style="display:inline;margin:0"><input type="hidden" name="sessionId" value="${sessionId!''}"/><input type="hidden" name="closingCash" value="0"/><input type="hidden" name="moquiSessionToken" value="${ec.web.sessionToken}"/><button type="submit" class="nb-power" title="Close session / log out"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v10"/><path d="M18.4 6.6a9 9 0 1 1-12.77.04"/></svg></button></form>
+    <form method="post" action="Terminal/closeSession" style="display:inline;margin:0"><input type="hidden" name="sessionId" value="${sessionId!''}"/><input type="hidden" name="closingCash" value="0"/><input type="hidden" name="moquiSessionToken" value="${ec.web.sessionToken}"/><button type="submit" class="nb-power" title="Review cash and close this POS session" aria-label="Review cash and close session"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9h10M7 13h7"/></svg><span>Close session</span></button></form>
   </div>
 </div>
 
@@ -5758,7 +5830,6 @@ body.Terminal:not(.pos-mode-normal) .pos-product-grid button div[style*="#e53935
     <button type="submit" class="nb-toggle<#if (taxOn!'N') == 'Y'> on</#if>" title="Toggle tax on/off" aria-label="Toggle tax"><span class="nb-toggle__knob"></span></button>
   </form>
 
-  <a href="CreditBills" class="nb-abtn nb-abtn--credit" title="Credit / Outstanding Bills"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 22h2a2 2 0 0 0 2-2V7l-5-5H6a2 2 0 0 0-2 2v3"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><circle cx="8" cy="16" r="6"/><path d="M9.5 17.5 8 16.25V14"/></svg><span>Credit Bills</span></a>
 
   <span id="pos-held-wrap" class="nb-held"><#if heldTxns?? && (heldTxns?size > 0)>
     <details class="nb-held__d">
@@ -5787,14 +5858,11 @@ body.Terminal:not(.pos-mode-normal) .pos-product-grid button div[style*="#e53935
 
   
 
-  <button type="button" id="posHelpBtn_terminal" class="nb-abtn nb-abtn--icon" title="Billing help" aria-label="Billing help" onclick="document.getElementById('posHelp_terminal').style.display='block';this.style.display='none';try{localStorage.removeItem('posHelpHide_terminal')}catch(e){}">?</button>
   <button id="posFullscreenBtn" onclick="posToggleFocus()" class="nb-abtn nb-abtn--icon" title="Full-screen billing — toggle"><span id="fsBtnIcon">&#x26F6;</span></button>
 </div>
 
 
-<img src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" alt="" style="display:none" onload="try{if(location.pathname.indexOf('/qapps/')===0){location.replace(location.href.replace('/qapps/','/apps/'));}}catch(e){}"/><div id="posHelp_terminal" style="display:none;position:relative;margin:6px 8px 0;z-index:1;background:#e8f0fe;border:1px solid #4285f4;border-left:6px solid #1a73e8;border-radius:10px;padding:10px 14px;box-shadow:0 6px 18px rgba(0,0,0,0.2);font-family:'Segoe UI',Arial,sans-serif"><div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px"><div style="min-width:0"><div style="font-weight:800;font-size:14px;color:#174ea6;margin-bottom:4px">&#128161; Billing Terminal &mdash; quick start</div><div style="font-size:13px;color:#202124;line-height:1.8"><b>1</b>&nbsp;In Advanced billing, tap a product. In either layout, <b>scan its barcode</b> or press <b>/</b> to search by name or code. A scanner gun works in the product search box; an unknown code shows &lsquo;Product not found&rsquo;.<br><b>2</b>&nbsp;Change quantity with <b>+</b> / <b>&#8722;</b> (or pick a line and type the number).<br><b>3</b>&nbsp;Take payment &mdash; <b>F1</b>&nbsp;Cash &middot; <b>F2</b>&nbsp;Card &middot; <b>F3</b>&nbsp;UPI &middot; <b>F4</b>&nbsp;Split.<br><b>4</b>&nbsp;<b>F10</b> new sale &middot; <b>F7</b> hold &middot; <b>F8</b> void &middot; <b>F9</b> history. <span style="color:#5f6368">The full key list is in the blue bar under the cart.</span></div></div><button type="button" onclick="document.getElementById('posHelp_terminal').style.display='none';document.getElementById('posHelpBtn_terminal').style.display='flex';try{localStorage.setItem('posHelpHide_terminal','1')}catch(e){}" style="flex-shrink:0;background:#1a73e8;color:#fff;border:none;border-radius:8px;padding:8px 14px;font-size:13px;font-weight:700;cursor:pointer;white-space:nowrap">Got it &#10005;</button></div></div><img src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" alt="" style="display:none" onload="try{if(localStorage.getItem('posHelpHide_terminal')){var e=document.getElementById('posHelp_terminal');if(e)e.style.display='none';var b=document.getElementById('posHelpBtn_terminal');if(b)b.style.display='flex';}}catch(e){}"/>
-
-<div class="pos-main-layout" style="display:flex;flex:1;min-height:0;gap:0;font-family:'Segoe UI',Arial,sans-serif;overflow:hidden">
+<img src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" alt="" style="display:none" onload="try{if(location.pathname.indexOf('/qapps/')===0){location.replace(location.href.replace('/qapps/','/apps/'));}}catch(e){}"/><div class="pos-main-layout" style="display:flex;flex:1;min-height:0;gap:0;font-family:'Segoe UI',Arial,sans-serif;overflow:hidden">
 
 
 
@@ -5843,54 +5911,6 @@ body.Terminal:not(.pos-mode-normal) .pos-product-grid button div[style*="#e53935
 
 
             </#if>
-
-
-
-        </div>
-
-
-
-
-
-
-
-        <!-- Search Bar -->
-
-
-
-        <div class="pos-search-bar" style="padding:6px 10px;background:#eceff1;flex-shrink:0">
-
-
-
-            <form method="get" action="Terminal/searchProducts" style="display:flex;gap:6px;margin:0">
-
-
-
-                <input type="hidden" name="sessionId" value="${sessionId!''}"/>
-
-
-
-                <input type="hidden" name="transactionId" value="${transactionId!''}"/>
-
-
-
-                <input type="hidden" name="catId" value="${catId!''}"/>
-
-
-
-                <input type="hidden" name="taxOn" value="${taxOn!'N'}"/>
-
-
-
-                <input type="hidden" name="salesModeId" value="${salesModeId!''}"/>
-
-
-
-                <input type="text" name="searchTerm" placeholder="Search products..." value="${searchTerm!''}" style="flex:1;padding:12px 16px;border:2px solid #bbb;border-radius:8px;font-size:16px;box-sizing:border-box;outline:none;color:#333;background:#fff"/>
-
-
-
-            </form>
 
 
 
@@ -8094,7 +8114,7 @@ window.numpadQty=function() { /* qty override for next add */ };
 
 
 
-        if(bn){ bn.textContent=d.txnNum||'Pending'; bn.title=d.txnNum?'Issued bill number':'Bill number is assigned when payment completes'; bn.classList.toggle('nb-billno__new',!d.txnNum); }
+        if(bn){ if(d.txnNum) bn.dataset.lastBill=d.txnNum; bn.textContent=bn.dataset.lastBill||'—'; bn.classList.toggle('nb-billno__new',!bn.dataset.lastBill); }
 
 
 
@@ -8423,58 +8443,6 @@ window.numpadQty=function() { /* qty override for next add */ };
                 if(ng){ var g2=document.querySelector('.pos-product-grid'); if(g2) g2.innerHTML=ng.innerHTML; if(isAll) __posAllGrid=ng.innerHTML; }
             });
         });
-    });
-
-
-
-
-
-
-
-    /* Search bar: AJAX */
-
-
-
-    var sf=document.querySelector('.pos-search-bar form');
-
-
-
-    if(sf) sf.addEventListener('submit',function(e){
-
-
-
-        e.preventDefault();
-
-
-
-        var fd=new FormData(this);
-
-
-
-        var qs=new URLSearchParams(fd).toString();
-
-
-
-        fetch('Terminal/searchProducts?'+qs,{credentials:'same-origin'}).then(function(r){return r.text()}).then(function(html){
-
-
-
-            var p=new DOMParser(),doc=p.parseFromString(html,'text/html');
-
-
-
-            var ng=doc.querySelector('.pos-product-grid');
-
-
-
-            if(ng) document.querySelector('.pos-product-grid').innerHTML=ng.innerHTML;
-
-
-
-        });
-
-
-
     });
 
 
