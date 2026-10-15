@@ -24,7 +24,7 @@
             <if condition="existingOpen">
                 <entity-find-count entity-name="zenith.erp.pos.PosTransaction" count-field="_exTxnCount"><econdition field-name="sessionId" from="existingOpen[0].sessionId"/><econdition field-name="statusId" value="PtCompleted"/></entity-find-count>
                 <service-call name="zenith.pos.PosServices.check#PosSessionRetirement" in-map="[sessionId:existingOpen[0].sessionId]" out-map="_retirement"/>
-                <if condition="_retirement.hasUnfinishedMoney || _retirement.hasHeldSales"><return error="true" message="Resolve the recorded payments and held bills in this session before reopening it."/></if>
+                <if condition="_retirement.hasUnfinishedMoney || _retirement.hasHeldSales || _retirement.hasUnreviewedDrawer"><return error="true" message="Review this session's recorded payments, returns, or cash movements before reopening the terminal."/></if>
                 <if condition="_exTxnCount &gt; 0">
                     <return error="true" message="This terminal already has an active session with sales recorded. Please close that session before opening a new one."/>
                 </if>
@@ -57,7 +57,7 @@
                         def soldCount = ec.entity.find("zenith.erp.pos.PosTransaction")
                             .condition("sessionId", os.sessionId).condition("statusId", "PtCompleted").count()
                         def retirement = ec.service.sync().name("zenith.pos.PosServices.check#PosSessionRetirement").parameter("sessionId",os.sessionId).call()
-                        if (soldCount == 0 && !retirement.hasUnfinishedMoney && !retirement.hasHeldSales) {
+                        if (soldCount == 0 && !retirement.hasUnfinishedMoney && !retirement.hasHeldSales && !retirement.hasUnreviewedDrawer) {
                             ec.entity.find("zenith.erp.pos.PosTransaction").condition("sessionId", os.sessionId).condition("statusId", "PtCreated").list().each { st ->
                                 ec.entity.find("zenith.erp.pos.PosTransactionItem").condition("transactionId", st.transactionId).deleteAll()
                                 ec.entity.find("zenith.erp.pos.PosPayment").condition("transactionId", st.transactionId).deleteAll()
@@ -140,7 +140,7 @@
     </service>
 
     <!-- Close an idle drawer without inventing a cash count. Completed sales and their tenders
-         remain recorded for later review. A held bill or partially paid cart still needs the cashier. -->
+         remain recorded for later review. Held/partially paid carts and refunds still need a cashier. -->
     <service verb="close" noun="IdlePosSession" authenticate="anonymous-all">
         <in-parameters><parameter name="sessionId" required="true"/></in-parameters>
         <out-parameters><parameter name="closed" type="Boolean"/><parameter name="reason"/></out-parameters>
@@ -158,6 +158,12 @@
                 if (txns.any { it.statusId == 'PtHeld' || !['PtCreated','PtCompleted','PtVoided'].contains(it.statusId) }) return
                 if (txns.findAll { it.statusId == 'PtCreated' }.any { it.transactionNumber || ((it.paidAmount ?: 0) as BigDecimal) > 0 ||
                     ec.entity.find('zenith.erp.pos.PosPayment').condition('transactionId',it.transactionId).count() > 0 }) return
+                // Existing cash reconciliation does not net cash refunds or paid voids. Require
+                // a cashier to review those shifts instead of presenting a misleading variance.
+                if (txns.findAll { it.statusId == 'PtVoided' }.any { it.transactionNumber || ((it.paidAmount ?: 0) as BigDecimal) > 0 ||
+                    ec.entity.find('zenith.erp.pos.PosPayment').condition('transactionId',it.transactionId).count() > 0 }) return
+                def returns = ec.entity.find('zenith.erp.pos.PosReturn').condition('sessionId',sessionId).list()
+                if (returns.any { it.statusId != 'PrCancelled' && (it.statusId != 'PrCompleted' || !it.refundMethod || it.refundMethod == 'Cash') }) return
                 if (ec.entity.find('zenith.erp.pos.PosHeldTransaction').condition('sessionId',sessionId).condition('statusId','PhHeld').count()) return
                 txns.findAll { it.statusId == 'PtCreated' }.each { st ->
                     ec.entity.find('zenith.erp.pos.PosTransactionItem').condition('transactionId',st.transactionId).deleteAll()
@@ -167,7 +173,7 @@
                 sess.statusId = 'PsClosed'
                 sess.closeDate = ec.user.nowTimestamp
                 sess.closeReason = 'IdleUnverifiedCash'
-                // Bills, tenders, returns and movements are retained. The cash count, expected
+                // Bills, tenders and movements are retained. The cash count, expected
                 // balance and difference remain null until an authorized person reviews them.
                 sess.update()
                 closed = true
@@ -2280,7 +2286,8 @@
     <!-- An abandoned cart has neither a recorded tender nor an issued number. Never infer that from status alone. -->
     <service verb="check" noun="PosSessionRetirement">
         <in-parameters><parameter name="sessionId" required="true"/></in-parameters>
-        <out-parameters><parameter name="hasUnfinishedMoney" type="Boolean"/><parameter name="hasHeldSales" type="Boolean"/></out-parameters>
+        <out-parameters><parameter name="hasUnfinishedMoney" type="Boolean"/><parameter name="hasHeldSales" type="Boolean"/>
+            <parameter name="hasUnreviewedDrawer" type="Boolean"/></out-parameters>
         <actions>
             <service-call name="zenith.pos.PosAccessServices.assert#PosAccess" in-map="[sessionId:sessionId]" out-map="_retireAccess"/>
             <if condition="!_retireAccess.allowed"><return/></if>
@@ -2290,6 +2297,12 @@
                 hasUnfinishedMoney = carts.any { cart -> cart.transactionNumber || ((cart.paidAmount ?: 0) > 0) ||
                     ec.entity.find('zenith.erp.pos.PosPayment').condition('transactionId',cart.transactionId).count() > 0 }
                 hasHeldSales = ec.entity.find('zenith.erp.pos.PosHeldTransaction').condition('sessionId',sessionId).condition('statusId','PhHeld').count() > 0
+                def returns = ec.entity.find('zenith.erp.pos.PosReturn').condition('sessionId',sessionId).list()
+                def paidVoid = ec.entity.find('zenith.erp.pos.PosTransaction').condition('sessionId',sessionId).condition('statusId','PtVoided').list().any { cart ->
+                    cart.transactionNumber || ((cart.paidAmount ?: 0) > 0) || ec.entity.find('zenith.erp.pos.PosPayment').condition('transactionId',cart.transactionId).count() > 0 }
+                hasUnreviewedDrawer = paidVoid || returns.any { it.statusId != 'PrCancelled' } ||
+                    ec.entity.find('zenith.erp.pos.PosCashEntry').condition('sessionId',sessionId).count() > 0 ||
+                    ec.entity.find('zenith.erp.pos.PosCashManagement').condition('sessionId',sessionId).count() > 0
             ]]></script>
         </actions>
     </service>
