@@ -90,7 +90,7 @@
         <actions>
             <service-call name="zenith.pos.PosAccessServices.assert#PosAccess" out-map="_posAccess" in-map="[sessionId:sessionId]"/>
             <if condition="!_posAccess.allowed"><return/></if>
-            <entity-find-one entity-name="zenith.erp.pos.PosSession" value-field="session"/>
+            <entity-find-one entity-name="zenith.erp.pos.PosSession" value-field="session" for-update="true"/>
             <if condition="!session">
                 <return error="true" message="Session not found"/></if>
             <!-- Idempotent close: if the session is already closed (CLOSE double-submitted, a stale terminal
@@ -139,8 +139,8 @@
         </actions>
     </service>
 
-    <!-- Auto-close only a never-paid, unnumbered, sale-free drawer. Existing sessions have a
-         null lastActivityDate and are deliberately excluded. Cash remains uncounted. -->
+    <!-- Close an idle drawer without inventing a cash count. Completed sales and their tenders
+         remain recorded for later review. A held bill or partially paid cart still needs the cashier. -->
     <service verb="close" noun="IdlePosSession" authenticate="anonymous-all">
         <in-parameters><parameter name="sessionId" required="true"/></in-parameters>
         <out-parameters><parameter name="closed" type="Boolean"/><parameter name="reason"/></out-parameters>
@@ -153,13 +153,12 @@
                 if (!sess || sess.statusId != 'PsOpen') { reason = 'already_closed'; return }
                 def last = sess.lastActivityDate
                 if (!last || last.time > ec.user.nowTimestamp.time - 3600000L) { reason = 'still_active'; return }
-                def txns = ec.entity.find('zenith.erp.pos.PosTransaction').condition('sessionId',sessionId).list()
-                if (txns.any { it.statusId in ['PtCompleted','PtHeld'] || it.transactionNumber || ((it.paidAmount ?: 0) as BigDecimal) > 0 }) return
-                if (txns.any { ec.entity.find('zenith.erp.pos.PosPayment').condition('transactionId',it.transactionId).count() > 0 }) return
+                def txns = ec.entity.find('zenith.erp.pos.PosTransaction').condition('sessionId',sessionId)
+                    .orderBy('transactionId').forUpdate(true).list()
+                if (txns.any { it.statusId == 'PtHeld' || !['PtCreated','PtCompleted','PtVoided'].contains(it.statusId) }) return
+                if (txns.findAll { it.statusId == 'PtCreated' }.any { it.transactionNumber || ((it.paidAmount ?: 0) as BigDecimal) > 0 ||
+                    ec.entity.find('zenith.erp.pos.PosPayment').condition('transactionId',it.transactionId).count() > 0 }) return
                 if (ec.entity.find('zenith.erp.pos.PosHeldTransaction').condition('sessionId',sessionId).condition('statusId','PhHeld').count()) return
-                if (ec.entity.find('zenith.erp.pos.PosCashEntry').condition('sessionId',sessionId).count()) return
-                if (ec.entity.find('zenith.erp.pos.PosCashManagement').condition('sessionId',sessionId).count()) return
-                if (ec.entity.find('zenith.erp.pos.PosReturn').condition('sessionId',sessionId).count()) return
                 txns.findAll { it.statusId == 'PtCreated' }.each { st ->
                     ec.entity.find('zenith.erp.pos.PosTransactionItem').condition('transactionId',st.transactionId).deleteAll()
                     ec.entity.find('zenith.erp.pos.PosItemPriceOverride').condition('transactionId',st.transactionId).deleteAll()
@@ -167,8 +166,9 @@
                 }
                 sess.statusId = 'PsClosed'
                 sess.closeDate = ec.user.nowTimestamp
-                sess.closeReason = 'IdleNoSales'
-                // closingCash/cashDifference remain null: nobody counted the drawer.
+                sess.closeReason = 'IdleUnverifiedCash'
+                // Bills, tenders, returns and movements are retained. The cash count, expected
+                // balance and difference remain null until an authorized person reviews them.
                 sess.update()
                 closed = true
                 reason = 'idle_closed'
@@ -190,8 +190,30 @@
                     def result = ec.service.sync().name('zenith.pos.PosServices.close#IdlePosSession').parameter('sessionId',id).call()
                     if (result.closed) closedCount++
                 }
-                if (closedCount) ec.logger.info('Closed ' + closedCount + ' empty POS session(s) after one hour idle')
+                if (closedCount) ec.logger.info('Closed ' + closedCount + ' POS session(s) with unverified cash after one hour idle')
             ]]></script>
+        </actions>
+    </service>
+
+    <service verb="reconcile" noun="IdlePosSessionCash">
+        <in-parameters><parameter name="sessionId" required="true"/>
+            <parameter name="closingCash" type="BigDecimal" required="true"/></in-parameters>
+        <actions>
+            <service-call name="zenith.pos.PosAccessServices.assert#PosAccess" in-map="[sessionId:sessionId]" out-map="_reviewAccess"/>
+            <if condition="!_reviewAccess.allowed"><return/></if>
+            <if condition="closingCash &lt; 0"><return error="true" message="Counted cash cannot be negative."/></if>
+            <entity-find-one entity-name="zenith.erp.pos.PosSession" value-field="_reviewSession" for-update="true"/>
+            <if condition="!_reviewSession || _reviewSession.statusId != 'PsClosed' ||
+                    !['IdleNoSales','IdleUnverifiedCash'].contains(_reviewSession.closeReason) || _reviewSession.closingCash != null">
+                <return error="true" message="This session has no unverified idle cash count."/>
+            </if>
+            <service-call name="zenith.pos.PosServices.get#PosSessionCashSummary" in-map="[sessionId:sessionId]" out-map="_reviewSummary"/>
+            <if condition="ec.message.hasError()"><return/></if>
+            <service-call name="update#zenith.erp.pos.PosSession" in-map="[sessionId:sessionId,
+                expectedCash:_reviewSummary.expectedCash, closingCash:closingCash,
+                cashDifference:closingCash - _reviewSummary.expectedCash,
+                closeReason:'IdleReviewed', cashReviewedByPartyId:ec.user.userAccount?.partyId,
+                cashReviewedDate:ec.user.nowTimestamp]"/>
         </actions>
     </service>
 
