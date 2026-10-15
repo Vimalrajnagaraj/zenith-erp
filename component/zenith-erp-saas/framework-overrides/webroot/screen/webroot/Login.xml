@@ -44,6 +44,17 @@ along with this software (see the LICENSE.md file). If not, see
 
     <transition name="login" require-session-token="false">
         <actions>
+            <!-- Keep the choice through the password -> 2FA round trip. An unchecked
+                 checkbox is absent from the request, so record each submitted choice. -->
+            <if condition="rememberMeSubmitted == 'Y'">
+                <script>
+                    ec.web.sessionAttributes.put('zenithRememberMe', rememberMe == 'true' ? 'Y' : 'N')
+                    if (organizationId) ec.web.sessionAttributes.put('zenithLoginOrgId', organizationId)
+                </script>
+            </if>
+            <if condition="!organizationId &amp;&amp; ec.web.sessionAttributes.moquiPreAuthcUsername">
+                <set field="organizationId" from="ec.web.sessionAttributes.zenithLoginOrgId"/>
+            </if>
             <if condition="ec.web?.sessionAttributes?.moquiPreAuthcUsername"><then>
                 <!-- already pre-auth'ed, verify code below -->
                 <set field="username" from="ec.web?.sessionAttributes?.moquiPreAuthcUsername"/>
@@ -83,7 +94,7 @@ along with this software (see the LICENSE.md file). If not, see
                                 in-map="[code:code]" out-map="validateOut"/>
                         <if condition="validateOut.verified"><then>
                             <script>ec.user.internalLoginUser(validateOut.username)</script>
-                            <return/>
+                            <!-- Continue through email/org checks and Remember Me below. -->
                         </then><else>
                             <message error="true" public="true">Authentication code is not valid</message>
                         </else></if>
@@ -100,6 +111,8 @@ along with this software (see the LICENSE.md file). If not, see
                  identical whether or not the username exists. -->
             <if condition="!ec.user.userId &amp;&amp; !ec.web.sessionAttributes.moquiAuthcFactorRequired &amp;&amp; !ec.web?.sessionAttributes?.moquiPreAuthcUsername">
                 <script><![CDATA[
+                    ec.web.sessionAttributes.remove('zenithRememberMe')
+                    ec.web.sessionAttributes.remove('zenithLoginOrgId')
                     ec.message.clearAll()
                     ec.message.addError("The username or password you entered is incorrect.")
                     // ZE-ROLE-002: if the credentials are actually correct but the account is DISABLED, tell
@@ -139,7 +152,7 @@ along with this software (see the LICENSE.md file). If not, see
                         }
                     } finally { if (!adDis) ec.artifactExecution.enableAuthz() }
                 ]]></script>
-                <if condition="emailUnverified"><script>ec.user.logoutUser()</script></if>
+                <if condition="emailUnverified"><script>ec.user.logoutUser(); ec.web.sessionAttributes.remove('zenithRememberMe'); ec.web.sessionAttributes.remove('zenithLoginOrgId')</script></if>
             </if>
 
             <!-- Validate Organization ID after successful login -->
@@ -209,6 +222,8 @@ along with this software (see the LICENSE.md file). If not, see
                 <if condition="orgValidationFailed">
                     <script>
                         ec.user.logoutUser()
+                        ec.web.sessionAttributes.remove('zenithRememberMe')
+                        ec.web.sessionAttributes.remove('zenithLoginOrgId')
                         ec.message.addError(orgValidationError)
                     </script>
                     <set field="orgLoginFailed" value="true"/>
@@ -220,19 +235,24 @@ along with this software (see the LICENSE.md file). If not, see
             <if condition="ec.user.userId &amp;&amp; !organizationId &amp;&amp; !ec.user.isInGroup('ADMIN')">
                 <script>
                     ec.user.logoutUser()
+                    ec.web.sessionAttributes.remove('zenithRememberMe')
+                    ec.web.sessionAttributes.remove('zenithLoginOrgId')
                     ec.message.addError("Organization ID is required")
                 </script>
                 <set field="orgLoginFailed" value="true"/>
             </if>
 
-            <!-- Remember Me: set login key cookie after successful login -->
-            <if condition="ec.user.userId &amp;&amp; !orgLoginFailed &amp;&amp; rememberMe == 'true'">
+            <!-- Issue a key only after all authentication, email and organization checks
+                 pass. A later sign-in without Remember Me clears a previous key. -->
+            <if condition="ec.user.userId &amp;&amp; !orgLoginFailed &amp;&amp; !emailUnverified">
                 <script><![CDATA[
-                    def loginKey = ec.user.getLoginKey(720)
-                    def cookie = new jakarta.servlet.http.Cookie("moquiLoginKey", loginKey)
-                    cookie.maxAge = 30 * 24 * 60 * 60
+                    def remember = ec.web.sessionAttributes.remove('zenithRememberMe') == 'Y'
+                    ec.web.sessionAttributes.remove('zenithLoginOrgId')
+                    def cookie = new jakarta.servlet.http.Cookie('moquiLoginKey', remember ? ec.user.getLoginKey(720) : '')
+                    cookie.maxAge = remember ? 30 * 24 * 60 * 60 : 0
                     cookie.path = "/"
                     cookie.httpOnly = true
+                    cookie.secure = ec.web.request.isSecure()
                     ec.web.response.addCookie(cookie)
                 ]]></script>
             </if>
@@ -251,10 +271,13 @@ along with this software (see the LICENSE.md file). If not, see
     <transition name="logout">
         <actions><script>
             ec.user.logoutUser()
+            ec.web.sessionAttributes.remove('zenithRememberMe')
+            ec.web.sessionAttributes.remove('zenithLoginOrgId')
             def cookie = new jakarta.servlet.http.Cookie("moquiLoginKey", "")
             cookie.maxAge = 0
             cookie.path = "/"
             cookie.httpOnly = true
+            cookie.secure = ec.web.request.isSecure()
             ec.web.response.addCookie(cookie)
         </script></actions>
         <default-response url="/"/>
@@ -262,6 +285,8 @@ along with this software (see the LICENSE.md file). If not, see
     </transition>
     <transition name="removePreAuth">
         <actions><script>
+            ec.web.sessionAttributes.remove('zenithRememberMe')
+            ec.web.sessionAttributes.remove('zenithLoginOrgId')
             ec.web.sessionAttributes.remove("moquiPreAuthcUsername")
             ec.web.sessionAttributes.remove("moquiAuthcFactorRequired")
             ec.web.sessionAttributes.remove("moquiPasswordChangeRequired")
@@ -385,26 +410,38 @@ along with this software (see the LICENSE.md file). If not, see
             if (loginKeyCookie) {
                 boolean loggedIn = ec.user.loginUserKey(loginKeyCookie.value)
                 if (loggedIn) {
-                    // restore org preference for the remembered user
+                    // A remembered key still needs the same verified-email and
+                    // active-organization membership gates as password login.
                     boolean alreadyDisabled = ec.artifactExecution.disableAuthz()
+                    boolean allowed = true
                     try {
-                        def pref = ec.entity.find("moqui.security.UserPreference")
-                                .condition("userId", ec.user.userId)
-                                .condition("preferenceKey", "ACTIVE_ORGANIZATION").one()
-                        if (pref?.preferenceValue) {
-                            ec.user.setPreference("ACTIVE_ORGANIZATION", pref.preferenceValue)
+                        def unverified = ec.entity.find('moqui.security.UserPreference')
+                                .condition('userId', ec.user.userId).condition('preferenceKey', 'EMAIL_VERIFIED').one()
+                        if (unverified?.preferenceValue == 'N') allowed = false
+                        if (!ec.user.isInGroup('ADMIN')) {
+                            def orgId = ec.user.getPreference('ACTIVE_ORGANIZATION')
+                            def partyId = ec.user.userAccount?.partyId
+                            def member = orgId && orgId != '_NA_' && partyId && ec.entity.find('mantle.party.PartyRelationship')
+                                    .condition('fromPartyId', partyId).condition('toPartyId', orgId)
+                                    .condition('relationshipTypeEnumId', 'in', ['PrtEmployee', 'PrtAgent', 'PrtMember'])
+                                    .conditionDate('fromDate', 'thruDate', ec.user.nowTimestamp).count() > 0
+                            if (member) ec.web.sessionAttributes.put('organizationPartyId', orgId)
+                            else allowed = false
                         }
                     } finally { if (!alreadyDisabled) ec.artifactExecution.enableAuthz() }
-                    sri.sendRedirectAndStopRender('/qapps/zenith/Dashboard')
-                    return
-                } else {
-                    // invalid/expired key, clear cookie
-                    def expCookie = new jakarta.servlet.http.Cookie("moquiLoginKey", "")
-                    expCookie.maxAge = 0
-                    expCookie.path = "/"
-                    expCookie.httpOnly = true
-                    ec.web.response.addCookie(expCookie)
+                    if (allowed) {
+                        sri.sendRedirectAndStopRender('/qapps/zenith/Dashboard')
+                        return
+                    }
+                    ec.user.logoutUser()
                 }
+                // Invalid, expired or no-longer-authorized key: clear it.
+                def expCookie = new jakarta.servlet.http.Cookie("moquiLoginKey", "")
+                expCookie.maxAge = 0
+                expCookie.path = "/"
+                expCookie.httpOnly = true
+                expCookie.secure = ec.web.request.isSecure()
+                ec.web.response.addCookie(expCookie)
             }
         }
 

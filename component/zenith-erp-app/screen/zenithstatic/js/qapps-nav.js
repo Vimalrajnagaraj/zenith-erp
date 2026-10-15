@@ -295,6 +295,7 @@
             if (!toolbar || document.getElementById('zq-toolbtns')) return;
             var cfg = document.getElementById('zenith-saas-cfg');
             var uname = (cfg && cfg.getAttribute('data-user-name')) || '';
+            var platformAdmin = cfg && cfg.getAttribute('data-super') === 'true';
             // hide the framework's mismatched right buttons (none exist on /apps)
             [].slice.call(toolbar.querySelectorAll('button.q-btn')).forEach(function (btn) {
                 var ic = btn.querySelector('.q-icon, .material-icons'); var t = ic ? ic.textContent.trim() : '';
@@ -304,26 +305,39 @@
             var cluster = el('div'); cluster.id = 'zq-toolbtns';
             function tb(icon, href, title, cls) { var a = el('a', 'zqtb' + (cls ? ' ' + cls : '')); a.href = href; a.title = title; a.setAttribute('aria-label', title); a.appendChild(mi(icon)); return a; }
             var lock = tb('lock', '/apps/zenith/MyPassword', 'My Password');
-            var bell = tb('notifications', '/apps/my/User/Notifications', 'Notifications'); bell.appendChild(el('span', 'zqtb-badge zq-empty'));
-            var mail = tb('mail', '/apps/my/User/Messages/FindMessage?statusId=CeReceived', 'Messages', 'zqtb-quad');
-            var cal = tb('event', '/apps/my/User/Calendar/MyCalendar', 'Events This Week', 'zqtb-quad');
-            var task = tb('task_alt', '/apps/my/User/Task/MyTasks', 'Open Tasks', 'zqtb-quad');
+            var accountHref = function (section, frameworkPath) {
+                return platformAdmin ? '/apps/my/User/' + frameworkPath : '/apps/zenith/MyWorkspace?section=' + section;
+            };
+            var bell = tb('notifications', accountHref('notifications', 'Notifications'), 'Notifications'); bell.appendChild(el('span', 'zqtb-badge zq-empty'));
+            var mail = tb('mail', accountHref('messages', 'Messages/FindMessage?statusId=CeReceived&toCurrentUser=true'), 'Messages', 'zqtb-quad');
+            var cal = tb('event', accountHref('calendar', 'Calendar/MyCalendar'), 'Events This Week', 'zqtb-quad');
+            var task = tb('task_alt', accountHref('tasks', 'Task/MyTasks'), 'Open Tasks', 'zqtb-quad');
             var theme = tb('contrast', '#', 'Switch Dark / Light');
+            theme.setAttribute('role', 'button');
+            function setDark(on) {
+                try {
+                    var app = document.getElementById('apps-root');
+                    if (app && app.__vue__ && app.__vue__.$q && app.__vue__.$q.dark) app.__vue__.$q.dark.set(on);
+                } catch (_e) {}
+                document.body.classList.toggle('body--dark', on);
+                theme.setAttribute('aria-pressed', on ? 'true' : 'false');
+            }
             theme.addEventListener('click', function (e) {
                 e.preventDefault();
-                try {
-                    var on = document.body.classList.toggle('body--dark');
-                    try { localStorage.setItem('zqDark', on ? '1' : '0'); } catch (_e) {}
-                    try { var app = document.getElementById('apps-root'); if (app && app.__vue__ && app.__vue__.$q && app.__vue__.$q.dark) app.__vue__.$q.dark.set(on); } catch (_e) {}
-                } catch (_e) {}
+                var on = !document.body.classList.contains('body--dark');
+                setDark(on);
+                try { localStorage.setItem('zqDark', on ? '1' : '0'); } catch (_e) {}
+            });
+            theme.addEventListener('keydown', function (e) {
+                if (e.key === ' ') { e.preventDefault(); theme.click(); }
             });
             var logout = tb('power_settings_new', '/Login/logout', 'Logout' + (uname ? ' ' + uname : ''), 'zqtb-danger');
             // avatar (initials) → My Account — rightmost, mirroring /apps
-            var av = el('a', 'zqtb zqtb-avatar'); av.href = '/apps/my'; av.title = uname || 'My account'; av.setAttribute('aria-label', (uname ? uname + ' — ' : '') + 'My account'); av.textContent = zInitials(uname);
+            var av = el('a', 'zqtb zqtb-avatar'); av.href = platformAdmin ? '/apps/my' : '/apps/zenith/MyWorkspace?section=account'; av.title = uname || 'My account'; av.setAttribute('aria-label', (uname ? uname + ' — ' : '') + 'My account'); av.textContent = zInitials(uname);
             // order matches the /apps toolbar (L→R): password, notifications, messages, calendar, tasks, theme, logout, avatar
             [lock, bell, mail, cal, task, theme, logout, av].forEach(function (b2) { cluster.appendChild(b2); });
             toolbar.appendChild(cluster);
-            try { if (localStorage.getItem('zqDark') === '1') document.body.classList.add('body--dark'); } catch (_e) {}
+            try { setDark(localStorage.getItem('zqDark') === '1'); } catch (_e) { setDark(false); }
         } catch (_e) {}
     }
 
