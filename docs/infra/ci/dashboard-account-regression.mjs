@@ -109,16 +109,17 @@ try {
     if (remember) body.set('rememberMe', 'true');
     const response = await fetch(`${base}/Login/login`, { method: 'POST', body, redirect: 'manual' });
     assert(response.status >= 300 && response.status < 400, `Login returned ${response.status}`);
-    return response.headers.getSetCookie().find(value => value.startsWith('moquiLoginKey='));
+    return response.headers.getSetCookie().filter(value => value.startsWith('moquiLoginKey='));
   };
-  const rememberCookie = await postLogin(true);
+  const rememberCookie = (await postLogin(true)).find(value => /Max-Age=2592000/i.test(value));
   assert(rememberCookie?.includes('HttpOnly') && /Max-Age=2592000/i.test(rememberCookie), 'Remember Me did not issue a persistent HttpOnly key');
   const key = rememberCookie.split(';')[0];
   const resumed = await fetch(`${base}/Login`, { headers: { Cookie: key }, redirect: 'manual' });
   assert(resumed.status >= 300 && resumed.status < 400, 'Remembered key did not resume login');
   assert(resumed.headers.get('location')?.includes('/qapps/zenith/Dashboard'));
   const forgotten = await postLogin(false);
-  assert(forgotten && /Max-Age=0/i.test(forgotten), 'Unchecked Remember Me did not clear the old browser key');
+  assert(forgotten.some(value => /Max-Age=0/i.test(value)),
+    `Unchecked Remember Me did not clear the old browser key: ${JSON.stringify(forgotten.map(value => value.replace(/moquiLoginKey=[^;]*/, 'moquiLoginKey=<redacted>')))}`);
   const invalid = await fetch(`${base}/Login`, { headers: { Cookie: 'moquiLoginKey=invalid' }, redirect: 'manual' });
   assert.equal(invalid.status, 200, 'Invalid key did not return to login');
   assert(invalid.headers.getSetCookie().some(value => value.startsWith('moquiLoginKey=') && /Max-Age=0/i.test(value)));
