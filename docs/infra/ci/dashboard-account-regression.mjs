@@ -42,7 +42,8 @@ try {
   // must open the own-user workspace, without granting access to SimpleScreens.
   const staff = await browser.newPage();
   await establishSession(staff, base, 'citest.a', 'moqui');
-  await staff.goto(`${base}/qapps/zenith`, { waitUntil: 'networkidle2' });
+  const staffDashboard = `${base}/qapps/zenith/pos/Dashboard`;
+  await staff.goto(staffDashboard, { waitUntil: 'networkidle2' });
   await staff.waitForSelector('#zq-toolbtns');
   const links = await staff.$$eval('#zq-toolbtns a[href]', nodes => nodes.map(a => ({ label: a.getAttribute('aria-label'), href: a.getAttribute('href') })));
   for (const label of ['My Password', 'Notifications', 'Messages', 'Events This Week', 'Open Tasks', 'My account']) {
@@ -55,7 +56,7 @@ try {
     const body = await staff.$eval('body', node => node.innerText);
     assert(!/not authorized|permission denied|screen render exception/i.test(body), `${label}: authorization/render error`);
     assert(!body.includes("We couldn't load this account activity"), `${label}: account data did not load`);
-    await staff.goto(`${base}/qapps/zenith`, { waitUntil: 'networkidle2' });
+    await staff.goto(staffDashboard, { waitUntil: 'networkidle2' });
     await staff.waitForSelector('#zq-toolbtns');
   }
   await staff.goto(`${base}/apps/zenith/pos/Dashboard`, { waitUntil: 'networkidle2' });
@@ -64,7 +65,7 @@ try {
   for (const section of ['notifications', 'messages', 'calendar', 'tasks', 'account']) {
     assert(appsAccountLinks.some(href => href?.includes(`MyWorkspace?section=${section}`)), `/apps header missing ${section}`);
   }
-  await staff.goto(`${base}/qapps/zenith`, { waitUntil: 'networkidle2' });
+  await staff.goto(staffDashboard, { waitUntil: 'networkidle2' });
   await staff.waitForSelector('#zq-toolbtns');
   await staff.screenshot({ path: join(process.env.RUNNER_TEMP || process.cwd(), 'account-toolbar-ci.png') });
   const themeRect = await staff.$eval('#zq-toolbtns [aria-label="Switch Dark / Light"]', node => {
@@ -88,6 +89,20 @@ try {
   assert(await staff.$eval('body', node => node.classList.contains('body--dark')), 'Theme did not persist');
   await staff.click('#zq-toolbtns [aria-label="Switch Dark / Light"]');
   console.log('PASS shared account destinations and persisted theme for staff');
+
+  // The ERP home dashboard intentionally substitutes its own small utility
+  // cluster for the shared one. Check the controls people actually see there.
+  await staff.goto(`${base}/qapps/zenith/Dashboard`, { waitUntil: 'networkidle2' });
+  await staff.waitForSelector('#homeUtilities');
+  const homeLinks = await staff.$$eval('#homeUtilities a', nodes => nodes.map(node => ({
+    label: node.getAttribute('aria-label'), href: node.getAttribute('href'), width: node.getBoundingClientRect().width,
+  })));
+  for (const [label, section] of [['Calendar', 'calendar'], ['Notifications', 'notifications']]) {
+    const link = homeLinks.find(item => item.label === label);
+    assert(link?.width > 0 && link.href === `/apps/zenith/MyWorkspace?section=${section}`, `Home ${label} action is unavailable`);
+  }
+  assert(homeLinks.some(item => item.label?.includes('My account') && item.width > 0), 'Home account action is unavailable');
+  console.log('PASS visible home dashboard account utilities');
 
   const postLogin = async remember => {
     const body = new URLSearchParams({ organizationId: 'CITEST_A', username: 'citest.a', password: 'moqui', rememberMeSubmitted: 'Y' });
