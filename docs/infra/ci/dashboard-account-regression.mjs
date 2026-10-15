@@ -66,6 +66,13 @@ try {
   }
   await staff.goto(`${base}/qapps/zenith`, { waitUntil: 'networkidle2' });
   await staff.waitForSelector('#zq-toolbtns');
+  await staff.screenshot({ path: join(process.env.RUNNER_TEMP || process.cwd(), 'account-toolbar-ci.png') });
+  const themeRect = await staff.$eval('#zq-toolbtns [aria-label="Switch Dark / Light"]', node => {
+    const rect = node.getBoundingClientRect();
+    return { x: rect.x, y: rect.y, width: rect.width, height: rect.height, viewport: innerWidth };
+  });
+  assert(themeRect.width > 0 && themeRect.x >= 0 && themeRect.x + themeRect.width <= themeRect.viewport,
+    `Theme control is outside the viewport: ${JSON.stringify(themeRect)}`);
   await staff.click('#zq-toolbtns [aria-label="Switch Dark / Light"]');
   assert(await staff.$eval('body', node => node.classList.contains('body--dark')));
   await staff.reload({ waitUntil: 'networkidle2' });
