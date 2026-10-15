@@ -54,6 +54,7 @@ try {
     assert(!staff.url().includes('/Login'), `${label}: redirected to login`);
     const body = await staff.$eval('body', node => node.innerText);
     assert(!/not authorized|permission denied|screen render exception/i.test(body), `${label}: authorization/render error`);
+    assert(!body.includes("We couldn't load this account activity"), `${label}: account data did not load`);
     await staff.goto(`${base}/qapps/zenith`, { waitUntil: 'networkidle2' });
     await staff.waitForSelector('#zq-toolbtns');
   }
