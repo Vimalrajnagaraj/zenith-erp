@@ -69,7 +69,16 @@ try {
   await staff.screenshot({ path: join(process.env.RUNNER_TEMP || process.cwd(), 'account-toolbar-ci.png') });
   const themeRect = await staff.$eval('#zq-toolbtns [aria-label="Switch Dark / Light"]', node => {
     const rect = node.getBoundingClientRect();
-    return { x: rect.x, y: rect.y, width: rect.width, height: rect.height, viewport: innerWidth };
+    const describe = element => {
+      const bounds = element.getBoundingClientRect();
+      const style = getComputedStyle(element);
+      return { tag: element.tagName, id: element.id, className: element.className,
+        display: style.display, visibility: style.visibility, width: bounds.width, height: bounds.height };
+    };
+    return { x: rect.x, y: rect.y, width: rect.width, height: rect.height, viewport: innerWidth,
+      bodyClass: document.body.className,
+      ancestors: [node, node.parentElement, node.parentElement?.parentElement, node.closest('.q-header')].filter(Boolean).map(describe),
+      toolbars: [...document.querySelectorAll('.q-header .q-toolbar')].map(describe) };
   });
   assert(themeRect.width > 0 && themeRect.x >= 0 && themeRect.x + themeRect.width <= themeRect.viewport,
     `Theme control is outside the viewport: ${JSON.stringify(themeRect)}`);
