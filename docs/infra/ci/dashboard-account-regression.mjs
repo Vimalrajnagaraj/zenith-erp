@@ -117,12 +117,14 @@ try {
   const resumed = await fetch(`${base}/Login`, { headers: { Cookie: key }, redirect: 'manual' });
   assert(resumed.status >= 300 && resumed.status < 400, 'Remembered key did not resume login');
   assert(resumed.headers.get('location')?.includes('/qapps/zenith/Dashboard'));
+  const isClearedKey = value => value.startsWith('moquiLoginKey=;') &&
+    (/Max-Age=0/i.test(value) || /Expires=Thu, 01 Jan 1970/i.test(value));
   const forgotten = await postLogin(false);
-  assert(forgotten.some(value => /Max-Age=0/i.test(value)),
+  assert(forgotten.some(isClearedKey),
     `Unchecked Remember Me did not clear the old browser key: ${JSON.stringify(forgotten.map(value => value.replace(/moquiLoginKey=[^;]*/, 'moquiLoginKey=<redacted>')))}`);
   const invalid = await fetch(`${base}/Login`, { headers: { Cookie: 'moquiLoginKey=invalid' }, redirect: 'manual' });
   assert.equal(invalid.status, 200, 'Invalid key did not return to login');
-  assert(invalid.headers.getSetCookie().some(value => value.startsWith('moquiLoginKey=') && /Max-Age=0/i.test(value)));
+  assert(invalid.headers.getSetCookie().some(isClearedKey));
   console.log('PASS Remember Me issue/resume/clear/invalid-key cases');
 } finally {
   await browser.close();
