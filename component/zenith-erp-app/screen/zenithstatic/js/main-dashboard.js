@@ -78,10 +78,12 @@
       link.appendChild(outlineIcon(icon));
       tools.appendChild(link); return link;
     }
-    utility('calendar_today', '/apps/my/User/Calendar/MyCalendar', 'Calendar');
+    var accountCfg = document.getElementById('zenith-saas-cfg');
+    var platformAdmin = accountCfg && accountCfg.getAttribute('data-super') === 'true';
+    utility('calendar_today', platformAdmin ? '/apps/my/User/Calendar/MyCalendar' : '/apps/zenith/MyWorkspace?section=calendar', 'Calendar');
     var settings = (cfg.nav || []).find(function (item) { return item.label === 'Settings'; });
     if (settings) utility('settings', settings.url.replace('/apps/', spa ? '/qapps/' : '/apps/'), 'Settings');
-    var bell = utility('notifications_none', '/apps/my/User/Notifications', 'Notifications');
+    var bell = utility('notifications_none', platformAdmin ? '/apps/my/User/Notifications' : '/apps/zenith/MyWorkspace?section=notifications', 'Notifications');
     var sourceBadge = document.querySelector('#navbar_notification_count, #zq-toolbtns .zqtb-badge');
     var dot = document.createElement('span'); dot.className = 'home-notification-dot'; dot.hidden = true; bell.appendChild(dot);
     function notificationCount() { dot.hidden = !sourceBadge || !(Number(sourceBadge.textContent.trim()) > 0); }

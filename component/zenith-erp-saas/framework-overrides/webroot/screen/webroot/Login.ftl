@@ -321,7 +321,8 @@ body.Login {
     <div id="login" class="tab-pane active">
         <form method="post" action="${sri.buildUrl("login").url}" class="form-signin" id="login_form">
             <input type="hidden" name="initialTab" value="login">
-            <input id="login_form_organizationId" name="organizationId" type="text"
+            <input type="hidden" name="rememberMeSubmitted" value="Y">
+            <input id="login_form_organizationId" name="organizationId" type="text" value="${(ec.web.sessionAttributes.zenithLoginOrgId!'')?html}"
                     required="required" class="form-control top"
                     placeholder="${ec.l10n.localize("Organization ID")}" aria-label="${ec.l10n.localize("Organization ID")}">
             <input id="login_form_username" name="username" type="text" value="${(username!"")?html}"
@@ -338,7 +339,7 @@ body.Login {
             </#if>
             <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:12px;">
                 <label style="display:flex; align-items:center; cursor:pointer; font-size:14px; color:#64748b; margin:0; font-weight:400;">
-                    <input type="checkbox" name="rememberMe" value="true" style="width:auto !important; margin:0 8px 0 0 !important; padding:0 !important; accent-color:#7C3AED;">
+                    <input type="checkbox" name="rememberMe" value="true" <#if (ec.web.sessionAttributes.zenithRememberMe!'') == 'Y'>checked</#if> style="width:auto !important; margin:0 8px 0 0 !important; padding:0 !important; accent-color:#7C3AED;">
                     ${ec.l10n.localize("Remember me")}
                 </label>
             </div>
