@@ -103,7 +103,7 @@
         });
     }
     function close(force) {
-        if (!drawer || busy) return;
+        if (!drawer || (busy && !force)) return;
         if (!force && JSON.stringify(draft) !== JSON.stringify(current.settings) &&
                 !window.confirm('Discard unsaved navigation changes?')) return;
         drawer.remove(); veil.remove(); drawer = veil = null;
@@ -111,7 +111,7 @@
         if (previousFocus && previousFocus.isConnected) previousFocus.focus();
     }
     function open() {
-        if (!current || !current.settings || drawer) return;
+        if (!current || !current.settings || drawer || busy) return;
         previousFocus = document.activeElement;
         draft = copy(current.settings);
         veil = el('div', 'zsn-veil'); veil.addEventListener('click', function () { close(false); });
@@ -193,16 +193,18 @@
         function persist() {
             if (busy) return;
             busy = true; save.disabled = true; save.textContent = 'Saving...'; error.hidden = true;
+            var view = current, panel = drawer, pending = copy(draft);
             var token = document.getElementById('z-shopdata');
-            var form = new URLSearchParams({ module:current.module, payload:JSON.stringify(draft),
+            var form = new URLSearchParams({ module:view.module, payload:JSON.stringify(pending),
                 moquiSessionToken:token ? token.getAttribute('data-token') || '' : '' });
             fetch('/apps/zenith/saveSubnavConfiguration', { method:'POST', credentials:'same-origin',
                 headers:{ 'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8', Accept:'application/json' },
                 body:form.toString() }).then(function (response) {
                 return response.json().then(function (data) {
                     if (!response.ok || !data.saved) throw new Error(data.error || 'Could not save navigation settings.');
-                    current.settings = copy(draft); cache[current.module] = copy(draft); apply();
-                    busy = false; close(true);
+                    view.settings = pending; cache[view.module] = copy(pending);
+                    if (current === view) apply();
+                    busy = false; if (drawer === panel) close(true);
                 });
             }).catch(function (failure) {
                 error.textContent = failure.message || 'Could not save navigation settings. Please retry.';
