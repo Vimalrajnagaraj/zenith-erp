@@ -90,19 +90,47 @@ try {
   await staff.click('#zq-toolbtns [aria-label="Switch Dark / Light"]');
   console.log('PASS shared account destinations and persisted theme for staff');
 
-  // The ERP home dashboard intentionally substitutes its own small utility
-  // cluster for the shared one. Check the controls people actually see there.
+  // A signed-in user's Contacts tab choices must persist and appear in both shells.
+  await staff.goto(`${base}/apps/zenith/Contacts/ContactsDashboard`, { waitUntil: 'networkidle2' });
+  await staff.waitForSelector('#z-subnav .zsn-trigger:not([disabled])');
+  await staff.click('#z-subnav .zsn-trigger');
+  await staff.click('.zsn-row[data-id="/Contacts/Vendors"] .zsn-toggle');
+  await staff.click('.zsn-row[data-id="/Contacts/Customers"] [data-direction="-1"]');
+  await staff.click('.zsn-row[data-id="/Contacts/Customers"] [data-direction="-1"]');
+  await staff.click('.zsn-save');
+  await staff.waitForFunction(() => !document.querySelector('.zsn-drawer'));
+  await staff.reload({ waitUntil: 'networkidle2' });
+  await staff.waitForSelector('#z-subnav .zsn-trigger:not([disabled])');
+  const appsTabs = await staff.$$eval('#z-subnav .zsub-grp.show .zsub-tab', nodes => nodes.filter(node => !node.hidden).map(node => node.dataset.match));
+  assert.equal(appsTabs[0], '/Contacts/Customers', 'Saved Contacts tab order was lost on reload');
+  assert(!appsTabs.includes('/Contacts/Vendors'), 'Hidden Contacts tab returned on reload');
+  await staff.goto(`${base}/qapps/zenith/Contacts/ContactsDashboard`, { waitUntil: 'networkidle2' });
+  await staff.waitForSelector('#zq-subnav .zsn-trigger:not([disabled])');
+  const qappsTabs = await staff.$$eval('#zq-subnav .zqsub-tab', nodes => nodes.filter(node => !node.hidden).map(node => node.dataset.match));
+  assert.equal(qappsTabs[0], '/Contacts/Customers', 'Saved Contacts order did not reach /qapps');
+  assert(!qappsTabs.includes('/Contacts/Vendors'), 'Hidden Contacts tab did not reach /qapps');
+  await staff.click('#zq-subnav .zsn-trigger');
+  await staff.click('.zsn-reset');
+  await staff.click('.zsn-save');
+  await staff.waitForFunction(() => !document.querySelector('.zsn-drawer'));
+  assert(await staff.$eval('#zq-subnav .zqsub-tab[data-match="/Contacts/Vendors"]', node => !node.hidden), 'Reset did not restore the default tab');
+  console.log('PASS Contacts tab reorder/hide persistence across both shells and reset');
+
+  // The ERP home dashboard uses the same shell and account toolbar as every module.
   await staff.goto(`${base}/qapps/zenith/Dashboard`, { waitUntil: 'networkidle2' });
-  await staff.waitForSelector('#homeUtilities');
-  const homeLinks = await staff.$$eval('#homeUtilities a', nodes => nodes.map(node => ({
+  await staff.waitForSelector('#zq-toolbtns');
+  const homeLinks = await staff.$$eval('#zq-toolbtns a', nodes => nodes.map(node => ({
     label: node.getAttribute('aria-label'), href: node.getAttribute('href'), width: node.getBoundingClientRect().width,
   })));
-  for (const [label, section] of [['Calendar', 'calendar'], ['Notifications', 'notifications']]) {
-    const link = homeLinks.find(item => item.label === label);
+  for (const [label, section] of [['Events This Week', 'calendar'], ['Notifications', 'notifications']]) {
+    const link = homeLinks.find(item => item.label?.includes(label));
     assert(link?.width > 0 && link.href === `/apps/zenith/MyWorkspace?section=${section}`, `Home ${label} action is unavailable`);
   }
   assert(homeLinks.some(item => item.label?.includes('My account') && item.width > 0), 'Home account action is unavailable');
-  console.log('PASS visible home dashboard account utilities');
+  assert(await staff.$eval('#zq-sidebar', node => node.getBoundingClientRect().width > 0), 'Home dashboard shared sidebar is unavailable');
+  assert(await staff.$eval('#zq-subnav', node => node.getBoundingClientRect().height > 0), 'Home dashboard shared module navigation is unavailable');
+  assert(!(await staff.$('#homeUtilities')), 'Home dashboard still renders duplicate account utilities');
+  console.log('PASS shared home dashboard shell and account utilities');
 
   const postLogin = async remember => {
     const body = new URLSearchParams({ organizationId: 'CITEST_A', username: 'citest.a', password: 'moqui', rememberMeSubmitted: 'Y' });
