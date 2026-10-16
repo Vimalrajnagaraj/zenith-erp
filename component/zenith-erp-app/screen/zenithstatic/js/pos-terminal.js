@@ -1111,8 +1111,29 @@ window._posOffline = (function() {
         return t ? (t.value || '') : '';
     }
     function setCustChip(name) {
-        var el = document.getElementById('pos-cust-name');
-        if (el) el.textContent = (name && name.length) ? name : 'Walk-In';
+        ['pos-cust-name', 'pos-header-customer-name'].forEach(function(id) {
+            var el = document.getElementById(id);
+            if (el) el.textContent = (name && name.length) ? name : 'Walk-in Customer';
+        });
+    }
+    function custEscape(value) {
+        return String(value == null ? '' : value).replace(/[&<>"']/g, function(ch) {
+            return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch];
+        });
+    }
+    function enableTaxBill(transactionId) {
+        var source = document.querySelector('form.nb-tax');
+        if (!source) { histToast('Tax mode is unavailable. Please use the Tax switch.', '#c62828'); return; }
+        var form = document.createElement('form');
+        form.method = 'post'; form.action = source.action; form.style.display = 'none';
+        source.querySelectorAll('input[name]').forEach(function(input) {
+            var hidden = document.createElement('input');
+            hidden.type = 'hidden'; hidden.name = input.name;
+            hidden.value = input.name === 'transactionId' ? transactionId : input.value;
+            form.appendChild(hidden);
+        });
+        document.body.appendChild(form);
+        form.submit();
     }
     function custPost(transition, params) {
         params = params || {};
@@ -1145,10 +1166,12 @@ window._posOffline = (function() {
           + '<input id="cust-search" type="text" placeholder="Search name or phone…" autocomplete="off" style="flex:1;padding:11px 14px;border:1px solid #ccc;border-radius:8px;font-size:15px;box-sizing:border-box;outline:none"/>'
           + '<a href="/apps/zenith/Contacts/Customers" target="_blank" rel="noopener" style="white-space:nowrap;padding:11px 14px;border-radius:8px;background:#ECE8FB;color:#7C3AED;border:1px solid #DCD3F2;font-weight:700;font-size:13px;text-decoration:none" title="Add a new customer in Contacts (opens a new tab)">&#43; New</a></div>'
           + '<div style="padding:8px 18px 0"><button id="cust-walkin" type="button" style="width:100%;padding:11px;border:1px dashed #bbb;background:#fafafa;border-radius:8px;font-size:14px;font-weight:700;color:#555;cursor:pointer">&#128694; Walk-In (no customer)</button></div>'
+          + '<label style="display:flex;align-items:center;gap:9px;padding:10px 18px;color:#374151;font-size:13px"><input id="cust-tax-bill" type="checkbox" style="width:17px;height:17px;accent-color:#7C3AED"/> Tax bill for selected customer (3-inch receipt)</label>'
           + '<div id="cust-list" style="flex:1;overflow-y:auto;padding:10px 14px 16px"><div style="text-align:center;padding:30px;color:#999">Type a name or phone number to search your customers…</div></div>';
         ov.appendChild(panel); document.body.appendChild(ov);
         ov.addEventListener('click', function(ev) { if (ev.target === ov) closeCustomer(); });
         panel.querySelector('#cust-close').addEventListener('click', closeCustomer);
+        panel.querySelector('#cust-tax-bill').checked = typeof window._posCurrentTax === 'function' && window._posCurrentTax() === 'Y';
         panel.querySelector('#cust-walkin').addEventListener('click', function() {
             var tx = getOpenTxId();
             if (!tx) { setCustChip('Walk-In'); closeCustomer(); return; }
@@ -1171,9 +1194,9 @@ window._posOffline = (function() {
             if (!d.customers || !d.customers.length) { listEl.innerHTML = '<div style="text-align:center;padding:24px;color:#999">No customers found. Use “+ New” to add one in Contacts.</div>'; return; }
             var h = '';
             d.customers.forEach(function(c) {
-                h += '<div class="cust-row" data-pid="' + c.partyId + '" data-name="' + (c.name || '').replace(/"/g, '&quot;') + '" style="padding:12px 14px;border:1px solid #e8e8e8;border-radius:10px;margin-bottom:8px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;gap:10px" onmouseover="this.style.background=\'#e8eaf6\'" onmouseout="this.style.background=\'#fff\'">'
-                  + '<span style="font-weight:700;color:#7C3AED">' + (c.name || c.partyId) + '</span>'
-                  + (c.phone ? '<span style="font-size:13px;color:#777;white-space:nowrap">' + c.phone + '</span>' : '')
+                h += '<div class="cust-row" data-pid="' + custEscape(c.partyId) + '" data-name="' + custEscape(c.name || '') + '" style="padding:12px 14px;border:1px solid #e8e8e8;border-radius:10px;margin-bottom:8px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;gap:10px" onmouseover="this.style.background=\'#e8eaf6\'" onmouseout="this.style.background=\'#fff\'">'
+                  + '<span style="font-weight:700;color:#7C3AED">' + custEscape(c.name || c.partyId) + '</span>'
+                  + (c.phone ? '<span style="font-size:13px;color:#777;white-space:nowrap">' + custEscape(c.phone) + '</span>' : '')
                   + '</div>';
             });
             listEl.innerHTML = h;
@@ -1181,9 +1204,13 @@ window._posOffline = (function() {
                 row.addEventListener('click', function() {
                     var tx = getOpenTxId();
                     var pid = row.dataset.pid, nm = row.dataset.name;
+                    var wantsTaxBill = document.getElementById('cust-tax-bill').checked;
                     if (!tx && !CTX.sessionId) { histToast('Open a session before selecting a customer', '#e65100'); return; }
                     custPost('setCustomer', {transactionId: tx, customerPartyId: pid}).then(function(d) {
                         if (d && d.success) {
+                            if (wantsTaxBill && typeof window._posCurrentTax === 'function' && window._posCurrentTax() !== 'Y') {
+                                closeCustomer(); enableTaxBill(d.transactionId || tx); return;
+                            }
                             if (!tx && d.transactionId) {
                                 var next = new URL(window.location.href);
                                 next.searchParams.set('sessionId',CTX.sessionId); next.searchParams.set('transactionId',d.transactionId);
@@ -2594,7 +2621,7 @@ window.posToggleFullscreen = function() {
                 html += '<div class="c b" style="font-size:12px;margin:3px 0;border:1px dashed #000;padding:3px 2px">** EDITED / REVISED BILL **</div>';
                 html += '<div class="c hdr" style="margin-bottom:2px">Reprinted after modification</div>';
             }
-            html += '<table><tr><td class="hdr" style="width:30%">POS Bill No:</td><td class="b">' + (bi.number||'') + '</td></tr>';
+            html += '<table><tr><td class="hdr" style="width:30%">Bill No:</td><td class="b">' + (bi.number||'') + '</td></tr>';
             html += '<tr><td class="hdr">Date:</td><td>' + (bi.date||'') + '</td></tr>';
             if (bi.cashier) html += '<tr><td class="hdr">Cashier:</td><td>' + bi.cashier + '</td></tr>';
             html += '<tr><td class="hdr">Customer:</td><td>' + (bi.customer||'Walk-In') + '</td></tr>';
