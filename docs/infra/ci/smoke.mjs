@@ -163,6 +163,8 @@ try {
       await page.waitForFunction(() => document.body.innerText.includes('Showing: This week'), { timeout: 15000 });
       await page.goto(`${BASE}/${surface}/zenith/Crm/Dashboard?period=today`, { waitUntil: 'networkidle2', timeout: 60000 });
       await page.waitForFunction(() => document.body.innerText.includes('Showing: Today'), { timeout: 15000 });
+      const activePeriod = await page.$eval('.zcrm-period a.zcrm-period-active', link => link.textContent.trim());
+      if (activePeriod !== 'Today') throw new Error(`CRM highlighted ${activePeriod} instead of Today`);
       console.log(`PASS  CRM ${surface} dashboard range`);
     } catch (error) {
       failures++;
