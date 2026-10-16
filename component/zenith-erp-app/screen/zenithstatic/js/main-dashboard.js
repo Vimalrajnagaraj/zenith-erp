@@ -2,17 +2,6 @@
 (function () {
   'use strict';
   var initialized = new WeakSet();
-  var navRoot;
-  var notificationObserver;
-  function syncSidebarOffset() {
-    var root = document.getElementById('homeDashboard');
-    if (!root) { document.documentElement.style.removeProperty('--home-sidebar-top'); return; }
-    var headerOffset = window.innerWidth <= 900 ? 104 : 64;
-    var top = Math.max(0, headerOffset - Math.max(0, window.scrollY || 0));
-    document.documentElement.style.setProperty('--home-sidebar-top', top + 'px');
-  }
-  window.addEventListener('scroll', syncSidebarOffset, { passive: true });
-  window.addEventListener('resize', syncSidebarOffset);
   // Outline icons from the supplied dashboard reference; SVG stays crisp at the header's actual size.
   function outlineIcon(name) {
     var paths = {
@@ -31,73 +20,8 @@
     svg.setAttribute('aria-hidden', 'true'); svg.setAttribute('focusable', 'false'); svg.setAttribute('class', 'home-glyph'); svg.innerHTML = paths[name] || '';
     return svg;
   }
-  function clearChrome() {
-    ['homePrimaryNav', 'homeBrand', 'homeMenuButton', 'homeUtilities', 'homeOwnerIcon', 'homeSearchIcon'].forEach(function (id) {
-      var element = document.getElementById(id); if (element) element.remove();
-    });
-    if (notificationObserver) notificationObserver.disconnect();
-    notificationObserver = null; navRoot = null;
-  }
-  function chrome(root) {
-    var nav = document.getElementById('homePrimaryNav');
-    if (nav && navRoot !== root) { clearChrome(); nav = null; }
-    if (!root) { clearChrome(); return; }
-    if (nav) return;
-    var search = document.getElementById('zq-search') || document.getElementById('z-search');
-    if (!search) return;
-    var cfg;
-    try { cfg = JSON.parse(root.dataset.config); } catch (error) { return; }
-    nav = document.createElement('nav'); nav.id = 'homePrimaryNav'; nav.setAttribute('aria-label', 'Primary modules');
-    [{ label: 'Dashboard', url: '/apps/zenith/Dashboard' }].concat(cfg.nav || []).forEach(function (item, index) {
-      var link = document.createElement('a'); link.textContent = item.label;
-      link.href = item.url.replace('/apps/', location.pathname.startsWith('/qapps/') ? '/qapps/' : '/apps/');
-      if (index === 0) link.setAttribute('aria-current', 'page');
-      nav.appendChild(link);
-    });
-    search.before(nav);
-    var spa = location.pathname.startsWith('/qapps/');
-    var host = search.parentNode;
-    var owner = document.getElementById(spa ? 'zq-ownerview' : 'z-ownerview');
-    if (owner) { var ownerIcon = outlineIcon('owner'); ownerIcon.id = 'homeOwnerIcon'; owner.prepend(ownerIcon); }
-    var searchIcon = outlineIcon('search'); searchIcon.id = 'homeSearchIcon'; search.querySelector('.zqsr-box,.zsr-box').prepend(searchIcon);
-    var brand = document.createElement('a'); brand.id = 'homeBrand'; brand.href = (spa ? '/qapps/' : '/apps/') + 'zenith/Dashboard';
-    brand.setAttribute('aria-label', 'ZcERP dashboard');
-    var logo = document.createElement('span'); logo.className = 'home-logo'; logo.textContent = 'Zc'; brand.appendChild(logo);
-    var name = document.createElement('span'); name.textContent = 'ZcERP'; brand.appendChild(name); host.prepend(brand);
-    if (!spa) {
-      var menu = document.createElement('button'); menu.id = 'homeMenuButton'; menu.type = 'button'; menu.setAttribute('aria-label', 'Toggle sidebar');
-      menu.appendChild(outlineIcon('menu'));
-      menu.addEventListener('click', function () { var toggle = document.getElementById(innerWidth > 900 ? 'z-side-toggle' : 'z-side-burger'); if (toggle) toggle.click(); });
-      host.prepend(menu);
-    }
-    var input = search.querySelector('input');
-    if (input) { input.placeholder = 'Search…'; input.setAttribute('aria-label', 'Search modules and screens'); }
-    var tools = document.createElement('nav'); tools.id = 'homeUtilities'; tools.setAttribute('aria-label', 'Account tools');
-    function utility(icon, href, label) {
-      var link = document.createElement('a'); link.href = href; link.title = label; link.setAttribute('aria-label', label);
-      link.appendChild(outlineIcon(icon));
-      tools.appendChild(link); return link;
-    }
-    var accountCfg = document.getElementById('zenith-saas-cfg');
-    var platformAdmin = accountCfg && accountCfg.getAttribute('data-super') === 'true';
-    utility('calendar_today', platformAdmin ? '/apps/my/User/Calendar/MyCalendar' : '/apps/zenith/MyWorkspace?section=calendar', 'Calendar');
-    var settings = (cfg.nav || []).find(function (item) { return item.label === 'Settings'; });
-    if (settings) utility('settings', settings.url.replace('/apps/', spa ? '/qapps/' : '/apps/'), 'Settings');
-    var bell = utility('notifications_none', platformAdmin ? '/apps/my/User/Notifications' : '/apps/zenith/MyWorkspace?section=notifications', 'Notifications');
-    var sourceBadge = document.querySelector('#navbar_notification_count, #zq-toolbtns .zqtb-badge');
-    var dot = document.createElement('span'); dot.className = 'home-notification-dot'; dot.hidden = true; bell.appendChild(dot);
-    function notificationCount() { dot.hidden = !sourceBadge || !(Number(sourceBadge.textContent.trim()) > 0); }
-    notificationCount();
-    if (sourceBadge) { notificationObserver = new MutationObserver(notificationCount); notificationObserver.observe(sourceBadge, { childList: true, characterData: true, subtree: true }); }
-    var sourceAvatar = document.querySelector('#z-avatar, #zq-toolbtns .zqtb-avatar');
-    if (sourceAvatar) { var avatar = sourceAvatar.cloneNode(true); avatar.removeAttribute('id'); avatar.className = 'home-avatar'; tools.appendChild(avatar); }
-    search.after(tools);
-    navRoot = root;
-  }
   function boot() {
     var root = document.getElementById('homeDashboard');
-    syncSidebarOffset();
-    chrome(root);
     if (!root || initialized.has(root)) return;
     var chart = root.querySelector('#homeActivityChart');
     var status = root.querySelector('#homeLayoutStatus');
