@@ -13,7 +13,10 @@
 
   function $(id) { return document.getElementById(id); }
   function qsa(s) { return Array.prototype.slice.call(document.querySelectorAll(s)); }
-  function base() { return location.pathname.replace(/\/$/, ''); }
+  function base() {
+    var prefix = location.pathname.indexOf('/qapps/') === 0 ? '/qapps' : '/apps';
+    return prefix + '/zenith/pos/Kitchen/KotBilling';
+  }
   function cssId(id) { return (window.CSS && CSS.escape) ? CSS.escape(id) : id; }
   function tok() {
     try { if (window.moqui && window.moqui.webrootVue && window.moqui.webrootVue.moquiSessionToken) return window.moqui.webrootVue.moquiSessionToken; } catch (e) {}

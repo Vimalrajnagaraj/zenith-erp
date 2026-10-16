@@ -6,7 +6,10 @@
   window.__tmInit = true;
 
   function qsa(sel) { return Array.prototype.slice.call(document.querySelectorAll(sel)); }
-  function base() { return location.pathname.replace(/\/$/, ''); }
+  function base() {
+    var prefix = location.pathname.indexOf('/qapps/') === 0 ? '/qapps' : '/apps';
+    return prefix + '/zenith/pos/Kitchen/Tables';
+  }
 
   // Moqui session token: WebrootVue on /qapps, hidden-input fallback on /apps.
   function tok() {
@@ -124,6 +127,7 @@
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: body.toString()
     }).then(function (r) {
+      if (!r.ok) throw Error('Could not add table');
       location.href = r.url || location.href;
     }).catch(function () {
       if (btn) { btn.disabled = false; btn.textContent = 'Add Table'; }
