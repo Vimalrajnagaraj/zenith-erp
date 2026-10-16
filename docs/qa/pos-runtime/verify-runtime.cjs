@@ -20,6 +20,21 @@ const rows=(table,where)=>q(`SELECT * FROM ${table} WHERE ${where}`),count=(tabl
  const a=await account('pos.qa');const foreign=await account('pos.b.qa');const p=a.p;p.on('pageerror',e=>report.consoleErrors.push({url:p.url(),message:e.message,stack:e.stack}));
  async function post(screen,transition,params={},actor=a,csrf=true,shell='apps'){return actor.c.request.post(`${base}/${shell}/zenith/pos/${screen}/${transition}`,{form:{...(csrf?{moquiSessionToken:actor.t}:{}),...params},maxRedirects:0});}
  async function invoke(op,params={},reject=false,actor=a){const r=await post('PosQaAcceptance','invoke',{op,...params},actor);let b;try{b=await r.json()}catch{b={errors:[(await r.text()).slice(0,160)]}}check(op+(reject?' rejected':' succeeded'),reject?(r.status()===403||b.errors?.length>0):r.status()===200&&!b.errors?.length,{status:r.status(),...b});return b.result||{};}
+ if(process.env.POS_QA_UI_ONLY!=='true'){
+ const terminalDraft={terminalId:'POS_QA_A_NEW_TERM',terminalName:'Disposable POS new terminal',facilityId:'POS_QA_A_FAC',organizationPartyId:'POS_QA_A',stateCode:'33',isActive:'Y'};
+ await post('PosTerminals','createTerminal',{...terminalDraft,facilityId:'POS_QA_B_FAC'});
+ check('terminal creation rejects a foreign facility before any write',count('pos_terminal',"terminal_id='POS_QA_A_NEW_TERM'")===0);
+ await post('PosTerminals','createTerminal',{...terminalDraft,organizationPartyId:'POS_QA_B'});
+ check('terminal creation rejects a forged organization before any write',count('pos_terminal',"terminal_id='POS_QA_A_NEW_TERM'")===0);
+ await post('PosTerminals','createTerminal',terminalDraft,foreign);
+ check('foreign tenant cannot create a terminal in this organization',count('pos_terminal',"terminal_id='POS_QA_A_NEW_TERM'")===0);
+ const createdTerminal=await post('PosTerminals','createTerminal',terminalDraft);
+ check('authorized terminal creation persists once in the active organization',createdTerminal.status()<400&&count('pos_terminal',"terminal_id='POS_QA_A_NEW_TERM' AND organization_party_id='POS_QA_A' AND facility_id='POS_QA_A_FAC'")===1,{status:createdTerminal.status()});
+ const terminalListPage=await a.c.request.get(base+'/apps/zenith/pos/PosTerminals');
+ check('created terminal appears after reload',terminalListPage.status()===200&&(await terminalListPage.text()).includes('Disposable POS new terminal'));
+ await post('PosTerminals','createTerminal',terminalDraft);
+ check('retry does not create a duplicate terminal',count('pos_terminal',"terminal_id='POS_QA_A_NEW_TERM'")===1);
+ }
  const open=async(term='POS_QA_A_TERM1',actor=a)=>invoke('open',{terminalId:term,openingCash:'100'},false,actor);
  const cart=async(s,actor=a)=>invoke('cart',{sessionId:s.sessionId},false,actor);
  const item=async(t,extra={},actor=a)=>invoke('add',{transactionId:t.transactionId,productId:'POS_QA_A_P18',quantity:'1',...extra},false,actor);
