@@ -188,8 +188,14 @@
             <script><![CDATA[
                 ec.user.loginAnonymousIfNoUser()
                 closedCount = 0
+                // Only shops that have explicitly opted in (PosOrgBillingConfig.idleSessionAutoClose='Y') are swept.
+                // Default = no time-based expiry, so this is a no-op for every existing tenant.
+                def optedOrgs = ec.entity.find('zenith.erp.pos.PosOrgBillingConfig').condition('idleSessionAutoClose','Y')
+                    .selectField('organizationPartyId').list().collect { it.organizationPartyId }
+                if (!optedOrgs) return
                 def cutoff = new java.sql.Timestamp(ec.user.nowTimestamp.time - 3600000L)
                 def ids = ec.entity.find('zenith.erp.pos.PosSession').condition('statusId','PsOpen')
+                    .condition('organizationPartyId', 'in', optedOrgs)
                     .condition('lastActivityDate',org.moqui.entity.EntityCondition.LESS_THAN_EQUAL_TO,cutoff)
                     .selectField('sessionId').list().collect { it.sessionId }
                 ids.each { id ->
@@ -255,38 +261,64 @@
                 <set field="transactionNumber" from="txn.transactionNumber"/>
                 <return/></if>
             <script><![CDATA[
-                // India POS business day is shared across cashiers, regardless of their profile/browser zone.
-                // Existing POS/FY/NNNNN bills are retained unchanged. Only newly issued bills use the day key.
-                def billDayFormat = new java.text.SimpleDateFormat('yyyyMMdd')
-                billDayFormat.setTimeZone(java.util.TimeZone.getTimeZone('Asia/Kolkata'))
-                def billDay = billDayFormat.format(txn.completedDate ?: ec.user.nowTimestamp)
-                // Serialize the first allocation as well as later increments. The organization row
-                // already exists, so it provides a stable lock before the day's counter row is created.
-                // No growing full-table count scan is needed after the first bill of the day.
-                def org = txn.organizationPartyId
-                if (!org || !ec.entity.find('mantle.party.Party').condition('partyId', org).forUpdate(true).one()) {
-                    throw new IllegalStateException('POS bill organization is missing')
+                // Bill-number scheme is per-organization and OPT-IN. Default (no config row / 'N') = the legacy
+                // per-(org, financial-year) consecutive number, which is also used as the GST invoice number — a
+                // no-op for every existing tenant. A shop that sets dailyBillNumbering='Y' gets a per-India-business-
+                // day series (POS/yyyyMMdd/NNNNN); its GST invoice number is minted separately (see PosSyncServices).
+                def txnOrg = txn.organizationPartyId
+                def _billCfg = txnOrg ? ec.entity.find('zenith.erp.pos.PosOrgBillingConfig').condition('organizationPartyId', txnOrg).one() : null
+                def org, periodKey
+                if (_billCfg?.dailyBillNumbering == 'Y') {
+                    // Opt-in: shared India business day. The org row provides a stable lock before the day counter exists.
+                    if (!txnOrg || !ec.entity.find('mantle.party.Party').condition('partyId', txnOrg).forUpdate(true).one()) {
+                        throw new IllegalStateException('POS bill organization is missing')
+                    }
+                    org = txnOrg
+                    def billDayFormat = new java.text.SimpleDateFormat('yyyyMMdd')
+                    billDayFormat.setTimeZone(java.util.TimeZone.getTimeZone('Asia/Kolkata'))
+                    periodKey = billDayFormat.format(txn.completedDate ?: ec.user.nowTimestamp)
+                } else {
+                    // Default/legacy: per-(org, financial-year) counter (fyLabel, or yyyy-MM when the FY is unknown).
+                    def fyStr = null
+                    if (txnOrg) {
+                        try {
+                            def fyResult = ec.service.sync().name("zenith.base.LocalizationServices.get#FinancialYearDates")
+                                .parameter("organizationPartyId", txnOrg).call()
+                            fyStr = fyResult?.fyLabel
+                        } catch (Exception e) { /* fall through to date-based number */ }
+                    }
+                    if (!fyStr) { fyStr = new java.text.SimpleDateFormat("yyyy-MM").format(ec.user.nowTimestamp) }
+                    org = txnOrg ?: '_NA_'
+                    periodKey = fyStr
                 }
-                def seqKey = org + "_" + billDay
+                // Atomic per-(org, period) counter: O(1) row-locked increment, race-safe (two registers never collide).
+                def seqKey = org + "_" + periodKey
                 def nextNum
                 def counter = ec.entity.find("zenith.erp.pos.PosBillSequence").condition("seqKey", seqKey).forUpdate(true).one()
                 if (counter != null) {
                     nextNum = ((counter.lastNumber ?: 0) as int) + 1
                     ec.service.sync().name("update#zenith.erp.pos.PosBillSequence").parameters([seqKey:seqKey, lastNumber:nextNum]).call()
                 } else {
-                    // First bill for this org+day: seed from the existing max for safe retries/migrations.
+                    // First bill for this key: seed from the existing max so we never collide with or renumber prior bills.
                     int mx = 0
                     def prior = ec.entity.find("zenith.erp.pos.PosTransaction").condition("organizationPartyId", org)
-                        .condition("transactionNumber", "like", "POS/${billDay}/%").selectField("transactionNumber").list()
+                        .condition("transactionNumber", "like", "POS/${periodKey}/%").selectField("transactionNumber").list()
                     for (r in prior) {
                         def m = (r.transactionNumber =~ /\/(\d+)$/)
                         if (m.find()) { int n = m.group(1) as int; if (n > mx) mx = n }
                     }
                     nextNum = mx + 1
-                    ec.service.sync().name("create#zenith.erp.pos.PosBillSequence").parameters([seqKey:seqKey, lastNumber:nextNum]).call()
+                    try {
+                        ec.service.sync().name("create#zenith.erp.pos.PosBillSequence").parameters([seqKey:seqKey, lastNumber:nextNum]).call()
+                    } catch (Exception e) {
+                        // concurrent first-bill for this key: another thread seeded it — re-read locked and increment
+                        def c2 = ec.entity.find("zenith.erp.pos.PosBillSequence").condition("seqKey", seqKey).forUpdate(true).one()
+                        nextNum = (((c2?.lastNumber ?: mx) as int)) + 1
+                        ec.service.sync().name("update#zenith.erp.pos.PosBillSequence").parameters([seqKey:seqKey, lastNumber:nextNum]).call()
+                    }
                 }
                 def seqNum = String.format("%05d", nextNum)
-                transactionNumber = "POS/${billDay}/${seqNum}"
+                transactionNumber = "POS/${periodKey}/${seqNum}"
             ]]></script>
             <service-call name="update#zenith.erp.pos.PosTransaction"
                 in-map="[transactionId:transactionId, transactionNumber:transactionNumber]"/>

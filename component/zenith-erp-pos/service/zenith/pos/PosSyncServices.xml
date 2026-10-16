@@ -78,13 +78,43 @@
                     }
                 }
 
-                // The POS bill identifies the till sale; the Sales/GST invoice is a separate document.
-                // invoiceId is globally unique, so this follows the regular Sales invoice format without
-                // consuming another POS bill number or renumbering any invoice already linked to a sale.
+                // GST invoice number is per-organization. Default (legacy) = the POS bill number itself, which is a
+                // per-financial-year CONSECUTIVE series. When a shop opts in to daily POS bill numbers the POS number
+                // is no longer FY-consecutive, so the GST invoice gets its OWN per-(org, FY) consecutive series
+                // (INV/FY/NNNNN) — never a gappy global sequence — to stay GST Rule 46 compliant.
+                def _billCfg = org ? ec.entity.find('zenith.erp.pos.PosOrgBillingConfig').condition('organizationPartyId', org).one() : null
                 def fy = ec.service.sync().name("zenith.base.LocalizationServices.get#FinancialYearDates")
                     .parameters([organizationPartyId:org, referenceDate:(txn.completedDate ?: txn.entryDate)]).call()
-                if (!fy?.fyLabel) throw new IllegalStateException('Financial year required for POS invoice ' + iid)
-                def invoiceNumber = "INV/${fy.fyLabel}/${iid}"
+                def invoiceNumber
+                if (_billCfg?.dailyBillNumbering == 'Y') {
+                    if (!fy?.fyLabel) throw new IllegalStateException('Financial year required for POS invoice ' + iid)
+                    // Atomic per-(org, FY) CONSECUTIVE GST invoice counter (seqKey distinct from the POS bill counter).
+                    def gstKey = org + "_GSTINV_" + fy.fyLabel
+                    def gNext
+                    def gCounter = ec.entity.find("zenith.erp.pos.PosBillSequence").condition("seqKey", gstKey).forUpdate(true).one()
+                    if (gCounter != null) {
+                        gNext = ((gCounter.lastNumber ?: 0) as int) + 1
+                        ec.service.sync().name("update#zenith.erp.pos.PosBillSequence").parameters([seqKey:gstKey, lastNumber:gNext]).call()
+                    } else {
+                        // First GST invoice for this org+FY: seed from the existing max so retries never collide.
+                        int gmx = 0
+                        def gPrior = ec.entity.find("mantle.account.invoice.Invoice").condition("fromPartyId", org)
+                            .condition("gstInvoiceNumber", "like", "INV/${fy.fyLabel}/%").selectField("gstInvoiceNumber").list()
+                        for (r in gPrior) { def m = (r.gstInvoiceNumber =~ /\/(\d+)$/); if (m.find()) { int n = m.group(1) as int; if (n > gmx) gmx = n } }
+                        gNext = gmx + 1
+                        try {
+                            ec.service.sync().name("create#zenith.erp.pos.PosBillSequence").parameters([seqKey:gstKey, lastNumber:gNext]).call()
+                        } catch (Exception e) {
+                            def gc2 = ec.entity.find("zenith.erp.pos.PosBillSequence").condition("seqKey", gstKey).forUpdate(true).one()
+                            gNext = (((gc2?.lastNumber ?: gmx) as int)) + 1
+                            ec.service.sync().name("update#zenith.erp.pos.PosBillSequence").parameters([seqKey:gstKey, lastNumber:gNext]).call()
+                        }
+                    }
+                    invoiceNumber = "INV/${fy.fyLabel}/" + String.format("%05d", gNext)
+                } else {
+                    // Legacy coupling: the GST invoice number IS the POS bill number (a per-FY consecutive series).
+                    invoiceNumber = txn.transactionNumber
+                }
                 def docType = (((txn.totalTaxAmount ?: 0) as BigDecimal) > 0) ? "Tax Invoice" : "Bill of Supply"
                 ec.service.sync().name("update#mantle.account.invoice.Invoice").parameters([
                     invoiceId:iid, customInvoiceNumber:invoiceNumber, gstInvoiceNumber:invoiceNumber,
