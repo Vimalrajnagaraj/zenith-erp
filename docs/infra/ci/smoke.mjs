@@ -82,6 +82,18 @@ try {
         if (path.includes('/Crm/Dashboard') && await page.$('.zcrm-error')) {
           throw new Error('CRM dashboard returned its data-error state');
         }
+        if (path.includes('/Crm/Dashboard')) {
+          await page.waitForSelector('.zcrm-dashboard-metrics', { timeout: 15000 });
+          const count = await page.$$eval('.zcrm-dashboard-metrics .zcrm-metric', cards => cards.length);
+          if (count !== 4) throw new Error(`CRM dashboard rendered ${count} metric cards instead of four`);
+        }
+        if (path.includes('/Crm/Leads')) {
+          await page.waitForSelector('.zcrm-lead-metrics', { timeout: 15000 });
+          const count = await page.$$eval('.zcrm-lead-metrics .zcrm-metric', cards => cards.length);
+          if (count !== 4 || !(await page.$('.zcrm-leads-directory'))) {
+            throw new Error('CRM lead metrics or directory did not render');
+          }
+        }
       }
       if (path.includes('/Inventory/InventoryDashboard')) {
         await page.waitForSelector('.inv-dashboard', { timeout: 15000 });
@@ -149,6 +161,8 @@ try {
     try {
       await page.goto(`${BASE}/${surface}/zenith/Crm/Dashboard?period=week`, { waitUntil: 'networkidle2', timeout: 60000 });
       await page.waitForFunction(() => document.body.innerText.includes('Showing: This week'), { timeout: 15000 });
+      await page.goto(`${BASE}/${surface}/zenith/Crm/Dashboard?period=today`, { waitUntil: 'networkidle2', timeout: 60000 });
+      await page.waitForFunction(() => document.body.innerText.includes('Showing: Today'), { timeout: 15000 });
       console.log(`PASS  CRM ${surface} dashboard range`);
     } catch (error) {
       failures++;
