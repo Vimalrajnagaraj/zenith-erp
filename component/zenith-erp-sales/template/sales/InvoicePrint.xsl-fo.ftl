@@ -39,7 +39,7 @@
                 <fo:table-column column-width="60mm"/>
                 <fo:table-column column-width="65mm"/>
                 <fo:table-body>
-                    <fo:table-row>
+                    <fo:table-row keep-together.within-page="always">
                         <#-- Logo / Company Branding -->
                         <fo:table-cell>
                             <fo:block font-size="20pt" font-weight="bold" color="#ff7a00" margin-top="5mm">
@@ -51,7 +51,7 @@
                         </fo:table-cell>
                         
                         <#-- Title -->
-                        <fo:table-cell text-align="center">
+                        <fo:table-cell text-align="center" padding-top="2mm" padding-bottom="2mm">
                             <fo:block font-size="8pt" margin-bottom="2mm">
                                 <#if invoice.documentType??><@encodeText invoice.documentType?upper_case/><#else>TAX INVOICE</#if>
                                 (Original for Recipient)
@@ -61,11 +61,12 @@
                                  extension (barcode4j-fop-ext on the classpath); omit entirely when there is no number. -->
                             <#assign bcMsg = (invoice.gstInvoiceNumber)!((invoice.customInvoiceNumber)!'')>
                             <#if bcMsg?has_content>
-                            <fo:block text-align="center" margin-top="1mm">
+                            <fo:block text-align="center" margin-top="1mm" padding-top="1mm" padding-bottom="1mm">
                                 <fo:instream-foreign-object>
                                     <barcode:barcode xmlns:barcode="http://barcode4j.krysalis.org/ns" message="${bcMsg}">
                                         <barcode:datamatrix>
                                             <barcode:module-width>0.7mm</barcode:module-width>
+                                            <barcode:quiet-zone>2mm</barcode:quiet-zone>
                                         </barcode:datamatrix>
                                     </barcode:barcode>
                                 </fo:instream-foreign-object>

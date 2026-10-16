@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
+        require-authentication="true" default-menu-include="false">
+    <parameter name="section"/>
+    <actions><script><![CDATA[
+        // This is a deliberately narrow self-service surface. Never accept a partyId,
+        // userId or organizationId from the request for these account-wide lists.
+        // NB: 'section' is a reserved FreeMarker screen macro, so the view variable must
+        // not be named 'section' or the template compares a macro to a string. Use wsSection.
+        wsSection = ['notifications', 'messages', 'calendar', 'tasks', 'account'].contains(section) ? section : 'account'
+        def partyId = ec.user.userAccount?.partyId
+        workspaceRows = []
+        workspaceError = false
+        try {
+            if (wsSection == 'notifications') {
+                ec.entity.find('moqui.security.user.NotificationMessageByUser')
+                        .condition('userId', ec.user.userId).orderBy('-sentDate').limit(50).list().each { row ->
+                    workspaceRows.add([title:row.titleText ?: 'Notification', detail:'',
+                            date:row.sentDate?.toString() ?: ''])
+                }
+            } else if (wsSection == 'messages' && partyId) {
+                def byId = [:]
+                ['fromPartyId', 'toPartyId'].each { side ->
+                    ec.entity.find('mantle.party.communication.CommunicationEvent')
+                            .condition(side, partyId).orderBy('-entryDate').limit(50).list().each { row ->
+                        byId[row.communicationEventId] = [title:row.subject ?: 'Message', detail:(row.body ?: '').toString().take(280),
+                                date:row.entryDate?.toString() ?: '']
+                    }
+                }
+                workspaceRows = byId.values().sort { a, b -> b.date <=> a.date }.take(50)
+            } else if ((wsSection == 'calendar' || wsSection == 'tasks') && partyId) {
+                def query = ec.entity.find('mantle.work.effort.WorkEffortAndParty')
+                        .condition('partyId', partyId)
+                        .condition('workEffortTypeEnumId', wsSection == 'tasks' ? 'WetTask' : 'WetEvent')
+                        .orderBy(wsSection == 'tasks' ? '-estimatedCompletionDate' : '-estimatedStartDate').limit(50)
+                query.list().each { row ->
+                    workspaceRows.add([title:row.workEffortName ?: (wsSection == 'tasks' ? 'Task' : 'Event'),
+                            detail:(row.description ?: '').toString().take(280),
+                            date:(wsSection == 'tasks' ? row.estimatedCompletionDate : row.estimatedStartDate)?.toString() ?: ''])
+                }
+            }
+        } catch (Exception ignored) {
+            workspaceRows = []
+            workspaceError = true
+        }
+        workspaceTitle = [notifications:'Notifications', messages:'Messages', calendar:'Calendar',
+                tasks:'Tasks', account:'My Account'][wsSection]
+    ]]></script></actions>
+    <widgets><render-mode><text type="html,vuet,qvt" template="true"><![CDATA[
+<div class="z-workspace">
+  <div class="z-workspace-head"><h1>${workspaceTitle?html}</h1><p>Your account activity and settings</p></div>
+  <nav class="z-workspace-tabs" aria-label="My account sections">
+    <a href="?section=notifications" class="<#if wsSection == 'notifications'>active</#if>">Notifications</a>
+    <a href="?section=messages" class="<#if wsSection == 'messages'>active</#if>">Messages</a>
+    <a href="?section=calendar" class="<#if wsSection == 'calendar'>active</#if>">Calendar</a>
+    <a href="?section=tasks" class="<#if wsSection == 'tasks'>active</#if>">Tasks</a>
+    <a href="?section=account" class="<#if wsSection == 'account'>active</#if>">My Account</a>
+  </nav>
+  <div class="z-workspace-card">
+    <#if wsSection == 'account'>
+      <h2>Account settings</h2>
+      <p>Signed in as <strong>${(ec.user.userAccount.username!'')?html}</strong>.</p>
+      <div class="z-workspace-actions">
+        <a href="/apps/zenith/MyPassword">Change password</a>
+        <a href="/apps/zenith/MySecurity">Two-factor login</a>
+        <a href="/apps/zenith/MyNotifications">Browser notification settings</a>
+      </div>
+    <#elseif workspaceError>
+      <p role="alert">We couldn't load this account activity. Please reload the page.</p>
+    <#elseif workspaceRows?size == 0>
+      <p class="z-workspace-empty">No ${workspaceTitle?lower_case?html} to show.</p>
+    <#else>
+      <ul class="z-workspace-list">
+        <#list workspaceRows as row>
+          <li><div><strong>${(row.title!'')?html}</strong><#if (row.detail!'')?has_content><p>${row.detail?html}</p></#if></div><time>${(row.date!'')?html}</time></li>
+        </#list>
+      </ul>
+    </#if>
+  </div>
+</div>
+    ]]></text></render-mode></widgets>
+</screen>
