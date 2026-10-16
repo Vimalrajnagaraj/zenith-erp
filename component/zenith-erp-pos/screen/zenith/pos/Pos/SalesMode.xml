@@ -54,16 +54,27 @@
                 def mode = salesModeId ? ec.entity.find('zenith.erp.pos.PosSalesMode').condition('salesModeId',salesModeId).one() : null
                 if (access?.canWrite != true || !(ec.user.isInGroup('ADMIN') || ec.user.isInGroup('ZENITH_ADMIN')) || !org || org == '_NA_' || mode?.organizationPartyId != org) { ec.message.addError('This shop cannot edit that sales mode.'); return }
                 if (ec.entity.find('zenith.erp.pos.PosTransaction').condition('organizationPartyId',org).condition('salesModeId',salesModeId).condition('statusId','PtCreated').count() > 0) { ec.message.addError('Finish or void open carts in this mode before changing it.'); return }
-                def disc
-                try { disc = (discountPercent ?: '0') as BigDecimal } catch (Exception ignored) { ec.message.addError('Enter a valid discount.'); return }
-                if (disc < 0 || disc > 100) { ec.message.addError('Discount % must be between 0 and 100.'); return }
+                def disc, markup, minimum
+                try {
+                    disc = (discountPercent ?: '0') as BigDecimal
+                    markup = (ec.web.parameters.containsKey('markupPercent') ? (markupPercent ?: '0') : (mode.markupPercent ?: 0)) as BigDecimal
+                    minimum = (ec.web.parameters.containsKey('minOrderAmount') ? (minOrderAmount ?: '0') : (mode.minOrderAmount ?: 0)) as BigDecimal
+                } catch (Exception ignored) { ec.message.addError('Enter valid numeric pricing values.'); return }
+                if (disc < 0 || disc > 100 || markup < 0 || minimum < 0) { ec.message.addError('Discount must be 0-100%; markup and minimum must be non-negative.'); return }
                 def code = (modeCode ?: '').toString().trim().toUpperCase(java.util.Locale.ROOT)
                 if (!(code ==~ /[A-Z0-9_]{2,12}/)) { ec.message.addError('Use a 2-12 character code.'); return }
                 if (ec.entity.find('zenith.erp.pos.PosSalesMode').condition('modeCode',code).list().any { it.salesModeId != salesModeId && (!it.organizationPartyId || it.organizationPartyId == org) }) { ec.message.addError('That mode code already exists.'); return }
+                def prefix = ec.web.parameters.containsKey('invoicePrefix') ? (invoicePrefix ?: '').toString().trim() : (mode.invoicePrefix ?: '')
+                def color = ec.web.parameters.containsKey('colorCode') ? (colorCode ?: '').toString().trim() : (mode.colorCode ?: '#7C3AED')
+                if (prefix.length() > 20 || !(color ==~ /#[0-9a-fA-F]{6}/)) { ec.message.addError('Use an invoice prefix up to 20 characters and a valid six-digit color code.'); return }
                 mode.setAll([modeName:(modeName ?: '').toString().trim().take(100), modeCode:code,
                     priceSource:(['PpsMrp','PpsDiscountMrp','PpsFixedProduct'].contains(priceSource) ? priceSource : mode.priceSource),
-                    discountPercent:disc, isTaxInclusive:(isTaxInclusive == 'Y' ? 'Y' : 'N'),
-                    requireCustomer:(requireCustomer == 'Y' ? 'Y' : 'N'), isActive:(isActive == 'N' ? 'N' : 'Y'), isDefault:'N'])
+                    discountPercent:disc, markupPercent:markup, minOrderAmount:minimum,
+                    invoicePrefix:prefix, colorCode:color,
+                    description:(ec.web.parameters.containsKey('description') ? (description ?: '').toString().trim().take(1000) : mode.description),
+                    isTaxInclusive:(isTaxInclusive == 'Y' ? 'Y' : 'N'),
+                    requireCustomer:(requireCustomer == 'Y' ? 'Y' : 'N'),
+                    isActive:(ec.web.parameters.containsKey('isActive') ? (isActive == 'N' ? 'N' : 'Y') : mode.isActive)])
                 if (!mode.modeName) { ec.message.addError('Mode name is required.'); return }
                 mode.update()
             ]]></script>
@@ -137,13 +148,6 @@
         </actions>
         <default-response url="."/>
     </transition>
-    <transition name="goProductPrices"><default-response url="../ProductPricing"/></transition>
-    <transition name="goTerminals"><default-response url="../PosTerminals"/></transition>
-    <transition name="goTerminal"><default-response url="../Terminal"/></transition>
-    <transition name="goDashboard"><default-response url="../Dashboard"/></transition>
-    <transition name="goSessions"><default-response url="../PosSessions"/></transition>
-    <transition name="goReceipts"><default-response url="../ReceiptConfig"/></transition>
-
     <actions>
         <entity-find entity-name="zenith.erp.pos.PosSalesMode" list="modeList">
             <order-by field-name="isDefault,modeName"/>
@@ -167,7 +171,6 @@
         <script><![CDATA[
             modeList = (modeList ?: []).findAll { !it.organizationPartyId || it.organizationPartyId == _activeOrg }
             activeModeList = modeList.findAll { it.isActive == 'Y' }
-            editableModeList = modeList.findAll { it.organizationPartyId && it.organizationPartyId == _activeOrg }
             terminalList = (_activeOrg && _activeOrg != '_NA_') ? (terminalList ?: []).findAll { it.organizationPartyId == _activeOrg } : []
             def terminalIds = terminalList.collect { it.terminalId } as Set
             terminalModeList = (terminalModeList ?: []).findAll { terminalIds.contains(it.terminalId) }
@@ -217,8 +220,18 @@
                 _tiles.append('<div class="smode-fact"><dt>Tax Inclusive</dt><dd>').append(taxLabel).append('</dd></div>')
                 _tiles.append('<div class="smode-fact"><dt>Require Customer</dt><dd>').append(reqLabel).append('</dd></div></dl>')
                 if (m.description) _tiles.append('<div class="smode-tile-foot">').append(_esc(m.description)).append('</div>')
-                if (modeCanManage && m.organizationPartyId && m.organizationPartyId == _activeOrg)
-                    _tiles.append('<form class="smode-tile-actions" method="post" action="SalesMode/deleteMode" onsubmit="return confirm(&quot;Archive this sales mode? It will disappear from billing choices, but past bills are kept.&quot;)"><input type="hidden" name="salesModeId" value="').append(_esc(m.salesModeId)).append('"/><input type="hidden" name="moquiSessionToken" value="').append(_esc(ec.web.sessionToken)).append('"/><button type="submit">Archive mode</button></form>')
+                if (modeCanManage && m.organizationPartyId && m.organizationPartyId == _activeOrg) {
+                    _tiles.append('<details class="smode-menu"><summary aria-label="Actions for ').append(_esc(m.modeName)).append('" title="Mode actions">&#8942;</summary><div class="smode-menu-pop"><button type="button" onclick="this.closest(&quot;.smode-tile&quot;).querySelector(&quot;dialog&quot;).showModal()">Edit mode</button>')
+                    if (!isDef) _tiles.append('<form method="post" action="SalesMode/deleteMode" onsubmit="return confirm(&quot;Delete this mode from billing choices? Existing bills and prices remain in history.&quot;)"><input type="hidden" name="salesModeId" value="').append(_esc(m.salesModeId)).append('"/><input type="hidden" name="moquiSessionToken" value="').append(_esc(ec.web.sessionToken)).append('"/><button type="submit" class="smode-delete">Delete mode</button></form>')
+                    _tiles.append('</div></details>')
+                    _tiles.append('<dialog class="smode-edit-dialog"><div class="smode-dialog-head"><h3>Edit ').append(_esc(m.modeName)).append('</h3><button type="button" aria-label="Close" onclick="this.closest(&quot;dialog&quot;).close()">&times;</button></div><form method="post" action="SalesMode/updateMode"><input type="hidden" name="salesModeId" value="').append(_esc(m.salesModeId)).append('"/><input type="hidden" name="moquiSessionToken" value="').append(_esc(ec.web.sessionToken)).append('"/>')
+                    _tiles.append('<label>Mode name<input name="modeName" maxlength="100" required value="').append(_esc(m.modeName)).append('"/></label><label>Code<input name="modeCode" maxlength="12" pattern="[A-Za-z0-9_]{2,12}" required value="').append(_esc(m.modeCode)).append('"/></label><label>Price source<select name="priceSource">')
+                    (supportedPriceSourceList ?: []).each { opt -> _tiles.append('<option value="').append(_esc(opt.enumId)).append('"').append(m.priceSource == opt.enumId ? ' selected' : '').append('>').append(_esc(opt.description)).append('</option>') }
+                    _tiles.append('</select></label><div class="smode-edit-pair"><label>Discount %<input name="discountPercent" type="number" min="0" max="100" step="0.01" value="').append(_esc(disc)).append('"/></label><label>Markup %<input name="markupPercent" type="number" min="0" step="0.01" value="').append(_esc(markup)).append('"/></label></div>')
+                    _tiles.append('<div class="smode-edit-pair"><label>Tax inclusive<select name="isTaxInclusive"><option value="N"').append(m.isTaxInclusive == 'Y' ? '' : ' selected').append('>No</option><option value="Y"').append(m.isTaxInclusive == 'Y' ? ' selected' : '').append('>Yes</option></select></label><label>Require customer<select name="requireCustomer"><option value="N"').append(m.requireCustomer == 'Y' ? '' : ' selected').append('>No</option><option value="Y"').append(m.requireCustomer == 'Y' ? ' selected' : '').append('>Yes</option></select></label></div>')
+                    _tiles.append('<label>Minimum order amount<input name="minOrderAmount" type="number" min="0" step="0.01" value="').append(_esc(m.minOrderAmount ?: 0)).append('"/></label><label>Invoice prefix<input name="invoicePrefix" maxlength="20" value="').append(_esc(m.invoicePrefix)).append('"/></label><label>Color code<input name="colorCode" pattern="#[0-9a-fA-F]{6}" value="').append(_esc(m.colorCode ?: '#7C3AED')).append('"/></label><label>Description<textarea name="description" maxlength="1000" rows="3">').append(_esc(m.description)).append('</textarea></label>')
+                    _tiles.append('<div class="smode-dialog-actions"><button type="button" onclick="this.closest(&quot;dialog&quot;).close()">Cancel</button><button type="submit">Save changes</button></div></form></dialog>')
+                }
                 _tiles.append('</div>')
             }
             context.tilesHtml = _tiles.length() ? ('<div class="smode-tiles">' + _tiles.toString() + '</div>') : '<div class="smode-info">No sales modes yet — create one on the left.</div>'
@@ -234,14 +247,6 @@
   <details class="smode-helpd"><summary class="smode-help"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><path d="M12 17h.01"/></svg> Need help? View guide <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg></summary><div class="smode-helpbody"><b>Sales modes</b> are the price tiers a cashier picks while billing. Your shop already has Retail, Wholesale and Custom &mdash; most shops never change anything here. <b>Retail</b> charges MRP; <b>Wholesale</b> / <b>Custom</b> charge a fixed price you set per product in <b>Product Prices</b>. This screen is for advanced setup &mdash; creating a mode, or choosing which modes appear on each terminal.</div></details>
 </div>
             ]]></text></render-mode>
-            <container style="row items-center justify-end q-mb-lg q-gutter-sm">
-                <link url="goProductPrices" text="Product Prices" icon="fa fa-tags" btn-type="warning" style="q-btn--dense"/>
-                <link url="goTerminals" text="Terminals" icon="fa fa-desktop" btn-type="primary" style="q-btn--dense"/>
-                <link url="goSessions" text="Sessions" icon="fa fa-clock-o" style="q-btn--dense"/>
-                <link url="goReceipts" text="Receipts" icon="fa fa-file-text-o" style="q-btn--dense"/>
-                <link url="goTerminal" text="Billing" icon="fa fa-calculator" btn-type="success" style="q-btn--dense"/>
-                <link url="goDashboard" text="Dashboard" icon="fa fa-dashboard" style="q-btn--dense"/>
-            </container>
             <container style="smode-grid">
                 <section name="CreateMode_write"><condition><expression>modeCanManage</expression></condition><widgets>
                     <container style="smode-card smode-createform">
@@ -294,41 +299,6 @@
                     <render-mode><text type="html,qvt"><![CDATA[${tilesHtml}]]></text></render-mode>
                     <render-mode><text type="html,qvt"><![CDATA[<div class="smode-info"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg><span>Each sales mode can have different pricing rules and can be assigned to specific terminals.</span></div>]]></text></render-mode>
                 </container>
-            </container>
-
-            <container style="smode-card smode-tbl">
-            <render-mode><text type="html,qvt"><![CDATA[<div class="smode-card-hd"><span class="smode-card-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg></span><h2 class="smode-card-title">Sales Mode Pricing Rules</h2></div>]]></text></render-mode>
-            <form-list name="ModeListForm" list="editableModeList" transition="updateMode" skip-form="false">
-                <field name="salesModeId"><default-field><hidden/></default-field></field>
-                <field name="modeName"><default-field title="Name">
-                    <text-line size="15"/>
-                </default-field></field>
-                <field name="modeCode"><default-field title="Code">
-                    <text-line size="5"/>
-                </default-field></field>
-                <field name="priceSource"><default-field title="Price Source">
-                    <drop-down>
-                        <list-options list="supportedPriceSourceList" key="${enumId}" text="${description}"/>
-                    </drop-down>
-                </default-field></field>
-                <field name="discountPercent"><default-field title="Disc %">
-                    <text-line size="5" input-type="number"/>
-                </default-field></field>
-                <field name="isTaxInclusive"><default-field title="Tax Incl.">
-                    <drop-down><option key="Y" text="Yes"/><option key="N" text="No"/></drop-down>
-                </default-field></field>
-                <field name="requireCustomer"><default-field title="Req. Cust.">
-                    <drop-down><option key="N" text="No"/><option key="Y" text="Yes"/></drop-down>
-                </default-field></field>
-                <field name="isActive"><default-field title="Active">
-                    <drop-down><option key="Y" text="Yes"/><option key="N" text="No"/></drop-down>
-                </default-field></field>
-                <field name="submitBtn">
-                    <conditional-field name="mode_save_write" condition="modeCanManage &amp;&amp; organizationPartyId == _activeOrg" title="">
-                    <submit text="Save" icon="fa fa-save"/>
-                    </conditional-field>
-                    <default-field title=""><label text="" type="span"/></default-field></field>
-            </form-list>
             </container>
 
             <label text="Order Rules for This Shop" type="h6" style="text-weight-bold q-mt-lg q-mb-sm"/>
