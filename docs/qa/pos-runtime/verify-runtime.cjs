@@ -210,6 +210,20 @@ const rows=(table,where)=>q(`SELECT * FROM ${table} WHERE ${where}`),count=(tabl
  vr=await post('Terminal','ajaxCart',{action:'refresh',transactionId:t.transactionId,sessionId:s.sessionId});const stale=await vr.json();check('issued bill refresh tells browser to discard stale cart',vr.status()===200&&stale.cartClosed===true&&stale.transactionId===''&&JSON.stringify(tx(t.transactionId))===JSON.stringify(frozen),stale);
  // Both shells' report children are exercised, not just the default report tab.
  for(const shell of ['apps','qapps'])for(const screen of ['Reports/ItemWise','Reports/PaymentWise','Reports/UserWise','Reports/CancelledBills','Reports/EditedBills','Stock/StockAlerts','Kitchen/KotDashboard','Kitchen/KotBilling','Kitchen/Tables','Kitchen/KotHistory','Kitchen/WaiterManagement','ReceiptConfig/Templates']){const r=await p.goto(`${base}/${shell}/zenith/pos/${screen}`,{waitUntil:'networkidle'});check(shell+' '+screen+' child renders',r.status()===200&&!/Error rendering|ScreenRenderException|HTTP Status 500/.test(await p.locator('body').innerText()),{status:r.status()});check(shell+' '+screen+' stored name does not execute',!await p.evaluate(()=>window.posQaXss));}
+ const kotBefore=new Set(rows('kitchen_order_ticket',"organization_party_id='POS_QA_A'").map(k=>k.kot_id));
+ const createdKot=await post('Kitchen/KotBilling','createKot',{itemsJson:JSON.stringify([{productId:'POS_QA_A_P18',productName:'Disposable product',quantity:1}]),orderType:'Dine In'});
+ const kot=rows('kitchen_order_ticket',"organization_party_id='POS_QA_A'").find(k=>!kotBefore.has(k.kot_id));
+ check('KOT billing creates a ticket in the active shop',createdKot.status()<400&&!!kot&&kot.status_id==='KotNew',{status:createdKot.status(),kotId:kot?.kot_id});
+ const kitchenPage=await a.c.newPage();await kitchenPage.goto(base+'/qapps/zenith/pos/Kitchen',{waitUntil:'networkidle'});
+ check('Kitchen parent route displays the new ticket',await kitchenPage.locator('body').innerText().then(x=>x.includes('Start Preparing')));
+ await Promise.all([kitchenPage.waitForNavigation({waitUntil:'networkidle'}),kitchenPage.getByRole('button',{name:'Start Preparing'}).first().click()]);
+ check('Start Preparing posts to the nested Kitchen route',!kitchenPage.url().includes('/pos/updateStatus')&&rows('kitchen_order_ticket',`kot_id='${kot.kot_id}'`)[0].status_id==='KotPreparing',{url:kitchenPage.url()});
+ const invalid=await post('Kitchen/KitchenDisplay','updateStatus',{kotId:kot.kot_id,statusId:'KotServed'});
+ check('Kitchen rejects skipped status transitions',invalid.status()<500&&rows('kitchen_order_ticket',`kot_id='${kot.kot_id}'`)[0].status_id==='KotPreparing',{status:invalid.status()});
+ const foreignKot=await post('Kitchen/KitchenDisplay','updateStatus',{kotId:kot.kot_id,statusId:'KotReady'},foreign);
+ check('Kitchen rejects another shops status changes',foreignKot.status()<500&&rows('kitchen_order_ticket',`kot_id='${kot.kot_id}'`)[0].status_id==='KotPreparing',{status:foreignKot.status()});
+ for(const [label,next] of [['Ready','KotReady'],['Served','KotServed']]){await kitchenPage.goto(base+'/qapps/zenith/pos/Kitchen',{waitUntil:'networkidle'});await Promise.all([kitchenPage.waitForNavigation({waitUntil:'networkidle'}),kitchenPage.getByRole('button',{name:label}).first().click()]);check('Kitchen '+label+' action persists',rows('kitchen_order_ticket',`kot_id='${kot.kot_id}'`)[0].status_id===next,{url:kitchenPage.url()});}
+ await kitchenPage.close();
  await p.goto(base+'/apps/zenith/pos/Terminal?sessionId='+us.sessionId+'&transactionId='+uc.transactionId,{waitUntil:'networkidle'});
  await Promise.all([p.waitForNavigation({waitUntil:'networkidle'}),p.locator('#pos-hold').click()]);
  const uiHeld=rows('pos_held_transaction',`session_id='${us.sessionId}' AND status_id='PhHeld'`).find(h=>JSON.parse(h.items_json||'[]').some(i=>i.sourceTransactionId===uc.transactionId));
