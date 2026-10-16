@@ -356,23 +356,25 @@
         // Home/Dashboard landing → the "Dashboards" hub (every ERP dashboard)
         if (rel === '/' || rel === '/Dashboard') {
             subBar.innerHTML = '';
-            subBar.removeAttribute('data-mod');
+            subBar.setAttribute('data-mod', '__dash');
             subBar.appendChild(el('span', 'zqsub-title', 'Dashboards'));
             var mods = tenantMods();
             DASHBOARDS.forEach(function (d) {
                 if (d[3] && mods && mods.indexOf(d[3]) < 0) return;   // module not in the tenant's plan → skip
                 var a = el('a', 'zqsub-tab', d[0]); a.href = d[1];
+                a.setAttribute('data-match', d[2]);
                 var on = (d[2] === '/') ? (rel === '/' || rel === '/Dashboard') : (rel.indexOf(d[2]) === 0);
                 if (on) a.classList.add('on');
                 subBar.appendChild(a);
             });
             subBar.classList.add('show'); document.body.classList.add('zq-has-subnav'); syncHeaderLayout();
+            document.dispatchEvent(new Event('zc:subnav-updated'));
             return;
         }
         var key = null, klen = -1;
         for (var k in SUBNAV) { if (rel.indexOf(k) === 0 && k.length > klen) { key = k; klen = k.length; } }
         subBar.innerHTML = '';
-        if (!key) { subBar.classList.remove('show'); document.body.classList.remove('zq-has-subnav'); syncHeaderLayout(); return; }
+        if (!key) { subBar.classList.remove('show'); document.body.classList.remove('zq-has-subnav'); syncHeaderLayout(); document.dispatchEvent(new Event('zc:subnav-updated')); return; }
         var arr = SUBNAV[key], mount = key.slice(1);
         subBar.setAttribute('data-mod', mount);  // ZE-CONTACTS-DS: lets CSS scope the active-tab pill to Contacts only
         // ZE-NAV-ALIAS: a detail/edit screen (menu-include=false, e.g. EditStockTransfer) shares no URL prefix with its
@@ -392,12 +394,14 @@
             if (posCash && !posCash[seg]) continue;
             var href = (mount === 'pos' && seg === 'Terminal') ? '/apps/zenith/pos/Terminal' : ('/qapps/zenith/' + mount + '/' + seg);
             var a = el('a', 'zqsub-tab', label); a.href = href;
+            a.setAttribute('data-match', key + '/' + seg);
             var m = key + '/' + seg; if (relA.indexOf(m) === 0 && m.length > alen) { active = a; alen = m.length; }
             subBar.appendChild(a);
         }
         if (active) active.classList.add('on');
         subBar.classList.add('show'); document.body.classList.add('zq-has-subnav'); syncHeaderLayout();
         if (active) { try { var r = active.getBoundingClientRect(), br = subBar.getBoundingClientRect(); subBar.scrollLeft += (r.left - br.left) - (subBar.clientWidth / 2) + (r.width / 2); } catch (_e) {} }
+        document.dispatchEvent(new Event('zc:subnav-updated'));
     }
 
     function init() {
