@@ -1532,6 +1532,7 @@ window._posOffline = (function() {
 /* === Fullscreen Toggle === */
 window._pfs = window._pfs || {saved: [], active: false};
 window.posPayCash = function(form) {
+    if (form.dataset.posPaymentConfirmed === '1') return true;
     // Cash tender modal: quick denomination buttons + editable amount + live change.
     // Defensive: any script error must NOT block checkout -> fall through to a normal exact-amount submit.
     try {
@@ -1588,12 +1589,15 @@ window.posPayCash = function(form) {
         ov.querySelector('#posCashClear').addEventListener('click', function() { recvInp.value = '0'; refresh(); recvInp.focus(); });
         recvInp.addEventListener('input', refresh);
         function closeOv() { if (ov.parentNode) ov.parentNode.removeChild(ov); }
+        var confirmed = false;
         function doConfirm() {
             var r = parseFloat(recvInp.value) || 0;
-            if (r < due) { return; }
+            if (confirmed || r < due) { return; }
+            confirmed = true;
             if (f) f.value = r.toFixed(2);
             closeOv();
-            form.submit();
+            form.dataset.posPaymentConfirmed = '1';
+            if (form.requestSubmit) form.requestSubmit(); else form.submit();
         }
         ov.querySelector('#posCashCancel').addEventListener('click', closeOv);
         confirmBtn.addEventListener('click', doConfirm);
@@ -1609,6 +1613,7 @@ window.posPayCash = function(form) {
 };
 
 window.posPayDigital = function(form) {
+    if (form.dataset.posPaymentConfirmed === '1') return true;
     // Card / UPI confirmation gate. Unlike Cash, these forms submit (and mint the
     // bill) the instant the button is tapped, so a mis-tap or a declined/cancelled
     // payment would still complete the sale. Require the cashier to confirm the
@@ -1641,7 +1646,12 @@ window.posPayDigital = function(form) {
         function closeOv() { if (ov.parentNode) ov.parentNode.removeChild(ov); }
         var okBtn = ov.querySelector('#posPayConfOk');
         var doneOnce = false;
-        function doConfirm() { if (doneOnce) return; doneOnce = true; closeOv(); form.submit(); }
+        function doConfirm() {
+            if (doneOnce) return;
+            doneOnce = true; closeOv();
+            form.dataset.posPaymentConfirmed = '1';
+            if (form.requestSubmit) form.requestSubmit(); else form.submit();
+        }
         ov.querySelector('#posPayConfCancel').addEventListener('click', closeOv);
         okBtn.addEventListener('click', doConfirm);
         ov.addEventListener('click', function(e) { if (e.target === ov) closeOv(); });
@@ -2740,11 +2750,11 @@ window.posToggleFullscreen = function() {
         }
 
         function payBtn(method, label, bg) {
-            return '<form method="post" action="Terminal/payAndComplete" class="pos-pay-form" style="margin:0">'
+            return '<form method="post" action="Terminal/payAndComplete" class="pos-pay-form" onsubmit="return '+(method === 'Cash' ? 'posPayCash' : 'posPayDigital')+'(this)" style="margin:0">'
                 + '<input type="hidden" name="transactionId" value="'+TX+'"/>'
                 + '<input type="hidden" name="sessionId" value="'+SI+'"/>'
                 + '<input type="hidden" name="paymentMethod" value="'+method+'"/>'
-                + '<input type="hidden" name="amount" value="0"/>'
+                + '<input type="hidden" name="amount" value="'+Number(lastPay || 0)+'"/>'
                 + '<input type="hidden" name="salesModeId" value="'+SM+'"/>'
                 + '<input type="hidden" name="customerPhone" value=""/>'
                 + '<input type="hidden" name="moquiSessionToken" value="'+TK+'"/>'
@@ -3712,6 +3722,18 @@ window.posToggleFullscreen = function() {
             }
             if (act.indexOf('payAndComplete') !== -1 && act.indexOf('splitPayAndComplete') === -1) {
                 e.preventDefault();
+                // This capture listener runs before the form's native confirmation
+                // handler. Gate first, then re-enter once through requestSubmit().
+                e.stopPropagation();
+                if (/posPayCash|posPayDigital/.test(form.getAttribute('onsubmit') || '') && form.dataset.posPaymentConfirmed !== '1') {
+                    var gate = form.querySelector('[name="paymentMethod"]').value === 'Cash' ? window.posPayCash : window.posPayDigital;
+                    if (gate(form) !== false) {
+                        form.dataset.posPaymentConfirmed = '1';
+                        if (form.requestSubmit) form.requestSubmit(); else form.submit();
+                    }
+                    return;
+                }
+                delete form.dataset.posPaymentConfirmed;
                 var fd = new FormData(form);
                 fd.set('transactionId', TX); fd.set('sessionId', SI);
                 fd.set('salesModeId', SM); fd.set('moquiSessionToken', TK);
