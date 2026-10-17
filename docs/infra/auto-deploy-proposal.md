@@ -177,6 +177,24 @@ PR ──► merge to master  (CI: lint guards + review + secret/customer-data s
     deploy job exists yet. Standing up the actual prod-deploy half still needs owner decisions (the
     *Open decisions* below): a deploy runner with scoped prod access, where the QZ key / deploy
     credentials live, the approvers, and the `CODEOWNERS` map. Nothing touches prod until those are set.
+  - **Build + prod-deploy mechanism built & proven (2026-10-17): [`build-from-git.sh`](build-from-git.sh).**
+    This is the `[Build]` + `[Prod deploy job]` boxes above, as a single on-host script. It makes **git the
+    mechanical source of truth**: the app `component/zenith-erp-*` tree comes straight from `git` at a ref,
+    the Moqui infra (Dockerfile, framework-patches, conf) + the host-only QZ secret come from the host, and
+    it runs a **COPY-based `docker build`** on the prod host (the only place the pinned base is cached — GHCR
+    403 elsewhere). Prod then moves by **re-tagging** the freshly built image, never by `docker commit` of a
+    mutated container — which **eliminates both the build-context drift** (the context's app tree is git, not
+    the running container) **and the per-deploy commit/rollback-image churn** behind the disk-fill outages.
+    Two modes: `candidate [REF]` builds `:gitbuild-<sha>` and boot-verifies it in a throwaway pg+moqui stack
+    (127.0.0.1:8099, empty DB → expect login 302/401) with **zero prod impact**; `promote [REF]` tags a
+    rollback, re-tags `:latest`, refreshes the canonical context, `compose restart`s (never `up -d`), polls,
+    and **auto-rolls-back** if health never returns. It carries the same single-flight `flock` + disk-guard +
+    rollback-tag-trim as the hardened manual pipeline. **Verified 2026-10-17:** `candidate master` builds in
+    ~13 s and boots clean (302, no screen/service/Groovy parse errors); an A/B control proved the git-built
+    image is behaviorally identical to the deployed `:latest` (same empty-DB cold-load FK noise, which is
+    intrinsic and absent on real prod). DB/entity-schema migrations and seed/data loads stay **out of scope**
+    (manual), exactly as the non-goals above. `promote` is human-invoked today; a CI deploy runner can call it
+    once owner decisions 2/4/5 are made.
 - **Phase 3 — widen the auto tiers** as confidence grows; add monitoring-driven auto-rollback.
 
 ## The honest tradeoff
