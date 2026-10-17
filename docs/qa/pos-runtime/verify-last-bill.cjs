@@ -21,6 +21,7 @@ module.exports=async function({a,base,check,q,invoke,post,out}) {
   await page.waitForFunction(number=>document.getElementById('pos-last-completed')?.textContent.includes(number),saved.transaction_number);
   check('AJAX checkout refreshes Last bill number and amount',await page.locator('#pos-last-completed').innerText()===`Last: ${saved.transaction_number} / ${amount.toFixed(2)}`);
   check('header also shows the most recently completed bill',await page.locator('#pos-bill-badge').innerText()===saved.transaction_number);
+  check('completed checkout removes the old cart ID from the refresh URL',!new URL(page.url()).searchParams.has('transactionId'));
   return saved;
  }
  try {
@@ -35,6 +36,7 @@ module.exports=async function({a,base,check,q,invoke,post,out}) {
   const frozen=JSON.stringify([record(older.transactionId),record(newer.transactionId)]);
   await page.reload();await page.locator('#pos-last-completed').waitFor();
   check('Last uses completion order after refresh',await page.locator('#pos-last-completed').innerText()===`Last: ${last.transaction_number} / 118.00`);
+  check('refresh retains an empty new cart with zero payable',await page.locator('.pos-sum-total').innerText().then(text=>/₹0(?:\.00)?\s*$/.test(text)));
   await page.screenshot({path:path.join(out,'last-completed-bill-after-recall.png')});
   check('Last display changes no issued bill number or amount',JSON.stringify([record(older.transactionId),record(newer.transactionId)])===frozen);
   check('last-bill checkout and layout updates have no browser errors',errors.length===0,{errors});

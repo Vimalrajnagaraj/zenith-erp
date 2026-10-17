@@ -3013,6 +3013,15 @@ window.posToggleFullscreen = function() {
         }
 
         function syncIssuedBillHeader(doc) {
+            // Checkout leaves an empty cart. A refresh must not reopen the completed
+            // transaction still present in the original cashier URL.
+            if (!TX) {
+                var current = new URL(window.location.href);
+                if (current.searchParams.has('transactionId')) {
+                    current.searchParams.delete('transactionId');
+                    history.replaceState(history.state, '', current.pathname + current.search + current.hash);
+                }
+            }
             var sourceBill = doc.querySelector('#pos-bill-badge');
             var bill = document.getElementById('pos-bill-badge');
             if (sourceBill && bill) {
