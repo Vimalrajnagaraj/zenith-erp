@@ -386,6 +386,7 @@ const rows=(table,where)=>q(`SELECT * FROM ${table} WHERE ${where}`),count=(tabl
  const closeCredit=await invoke('close',{sessionId:creditSession.sessionId,closingCash:'150'});
  check('upfront cash reconciles in the credit session',Number(rows('pos_session',`session_id='${creditSession.sessionId}'`)[0].cash_difference)===0,{closeCredit});
  }
+ if(process.env.POS_QA_UI_ONLY!=='true') await require('./verify-item-sequence.cjs')({invoke,check,q});
  const screens=['Dashboard','OwnerDashboard','Terminal','PosTransactions','DailySummary','PosSessions','PosTerminals','CreditBills','CashEntry','Expenses','Wastage','Stock','Reports','BillAuditReport','ProductPricing','PriceOverrides','DiscountSettings','SalesMode','Barcodes','BarcodeLabels','ProductImport','ReceiptConfig','PrinterConfig','Kitchen','BillNumberRegister','OfflineMode',`EditTransaction?transactionId=${t.transactionId}`,`EditSession?sessionId=${s.sessionId}`];
  for(const shell of ['apps','qapps'])for(const screen of screens){await p.setViewportSize({width:1366,height:768});const r=await p.goto(`${base}/${shell}/zenith/pos/${screen}`,{waitUntil:'networkidle',timeout:60000});const text=await p.locator('body').innerText();const error=/Error rendering|ScreenRenderException|500 Internal Server Error|HTTP Status 500|freemarker\.core/i.test(text);report.pages.push({shell,screen,status:r.status(),error,url:p.url()});check(shell+' '+screen+' renders',r.status()===200&&!error,{status:r.status(),error});}
  // A populated Daily Summary used to render the FreeMarker ?url charset exception as table rows.
