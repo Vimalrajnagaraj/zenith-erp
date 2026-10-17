@@ -23,7 +23,7 @@ module.exports=async function({a,foreign,base,check,q,out}) {
    check(`${shell} row Save posts once and commits only its shop price`,posts===before+1&&read('POS_QA_A_P18')===500&&read('POS_QA_B_P18')===600);
    await page.reload();await row.waitFor();
    check(`${shell} saved price survives refresh`,await input.inputValue()==='500');
-   await page.goto(`${base}/${shell}/zenith/pos/SalesMode`);await page.locator('.smode-h1').waitFor();await page.waitForLoadState('networkidle');await page.goBack();await row.waitFor();
+   await page.locator('#zq-subnav a[href*="/SalesMode"]').click();await page.locator('.smode-h1').waitFor();await page.waitForLoadState('networkidle');await page.goBack();await row.waitFor();
    check(`${shell} Back restores saved selected-mode price`,await input.inputValue()==='500'&&await root.locator('[data-mode-id=WHOLESALE]').count()===0);
    await page.goForward();await page.locator('.smode-h1').waitFor();await page.waitForLoadState('networkidle');await page.goBack();await row.waitFor();
    const historyPosts=posts;await input.fill('501');const second=page.waitForResponse(r=>r.url().includes('/ProductPricing/savePrices'));
@@ -42,6 +42,10 @@ module.exports=async function({a,foreign,base,check,q,out}) {
    const foreignWrite=await save(foreign,'POS_QA_A_P18',700,shell);
    check(`${shell} second shop cannot overwrite first-shop price`,foreignWrite.status()===403&&read('POS_QA_A_P18')===501&&read('POS_QA_B_P18')===600);
   }
+ } catch(error) {
+  await page.screenshot({path:path.join(out,'pricing-save-failure.png'),fullPage:true});
+  error.message += `; URL=${page.url()}; body=${(await page.locator('body').innerText()).slice(-1200)}`;
+  throw error;
  } finally {
   for(const [id,price] of Object.entries(originals)) {
    const response=await save(id.includes('_B_')?foreign:a,id,price);
