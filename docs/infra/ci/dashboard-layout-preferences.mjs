@@ -5,6 +5,9 @@ import assert from 'node:assert/strict';
 export async function verifyDashboardLayout(page, base, surface, screenshot) {
   await page.goto(`${base}/${surface}/zenith/pos/Dashboard`, { waitUntil: 'domcontentloaded' });
   await page.waitForSelector('.pos-dash-v2');
+  if (surface === 'qapps') {
+    await page.waitForFunction(() => document.documentElement.classList.contains('zq-nav-ready'));
+  }
   await page.click('.pos-dash-customize');
   await page.waitForSelector('#pos-dash-settings');
   if (screenshot) await page.screenshot({ path: screenshot });
@@ -15,6 +18,10 @@ export async function verifyDashboardLayout(page, base, surface, screenshot) {
   assert.equal(paths.save, `/${surface}/zenith/pos/Dashboard/saveDashLayout`);
   assert.equal(paths.reset, `/${surface}/zenith/pos/Dashboard/resetDashLayout`);
   const submit = async (path, selector) => {
+    await page.$eval(selector, button => new Promise(resolve => {
+      button.scrollIntoView({ block: 'center' });
+      requestAnimationFrame(() => requestAnimationFrame(resolve));
+    }));
     const [response] = await Promise.all([
       page.waitForResponse(r => r.request().method() === 'POST' && new URL(r.url()).pathname === path),
       page.click(selector),
@@ -28,7 +35,7 @@ export async function verifyDashboardLayout(page, base, surface, screenshot) {
   await page.waitForSelector('.pos-dash-v2');
   assert.equal(await page.$('.pos-dash-secondary'), null, `${surface}: choice was not persisted`);
   await page.click('.pos-dash-customize');
-  await page.waitForSelector('#pos-dash-settings');
+  await page.waitForSelector('#pos-dash-settings', { visible: true });
   await submit(paths.reset, '#pos-dash-settings .pos-dash-reset');
   await page.waitForSelector('.pos-dash-secondary');
   await page.reload({ waitUntil: 'domcontentloaded' });
