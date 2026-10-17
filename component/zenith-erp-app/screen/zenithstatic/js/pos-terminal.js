@@ -3012,16 +3012,17 @@ window.posToggleFullscreen = function() {
                 + esc(bill && bill.dataset.sessionLastAmount || '0') + '</div>';
         }
 
-        function syncIssuedBillHeader(doc) {
+        function clearCompletedCartUrl() {
             // Checkout leaves an empty cart. A refresh must not reopen the completed
             // transaction still present in the original cashier URL.
-            if (!TX) {
-                var current = new URL(window.location.href);
-                if (current.searchParams.has('transactionId')) {
-                    current.searchParams.delete('transactionId');
-                    history.replaceState(history.state, '', current.pathname + current.search + current.hash);
-                }
+            var current = new URL(window.location.href);
+            if (current.searchParams.has('transactionId')) {
+                current.searchParams.delete('transactionId');
+                history.replaceState(history.state, '', current.pathname + current.search + current.hash);
             }
+        }
+
+        function syncIssuedBillHeader(doc) {
             var sourceBill = doc.querySelector('#pos-bill-badge');
             var bill = document.getElementById('pos-bill-badge');
             if (sourceBill && bill) {
@@ -3773,6 +3774,7 @@ window.posToggleFullscreen = function() {
                         printReceipt(savedTx, billNum, TO, false, d.receiptUnavailable ? null : d);
                         TX = '';
                         lastTxnNum = '';
+                        clearCompletedCartUrl();
                         return fetchScreen({});
                     })
                     .then(function(doc) {
@@ -3831,6 +3833,7 @@ window.posToggleFullscreen = function() {
                         lastTxnNum = '';
                         lastPay = 0;
                         lastCartData = null;
+                        clearCompletedCartUrl();
                         return fetchScreen({});
                     })
                     .then(function(doc) {
@@ -3937,6 +3940,7 @@ window.posToggleFullscreen = function() {
                         showToast(toastMsg);
                         printReceipt(savedTx, billNum, TO, false, d.receiptUnavailable ? null : d);
                         TX = ''; lastTxnNum = ''; lastPay = 0; lastCartData = null;
+                        clearCompletedCartUrl();
                         return fetchScreen({});
                     })
                     .then(function(doc) {
