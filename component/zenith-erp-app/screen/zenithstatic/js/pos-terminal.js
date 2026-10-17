@@ -3008,8 +3008,8 @@ window.posToggleFullscreen = function() {
         function lastCompletedMarkup() {
             var bill = document.getElementById('pos-bill-badge');
             return '<div id="pos-last-completed" style="font-size:13px;color:#777">Last: '
-                + esc(bill && bill.dataset.sessionLastBill || '-') + ' / '
-                + esc(bill && bill.dataset.sessionLastAmount || '0') + '</div>';
+                + cartText(bill && bill.dataset.sessionLastBill || '-') + ' / '
+                + cartText(bill && bill.dataset.sessionLastAmount || '0') + '</div>';
         }
 
         function clearCompletedCartUrl() {
