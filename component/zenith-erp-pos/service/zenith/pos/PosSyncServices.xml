@@ -45,7 +45,7 @@
                 // Invoice header (start In-Process)
                 def inv = ec.service.sync().name("mantle.account.InvoiceServices.create#Invoice").parameters([
                     invoiceTypeEnumId:"InvoiceSales", fromPartyId:org, toPartyId:toParty,
-                    invoiceDate:txn.entryDate, currencyUomId:"INR", statusId:"InvoiceInProcess"]).call()
+                    invoiceDate:(txn.completedDate ?: txn.entryDate), currencyUomId:"INR", statusId:"InvoiceInProcess"]).call()
                 def iid = inv.invoiceId
 
                 def items = ec.entity.find("zenith.erp.pos.PosTransactionItem")
@@ -78,12 +78,46 @@
                     }
                 }
 
-                // Header totals + use the POS bill number as the tax-invoice number + finalize
+                // GST invoice number is per-organization. Default (legacy) = the POS bill number itself, which is a
+                // per-financial-year CONSECUTIVE series. When a shop opts in to daily POS bill numbers the POS number
+                // is no longer FY-consecutive, so the GST invoice gets its OWN per-(org, FY) consecutive series
+                // (INV/FY/NNNNN) — never a gappy global sequence — to stay GST Rule 46 compliant.
+                def _billCfg = org ? ec.entity.find('zenith.erp.pos.PosOrgBillingConfig').condition('organizationPartyId', org).one() : null
                 def fy = ec.service.sync().name("zenith.base.LocalizationServices.get#FinancialYearDates")
-                    .parameters([organizationPartyId:org, referenceDate:txn.entryDate]).call()
+                    .parameters([organizationPartyId:org, referenceDate:(txn.completedDate ?: txn.entryDate)]).call()
+                def invoiceNumber
+                if (_billCfg?.dailyBillNumbering == 'Y') {
+                    if (!fy?.fyLabel) throw new IllegalStateException('Financial year required for POS invoice ' + iid)
+                    // Atomic per-(org, FY) CONSECUTIVE GST invoice counter (seqKey distinct from the POS bill counter).
+                    def gstKey = org + "_GSTINV_" + fy.fyLabel
+                    def gNext
+                    def gCounter = ec.entity.find("zenith.erp.pos.PosBillSequence").condition("seqKey", gstKey).forUpdate(true).one()
+                    if (gCounter != null) {
+                        gNext = ((gCounter.lastNumber ?: 0) as int) + 1
+                        ec.service.sync().name("update#zenith.erp.pos.PosBillSequence").parameters([seqKey:gstKey, lastNumber:gNext]).call()
+                    } else {
+                        // First GST invoice for this org+FY: seed from the existing max so retries never collide.
+                        int gmx = 0
+                        def gPrior = ec.entity.find("mantle.account.invoice.Invoice").condition("fromPartyId", org)
+                            .condition("gstInvoiceNumber", "like", "INV/${fy.fyLabel}/%").selectField("gstInvoiceNumber").list()
+                        for (r in gPrior) { def m = (r.gstInvoiceNumber =~ /\/(\d+)$/); if (m.find()) { int n = m.group(1) as int; if (n > gmx) gmx = n } }
+                        gNext = gmx + 1
+                        try {
+                            ec.service.sync().name("create#zenith.erp.pos.PosBillSequence").parameters([seqKey:gstKey, lastNumber:gNext]).call()
+                        } catch (Exception e) {
+                            def gc2 = ec.entity.find("zenith.erp.pos.PosBillSequence").condition("seqKey", gstKey).forUpdate(true).one()
+                            gNext = (((gc2?.lastNumber ?: gmx) as int)) + 1
+                            ec.service.sync().name("update#zenith.erp.pos.PosBillSequence").parameters([seqKey:gstKey, lastNumber:gNext]).call()
+                        }
+                    }
+                    invoiceNumber = "INV/${fy.fyLabel}/" + String.format("%05d", gNext)
+                } else {
+                    // Legacy coupling: the GST invoice number IS the POS bill number (a per-FY consecutive series).
+                    invoiceNumber = txn.transactionNumber
+                }
                 def docType = (((txn.totalTaxAmount ?: 0) as BigDecimal) > 0) ? "Tax Invoice" : "Bill of Supply"
                 ec.service.sync().name("update#mantle.account.invoice.Invoice").parameters([
-                    invoiceId:iid, customInvoiceNumber:txn.transactionNumber, gstInvoiceNumber:txn.transactionNumber,
+                    invoiceId:iid, customInvoiceNumber:invoiceNumber, gstInvoiceNumber:invoiceNumber,
                     financialYearPrefix:fy?.fyLabel, invoiceTotal:txn.grandTotal, unpaidTotal:txn.grandTotal, totalTaxableAmount:txn.subtotal, totalTaxAmount:txn.totalTaxAmount,
                     roundOffAmount:txn.roundOff, documentType:docType, statusId:"InvoiceFinalized", facilityId:_shopFac]).call()
 
@@ -97,7 +131,7 @@
                                 ec.service.sync().name("zenith.inventory.InventoryStockServices.adjust#AssetOnHand")
                                     .parameters([organizationPartyId:org, productId:li.productId,
                                                  quantityDiff:(-((li.quantity ?: 0) as BigDecimal)),
-                                                 reason:("POS Sale " + txn.transactionNumber), effectiveDate:txn.entryDate]).call()
+                                                 reason:("POS Sale " + txn.transactionNumber), effectiveDate:(txn.completedDate ?: txn.entryDate)]).call()
                             } catch (Throwable e) { ec.logger.error("Stock depletion failed for " + li.productId + ": " + e.message) }
                         }
                     }

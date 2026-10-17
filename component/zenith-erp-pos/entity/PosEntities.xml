@@ -96,7 +96,11 @@
         <field name="organizationPartyId" type="id"/>
         <field name="operatorPartyId" type="id"/>
         <field name="openDate" type="date-time"/>
+        <field name="lastActivityDate" type="date-time"><description>Last cashier interaction or completed bill; null on pre-upgrade sessions so they are not closed by an idle sweep.</description></field>
         <field name="closeDate" type="date-time"/>
+        <field name="closeReason" type="text-short"><description>IdleUnverifiedCash until a later count; IdleReviewed after review. IdleNoSales is retained for earlier empty-session closures.</description></field>
+        <field name="cashReviewedByPartyId" type="id"/>
+        <field name="cashReviewedDate" type="date-time"/>
         <field name="openingCash" type="currency-amount"/>
         <field name="closingCash" type="currency-amount"/>
         <field name="expectedCash" type="currency-amount"/>
@@ -107,11 +111,16 @@
         <field name="statusId" type="id"/>
         <relationship type="one" related="zenith.erp.pos.PosTerminal"/>
         <relationship type="one" title="PosSession" related="moqui.basic.StatusItem"/>
+        <index name="POS_SESSION_IDLE"><index-field name="statusId"/><index-field name="lastActivityDate"/></index>
         <seed-data>
             <moqui.basic.StatusType statusTypeId="PosSession" description="POS Session"/>
             <moqui.basic.StatusItem statusId="PsOpen" statusTypeId="PosSession" description="Open" sequenceNum="1"/>
             <moqui.basic.StatusItem statusId="PsClosed" statusTypeId="PosSession" description="Closed" sequenceNum="2"/>
             <moqui.basic.StatusFlowTransition statusFlowId="Default" statusId="PsOpen" toStatusId="PsClosed" transitionName="Close Session"/>
+            <moqui.service.job.ServiceJob jobName="zenith_PosIdleSessionSweep_5min"
+                description="Close idle POS sessions after one hour; cash remains unverified until reviewed"
+                serviceName="zenith.pos.PosServices.sweep#IdlePosSessions"
+                cronExpression="0 0/5 * * * ?" paused="N"/>
         </seed-data>
     </entity>
 
@@ -145,6 +154,7 @@
         <field name="linkedInvoiceId" type="id"/>
         <relationship type="one" related="zenith.erp.pos.PosSession"/>
         <relationship type="one" title="PosTransaction" related="moqui.basic.StatusItem"/>
+        <index name="POS_TRANSACTION_DAY"><index-field name="organizationPartyId"/><index-field name="statusId"/><index-field name="completedDate"/></index>
         <seed-data>
             <moqui.basic.StatusType statusTypeId="PosTransaction" description="POS Transaction"/>
             <moqui.basic.StatusItem statusId="PtCreated" statusTypeId="PosTransaction" description="Created" sequenceNum="1"/>
@@ -157,9 +167,9 @@
         </seed-data>
     </entity>
 
-    <!-- Atomic per-(org, financial-year) bill-number counter -->
+    <!-- Atomic per-(org, local calendar day) POS bill counter; legacy FY keys remain untouched. -->
     <entity entity-name="PosBillSequence" package="zenith.erp.pos" short-alias="PosBillSequences">
-        <field name="seqKey" type="text-medium" is-pk="true"><description>organizationPartyId + "_" + FY label, e.g. 100000_FY 2026-27</description></field>
+        <field name="seqKey" type="text-medium" is-pk="true"><description>organizationPartyId + "_" + yyyyMMdd for new POS bills; old FY keys are retained.</description></field>
         <field name="lastNumber" type="number-integer"/>
     </entity>
 
@@ -775,6 +785,16 @@
         <field name="minOrderAmount" type="currency-amount"><description>Block completing a sale in this mode when the bill total is below this. Null/0 = no minimum.</description></field>
         <relationship type="one" related="zenith.erp.pos.PosSalesMode" short-alias="salesMode">
             <key-map field-name="salesModeId"/></relationship>
+    </entity>
+
+    <!-- ========== Per-organization POS billing options (opt-in) ==========
+         A missing row, or the default values, mean LEGACY behaviour, so this is a
+         no-op for every existing tenant until a shop explicitly opts in. -->
+    <entity entity-name="PosOrgBillingConfig" package="zenith.erp.pos" short-alias="PosOrgBillingConfigs">
+        <field name="organizationPartyId" type="id" is-pk="true"/>
+        <field name="dailyBillNumbering" type="text-indicator" default="'N'"><description>Y = POS bill numbers reset per India business day (POS/yyyyMMdd/NNNNN) and the GST invoice number is minted as its own per-financial-year CONSECUTIVE series (INV/FY/NNNNN). N (default) = legacy per-financial-year consecutive POS number, which is also used verbatim as the GST invoice number.</description></field>
+        <field name="idleSessionAutoClose" type="text-indicator" default="'N'"><description>Y = the 5-minute sweep closes this shop's sessions idle &gt; 1 hour, leaving the cash count unverified for later review. N (default) = sessions are never closed by a timer (no time-based expiry).</description></field>
+        <relationship type="one" title="Organization" related="mantle.party.Party"><key-map field-name="organizationPartyId" related="partyId"/></relationship>
     </entity>
 
     <!-- ========== Explicit per-product price for each sales mode ==========
