@@ -2774,7 +2774,7 @@ window.posToggleFullscreen = function() {
             extractHeldInfo(document); // keep held count/id in sync with the live header badge
             var modeLabel = SM ? (SM.charAt(0).toUpperCase() + SM.slice(1).toLowerCase()) : 'Retail';
             var sh = '<div class="pos-sum-strip" style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">'
-                + '<div style="font-size:13px;color:#777">Last: - / 0</div>'
+                + lastCompletedMarkup()
                 + '<div style="display:flex;gap:16px;font-size:14px">'
                 + '<span style="color:#555">Qty: <b id="posSumQty">'+fmt(d.tQty)+'</b></span>'
                 + '<span style="color:#555">Tax: <b id="posSumTax">'+fmt(d.tax)+'</b></span>'
@@ -2808,7 +2808,7 @@ window.posToggleFullscreen = function() {
         function buildSplitPanel() {
             var modeLabel = SM ? (SM.charAt(0).toUpperCase() + SM.slice(1).toLowerCase()) : 'Retail';
             return '<div class="pos-sum-strip" style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">'
-                + '<div style="font-size:13px;color:#777">Last: - / 0</div>'
+                + lastCompletedMarkup()
                 + '<div style="display:flex;gap:16px;font-size:14px">'
                 + '<span style="color:#555">Qty: <b>'+(lastCartData ? fmt(lastCartData.tQty) : '0')+'</b></span>'
                 + '<span style="color:#555">Tax: <b>'+(lastCartData ? fmt(lastCartData.tax) : '0')+'</b></span>'
@@ -2870,7 +2870,7 @@ window.posToggleFullscreen = function() {
         function buildCashPanel() {
             var modeLabel = SM ? (SM.charAt(0).toUpperCase() + SM.slice(1).toLowerCase()) : 'Retail';
             return '<div class="pos-sum-strip" style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">'
-                + '<div style="font-size:13px;color:#777">Last: - / 0</div>'
+                + lastCompletedMarkup()
                 + '<div style="display:flex;gap:16px;font-size:14px">'
                 + '<span style="color:#555">Qty: <b>'+(lastCartData ? fmt(lastCartData.tQty) : '0')+'</b></span>'
                 + '<span style="color:#555">Tax: <b>'+(lastCartData ? fmt(lastCartData.tax) : '0')+'</b></span>'
@@ -3005,14 +3005,26 @@ window.posToggleFullscreen = function() {
             if (_cn) _cn.textContent = (d.customer && d.customer.length) ? d.customer : 'Walk-In';
         }
 
+        function lastCompletedMarkup() {
+            var bill = document.getElementById('pos-bill-badge');
+            return '<div id="pos-last-completed" style="font-size:13px;color:#777">Last: '
+                + esc(bill && bill.dataset.sessionLastBill || '-') + ' / '
+                + esc(bill && bill.dataset.sessionLastAmount || '0') + '</div>';
+        }
+
         function syncIssuedBillHeader(doc) {
             var sourceBill = doc.querySelector('#pos-bill-badge');
             var bill = document.getElementById('pos-bill-badge');
             if (sourceBill && bill) {
                 bill.dataset.lastBill = sourceBill.dataset.lastBill || '';
+                bill.dataset.sessionLastBill = sourceBill.dataset.sessionLastBill || '-';
+                bill.dataset.sessionLastAmount = sourceBill.dataset.sessionLastAmount || '0';
                 bill.textContent = sourceBill.textContent;
                 bill.classList.toggle('nb-billno__new', !bill.dataset.lastBill);
             }
+            var lastSummary = document.getElementById('pos-last-completed');
+            if (lastSummary && bill) lastSummary.textContent = 'Last: '
+                + (bill.dataset.sessionLastBill || '-') + ' / ' + (bill.dataset.sessionLastAmount || '0');
             var sourceCount = doc.querySelector('#pos-today-bills');
             var count = document.getElementById('pos-today-bills');
             if (sourceCount && count) {
@@ -3928,6 +3940,7 @@ window.posToggleFullscreen = function() {
                         var ntk = doc.querySelector('input[name="moquiSessionToken"]');
                         if (ntk && ntk.value) TK = ntk.value;
                         swapGrid(doc);
+                        syncIssuedBillHeader(doc);
                         var nb = doc.querySelector('.pos-cart tbody');
                         if (nb) document.querySelector('.pos-cart tbody').innerHTML = nb.innerHTML;
                         var ns = doc.querySelector('.pos-summary');
