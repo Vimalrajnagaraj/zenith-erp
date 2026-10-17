@@ -23,7 +23,9 @@ module.exports=async function({a,foreign,base,check,q,out}) {
    check(`${shell} row Save posts once and commits only its shop price`,posts===before+1&&read('POS_QA_A_P18')===500&&read('POS_QA_B_P18')===600);
    await page.reload();await row.waitFor();
    check(`${shell} saved price survives refresh`,await input.inputValue()==='500');
-   await page.locator('#zq-subnav a[href*="/SalesMode"]').click();await page.locator('.smode-h1').waitFor();await page.waitForLoadState('networkidle');await page.goBack();await row.waitFor();
+   if(shell==='qapps')await page.locator('a[href*="/pos/SalesMode"]').first().click();
+   else await page.goto(`${base}/${shell}/zenith/pos/SalesMode`);
+   await page.locator('.smode-h1').waitFor();await page.waitForLoadState('networkidle');await page.goBack();await row.waitFor();
    check(`${shell} Back restores saved selected-mode price`,await input.inputValue()==='500'&&await root.locator('[data-mode-id=WHOLESALE]').count()===0);
    await page.goForward();await page.locator('.smode-h1').waitFor();await page.waitForLoadState('networkidle');await page.goBack();await row.waitFor();
    const historyPosts=posts;await input.fill('501');const second=page.waitForResponse(r=>r.url().includes('/ProductPricing/savePrices'));
