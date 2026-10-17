@@ -3,13 +3,21 @@ import assert from 'node:assert/strict';
 // Form submissions can navigate the document or refresh the Quasar subscreen.
 // Verify the real response and resulting preference, rather than requiring one transport.
 export async function verifyDashboardLayout(page, base, surface, screenshot) {
+  const ready = async () => {
+    await page.waitForSelector('.pos-dash-v2');
+    if (surface === 'qapps') await page.waitForFunction(() => document.documentElement.classList.contains('zq-nav-ready'));
+  };
+  const click = async selector => {
+    await page.$eval(selector, button => new Promise(resolve => {
+      button.scrollIntoView({ block: 'center' });
+      requestAnimationFrame(() => requestAnimationFrame(resolve));
+    }));
+    await page.click(selector);
+  };
   await page.goto(`${base}/${surface}/zenith/pos/Dashboard`, { waitUntil: 'domcontentloaded' });
-  await page.waitForSelector('.pos-dash-v2');
-  if (surface === 'qapps') {
-    await page.waitForFunction(() => document.documentElement.classList.contains('zq-nav-ready'));
-  }
-  await page.click('.pos-dash-customize');
-  await page.waitForSelector('#pos-dash-settings');
+  await ready();
+  await click('.pos-dash-customize');
+  await page.waitForSelector('#pos-dash-settings', { visible: true });
   if (screenshot) await page.screenshot({ path: screenshot });
   const paths = await page.$eval('#pos-dash-settings', form => ({
     save: new URL(form.action).pathname,
@@ -18,13 +26,9 @@ export async function verifyDashboardLayout(page, base, surface, screenshot) {
   assert.equal(paths.save, `/${surface}/zenith/pos/Dashboard/saveDashLayout`);
   assert.equal(paths.reset, `/${surface}/zenith/pos/Dashboard/resetDashLayout`);
   const submit = async (path, selector) => {
-    await page.$eval(selector, button => new Promise(resolve => {
-      button.scrollIntoView({ block: 'center' });
-      requestAnimationFrame(() => requestAnimationFrame(resolve));
-    }));
     const [response] = await Promise.all([
       page.waitForResponse(r => r.request().method() === 'POST' && new URL(r.url()).pathname === path),
-      page.click(selector),
+      click(selector),
     ]);
     assert(response.status() < 400, `${surface}: preference POST returned ${response.status()}`);
   };
@@ -32,13 +36,14 @@ export async function verifyDashboardLayout(page, base, surface, screenshot) {
   await submit(paths.save, '#pos-dash-settings button[type="submit"]:not(.pos-dash-reset)');
   await page.waitForFunction(() => !!document.querySelector('.pos-dash-v2') && !document.querySelector('.pos-dash-secondary'));
   await page.reload({ waitUntil: 'domcontentloaded' });
-  await page.waitForSelector('.pos-dash-v2');
+  await ready();
   assert.equal(await page.$('.pos-dash-secondary'), null, `${surface}: choice was not persisted`);
-  await page.click('.pos-dash-customize');
+  await click('.pos-dash-customize');
   await page.waitForSelector('#pos-dash-settings', { visible: true });
   await submit(paths.reset, '#pos-dash-settings .pos-dash-reset');
   await page.waitForSelector('.pos-dash-secondary');
   await page.reload({ waitUntil: 'domcontentloaded' });
+  await ready();
   await page.waitForSelector('.pos-dash-secondary');
   console.log(`PASS POS Customize Save/persist/Reset on /${surface}`);
 }

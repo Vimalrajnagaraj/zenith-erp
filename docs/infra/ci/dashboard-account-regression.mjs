@@ -13,6 +13,7 @@ assert(['localhost', '127.0.0.1'].includes(url.hostname) && url.port === '8080')
 const browser = await puppeteer.launch({ headless: 'new', args: ['--no-sandbox', '--disable-dev-shm-usage'] });
 try {
   const page = await browser.newPage();
+  await page.setViewport({ width: 1366, height: 900 });
   await establishSession(page, base, 'john.doe', 'moqui');
   for (const surface of ['apps', 'qapps']) {
     await verifyDashboardLayout(page, base, surface, surface === 'apps' ? join(process.env.RUNNER_TEMP || process.cwd(), 'pos-dashboard-customize-ci.png') : null);
@@ -21,6 +22,7 @@ try {
   // The fixture user has no MY_ACCOUNT_USERS membership. Header destinations
   // must open the own-user workspace, without granting access to SimpleScreens.
   const staff = await browser.newPage();
+  await staff.setViewport({ width: 1366, height: 900 });
   await establishSession(staff, base, 'citest.a', 'moqui');
   const staffDashboard = `${base}/qapps/zenith/pos/Dashboard`;
   await staff.goto(staffDashboard, { waitUntil: 'networkidle2' });
