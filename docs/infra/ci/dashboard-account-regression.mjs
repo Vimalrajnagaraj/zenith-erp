@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { join } from 'node:path';
 import puppeteer from 'puppeteer';
 import { establishSession } from './session.mjs';
+import { verifyDashboardLayout } from './dashboard-layout-preferences.mjs';
 
 const base = (process.argv[2] || 'http://localhost:8080').replace(/\/+$/, '');
 const url = new URL(base);
@@ -12,35 +13,16 @@ assert(['localhost', '127.0.0.1'].includes(url.hostname) && url.port === '8080')
 const browser = await puppeteer.launch({ headless: 'new', args: ['--no-sandbox', '--disable-dev-shm-usage'] });
 try {
   const page = await browser.newPage();
+  await page.setViewport({ width: 1366, height: 900 });
   await establishSession(page, base, 'john.doe', 'moqui');
   for (const surface of ['apps', 'qapps']) {
-    const dashboard = `${base}/${surface}/zenith/pos/Dashboard`;
-    await page.goto(dashboard, { waitUntil: 'networkidle2' });
-    await page.waitForSelector('.pos-dash-v2');
-    await page.click('.pos-dash-customize');
-    await page.waitForSelector('#pos-dash-settings');
-    if (surface === 'apps') await page.screenshot({ path: join(process.env.RUNNER_TEMP || process.cwd(), 'pos-dashboard-customize-ci.png') });
-    const paths = await page.$eval('#pos-dash-settings', form => ({
-      save: new URL(form.action).pathname,
-      reset: new URL(form.querySelector('.pos-dash-reset').formAction).pathname,
-    }));
-    assert.equal(paths.save, `/${surface}/zenith/pos/Dashboard/saveDashLayout`);
-    assert.equal(paths.reset, `/${surface}/zenith/pos/Dashboard/resetDashLayout`);
-    await page.$eval('#pos-dash-settings [name="w_opsKpi"]', input => { input.checked = false; });
-    await Promise.all([page.waitForNavigation({ waitUntil: 'networkidle2' }), page.click('#pos-dash-settings button[type="submit"]:not(.pos-dash-reset)')]);
-    assert.equal(await page.$('.pos-dash-secondary'), null, `${surface}: operations remained visible after Save`);
-    await page.reload({ waitUntil: 'networkidle2' });
-    assert.equal(await page.$('.pos-dash-secondary'), null, `${surface}: choice was not persisted`);
-    await page.click('.pos-dash-customize');
-    await page.waitForSelector('#pos-dash-settings');
-    await Promise.all([page.waitForNavigation({ waitUntil: 'networkidle2' }), page.click('#pos-dash-settings .pos-dash-reset')]);
-    assert(await page.$('.pos-dash-secondary'), `${surface}: Reset did not restore role defaults`);
-    console.log(`PASS POS Customize Save/persist/Reset on /${surface}`);
+    await verifyDashboardLayout(page, base, surface, surface === 'apps' ? join(process.env.RUNNER_TEMP || process.cwd(), 'pos-dashboard-customize-ci.png') : null);
   }
 
   // The fixture user has no MY_ACCOUNT_USERS membership. Header destinations
   // must open the own-user workspace, without granting access to SimpleScreens.
   const staff = await browser.newPage();
+  await staff.setViewport({ width: 1366, height: 900 });
   await establishSession(staff, base, 'citest.a', 'moqui');
   const staffDashboard = `${base}/qapps/zenith/pos/Dashboard`;
   await staff.goto(staffDashboard, { waitUntil: 'networkidle2' });
