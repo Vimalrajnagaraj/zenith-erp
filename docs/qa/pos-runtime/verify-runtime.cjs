@@ -386,8 +386,8 @@ const rows=(table,where)=>q(`SELECT * FROM ${table} WHERE ${where}`),count=(tabl
  const closeCredit=await invoke('close',{sessionId:creditSession.sessionId,closingCash:'150'});
  check('upfront cash reconciles in the credit session',Number(rows('pos_session',`session_id='${creditSession.sessionId}'`)[0].cash_difference)===0,{closeCredit});
  }
+ if(process.env.POS_QA_UI_ONLY!=='true') await require('./verify-transactions-csv.cjs')({a,foreign,base,check,q,invoke});
  if(process.env.POS_QA_UI_ONLY!=='true')await require('./verify-checkout-confirmation.cjs')({a,base,check,q,invoke,out});
- if(process.env.POS_QA_UI_ONLY!=='true')await require('./verify-last-bill.cjs')({a,base,check,q,invoke,post,out});
  // Billing has one canonical surface; verify the actual Quasar navigation entry.
  const billingNav=await a.c.newPage();await billingNav.goto(base+'/qapps/zenith/pos/Dashboard',{waitUntil:'domcontentloaded'});
  const billingLink=billingNav.locator('#zq-subnav a[data-match="/pos/Terminal"]');await billingLink.waitFor();
@@ -396,6 +396,7 @@ const rows=(table,where)=>q(`SELECT * FROM ${table} WHERE ${where}`),count=(tabl
  async function gotoScreen(url){let loaded;const capture=r=>{if(r.request().isNavigationRequest()&&r.frame()===p.mainFrame())loaded=r;};p.on('response',capture);try{const response=await p.goto(url,{waitUntil:'domcontentloaded',timeout:60000});if(!response&&!loaded)throw Error('No document response for '+url);return response||loaded;}finally{p.off('response',capture);}}
  const screens=['Dashboard','OwnerDashboard','Terminal','PosTransactions','DailySummary','PosSessions','PosTerminals','CreditBills','CashEntry','Expenses','Wastage','Stock','Reports','BillAuditReport','ProductPricing','PriceOverrides','DiscountSettings','SalesMode','Barcodes','BarcodeLabels','ProductImport','ReceiptConfig','PrinterConfig','Kitchen','BillNumberRegister','OfflineMode',`EditTransaction?transactionId=${t.transactionId}`,`EditSession?sessionId=${s.sessionId}`];
  for(const shell of ['apps','qapps'])for(const screen of screens){await p.setViewportSize({width:1366,height:768});const r=await gotoScreen(shell==='qapps'&&screen==='Terminal'?base+billingHref:`${base}/${shell}/zenith/pos/${screen}`);if(['Terminal','CreditBills'].includes(screen))await p.locator(screen==='Terminal'?'#pos-terminal-root,.pos-no-session,.pos-receipt-card':'#credit-bills-root').first().waitFor();await p.locator('.z-pos-page').first().waitFor();const text=await p.locator('body').innerText();const error=/Error rendering|ScreenRenderException|500 Internal Server Error|HTTP Status 500|freemarker\.core/i.test(text);report.pages.push({shell,screen,status:r.status(),error,url:p.url()});check(shell+' '+screen+' renders',r.status()===200&&!error,{status:r.status(),error});}
+ if(process.env.POS_QA_UI_ONLY!=='true')await require('./verify-last-bill.cjs')({a,base,check,q,invoke,post,out});
  // A populated Daily Summary used to render the FreeMarker ?url charset exception as table rows.
  if(process.env.POS_QA_UI_ONLY!=='true')for(const shell of ['apps','qapps']){
   const date=new Date(tx(t.transactionId).entry_date);
