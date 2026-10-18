@@ -1,0 +1,9 @@
+# POS-09-01-02: Last completed bill
+
+Three client summary builders reset Last to a literal placeholder. The cash-panel completion path also omitted the issued-header refresh. Server reads selected a single matching entity with one(), which did not honor the intended ordering in the reproduced native flow. Use a fresh ordered, limited list for the shop header and session summary, ordered by completion time with a creation-time fallback for undated legacy rows. A held older cart completed later must win.
+
+Carry the server's escaped session Last number/amount through AJAX summary rebuilds and refresh it after cash completion. Clear the completed cart ID from the URL after checkout so refresh starts an empty new cart with zero payable. Daily bill counts and the distinction between POS bill and GST invoice numbers remain unchanged. No issued financial record is rewritten.
+
+Disposable native Moqui/H2 with real Chrome: **25 checks passed**, zero failures. Two actual cashier-confirmed cash checkouts completed a newer cart and then a recalled older cart. Both header and Last summary updated immediately to the real persisted bill; Normal/Advanced layouts and refresh retained the latest completion and its amount. Issued-record snapshots remained unchanged by the display/layout checks. No browser exceptions. Terminal billing's actual payment workflow is verified on its canonical Apps surface; the full staging profile retains both-shell rendering and viewport checks.
+
+This PR depends on the separate checkout-confirmation fix so its test never submits an unconfirmed payment. All four guards, XML parsing, JavaScript syntax and whitespace checks passed. The in-memory database was discarded and port closed; zero test records remain. No production access or deployment. Owner deployment verification remains required by the repository SOP.
