@@ -387,6 +387,7 @@ const rows=(table,where)=>q(`SELECT * FROM ${table} WHERE ${where}`),count=(tabl
  const closeCredit=await invoke('close',{sessionId:creditSession.sessionId,closingCash:'150'});
  check('upfront cash reconciles in the credit session',Number(rows('pos_session',`session_id='${creditSession.sessionId}'`)[0].cash_difference)===0,{closeCredit});
  }
+ if(process.env.POS_QA_UI_ONLY!=='true') await require('./verify-transactions-csv.cjs')({a,foreign,base,check,q,invoke});
  // Billing has one canonical surface; verify the actual Quasar navigation entry.
  const billingNav=await a.c.newPage();await billingNav.goto(base+'/qapps/zenith/pos/Dashboard',{waitUntil:'domcontentloaded'});
  const billingLink=billingNav.locator('#zq-subnav a[data-match="/pos/Terminal"]');await billingLink.waitFor();
