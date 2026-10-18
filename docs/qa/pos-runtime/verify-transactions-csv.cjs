@@ -42,4 +42,7 @@ module.exports=async function({a,foreign,base,check,q,invoke}) {
   check(`${shell} other organization export contains only its own rows`,otherRows.slice(1).every(row=>foreignIds.has(row[0]))&&!otherRows.slice(1).some(row=>row[0]===cart.transactionId));
  }
  check('CSV export leaves the saved transaction and amounts unchanged',JSON.stringify(q(`SELECT transaction_id,total_tax_amount,payable_amount,customer_name FROM pos_transaction WHERE transaction_id='${cart.transactionId}'`)[0])===snapshot);
+ await invoke('close',{sessionId:session.sessionId,closingCash:'218'});
+ const closed=q(`SELECT status_id,cash_difference FROM pos_session WHERE session_id='${session.sessionId}'`)[0];
+ check('CSV fixture closes its till with reconciled cash',closed.status_id==='PsClosed'&&Number(closed.cash_difference)===0);
 };
