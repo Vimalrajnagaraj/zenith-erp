@@ -2,7 +2,7 @@ const path=require('node:path');
 module.exports=async function({a,foreign,base,check,q,invoke,post,out}) {
  const terminalId='POS_QA_A_CHECKOUT';
  if(!q(`SELECT * FROM pos_terminal WHERE terminal_id='${terminalId}'`).length){
-  await post('PosTerminals','createTerminal',{terminalId,terminalName:'Disposable checkout QA counter',facilityId:'POS_QA_A_FAC',organizationPartyId:'POS_QA_A',stateCode:'33',isActive:'Y'});
+  await post('PosTerminals','createTerminal',{terminalId,terminalName:'Disposable checkout QA counter',facilityId:'POS_QA_A_FAC',organizationPartyId:'POS_QA_A',regionGeoId:'33',stateCode:'33',countryGeoId:'IND',isActive:'Y'});
   check('dedicated checkout counter is created in the test organization',q(`SELECT * FROM pos_terminal WHERE terminal_id='${terminalId}' AND organization_party_id='POS_QA_A'`).length===1);
  }
  const session=await invoke('open',{terminalId,openingCash:'100'});
