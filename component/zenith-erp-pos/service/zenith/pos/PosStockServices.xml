@@ -1,0 +1,151 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+    <!-- Called inside the posting transaction. Product locks serialize POS issues across tills and wastage. -->
+    <service verb="issue" noun="PosStock" authenticate="true">
+        <in-parameters>
+            <parameter name="productId" required="true"/>
+            <parameter name="facilityId" required="true"/>
+            <parameter name="quantity" type="BigDecimal" required="true"/>
+            <parameter name="batchNumber"/>
+            <parameter name="reason" required="true"/>
+            <parameter name="checkOnly" type="Boolean" default="false"/>
+        </in-parameters>
+        <out-parameters><parameter name="availableQuantity" type="BigDecimal"/></out-parameters>
+        <actions><script><![CDATA[
+            def access = ec.service.sync().name('zenith.pos.PosAccessServices.assert#PosAccess')
+                .parameters([productId:productId, facilityId:facilityId]).call()
+            if (!access?.allowed) return
+            if (quantity <= 0) { ec.message.addError('Quantity must be greater than zero.'); return }
+            def org = access.organizationPartyId
+            def product = ec.entity.find('mantle.product.Product').condition('productId',productId).forUpdate(true).one()
+            def facility = ec.entity.find('mantle.facility.Facility').condition('facilityId',facilityId).one()
+            def find = ec.entity.find('mantle.product.asset.Asset').condition('ownerPartyId',org)
+                .condition('productId',productId).condition('facilityId',facilityId).condition('assetTypeEnumId','AstTpInventory')
+                .orderBy('assetId').forUpdate(true)
+            if (batchNumber) find.condition('batchNumber',batchNumber)
+            def assets = find.list()
+            availableQuantity = assets.inject(BigDecimal.ZERO) { sum, a -> sum + ((a.quantityOnHandTotal ?: 0) as BigDecimal) }
+            if (facility.assetAllowIssueOverQoh != 'Y' && quantity > availableQuantity) {
+                ec.message.addError('Only ' + availableQuantity.stripTrailingZeros().toPlainString() + ' of ' +
+                    (product.productName ?: product.pseudoId ?: productId) + ' is available in ' + facility.facilityName + '. Nothing was posted.')
+                return
+            }
+            if (checkOnly) return
+            // We update the locked balance ourselves. Mantle's generic detail EECA recomputes
+            // historical totals and auto-creates "found" stock for negatives, ignoring the shop's
+            // explicit issue-over-QOH policy. Suppress only that nested entity callback here;
+            // retain the detail service and its accounting SECAs, and always restore the flag.
+            def movement = { asset, amount ->
+                def wasDisabled = ec.artifactExecution.disableEntityEca()
+                try {
+                    ec.service.sync().name('create#mantle.product.asset.AssetDetail').parameters([
+                        assetId:asset.assetId, productId:productId, effectiveDate:ec.user.nowTimestamp,
+                        quantityOnHandDiff:-amount, availableToPromiseDiff:-amount, description:reason]).call()
+                } finally { if (!wasDisabled) ec.artifactExecution.enableEntityEca() }
+            }
+            def remaining = quantity
+            // Consume existing lots in a stable order, retaining their batch identity and audit trail.
+            assets.each { asset ->
+                def qoh = (asset.quantityOnHandTotal ?: 0) as BigDecimal
+                if (remaining <= 0 || qoh <= 0) return
+                def taken = remaining.min(qoh)
+                asset.quantityOnHandTotal = qoh - taken
+                asset.availableToPromiseTotal = ((asset.availableToPromiseTotal ?: 0) as BigDecimal) - taken
+                asset.update()
+                movement(asset,taken)
+                remaining -= taken
+            }
+            // A negative balance is allowed only by this facility's explicit existing policy.
+            if (remaining > 0) {
+                def asset = assets ? assets[0] : ec.entity.makeValue('mantle.product.asset.Asset').setFields([
+                    assetTypeEnumId:'AstTpInventory', statusId:'AstAvailable', ownerPartyId:org, productId:productId,
+                    facilityId:facilityId, hasQuantity:'Y', quantityOnHandTotal:0, availableToPromiseTotal:0, batchNumber:batchNumber],true,null,null)
+                if (!assets) { asset.setSequencedIdPrimary(); asset.create() }
+                asset.quantityOnHandTotal = ((asset.quantityOnHandTotal ?: 0) as BigDecimal) - remaining
+                asset.availableToPromiseTotal = ((asset.availableToPromiseTotal ?: 0) as BigDecimal) - remaining
+                asset.update()
+                movement(asset,remaining)
+            }
+        ]]></script></actions>
+    </service>
+
+    <service verb="check" noun="PosCartStock" authenticate="true">
+        <in-parameters>
+            <parameter name="transactionId" required="true"/>
+            <parameter name="productId"/>
+            <parameter name="quantityDelta" type="BigDecimal" default="0"/>
+            <parameter name="postStock" type="Boolean" default="false"/>
+        </in-parameters>
+        <actions><script><![CDATA[
+            def access = ec.service.sync().name('zenith.pos.PosAccessServices.assert#PosAccess')
+                .parameters([transactionId:transactionId, productId:productId]).call()
+            if (!access?.allowed) return
+            def txn = ec.entity.find('zenith.erp.pos.PosTransaction').condition('transactionId',transactionId).forUpdate(true).one()
+            if (txn.transactionType != 'Sale' || txn.stockPosted == 'Y') return
+            if (postStock && txn.statusId != 'PtCreated') { ec.message.addError('Stock can only be posted by an open checkout.'); return }
+            def session = ec.entity.find('zenith.erp.pos.PosSession').condition('sessionId',txn.sessionId).one()
+            def terminal = ec.entity.find('zenith.erp.pos.PosTerminal').condition('terminalId',session.terminalId).one()
+            def quantities = [:]
+            ec.entity.find('zenith.erp.pos.PosTransactionItem').condition('transactionId',transactionId).list().each { line ->
+                quantities[line.productId] = (quantities[line.productId] ?: BigDecimal.ZERO) + ((line.quantity ?: 0) as BigDecimal)
+            }
+            if (productId) quantities[productId] = (quantities[productId] ?: BigDecimal.ZERO) + quantityDelta
+            // Lock products in the same order for all carts to prevent opposite-order till deadlocks.
+            for (id in (productId ? [productId] : quantities.keySet().findAll { it }.sort())) {
+                def product = ec.entity.find('mantle.product.Product').condition('productId',id).one()
+                if (product?.inventoryTracked != 'Y' || quantities[id] <= 0) continue
+                if (!terminal.facilityId) { ec.message.addError('Assign a stock location to this terminal before selling tracked products.'); return }
+                ec.service.sync().name('zenith.pos.PosStockServices.issue#PosStock').parameters([
+                    productId:id, facilityId:terminal.facilityId, quantity:quantities[id], checkOnly:!postStock,
+                    reason:'POS sale ' + transactionId]).call()
+                if (ec.message.hasError()) return
+            }
+            if (postStock) { txn.stockPosted = 'Y'; txn.update() }
+        ]]></script></actions>
+    </service>
+
+    <service verb="record" noun="PosWastage" authenticate="true">
+        <in-parameters>
+            <parameter name="productId" required="true"/>
+            <parameter name="facilityId" required="true"/>
+            <parameter name="requestId" required="true"/>
+            <parameter name="quantity" type="BigDecimal" required="true"/>
+            <parameter name="unitCost" type="BigDecimal" default="0"/>
+            <parameter name="wastageDate" type="Timestamp" default="ec.user.nowTimestamp"/>
+            <parameter name="wastageReason" required="true"/>
+            <parameter name="batchNumber"/>
+            <parameter name="description"/>
+        </in-parameters>
+        <out-parameters><parameter name="wastageId"/><parameter name="duplicate" type="Boolean"/></out-parameters>
+        <actions><script><![CDATA[
+            def access = ec.service.sync().name('zenith.pos.PosAccessServices.assert#PosAccess')
+                .parameters([productId:productId, facilityId:facilityId]).call()
+            if (!access?.allowed) return
+            if (quantity <= 0 || unitCost < 0) { ec.message.addError('Enter a positive quantity and a nonnegative unit cost.'); return }
+            if (!ec.entity.find('moqui.basic.Enumeration').condition('enumId',wastageReason).condition('enumTypeId','PosWastageReason').one()) {
+                ec.message.addError('Select a valid wastage reason.'); return
+            }
+            def org = access.organizationPartyId
+            def product = ec.entity.find('mantle.product.Product').condition('productId',productId).forUpdate(true).one()
+            if (product.productTypeEnumId != 'PtAsset') { ec.message.addError('Select an inventory product for wastage.'); return }
+            def previous = ec.entity.find('zenith.erp.pos.PosStockWastage').condition('organizationPartyId',org).condition('requestId',requestId).one()
+            if (previous) {
+                if (previous.productId != productId || previous.facilityId != facilityId || previous.quantity != quantity ||
+                    previous.unitCost != unitCost || previous.wastageReason != wastageReason || (previous.batchNumber ?: '') != (batchNumber ?: '')) {
+                    ec.message.addError('This request was already used for different wastage. Refresh the form before recording another entry.'); return
+                }
+                wastageId = previous.wastageId; duplicate = true; return
+            }
+            ec.service.sync().name('zenith.pos.PosStockServices.issue#PosStock').parameters([
+                productId:productId, facilityId:facilityId, quantity:quantity, batchNumber:batchNumber,
+                reason:'POS wastage ' + requestId]).call()
+            if (ec.message.hasError()) return
+            def recorded = ec.service.sync().name('create#zenith.erp.pos.PosStockWastage').parameters([
+                organizationPartyId:org, productId:productId, productName:(product.productName ?: product.pseudoId ?: productId),
+                facilityId:facilityId, requestId:requestId, quantity:quantity, unitCost:unitCost, totalLoss:quantity * unitCost,
+                wastageDate:wastageDate, wastageReason:wastageReason, batchNumber:batchNumber, description:description,
+                enteredByPartyId:ec.user.userAccount?.partyId]).call()
+            wastageId = recorded.wastageId; duplicate = false
+        ]]></script></actions>
+    </service>
+</services>
