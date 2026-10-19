@@ -45,6 +45,7 @@ module.exports=async function({a,base,check,q,invoke,post,out,loggedOutSweep}) {
  check('POS-03-06 closes once and preserves its bill and tender',twice.closedCount===0&&get(active.sessionId).close_date===ended.close_date&&q(`SELECT * FROM pos_transaction WHERE transaction_id='${cart.transactionId}' AND status_id='PtCompleted'`).length===1&&Number(q(`SELECT amount FROM pos_payment WHERE transaction_id='${cart.transactionId}'`)[0].amount)===5);
  for(const shell of ['apps','qapps'])for(const [name,id] of [['empty',empty.sessionId],['activity-reset',active.sessionId]]){
   const p=await a.c.newPage();await p.goto(`${base}/${shell}/zenith/pos/EditSession?sessionId=${id}`);
+  await p.getByText('Cash not counted',{exact:false}).first().waitFor();
   check(shell+' '+name+' idle-close status survives reload',(await p.locator('body').innerText()).includes('Cash not counted'));
   await p.screenshot({path:path.join(out,`${shell}-idle-${name}-verified.png`),fullPage:true});await p.close();
  }
