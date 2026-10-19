@@ -26,6 +26,32 @@ module.exports = async function verifyKot({a,foreign,base,post,rows,count,check}
   check('Kitchen treats notes, table labels and instructions as text',
     (await kitchen.locator('body').innerText()).includes(xss)&&!await kitchen.evaluate(()=>window.posQaXss));
   await kitchen.close();
+  for (const shell of ['apps','qapps']) {
+    const old=await a.c.request.get(`${base}/${shell}/zenith/pos/KitchenOrders`);
+    check(shell+' legacy Kitchen Orders renders with current ticket fields',old.status()===200&&(await old.text()).includes('Open Kitchen'),{status:old.status()});
+  }
+  await a.c.request.get(`${base}/apps/zenith/pos/KitchenOrders/updateKotStatus?kotId=${ticket.kot_id}&statusId=KotPreparing`,{maxRedirects:0});
+  check('legacy GET status link cannot change a kitchen order',rows('kitchen_order_ticket',`kot_id='${ticket.kot_id}'`)[0].status_id==='KotNew');
+  const foreignPrint=await post('Kitchen/KotBilling','reprintKot',{kotId:ticket.kot_id},foreign);
+  check('another shop cannot increase the KOT print count',
+    foreignPrint.status()===200&&!(await foreignPrint.json()).success&&Number(rows('kitchen_order_ticket',`kot_id='${ticket.kot_id}'`)[0].print_count)===0);
+  const printPage=await a.c.newPage();
+  await printPage.goto(base+'/apps/zenith/pos/Kitchen/KotBilling',{waitUntil:'networkidle'});
+  await printPage.waitForFunction(()=>typeof window.kbPrintKot==='function');
+  await Promise.all([
+    printPage.waitForResponse(r=>r.url().includes('/reprintKot')),
+    printPage.evaluate(id=>{
+      window.__printedHtml=''; window.__printCalls=0;
+      window.open=()=>({document:{write:s=>{window.__printedHtml+=s},close:()=>{}},
+        focus:()=>{},print:()=>{window.__printCalls++},close:()=>{}});
+      window.kbPrintKot(id);
+    },ticket.kot_id)
+  ]);
+  await printPage.waitForFunction(()=>window.__printedHtml.includes('Disposable POS A P18'));
+  check('Print on an existing KOT records one shop-owned reprint and opens the slip',
+    Number(rows('kitchen_order_ticket',`kot_id='${ticket.kot_id}'`)[0].print_count)===1&&
+    await printPage.evaluate(()=>window.__printedHtml.includes('KOT #')));
+  await printPage.close();
 
   const ownTable='POS_QA_KOT_A_TABLE';
   await post('Kitchen/Tables','createTable',{facilityId:'POS_QA_B_FAC',tableNumber:ownTable,seatingCapacity:'4'});
@@ -36,6 +62,13 @@ module.exports = async function verifyKot({a,foreign,base,post,rows,count,check}
   check('KOT table creation sets safe defaults and ignores forged assignment',count('restaurant_table',`table_number='${ownTable}' AND facility_id='POS_QA_A_FAC' AND status_id='TblAvailable' AND assigned_waiter_id IS NULL`)===1);
   await post('Kitchen/Tables','createTable',{facilityId:'POS_QA_A_FAC',tableNumber:ownTable,seatingCapacity:'4'});
   check('KOT table creation rejects duplicate number in a facility',count('restaurant_table',`table_number='${ownTable}' AND facility_id='POS_QA_A_FAC'`)===1);
+  const ownTableId=rows('restaurant_table',`table_number='${ownTable}' AND facility_id='POS_QA_A_FAC'`)[0].table_id;
+  await post('Kitchen/Tables','updateTableStatus',{tableId:ownTableId,statusId:'TblOccupied'},foreign);
+  check('another shop cannot change this table',count('restaurant_table',`table_id='${ownTableId}' AND status_id='TblAvailable'`)===1);
+  await post('Kitchen/Tables','updateTableStatus',{tableId:ownTableId,statusId:'TblOccupied'});
+  check('table status change persists for its shop',count('restaurant_table',`table_id='${ownTableId}' AND status_id='TblOccupied'`)===1);
+  await post('Kitchen/Tables','closeTable',{tableId:ownTableId});
+  check('closing a table releases it',count('restaurant_table',`table_id='${ownTableId}' AND status_id='TblAvailable'`)===1);
   const foreignTable='POS_QA_KOT_B_TABLE';
   await post('Kitchen/Tables','createTable',{facilityId:'POS_QA_B_FAC',tableNumber:foreignTable,seatingCapacity:'2'},foreign);
   const menu=await a.c.newPage();
