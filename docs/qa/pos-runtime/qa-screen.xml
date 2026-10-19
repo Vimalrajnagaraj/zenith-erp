@@ -8,6 +8,8 @@
     if (ec.entity.find('mantle.party.Party').condition('partyId','POS_QA_A').disableAuthz().count()) {
         ec.web.response.setStatus(409);ec.web.sendJsonResponse([denied:true]);return
     }
+    // Deterministic time-boundary tests invoke the real sweep explicitly; no scheduled worker races them.
+    ec.service.sync().name('update#moqui.service.job.ServiceJob').parameters([jobName:'zenith_PosIdleSessionSweep_5min',paused:'Y']).call()
     def baseline=[modes:ec.entity.find('zenith.erp.pos.PosSalesMode').count(),sessionStatuses:ec.entity.find('moqui.basic.StatusItem').condition('statusTypeId','PosSession').count()]
     ec.entity.makeDataLoader().location('component://zenith-erp-pos/PosQaTypes.xml').load()
     ec.entity.makeDataLoader().location('component://zenith-erp-pos/PosQaFixture.xml').load()
@@ -23,6 +25,21 @@
 <transition name="invoke"><actions><script><![CDATA[
     if (System.getProperty('pos.qa.disposable')!='true' || !['pos.qa','pos.b.qa','pos.cashier.qa'].contains(ec.user.username)) {
         ec.web.response.setStatus(403);ec.web.sendJsonResponse([denied:true]);return
+    }
+    if (ec.web.parameters.op=='idleJobState') {
+        def pause=ec.web.parameters.paused
+        if (!['Y','N'].contains(pause)) { ec.web.response.setStatus(400);return }
+        ec.service.sync().name('update#moqui.service.job.ServiceJob').parameters([jobName:'zenith_PosIdleSessionSweep_5min',paused:pause]).call()
+        ec.web.sendJsonResponse([updated:!ec.message.hasError()]);return
+    }
+    if (ec.web.parameters.op=='idleLogout') {
+        ec.user.logoutUser();ec.web.sendJsonResponse([loggedOut:true]);return
+    }
+    if (ec.web.parameters.op=='idleSweepLoggedOut') {
+        ec.user.logoutUser()
+        def result=ec.service.sync().name('zenith.pos.PosServices.sweep#IdlePosSessions').call()
+        ec.web.sendJsonResponse([closedCount:result?.closedCount,errors:ec.message.errorsString])
+        return
     }
     def calls=[
         gift:['zenith.pos.PosServices.pay#WithGiftCard',['transactionId','cardNumber','amount']],
@@ -67,11 +84,11 @@
     ec.web.sendJsonResponse([result:publicResult,errors:errors])
 ]]></script></actions><default-response type="none"/></transition>
 <transition name="idleClock"><actions><script><![CDATA[
-    if (System.getProperty('pos.qa.disposable')!='true' || ec.user.username!='pos.qa') {
+    if (System.getProperty('pos.qa.disposable')!='true' || !['pos.qa','pos.b.qa'].contains(ec.user.username)) {
         ec.web.response.setStatus(403);ec.web.sendJsonResponse([denied:true]);return
     }
     def session=ec.entity.find('zenith.erp.pos.PosSession').condition('sessionId',ec.web.parameters.sessionId).one()
-    if (!session || session.organizationPartyId!='POS_QA_A' || session.statusId!='PsOpen') {
+    if (!session || session.organizationPartyId!=(ec.user.username=='pos.qa'?'POS_QA_A':'POS_QA_B') || session.statusId!='PsOpen') {
         ec.web.response.setStatus(403);ec.web.sendJsonResponse([denied:true]);return
     }
     session.lastActivityDate=new java.sql.Timestamp(ec.user.nowTimestamp.time-61L*60L*1000L)
