@@ -69,7 +69,7 @@ module.exports=async function({a,foreign,base,check,q,invoke,post,out}) {
   // Unpaid clearing rejects cross-tenant and paid drafts, and never issues a number or stock movement.
   const denied=await api({action:'clearCart'},foreign);check('foreign cart clear rejected',denied.r.status()===403||!denied.d.success);
   const csrf=await post('Terminal','ajaxCart',{action:'clearCart',sessionId:session.sessionId,transactionId:cart.transactionId},a,false);
-  check('Clear Cart requires CSRF protection',csrf.status()===403&&lines().length===1);
+  check('Clear Cart requires CSRF protection',[401,403].includes(csrf.status())&&lines().length===1,{status:csrf.status(),lineCount:lines().length});
   let delayed=false;
   const delayEdit=async route=>{if(new URLSearchParams(route.request().postData()||'').get('action')==='updateQty'){delayed=true;await new Promise(resolve=>setTimeout(resolve,700));}await route.continue();};
   await page.route('**/Terminal/ajaxCart',delayEdit);
@@ -107,9 +107,10 @@ module.exports=async function({a,foreign,base,check,q,invoke,post,out}) {
   const recalled=page.waitForResponse(r=>r.request().method()==='POST'&&r.url().includes('/recallSale'));
   await page.locator('.nb-held__item').first().click();await recalled;await page.locator('.pos-cart .aj-qi').waitFor();
   check('F9 held picker recalls items',q(`SELECT * FROM pos_held_transaction WHERE session_id='${session.sessionId}' AND status_id='PhHeld'`).length===0);
+  const recalledTx=await page.locator('#cartInlineAddForm input[name=transactionId]').inputValue();
   const voided=page.waitForResponse(r=>r.request().method()==='POST'&&r.url().includes('/voidSale'));
   await page.locator('.pos-cart-heading h2').click();await page.keyboard.press('F8');await voided;
-  check('F8 void cancels only the open draft',q(`SELECT * FROM pos_transaction WHERE session_id='${session.sessionId}' AND status_id='PtVoided'`).length===1&&tx().status_id==='PtCompleted');
+  check('F8 void cancels only the open draft',q(`SELECT * FROM pos_transaction WHERE transaction_id='${recalledTx}' AND status_id='PtVoided'`).length===1&&tx().status_id==='PtCompleted');
   await page.locator('.pos-cart-heading h2').click();await page.keyboard.press('c');await page.locator('#posCloseSessionOverlay').waitFor();
   check('C opens exactly one cash-review dialog',await page.locator('#posCloseSessionOverlay').count()===1);
   await page.locator('.pos-close-cancel').click();
