@@ -2291,13 +2291,21 @@ window.posToggleFullscreen = function() {
             });
         }
         window.posDiscount = function() {
-            if (!TX || !lastCartData || !lastCartData.items || !lastCartData.items.length) { showToast('Add items to the cart first', '#e53935'); return; }
+            if (!TX || cartClearing || modeSwitching) { showToast('Add items or wait for the cart to finish updating', '#e53935'); return; }
+            if (!lastCartData || OPT._drainPending()) {
+                OPT.whenIdle().then(function(){return post({action:'refresh',transactionId:TX});}).then(function(data){
+                    if (!data || !data.success || !data.items.length) throw new Error('Add items to the cart first');
+                    renderCart(data); window.posDiscount();
+                }).catch(function(error){showToast(error.message,'#e53935');});
+                return;
+            }
+            if (!lastCartData.items.length) { showToast('Add items to the cart first', '#e53935'); return; }
             var ov = document.createElement('div');
             ov.style.cssText = 'position:fixed;inset:0;z-index:999999;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;padding:16px';
             ov.id='posDiscountOverlay'; ov.setAttribute('role','dialog'); ov.setAttribute('aria-label','Discount and round off');
             var rows = lastCartData.items.map(function(it) {
                 return '<div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid #f0f0f0">'
-                    + '<div style="flex:1;min-width:0;font-size:13px;font-weight:600;color:#333;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + (it.name || it.seq)
+                    + '<div style="flex:1;min-width:0;font-size:13px;font-weight:600;color:#333;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + cartText(it.name || it.seq)
                     + '<span style="color:#999;font-weight:400"> &nbsp;' + (Number(it.qty) || 0) + ' &times; &#8377;' + Number(it.price || 0).toFixed(2) + '</span></div>'
                     + '<input class="pd-line" data-seq="' + it.seq + '" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0" style="width:66px;padding:6px;border:1px solid #ccc;border-radius:6px;text-align:right;font-size:13px"/>'
                     + '<button type="button" class="pd-tg" data-t="pct" style="width:36px;padding:6px 0;border:1px solid #bbb;border-radius:6px;background:#f5f5f5;cursor:pointer;font-weight:700">%</button></div>';
@@ -2958,14 +2966,14 @@ window.posToggleFullscreen = function() {
                 var modeCell = '-';
                 if (d.modes && d.modes.length) {
                     var _cm = null; for (var _mi = 0; _mi < d.modes.length; _mi++) { if (d.modes[_mi].id === it.mode) { _cm = d.modes[_mi]; break; } }
-                    if (!_cm) _cm = d.modes[0];
+                    if (!_cm) _cm = d.modes.find(function(m){return m.id===SM;}) || d.modes[0];
                     var _mn = _cm ? _cm.name : '';
                     var _cbg = '#DBEAFE', _cfg = '#2563EB';
                     if (/whole/i.test(_mn)) { _cbg = '#FFEDD5'; _cfg = '#EA580C'; }
                     else if (/custom/i.test(_mn)) { _cbg = '#D5F0EC'; _cfg = '#0F766E'; }
                     if (d.modes.length > 1) {
                         var mo = '';
-                        d.modes.forEach(function(m){ mo += '<option value="'+cartText(m.id)+'"'+(it.mode===m.id?' selected':'')+'>'+cartText(m.name)+(Number(m.disc)>0?(' −'+Number(m.disc)+'%'):'')+'</option>'; });
+                        d.modes.forEach(function(m){ mo += '<option value="'+cartText(m.id)+'"'+((it.mode||SM)===m.id?' selected':'')+'>'+cartText(m.name)+(Number(m.disc)>0?(' −'+Number(m.disc)+'%'):'')+'</option>'; });
                         modeCell = '<select class="aj-mode" data-seq="'+cartText(it.seq)+'" title="Sale mode for this item" style="font-size:12px;font-weight:600;padding:3px 6px;border:1px solid '+_cbg+';border-radius:6px;background:'+_cbg+';color:'+_cfg+';cursor:pointer;max-width:120px">'+mo+'</select>';
                     } else {
                         modeCell = '<span style="display:inline-block;font-size:12px;font-weight:600;padding:3px 8px;border-radius:6px;background:'+_cbg+';color:'+_cfg+'">'+cartText(_mn)+'</span>';
