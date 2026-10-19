@@ -4,8 +4,8 @@ The screenshots and `focused-report.json` were captured from the working termina
 in disposable native Moqui/H2 with real Chrome and synthetic `POS_QA_` fixtures.
 They are browser captures of persisted application state, not static mockups.
 
-The focused run passed **71 checks, zero failures and zero JavaScript exceptions**
-against application/test commit `85f3fddb1315b8e2c7147172a8e0fe7c5930578b`.
+The focused run passed **74 checks, zero failures and zero JavaScript exceptions**
+against application/test commit `a4ec1b1987fef283103d024f43576570e379e39c`.
 It covers GST on/off, decimal rate and quantity updates, nested trash-icon clicks,
 search, payment/credit/split/customer dialogs, tenant and CSRF denial, unpaid-cart
 clearing with queued edits, protection of paid/issued bills, hold/recall/void,
