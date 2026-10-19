@@ -65,4 +65,6 @@ module.exports=async function({a,foreign,base,check,q,invoke,post,out}){
  for(const shell of ['apps','qapps']){const page=await a.c.newPage();await page.goto(`${base}/${shell}/zenith/pos/PosSessions`);await page.getByText('Automatic session close',{exact:true}).waitFor();check(`${shell} session list exposes the unverified idle-close status`,(await page.locator('body').innerText()).includes('Idle closed'));await page.screenshot({path:path.join(out,`${shell}-idle-session-closed.png`),fullPage:true});await page.close();}
  }
 
+ await require('./verify-idle-boundaries.cjs')({a,base,check,q,invoke,post,out,loggedOutSweep});
+
 };
