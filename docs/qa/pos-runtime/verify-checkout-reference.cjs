@@ -34,6 +34,9 @@ module.exports=async function({a,foreign,base,check,q,invoke,post,out}) {
   check('tax on recalculates real GST',Number(tx().total_tax_amount)>0,tx());
   await page.locator('.nb-tax button').click();await page.waitForFunction(()=>!document.querySelector('.nb-toggle')?.classList.contains('on'));
   check('tax off removes GST consistently',Number(tx().total_tax_amount)===0&&Number(tx().payable_amount)===151,tx());
+  await clickAndSettle('.pos-product-grid form:has(input[name=productId][value=POS_QA_A_P5]) button','addItem');
+  await clickAndSettle('.pos-cart tbody tr:has-text("Disposable POS A P5") .aj-rm svg','removeItem');
+  check('clicking the trash icon removes only that product',lines().length===1&&lines()[0].product_id==='POS_QA_A_P18'&&Number(tx().subtotal)===151);
   // Show/cancel each payment path without writing a tender.
   for(const [key,selector] of [['F1','#posDiscountOverlay'],['F4','#posCreditOverlay'],['F6','.pos-split-panel']]) {
    await page.locator('.pos-cart-heading h2').click();await page.keyboard.press(key);await page.locator(selector).waitFor();

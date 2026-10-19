@@ -29,7 +29,7 @@
         root.querySelectorAll('.pos-cart .aj-p').forEach(function (input) { input.setAttribute('aria-label', 'Unit price'); });
         root.querySelectorAll('.pos-cart .aj-qi').forEach(function (input) { input.setAttribute('aria-label', 'Quantity'); });
         root.querySelectorAll('.pos-cart .aj-q').forEach(function (button) { button.setAttribute('aria-label', button.textContent.trim() === '+' ? 'Increase quantity' : 'Decrease quantity'); });
-        root.querySelectorAll('.pos-cart .aj-rm').forEach(function (button) { button.setAttribute('aria-label', 'Remove item'); button.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M3 6h18M9 6V3h6v3M6 6l1 15h10l1-15M10 10v7M14 10v7"/></svg>'; });
+        root.querySelectorAll('.pos-cart .aj-rm').forEach(function (button) { button.setAttribute('aria-label', 'Remove item'); if (!button.querySelector('svg')) button.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M3 6h18M9 6V3h6v3M6 6l1 15h10l1-15M10 10v7M14 10v7"/></svg>'; });
         root.querySelectorAll('.pos-cat-strip a').forEach(function (link) {
             var current = root.querySelector('#cartInlineAddForm input[name="catId"]');
             var category = root.dataset.checkoutCategory != null ? root.dataset.checkoutCategory : current ? current.value : new URL(location.href).searchParams.get('catId') || '';
@@ -49,7 +49,10 @@
     }
     function refreshStock() {
         if (!root || !root.isConnected || document.hidden || !navigator.onLine || stockBusy) return;
-        var cards = Array.from(root.querySelectorAll('.pos-card-stock'));
+        var grid=root.querySelector('.pos-product-grid'); if (!grid) return;
+        var bounds=grid.getBoundingClientRect(), top=Math.max(0,bounds.top), bottom=Math.min(innerHeight,bounds.bottom);
+        if (bottom<=top) return;
+        var cards = Array.from(grid.querySelectorAll('.pos-card-stock')).filter(function(card){var r=card.getBoundingClientRect();return r.bottom>=top&&r.top<=bottom;}).slice(0,120);
         var form = document.getElementById('cartInlineAddForm'); if (!cards.length || !form) return;
         var params = new URLSearchParams(); ['sessionId','moquiSessionToken'].forEach(function (name) { var input=form.elements.namedItem(name); if (input) params.set(name,input.value); });
         params.set('action','cardStock'); params.set('productIds',cards.slice(0,120).map(function (card) { return card.dataset.productId; }).join(','));
