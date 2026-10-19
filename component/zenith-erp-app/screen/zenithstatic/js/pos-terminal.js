@@ -2130,7 +2130,7 @@ window.posToggleFullscreen = function() {
                 .then(function(r){return r.json();})
                 .then(function(d){
                     if (d.closed || d.reason === 'already_closed') {
-                        window.location.assign('/apps/zenith/pos/Terminal');
+                        window.location.assign('/apps/zenith/pos/PosSessions?sessionId=' + encodeURIComponent(SI));
                     } else if (d.reason === 'still_active') {
                         // Another live tab or a completed bill refreshed server activity.
                         lastGestureAt = Date.now();
@@ -3653,7 +3653,7 @@ window.posToggleFullscreen = function() {
                                 if (!result.success) throw new Error(result.error || 'Session close failed.');
                                 ov.remove();
                                 showToast('Session closed successfully');
-                                window.location.assign('/apps/zenith/pos/Terminal');
+                                window.location.assign('/apps/zenith/pos/PosSessions?sessionId=' + encodeURIComponent(SI));
                             }).catch(function(error) {
                                 confirmButton.disabled = false;
                                 confirmButton.textContent = 'CLOSE SESSION';
