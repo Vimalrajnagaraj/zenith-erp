@@ -278,7 +278,7 @@
             </if>
             <service-call name="zenith.pos.PosServices.complete#PosTransactionCredit"
                           in-map="[transactionId:transactionId, customerName:customerName, customerPhone:customerPhone,
-                                   customerPartyId:customerPartyId, upfrontAmount:upfrontAmount, upfrontMethod:upfrontMethod]"/>
+                                   customerPartyId:customerPartyId, upfrontAmount:upfrontAmount, upfrontMethod:upfrontMethod, creditDays:creditDays, termsReason:termsReason]"/>
         </actions>
         <default-response url="." parameter-map="[sessionId:sessionId, lastCompletedId:transactionId]"/>
     </transition>
@@ -1633,7 +1633,7 @@
                     def match = !term || nm.toLowerCase().contains(termL) || (r.partyId ?: '').toLowerCase().contains(termL) || (digits.length() >= 3 && phoneDigits.contains(digits))
                     if (!match) continue
                     seen[r.partyId] = true
-                    out.add([partyId:r.partyId, name:nm, phone:phone])
+                    out.add([partyId:r.partyId, name:nm, phone:phone, creditDays:ec.entity.find('mantle.party.Party').condition('partyId',r.partyId).one()?.creditDays])
                     if (out.size() >= 30) break
                 }
                 ec.web.sendJsonResponse([success:true, customers:out])
@@ -2438,16 +2438,25 @@
                         def orgTerms = ct?.organizationPartyId ? (ec.entity.find("zenith.erp.pos.PosTerminal").condition("organizationPartyId", ct.organizationPartyId).list()*.terminalId) : (histTermId ? [histTermId] : null)
                         def sessIds = orgTerms ? (ec.entity.find("zenith.erp.pos.PosSession").condition("terminalId", "in", orgTerms).list()*.sessionId) : null
                         if (!sessIds) { ec.web.sendJsonResponse([success:true, action:'creditBills', bills:[], total:0]); return }
-                        def crTxns = ec.entity.find("zenith.erp.pos.PosTransaction").condition("sessionId", "in", sessIds).condition("isCredit", "Y").orderBy("-entryDate").list()
+                        def crTxns = ec.entity.find("zenith.erp.pos.PosTransaction").condition("organizationPartyId",ct?.organizationPartyId ?: ec.user.getPreference('ACTIVE_ORGANIZATION') ?: '__NO_ORGANIZATION__').condition("sessionId", "in", sessIds).condition("isCredit", "Y").orderBy("-entryDate").list()
                         def crSearch = (p.search ?: '').toLowerCase()
                         // ---- all-time stats (across every credit bill, before the search filter) ----
                         def _nowCr = ec.user.nowTimestamp
                         def _cCr = java.util.Calendar.getInstance(); _cCr.setTime(_nowCr); _cCr.set(java.util.Calendar.DAY_OF_MONTH, 1); _cCr.set(java.util.Calendar.HOUR_OF_DAY,0); _cCr.set(java.util.Calendar.MINUTE,0); _cCr.set(java.util.Calendar.SECOND,0)
                         def _crMonthStart = new java.sql.Timestamp(_cCr.getTimeInMillis())
-                        def _crOverdueCut = new java.sql.Timestamp(_nowCr.getTime() - 30L*24*60*60*1000)
+                        def creditState = { tx, due ->
+                            if(tx.statusId!='PtCompleted') return 'Cancelled'
+                            if(due<=0) return 'Settled'
+                            if(!tx.creditDueDate) return 'Due date not set'
+                            def today=_nowCr.toInstant().atZone(java.time.ZoneId.of(tx.creditTimeZone ?: ec.user.timeZone.ID)).toLocalDate()
+                            def remaining=java.time.temporal.ChronoUnit.DAYS.between(today,tx.creditDueDate.toLocalDate())
+                            remaining<0?'Overdue':remaining<=2?'Due soon':'Open'
+                        }
                         def crAllCount = crTxns.size(); def crOutCount = 0; def crOutSum = 0 as BigDecimal; def crOverdue = 0
                         def creditTxnIds = crTxns.collect { it.transactionId }
-                        crTxns.each { tx -> def _o = ((tx.payableAmount ?: 0) as BigDecimal) - ((tx.paidAmount ?: 0) as BigDecimal); if (_o > 0) { crOutCount++; crOutSum += _o; if (tx.entryDate != null && tx.entryDate < _crOverdueCut) crOverdue++ } }
+                        def creditPayments = creditTxnIds ? ec.entity.find('zenith.erp.pos.PosPayment').condition('transactionId','in',creditTxnIds).orderBy('paymentDate,paymentId').list().groupBy { it.transactionId } : [:]
+
+                        crTxns.each { tx -> def _o = ((tx.payableAmount ?: 0) as BigDecimal) - ((tx.paidAmount ?: 0) as BigDecimal); if (_o > 0) { crOutCount++; crOutSum += _o; if (creditState(tx,_o)=='Overdue') crOverdue++ } }
                         def crPaidMonthAmt = 0 as BigDecimal; def crPaidMonthCount = 0
                         if (creditTxnIds) {
                             def _pm = ec.entity.find("zenith.erp.pos.PosPayment").condition("transactionId","in",creditTxnIds).condition("paymentDate","greater-equals",_crMonthStart).list()
@@ -2461,7 +2470,12 @@
                             def items = ec.entity.find("zenith.erp.pos.PosTransactionItem").condition("transactionId", tx.transactionId).list()
                             def payable = (tx.payableAmount ?: 0) as BigDecimal
                             def paid = (tx.paidAmount ?: 0) as BigDecimal
-                            crBills.add([txId: tx.transactionId, billNo: tx.transactionNumber ?: tx.transactionId,
+                            def payments = creditPayments[tx.transactionId] ?: []
+                            def lastPayment = payments ? payments[-1].paymentDate : null
+                            def state = creditState(tx,payable-paid)
+                            crBills.add([dueDate:tx.creditDueDate?.toString(),creditStatus:state,
+                                lastPayment:lastPayment ? ec.l10n.format(lastPayment,'dd MMM yyyy, hh:mm a z') : null,
+                                settledOn:state=='Settled' && lastPayment ? ec.l10n.format(lastPayment,'dd MMM yyyy, hh:mm a z') : null,txId: tx.transactionId, billNo: tx.transactionNumber ?: tx.transactionId,
                                 date: ec.l10n.format(tx.entryDate, 'dd/MM/yyyy hh:mm a'), ts: (tx.entryDate ? tx.entryDate.getTime() : 0L),
                                 customer: tx.customerName ?: 'Walk-In', phone: tx.customerPhone ?: '',
                                 grand: payable, paid: paid, outstanding: payable - paid, itemCount: items.size()])
@@ -3068,6 +3082,8 @@
 
                         grand:txn?.grandTotal ?: 0, pay:txn?.payableAmount ?: 0, paid:txn?.paidAmount ?: 0, round:txn?.roundOff ?: 0,
                         customer:txn?.customerName ?: '', customerPhone:txn?.customerPhone ?: '', customerPartyId:txn?.customerPartyId ?: '',
+                        customerCreditDays:txn?.customerPartyId ? ec.entity.find('mantle.party.Party').condition('partyId',txn.customerPartyId).one()?.creditDays : null,
+                        creditDateToday:ec.l10n.format(ec.user.nowTimestamp,'yyyy-MM-dd'), creditTimeZone:ec.user.timeZone.ID,
 
 
 
@@ -4544,7 +4560,7 @@ gridNextOffset = gridOffset + gridProducts.size()
                           </div>
                           </#if>
                         ]]></text></render-mode>
-                        <render-mode><text type="html,qvt" template="true"><![CDATA[<img src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" alt="" style="display:none" onload="try{if(location.pathname.indexOf('/qapps/')===0){location.replace(location.href.replace('/qapps/','/apps/'));}}catch(e){}"/><div style="text-align:center;margin-top:18px"><button id="pos-history-btn-ns" type="button" onclick="window.posOpenHistory&amp;&amp;window.posOpenHistory()" style="padding:10px 24px;border-radius:8px;font-size:14px;font-weight:bold;cursor:pointer;background:#7C3AED;color:#fff;border:1px solid #A78BFA">&#128196; View Bill History<span style="margin-left:7px;padding:1px 6px;border:1px solid rgba(255,255,255,0.7);border-radius:4px;font-size:11px;font-weight:700;opacity:0.9">F9</span></button></div><script src="/zenithstatic/js/pos-terminal.js?v=167"></script>]]></text></render-mode>
+                        <render-mode><text type="html,qvt" template="true"><![CDATA[<img src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" alt="" style="display:none" onload="try{if(location.pathname.indexOf('/qapps/')===0){location.replace(location.href.replace('/qapps/','/apps/'));}}catch(e){}"/><div style="text-align:center;margin-top:18px"><button id="pos-history-btn-ns" type="button" onclick="window.posOpenHistory&amp;&amp;window.posOpenHistory()" style="padding:10px 24px;border-radius:8px;font-size:14px;font-weight:bold;cursor:pointer;background:#7C3AED;color:#fff;border:1px solid #A78BFA">&#128196; View Bill History<span style="margin-left:7px;padding:1px 6px;border:1px solid rgba(255,255,255,0.7);border-radius:4px;font-size:11px;font-weight:700;opacity:0.9">F9</span></button></div><script src="/zenithstatic/js/pos-terminal.js?v=168"></script>]]></text></render-mode>
 
 
 
@@ -7069,7 +7085,7 @@ body.Terminal .nb-today-bills strong{color:#4F46E5}
 <script src="https://cdn.jsdelivr.net/npm/qz-tray@2.2.4/qz-tray.js"></script>
 
 
-<script src="/zenithstatic/js/pos-terminal.js?v=167"></script>
+<script src="/zenithstatic/js/pos-terminal.js?v=168"></script>
 
 
 

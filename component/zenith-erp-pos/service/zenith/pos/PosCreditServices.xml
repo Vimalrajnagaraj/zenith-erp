@@ -1,0 +1,176 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+    <!-- Snapshot the customer's existing Contacts creditDays; changing the contact never redates issued bills. -->
+    <service verb="assign" noun="PosCreditDueDate">
+        <in-parameters>
+            <parameter name="transactionId" required="true"/><parameter name="customerPartyId" required="true"/>
+            <parameter name="creditDays" type="Integer"/><parameter name="termsReason"/>
+        </in-parameters>
+        <actions><script><![CDATA[
+            def access = ec.service.sync().name('zenith.pos.PosAccessServices.assert#PosAccess')
+                .parameters([transactionId:transactionId,customerPartyId:customerPartyId]).call()
+            if (!access?.allowed) return
+            def txn = ec.entity.find('zenith.erp.pos.PosTransaction').condition('transactionId',transactionId).forUpdate(true).one()
+            if (txn.statusId != 'PtCreated') { ec.message.addError('Credit terms can only be assigned to an open sale.'); return }
+            def customer = ec.entity.find('mantle.party.Party').condition('partyId',customerPartyId).one()
+            def defaultDays = customer.creditDays
+            def days = creditDays != null ? creditDays : defaultDays
+            if (days != null && (days < 0 || days > 3650)) { ec.message.addError('Credit days must be a whole number from 0 to 3650.'); return }
+            boolean override = creditDays != null && creditDays != defaultDays
+            if (override && !(ec.user.isInGroup('ADMIN') || ec.user.isInGroup('ZENITH_ADMIN'))) {
+                ec.message.addError('A manager must authorize a term different from this customer’s saved credit days.'); return
+            }
+            if (override && !termsReason?.trim()) { ec.message.addError('Enter a reason for the credit-term override.'); return }
+            def zone = ec.user.timeZone.toZoneId()
+            def issuedDay = ec.user.nowTimestamp.toInstant().atZone(zone).toLocalDate()
+            txn.creditDays = days
+            txn.creditDueDate = days != null ? java.sql.Date.valueOf(issuedDay.plusDays(days as long)) : null
+            txn.creditTimeZone = zone.id
+            txn.creditTermsReason = override ? termsReason.trim() : 'Customer credit days'
+            txn.creditTermsByPartyId = ec.user.userAccount?.partyId
+            txn.update()
+        ]]></script></actions>
+    </service>
+
+    <service verb="get" noun="PosCreditHistory">
+        <in-parameters><parameter name="transactionId" required="true"/></in-parameters>
+        <out-parameters><parameter name="history" type="Map"/></out-parameters>
+        <actions><script><![CDATA[
+            def access = ec.service.sync().name('zenith.pos.PosAccessServices.assert#PosAccess').parameter('transactionId',transactionId).call()
+            if (!access?.allowed) return
+            def txn = ec.entity.find('zenith.erp.pos.PosTransaction').condition('transactionId',transactionId).one()
+            if (txn.isCredit != 'Y') { ec.message.addError('Select a credit bill.'); return }
+            def payments = ec.entity.find('zenith.erp.pos.PosPayment').condition('transactionId',transactionId).orderBy('paymentDate,paymentId').list()
+            def total = (txn.payableAmount ?: 0) as BigDecimal
+            def running = BigDecimal.ZERO
+            def rows = payments.collect { payment ->
+                running += (payment.amount ?: 0) as BigDecimal
+                def person = payment.recordedByPartyId ? ec.entity.find('mantle.party.Person').condition('partyId',payment.recordedByPartyId).one() : null
+                [paymentId:payment.paymentId, date:payment.paymentDate ? ec.l10n.format(payment.paymentDate,'dd MMM yyyy, hh:mm:ss a z') : null,
+                 amount:payment.amount, method:payment.paymentMethod, reference:payment.referenceNumber ?: payment.digitalTransactionId ?: '',
+                 recordedBy:person ? [person.firstName,person.lastName].findAll { it }.join(' ') : 'Not recorded (legacy)',
+                 balance:(total - running).max(BigDecimal.ZERO)]
+            }
+            def remaining = (total - running).max(BigDecimal.ZERO)
+            def due = txn.creditDueDate?.toLocalDate()
+            def zone = java.time.ZoneId.of(txn.creditTimeZone ?: ec.user.timeZone.ID)
+            def today = ec.user.nowTimestamp.toInstant().atZone(zone).toLocalDate()
+            def daysRemaining = due ? java.time.temporal.ChronoUnit.DAYS.between(today,due) : null
+            def status = txn.statusId != 'PtCompleted' ? 'Cancelled' : remaining == 0 ? 'Settled' :
+                due == null ? 'Due date not set' : daysRemaining < 0 ? 'Overdue' : daysRemaining <= 2 ? 'Due soon' : 'Open'
+            def customer = txn.customerPartyId ? ec.entity.find('mantle.party.Party').condition('partyId',txn.customerPartyId).one() : null
+            def policy = txn.customerPartyId ? ec.entity.find('zenith.erp.pos.PosCreditReminderPolicy')
+                .condition('organizationPartyId',access.organizationPartyId).condition('customerPartyId',txn.customerPartyId).one() : null
+            history = [transactionId:transactionId, billNo:txn.transactionNumber, customer:txn.customerName, customerPartyId:txn.customerPartyId,
+                total:total, paid:running, outstanding:remaining, payments:rows, lastPayment:rows ? rows[-1].date : null,
+                settledOn:status == 'Settled' && rows ? rows[-1].date : null, dueDate:due?.toString(), creditDays:txn.creditDays,
+                customerCreditDays:customer?.creditDays, daysRemaining:daysRemaining, status:status, dueTimeZone:zone.id,
+                termChanges:ec.entity.find('zenith.erp.pos.PosCreditTermsChange').condition('organizationPartyId',access.organizationPartyId)
+                    .condition('customerPartyId',txn.customerPartyId).orderBy('-changedDate,-changeId').limit(50).list()
+                    .findAll { !it.transactionId || it.transactionId == transactionId }.collect { change ->
+                        [date:ec.l10n.format(change.changedDate,'dd MMM yyyy, hh:mm a z'),reason:change.reason,
+                         scope:change.transactionId ? 'This bill due date' : 'Customer default days',
+                         before:change.transactionId ? change.oldDueDate?.toString() : change.oldDays,
+                         after:change.transactionId ? change.newDueDate?.toString() : change.newDays] },
+                canManageTerms:ec.user.isInGroup('ADMIN') || ec.user.isInGroup('ZENITH_ADMIN'),
+                reminders:ec.entity.find('zenith.erp.pos.PosCreditReminder').condition('organizationPartyId',access.organizationPartyId)
+                    .condition('transactionId',transactionId).orderBy('-createdDate').list().collect { r ->
+                        [date:ec.l10n.format(r.createdDate,'dd MMM yyyy, hh:mm a z'),channel:r.channel,status:r.deliveryStatus,
+                         amount:r.outstandingAmount,error:r.failureReason] },
+                reminderPolicy:[consent:policy?.consent ?: 'N', intervalDays:policy?.intervalDays ?: 7, maxAttempts:policy?.maxAttempts ?: 3, channel:policy?.channel ?: 'SMS']]
+        ]]></script></actions>
+    </service>
+
+    <service verb="save" noun="PosCustomerCreditTerms">
+        <in-parameters>
+            <parameter name="customerPartyId" required="true"/><parameter name="creditDays" type="Integer" required="true"/>
+            <parameter name="reason" required="true"/>
+        </in-parameters>
+        <actions><script><![CDATA[
+            def access = ec.service.sync().name('zenith.pos.PosAccessServices.assert#PosAccess').parameter('customerPartyId',customerPartyId).call()
+            if (!access?.allowed) return
+            if (!(ec.user.isInGroup('ADMIN') || ec.user.isInGroup('ZENITH_ADMIN'))) { ec.message.addError('Only a manager can change customer credit terms.'); return }
+            if (creditDays < 0 || creditDays > 3650 || !reason?.trim()) { ec.message.addError('Enter 0–3650 credit days and a reason.'); return }
+            def customer = ec.entity.find('mantle.party.Party').condition('partyId',customerPartyId).forUpdate(true).one()
+            def oldDays = customer.creditDays
+            customer.creditDays = creditDays; customer.update()
+            if (oldDays != creditDays) ec.service.sync().name('create#zenith.erp.pos.PosCreditTermsChange').parameters([
+                organizationPartyId:access.organizationPartyId,customerPartyId:customerPartyId,oldDays:oldDays,newDays:creditDays,
+                changedDate:ec.user.nowTimestamp,changedByPartyId:ec.user.userAccount?.partyId,reason:reason.trim()]).call()
+        ]]></script></actions>
+    </service>
+
+    <service verb="change" noun="PosCreditDueDate">
+        <in-parameters><parameter name="transactionId" required="true"/><parameter name="dueDate" type="Date" required="true"/><parameter name="reason" required="true"/></in-parameters>
+        <actions><script><![CDATA[
+            def access = ec.service.sync().name('zenith.pos.PosAccessServices.assert#PosAccess').parameter('transactionId',transactionId).call()
+            if (!access?.allowed) return
+            if (!(ec.user.isInGroup('ADMIN') || ec.user.isInGroup('ZENITH_ADMIN'))) { ec.message.addError('Only a manager can change a bill due date.'); return }
+            def txn = ec.entity.find('zenith.erp.pos.PosTransaction').condition('transactionId',transactionId).forUpdate(true).one()
+            if (txn.isCredit != 'Y' || txn.statusId != 'PtCompleted' || !reason?.trim()) { ec.message.addError('Select an active credit bill and enter a reason.'); return }
+            if (dueDate == txn.creditDueDate) return
+            ec.service.sync().name('create#zenith.erp.pos.PosCreditTermsChange').parameters([
+                organizationPartyId:access.organizationPartyId,customerPartyId:txn.customerPartyId,transactionId:transactionId,
+                oldDueDate:txn.creditDueDate,newDueDate:dueDate,changedDate:ec.user.nowTimestamp,
+                changedByPartyId:ec.user.userAccount?.partyId,reason:reason.trim()]).call()
+            txn.creditDueDate = dueDate; txn.update()
+        ]]></script></actions>
+    </service>
+
+    <service verb="save" noun="PosCreditReminderPolicy">
+        <in-parameters>
+            <parameter name="customerPartyId" required="true"/><parameter name="consent" required="true"/>
+            <parameter name="channel" required="true"/><parameter name="intervalDays" type="Integer" required="true"/>
+            <parameter name="maxAttempts" type="Integer" required="true"/>
+        </in-parameters>
+        <actions><script><![CDATA[
+            def access = ec.service.sync().name('zenith.pos.PosAccessServices.assert#PosAccess').parameter('customerPartyId',customerPartyId).call()
+            if (!access?.allowed) return
+            if (!(ec.user.isInGroup('ADMIN') || ec.user.isInGroup('ZENITH_ADMIN'))) { ec.message.addError('Only a manager can configure customer reminders.'); return }
+            if (!['Y','N'].contains(consent) || !['SMS','WhatsApp','Email'].contains(channel) || intervalDays < 1 || intervalDays > 365 || maxAttempts < 1 || maxAttempts > 12) {
+                ec.message.addError('Choose a channel, consent, 1–365 days between reminders, and a maximum of 1–12 attempts.'); return
+            }
+            ec.service.sync().name('store#zenith.erp.pos.PosCreditReminderPolicy').parameters([
+                organizationPartyId:access.organizationPartyId,customerPartyId:customerPartyId,consent:consent,channel:channel,
+                intervalDays:intervalDays,maxAttempts:maxAttempts,changedDate:ec.user.nowTimestamp,changedByPartyId:ec.user.userAccount?.partyId]).call()
+            if (consent == 'N') ec.entity.find('zenith.erp.pos.PosCreditReminder').condition('organizationPartyId',access.organizationPartyId)
+                .condition('customerPartyId',customerPartyId).condition('deliveryStatus','Awaiting provider').list().each {
+                    it.deliveryStatus='Cancelled'; it.failureReason='Customer opted out before delivery.'; it.update()
+                }
+        ]]></script></actions>
+    </service>
+
+    <!-- Preparation is functional and idempotent. Delivery stays explicitly blocked until a supported
+         provider is integrated; a queued record is never represented as a delivered customer message. -->
+    <service verb="prepare" noun="PosCreditReminders" authenticate="false">
+        <actions><script><![CDATA[
+            def now = ec.user.nowTimestamp
+            ec.entity.find('zenith.erp.pos.PosCreditReminderPolicy').condition('consent','Y').list().each { policy ->
+                def bills = ec.entity.find('zenith.erp.pos.PosTransaction').condition('organizationPartyId',policy.organizationPartyId)
+                    .condition('customerPartyId',policy.customerPartyId).condition('isCredit','Y').list()
+                bills.each { bill ->
+                    def txn = ec.entity.find('zenith.erp.pos.PosTransaction').condition('transactionId',bill.transactionId).forUpdate(true).one()
+                    def pending = ec.entity.find('zenith.erp.pos.PosCreditReminder').condition('organizationPartyId',policy.organizationPartyId)
+                        .condition('transactionId',txn.transactionId).condition('deliveryStatus','Awaiting provider').list()
+                    def paid = ec.entity.find('zenith.erp.pos.PosPayment').condition('transactionId',txn.transactionId).list().sum { (it.amount ?: 0) as BigDecimal } ?: BigDecimal.ZERO
+                    def remaining = ((txn.payableAmount ?: 0) as BigDecimal) - paid
+                    if (txn.statusId != 'PtCompleted' || remaining <= 0) {
+                        pending.each { it.deliveryStatus = 'Cancelled'; it.failureReason = 'Bill settled or cancelled before delivery.'; it.update() }; return
+                    }
+                    pending.each { it.outstandingAmount = remaining; it.update() }
+                    if (!txn.creditDueDate) return
+                    def today = now.toInstant().atZone(java.time.ZoneId.of(txn.creditTimeZone ?: 'UTC')).toLocalDate()
+                    if (!today.isAfter(txn.creditDueDate.toLocalDate())) return
+                    def attempts = ec.entity.find('zenith.erp.pos.PosCreditReminder').condition('transactionId',txn.transactionId)
+                        .condition('organizationPartyId',policy.organizationPartyId).orderBy('-createdDate').list()
+                    if (attempts.size() >= policy.maxAttempts || attempts.any { it.deliveryStatus == 'Awaiting provider' }) return
+                    if (attempts && now.time - attempts[0].createdDate.time < (policy.intervalDays as long) * 86400000L) return
+                    ec.service.sync().name('create#zenith.erp.pos.PosCreditReminder').parameters([
+                        organizationPartyId:policy.organizationPartyId,transactionId:txn.transactionId,customerPartyId:txn.customerPartyId,
+                        eventKey:txn.transactionId + ':' + attempts.size(),createdDate:now,channel:policy.channel,outstandingAmount:remaining,
+                        deliveryStatus:'Awaiting provider',failureReason:'No supported delivery provider is configured. No customer message was sent.']).call()
+                }
+            }
+        ]]></script></actions>
+    </service>
+</services>
