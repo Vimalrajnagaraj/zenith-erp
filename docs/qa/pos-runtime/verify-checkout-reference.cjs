@@ -93,6 +93,10 @@ module.exports=async function({a,foreign,base,check,q,invoke,post,out}) {
   await clickAndSettle(product,'addItem');
   await page.reload({waitUntil:'networkidle'});
   check('resumed server-rendered cart uses the same editable quantity and trash icon',await page.locator('.pos-cart .aj-qi').count()===1&&await page.locator('.pos-cart .aj-rm svg').count()===1&&await page.locator('.pos-cart .pos-cart-uom').count()===0);
+  for(const invalid of ['', '0', '-1']) {
+   await page.locator('.pos-cart .aj-qi').fill(invalid);await page.locator('.pos-cart .aj-qi').press('Tab');
+   check('resumed quantity rejects '+JSON.stringify(invalid)+' without hiding its saved value',(await page.locator('.pos-cart .aj-qi').inputValue())==='1');
+  }
   const resumedEdit=page.waitForResponse(r=>r.request().method()==='POST'&&r.url().includes('/ajaxCart')&&new URLSearchParams(r.request().postData()||'').get('action')==='updateQty');
   await page.locator('.pos-cart .aj-qi').fill('2');await page.locator('.pos-cart .aj-qi').press('Tab');await resumedEdit;
   const resumedId=await page.locator('#cartInlineAddForm input[name=transactionId]').inputValue();

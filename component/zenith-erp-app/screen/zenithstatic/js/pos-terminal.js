@@ -3375,7 +3375,7 @@ window.posToggleFullscreen = function() {
                     // Empty/0/NaN (e.g. the box was cleared to retype a decimal) must not delete
                     // the line — revert to the last good qty. Any value > 0 (incl. decimals like
                     // 0.5) keeps the line and recomputes its amount (qty × rate).
-                    if (!(nq > 0)) { renderCart(lastCartData); return; }
+                    if (!(nq > 0)) { if (lastCartData) renderCart(lastCartData); else e.target.value = e.target.defaultValue; return; }
                     OPT.qty(e.target.dataset.seq, nq);
                 }
                 if (e.target.classList.contains('aj-mode')) {
