@@ -2780,7 +2780,7 @@ window.posToggleFullscreen = function() {
                 + '<input type="hidden" name="salesModeId" value="'+SM+'"/>'
                 + '<input type="hidden" name="customerPhone" value=""/>'
                 + '<input type="hidden" name="moquiSessionToken" value="'+TK+'"/>'
-                + '<button type="submit" style="width:100%;padding:clamp(8px,1.4vh,15px) 8px;border:none;border-radius:10px;font-size:16px;font-weight:700;cursor:pointer;background:'+bg+';color:#fff">'+label+'</button></form>';
+                + '<button type="submit" id="pos-pay-'+method.toLowerCase()+'" style="width:100%;padding:clamp(8px,1.4vh,15px) 8px;border:none;border-radius:10px;font-size:16px;font-weight:700;cursor:pointer;background:'+bg+';color:#fff">'+label+'</button></form>';
         }
         function actionBtn(action, label, bg, conf) {
             return '<form method="post" action="Terminal/'+action+'" style="margin:0">'
@@ -2789,7 +2789,7 @@ window.posToggleFullscreen = function() {
                 + '<input type="hidden" name="taxOn" value="'+TO+'"/>'
                 + '<input type="hidden" name="salesModeId" value="'+SM+'"/>'
                 + '<input type="hidden" name="moquiSessionToken" value="'+TK+'"/>'
-                + '<button type="submit" style="width:100%;padding:clamp(7px,1.2vh,13px) 8px;border:none;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;background:'+bg+';color:#fff"'
+                + '<button type="submit"'+(action==='holdSale'?' id="pos-hold"':action==='voidSale'?' id="pos-void"':'')+' style="width:100%;padding:clamp(7px,1.2vh,13px) 8px;border:none;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;background:'+bg+';color:#fff"'
                 + (conf ? ' onclick="return confirm(\''+conf+'\')"' : '') + '>'+label+'</button></form>';
         }
         function referencePayments(d) {

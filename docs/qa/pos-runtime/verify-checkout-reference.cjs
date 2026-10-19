@@ -1,6 +1,11 @@
 const path=require('node:path');
 module.exports=async function({a,foreign,base,check,q,invoke,post,out}) {
- const session=await invoke('open',{terminalId:'POS_QA_A_TERM2',openingCash:'100'});
+ const terminalId='POS_QA_A_CHECKOUT';
+ if(!q(`SELECT * FROM pos_terminal WHERE terminal_id='${terminalId}'`).length){
+  await post('PosTerminals','createTerminal',{terminalId,terminalName:'Disposable checkout QA counter',facilityId:'POS_QA_A_FAC',organizationPartyId:'POS_QA_A',stateCode:'33',isActive:'Y'});
+  check('dedicated checkout counter is created in the test organization',q(`SELECT * FROM pos_terminal WHERE terminal_id='${terminalId}' AND organization_party_id='POS_QA_A'`).length===1);
+ }
+ const session=await invoke('open',{terminalId,openingCash:'100'});
  const page=await a.c.newPage();page.setDefaultTimeout(30000);
  const errors=[];page.on('pageerror',e=>errors.push(e.message));page.on('dialog',d=>d.accept());
  const cart=await invoke('cart',{sessionId:session.sessionId});
@@ -99,6 +104,7 @@ module.exports=async function({a,foreign,base,check,q,invoke,post,out}) {
   await page.locator('.pos-cart-heading h2').click();await page.keyboard.press('F2');await page.locator('.pos-cash-panel').waitFor();
   check('F2 cash Proceed is reachable',await page.locator('.pos-cash-confirm').evaluate(e=>{const r=e.getBoundingClientRect();return r.top>=0&&r.bottom<=innerHeight;}));
   await page.locator('.pos-cash-cancel').click();
+  check('payment shortcuts exist immediately after cancelling Cash',await page.evaluate(()=>['pos-discount','pos-pay-cash','pos-pay-card','pos-credit','pos-pay-upi','pos-split','pos-hold','pos-void'].every(id=>document.getElementById(id))));
   const heldRequest=page.waitForResponse(r=>r.request().method()==='POST'&&r.url().includes('/holdSale'));
   await page.locator('.pos-cart-heading h2').click();await page.keyboard.press('F7');await heldRequest;
   await page.locator('#pos-held-wrap summary').waitFor();
@@ -114,6 +120,7 @@ module.exports=async function({a,foreign,base,check,q,invoke,post,out}) {
   await page.locator('.pos-cart-heading h2').click();await page.keyboard.press('c');await page.locator('#posCloseSessionOverlay').waitFor();
   check('C opens exactly one cash-review dialog',await page.locator('#posCloseSessionOverlay').count()===1);
   await page.locator('.pos-close-cancel').click();
+  await invoke('close',{sessionId:session.sessionId,closingCash:'200'});
   check('reference checkout produces no JavaScript exceptions',errors.length===0,{errors});
  }catch(error){await page.screenshot({path:path.join(out,'checkout-reference-failure.png'),fullPage:true});throw error;}
  finally{await page.close();}
