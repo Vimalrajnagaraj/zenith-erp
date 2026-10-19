@@ -91,6 +91,11 @@ module.exports=async function({a,foreign,base,check,q,invoke,post,out}) {
   const issued=await api({action:'clearCart'});check('issued bill cannot be cleared',!issued.d.success&&lines().length===1&&tx().status_id==='PtCompleted');
   await page.goto(`${base}/apps/zenith/pos/Terminal?sessionId=${session.sessionId}&taxOn=N`);
   await clickAndSettle(product,'addItem');
+  await page.reload({waitUntil:'networkidle'});
+  check('resumed server-rendered cart uses the same editable quantity and trash icon',await page.locator('.pos-cart .aj-qi').count()===1&&await page.locator('.pos-cart .aj-rm svg').count()===1&&await page.locator('.pos-cart .pos-cart-uom').count()===0);
+  const resumedEdit=page.waitForResponse(r=>r.request().method()==='POST'&&r.url().includes('/ajaxCart')&&new URLSearchParams(r.request().postData()||'').get('action')==='updateQty');
+  await page.locator('.pos-cart .aj-qi').fill('2');await page.locator('.pos-cart .aj-qi').press('Tab');await resumedEdit;
+  check('first quantity edit after reload persists through the existing fallback',lines().length===1&&Number(lines()[0].quantity)===2&&Number(tx().subtotal)===200);
   for(const size of [{width:1672,height:941},{width:1366,height:768},{width:1024,height:768},{width:800,height:768},{width:390,height:844},{width:320,height:700}]) {
    await page.setViewportSize(size);await page.waitForTimeout(200);
    const g=await page.evaluate(()=>{const box=s=>document.querySelector(s).getBoundingClientRect().toJSON();return {w:innerWidth,h:innerHeight,scroll:document.documentElement.scrollWidth,header:box('.nb-hrow'),actions:box('.nb-actionbar'),catalog:box('.pos-left-panel'),cart:box('#cartScroll'),pay:box('.pos-reference-payments'),toolbar:[...document.querySelectorAll('.nb-actionbar button,.nb-actionbar summary')].filter(e=>e.checkVisibility()).map(e=>e.getBoundingClientRect().toJSON()),quantity:[...document.querySelectorAll('.aj-qi')].map(e=>({value:e.value,width:e.getBoundingClientRect().width})),cards:[...document.querySelectorAll('.pos-product-grid button')].map(e=>e.getBoundingClientRect().toJSON())};});
