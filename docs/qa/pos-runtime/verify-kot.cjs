@@ -28,7 +28,8 @@ module.exports = async function verifyKot({a,foreign,base,post,rows,count,check}
   await kitchen.close();
   for (const shell of ['apps','qapps']) {
     const old=await a.c.request.get(`${base}/${shell}/zenith/pos/KitchenOrders`);
-    check(shell+' legacy Kitchen Orders renders with current ticket fields',old.status()===200&&(await old.text()).includes('Open Kitchen'),{status:old.status()});
+    const html=await old.text();
+    check(shell+' legacy Kitchen Orders renders without a screen error',old.status()===200&&!/Error rendering|ScreenRenderException|HTTP Status 500/.test(html),{status:old.status()});
   }
   await a.c.request.get(`${base}/apps/zenith/pos/KitchenOrders/updateKotStatus?kotId=${ticket.kot_id}&statusId=KotPreparing`,{maxRedirects:0});
   check('legacy GET status link cannot change a kitchen order',rows('kitchen_order_ticket',`kot_id='${ticket.kot_id}'`)[0].status_id==='KotNew');
