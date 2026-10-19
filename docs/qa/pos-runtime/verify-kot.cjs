@@ -34,8 +34,12 @@ module.exports = async function verifyKot({a,foreign,base,post,rows,count,check}
   await a.c.request.get(`${base}/apps/zenith/pos/KitchenOrders/updateKotStatus?kotId=${ticket.kot_id}&statusId=KotPreparing`,{maxRedirects:0});
   check('legacy GET status link cannot change a kitchen order',rows('kitchen_order_ticket',`kot_id='${ticket.kot_id}'`)[0].status_id==='KotNew');
   const foreignPrint=await post('Kitchen/KotBilling','reprintKot',{kotId:ticket.kot_id},foreign);
+  let printDenied=foreignPrint.status()===403;
+  if (foreignPrint.status()===200) {
+    try { printDenied=!(await foreignPrint.json()).success; } catch (_) { printDenied=false; }
+  }
   check('another shop cannot increase the KOT print count',
-    foreignPrint.status()===200&&!(await foreignPrint.json()).success&&Number(rows('kitchen_order_ticket',`kot_id='${ticket.kot_id}'`)[0].print_count)===0);
+    printDenied&&Number(rows('kitchen_order_ticket',`kot_id='${ticket.kot_id}'`)[0].print_count)===0,{status:foreignPrint.status()});
   const printPage=await a.c.newPage();
   await printPage.goto(base+'/apps/zenith/pos/Kitchen/KotBilling',{waitUntil:'networkidle'});
   await printPage.waitForFunction(()=>typeof window.kbPrintKot==='function');
