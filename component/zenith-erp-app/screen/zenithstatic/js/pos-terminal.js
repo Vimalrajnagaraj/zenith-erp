@@ -264,28 +264,30 @@ window._posOffline = (function() {
     function payable(){return Math.round(cart.reduce(function(a,it){return a+Number(it.qty)*Number(it.price)+taxAmount(it);},0));}
     function render(){
         var tb=document.querySelector('.pos-cart tbody');
-        if(tb){ var h=''; if(!cart.length) h='<tr><td colspan="7" style="text-align:center;padding:40px;color:#aaa;font-size:16px">Offline &mdash; tap products to add items</td></tr>';
+        if(tb){ var h=''; if(!cart.length) h='<tr><td colspan="8" style="text-align:center;padding:40px;color:#aaa;font-size:16px">Offline &mdash; tap products to add items</td></tr>';
             cart.forEach(function(it,i){ h+='<tr style="border-bottom:1px solid #e0e0e0">'
                 +'<td style="padding:8px 10px;text-align:center;font-weight:700;color:#777;width:30px">'+(i+1)+'</td>'
                 +'<td style="padding:8px 10px"><div style="font-size:14px;font-weight:600;color:#000">'+esc(it.name)+'</div><div style="font-size:11px;color:#555">'+esc(it.productId)+'</div></td>'
+                +'<td style="padding:8px;color:#7780a3">Cached</td>'
                 +'<td style="padding:8px 10px;text-align:right;color:#000">'+f2(it.price)+'</td>'
                 +'<td style="padding:4px;text-align:center"><div style="display:flex;align-items:center;justify-content:center">'
                 +'<button data-i="'+i+'" class="ofl-minus" style="width:32px;height:38px;border:2px solid #e53935;background:#fff;font-size:20px;font-weight:bold;cursor:pointer;border-radius:8px 0 0 8px;color:#e53935">-</button>'
                 +'<input data-i="'+i+'" class="ofl-qi" type="number" step="any" value="'+Number(it.qty)+'" style="width:52px;height:38px;text-align:center;font-weight:bold;font-size:15px;border-top:2px solid #ccc;border-bottom:2px solid #ccc;border-left:none;border-right:none;box-sizing:border-box;outline:none"/>'
                 +'<button data-i="'+i+'" class="ofl-plus" style="width:32px;height:38px;border:2px solid #2e7d32;background:#fff;font-size:20px;font-weight:bold;cursor:pointer;border-radius:0 8px 8px 0;color:#2e7d32">+</button>'
                 +'</div>'+(it.uom?'<div style="font-size:11px;color:#e65100;font-weight:700;text-align:center;margin-top:2px">'+esc(it.uom)+'</div>':'')+'</td>'
-                +'<td style="padding:8px 10px;text-align:right;font-weight:700;color:#000">'+f2(it.qty*it.price)+'</td>'
+                +'<td>'+f2(taxAmount(it))+'</td>'
+                +'<td style="padding:8px 10px;text-align:right;font-weight:700;color:#000">'+f2(it.qty*it.price+taxAmount(it))+'</td>'
                 +'<td style="padding:4px;text-align:center"><button data-i="'+i+'" class="ofl-rm" style="width:30px;height:30px;border:none;background:#e53935;color:#fff;border-radius:6px;cursor:pointer">&#10005;</button></td></tr>'; });
             tb.innerHTML=h; }
         var sm=document.querySelector('.pos-summary');
         if(sm){ var total=payable(); var qty=cart.reduce(function(a,it){return a+Number(it.qty);},0);
-            var s='<div style="display:flex;justify-content:space-between;font-size:13px;color:#777;margin-bottom:6px"><span style="color:#c62828;font-weight:700">OFFLINE</span><span>Qty: <b>'+qty+'</b></span></div>'
-                +'<div style="background:#c62828;color:#fff;padding:clamp(5px,1vh,12px) 20px;border-radius:10px;display:flex;justify-content:space-between;align-items:center;margin-bottom:10px"><span style="font-size:16px;font-weight:600">OFFLINE TOTAL (incl. tax)</span><span style="font-size:28px;font-weight:800">&#8377;'+f2(total)+'</span></div>';
-            if(cart.length){ s+='<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px">'
-                +'<button type="button" class="ofl-pay" data-m="Cash" style="padding:clamp(8px,1.4vh,15px) 8px;border:none;border-radius:10px;font-size:16px;font-weight:700;cursor:pointer;background:#4caf50;color:#fff">&#128176; CASH</button>'
-                +'<button type="button" class="ofl-pay" data-m="Card" style="padding:clamp(8px,1.4vh,15px) 8px;border:none;border-radius:10px;font-size:16px;font-weight:700;cursor:pointer;background:#2196f3;color:#fff">&#128179; CARD</button>'
-                +'<button type="button" class="ofl-pay" data-m="UPI" style="padding:clamp(8px,1.4vh,15px) 8px;border:none;border-radius:10px;font-size:16px;font-weight:700;cursor:pointer;background:#9c27b0;color:#fff">&#128241; UPI</button></div>';
-            } else { s+='<div style="text-align:center;padding:16px;color:#aaa">Offline &mdash; tap products to add items</div>'; }
+            var s='<div class="pos-sum-strip" style="display:flex;justify-content:space-between;font-size:13px;color:#777;margin-bottom:6px"><span style="color:#c62828;font-weight:700">OFFLINE</span><span>Qty: <b>'+qty+'</b></span></div>'
+                +'<div class="pos-sum-total" style="background:#c62828;color:#fff;padding:clamp(5px,1vh,12px) 20px;border-radius:10px;display:flex;justify-content:space-between;align-items:center;margin-bottom:10px"><span style="font-size:16px;font-weight:600">Offline TOTAL</span><span style="font-size:28px;font-weight:800">&#8377;'+f2(total)+'</span></div>';
+            if(cart.length){ s+='<div class="pos-paywrap pos-reference-payments pos-offline-payments" style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px">'
+                +'<button type="button" class="ofl-pay" id="pos-pay-cash" data-m="Cash" style="padding:clamp(8px,1.4vh,15px) 8px;border:none;border-radius:10px;font-size:16px;font-weight:700;cursor:pointer;background:#4caf50;color:#fff">&#128176; CASH<kbd>F2</kbd></button>'
+                +'<button type="button" class="ofl-pay" id="pos-pay-card" data-m="Card" style="padding:clamp(8px,1.4vh,15px) 8px;border:none;border-radius:10px;font-size:16px;font-weight:700;cursor:pointer;background:#2196f3;color:#fff">&#128179; CARD<kbd>F3</kbd></button>'
+                +'<button type="button" class="ofl-pay" id="pos-pay-upi" data-m="UPI" style="padding:clamp(8px,1.4vh,15px) 8px;border:none;border-radius:10px;font-size:16px;font-weight:700;cursor:pointer;background:#9c27b0;color:#fff">&#128241; UPI<kbd>F5</kbd></button></div>';
+            } else { s+='<div class="pos-paywrap pos-reference-payments" style="justify-content:center;text-align:center;padding:16px;color:#aaa">Offline &mdash; tap products to add items</div>'; }
             sm.innerHTML=s; }
     }
     function add(pid, price){ var p=catalog[pid]||{}; var pr=Number(price||p.price||0); var ex=cart.find(function(it){return it.productId===pid && Number(it.price)===pr;}); if(ex) ex.qty=Number(ex.qty)+1; else cart.push({productId:pid,name:p.name||pid,price:pr,qty:1,uom:p.uom||'',taxRate:p.taxRate}); render(); }
@@ -315,7 +317,7 @@ window._posOffline = (function() {
         window.addEventListener('online', function(){ banner(false); sync().then(function(nn){ if(nn>0) toast('✔ '+nn+' offline sale(s) synced','#2e7d32'); setTimeout(function(){ try{location.reload();}catch(e){} }, nn>0?1600:300); }); });
         // Stale-while-revalidate: refresh the local master-data cache in the background so local reads stay current
         setInterval(function(){ if(navigator.onLine) cacheCatalog(); }, 180000);
-        document.addEventListener('click', function(e){ var t=e.target; if(!t.classList) return;
+        document.addEventListener('click', function(e){ var t=e.target.closest ? (e.target.closest('.ofl-minus,.ofl-plus,.ofl-rm,.ofl-pay') || e.target) : e.target; if(!t.classList) return;
             if(t.classList.contains('ofl-minus')){ var i=+t.dataset.i; cart[i].qty=Number(cart[i].qty)-1; if(cart[i].qty<=0)cart.splice(i,1); render(); }
             else if(t.classList.contains('ofl-plus')){ var i2=+t.dataset.i; cart[i2].qty=Number(cart[i2].qty)+1; render(); }
             else if(t.classList.contains('ofl-rm')){ cart.splice(+t.dataset.i,1); render(); }
@@ -323,7 +325,7 @@ window._posOffline = (function() {
         document.addEventListener('change', function(e){ if(e.target.classList&&e.target.classList.contains('ofl-qi')){ var i=+e.target.dataset.i; var nq=Number(e.target.value); if(!Number.isFinite(nq)||nq<=0){toast('Quantity must be greater than zero. Use remove to delete a line.','#c62828');} else cart[i].qty=nq; render(); } });
     }
     setTimeout(boot, 1500);
-    return { boot:boot, active:active, add:add, scan:scan, sync:sync, render:render, cacheCatalog:cacheCatalog, search:search, lookup:lookup, catalogSize:catalogSize, getQueue:getQueue, recoverLegacy:recoverLegacy };
+    return { boot:boot, active:active, add:add, scan:scan, sync:sync, clearDraft:function(){cart=[];render();}, render:render, cacheCatalog:cacheCatalog, search:search, lookup:lookup, catalogSize:catalogSize, getQueue:getQueue, recoverLegacy:recoverLegacy };
 })();
 
 /* === Product Import screen: manual add + search auto-fill + CSV (external JS, so the
@@ -3283,6 +3285,7 @@ window.posToggleFullscreen = function() {
         })();
 
         window._posClearCart = function() {
+            if (document.querySelector('.ofl-qi') && window._posOffline) { window._posOffline.clearDraft(); return Promise.resolve(); }
             if (!navigator.onLine) return Promise.reject(new Error('Reconnect before clearing the server cart.'));
             if (modeSwitching) return Promise.reject(new Error('Wait for the sales mode to finish changing.'));
             if (cartClearing) return Promise.reject(new Error('The cart is already being cleared.'));
