@@ -3340,7 +3340,7 @@ window.posToggleFullscreen = function() {
         var cart = document.querySelector('.pos-cart');
         if (cart) {
             cart.addEventListener('click', function(e) {
-                var t = e.target;
+                var t = e.target.closest ? (e.target.closest('.aj-q,.aj-pb,.aj-rm') || e.target) : e.target;
                 if (t.classList.contains('aj-q')) {
                     e.preventDefault(); e.stopPropagation();
                     var nq = Number(t.dataset.q);
