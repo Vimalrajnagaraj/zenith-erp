@@ -45,7 +45,11 @@
         if (!panel || !input) return;
         panel.classList.toggle('is-open', open);
         document.getElementById('pos-search-toggle').setAttribute('aria-expanded', String(open));
-        if (open) input.focus();
+        if (open) {
+            var heading=root.querySelector('.pos-cart-heading').getBoundingClientRect();
+            panel.style.top=Math.max(12,Math.min(heading.bottom+6,innerHeight-340))+'px';
+            input.focus();
+        }
     }
     function refreshStock() {
         if (!root || !root.isConnected || document.hidden || !navigator.onLine || stockBusy) return;
@@ -71,6 +75,12 @@
         root = document.querySelector('.pos-checkout-reference'); if (!root || root.dataset.checkoutBound) return;
         root.dataset.checkoutBound = '1';
         observer = new MutationObserver(schedule); paint(); connection();
+        root.addEventListener('keydown',function(event){
+            if(event.target.id==='cartInlineSearch' && (event.key==='Enter'||event.key==='Escape')) setTimeout(function(){search(false);},0);
+        },true);
+        root.addEventListener('click',function(event){
+            if(event.target.closest('.cart-dd-item')) setTimeout(function(){search(false);},0);
+        },true);
         root.addEventListener('click', function (event) {
             var category = event.target.closest('.pos-cat-strip a');
             if (category) { root.dataset.checkoutCategory = new URL(category.href).searchParams.get('catId') || ''; schedule(); }

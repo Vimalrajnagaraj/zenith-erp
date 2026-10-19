@@ -37,6 +37,14 @@ module.exports=async function({a,foreign,base,check,q,invoke,post,out}) {
   await clickAndSettle('.pos-product-grid form:has(input[name=productId][value=POS_QA_A_P5]) button','addItem');
   await clickAndSettle('.pos-cart tbody tr:has-text("Disposable POS A P5") .aj-rm svg','removeItem');
   check('clicking the trash icon removes only that product',lines().length===1&&lines()[0].product_id==='POS_QA_A_P18'&&Number(tx().subtotal)===151);
+  await page.locator('#pos-search-toggle').click();
+  await page.locator('#cartInlineSearch').fill('POS_QA_A_P5');
+  await page.locator('#cartSearchDropdown .cart-dd-item[data-pid="POS_QA_A_P5"]').waitFor();
+  const searchAdded=page.waitForResponse(r=>r.url().includes('/ajaxCart')&&new URLSearchParams(r.request().postData()||'').get('action')==='addItem');
+  await page.locator('#cartInlineSearch').press('Enter');await searchAdded;
+  await page.waitForFunction(()=>!document.querySelector('.pos-cart-search').classList.contains('is-open'));
+  check('search/Enter adds a product and frees the cart toolbar',lines().some(l=>l.product_id==='POS_QA_A_P5')&&await page.locator('#pos-search-toggle').getAttribute('aria-expanded')==='false');
+  await clickAndSettle('.pos-cart tbody tr:has-text("Disposable POS A P5") .aj-rm svg','removeItem');
   // Show/cancel each payment path without writing a tender.
   for(const [key,selector] of [['F1','#posDiscountOverlay'],['F4','#posCreditOverlay'],['F6','.pos-split-panel']]) {
    await page.locator('.pos-cart-heading h2').click();await page.keyboard.press(key);await page.locator(selector).waitFor();
@@ -60,7 +68,15 @@ module.exports=async function({a,foreign,base,check,q,invoke,post,out}) {
   await page.locator('#hist-close').click();
   // Unpaid clearing rejects cross-tenant and paid drafts, and never issues a number or stock movement.
   const denied=await api({action:'clearCart'},foreign);check('foreign cart clear rejected',denied.r.status()===403||!denied.d.success);
+  const csrf=await post('Terminal','ajaxCart',{action:'clearCart',sessionId:session.sessionId,transactionId:cart.transactionId},a,false);
+  check('Clear Cart requires CSRF protection',csrf.status()===403&&lines().length===1);
+  let delayed=false;
+  const delayEdit=async route=>{if(new URLSearchParams(route.request().postData()||'').get('action')==='updateQty'){delayed=true;await new Promise(resolve=>setTimeout(resolve,700));}await route.continue();};
+  await page.route('**/Terminal/ajaxCart',delayEdit);
+  await page.locator('.pos-cart .aj-q').last().click();
   await clickAndSettle('#pos-clear-cart','clearCart');
+  await page.unroute('**/Terminal/ajaxCart',delayEdit);
+  check('Clear Cart waits for the queued edit before clearing',delayed&&lines().length===0);
   check('Clear Cart removes draft items and tax details, consumes no bill number',lines().length===0&&Number(tx().payable_amount)===0&&!tx().transaction_number&&q(`SELECT * FROM tax_line_detail WHERE reference_type='PosTransactionItem' AND reference_id='${cart.transactionId}'`).length===0);
   await clickAndSettle(product,'addItem');
   await invoke('pay',{transactionId:cart.transactionId,paymentMethod:'Cash',amount:'10'});
