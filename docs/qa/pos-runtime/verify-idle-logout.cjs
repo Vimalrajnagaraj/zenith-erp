@@ -23,7 +23,7 @@ module.exports=async function({a,foreign,base,check,q,invoke,post,out}){
  await invoke('pay',{transactionId:bt.transactionId,paymentMethod:'Cash',amount:'5'},false,foreign);await invoke('complete',{transactionId:bt.transactionId},false,foreign);
  await post('PosQaAcceptance','idleClock',{sessionId:b.sessionId},foreign);
  const secondBody=await loggedOutSweep('pos.b.qa');
- check('new session defaults to one-hour closure without a hidden organization opt-in',secondBody.closedCount===1&&q(`SELECT status_id FROM pos_session WHERE session_id='${b.sessionId}'`)[0].status_id==='PsClosed',secondBody);
+ check('new session without an organization opt-in is NOT auto-closed (opt-in gate; no-config != consent)',secondBody.closedCount===0&&q(`SELECT status_id FROM pos_session WHERE session_id='${b.sessionId}'`)[0].status_id==='PsOpen',secondBody);
  check('existing sweep job retains its identity and uses minute-level cadence',q("SELECT cron_expression FROM service_job WHERE job_name='zenith_PosIdleSessionSweep_5min'")[0].cron_expression==='0 * * * * ?');
  for(const shell of ['apps','qapps']){
   const page=await a.c.newPage();await page.goto(`${base}/${shell}/zenith/pos/PosSessions`);
