@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+    <service verb="get" noun="TerminalModes">
+        <in-parameters><parameter name="terminalId" required="true"/></in-parameters>
+        <out-parameters><parameter name="modes" type="List"/></out-parameters>
+        <actions>
+            <set field="modes" from="[]"/>
+            <service-call name="zenith.pos.PosAccessServices.assert#PosAccess" in-map="[terminalId:terminalId]" out-map="access"/>
+            <if condition="!access.allowed"><return/></if>
+            <script><![CDATA[
+                def terminal = ec.entity.find('zenith.erp.pos.PosTerminal').condition('terminalId',terminalId).one()
+                def removed = ec.entity.find('zenith.erp.pos.PosSalesModeShop')
+                    .condition('organizationPartyId',access.organizationPartyId).condition('facilityId',terminal.facilityId).list()*.salesModeId as Set
+                def assigned = ec.entity.find('zenith.erp.pos.PosTerminalSalesMode')
+                    .condition('terminalId',terminalId).condition('isActive','Y').list()*.salesModeId as Set
+                modes = ec.entity.find('zenith.erp.pos.PosSalesMode').condition('isActive','Y').orderBy('isDefault,modeName').list().findAll {
+                    (!it.organizationPartyId || it.organizationPartyId == access.organizationPartyId) &&
+                    (it.isDefault == 'Y' || ((!assigned || assigned.contains(it.salesModeId)) && !removed.contains(it.salesModeId)))
+                }
+            ]]></script>
+        </actions>
+    </service>
+    <service verb="assert" noun="TerminalMode">
+        <in-parameters><parameter name="terminalId" required="true"/><parameter name="salesModeId"/></in-parameters>
+        <actions>
+            <if condition="!salesModeId"><return/></if>
+            <!-- Coordinate a mode change/add with removal on this terminal. -->
+            <entity-find-one entity-name="zenith.erp.pos.PosTerminal" value-field="modeTerminal" for-update="true"/>
+            <service-call name="zenith.pos.PosModeServices.get#TerminalModes" in-map="[terminalId:terminalId]" out-map="available"/>
+            <if condition="!available.modes.any { it.salesModeId == salesModeId }">
+                <return error="true" message="This sales mode is not available at this shop. Choose an available mode."/>
+            </if>
+        </actions>
+    </service>
+    <service verb="set" noun="ShopModeAvailability">
+        <in-parameters>
+            <parameter name="salesModeId" required="true"/>
+            <parameter name="facilityIds" type="List" required="true"/>
+            <parameter name="restore" type="Boolean" default="false"/>
+        </in-parameters>
+        <actions>
+            <service-call name="zenith.base.SecurityServices.check#ModuleWriteAccess" in-map="[moduleId:'pos']" out-map="permission"/>
+            <if condition="permission.canWrite != true || !(ec.user.isInGroup('ADMIN') || ec.user.isInGroup('ZENITH_ADMIN'))">
+                <return error="true" message="POS administrator access is required to change shop modes."/>
+            </if>
+            <service-call name="zenith.pos.PosAccessServices.assert#PosAccess" in-map="[:]" out-map="access"/>
+            <if condition="!access.allowed"><return/></if>
+            <script><![CDATA[
+                def ids = (facilityIds ?: []).findAll { it }.collect { it.toString() }.unique().sort()
+                def mode = ec.entity.find('zenith.erp.pos.PosSalesMode').condition('salesModeId',salesModeId).one()
+                if (!mode || mode.isActive != 'Y' || (mode.organizationPartyId && mode.organizationPartyId != access.organizationPartyId)) {
+                    ec.message.addError('Choose an active sales mode from your organization.'); return
+                }
+                if (mode.isDefault == 'Y') { ec.message.addError('The default Retail mode must remain available.'); return }
+                if (!ids || ids.size() > 100) { ec.message.addError('Select the shop or shops to update.'); return }
+                def shops = ec.entity.find('mantle.facility.Facility').condition('facilityId','in',ids)
+                    .condition('ownerPartyId',access.organizationPartyId).condition('facilityTypeEnumId','FcTpRetailStore').list()
+                if (shops.size() != ids.size()) { ec.message.addError('Choose only shops belonging to your active organization.'); return }
+                def terminals = ec.entity.find('zenith.erp.pos.PosTerminal').condition('organizationPartyId',access.organizationPartyId)
+                    .condition('facilityId','in',ids).orderBy('terminalId').forUpdate(true).list()
+                if (!restore && terminals) {
+                    def sessions = ec.entity.find('zenith.erp.pos.PosSession').condition('organizationPartyId',access.organizationPartyId)
+                        .condition('terminalId','in',terminals*.terminalId).list()*.sessionId
+                    if (sessions) {
+                        def carts = ec.entity.find('zenith.erp.pos.PosTransaction').condition('organizationPartyId',access.organizationPartyId)
+                            .condition('sessionId','in',sessions).condition('statusId','in',['PtCreated','PtHeld']).list()
+                        def used = carts.any { it.salesModeId == salesModeId }
+                        if (!used && carts) used = ec.entity.find('zenith.erp.pos.PosTransactionItem')
+                            .condition('transactionId','in',carts*.transactionId).condition('salesModeId',salesModeId).count() > 0
+                        if (used) { ec.message.addError('Finish, switch or void open and held carts using this mode in the selected shops first.'); return }
+                    }
+                }
+                // Validate the complete selection before writing any shop override.
+                ids.each { id ->
+                    if (restore) ec.entity.find('zenith.erp.pos.PosSalesModeShop').condition('organizationPartyId',access.organizationPartyId)
+                        .condition('facilityId',id).condition('salesModeId',salesModeId).deleteAll()
+                    else ec.service.sync().name('store#zenith.erp.pos.PosSalesModeShop').parameters([
+                        facilityId:id,salesModeId:salesModeId,organizationPartyId:access.organizationPartyId]).call()
+                }
+                ec.message.addMessage(restore ? 'Sales mode restored for the selected shop.' : 'Sales mode removed from the selected shops. Other shops and bill history are unchanged.')
+            ]]></script>
+        </actions>
+    </service>
+</services>

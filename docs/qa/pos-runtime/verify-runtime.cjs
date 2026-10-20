@@ -100,14 +100,14 @@ const rows=(table,where)=>q(`SELECT * FROM ${table} WHERE ${where}`),count=(tabl
   const card=modePage.locator('.smode-tile').filter({hasText:displayModeName});
   check(shell+' custom mode appears in active cards',await card.count()===1);
   check(shell+' Delete is visible without opening Customize',await card.locator('.smode-tile-actions > form .smode-delete').isVisible());
-  check(shell+' shared/default modes retain their delete protection',await modePage.locator('.smode-tile').filter({hasText:'Standard retail'}).locator('.smode-tile-actions .smode-delete').isDisabled());
+  check(shell+' default Retail retains its delete protection',await modePage.locator('.smode-tile').filter({hasText:'Standard retail'}).locator('.smode-tile-actions .smode-delete').isDisabled());
   await card.locator('.smode-menu summary').click();
   check(shell+' Customize retains Rename beside visible Delete',await card.getByRole('button',{name:/Rename/}).isVisible()&&await card.getByRole('button',{name:/Delete/}).isVisible());
   await card.getByRole('button',{name:/Rename/}).click();
-  check(shell+' Rename opens the editor',await card.locator('dialog').isVisible());
+  check(shell+' Rename opens the editor',await card.locator('dialog:not(.smode-shop-dialog)').isVisible());
   const nextName='Disposable Special '+shell;
-  await card.locator('dialog [name=modeName]').fill(nextName);
-  await card.locator('dialog button[type=submit]').click();await modePage.waitForLoadState('networkidle');
+  await card.locator('dialog:not(.smode-shop-dialog) [name=modeName]').fill(nextName);
+  await card.locator('dialog:not(.smode-shop-dialog) button[type=submit]').click();await modePage.waitForLoadState('networkidle');
   check(shell+' Rename persists for this shop',rows('pos_sales_mode',`sales_mode_id='${customId}'`)[0].mode_name===nextName);
   displayModeName=nextName;await modePage.close();
  }
@@ -126,8 +126,8 @@ const rows=(table,where)=>q(`SELECT * FROM ${table} WHERE ${where}`),count=(tabl
  await post('SalesMode','removeTerminal',{terminalId:'POS_QA_A_TERM1',salesModeId:customId});check('terminal assignment removal persists',count('pos_terminal_sales_mode',`terminal_id='POS_QA_A_TERM1' AND sales_mode_id='${customId}'`)===0);
  const archivePage=await a.c.newPage();await archivePage.goto(base+'/apps/zenith/pos/SalesMode',{waitUntil:'networkidle'});
  const archiveCard=archivePage.locator('.smode-tile').filter({hasText:displayModeName});await archiveCard.locator('.smode-menu summary').click();
- archivePage.once('dialog',dialog=>dialog.accept());await archiveCard.getByRole('button',{name:/Delete/}).click();await archivePage.waitForLoadState('networkidle');await archivePage.close();
- check('Visible Delete archives mode and retains price history',count('pos_sales_mode',`sales_mode_id='${customId}' AND is_active='N'`)===1&&count('pos_product_mode_price',`sales_mode_id='${customId}'`)===1);
+ await archiveCard.getByRole('button',{name:/Delete/}).click();await archiveCard.locator('.smode-shop-dialog [name=facilityIds][value="POS_QA_A_FAC"]').check();await archiveCard.locator('.smode-shop-dialog button[type=submit]').click();await archivePage.waitForLoadState('networkidle');await archivePage.close();
+ check('Visible Delete removes mode from this shop and retains prices and definition',count('pos_sales_mode_shop',`sales_mode_id='${customId}' AND facility_id='POS_QA_A_FAC'`)===1&&count('pos_sales_mode',`sales_mode_id='${customId}' AND is_active='Y'`)===1&&count('pos_product_mode_price',`sales_mode_id='${customId}'`)===1);
  const archivedPage=await a.c.request.get(base+'/apps/zenith/pos/Terminal?sessionId='+s.sessionId);check('archived custom mode absent from terminal choices',!modeChoice.test(await archivedPage.text()),{status:archivedPage.status()});
  const archivedCart=await cart(s);await invoke('add',{transactionId:archivedCart.transactionId,productId:'POS_QA_A_P18',quantity:'1',salesModeId:customId},true);await invoke('void',{transactionId:archivedCart.transactionId});
  const taxMode=await cart(s);const taxLine=await item(taxMode,{taxOn:'N'});

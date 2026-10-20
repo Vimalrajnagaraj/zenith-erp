@@ -3317,15 +3317,15 @@ window.posToggleFullscreen = function() {
         };
 
         /* --- Screen content fetcher (for grid/category/mode swaps) --- */
-        function fetchScreen(params) {
+        function fetchScreen(params, signal) {
             var base = window.location.pathname + '.qvt';
             var p = {sessionId: SI, taxOn: TO, salesModeId: SM};
             if (TX) p.transactionId = TX;
             if (CATID) p.catId = CATID;
             for (var k in params) { if (params[k] !== undefined && params[k] !== null && params[k] !== '') p[k] = params[k]; else delete p[k]; }
             var qs = Object.keys(p).filter(function(k) { return p[k] !== '' && p[k] !== undefined; }).map(function(k) { return k + '=' + encodeURIComponent(p[k]); }).join('&');
-            return fetch(base + '?' + qs, {credentials: 'same-origin'})
-                .then(function(r) { return r.text(); })
+            return fetch(base + '?' + qs, {credentials: 'same-origin', signal: signal})
+                .then(function(r) { if (!r.ok) throw new Error('Product refresh failed'); return r.text(); })
                 .then(function(html) { return new DOMParser().parseFromString(html, 'text/html'); });
         }
 
@@ -3463,14 +3463,44 @@ window.posToggleFullscreen = function() {
         }, true);
 
         /* --- Product Grid Search: AJAX --- */
-        window._gridSearch = function(term) {
+        var catalogVersion = 0, catalogAbort, lastCatalogCategory = CATID;
+        function loadCatalog(params, cachedGrid) {
+            var version = ++catalogVersion;
+            if (catalogAbort) catalogAbort.abort();
+            catalogAbort = new AbortController();
             var grid = document.querySelector('.pos-product-grid');
-            if (grid) { grid.style.opacity = '0.4'; grid.style.pointerEvents = 'none'; }
-            fetchScreen(term ? {searchTerm: term, catId: ''} : {catId: CATID || ''}).then(function(doc) {
+            if (grid) {
+                if (cachedGrid) grid.innerHTML = cachedGrid;
+                grid.style.opacity = cachedGrid ? '1' : '0.4';
+                grid.style.pointerEvents = cachedGrid ? '' : 'none';
+                grid.setAttribute('aria-busy', 'true');
+            }
+            return fetchScreen(params, catalogAbort.signal).then(function(doc) {
+                if (version !== catalogVersion) return;
+                var next = doc.querySelector('.pos-product-grid');
+                if (!next) throw new Error('Product grid unavailable');
                 swapGrid(doc);
+                lastCatalogCategory = CATID;
+                if (!params.catId && !params.searchTerm) __allGridCache = next.innerHTML;
+            }).catch(function(error) {
+                if (version !== catalogVersion || error.name === 'AbortError') return;
+                CATID = lastCatalogCategory;
+                var root = document.getElementById('pos-terminal-root');
+                if (root) root.dataset.checkoutCategory = CATID || '';
+                document.querySelectorAll('.pos-cat-strip a').forEach(function(link) {
+                    var selected = (new URL(link.href).searchParams.get('catId') || '') === (CATID || '');
+                    link.classList.toggle('is-selected', selected);
+                    link.style.background = selected ? '#7C3AED' : '#455a64';
+                });
+                showToast('Could not refresh products. The previous products are available; try again.', '#c62828');
+            }).finally(function() {
+                if (version !== catalogVersion) return;
                 var grid = document.querySelector('.pos-product-grid');
-                if (grid) grid.style.pointerEvents = '';
+                if (grid) { grid.style.pointerEvents = ''; grid.style.opacity = '1'; grid.setAttribute('aria-busy', 'false'); }
             });
+        }
+        window._gridSearch = function(term) {
+            return loadCatalog(term ? {searchTerm: term, catId: ''} : {catId: CATID || ''});
         };
 
         /* --- Category strip: AJAX. ZE-POS-0204: ALL ITEMS used to grey-out the grid (opacity 0.4 +
@@ -3481,7 +3511,7 @@ window.posToggleFullscreen = function() {
         var __allGridCache = null;
         (function() { try {
             var g = document.querySelector('.pos-product-grid');
-            if (g && !CATID) __allGridCache = g.innerHTML;
+            if (g && !CATID && !new URL(location.href).searchParams.get('searchTerm')) __allGridCache = g.innerHTML;
         } catch(e) {} })();
         document.querySelectorAll('.pos-cat-strip a').forEach(function(link) {
             link.addEventListener('click', function(e) {
@@ -3495,20 +3525,10 @@ window.posToggleFullscreen = function() {
                 var searchInput = document.getElementById('cartInlineSearch');
                 if (searchInput) searchInput.value = '';
                 if (newCatId === '' && __allGridCache && grid) {
-                    grid.innerHTML = __allGridCache;   // instant — the till never waits on the network
-                    fetchScreen({catId: '', searchTerm: ''}).then(function(doc) {
-                        var ng = doc.querySelector('.pos-product-grid');
-                        if (ng) { __allGridCache = ng.innerHTML; if (CATID === '') { var g2 = document.querySelector('.pos-product-grid'); if (g2) g2.innerHTML = ng.innerHTML; } }
-                    });
+                    loadCatalog({catId: '', searchTerm: ''}, __allGridCache);
                     return;
                 }
-                if (grid) { grid.style.opacity = '0.4'; grid.style.pointerEvents = 'none'; }
-                fetchScreen({catId: newCatId, searchTerm: ''}).then(function(doc) {
-                    swapGrid(doc);
-                    if (newCatId === '') { var ng = doc.querySelector('.pos-product-grid'); if (ng) __allGridCache = ng.innerHTML; }
-                    var grid = document.querySelector('.pos-product-grid');
-                    if (grid) grid.style.pointerEvents = '';
-                });
+                loadCatalog({catId: newCatId, searchTerm: ''});
             });
         });
 
