@@ -53,6 +53,10 @@ RUN sh /tmp/patch-webroot-lazy-rules.sh /opt/moqui/runtime/base-component/webroo
 # Source: docs/infra/framework-patches/patch-log4j2-authzfilter.sh.
 COPY ./framework-patches/patch-log4j2-authzfilter.sh /tmp/patch-log4j2-authzfilter.sh
 RUN sh /tmp/patch-log4j2-authzfilter.sh && rm /tmp/patch-log4j2-authzfilter.sh
+# Suppress benign EntityDbMeta "already exists" DDL-redundancy ERRORs (FKs to ZENITH_-table-name-override
+# entities re-add every restart). Idempotent + self-verifying. Source: docs/infra/framework-patches/patch-log4j2-dbmeta-filter.sh.
+COPY ./framework-patches/patch-log4j2-dbmeta-filter.sh /tmp/patch-log4j2-dbmeta-filter.sh
+RUN sh /tmp/patch-log4j2-dbmeta-filter.sh && rm /tmp/patch-log4j2-dbmeta-filter.sh
 # ZE-INR: Indian lakh/crore digit grouping (Java's DecimalFormat/locales can only do single 3-grouping).
 #  (1) com.zenith.Fmt on the runtime classpath regroups a formatted number string to 3-2-2. Component XML
 #      wraps explicit ec.l10n.format currency calls (both #,##0 and #,##,##0 conventions) with zinr.inr(...),
