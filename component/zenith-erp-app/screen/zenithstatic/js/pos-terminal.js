@@ -2170,9 +2170,14 @@ window.posToggleFullscreen = function() {
                         // Another live tab or a completed bill refreshed server activity.
                         lastGestureAt = Date.now();
                         idleClosePending = false;
+                    } else if (d.reason === 'disabled') {
+                        lastGestureAt = Date.now();
+                        idleClosePending = false;
                     } else {
+                        lastGestureAt = Date.now();
+                        idleClosePending = false;
                         showToast('Session idle for an hour. Count the drawer and close it to finish reconciliation.', '#c62828');
-                        // Financial sessions stay open until a cashier verifies the actual cash amount.
+                        // Keep real input tracking alive while a held/unfinished sale needs review.
                     }
                 }).catch(function(){ idleClosePending = false; });
         }
