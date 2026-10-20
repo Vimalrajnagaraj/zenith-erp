@@ -302,8 +302,8 @@ const rows=(table,where)=>q(`SELECT * FROM ${table} WHERE ${where}`),count=(tabl
  await p.locator('.pos-close-overlay').waitFor({state:'visible'});
  await p.locator('.pos-close-cash').fill('100');
  await p.locator('.pos-close-confirm').click();
- await p.waitForURL(u=>u.pathname==='/apps/zenith/pos/Terminal'&&!u.searchParams.has('sessionId'),{timeout:30000});
- check('terminal session close remains in POS and stores closing cash',count('pos_session',`session_id='${us.sessionId}' AND status_id='PsClosed' AND closing_cash=100`)===1,{url:p.url(),sessionId:us.sessionId});
+ await p.waitForURL(u=>u.pathname==='/apps/zenith/pos/PosSessions'&&u.searchParams.get('sessionId')===String(us.sessionId),{timeout:30000});
+ check('terminal session close opens POS Sessions and stores closing cash',count('pos_session',`session_id='${us.sessionId}' AND status_id='PsClosed' AND closing_cash=100`)===1,{url:p.url(),sessionId:us.sessionId});
  const cashier=await account('pos.cashier.qa');let cr=await cashier.c.request.get(base+'/apps/zenith/pos/Terminal');check('cashier reaches terminal',cr.status()===200);cr=await cashier.c.request.get(base+'/apps/zenith/Inventory/FindProduct');check('cashier reaches authorized inventory',cr.status()===200);cr=await cashier.c.request.get(base+'/apps/zenith/Accounting/AcctgDashboard');check('cashier cannot access accounting',cr.status()===403||cr.url().includes('/pos/Terminal'),{status:cr.status(),url:cr.url()});await cashier.c.close();
  }
  if(process.env.POS_QA_UI_ONLY!=='true'){

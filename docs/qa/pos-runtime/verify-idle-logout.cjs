@@ -62,7 +62,7 @@ module.exports=async function({a,foreign,base,check,q,invoke,post,out}){
  do {automaticRow=q(`SELECT * FROM pos_session WHERE session_id='${automatic.sessionId}'`)[0];if(automaticRow.status_id==='PsClosed')break;await new Promise(resolve=>setTimeout(resolve,2000));}while(Date.now()<deadline);
  check('real scheduled job closes the logged-out idle sold session',automaticRow.status_id==='PsClosed'&&automaticRow.close_reason==='IdleUnverifiedCash'&&automaticRow.closing_cash===null&&Number(automaticRow.total_sales)===5,automaticRow);
  check('idle sweep actually ran on the scheduler',Number(q("SELECT count(*) AS n FROM service_job_run WHERE job_name='zenith_PosIdleSessionSweep_5min'")[0].n)>0);
- for(const shell of ['apps','qapps']){const page=await a.c.newPage();await page.goto(`${base}/${shell}/zenith/pos/PosSessions`);await page.getByText('Automatic session close',{exact:true}).waitFor();check(`${shell} session list exposes the unverified idle-close status`,(await page.locator('body').innerText()).includes('Idle closed'));await page.screenshot({path:path.join(out,`${shell}-idle-session-closed.png`),fullPage:true});await page.close();}
+ for(const shell of ['apps','qapps']){const page=await a.c.newPage();await page.goto(`${base}/${shell}/zenith/pos/PosSessions`);await page.getByText('Automatic session close',{exact:true}).waitFor();check(`${shell} session list exposes the unverified auto-close status`,(await page.locator('body').innerText()).includes('Auto-closed'));await page.screenshot({path:path.join(out,`${shell}-auto-session-closed.png`),fullPage:true});await page.close();}
  }
 
  await require('./verify-idle-boundaries.cjs')({a,base,check,q,invoke,post,out,loggedOutSweep});
