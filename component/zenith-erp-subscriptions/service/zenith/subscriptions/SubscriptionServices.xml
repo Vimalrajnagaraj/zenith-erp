@@ -41,7 +41,7 @@
             <parameter name="supplyType"/>
         </out-parameters>
         <actions>
-            <set field="gstRate" from="gstRate ?: 18" type="BigDecimal"/>
+            <set field="gstRate" from="gstRate != null ? gstRate : 18" type="BigDecimal"/>
 
             <!-- Supplier (tenant org) state: GST config first, else its active GSTIN -->
             <set field="supplierStateCode" from="null"/>
@@ -136,7 +136,8 @@
         </out-parameters>
         <actions>
             <set field="now" from="ec.user.nowTimestamp"/>
-            <set field="organizationPartyId" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
+            <service-call name="zenith.subscriptions.CatalogServices.assert#SubscriptionWrite" out-map="subscriptionScope"/>
+            <set field="organizationPartyId" from="subscriptionScope.activeOrgId"/>
             <!-- A subscription is a tenant-owned billing record: refuse to create an orphan (no active org).
                  Tenant users always have a valid active org; super-admins must switch into an org first. -->
             <if condition="!organizationPartyId">
@@ -155,7 +156,7 @@
                 </if>
             </if>
             <entity-find-one entity-name="zenith.erp.subscriptions.SubscriptionPlan" value-field="plan"/>
-            <if condition="!plan"><return error="true" message="Plan not found"/></if>
+            <if condition="!plan || plan.isActive != 'Y' || plan.billingAmount == null || plan.billingAmount &lt; 0"><return error="true" message="Choose an active plan with a non-negative amount."/></if>
             <!-- ZE-SB-013 f/u: same isolation guard on the plan — the plan dropdown is org-scoped, but a forged
                  planId must not slip another tenant's plan/pricing onto this subscription. (Global org=NULL seed
                  plans are platform-only and not tenant-billable, so a tenant plan must be its own org's.) -->
@@ -163,6 +164,7 @@
                 <return error="true" message="That plan isn't part of your organization."/>
             </if>
 
+            <entity-find-one entity-name="mantle.party.Party" value-field="numberingOrg" for-update="true"><field-map field-name="partyId" from="organizationPartyId"/></entity-find-one>
             <!-- Generate SUB/FY/SEQ number -->
             <set field="cal" from="java.util.Calendar.getInstance()"/>
             <script>cal.setTime(now)</script>
@@ -218,7 +220,7 @@
 
             <!-- Calculate GST (split into CGST/SGST/IGST via the India engine; tax-EXCLUSIVE total preserved) -->
             <set field="billingAmount" from="plan.billingAmount"/>
-            <set field="gstRate" from="plan.taxRate ?: 18"/>
+            <set field="gstRate" from="plan.taxRate != null ? plan.taxRate : 18"/>
             <service-call name="zenith.subscriptions.SubscriptionServices.calculate#SubscriptionTax"
                           in-map="[organizationPartyId:organizationPartyId, customerPartyId:customerPartyId,
                                    taxableAmount:billingAmount, gstRate:gstRate, productTaxCode:plan.productTaxCode]"
@@ -238,9 +240,10 @@
                     <econdition field-name="organizationPartyId" from="organizationPartyId" ignore-if-empty="true"/>
                     <limit count="1"/>
                 </entity-find>
+                <if condition="!discList"><return error="true" message="Discount code not found for your organization."/></if>
                 <if condition="discList">
                     <set field="disc" from="discList[0]"/>
-                    <set field="discValid" from="true" type="Boolean"/>
+                    <set field="discValid" from="!disc.applicablePlanId || disc.applicablePlanId == planId" type="Boolean"/>
                     <if condition="disc.validFrom != null &amp;&amp; now.before(disc.validFrom)"><set field="discValid" from="false" type="Boolean"/></if>
                     <if condition="disc.validTo != null &amp;&amp; now.after(disc.validTo)"><set field="discValid" from="false" type="Boolean"/></if>
                     <if condition="disc.maxUses != null &amp;&amp; (disc.usedCount ?: 0) &gt;= disc.maxUses"><set field="discValid" from="false" type="Boolean"/></if>
@@ -275,6 +278,9 @@
             </if>
 
             <set field="statusId" from="hasTrial ? 'SubTrial' : 'SubActive'"/>
+            <entity-find-one entity-name="zenith.erp.base.CompanySettings" value-field="subscriptionCurrency">
+                <field-map field-name="organizationPartyId"/><field-map field-name="settingKey" value="CURRENCY_UOM_ID"/>
+            </entity-find-one>
 
             <service-call name="create#zenith.erp.subscriptions.Subscription"
                           in-map="[subscriptionId:subscriptionId, subscriptionNumber:subscriptionNumber,
@@ -282,7 +288,7 @@
                                    organizationPartyId:organizationPartyId,
                                    startDate:startDate, endDate:endDate, trialEndDate:trialEndDate,
                                    nextBillingDate:nextBillingDate, billingAmount:billingAmount,
-                                   currencyUomId:(plan.currencyUomId ?: 'USD'), gstAmount:gstAmount,
+                                   currencyUomId:(plan.currencyUomId ?: subscriptionCurrency?.settingValue ?: 'USD'), gstAmount:gstAmount,
                                    cgstAmount:cgstAmount, sgstAmount:sgstAmount, igstAmount:igstAmount, placeOfSupply:placeOfSupply,
                                    totalAmount:totalAmount,
                                    paymentMethodId:paymentMethodId, autoRenew:plan.autoRenew, notes:notes]"
@@ -302,11 +308,12 @@
             <parameter name="subscriptionId" required="true"/>
         </in-parameters>
         <actions>
-            <entity-find-one entity-name="zenith.erp.subscriptions.Subscription" value-field="sub"/>
+            <service-call name="zenith.subscriptions.CatalogServices.assert#SubscriptionWrite" out-map="subscriptionScope"/>
+            <entity-find-one entity-name="zenith.erp.subscriptions.Subscription" value-field="sub" for-update="true"/>
             <!-- Ownership guard: a tenant user may only mutate subscriptions owned by their active org (ADMIN exempt).
                  Same generic message whether missing or cross-tenant, to avoid leaking existence across tenants. -->
-            <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-            <if condition="sub == null || (activeOrg &amp;&amp; sub.organizationPartyId != activeOrg &amp;&amp; !ec.user.isInGroup('ADMIN'))">
+            <set field="activeOrg" from="subscriptionScope.activeOrgId"/>
+            <if condition="sub == null || (sub.organizationPartyId != activeOrg &amp;&amp; !ec.user.isInGroup('ADMIN'))">
                 <return error="true" message="Subscription not found"/>
             </if>
             <if condition="sub.statusId != 'SubTrial'">
@@ -331,9 +338,10 @@
             <parameter name="reason"/>
         </in-parameters>
         <actions>
-            <entity-find-one entity-name="zenith.erp.subscriptions.Subscription" value-field="sub"/>
-            <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-            <if condition="sub == null || (activeOrg &amp;&amp; sub.organizationPartyId != activeOrg &amp;&amp; !ec.user.isInGroup('ADMIN'))">
+            <service-call name="zenith.subscriptions.CatalogServices.assert#SubscriptionWrite" out-map="subscriptionScope"/>
+            <entity-find-one entity-name="zenith.erp.subscriptions.Subscription" value-field="sub" for-update="true"/>
+            <set field="activeOrg" from="subscriptionScope.activeOrgId"/>
+            <if condition="sub == null || (sub.organizationPartyId != activeOrg &amp;&amp; !ec.user.isInGroup('ADMIN'))">
                 <return error="true" message="Subscription not found"/>
             </if>
             <if condition="sub.statusId != 'SubActive'">
@@ -357,9 +365,10 @@
             <parameter name="subscriptionId" required="true"/>
         </in-parameters>
         <actions>
-            <entity-find-one entity-name="zenith.erp.subscriptions.Subscription" value-field="sub"/>
-            <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-            <if condition="sub == null || (activeOrg &amp;&amp; sub.organizationPartyId != activeOrg &amp;&amp; !ec.user.isInGroup('ADMIN'))">
+            <service-call name="zenith.subscriptions.CatalogServices.assert#SubscriptionWrite" out-map="subscriptionScope"/>
+            <entity-find-one entity-name="zenith.erp.subscriptions.Subscription" value-field="sub" for-update="true"/>
+            <set field="activeOrg" from="subscriptionScope.activeOrgId"/>
+            <if condition="sub == null || (sub.organizationPartyId != activeOrg &amp;&amp; !ec.user.isInGroup('ADMIN'))">
                 <return error="true" message="Subscription not found"/>
             </if>
             <if condition="sub.statusId != 'SubPaused'">
@@ -384,9 +393,10 @@
             <parameter name="cancelReason" required="true"/>
         </in-parameters>
         <actions>
-            <entity-find-one entity-name="zenith.erp.subscriptions.Subscription" value-field="sub"/>
-            <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-            <if condition="sub == null || (activeOrg &amp;&amp; sub.organizationPartyId != activeOrg &amp;&amp; !ec.user.isInGroup('ADMIN'))">
+            <service-call name="zenith.subscriptions.CatalogServices.assert#SubscriptionWrite" out-map="subscriptionScope"/>
+            <entity-find-one entity-name="zenith.erp.subscriptions.Subscription" value-field="sub" for-update="true"/>
+            <set field="activeOrg" from="subscriptionScope.activeOrgId"/>
+            <if condition="sub == null || (sub.organizationPartyId != activeOrg &amp;&amp; !ec.user.isInGroup('ADMIN'))">
                 <return error="true" message="Subscription not found"/>
             </if>
             <if condition="sub.statusId == 'SubCancelled' || sub.statusId == 'SubExpired'">
@@ -413,11 +423,12 @@
             <parameter name="subscriptionId" required="true"/>
         </in-parameters>
         <actions>
-            <entity-find-one entity-name="zenith.erp.subscriptions.Subscription" value-field="sub"/>
+            <service-call name="zenith.subscriptions.CatalogServices.assert#SubscriptionWrite" out-map="subscriptionScope"/>
+            <entity-find-one entity-name="zenith.erp.subscriptions.Subscription" value-field="sub" for-update="true"/>
             <!-- Org-isolation: only the owning tenant (or an ADMIN, or an un-scoped billing job) may act on
                  this subscription — block cross-tenant view/mutate/bill via a guessed id. -->
-            <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-            <if condition="sub == null || (activeOrg &amp;&amp; sub.organizationPartyId != activeOrg &amp;&amp; !ec.user.isInGroup('ADMIN'))">
+            <set field="activeOrg" from="subscriptionScope.activeOrgId"/>
+            <if condition="sub == null || (sub.organizationPartyId != activeOrg &amp;&amp; !ec.user.isInGroup('ADMIN'))">
                 <return error="true" message="Subscription not found for your account."/>
             </if>
             <entity-find-one entity-name="zenith.erp.subscriptions.SubscriptionPlan" value-field="plan">
@@ -462,13 +473,23 @@
             <parameter name="subInvoiceId"/>
         </out-parameters>
         <actions>
-            <entity-find-one entity-name="zenith.erp.subscriptions.Subscription" value-field="sub"/>
+            <service-call name="zenith.subscriptions.CatalogServices.assert#SubscriptionWrite" out-map="subscriptionScope"/>
+            <entity-find-one entity-name="zenith.erp.subscriptions.Subscription" value-field="sub" for-update="true"/>
             <!-- Org-isolation: only the owning tenant (or an ADMIN, or an un-scoped billing job) may act on
                  this subscription — block cross-tenant view/mutate/bill via a guessed id. -->
-            <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-            <if condition="sub == null || (activeOrg &amp;&amp; sub.organizationPartyId != activeOrg &amp;&amp; !ec.user.isInGroup('ADMIN'))">
+            <set field="activeOrg" from="subscriptionScope.activeOrgId"/>
+            <if condition="sub == null || (sub.organizationPartyId != activeOrg &amp;&amp; !ec.user.isInGroup('ADMIN'))">
                 <return error="true" message="Subscription not found for your account."/>
             </if>
+            <if condition="sub.statusId != 'SubActive'"><return error="true" message="Only active subscriptions can generate an invoice."/></if>
+            <entity-find-one entity-name="mantle.party.Party" value-field="numberingOrg" for-update="true"><field-map field-name="partyId" from="sub.organizationPartyId"/></entity-find-one>
+            <entity-find entity-name="zenith.erp.subscriptions.SubscriptionInvoice" list="periodInvoices">
+                <econdition field-name="subscriptionId"/>
+                <econdition field-name="periodFrom" from="sub.lastBillingDate ?: sub.startDate"/>
+                <econdition field-name="periodTo" from="sub.nextBillingDate ?: sub.endDate"/>
+                <order-by field-name="subInvoiceId"/><limit count="1"/>
+            </entity-find>
+            <if condition="periodInvoices"><set field="subInvoiceId" from="periodInvoices[0].subInvoiceId"/><return/></if>
             <entity-find-one entity-name="zenith.erp.subscriptions.SubscriptionPlan" value-field="plan">
                 <field-map field-name="planId" from="sub.planId"/>
             </entity-find-one>
@@ -513,7 +534,7 @@
                  create time, so the ISSUED invoice carries cgst/sgst/igst + place of supply, not a flat lump. -->
             <service-call name="zenith.subscriptions.SubscriptionServices.calculate#SubscriptionTax"
                           in-map="[organizationPartyId:sub.organizationPartyId, customerPartyId:sub.customerPartyId,
-                                   taxableAmount:taxableAmount, gstRate:(plan.taxRate ?: 18),
+                                   taxableAmount:taxableAmount, gstRate:(plan.taxRate != null ? plan.taxRate : 18),
                                    productTaxCode:plan.productTaxCode]" out-map="taxOut"/>
             <set field="taxAmount" from="taxOut.taxAmount"/>
             <set field="totalAmount" from="(taxableAmount + taxAmount).setScale(2, java.math.RoundingMode.HALF_UP)"/>
@@ -540,24 +561,27 @@
             <parameter name="newPlanId" required="true"/>
         </in-parameters>
         <actions>
-            <entity-find-one entity-name="zenith.erp.subscriptions.Subscription" value-field="sub"/>
+            <service-call name="zenith.subscriptions.CatalogServices.assert#SubscriptionWrite" out-map="subscriptionScope"/>
+            <entity-find-one entity-name="zenith.erp.subscriptions.Subscription" value-field="sub" for-update="true"/>
             <!-- Org-isolation: only the owning tenant (or an ADMIN, or an un-scoped billing job) may act on
                  this subscription — block cross-tenant view/mutate/bill via a guessed id. -->
-            <set field="activeOrg" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-            <if condition="sub == null || (activeOrg &amp;&amp; sub.organizationPartyId != activeOrg &amp;&amp; !ec.user.isInGroup('ADMIN'))">
+            <set field="activeOrg" from="subscriptionScope.activeOrgId"/>
+            <if condition="sub == null || (sub.organizationPartyId != activeOrg &amp;&amp; !ec.user.isInGroup('ADMIN'))">
                 <return error="true" message="Subscription not found for your account."/>
             </if>
             <entity-find-one entity-name="zenith.erp.subscriptions.SubscriptionPlan" value-field="newPlan">
                 <field-map field-name="planId" from="newPlanId"/>
             </entity-find-one>
-            <if condition="!newPlan"><return error="true" message="New plan not found"/></if>
+            <if condition="!newPlan || newPlan.isActive != 'Y' || newPlan.billingAmount == null || newPlan.billingAmount &lt; 0 || newPlan.organizationPartyId != sub.organizationPartyId">
+                <return error="true" message="Choose an active plan belonging to this subscription's organization."/>
+            </if>
 
             <set field="now" from="ec.user.nowTimestamp"/>
             <set field="oldPlanId" from="sub.planId"/>
             <set field="oldBillingAmount" from="sub.billingAmount ?: 0"/>
             <set field="sub.planId" from="newPlanId"/>
             <set field="sub.billingAmount" from="newPlan.billingAmount"/>
-            <set field="gstRate" from="newPlan.taxRate ?: 18"/>
+            <set field="gstRate" from="newPlan.taxRate != null ? newPlan.taxRate : 18"/>
             <set field="sub.gstAmount" from="(newPlan.billingAmount * gstRate / 100).setScale(2, java.math.RoundingMode.HALF_UP)"/>
             <set field="sub.totalAmount" from="sub.billingAmount + sub.gstAmount"/>
             <entity-update value-field="sub"/>
@@ -578,7 +602,7 @@
          safe to run repeatedly and can be wired to a scheduled ServiceJob to automate recurring billing.
          Left MANUAL-run by default (no live cron seeded) — enabling automatic billing is a go-live
          decision for the dev. Run on demand: zenith.subscriptions.SubscriptionServices.process#DueSubscriptions -->
-    <service verb="process" noun="DueSubscriptions" authenticate="anonymous-all">
+    <service verb="process" noun="DueSubscriptions" authenticate="true">
         <in-parameters>
             <parameter name="organizationPartyId"/> <!-- optional: restrict to one tenant (else all) -->
         </in-parameters>
@@ -587,7 +611,7 @@
             <parameter name="skippedCount" type="Integer"/>
         </out-parameters>
         <actions>
-            <script>ec.user.loginAnonymousIfNoUser()</script>
+            <if condition="!ec.user.isInGroup('ADMIN')"><return error="true" message="Platform billing permission is required."/></if>
             <set field="billedCount" from="0" type="Integer"/>
             <set field="skippedCount" from="0" type="Integer"/>
             <set field="today" from="ec.user.nowTimestamp"/>
