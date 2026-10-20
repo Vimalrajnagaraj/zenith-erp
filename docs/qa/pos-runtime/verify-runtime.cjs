@@ -387,7 +387,7 @@ const rows=(table,where)=>q(`SELECT * FROM ${table} WHERE ${where}`),count=(tabl
  await p.waitForFunction(()=>typeof window.posCreditSale==='function');await p.evaluate(()=>window.posCreditSale());
  check('credit checkout asks for customer and upfront amount',await p.locator('#credit-name').isVisible()&&await p.locator('#credit-phone').isVisible()&&await p.locator('#credit-upfront').isVisible()&&await p.locator('#credit-add-customer').isVisible());
  await p.waitForFunction(()=>{const b=document.querySelector('#credit-confirm');return b&&!b.disabled;});
- await p.locator('#credit-name').fill('Synthetic Fully Paid');await p.locator('#credit-phone').fill('0000000003');
+ await p.locator('#credit-name').fill('Synthetic Fully Paid');await p.locator('#credit-phone').fill('0000000003');await p.locator('#credit-days').fill('2');await p.locator('#credit-terms-reason').fill('Synthetic initial credit term');
  const dueText=await p.locator('#credit-due-preview').innerText();const uiDue=Number((dueText.match(/₹([\d,]+(?:\.\d{2})?)/)||[])[1]?.replace(/,/g,''));
  check('credit popup reads a positive current bill balance',uiDue>0,{dueText});
  await p.locator('#credit-upfront').fill(uiDue.toFixed(2));await p.locator('#credit-upfront-method').selectOption('Card');
@@ -418,6 +418,7 @@ const rows=(table,where)=>q(`SELECT * FROM ${table} WHERE ${where}`),count=(tabl
  for(const shell of ['apps','qapps'])for(const screen of screens){await p.setViewportSize({width:1366,height:768});const r=await gotoScreen(shell==='qapps'&&screen==='Terminal'?base+billingHref:`${base}/${shell}/zenith/pos/${screen}`);if(['Terminal','CreditBills'].includes(screen))await p.locator(screen==='Terminal'?'#pos-terminal-root,.pos-no-session,.pos-receipt-card':'#credit-bills-root').first().waitFor();await p.locator('.z-pos-page').first().waitFor();const text=await p.locator('body').innerText();const error=/Error rendering|ScreenRenderException|500 Internal Server Error|HTTP Status 500|freemarker\.core/i.test(text);report.pages.push({shell,screen,status:r.status(),error,url:p.url()});check(shell+' '+screen+' renders',r.status()===200&&!error,{status:r.status(),error});}
  if(process.env.POS_QA_UI_ONLY!=='true')await require('./verify-idle-logout.cjs')({a,foreign,base,check,q,invoke,post,out});
  if(process.env.POS_QA_UI_ONLY!=='true')await require('./verify-last-bill.cjs')({a,base,check,q,invoke,post,out});
+ if(process.env.POS_QA_UI_ONLY!=='true')await require('./verify-credit-terms.cjs')({a,foreign,base,check,q,invoke,post,out});
  // A populated Daily Summary used to render the FreeMarker ?url charset exception as table rows.
  if(process.env.POS_QA_UI_ONLY!=='true')for(const shell of ['apps','qapps']){
   const date=new Date(tx(t.transactionId).entry_date);

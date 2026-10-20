@@ -1232,12 +1232,12 @@ window._posOffline = (function() {
     }
     function creditFilterBills(){
         var a = (_creditData && _creditData.bills || []).slice();
-        var cut = Date.now() - 30*864e5;
+
         a = a.filter(function(b){
             var out = Number(b.outstanding||0);
             if (_creditFilter==='outstanding' && !(out>0.0001)) return false;
             if (_creditFilter==='settled' && out>0.0001) return false;
-            if (_creditFilter==='overdue' && !(out>0.0001 && (b.ts||0)<cut)) return false;
+            if (_creditFilter==='overdue' && b.creditStatus!=='Overdue') return false;
             if (_creditFrom) { var f=new Date(_creditFrom+'T00:00:00').getTime(); if ((b.ts||0)<f) return false; }
             if (_creditTo) { var t=new Date(_creditTo+'T23:59:59').getTime(); if ((b.ts||0)>t) return false; }
             return true;
@@ -1271,6 +1271,7 @@ window._posOffline = (function() {
             + '</div></div>';
     }
     function creditPaintList(){
+        var safeCredit=function(value){return String(value==null?'':value).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});};
         var host = document.getElementById('credit-list-host'); if (!host || !_creditData) return;
         var bills = creditFilterBills(); _creditPainted = bills;
         var cnt = document.getElementById('credit-count'); if (cnt) cnt.textContent = 'Showing '+bills.length+' of '+(_creditData.allCount||0)+' credit bills';
@@ -1285,9 +1286,11 @@ window._posOffline = (function() {
             h += '<div style="display:flex;align-items:center;gap:'+(compact?'14px':'20px')+';flex-wrap:wrap;padding:'+(compact?'12px 20px':'18px 20px')+';'+(i<bills.length-1?'border-bottom:1px solid #F1F5F9':'')+'">'
                 + '<div style="width:'+(compact?'32px;height:32px':'40px;height:40px')+';border-radius:50%;background:#EDE9FE;color:#7C3AED;display:flex;align-items:center;justify-content:center;flex:0 0 auto"><svg width="'+(compact?'16':'18')+'" height="'+(compact?'16':'18')+'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M10 9H8"/><path d="M16 13H8"/><path d="M16 17H8"/></svg></div>'
                 + '<div style="display:flex;flex-direction:column;gap:3px;min-width:200px;flex:1 1 auto">'
-                +   '<span style="font-size:14px;font-weight:600;color:#7C3AED">#'+b.billNo+'</span>'
-                +   '<span style="font-size:12px;color:#6B7280">'+b.date+'</span>'
-                +   '<span style="font-size:12px;color:#6B7280">'+b.customer+(b.phone?' • '+b.phone:'')+' • '+b.itemCount+' item'+(b.itemCount!==1?'s':'')+'</span>'
+                +   '<span style="font-size:14px;font-weight:600;color:#7C3AED">#'+safeCredit(b.billNo)+'</span>'
+                +   '<span style="font-size:12px;color:#6B7280">'+safeCredit(b.date)+'</span>'
+                +   '<span style="font-size:12px;color:#6B7280">Due: '+(b.dueDate||'Not set')+' · '+(b.creditStatus||'')+'</span>'
+                +   '<span style="font-size:12px;color:#6B7280">Last payment: '+(b.lastPayment||'None')+(b.settledOn?' · Settled on '+b.settledOn:'')+'</span>'
+                +   '<span style="font-size:12px;color:#6B7280">'+safeCredit(b.customer)+(b.phone?' • '+safeCredit(b.phone):'')+' • '+b.itemCount+' item'+(b.itemCount!==1?'s':'')+'</span>'
                 + '</div>'
                 + (compact ? '' : creditProgress(settled))
                 + '<div style="display:flex;flex-direction:column;align-items:flex-end;gap:2px;min-width:120px;text-align:right;flex:0 0 auto">'
@@ -1296,10 +1299,12 @@ window._posOffline = (function() {
                 +   '<span style="font-size:11.5px;color:#9CA3AF">Total ₹'+creditFmt(b.grand)+' • Paid ₹'+creditFmt(b.paid)+'</span>'
                 + '</div>'
                 + settleCtl
+                + '<button type="button" class="credit-history-btn" data-tx="'+b.txId+'" style="padding:8px 12px;border:1px solid #ddd6fe;border-radius:8px;background:#f5f3ff;color:#6d28d9;cursor:pointer">Repayment history</button>'
                 + creditRowKebab(i)
                 + '</div>';
         });
         host.innerHTML = h;
+        host.querySelectorAll('.credit-history-btn').forEach(function(button){button.addEventListener('click',function(){if(window.ZPosCreditHistory)window.ZPosCreditHistory.open(button.dataset.tx);});});
         host.querySelectorAll('.credit-settle-btn').forEach(function(btn){
             btn.addEventListener('click', function(e){ e.stopPropagation(); var bill=(_creditData.bills||[]).find(function(x){return x.txId===btn.dataset.tx;}); if (bill) openSettleOverlay(bill); });
         });
@@ -2352,6 +2357,9 @@ window.posToggleFullscreen = function() {
                 + '<button id="credit-add-customer" type="button" style="margin-top:7px;padding:0;border:0;background:none;color:#7C3AED;font-weight:700;cursor:pointer">+ Add customer with this name and phone</button>'
                 + '<div style="display:flex;gap:10px;margin-top:15px"><label style="flex:1;font-size:13px;font-weight:600;color:#555">Paid now (₹)<input id="credit-upfront" type="number" min="0" step="0.01" inputmode="decimal" value="0" style="display:block;width:100%;margin-top:4px;padding:11px 14px;border:2px solid #ffb74d;border-radius:8px;font-size:15px;box-sizing:border-box"/></label>'
                 + '<label style="flex:1;font-size:13px;font-weight:600;color:#555">Method<select id="credit-upfront-method" style="display:block;width:100%;margin-top:4px;padding:11px 14px;border:2px solid #ffb74d;border-radius:8px;font-size:15px;box-sizing:border-box"><option value="Cash">Cash</option><option value="Card">Card</option><option value="UPI">UPI</option></select></label></div>'
+                + '<label style="display:block;margin-top:12px">Credit days for this bill<input id="credit-days" type="number" min="0" max="3650" step="1" placeholder="Customer term, e.g. 2 or 30" style="display:block;width:100%;padding:10px;border:1px solid #ddd6fe;border-radius:8px;box-sizing:border-box"></label>'
+                + '<p id="credit-date-preview" style="font-size:12px;color:#6b7280" aria-live="polite"></p>'
+                + '<label style="display:block">Reason if overriding customer terms (manager)<input id="credit-terms-reason" maxlength="255" style="display:block;width:100%;padding:10px;border:1px solid #ddd6fe;border-radius:8px;box-sizing:border-box"></label>'
                 + '<div id="credit-due-preview" aria-live="polite" style="margin-top:9px;font-size:13px;font-weight:700;color:#c62828"></div>'
                 + '<div style="display:flex;gap:12px;margin-top:20px">'
                 + '<button id="credit-cancel" style="flex:1;padding:14px;border:2px solid #ccc;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;background:#fff;color:#555">Cancel</button>'
@@ -2369,6 +2377,17 @@ window.posToggleFullscreen = function() {
             var phoneInp = document.getElementById('credit-phone');
             var selectedPartyId = '';
             var amountInp = document.getElementById('credit-upfront');
+            var daysInp = document.getElementById('credit-days');
+            var daysTouched = false, customerDays = null;
+            function showDueDate(){
+                var days = daysInp.value.trim(), start = lastCartData && lastCartData.creditDateToday;
+                var node = document.getElementById('credit-date-preview');
+                if(!/^\d+$/.test(days)||Number(days)>3650||!start){node.textContent='Choose the customer’s calendar-day term before completing.';return;}
+                var date=new Date(start+'T00:00:00Z');date.setUTCDate(date.getUTCDate()+Number(days));
+                node.textContent='Due through '+date.toISOString().slice(0,10)+' ('+(lastCartData.creditTimeZone||'')+'). Day 0 is today; calendar days include weekends.';
+            }
+            daysInp.addEventListener('input',function(){daysTouched=true;showDueDate();});
+
             var duePreview = document.getElementById('credit-due-preview');
             var creditBtn = document.getElementById('credit-confirm');
             var creditReady = false;
@@ -2400,6 +2419,8 @@ window.posToggleFullscreen = function() {
                     if (!d || !d.success || !d.items || !d.items.length) throw new Error('Bill unavailable');
                     lastPay = Number(d.pay || 0);
                     lastCartData = d;
+                    if(!daysTouched && d.customerCreditDays!=null){customerDays=d.customerCreditDays;daysInp.value=String(customerDays);}
+                    showDueDate();
                     if (!nameInp.value.trim() && d.customer) { nameInp.value = d.customer; phoneInp.value = d.customerPhone || ''; selectedPartyId = d.customerPartyId || ''; }
                     updateDuePreview();
                     creditReady = true;
@@ -2422,9 +2443,9 @@ window.posToggleFullscreen = function() {
             function renderCreditCust(list) {
                 if (!list || !list.length) { resBox.style.display = 'block'; resBox.textContent = 'No saved customer found. Use Add customer below.'; return; }
                 var h = '';
-                function safe(v) { return String(v || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
+                function safe(v) { return String(v == null ? '' : v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
                 list.forEach(function(c) {
-                    h += '<div class="cc-row" data-party-id="' + safe(c.partyId) + '" data-name="' + safe(c.name) + '" data-phone="' + safe(c.phone) + '" style="padding:10px 12px;cursor:pointer;border-bottom:1px solid #f0f0f0;display:flex;justify-content:space-between;align-items:center;gap:10px"><span style="font-weight:700;color:#e65100">' + safe(c.name) + '</span>' + (c.phone ? '<span style="font-size:13px;color:#777;white-space:nowrap">' + safe(c.phone) + '</span>' : '') + '</div>';
+                    h += '<div class="cc-row" data-party-id="' + safe(c.partyId) + '" data-name="' + safe(c.name) + '" data-phone="' + safe(c.phone) + '" data-credit-days="' + safe(c.creditDays==null?'':c.creditDays) + '" style="padding:10px 12px;cursor:pointer;border-bottom:1px solid #f0f0f0;display:flex;justify-content:space-between;align-items:center;gap:10px"><span style="font-weight:700;color:#e65100">' + safe(c.name) + '</span>' + (c.phone ? '<span style="font-size:13px;color:#777;white-space:nowrap">' + safe(c.phone) + '</span>' : '') + '</div>';
                 });
                 resBox.innerHTML = h; resBox.style.display = 'block';
                 resBox.querySelectorAll('.cc-row').forEach(function(row) {
@@ -2432,6 +2453,8 @@ window.posToggleFullscreen = function() {
                         nameInp.value = row.dataset.name || '';
                         if (row.dataset.phone) phoneInp.value = row.dataset.phone;
                         selectedPartyId = row.dataset.partyId || '';
+                        customerDays=row.dataset.creditDays===''?null:Number(row.dataset.creditDays);
+                        daysInp.value=customerDays==null?'':String(customerDays);daysTouched=false;showDueDate();
                         resBox.style.display = 'none';
                         if (!phoneInp.value) phoneInp.focus();
                     });
@@ -2454,6 +2477,8 @@ window.posToggleFullscreen = function() {
                 if (!nm) { showToast('Enter the customer name', '#e53935'); document.getElementById('credit-name').focus(); return; }
                 if (!ph) { showToast('Enter the customer phone', '#e53935'); document.getElementById('credit-phone').focus(); return; }
                 if (ph.replace(/[^0-9]/g, '').length < 10 || ph.replace(/[^0-9]/g, '').length > 15) { showToast('Enter a valid 10 to 15 digit phone number', '#e53935'); phoneInp.focus(); return; }
+                var _dv=daysInp.value.trim(); if(_dv!==''&&(!/^\d+$/.test(_dv)||Number(_dv)>3650)){showToast('Choose 0–3650 calendar days for this bill','#e53935');daysInp.focus();return;}
+                if(_dv!==''&&customerDays!=null&&Number(_dv)!==customerDays&&!document.getElementById('credit-terms-reason').value.trim()){showToast('Enter a reason for overriding customer terms','#e53935');return;}
                 var paidNow = Number(amountInp.value);
                 var remaining = Math.max(0, Number(lastPay || 0) - Number((lastCartData && lastCartData.paid) || 0));
                 if (!/^\d+(\.\d{1,2})?$/.test(amountInp.value.trim()) || !Number.isFinite(paidNow) || paidNow > remaining) { showToast('Paid now must be between ₹0 and the remaining bill balance, with at most two decimals', '#e53935'); amountInp.focus(); return; }
@@ -2467,6 +2492,7 @@ window.posToggleFullscreen = function() {
                 hid('customerName', nm); hid('customerPhone', ph); hid('moquiSessionToken', TK);
                 if (selectedPartyId) hid('customerPartyId', selectedPartyId);
                 hid('upfrontAmount', paidNow.toFixed(2));
+                hid('creditDays',daysInp.value);hid('termsReason',document.getElementById('credit-terms-reason').value);
                 if (paidNow > 0) hid('upfrontMethod', document.getElementById('credit-upfront-method').value);
                 document.body.appendChild(f);
                 f.submit();
