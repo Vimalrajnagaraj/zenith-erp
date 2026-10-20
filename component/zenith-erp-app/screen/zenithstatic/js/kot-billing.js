@@ -187,7 +187,17 @@
   };
   window.kbPrintKot = function (id) {
     var o = orders[id]; if (!o) { alert('Order not found.'); return; }
-    openPrint(slip('KOT #' + o.num, 'Table: ' + o.table + '   ' + o.time, o.items, ''));
+    var w = window.open('', '_blank', 'width=340,height=560');
+    if (!w) { alert('Allow pop-ups to print the KOT.'); return; }
+    var body = new URLSearchParams(); body.append('kotId', id); body.append('moquiSessionToken', tok());
+    fetch(base() + '/reprintKot', { method:'POST', credentials:'same-origin',
+      headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:body.toString() })
+      .then(function (r) { if (!r.ok) throw Error('Reprint failed'); return r.json(); })
+      .then(function (result) {
+        if (!result.success) throw Error('Reprint denied');
+        w.document.write(slip('KOT #' + o.num, 'Table: ' + o.table + '   ' + o.time, o.items, ''));
+        w.document.close(); w.focus(); setTimeout(function () { w.print(); }, 250);
+      }).catch(function () { w.close(); alert('Could not reprint this KOT. Refresh and try again.'); });
   };
 
   // ---- init: read embedded server data, prime a resumed draft ----

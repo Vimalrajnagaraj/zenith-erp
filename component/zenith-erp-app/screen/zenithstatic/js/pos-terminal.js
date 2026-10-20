@@ -264,28 +264,30 @@ window._posOffline = (function() {
     function payable(){return Math.round(cart.reduce(function(a,it){return a+Number(it.qty)*Number(it.price)+taxAmount(it);},0));}
     function render(){
         var tb=document.querySelector('.pos-cart tbody');
-        if(tb){ var h=''; if(!cart.length) h='<tr><td colspan="7" style="text-align:center;padding:40px;color:#aaa;font-size:16px">Offline &mdash; tap products to add items</td></tr>';
+        if(tb){ var h=''; if(!cart.length) h='<tr><td colspan="8" style="text-align:center;padding:40px;color:#aaa;font-size:16px">Offline &mdash; tap products to add items</td></tr>';
             cart.forEach(function(it,i){ h+='<tr style="border-bottom:1px solid #e0e0e0">'
                 +'<td style="padding:8px 10px;text-align:center;font-weight:700;color:#777;width:30px">'+(i+1)+'</td>'
                 +'<td style="padding:8px 10px"><div style="font-size:14px;font-weight:600;color:#000">'+esc(it.name)+'</div><div style="font-size:11px;color:#555">'+esc(it.productId)+'</div></td>'
+                +'<td style="padding:8px;color:#7780a3">Cached</td>'
                 +'<td style="padding:8px 10px;text-align:right;color:#000">'+f2(it.price)+'</td>'
                 +'<td style="padding:4px;text-align:center"><div style="display:flex;align-items:center;justify-content:center">'
                 +'<button data-i="'+i+'" class="ofl-minus" style="width:32px;height:38px;border:2px solid #e53935;background:#fff;font-size:20px;font-weight:bold;cursor:pointer;border-radius:8px 0 0 8px;color:#e53935">-</button>'
                 +'<input data-i="'+i+'" class="ofl-qi" type="number" step="any" value="'+Number(it.qty)+'" style="width:52px;height:38px;text-align:center;font-weight:bold;font-size:15px;border-top:2px solid #ccc;border-bottom:2px solid #ccc;border-left:none;border-right:none;box-sizing:border-box;outline:none"/>'
                 +'<button data-i="'+i+'" class="ofl-plus" style="width:32px;height:38px;border:2px solid #2e7d32;background:#fff;font-size:20px;font-weight:bold;cursor:pointer;border-radius:0 8px 8px 0;color:#2e7d32">+</button>'
                 +'</div>'+(it.uom?'<div style="font-size:11px;color:#e65100;font-weight:700;text-align:center;margin-top:2px">'+esc(it.uom)+'</div>':'')+'</td>'
-                +'<td style="padding:8px 10px;text-align:right;font-weight:700;color:#000">'+f2(it.qty*it.price)+'</td>'
+                +'<td>'+f2(taxAmount(it))+'</td>'
+                +'<td style="padding:8px 10px;text-align:right;font-weight:700;color:#000">'+f2(it.qty*it.price+taxAmount(it))+'</td>'
                 +'<td style="padding:4px;text-align:center"><button data-i="'+i+'" class="ofl-rm" style="width:30px;height:30px;border:none;background:#e53935;color:#fff;border-radius:6px;cursor:pointer">&#10005;</button></td></tr>'; });
             tb.innerHTML=h; }
         var sm=document.querySelector('.pos-summary');
         if(sm){ var total=payable(); var qty=cart.reduce(function(a,it){return a+Number(it.qty);},0);
-            var s='<div style="display:flex;justify-content:space-between;font-size:13px;color:#777;margin-bottom:6px"><span style="color:#c62828;font-weight:700">OFFLINE</span><span>Qty: <b>'+qty+'</b></span></div>'
-                +'<div style="background:#c62828;color:#fff;padding:clamp(5px,1vh,12px) 20px;border-radius:10px;display:flex;justify-content:space-between;align-items:center;margin-bottom:10px"><span style="font-size:16px;font-weight:600">OFFLINE TOTAL (incl. tax)</span><span style="font-size:28px;font-weight:800">&#8377;'+f2(total)+'</span></div>';
-            if(cart.length){ s+='<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px">'
-                +'<button type="button" class="ofl-pay" data-m="Cash" style="padding:clamp(8px,1.4vh,15px) 8px;border:none;border-radius:10px;font-size:16px;font-weight:700;cursor:pointer;background:#4caf50;color:#fff">&#128176; CASH</button>'
-                +'<button type="button" class="ofl-pay" data-m="Card" style="padding:clamp(8px,1.4vh,15px) 8px;border:none;border-radius:10px;font-size:16px;font-weight:700;cursor:pointer;background:#2196f3;color:#fff">&#128179; CARD</button>'
-                +'<button type="button" class="ofl-pay" data-m="UPI" style="padding:clamp(8px,1.4vh,15px) 8px;border:none;border-radius:10px;font-size:16px;font-weight:700;cursor:pointer;background:#9c27b0;color:#fff">&#128241; UPI</button></div>';
-            } else { s+='<div style="text-align:center;padding:16px;color:#aaa">Offline &mdash; tap products to add items</div>'; }
+            var s='<div class="pos-sum-strip" style="display:flex;justify-content:space-between;font-size:13px;color:#777;margin-bottom:6px"><span style="color:#c62828;font-weight:700">OFFLINE</span><span>Qty: <b>'+qty+'</b></span></div>'
+                +'<div class="pos-sum-total" style="background:#c62828;color:#fff;padding:clamp(5px,1vh,12px) 20px;border-radius:10px;display:flex;justify-content:space-between;align-items:center;margin-bottom:10px"><span style="font-size:16px;font-weight:600">Offline TOTAL</span><span style="font-size:28px;font-weight:800">&#8377;'+f2(total)+'</span></div>';
+            if(cart.length){ s+='<div class="pos-paywrap pos-reference-payments pos-offline-payments" style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px">'
+                +'<button type="button" class="ofl-pay" id="pos-pay-cash" data-m="Cash" style="padding:clamp(8px,1.4vh,15px) 8px;border:none;border-radius:10px;font-size:16px;font-weight:700;cursor:pointer;background:#4caf50;color:#fff">&#128176; CASH<kbd>F2</kbd></button>'
+                +'<button type="button" class="ofl-pay" id="pos-pay-card" data-m="Card" style="padding:clamp(8px,1.4vh,15px) 8px;border:none;border-radius:10px;font-size:16px;font-weight:700;cursor:pointer;background:#2196f3;color:#fff">&#128179; CARD<kbd>F3</kbd></button>'
+                +'<button type="button" class="ofl-pay" id="pos-pay-upi" data-m="UPI" style="padding:clamp(8px,1.4vh,15px) 8px;border:none;border-radius:10px;font-size:16px;font-weight:700;cursor:pointer;background:#9c27b0;color:#fff">&#128241; UPI<kbd>F5</kbd></button></div>';
+            } else { s+='<div class="pos-paywrap pos-reference-payments" style="justify-content:center;text-align:center;padding:16px;color:#aaa">Offline &mdash; tap products to add items</div>'; }
             sm.innerHTML=s; }
     }
     function add(pid, price){ var p=catalog[pid]||{}; var pr=Number(price||p.price||0); var ex=cart.find(function(it){return it.productId===pid && Number(it.price)===pr;}); if(ex) ex.qty=Number(ex.qty)+1; else cart.push({productId:pid,name:p.name||pid,price:pr,qty:1,uom:p.uom||'',taxRate:p.taxRate}); render(); }
@@ -315,7 +317,7 @@ window._posOffline = (function() {
         window.addEventListener('online', function(){ banner(false); sync().then(function(nn){ if(nn>0) toast('✔ '+nn+' offline sale(s) synced','#2e7d32'); setTimeout(function(){ try{location.reload();}catch(e){} }, nn>0?1600:300); }); });
         // Stale-while-revalidate: refresh the local master-data cache in the background so local reads stay current
         setInterval(function(){ if(navigator.onLine) cacheCatalog(); }, 180000);
-        document.addEventListener('click', function(e){ var t=e.target; if(!t.classList) return;
+        document.addEventListener('click', function(e){ var t=e.target.closest ? (e.target.closest('.ofl-minus,.ofl-plus,.ofl-rm,.ofl-pay') || e.target) : e.target; if(!t.classList) return;
             if(t.classList.contains('ofl-minus')){ var i=+t.dataset.i; cart[i].qty=Number(cart[i].qty)-1; if(cart[i].qty<=0)cart.splice(i,1); render(); }
             else if(t.classList.contains('ofl-plus')){ var i2=+t.dataset.i; cart[i2].qty=Number(cart[i2].qty)+1; render(); }
             else if(t.classList.contains('ofl-rm')){ cart.splice(+t.dataset.i,1); render(); }
@@ -323,7 +325,7 @@ window._posOffline = (function() {
         document.addEventListener('change', function(e){ if(e.target.classList&&e.target.classList.contains('ofl-qi')){ var i=+e.target.dataset.i; var nq=Number(e.target.value); if(!Number.isFinite(nq)||nq<=0){toast('Quantity must be greater than zero. Use remove to delete a line.','#c62828');} else cart[i].qty=nq; render(); } });
     }
     setTimeout(boot, 1500);
-    return { boot:boot, active:active, add:add, scan:scan, sync:sync, render:render, cacheCatalog:cacheCatalog, search:search, lookup:lookup, catalogSize:catalogSize, getQueue:getQueue, recoverLegacy:recoverLegacy };
+    return { boot:boot, active:active, add:add, scan:scan, sync:sync, clearDraft:function(){cart=[];render();}, render:render, cacheCatalog:cacheCatalog, search:search, lookup:lookup, catalogSize:catalogSize, getQueue:getQueue, recoverLegacy:recoverLegacy };
 })();
 
 /* === Product Import screen: manual add + search auto-fill + CSV (external JS, so the
@@ -474,7 +476,7 @@ window._posOffline = (function() {
         function openBillHistory(search) {
             if (historyOverlay) { historyOverlay.remove(); historyOverlay = null; }
             var ov = document.createElement('div');
-            ov.id = 'pos-history-overlay';
+            ov.id = 'pos-history-overlay'; ov.setAttribute('role','dialog'); ov.setAttribute('aria-label','Bill history');
             historyOverlay = ov;
             ov.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;z-index:2147483647;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center';
             var panel = document.createElement('div');
@@ -1154,7 +1156,7 @@ window._posOffline = (function() {
         var af = document.getElementById('cartInlineAddForm');
         CTX.sessionId = af ? ((af.querySelector('[name=sessionId]') || {}).value || '') : CTX.sessionId;
         closeCustomer();
-        var ov = document.createElement('div'); customerOverlay = ov;
+        var ov = document.createElement('div'); customerOverlay = ov; ov.id='posCustomerOverlay'; ov.setAttribute('role','dialog'); ov.setAttribute('aria-label','Choose customer');
         ov.style.cssText = 'position:fixed;inset:0;z-index:2147483647;background:rgba(0,0,0,0.5);display:flex;align-items:flex-start;justify-content:center;padding-top:6vh';
         var panel = document.createElement('div');
         panel.style.cssText = 'background:#fff;border-radius:16px;width:90vw;max-width:560px;max-height:84vh;display:flex;flex-direction:column;box-shadow:0 12px 48px rgba(0,0,0,0.3);overflow:hidden';
@@ -1269,6 +1271,17 @@ window._posOffline = (function() {
     var _creditData = null, _creditSort = 'latest', _creditFilter = 'all', _creditFrom = '', _creditTo = '', _creditView = 'list', _creditPainted = [];
     var CBI = 'padding:9px 14px;font-size:13px;cursor:pointer;white-space:nowrap;color:#334155';
     function creditCloseMenus(){ document.querySelectorAll('.cb-menu').forEach(function(m){ m.style.display='none'; }); }
+    function creditDateText(value) {
+        if (!value) return '';
+        var date = new Date(value + 'T00:00:00');
+        return isNaN(date.getTime()) ? '' : new Intl.DateTimeFormat('en-GB', {day:'2-digit', month:'short', year:'numeric'}).format(date);
+    }
+    function creditDateLabel() {
+        if (_creditFrom && _creditTo) return creditDateText(_creditFrom) + ' – ' + creditDateText(_creditTo);
+        if (_creditFrom) return 'From ' + creditDateText(_creditFrom);
+        if (_creditTo) return 'Until ' + creditDateText(_creditTo);
+        return 'All dates';
+    }
     function creditFilterBills(){
         var a = (_creditData && _creditData.bills || []).slice();
         var cut = Date.now() - 30*864e5;
@@ -1281,7 +1294,11 @@ window._posOffline = (function() {
             if (_creditTo) { var t=new Date(_creditTo+'T23:59:59').getTime(); if ((b.ts||0)>t) return false; }
             return true;
         });
-        if (_creditSort==='oldest') a.sort(function(x,y){return (x.ts||0)-(y.ts||0);});
+        if (_creditSort==='overdue') a.sort(function(x,y){
+            var xo=Number(x.outstanding||0)>0.0001 && (x.ts||0)<cut, yo=Number(y.outstanding||0)>0.0001 && (y.ts||0)<cut;
+            return Number(yo)-Number(xo) || (y.ts||0)-(x.ts||0);
+        });
+        else if (_creditSort==='oldest') a.sort(function(x,y){return (x.ts||0)-(y.ts||0);});
         else if (_creditSort==='high') a.sort(function(x,y){return (y.outstanding||0)-(x.outstanding||0);});
         else if (_creditSort==='low') a.sort(function(x,y){return (x.outstanding||0)-(y.outstanding||0);});
         else a.sort(function(x,y){return (y.ts||0)-(x.ts||0);});
@@ -1362,9 +1379,12 @@ window._posOffline = (function() {
             var listSvg = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" x2="21" y1="6" y2="6"/><line x1="8" x2="21" y1="12" y2="12"/><line x1="8" x2="21" y1="18" y2="18"/><line x1="3" x2="3.01" y1="6" y2="6"/><line x1="3" x2="3.01" y1="12" y2="12"/><line x1="3" x2="3.01" y1="18" y2="18"/></svg>';
             var funnel = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>';
             var vActive = (_creditView==='compact');
+            var searchIcon = '<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg>';
+            var calendarIcon = '<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2v4M16 2v4"/><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M3 10h18"/></svg>';
+            var chevronIcon = '<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>';
             var h = '<div style="font-family:Inter,Segoe UI,Arial,sans-serif">'
                 + '<div style="display:flex;align-items:flex-start;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:18px">'
-                +   '<div><div style="font-size:13px;color:#6B7280">Track and manage all credit bills and outstanding dues</div></div>'
+                +   '<div><h1 style="font-size:22px;line-height:1.3;font-weight:700;color:#20213A;margin:0 0 5px">Credit Bills</h1><div style="font-size:13px;color:#6B7280">Track and manage all credit bills and outstanding dues</div></div>'
                 +   '<div style="display:flex;gap:10px;align-items:center">'
                 +     '<a href="/apps/zenith/pos/Terminal" style="display:inline-flex;align-items:center;gap:8px;height:40px;padding:0 16px;background:#7C3AED;color:#fff;border-radius:8px;font-size:13px;font-weight:600;text-decoration:none">+ New Credit Bill</a>'
                 +     '<div style="position:relative"><button id="credit-hdr-kebab" style="width:40px;height:40px;border:1px solid #7C3AED;border-radius:8px;background:#fff;color:#7C3AED;cursor:pointer;font-size:18px;line-height:1">&#8942;</button>'
@@ -1375,15 +1395,16 @@ window._posOffline = (function() {
                 +   '</div>'
                 + '</div>'
                 + creditStatCards(d)
-                + '<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:18px">'
-                +   '<input id="credit-search" type="text" placeholder="Search by bill no, customer or phone..." value="'+(search||'').replace(/"/g,'&quot;')+'" style="flex:1;min-width:220px;height:40px;padding:0 14px;border:1px solid #E5E7EB;border-radius:8px;font-size:13px;outline:none"/>'
-                +   '<div style="display:flex;align-items:center;gap:6px;height:40px;padding:0 12px;border:1px solid #E5E7EB;border-radius:8px"><input id="credit-from" type="date" value="'+_creditFrom+'" style="border:none;outline:none;font-size:12.5px;color:#111827;background:transparent"/><span style="color:#9CA3AF">–</span><input id="credit-to" type="date" value="'+_creditTo+'" style="border:none;outline:none;font-size:12.5px;color:#111827;background:transparent"/></div>'
-                +   '<div style="position:relative"><button id="credit-filter-btn" style="height:40px;padding:0 14px;border:1px solid '+(_creditFilter!=='all'?'#7C3AED':'#E5E7EB')+';border-radius:8px;background:#fff;color:'+(_creditFilter!=='all'?'#7C3AED':'#6B7280')+';cursor:pointer;font-size:12.5px;display:inline-flex;align-items:center;gap:6px">'+funnel+' Filter'+(_creditFilter!=='all'?' •':'')+'</button>'
+                + '<div class="cb-toolbar">'
+                +   '<div class="cb-search">'+searchIcon+'<input id="credit-search" type="search" aria-label="Search credit bills" placeholder="Search by bill no, customer or phone..." value="'+(search||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')+'"/></div>'
+                +   '<div class="cb-date"><button id="credit-date-btn" type="button" aria-haspopup="true" aria-expanded="false">'+calendarIcon+'<span id="credit-date-label">'+creditDateLabel()+'</span>'+chevronIcon+'</button>'
+                +     '<div id="credit-date-pop" class="cb-date-pop" hidden><label for="credit-from">From<input id="credit-from" type="date" value="'+_creditFrom+'"/></label><label for="credit-to">To<input id="credit-to" type="date" value="'+_creditTo+'"/></label><button id="credit-date-clear" type="button">Clear dates</button></div></div>'
+                +   '<div class="cb-filter-wrap"><button id="credit-filter-btn" type="button" class="cb-filter-btn" style="border-color:'+(_creditFilter!=='all'?'var(--z-primary)':'var(--z-border)')+';color:'+(_creditFilter!=='all'?'var(--z-primary)':'var(--z-text-muted)')+'">'+funnel+' Filter'+(_creditFilter!=='all'?' •':'')+'</button>'
                 +     '<div class="cb-menu" style="display:none;position:absolute;left:0;top:44px;background:#fff;border:1px solid #E5E7EB;border-radius:10px;box-shadow:0 6px 20px rgba(17,24,39,.12);z-index:50;overflow:hidden;min-width:150px">'
                 +       '<div class="cb-filter" data-f="all" style="'+CBI+'">All Bills</div><div class="cb-filter" data-f="outstanding" style="'+CBI+'">Outstanding</div><div class="cb-filter" data-f="overdue" style="'+CBI+'">Overdue</div><div class="cb-filter" data-f="settled" style="'+CBI+'">Settled</div>'
                 +     '</div></div>'
-                +   '<label style="font-size:12.5px;color:#6B7280;font-weight:500;display:inline-flex;align-items:center;gap:8px">Sort by:<select id="credit-sort" style="height:40px;padding:0 10px;border:1px solid #E5E7EB;border-radius:8px;font-size:12.5px;color:#111827;outline:none"><option value="latest">Latest First</option><option value="oldest">Oldest First</option><option value="high">Highest Amount</option><option value="low">Lowest Amount</option></select></label>'
-                +   '<button id="credit-view-btn" title="Toggle compact view" style="width:40px;height:40px;border:1px solid #E5E7EB;border-radius:8px;background:'+(vActive?'#F5F3FF':'#fff')+';color:'+(vActive?'#7C3AED':'#6B7280')+';cursor:pointer;display:inline-flex;align-items:center;justify-content:center">'+listSvg+'</button>'
+                +   '<label class="cb-sort">Sort by: <select id="credit-sort" aria-label="Sort credit bills"><option value="latest">Latest First</option><option value="oldest">Oldest First</option><option value="high">Highest Amount</option><option value="low">Lowest Amount</option><option value="overdue">Overdue First</option></select>'+chevronIcon+'</label>'
+                +   '<button id="credit-view-btn" type="button" title="Toggle compact view" class="cb-view-btn" style="background:'+(vActive?'var(--z-primary-light)':'var(--z-bg-card)')+';color:'+(vActive?'var(--z-primary)':'var(--z-text-muted)')+'">'+listSvg+'</button>'
                 + '</div>'
                 + '<div style="background:#fff;border:1px solid #E5E7EB;border-radius:12px;overflow:hidden;margin-bottom:16px"><div id="credit-list-host"></div></div>'
                 + '<div id="credit-count" style="font-size:12.5px;color:#6B7280"></div>'
@@ -1392,11 +1413,15 @@ window._posOffline = (function() {
             var sel = document.getElementById('credit-sort'); if (sel) { sel.value = _creditSort; sel.addEventListener('change', function(){ _creditSort = sel.value; creditPaintList(); }); }
             var si = document.getElementById('credit-search');
             if (si) { var t=null; si.addEventListener('input', function(){ clearTimeout(t); t=setTimeout(function(){ renderCreditBills(si.value); }, 400); }); }
-            var cf = document.getElementById('credit-from'); if (cf) cf.addEventListener('change', function(){ _creditFrom=cf.value; creditPaintList(); });
-            var ct = document.getElementById('credit-to'); if (ct) ct.addEventListener('change', function(){ _creditTo=ct.value; creditPaintList(); });
+            function updateCreditDates(){ var label=document.getElementById('credit-date-label'); if(label) label.textContent=creditDateLabel(); creditPaintList(); }
+            var cf = document.getElementById('credit-from'); if (cf) cf.addEventListener('change', function(){ _creditFrom=cf.value; updateCreditDates(); });
+            var ct = document.getElementById('credit-to'); if (ct) ct.addEventListener('change', function(){ _creditTo=ct.value; updateCreditDates(); });
+            var dc = document.getElementById('credit-date-clear'); if (dc) dc.addEventListener('click', function(){ _creditFrom=''; _creditTo=''; cf.value=''; ct.value=''; updateCreditDates(); });
+            var db = document.getElementById('credit-date-btn'); if (db) db.addEventListener('click', function(){ var pop=document.getElementById('credit-date-pop'); pop.hidden=!pop.hidden; db.setAttribute('aria-expanded',String(!pop.hidden)); });
+            if (!window.__cbDateClose) { window.__cbDateClose=true; document.addEventListener('click',function(e){ if(e.target.closest && e.target.closest('.cb-date')) return; var pop=document.getElementById('credit-date-pop'), btn=document.getElementById('credit-date-btn'); if(pop) pop.hidden=true; if(btn) btn.setAttribute('aria-expanded','false'); }); }
             var vb = document.getElementById('credit-view-btn'); if (vb) vb.addEventListener('click', function(){ _creditView=(_creditView==='list'?'compact':'list'); var on=(_creditView==='compact'); vb.style.background=on?'#F5F3FF':'#fff'; vb.style.color=on?'#7C3AED':'#6B7280'; creditPaintList(); });
             var fb = document.getElementById('credit-filter-btn'); if (fb) fb.addEventListener('click', function(e){ e.stopPropagation(); var m=fb.nextElementSibling; var open=(m.style.display==='block'); creditCloseMenus(); m.style.display=open?'none':'block'; });
-            root.querySelectorAll('.cb-filter').forEach(function(it){ it.addEventListener('click', function(e){ e.stopPropagation(); _creditFilter=it.dataset.f; creditCloseMenus(); var on=(_creditFilter!=='all'); if (fb){ fb.style.borderColor=on?'#7C3AED':'#E5E7EB'; fb.style.color=on?'#7C3AED':'#6B7280'; } creditPaintList(); }); });
+            root.querySelectorAll('.cb-filter').forEach(function(it){ it.addEventListener('click', function(e){ e.stopPropagation(); _creditFilter=it.dataset.f; creditCloseMenus(); var on=(_creditFilter!=='all'); if (fb){ fb.style.borderColor=on?'var(--z-primary)':'var(--z-border)'; fb.style.color=on?'var(--z-primary)':'var(--z-text-muted)'; fb.innerHTML=funnel+' Filter'+(on?' •':''); } creditPaintList(); }); });
             var hk = document.getElementById('credit-hdr-kebab'); if (hk) hk.addEventListener('click', function(e){ e.stopPropagation(); var m=hk.nextElementSibling; var open=(m.style.display==='block'); creditCloseMenus(); m.style.display=open?'none':'block'; });
             root.querySelectorAll('.cb-hdr-item').forEach(function(it){ it.addEventListener('click', function(e){ e.stopPropagation(); creditCloseMenus(); if (it.dataset.act==='export') creditExportCsv(); else renderCreditBills(si?si.value:(search||'')); }); });
             creditPaintList();
@@ -1675,6 +1700,14 @@ window.posPayDigital = function(form) {
         var tag = (e.target && e.target.tagName) ? e.target.tagName.toUpperCase() : '';
         var typing = (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT');
         function clk(id) { var el = document.getElementById(id); if (el) { e.preventDefault(); el.click(); } }
+        if (document.querySelector('.pos-checkout-reference')) {
+            if (document.querySelector('[role="dialog"],#pos-history-overlay,#posCustomerOverlay,#posCreditOverlay,#posCloseSessionOverlay,.pos-split-panel,.pos-cash-panel')) return;
+            var keys = {F1:'pos-discount',F2:'pos-pay-cash',F3:'pos-pay-card',F4:'pos-credit',F5:'pos-pay-upi',F6:'pos-split',F7:'pos-hold',F8:'pos-void',F10:'pos-history-btn'};
+            if (keys[e.key]) { e.preventDefault(); clk(keys[e.key]); return; }
+            if (e.key === 'F9') { e.preventDefault(); var held=document.querySelector('#pos-held-wrap summary,#pos-held-wrap button'); if (held) held.click(); return; }
+            // The reference layout's search drawer owns '/'.
+            if (e.key === '/') return;
+        }
         switch (e.key) {
             case 'F1': e.preventDefault(); clk('pos-pay-cash'); break;
             case 'F2': e.preventDefault(); clk('pos-pay-card'); break;
@@ -1878,7 +1911,7 @@ window.posPayDigital = function(form) {
 
     document.addEventListener('keydown', function (e) {
         if (document.getElementById('posCashTenderOverlay') || document.getElementById('posPayConfirmOverlay')) return;
-        if (typing(e)) return;
+        if (typing(e) || document.querySelector('[role=dialog]')) return;
         var k = e.key;
 
         if (k === 'Tab') { e.preventDefault(); if (e.shiftKey) gotoProducts(); else gotoCart(); return; }
@@ -1892,7 +1925,7 @@ window.posPayDigital = function(form) {
         // global utility shortcuts: T tax toggle, F fullscreen, C close session
         if (k === 't' || k === 'T') { e.preventDefault(); var _tb = document.querySelector('.pos-header form[action*="toggleTax"] button'); if (_tb) { _tb.click(); flash('TAX toggled', 'rgba(21,101,192,0.96)', 2000); } return; }
         if (k === 'f' || k === 'F') { e.preventDefault(); var _fb = document.getElementById('posFullscreenBtn'); if (_fb) _fb.click(); else if (window.posToggleFullscreen) window.posToggleFullscreen(); return; }
-        if (k === 'c' || k === 'C') { e.preventDefault(); if (window.confirm('Close this POS session?')) { var _cb = document.querySelector('.pos-header form[action*="closeSession"] button'); if (_cb) _cb.click(); } return; }
+        if (k === 'c' || k === 'C') { e.preventDefault(); if (document.querySelector('.pos-checkout-reference') || window.confirm('Close this POS session?')) { var _cb = document.querySelector('.pos-header form[action*="closeSession"] button'); if (_cb) _cb.click(); } return; }
 
         // M = sales mode: global unless we're on a cart line (then it's the line's item mode)
         if ((k === 'm' || k === 'M') && !(cur && cur.type === 'cartrow')) { e.preventDefault(); cycleGlobalMode(); return; }
@@ -1978,12 +2011,13 @@ window.posPayDigital = function(form) {
     ];
 
     function decorate() {
-        HDR.forEach(function (h) { var el = h[0](); if (el) addBadge(el, h[1]); });
+        (document.querySelector('.pos-checkout-reference') ? [] : HDR).forEach(function (h) { var el = h[0](); if (el) addBadge(el, h[1]); });
         var sm = document.querySelector('.pos-summary');
         if (!sm) return;
+        var reference = !!document.querySelector('.pos-checkout-reference');
         MAP.forEach(function (m) {
             var el = m[0](sm);
-            if (el) { if (!el.id) el.id = m[1]; addBadge(el, m[2]); }
+            if (el) { if (!el.id) el.id = m[1]; if (!reference) addBadge(el, m[2]); }
         });
         var lg = document.getElementById('posKbLegend');
         if (lg) { if (!savedLegend) savedLegend = lg.outerHTML; }
@@ -2083,6 +2117,7 @@ window.posToggleFullscreen = function() {
         var CS = '₹';
         var busy = false;
         var modeSwitching = false;
+        var cartClearing = false;
         var lastTxnNum = '';
         var lastPay = 0;
         var lastCartData = null;
@@ -2286,12 +2321,21 @@ window.posToggleFullscreen = function() {
             });
         }
         window.posDiscount = function() {
-            if (!TX || !lastCartData || !lastCartData.items || !lastCartData.items.length) { showToast('Add items to the cart first', '#e53935'); return; }
+            if (!TX || cartClearing || modeSwitching) { showToast('Add items or wait for the cart to finish updating', '#e53935'); return; }
+            if (!lastCartData || OPT._drainPending()) {
+                OPT.whenIdle().then(function(){return post({action:'refresh',transactionId:TX});}).then(function(data){
+                    if (!data || !data.success || !data.items.length) throw new Error('Add items to the cart first');
+                    renderCart(data); window.posDiscount();
+                }).catch(function(error){showToast(error.message,'#e53935');});
+                return;
+            }
+            if (!lastCartData.items.length) { showToast('Add items to the cart first', '#e53935'); return; }
             var ov = document.createElement('div');
             ov.style.cssText = 'position:fixed;inset:0;z-index:999999;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;padding:16px';
+            ov.id='posDiscountOverlay'; ov.setAttribute('role','dialog'); ov.setAttribute('aria-label','Discount and round off');
             var rows = lastCartData.items.map(function(it) {
                 return '<div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid #f0f0f0">'
-                    + '<div style="flex:1;min-width:0;font-size:13px;font-weight:600;color:#333;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + (it.name || it.seq)
+                    + '<div style="flex:1;min-width:0;font-size:13px;font-weight:600;color:#333;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + cartText(it.name || it.seq)
                     + '<span style="color:#999;font-weight:400"> &nbsp;' + (Number(it.qty) || 0) + ' &times; &#8377;' + Number(it.price || 0).toFixed(2) + '</span></div>'
                     + '<input class="pd-line" data-seq="' + it.seq + '" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0" style="width:66px;padding:6px;border:1px solid #ccc;border-radius:6px;text-align:right;font-size:13px"/>'
                     + '<button type="button" class="pd-tg" data-t="pct" style="width:36px;padding:6px 0;border:1px solid #bbb;border-radius:6px;background:#f5f5f5;cursor:pointer;font-weight:700">%</button></div>';
@@ -2365,6 +2409,7 @@ window.posToggleFullscreen = function() {
                 + '<button id="credit-cancel" style="flex:1;padding:14px;border:2px solid #ccc;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;background:#fff;color:#555">Cancel</button>'
                 + '<button id="credit-confirm" style="flex:1;padding:14px;border:none;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;background:#e65100;color:#fff">Complete Credit Sale</button>'
                 + '</div></div></div>';
+            ov.id='posCreditOverlay'; ov.setAttribute('role','dialog'); ov.setAttribute('aria-label','Credit sale');
             document.body.appendChild(ov);
             ov.addEventListener('click', function(e) { if (e.target === ov) ov.remove(); });
             var nameInp = document.getElementById('credit-name');
@@ -2763,7 +2808,7 @@ window.posToggleFullscreen = function() {
                 + '<input type="hidden" name="salesModeId" value="'+SM+'"/>'
                 + '<input type="hidden" name="customerPhone" value=""/>'
                 + '<input type="hidden" name="moquiSessionToken" value="'+TK+'"/>'
-                + '<button type="submit" style="width:100%;padding:clamp(8px,1.4vh,15px) 8px;border:none;border-radius:10px;font-size:16px;font-weight:700;cursor:pointer;background:'+bg+';color:#fff">'+label+'</button></form>';
+                + '<button type="submit" id="pos-pay-'+method.toLowerCase()+'" style="width:100%;padding:clamp(8px,1.4vh,15px) 8px;border:none;border-radius:10px;font-size:16px;font-weight:700;cursor:pointer;background:'+bg+';color:#fff">'+label+'</button></form>';
         }
         function actionBtn(action, label, bg, conf) {
             return '<form method="post" action="Terminal/'+action+'" style="margin:0">'
@@ -2772,9 +2817,26 @@ window.posToggleFullscreen = function() {
                 + '<input type="hidden" name="taxOn" value="'+TO+'"/>'
                 + '<input type="hidden" name="salesModeId" value="'+SM+'"/>'
                 + '<input type="hidden" name="moquiSessionToken" value="'+TK+'"/>'
-                + '<button type="submit" style="width:100%;padding:clamp(7px,1.2vh,13px) 8px;border:none;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;background:'+bg+';color:#fff"'
+                + '<button type="submit"'+(action==='holdSale'?' id="pos-hold"':action==='voidSale'?' id="pos-void"':'')+' style="width:100%;padding:clamp(7px,1.2vh,13px) 8px;border:none;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;background:'+bg+';color:#fff"'
                 + (conf ? ' onclick="return confirm(\''+conf+'\')"' : '') + '>'+label+'</button></form>';
         }
+        function referencePayments(d) {
+            var disabled = !d.items.length;
+            var badge = function(key) { return '<kbd>'+key+'</kbd>'; };
+            var html = '<div class="pos-paywrap pos-reference-payments">'
+                + '<button type="button" id="pos-discount" class="pos-discount-btn">&#127991; DISCOUNT / ROUND-OFF'+badge('F1')+'</button>'
+                + '<button type="button" id="pos-pay-cash" class="pos-cash-btn">&#128176; CASH'+badge('F2')+'</button>'
+                + payBtn('Card','&#128179; CARD'+badge('F3'),'#009dff')
+                + '<button id="pos-credit" type="button" onclick="posCreditSale()">&#128196; CREDIT'+badge('F4')+'</button>'
+                + payBtn('UPI','&#128241; UPI'+badge('F5'),'#9518dd')
+                + '<button id="pos-split" type="button" class="pos-split-btn">&#8596; SPLIT PAYMENT'+badge('F6')+'</button>'
+                + actionBtn('holdSale','&#10074;&#10074; HOLD'+badge('F7'),'#ff9b00')
+                + actionBtn('voidSale','&#10005; VOID / CANCEL'+badge('F8'),'#ff3f49','Void this sale?')
+                + '<button id="pos-copilot" type="button" onclick="posCheckoutCopilot()">&#9635; AI Copilot</button></div>';
+            if (disabled) html=html.replace(/<button(?![^>]*id="pos-copilot")/g,'<button disabled');
+            return html;
+        }
+
         function buildSummary(d) {
             extractHeldInfo(document); // keep held count/id in sync with the live header badge
             var modeLabel = SM ? (SM.charAt(0).toUpperCase() + SM.slice(1).toLowerCase()) : 'Retail';
@@ -2787,7 +2849,8 @@ window.posToggleFullscreen = function() {
                 + '</div></div>'
                 + '<div class="pos-sum-total" style="background:#7C3AED;color:#fff;padding:clamp(5px,1vh,12px) 20px;border-radius:10px;display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">'
                 + '<span style="font-size:16px;font-weight:600">'+modeLabel+' TOTAL</span>'
-                + '<span id="posSumTotal" style="font-size:28px;font-weight:800;letter-spacing:1px">'+CS+fmt(d.pay)+'</span></div>';
+                + '<span id="posSumTotal" style="font-size:28px;font-weight:800;letter-spacing:1px">'+CS+fmt2(d.pay)+'</span></div>';
+            if (document.querySelector('.pos-checkout-reference')) return sh + referencePayments(d);
             sh += '<div class="pos-paywrap">';
             if (d.items.length > 0) {
                 sh += '<button type="button" class="pos-discount-btn" style="display:block;width:100%;padding:clamp(7px,1.1vh,12px) 8px;border-radius:10px;font-size:14px;font-weight:700;cursor:pointer;background:#6a1b9a;color:#fff;border:none;text-align:center;margin-bottom:8px;box-sizing:border-box">&#127991;&#65039; DISCOUNT / ROUND-OFF</button>';
@@ -2933,14 +2996,14 @@ window.posToggleFullscreen = function() {
                 var modeCell = '-';
                 if (d.modes && d.modes.length) {
                     var _cm = null; for (var _mi = 0; _mi < d.modes.length; _mi++) { if (d.modes[_mi].id === it.mode) { _cm = d.modes[_mi]; break; } }
-                    if (!_cm) _cm = d.modes[0];
+                    if (!_cm) _cm = d.modes.find(function(m){return m.id===SM;}) || d.modes[0];
                     var _mn = _cm ? _cm.name : '';
                     var _cbg = '#DBEAFE', _cfg = '#2563EB';
                     if (/whole/i.test(_mn)) { _cbg = '#FFEDD5'; _cfg = '#EA580C'; }
                     else if (/custom/i.test(_mn)) { _cbg = '#D5F0EC'; _cfg = '#0F766E'; }
                     if (d.modes.length > 1) {
                         var mo = '';
-                        d.modes.forEach(function(m){ mo += '<option value="'+cartText(m.id)+'"'+(it.mode===m.id?' selected':'')+'>'+cartText(m.name)+(Number(m.disc)>0?(' −'+Number(m.disc)+'%'):'')+'</option>'; });
+                        d.modes.forEach(function(m){ mo += '<option value="'+cartText(m.id)+'"'+((it.mode||SM)===m.id?' selected':'')+'>'+cartText(m.name)+(Number(m.disc)>0?(' −'+Number(m.disc)+'%'):'')+'</option>'; });
                         modeCell = '<select class="aj-mode" data-seq="'+cartText(it.seq)+'" title="Sale mode for this item" style="font-size:12px;font-weight:600;padding:3px 6px;border:1px solid '+_cbg+';border-radius:6px;background:'+_cbg+';color:'+_cfg+';cursor:pointer;max-width:120px">'+mo+'</select>';
                     } else {
                         modeCell = '<span style="display:inline-block;font-size:12px;font-weight:600;padding:3px 8px;border-radius:6px;background:'+_cbg+';color:'+_cfg+'">'+cartText(_mn)+'</span>';
@@ -2956,7 +3019,7 @@ window.posToggleFullscreen = function() {
                 h += '<button data-seq="'+cartText(it.seq)+'" data-q="'+(Number(it.qty)-1)+'" class="aj-q" style="width:34px;height:34px;border:2px solid #e53935;background:#fff;font-size:19px;font-weight:bold;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0;border-radius:8px 0 0 8px;color:#e53935">-</button>';
                 h += '<input type="number" step="any" value="'+Number(it.qty)+'" data-seq="'+cartText(it.seq)+'" class="aj-qi" style="width:58px;text-align:center;font-weight:bold;font-size:16px;border-top:2px solid #ccc;border-bottom:2px solid #ccc;border-left:none;border-right:none;height:34px;background:#fff;color:#000;outline:none;box-sizing:border-box"/>';
                 h += '<button data-seq="'+cartText(it.seq)+'" data-q="'+(Number(it.qty)+1)+'" class="aj-q" style="width:34px;height:34px;border:2px solid #2e7d32;background:#fff;font-size:19px;font-weight:bold;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0;border-radius:0 8px 8px 0;color:#2e7d32">+</button>';
-                if (it.uom) h += '<span style="font-size:11px;color:#e65100;font-weight:700;margin-left:5px;white-space:nowrap;flex-shrink:0">'+cartText(it.uom)+'</span>';
+                if (it.uom) h += '<span class="pos-cart-uom" style="font-size:11px;color:#e65100;font-weight:700;margin-left:5px;white-space:nowrap;flex-shrink:0">'+cartText(it.uom)+'</span>';
                 h += '</div>';
                 h += '</td>';
                 h += '<td style="padding:3px 10px;text-align:right;font-size:14px;color:#6B7280;vertical-align:middle">'+Number(it.tax||0).toFixed(3)+'</td>';
@@ -2981,7 +3044,7 @@ window.posToggleFullscreen = function() {
                     _q.innerHTML = fmt(d.tQty);
                     var _tx = sm.querySelector('#posSumTax'); if (_tx) _tx.innerHTML = fmt(d.tax);
                     var _dc = sm.querySelector('#posSumDisc'); if (_dc) _dc.innerHTML = fmt(d.disc);
-                    var _tt = sm.querySelector('#posSumTotal'); if (_tt) _tt.innerHTML = CS + fmt(d.pay);
+                    var _tt = sm.querySelector('#posSumTotal'); if (_tt) _tt.innerHTML = CS + (document.querySelector('.pos-checkout-reference') ? fmt2(d.pay) : fmt(d.pay));
                 } else {
                     sm.innerHTML = buildSummary(d);
                     sm.setAttribute('data-sig', _sig);
@@ -3238,17 +3301,31 @@ window.posToggleFullscreen = function() {
             function doScan(code) { enqueue({ action: 'scanAdd', code: code, lineKey: 'scan#' + (++scanN) }); }
 
             return {
-                add: function (pid, price, name, uom) { if (modeSwitching) return showToast('Wait for the sales mode to change', '#c62828'); try { doAdd(pid, price, name, uom); } catch (e) { post({ action: 'addItem', transactionId: TX, productId: pid, unitPrice: price, addQty: 1 }).then(renderCart); } },
-                qty: function (seq, q2) { if (modeSwitching) return showToast('Wait for the sales mode to change', '#c62828'); try { doQty(seq, q2); } catch (e) { post({ action: Number(q2) <= 0 ? 'removeItem' : 'updateQty', transactionId: TX, itemSeqId: seq, newQty: q2 }).then(renderCart); } },
-                price: function (seq, p2) { if (modeSwitching) return showToast('Wait for the sales mode to change', '#c62828'); try { doPrice(seq, p2); } catch (e) { post({ action: 'updatePrice', transactionId: TX, itemSeqId: seq, newPrice: p2 }).then(renderCart); } },
-                remove: function (seq) { if (modeSwitching) return showToast('Wait for the sales mode to change', '#c62828'); try { doRemove(seq); } catch (e) { post({ action: 'removeItem', transactionId: TX, itemSeqId: seq }).then(renderCart); } },
-                mode: function (seq, m) { if (modeSwitching) return showToast('Wait for the sales mode to change', '#c62828'); try { doMode(seq, m); } catch (e) { post({ action: 'setItemMode', transactionId: TX, itemSeqId: seq, itemMode: m }).then(renderCart); } },
-                scan: function (code) { if (modeSwitching) return showToast('Wait for the sales mode to change', '#c62828'); try { doScan(code); } catch (e) { post({ action: 'scanAdd', transactionId: TX, cartSearch: code }).then(function (d) { if (d && !d.success && d.error) alert(d.error); else renderCart(d); }); } },
+                add: function (pid, price, name, uom) { if (cartClearing || modeSwitching) return showToast('Wait for the cart to finish updating', '#c62828'); try { doAdd(pid, price, name, uom); } catch (e) { post({ action: 'addItem', transactionId: TX, productId: pid, unitPrice: price, addQty: 1 }).then(renderCart); } },
+                qty: function (seq, q2) { if (cartClearing || modeSwitching) return showToast('Wait for the cart to finish updating', '#c62828'); try { doQty(seq, q2); } catch (e) { post({ action: Number(q2) <= 0 ? 'removeItem' : 'updateQty', transactionId: TX, itemSeqId: seq, newQty: q2 }).then(renderCart); } },
+                price: function (seq, p2) { if (cartClearing || modeSwitching) return showToast('Wait for the cart to finish updating', '#c62828'); try { doPrice(seq, p2); } catch (e) { post({ action: 'updatePrice', transactionId: TX, itemSeqId: seq, newPrice: p2 }).then(renderCart); } },
+                remove: function (seq) { if (cartClearing || modeSwitching) return showToast('Wait for the cart to finish updating', '#c62828'); try { doRemove(seq); } catch (e) { post({ action: 'removeItem', transactionId: TX, itemSeqId: seq }).then(renderCart); } },
+                mode: function (seq, m) { if (cartClearing || modeSwitching) return showToast('Wait for the cart to finish updating', '#c62828'); try { doMode(seq, m); } catch (e) { post({ action: 'setItemMode', transactionId: TX, itemSeqId: seq, itemMode: m }).then(renderCart); } },
+                scan: function (code) { if (cartClearing || modeSwitching) return showToast('Wait for the cart to finish updating', '#c62828'); try { doScan(code); } catch (e) { post({ action: 'scanAdd', transactionId: TX, cartSearch: code }).then(function (d) { if (d && !d.success && d.error) alert(d.error); else renderCart(d); }); } },
                 _drainPending: function () { return q.length + (inflight ? 1 : 0); },
                 whenIdle: function () { return (inflight || q.length) ? new Promise(function(resolve) { idleWaiters.push(resolve); }) : Promise.resolve(); }
             };
         })();
 
+        window._posClearCart = function() {
+            if (document.querySelector('.ofl-qi') && window._posOffline) { window._posOffline.clearDraft(); return Promise.resolve(); }
+            if (!navigator.onLine) return Promise.reject(new Error('Reconnect before clearing the server cart.'));
+            if (modeSwitching) return Promise.reject(new Error('Wait for the sales mode to finish changing.'));
+            if (cartClearing) return Promise.reject(new Error('The cart is already being cleared.'));
+            cartClearing = true;
+            return OPT.whenIdle().then(function() {
+                if (!TX) throw new Error('There is no open cart to clear.');
+                return post({action:'clearCart',transactionId:TX});
+            }).then(function(data) {
+                if (!data || !data.success) throw new Error(data && data.error || 'Cart could not be cleared. Try again.');
+                renderCart(data);
+            }).finally(function() { cartClearing = false; });
+        };
         window._posCurrentTax = function() { return TO; };
         window._posRefreshCart = function() {
             return post({action:'refresh',transactionId:TX}).then(renderCart).catch(function() {
@@ -3294,7 +3371,7 @@ window.posToggleFullscreen = function() {
         var cart = document.querySelector('.pos-cart');
         if (cart) {
             cart.addEventListener('click', function(e) {
-                var t = e.target;
+                var t = e.target.closest ? (e.target.closest('.aj-q,.aj-pb,.aj-rm') || e.target) : e.target;
                 if (t.classList.contains('aj-q')) {
                     e.preventDefault(); e.stopPropagation();
                     var nq = Number(t.dataset.q);
@@ -3326,7 +3403,7 @@ window.posToggleFullscreen = function() {
                     // Empty/0/NaN (e.g. the box was cleared to retype a decimal) must not delete
                     // the line — revert to the last good qty. Any value > 0 (incl. decimals like
                     // 0.5) keeps the line and recomputes its amount (qty × rate).
-                    if (!(nq > 0)) { renderCart(lastCartData); return; }
+                    if (!(nq > 0)) { if (lastCartData) renderCart(lastCartData); else e.target.value = e.target.defaultValue; return; }
                     OPT.qty(e.target.dataset.seq, nq);
                 }
                 if (e.target.classList.contains('aj-mode')) {
@@ -3528,29 +3605,34 @@ window.posToggleFullscreen = function() {
         var taxForm = document.querySelector('.pos-header form[action*="toggleTax"]');
         if (taxForm) taxForm.addEventListener('submit', function(e) {
             e.preventDefault();
-            var newTax = (TO === 'Y') ? 'N' : 'Y';
+            if (modeSwitching || cartClearing) return;
+            var newTax = TO === 'Y' ? 'N' : 'Y';
             var btn = taxForm.querySelector('button');
-            if (btn) {
-                btn.style.background = (newTax === 'Y') ? '#4caf50' : '#f44336';
-                btn.textContent = 'TAX: ' + (newTax === 'Y' ? 'ON' : 'OFF');
-            }
-            var hi = taxForm.querySelector('input[name="taxOn"]');
-            if (hi) hi.value = (newTax === 'Y') ? 'N' : 'Y';
-            TO = newTax;
-            if (TX) {
+            if (btn) btn.disabled = true;
+            modeSwitching = true;
+            OPT.whenIdle().then(function() {
                 var fd = new FormData(taxForm);
-                fd.set('transactionId', TX);
-                fd.set('sessionId', SI);
-                fd.set('taxOn', newTax);
-                fd.set('salesModeId', SM);
-                fd.set('moquiSessionToken', TK);
-                fetch(taxForm.action, {method: 'POST', body: new URLSearchParams(fd), credentials: 'same-origin'})
-                    .then(function() {
-                        return post({action:'refresh', transactionId: TX});
-                    }).then(function(d) {
-                        if (d) renderCart(d);
-                    });
-            }
+                fd.set('transactionId',TX); fd.set('sessionId',SI); fd.set('taxOn',newTax);
+                fd.set('salesModeId',SM); fd.set('moquiSessionToken',TK);
+                return fetch(taxForm.action,{method:'POST',body:new URLSearchParams(fd),credentials:'same-origin'});
+            }).then(function(response) {
+                if (!response.ok) throw new Error('Tax mode could not be changed. Reload the bill and try again.');
+                return response.text();
+            }).then(function(html) {
+                var doc=new DOMParser().parseFromString(html,'text/html');
+                var saved=doc.querySelector('#cartInlineAddForm input[name="taxOn"]');
+                var error=doc.querySelector('#posModeSwitchErr,.alert-danger');
+                if (!saved || saved.value!==newTax || error) throw new Error(error ? error.textContent.trim() : 'Tax mode was not saved. Reload the bill.');
+                TO=newTax;
+                document.querySelectorAll('input[name="taxOn"]').forEach(function(input){input.value=TO;});
+                taxForm.querySelector('input[name="taxOn"]').value=TO==='Y'?'N':'Y';
+                var label=taxForm.querySelector('.nb-tax__lbl'); if(label) label.textContent='Tax: '+(TO==='Y'?'On':'Off');
+                if(btn) { btn.classList.toggle('on',TO==='Y'); btn.setAttribute('aria-pressed',String(TO==='Y')); }
+                var url=new URL(location.href);url.searchParams.set('taxOn',TO);history.replaceState(history.state,'',url.href);
+                return post({action:'refresh',transactionId:TX});
+            }).then(function(data) { if(data)renderCart(data); })
+                .catch(function(error){showToast(error.message,'#c62828');})
+                .finally(function(){modeSwitching=false;if(btn)btn.disabled=false;});
         });
 
         /* --- Close Session: AJAX dialog --- */
@@ -3567,7 +3649,7 @@ window.posToggleFullscreen = function() {
                 }).then(function(r) { return r.json(); }).then(function(d) {
                     if (!d || !d.success) { alert(d ? d.error : 'Failed to load session summary'); return; }
                     var ov = document.createElement('div');
-                    ov.className = 'pos-close-overlay';
+                    ov.className = 'pos-close-overlay'; ov.id='posCloseSessionOverlay'; ov.setAttribute('role','dialog'); ov.setAttribute('aria-label','Close session');
                     ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:99999;display:flex;align-items:center;justify-content:center';
                     var row = function(label, val, color) {
                         return '<div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #eee">'

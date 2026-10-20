@@ -2,6 +2,48 @@
 <services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
           xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
 
+    <!-- Reuse the row-locked counter store with a KOT-only key. Seed from existing numbers once. -->
+    <service verb="next" noun="KotNumber">
+        <out-parameters><parameter name="kotNumber"/></out-parameters>
+        <actions>
+            <script><![CDATA[
+                def access = ec.service.sync().name('zenith.base.SecurityServices.check#ModuleWriteAccess')
+                    .parameter('moduleId', 'pos').call()
+                def org = ec.user.getPreference('ACTIVE_ORGANIZATION')
+                if (access?.canWrite != true || !org || org == '_NA_') {
+                    ec.message.addError('POS write access and an active shop are required.')
+                    return
+                }
+                def key = 'KOT_' + org
+                def counter = ec.entity.find('zenith.erp.pos.PosBillSequence').condition('seqKey', key).forUpdate(true).one()
+                int nextNum
+                if (counter) {
+                    nextNum = ((counter.lastNumber ?: 1000) as int) + 1
+                    counter.set('lastNumber', nextNum).update()
+                } else {
+                    int maxNum = 1000
+                    def prior = ec.entity.find('zenith.erp.pos.KitchenOrderTicket')
+                        .condition('organizationPartyId', org).selectField('kotNumber').list()
+                    prior.each { row ->
+                        def n = row.kotNumber?.toString()
+                        if (n ==~ /\d+/) maxNum = Math.max(maxNum, n.toInteger())
+                    }
+                    nextNum = maxNum + 1
+                    try {
+                        ec.service.sync().name('create#zenith.erp.pos.PosBillSequence')
+                            .parameters([seqKey:key, lastNumber:nextNum]).call()
+                    } catch (Exception ignored) {
+                        def current = ec.entity.find('zenith.erp.pos.PosBillSequence')
+                            .condition('seqKey', key).forUpdate(true).one()
+                        nextNum = ((current.lastNumber ?: maxNum) as int) + 1
+                        current.set('lastNumber', nextNum).update()
+                    }
+                }
+                kotNumber = String.valueOf(nextNum)
+            ]]></script>
+        </actions>
+    </service>
+
     <!-- Create KOT (Kitchen Order Ticket) -->
     <service verb="create" noun="KitchenOrderTicket">
         <in-parameters>
@@ -74,9 +116,22 @@
     <service verb="reprint" noun="KitchenOrderTicket">
         <in-parameters><parameter name="kotId" required="true"/></in-parameters>
         <actions>
-            <entity-find-one entity-name="zenith.erp.pos.KitchenOrderTicket" value-field="kot" for-update="true"/>
-            <set field="kot.printCount" from="(kot.printCount ?: 0) + 1"/>
-            <entity-update value-field="kot"/>
+            <script><![CDATA[
+                def access = ec.service.sync().name('zenith.base.SecurityServices.check#ModuleWriteAccess')
+                    .parameter('moduleId', 'pos').call()
+                def org = ec.user.getPreference('ACTIVE_ORGANIZATION')
+                if (access?.canWrite != true || !org || org == '_NA_') {
+                    ec.message.addError('POS write access and an active shop are required.')
+                    return
+                }
+                def kot = ec.entity.find('zenith.erp.pos.KitchenOrderTicket')
+                    .condition('kotId', kotId).forUpdate(true).one()
+                if (!kot || kot.organizationPartyId != org) {
+                    ec.message.addError('Kitchen order not found in this shop.')
+                    return
+                }
+                kot.set('printCount', ((kot.printCount ?: 0) as int) + 1).update()
+            ]]></script>
         </actions>
     </service>
 
