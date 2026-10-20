@@ -237,6 +237,7 @@ const rows=(table,where)=>q(`SELECT * FROM ${table} WHERE ${where}`),count=(tabl
   await p.locator('details.nb-modes summary').click();
   await p.locator('[data-pos-layout="advanced"]').click();
   check('advanced billing shows the product grid',await p.locator('.pos-product-grid').isVisible());
+  check('advanced mode label and trash controls fit their columns',await p.locator('#cartScroll tbody tr').first().evaluate(row=>{const mode=row.querySelector('select'),trash=row.querySelector('.aj-rm');return mode&&mode.getBoundingClientRect().width>=104&&trash&&trash.getBoundingClientRect().right<=trash.closest('td').getBoundingClientRect().right+1;}));
   check('advanced cart uses reference headers and a visible inline scanner',await p.locator('.pos-cart-advanced-label').allTextContents().then(x=>x.join('|')==='Item|Amount (₹)')&&await p.locator('#cartInlineSearch').evaluate(e=>e.getBoundingClientRect().width>100&&getComputedStyle(e.closest('.pos-cart-search')).position==='relative'));
   await p.locator('.pos-cart .aj-mode').first().selectOption('WHOLESALE');await p.waitForFunction(()=>document.querySelector('.pos-cart .aj-mode')?.dataset.priceKind==='wholesale'&&document.querySelector('.pos-cart .aj-p')?.value==='90');
   check('Wholesale chip is orange without changing its saved price',await p.locator('.pos-cart .aj-mode').first().evaluate(e=>getComputedStyle(e).backgroundColor==='rgb(255, 243, 232)')&&Number(rows('pos_transaction_item',`transaction_id='${uc.transactionId}'`)[0]?.unit_price)===90);
