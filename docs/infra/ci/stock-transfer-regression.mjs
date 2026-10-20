@@ -59,7 +59,10 @@ try {
  await ship(first);check('Empty transfer cannot ship',()=>assert.equal(transfer(first).status_id,'StxDraft'));
  for(const quantity of ['0','-1']) await add(first,quantity);
  await add(first,'1',{productId:'STFIX_FOREIGN'});
- check('Invalid quantities and foreign products rejected',()=>assert.equal(count('stock_transfer_item',`stock_transfer_id=${quote(first)}`),0));
+ await add(first,'1',{productId:'STFIX_SERVICE'});
+ check('Invalid quantities, foreign products and services rejected',()=>assert.equal(count('stock_transfer_item',`stock_transfer_id=${quote(first)}`),0));
+ const itemPicker=await writer.request(route+'EditStockTransfer?stockTransferId='+first);
+ check('Transfer picker offers physical products only',()=>{assert(itemPicker.text.includes('STFIX_P'));assert(!itemPicker.text.includes('STFIX_SERVICE'));});
  const l1=await add(first,'8');const l2=await add(first,'8');
  await ship(first);
  check('Combined duplicate lines cannot overdraw free stock',()=>{assert.equal(transfer(first).status_id,'StxDraft');assert.equal(balance('STFIX_P','STFIX_A'),15);});
@@ -158,7 +161,7 @@ try {
  const cleanup=[];const del=(table,column,ids)=>{if(ids.length)cleanup.push(`delete from ${table} where ${column} in (${ids.map(quote).join(',')});`);};
  del('serial_number_history','history_id',history);del('stock_transfer_item_serial','stock_transfer_id',transferIds);del('stock_transfer_item','stock_transfer_id',transferIds);del('stock_transfer','stock_transfer_id',transferIds);
  del('invoice_item','invoice_id',invoices);del('invoice','invoice_id',invoices);del('product_serial_number','serial_number_id',['STFIX_SN1','STFIX_SN2','STFIX_SN3']);del('asset_detail','asset_detail_id',details);del('asset','asset_id',fixtureAssets);
- del('product','product_id',['STFIX_P','STFIX_BATCH','STFIX_SERIAL','STFIX_FOREIGN']);del('facility','facility_id',['STFIX_A','STFIX_B','STFIX_FOREIGN']);
+ del('product','product_id',['STFIX_P','STFIX_BATCH','STFIX_SERIAL','STFIX_SERVICE','STFIX_FOREIGN']);del('facility','facility_id',['STFIX_A','STFIX_B','STFIX_FOREIGN']);
  for(const table of ['user_preference','user_group_member','user_account'])del(table,'user_id',['STFIX_USER','STFIX_VIEW','STFIX_NOORG','STFIX_MANAGER']);
  del('party_relationship','party_relationship_id',['STFIX_MEMBERSHIP']);
  for(const table of ['party_role','organization','party'])del(table,'party_id',['STFIX_ORG','STFIX_OTHER','STFIX_PERSON']);
