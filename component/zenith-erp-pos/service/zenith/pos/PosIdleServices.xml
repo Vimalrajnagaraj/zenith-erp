@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+    <!-- Keep the existing job identity so upgrading cannot register two independent sweep jobs. -->
+    <service verb="ensure" noun="PosIdleJob">
+        <actions><script><![CDATA[
+            def access=ec.service.sync().name('zenith.pos.PosAccessServices.assert#PosAccess').call()
+            if (!access?.allowed) return
+            def jobName='zenith_PosIdleSessionSweep_5min'
+            def job=ec.entity.find('moqui.service.job.ServiceJob').condition('jobName',jobName).one()
+            if (!job) {
+                // Serialize first registration across organizations without relying on an absent-row lock.
+                ec.entity.find('moqui.basic.StatusItem').condition('statusId','PsOpen').forUpdate(true).one()
+                job=ec.entity.find('moqui.service.job.ServiceJob').condition('jobName',jobName).one()
+                if (!job) ec.service.sync().name('create#moqui.service.job.ServiceJob').parameters([
+                    jobName:jobName,description:'Close one-hour idle POS sessions; leave drawer cash unverified',
+                    serviceName:'zenith.pos.PosServices.sweep#IdlePosSessions',cronExpression:'0 * * * * ?',paused:'N']).call()
+            } else if (job.serviceName=='zenith.pos.PosServices.sweep#IdlePosSessions' && job.cronExpression=='0 0/5 * * * ?') {
+                // Preserve an administrator's explicit pause or custom schedule.
+                ec.service.sync().name('update#moqui.service.job.ServiceJob').parameters([jobName:jobName,cronExpression:'0 * * * * ?']).call()
+            }
+        ]]></script></actions>
+    </service>
+
+    <service verb="save" noun="PosIdlePolicy">
+        <in-parameters><parameter name="enabled" required="true"/></in-parameters>
+        <actions><script><![CDATA[
+            def access=ec.service.sync().name('zenith.pos.PosAccessServices.assert#PosAccess').call()
+            if (!access?.allowed) return
+            if (!(ec.user.isInGroup('ADMIN') || ec.user.isInGroup('ZENITH_ADMIN'))) { ec.message.addError('Only a manager can change automatic session closure.'); return }
+            if (!['Y','N'].contains(enabled)) { ec.message.addError('Choose Yes or No.'); return }
+            ec.entity.find('mantle.party.Party').condition('partyId',access.organizationPartyId).forUpdate(true).one()
+            def config=ec.entity.find('zenith.erp.pos.PosOrgBillingConfig').condition('organizationPartyId',access.organizationPartyId).one()
+            ec.service.sync().name((config?'update':'create')+'#zenith.erp.pos.PosOrgBillingConfig').parameters([
+                organizationPartyId:access.organizationPartyId,idleSessionAutoClose:enabled]).call()
+            ec.service.sync().name('zenith.pos.PosIdleServices.ensure#PosIdleJob').call()
+        ]]></script></actions>
+    </service>
+</services>
