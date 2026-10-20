@@ -25,10 +25,97 @@
         status.textContent = message;
         status.style.color = color;
     }
+    var modeRequests = new WeakMap();
+    function modeNote(root, message, kind) {
+        var status = root.querySelector('.pp-mode-message');
+        if (!status || (kind === 'saved' && status.dataset.kind === 'minimum')) return;
+        status.dataset.kind = kind || '';
+        status.textContent = message;
+        status.hidden = !message;
+    }
+    function saveModes(root) {
+        var state = modeRequests.get(root);
+        if (!state || state.inFlight || !root.isConnected) return;
+        var value = root.querySelector('[name=modeIds]').value;
+        var token = root.querySelector('[name=moquiSessionToken]');
+        if (!token || !token.value) { modeNote(root, 'Refresh this page before saving the selection.', 'error'); return; }
+        state.inFlight = true;
+        state.pending = false;
+        var retry = root.querySelector('.pp-mode-retry');
+        retry.hidden = true;
+        fetch(root.dataset.modeUrl, { method: 'POST', credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({ modeIds: value, moquiSessionToken: token.value }) })
+            .then(function (response) {
+                if (!response.ok || !(response.headers.get('Content-Type') || '').includes('application/json')) throw new Error();
+                return response.json();
+            })
+            .then(function (data) {
+                if (!data || !data.success) throw new Error();
+                modeNote(root, '', 'saved');
+            })
+            .catch(function () {
+                modeNote(root, 'The selection could not be saved. Your displayed columns and price edits are still here.', 'error');
+                retry.hidden = false;
+            })
+            .finally(function () {
+                state.inFlight = false;
+                if (state.pending) saveModes(root);
+            });
+    }
+    function selectModes(root, input) {
+        var choices = Array.from(root.querySelectorAll('.pp-mode-choice:checked'));
+        if (!choices.length) {
+            input.checked = true;
+            modeNote(root, 'At least one pricing mode must remain selected. Select another mode before removing ' + input.dataset.modeName + '.', 'minimum');
+            return;
+        }
+        modeNote(root, '', '');
+        var ids = choices.map(function (choice) { return choice.value; });
+        var editable = choices.some(function (choice) { return choice.dataset.editable === 'true'; });
+        root.querySelector('[name=modeIds]').value = ids.join(',');
+        root.querySelectorAll('[data-pp-mode]').forEach(function (cell) {
+            var shown = ids.includes(cell.dataset.ppMode);
+            cell.hidden = !shown;
+            cell.querySelectorAll('input').forEach(function (field) { field.disabled = !shown; });
+        });
+        root.querySelectorAll('.pp-wsthreshold').forEach(function (field) {
+            var cell = field.closest('[data-pp-mode]');
+            field.disabled = cell.hidden || !cell.querySelector('.pp-wstoggle').checked;
+        });
+        root.querySelectorAll('.pp-save').forEach(function (button) { button.hidden = !editable; });
+        root.querySelectorAll('.pp-view-only').forEach(function (label) { label.hidden = editable; });
+        root.querySelectorAll('td[colspan]').forEach(function (cell) { cell.colSpan = 5 + ids.length + (ids.includes('WHOLESALE') ? 1 : 0); });
+        var chips = root.querySelector('.pp-mode-chips');
+        chips.replaceChildren();
+        choices.forEach(function (choice) {
+            var chip = document.createElement('span');
+            chip.textContent = choice.dataset.modeName;
+            chips.appendChild(chip);
+        });
+        // Preserve filters, pagination, export and browser history without replacing the page or drafts.
+        var url = new URL(location.href);
+        url.searchParams.set('modeIds', ids.join(','));
+        history.replaceState(history.state, '', url);
+        root.querySelectorAll('a[href]').forEach(function (link) {
+            var target = new URL(link.href, location.href);
+            if (target.origin === location.origin && /\/ProductPricing(?:\/|$)/.test(target.pathname)) {
+                target.searchParams.set('modeIds', ids.join(','));
+                link.href = target.toString();
+            }
+        });
+        var state = modeRequests.get(root);
+        if (!state) { state = { inFlight: false }; modeRequests.set(root, state); }
+        state.pending = true;
+        clearTimeout(state.timer);
+        state.timer = setTimeout(function () { saveModes(root); }, 150);
+    }
     document.addEventListener('input', function (event) {
         if (rootOf(event.target) && event.target.classList.contains('pp-price')) recalc(event.target);
     });
     document.addEventListener('click', function (event) {
+        var retry = event.target.closest && event.target.closest('.pp-mode-retry');
+        if (retry) { saveModes(rootOf(retry)); return; }
         var button = event.target.closest && event.target.closest('.pp-save'), root = rootOf(button);
         if (!root || button.disabled) return;
         var row = button.closest('tr'), token = root.querySelector('[name=moquiSessionToken]');
@@ -37,8 +124,8 @@
             return;
         }
         var prices = {}, thresholds = {}, quantity = row.querySelector('.pp-wsthreshold');
-        row.querySelectorAll('.pp-mode-price').forEach(function (input) { prices[input.getAttribute('data-mode-id')] = input.value; });
-        if (quantity) thresholds.WHOLESALE = quantity.value;
+        row.querySelectorAll('.pp-mode-price:not(:disabled)').forEach(function (input) { prices[input.getAttribute('data-mode-id')] = input.value; });
+        if (quantity && row.querySelector('.pp-mode-price[data-mode-id="WHOLESALE"]:not(:disabled)')) thresholds.WHOLESALE = quantity.value;
         button.disabled = true;
         button.textContent = 'Saving...';
         note(button, '', '#1b5e20');
@@ -65,12 +152,7 @@
             if (quantity) { quantity.disabled = !input.checked; if (!input.checked) quantity.value = ''; else if (!quantity.value) quantity.focus(); }
         }
         if (input.classList.contains('pp-mode-choice')) {
-            var picker = input.closest('.pp-mode-picker'), form = picker && picker.closest('form');
-            if (!form) return;
-            var selected = Array.from(picker.querySelectorAll('.pp-mode-choice:checked'), function (choice) { return choice.value; });
-            if (!selected.length) { input.checked = true; return; }
-            form.querySelector('[name=modeIds]').value = selected.join(',');
-            form.submit();
+            selectModes(root, input);
         }
     });
     function refresh() {

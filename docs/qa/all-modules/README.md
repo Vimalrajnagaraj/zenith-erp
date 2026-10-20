@@ -1,5 +1,7 @@
 # Zenith ERP module audit — 20 October 2026
 
+This is first-phase evidence for commit `e41c1eef8de736796f0f437fcbd1d50b65f0acab`. The subsequent [POS Drive follow-up](../pos-drive-reports/README.md) records new POS changes, fresh regression results and reports still awaiting a policy/configuration decision. Its evidence supersedes the historical POS same-source reuse below for the final PR candidate.
+
 This audit covers Shops, Sales, Inventory, POS, Tax, Purchase, Dashboard, CRM, Contacts, Pricing, Barcode, My Subscription, customer Subscriptions, and platform subscription administration. The reviewed base is `ac5c8f5cbf74b20183dde642596bc1628919bea7`, which already includes merged PR #137. That PR's POS catalogue, shop mode removal and Purchase status fixes are not counted again as new findings.
 
 All writes used synthetic records in disposable, loopback-only, in-memory H2 databases. Production, customer databases, issued customer documents, payment providers and physical printers were not changed. Test helpers are documentation assets and must never be installed in production.
@@ -66,7 +68,7 @@ These are grouped findings, not a count of failing assertions. Several assertion
 | SaaS Admin browser | 22 |
 | **Current audit total** | **7,007** |
 
-The earlier POS run passed 1,122 assertions on the unchanged POS component/terminal JavaScript sources. It is retained as same-source evidence and is excluded from this new-audit total.
+At this first-phase commit, the earlier POS run passed 1,122 assertions on unchanged POS component/terminal JavaScript sources. It is historical same-source evidence, excluded from this phase's total. The later POS follow-up changes those sources and supplies fresh evidence for them.
 
 The screen inventory found 201 registered screens across the 14 areas. The broad read-only sweep completed 342 visits across `/apps` and `/qapps`, at desktop and mobile widths, with 1,368 render/layout/browser-error assertions. Thirty screens required IDs absent from the shared fixture and were deferred to dedicated module suites; this sweep alone does not prove all detail-screen workflows.
 

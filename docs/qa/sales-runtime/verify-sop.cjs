@@ -5,7 +5,12 @@ module.exports=async function({ctx,p,post,invoke,q,rows,inv,count,check,base,out
  const cases=[],failures=[];
  async function scenario(ids,name,run){
   try{await run();cases.push({ids,name,passed:true});}
-  catch(e){cases.push({ids,name,passed:false,error:e.message});failures.push(e.message);}
+  catch(e){cases.push({ids,name,passed:false,error:e.message});failures.push(e.message);
+   if(ids.includes('SL-102')){
+    fs.writeFileSync(path.join(out,'keyboard-submit-failure.html'),await p.content().catch(()=>''));
+    await p.screenshot({path:path.join(out,'keyboard-submit-failure.png'),fullPage:true}).catch(()=>{});
+   }
+  }
   fs.writeFileSync(path.join(out,'sop-extra.json'),JSON.stringify({cases,failures},null,2));
  }
  const createdId=(r,field)=>{const loc=r.headers().location;return loc?new URL(loc,base).searchParams.get(field):null;};
@@ -258,7 +263,11 @@ module.exports=async function({ctx,p,post,invoke,q,rows,inv,count,check,base,out
   for(const shell of ['apps','qapps']){
    const id=await createInvoice();await page('EditInvoice?invoiceId='+id,shell);await p.getByText('Add Item',{exact:true}).first().click();
    const qty=p.locator('input[name="quantity"]:visible').first();await qty.fill('1');await p.locator('input[name="amount"]:visible').first().fill('100');await p.locator('input[name="description"]:visible').first().fill('SOP keyboard');
-   await qty.focus();await p.keyboard.press('Tab');check('SOP '+shell+' quantity tabs to price',await p.evaluate(()=>document.activeElement?.name==='amount'),{});
+   // Quasar animates the dialog and restores autofocus after insertion. A real click
+   // waits for stable bounds; focus() alone races that restoration on Linux CI.
+   await qty.click();await p.waitForFunction(()=>document.activeElement?.name==='quantity');
+   await p.keyboard.press('Tab');await p.waitForFunction(()=>document.activeElement?.name==='amount');
+   check('SOP '+shell+' quantity tabs to price',await p.evaluate(()=>document.activeElement?.name==='amount'),{active:await p.evaluate(()=>({name:document.activeElement?.name,type:document.activeElement?.type}))});
    await Promise.all([p.waitForResponse(r=>r.url().includes('/EditInvoice/addItem')&&r.request().method()==='POST'),p.keyboard.press('Enter')]);
    await p.getByText('SOP keyboard',{exact:true}).filter({visible:true}).first().waitFor({state:'visible'});
    await p.waitForLoadState('networkidle');
