@@ -14,7 +14,7 @@ Delete archives the owned mode (`isActive=N`); it never deletes prices, mappings
 
 The local check used the clean staging image, a fresh tmpfs PostgreSQL database and the repository POS_QA fixtures on loopback port 18086. Native browser checks and independent SELECT assertions verified persisted row quantity, manual price, Wholesale pricing, Custom colour and item removal. API/DB checks cover open/held mixed-mode refusal, foreign/default/shared refusal, GET/CSRF rejection and archive after void while retaining price/line references. See functional-checks.json for completed assertions.
 
-Before/after images contain disposable fixtures only. The reference image's customer/product values are not fixtures and were not copied. Browser confirmation and the remaining viewport/Quasar checks were interrupted when the host Mac locked; these remain pending until verification resumes. CI links and teardown evidence will be added before review readiness.
+Before/after images contain disposable fixtures only. The reference image's customer/product values are not fixtures and were not copied. Local manual confirmation/cancel checks were interrupted when the host Mac locked. The independent PR acceptance run 39410961485 passed against merge candidate 7c38bbae, including both-shell mode Rename/Delete, archive/database checks and responsive layouts. Latest-master acceptance is rerun after rebase. The local temporary containers and tmpfs database were removed; the loopback listener closed (teardown.json). No Safari or payment/printer hardware acceptance is claimed.
 
 ## Scope and deployment
 
