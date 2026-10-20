@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+    <service verb="clear" noun="PosDraftCart" authenticate="true">
+        <in-parameters><parameter name="sessionId" required="true"/><parameter name="transactionId" required="true"/></in-parameters>
+        <actions><script><![CDATA[
+            def access=ec.service.sync().name('zenith.pos.PosAccessServices.assert#PosAccess')
+                .parameters([sessionId:sessionId,transactionId:transactionId]).call()
+            if (!access?.allowed) return
+            def txn=ec.entity.find('zenith.erp.pos.PosTransaction').condition('transactionId',transactionId).forUpdate(true).one()
+            def session=ec.entity.find('zenith.erp.pos.PosSession').condition('sessionId',sessionId).one()
+            if (txn.sessionId!=sessionId || session.statusId!='PsOpen' || txn.statusId!='PtCreated' || txn.transactionNumber) {
+                ec.message.addError('Only the open, unissued cart in this session can be cleared.'); return
+            }
+            if (ec.entity.find('zenith.erp.pos.PosPayment').condition('transactionId',transactionId).count()) {
+                ec.message.addError('This cart has recorded payments. Resolve the payments before clearing it.'); return
+            }
+            ec.entity.find('zenith.erp.pos.PosItemPriceOverride').condition('transactionId',transactionId).deleteAll()
+            ec.entity.find('zenith.erp.pos.PosTransactionItem').condition('transactionId',transactionId).deleteAll()
+            ec.entity.find('zenith.erp.tax.TaxLineDetail').condition('referenceType','PosTransactionItem').condition('referenceId',transactionId).deleteAll()
+            ec.service.sync().name('zenith.pos.PosServices.recalculate#TransactionTotals').parameter('transactionId',transactionId).call()
+            ec.service.sync().name('update#zenith.erp.pos.PosSession').parameters([sessionId:sessionId,lastActivityDate:ec.user.nowTimestamp]).call()
+        ]]></script></actions>
+    </service>
+    <!-- One bounded, uncached batch for the visible product page; never sum another shop's lots. -->
+    <service verb="get" noun="PosCardStock" authenticate="true">
+        <in-parameters><parameter name="sessionId" required="true"/><parameter name="productIds" type="List" required="true"/></in-parameters>
+        <out-parameters><parameter name="stock" type="Map"/></out-parameters>
+        <actions><script><![CDATA[
+            stock=[:]
+            def access=ec.service.sync().name('zenith.pos.PosAccessServices.assert#PosAccess').parameter('sessionId',sessionId).call()
+            if (!access?.allowed) return
+            def ids=productIds.findAll { it instanceof String && it.length()<=40 }.unique().take(120)
+            if (!ids) return
+            def session=ec.entity.find('zenith.erp.pos.PosSession').condition('sessionId',sessionId).one()
+            def terminal=ec.entity.find('zenith.erp.pos.PosTerminal').condition('terminalId',session.terminalId).one()
+            def facility=terminal.facilityId ? ec.entity.find('mantle.facility.Facility').condition('facilityId',terminal.facilityId).one() : null
+            def products=ec.entity.find('mantle.product.Product').condition('ownerPartyId',access.organizationPartyId)
+                .condition('productId','in',ids).list()
+            products.each { p -> stock[p.productId]=[tracked:p.inventoryTracked=='Y',quantity:null] }
+            if (!facility || facility.ownerPartyId!=access.organizationPartyId) return
+            def tracked=products.findAll { it.inventoryTracked=='Y' }*.productId
+            tracked.each { id -> stock[id].quantity=BigDecimal.ZERO }
+            if (!tracked) return
+            ec.entity.find('mantle.product.asset.Asset').condition('ownerPartyId',access.organizationPartyId)
+                .condition('facilityId',facility.facilityId).condition('assetTypeEnumId','AstTpInventory')
+                .condition('productId','in',tracked).selectFields(['productId','quantityOnHandTotal']).list().each { a ->
+                    stock[a.productId].quantity+=((a.quantityOnHandTotal ?: 0) as BigDecimal)
+                }
+        ]]></script></actions>
+    </service>
+</services>
