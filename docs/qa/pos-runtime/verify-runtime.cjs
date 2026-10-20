@@ -99,8 +99,10 @@ const rows=(table,where)=>q(`SELECT * FROM ${table} WHERE ${where}`),count=(tabl
   const modePage=await a.c.newPage();await modePage.goto(`${base}/${shell}/zenith/pos/SalesMode`,{waitUntil:'networkidle'});
   const card=modePage.locator('.smode-tile').filter({hasText:displayModeName});
   check(shell+' custom mode appears in active cards',await card.count()===1);
+  check(shell+' Delete is visible without opening Customize',await card.locator('.smode-tile-actions > form .smode-delete').isVisible());
+  check(shell+' shared/default modes retain their delete protection',await modePage.locator('.smode-tile').filter({hasText:'Standard retail'}).locator('.smode-tile-actions .smode-delete').isDisabled());
   await card.locator('.smode-menu summary').click();
-  check(shell+' Customize opens Rename and Delete',await card.getByRole('button',{name:/Rename/}).isVisible()&&await card.getByRole('button',{name:/Delete/}).isVisible());
+  check(shell+' Customize retains Rename beside visible Delete',await card.getByRole('button',{name:/Rename/}).isVisible()&&await card.getByRole('button',{name:/Delete/}).isVisible());
   await card.getByRole('button',{name:/Rename/}).click();
   check(shell+' Rename opens the editor',await card.locator('dialog').isVisible());
   const nextName='Disposable Special '+shell;
@@ -112,7 +114,7 @@ const rows=(table,where)=>q(`SELECT * FROM ${table} WHERE ${where}`),count=(tabl
  const foreignModePage=await foreign.c.request.get(base+'/apps/zenith/pos/SalesMode');check('foreign shop cannot see custom sales mode',!(await foreignModePage.text()).includes('Disposable Special'));
  const pricePage=await a.c.request.get(`${base}/apps/zenith/pos/ProductPricing?modeIds=${customId}`);const priceHtml=await pricePage.text();check('new fixed mode is selectable as the only product pricing column',pricePage.status()===200&&priceHtml.includes(displayModeName+' Price')&&!priceHtml.includes('Wholesale Price'),{status:pricePage.status()});
  const priceSave=await post('ProductPricing','savePrices',{productId:'POS_QA_A_P18',modePricesJson:JSON.stringify({[customId]:'80'}),modeThresholdsJson:'{}'});const priceResult=await priceSave.json();check('custom mode price persists without changing hidden Wholesale',priceResult.success&&count('pos_product_mode_price',`product_id='POS_QA_A_P18' AND sales_mode_id='${customId}' AND price=80`)===1&&count('pos_product_mode_price',"product_id='POS_QA_A_P18' AND sales_mode_id='WHOLESALE' AND price=90")===1,priceResult);
- const customCart=await cart(s);await item(customCart,{salesModeId:customId});check('custom mode bills its own product price',Number(tx(customCart.transactionId).subtotal)===80,tx(customCart.transactionId));await invoke('void',{transactionId:customCart.transactionId});
+ const customCart=await cart(s);await item(customCart,{salesModeId:customId});check('custom mode bills its own product price',Number(tx(customCart.transactionId).subtotal)===80,tx(customCart.transactionId));await post('SalesMode','deleteMode',{salesModeId:customId});check('mixed-mode open cart prevents archiving its line mode',count('pos_sales_mode',`sales_mode_id='${customId}' AND is_active='Y'`)===1);const heldMode=await invoke('hold',{transactionId:customCart.transactionId});await post('SalesMode','deleteMode',{salesModeId:customId});check('held cart prevents archiving its line mode',count('pos_sales_mode',`sales_mode_id='${customId}' AND is_active='Y'`)===1);await invoke('recall',{heldId:heldMode.heldId,sessionId:s.sessionId});await invoke('void',{transactionId:customCart.transactionId});
  await post('SalesMode','assignTerminal',{terminalId:'POS_QA_A_TERM1',salesModeId:customId});check('mode assignment persists for this shop',count('pos_terminal_sales_mode',`terminal_id='POS_QA_A_TERM1' AND sales_mode_id='${customId}'`)===1);
  await post('SalesMode','assignTerminal',{terminalId:'POS_QA_A_TERM1',salesModeId:customId},foreign);check('foreign shop cannot assign this terminal',count('pos_terminal_sales_mode',`terminal_id='POS_QA_A_TERM1' AND sales_mode_id='${customId}'`)===1);
  const getRemove=await a.c.request.get(`${base}/apps/zenith/pos/SalesMode/removeTerminal?terminalId=POS_QA_A_TERM1&salesModeId=${customId}`,{maxRedirects:0});check('GET cannot remove a terminal assignment',count('pos_terminal_sales_mode',`terminal_id='POS_QA_A_TERM1' AND sales_mode_id='${customId}'`)===1,{status:getRemove.status()});
@@ -125,7 +127,7 @@ const rows=(table,where)=>q(`SELECT * FROM ${table} WHERE ${where}`),count=(tabl
  const archivePage=await a.c.newPage();await archivePage.goto(base+'/apps/zenith/pos/SalesMode',{waitUntil:'networkidle'});
  const archiveCard=archivePage.locator('.smode-tile').filter({hasText:displayModeName});await archiveCard.locator('.smode-menu summary').click();
  archivePage.once('dialog',dialog=>dialog.accept());await archiveCard.getByRole('button',{name:/Delete/}).click();await archivePage.waitForLoadState('networkidle');await archivePage.close();
- check('Customize Delete archives mode and retains price history',count('pos_sales_mode',`sales_mode_id='${customId}' AND is_active='N'`)===1&&count('pos_product_mode_price',`sales_mode_id='${customId}'`)===1);
+ check('Visible Delete archives mode and retains price history',count('pos_sales_mode',`sales_mode_id='${customId}' AND is_active='N'`)===1&&count('pos_product_mode_price',`sales_mode_id='${customId}'`)===1);
  const archivedPage=await a.c.request.get(base+'/apps/zenith/pos/Terminal?sessionId='+s.sessionId);check('archived custom mode absent from terminal choices',!modeChoice.test(await archivedPage.text()),{status:archivedPage.status()});
  const archivedCart=await cart(s);await invoke('add',{transactionId:archivedCart.transactionId,productId:'POS_QA_A_P18',quantity:'1',salesModeId:customId},true);await invoke('void',{transactionId:archivedCart.transactionId});
  const taxMode=await cart(s);const taxLine=await item(taxMode,{taxOn:'N'});
