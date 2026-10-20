@@ -28,6 +28,11 @@
         var clear = document.getElementById('pos-clear-cart'); if (clear) clear.disabled = !count;
         root.querySelectorAll('.pos-cart .aj-p').forEach(function (input) { input.setAttribute('aria-label', 'Unit price'); });
         root.querySelectorAll('.pos-cart .aj-qi').forEach(function (input) { input.setAttribute('aria-label', 'Quantity'); });
+        root.querySelectorAll('#cartScroll select').forEach(function (select) {
+            var label = select.selectedOptions.length ? select.selectedOptions[0].textContent : '';
+            select.dataset.priceKind = /whole/i.test(label) ? 'wholesale' : /custom/i.test(label) ? 'custom' : 'retail';
+            select.setAttribute('aria-label', 'Sales mode');
+        });
         root.querySelectorAll('.pos-cart .aj-q').forEach(function (button) { button.setAttribute('aria-label', button.textContent.trim() === '+' ? 'Increase quantity' : 'Decrease quantity'); });
         root.querySelectorAll('.pos-cart .aj-rm').forEach(function (button) { button.setAttribute('aria-label', 'Remove item'); if (!button.querySelector('svg')) button.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M3 6h18M9 6V3h6v3M6 6l1 15h10l1-15M10 10v7M14 10v7"/></svg>'; });
         root.querySelectorAll('.pos-cat-strip a').forEach(function (link) {
