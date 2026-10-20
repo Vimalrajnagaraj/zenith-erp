@@ -291,6 +291,7 @@ const rows=(table,where)=>q(`SELECT * FROM ${table} WHERE ${where}`),count=(tabl
  check('Kitchen rejects another shops status changes',foreignKot.status()<500&&rows('kitchen_order_ticket',`kot_id='${kot.kot_id}'`)[0].status_id==='KotPreparing',{status:foreignKot.status()});
  for(const [label,next] of [['Ready','KotReady'],['Served','KotServed']]){await kitchenPage.goto(base+'/qapps/zenith/pos/Kitchen',{waitUntil:'networkidle'});await Promise.all([kitchenPage.waitForNavigation({waitUntil:'networkidle'}),kitchenPage.getByRole('button',{name:label}).first().click()]);check('Kitchen '+label+' action persists',rows('kitchen_order_ticket',`kot_id='${kot.kot_id}'`)[0].status_id===next,{url:kitchenPage.url()});}
  await kitchenPage.close();
+ await require('./verify-kot.cjs')({a,foreign,base,post,rows,count,check});
  await p.goto(base+'/apps/zenith/pos/Terminal?sessionId='+us.sessionId+'&transactionId='+uc.transactionId,{waitUntil:'networkidle'});
  await Promise.all([p.waitForNavigation({waitUntil:'networkidle'}),p.locator('#pos-hold').click()]);
  const uiHeld=rows('pos_held_transaction',`session_id='${us.sessionId}' AND status_id='PhHeld'`).find(h=>JSON.parse(h.items_json||'[]').some(i=>i.sourceTransactionId===uc.transactionId));
