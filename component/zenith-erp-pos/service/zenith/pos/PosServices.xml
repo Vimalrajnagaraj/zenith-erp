@@ -16,6 +16,10 @@
             <if condition="!_openTerminal || _openTerminal.isActive != 'Y'"><return error="true" message="Choose an active POS terminal."/></if>
             <service-call name="zenith.pos.PosAccessServices.assert#PosAccess" out-map="_posAccess" in-map="[terminalId:terminalId]"/>
             <if condition="!_posAccess.allowed"><return/></if>
+            <service-call name="zenith.pos.PosIdleServices.ensure#PosIdleJob"/>
+            <if condition="ec.message.hasError()"><return/></if>
+            <entity-find-one entity-name="zenith.erp.pos.PosOrgBillingConfig" value-field="_idlePolicy">
+                <field-map field-name="organizationPartyId" from="_posAccess.organizationPartyId"/></entity-find-one>
             <!-- Enforce one open session per terminal: block if this terminal already has an open session -->
             <entity-find entity-name="zenith.erp.pos.PosSession" list="existingOpen" limit="1">
                 <econdition field-name="terminalId" from="terminalId"/>
@@ -74,7 +78,7 @@
             <entity-find-one entity-name="zenith.erp.pos.PosTerminal" value-field="_term"><field-map field-name="terminalId" from="terminalId"/></entity-find-one>
             <service-call name="create#zenith.erp.pos.PosSession" out-map="context"
                 in-map="[terminalId:terminalId, organizationPartyId:_term?.organizationPartyId, operatorPartyId:ec.user.userAccount?.partyId,
-                         openDate:ec.user.nowTimestamp, lastActivityDate:ec.user.nowTimestamp, openingCash:openingCash,
+                         openDate:ec.user.nowTimestamp, lastActivityDate:ec.user.nowTimestamp, idleAutoClose:(_idlePolicy ? _idlePolicy.idleSessionAutoClose : 'N'), openingCash:openingCash,
                          totalSales:0, totalReturns:0, totalTransactions:0, statusId:'PsOpen']"/>
 
             <!-- Pricing/tax validation belongs to the actual cart line. Optional speculative
@@ -141,7 +145,7 @@
 
     <!-- Close an idle drawer without inventing a cash count. Completed sales and their tenders
          remain recorded for later review. Held/partially paid carts and refunds still need a cashier. -->
-    <service verb="close" noun="IdlePosSession" authenticate="anonymous-all">
+    <service verb="close" noun="IdlePosSession" authenticate="anonymous-all" transaction="force-new">
         <in-parameters><parameter name="sessionId" required="true"/></in-parameters>
         <out-parameters><parameter name="closed" type="Boolean"/><parameter name="reason"/></out-parameters>
         <actions>
@@ -149,12 +153,21 @@
                 ec.user.loginAnonymousIfNoUser()
                 closed = false
                 reason = 'review_required'
-                def sess = ec.entity.find('zenith.erp.pos.PosSession').condition('sessionId',sessionId).forUpdate(true).one()
+                def sess = ec.entity.find('zenith.erp.pos.PosSession').condition('sessionId',sessionId).one()
                 if (!sess || sess.statusId != 'PsOpen') { reason = 'already_closed'; return }
+                def policy=ec.entity.find('zenith.erp.pos.PosOrgBillingConfig').condition('organizationPartyId',sess.organizationPartyId).one()
+                if ((policy ? policy.idleSessionAutoClose : 'N') != 'Y') { reason='disabled'; return }
                 def last = sess.lastActivityDate
                 if (!last || last.time > ec.user.nowTimestamp.time - 3600000L) { reason = 'still_active'; return }
                 def txns = ec.entity.find('zenith.erp.pos.PosTransaction').condition('sessionId',sessionId)
                     .orderBy('transactionId').forUpdate(true).list()
+                // Checkout owns its transaction before touching the session. Use the same order
+                // so a sale finishing at the idle boundary cannot deadlock with this sweep.
+                sess = ec.entity.find('zenith.erp.pos.PosSession').condition('sessionId',sessionId).forUpdate(true).one()
+                if (sess.statusId != 'PsOpen') { reason='already_closed'; return }
+                if (!sess.lastActivityDate || sess.lastActivityDate.time > ec.user.nowTimestamp.time - 3600000L) { reason='still_active'; return }
+                def currentIds=ec.entity.find('zenith.erp.pos.PosTransaction').condition('sessionId',sessionId).selectField('transactionId').list()*.transactionId
+                if (currentIds.toSet() != (txns*.transactionId).toSet()) { reason='still_active'; return }
                 if (txns.any { it.statusId == 'PtHeld' || !['PtCreated','PtCompleted','PtVoided'].contains(it.statusId) }) return
                 if (txns.findAll { it.statusId == 'PtCreated' }.any { it.transactionNumber || ((it.paidAmount ?: 0) as BigDecimal) > 0 ||
                     ec.entity.find('zenith.erp.pos.PosPayment').condition('transactionId',it.transactionId).count() > 0 }) return
@@ -188,16 +201,16 @@
             <script><![CDATA[
                 ec.user.loginAnonymousIfNoUser()
                 closedCount = 0
-                // Only shops that have explicitly opted in (PosOrgBillingConfig.idleSessionAutoClose='Y') are swept.
-                // Default = no time-based expiry, so this is a no-op for every existing tenant.
-                def optedOrgs = ec.entity.find('zenith.erp.pos.PosOrgBillingConfig').condition('idleSessionAutoClose','Y')
-                    .selectField('organizationPartyId').list().collect { it.organizationPartyId }
-                if (!optedOrgs) return
-                def cutoff = new java.sql.Timestamp(ec.user.nowTimestamp.time - 3600000L)
-                def ids = ec.entity.find('zenith.erp.pos.PosSession').condition('statusId','PsOpen')
-                    .condition('organizationPartyId', 'in', optedOrgs)
-                    .condition('lastActivityDate',org.moqui.entity.EntityCondition.LESS_THAN_EQUAL_TO,cutoff)
-                    .selectField('sessionId').list().collect { it.sessionId }
+                def configs=ec.entity.find('zenith.erp.pos.PosOrgBillingConfig').list()
+                def optedOrgs=configs.findAll { it.idleSessionAutoClose=='Y' }.collect { it.organizationPartyId }
+                def configuredOrgs=configs.collect { it.organizationPartyId }
+                def cutoff=new java.sql.Timestamp(ec.user.nowTimestamp.time-3600000L)
+                def candidates={ -> ec.entity.find('zenith.erp.pos.PosSession').condition('statusId','PsOpen')
+                    .condition('lastActivityDate',org.moqui.entity.EntityCondition.LESS_THAN_EQUAL_TO,cutoff).orderBy('sessionId') }
+                // #129 rework (opt-in gate, restores #102 semantics): sweep ONLY orgs that explicitly
+                // opted in via PosOrgBillingConfig.idleSessionAutoClose='Y'. Orgs with no config row are
+                // NEVER auto-closed (no-config != consent) — MARUTHI and every unconfigured tenant are safe.
+                def ids=optedOrgs ? candidates().condition('organizationPartyId','in',optedOrgs).selectField('sessionId').list()*.sessionId : []
                 ids.each { id ->
                     def result = ec.service.sync().name('zenith.pos.PosServices.close#IdlePosSession').parameter('sessionId',id).call()
                     if (result.closed) closedCount++
@@ -394,6 +407,9 @@
             <if condition="txn.statusId != 'PtCreated'">
                 <return error="true" message="Transaction is already completed or voided"/></if>
 
+            <service-call name="zenith.pos.PosStockServices.check#PosCartStock"
+                in-map="[transactionId:transactionId, productId:productId, quantityDelta:quantity]"/>
+            <if condition="ec.message.hasError()"><return/></if>
             <!-- Get product details -->
             <entity-find-one entity-name="mantle.product.Product" value-field="product">
                 <field-map field-name="productId"/></entity-find-one>
@@ -719,6 +735,10 @@
             <set field="_openCredit" from="_ptxn.isCredit == 'Y' &amp;&amp; ((_ptxn.paidAmount ?: 0) as BigDecimal) &lt; ((_ptxn.payableAmount ?: 0) as BigDecimal)"/>
             <if condition="_ptxn.statusId != 'PtCreated' &amp;&amp; !_openCredit">
                 <return error="true" message="This bill is already completed - the payment was not re-applied."/></if>
+            <if condition="_ptxn.statusId == 'PtCreated'">
+                <service-call name="zenith.pos.PosStockServices.check#PosCartStock" in-map="[transactionId:transactionId]"/>
+                <if condition="ec.message.hasError()"><return/></if>
+            </if>
             <if condition="amount == 0">
                 <entity-find-count entity-name="zenith.erp.pos.PosTransactionItem" count-field="_zeroLines"><econdition field-name="transactionId"/></entity-find-count>
                 <if condition="_ptxn.statusId == 'PtCreated' &amp;&amp; _zeroLines &amp;&amp; ((_ptxn.payableAmount ?: 0) as BigDecimal) == 0"><return/></if>
@@ -794,6 +814,8 @@
                 <return error="true" message="Card/UPI/non-cash payments (${_nonCashPaid}) exceed the bill total (${txn.payableAmount}). Only cash can be over-tendered for change — reduce the Card/UPI amount."/></if>
 
             <!-- Capture one issue instant for the bill date and number, including a midnight sale. -->
+            <service-call name="zenith.pos.PosStockServices.check#PosCartStock" in-map="[transactionId:transactionId, postStock:true]"/>
+            <if condition="ec.message.hasError()"><return/></if>
             <set field="_completedAt" from="ec.user.nowTimestamp"/>
             <service-call name="update#zenith.erp.pos.PosTransaction"
                 in-map="[transactionId:transactionId, statusId:'PtCompleted', completedDate:_completedAt]"/>
@@ -934,6 +956,8 @@
                     in-map="[transactionId:transactionId, paymentMethod:upfrontMethod, amount:upfront, bypassModeRules:true]"/>
                 <if condition="ec.message.hasError()"><return/></if>
             </if>
+            <service-call name="zenith.pos.PosStockServices.check#PosCartStock" in-map="[transactionId:transactionId, postStock:true]"/>
+            <if condition="ec.message.hasError()"><return/></if>
             <set field="_completedAt" from="ec.user.nowTimestamp"/>
             <service-call name="update#zenith.erp.pos.PosTransaction"
                 in-map="[transactionId:transactionId, statusId:'PtCompleted', isCredit:'Y', completedDate:_completedAt,

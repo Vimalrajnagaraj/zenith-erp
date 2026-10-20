@@ -13,6 +13,7 @@ INSERT INTO product (product_id,pseudo_id,product_name,owner_party_id,product_ty
 ('STFIX_P','STFIX-SKU','Transfer fractional test','STFIX_ORG','PtAsset',10,'Y','N','N'),
 ('STFIX_BATCH','STFIX-BATCH','Transfer batch test','STFIX_ORG','PtAsset',10,'Y','Y','N'),
 ('STFIX_SERIAL','STFIX-SERIAL','Transfer serial test','STFIX_ORG','PtAsset',10,'Y','N','Y'),
+('STFIX_SERVICE','STFIX-SERVICE','Transfer service must be rejected','STFIX_ORG','PtService',10,'N','N','N'),
 ('STFIX_FOREIGN','FOREIGN-SKU','Foreign transfer product','STFIX_OTHER','PtAsset',10,'Y','N','N');
 INSERT INTO asset (asset_id,product_id,owner_party_id,facility_id,asset_type_enum_id,status_id,quantity_on_hand_total,available_to_promise_total,batch_number,expiry_date,manufacturing_date,valuation_rate,mrp_amount) VALUES
 ('STFIX_A1','STFIX_P','STFIX_ORG','STFIX_A','AstTpInventory','AstAvailable',10,8,NULL,NULL,NULL,5,10),
