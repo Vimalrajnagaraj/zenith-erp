@@ -15,6 +15,7 @@ All writes and screenshots use synthetic POS fixtures on loopback HTTP 18084 and
 | POS-05-10, zero stock | The fixture with shop stock enforcement enabled rejects a tracked item with exactly zero stock, names the product/facility and leaves the cart empty. Existing opt-out and facility negative-stock policies are deliberate rollout settings. | Open: confirm the reported shop's enforcement flag and facility policy. No global default changed. |
 | POS-04-09, zero/no price | Current business tests deliberately permit an explicit free product and a zero-total cash sale. Blocking every zero price would change that existing policy. | Open: user decision requested between manager approval/reason and blocking every zero-price item. Existing policy preserved while awaiting the answer. |
 | POS-10-05, credit reminders | Existing code already records settlement timestamps and configurable customer terms, including two- and thirty-day terms. Consent/idempotent reminder preparation exists; delivery is disabled without a configured provider. | Open: delivery provider/configuration remains outstanding. See [credit evidence](../pos-runtime/credit-terms-evidence/README.md). |
+| Additional native invoice modal defect | At 1440px, the invoice item's card hover transform creates a containing block for its fixed modal. Pointer movement makes the modal jump; a real double-click cannot stabilize or post. The existing list-card guard now also covers cards containing native modals. | Fixed. The same desktop Enter/double-click path and repeated 390px/1440px paths pass with independent stored-row counts. |
 
 Completed in Drive means implemented and verified for the PR; it does not mean merged or deployed. Reports requiring a policy, deployed configuration or delivery provider remain open.
 
@@ -29,6 +30,7 @@ Only POS-05-03, POS-05-04 and POS-05-13 are marked Completed. POS-04-07 remains 
 | AJAX rate edits omit the override entity write. One shared service should record only actual changes. | Independent SQL finds no actor/original/new-price row, duplicates on same-price retry, incorrect GST, or a foreign/read-only write. Configured cashier access must still work. |
 | Totals read their lines before locking the header and can overwrite a concurrent add with an old snapshot. Parent-first locking should serialize these requests. | The controlled schedule returns success but stored header totals differ from the committed item totals. |
 | Local date labels and JVM-based midnight bounds disagree. User-timezone boundaries should include the exact start/end of the selected day. | UI, CSV, PDF, Sales counts or forecast buckets exclude local-day records or include adjacent-day records. |
+| A transformed invoice card moves its fixed descendant modal. Extending the existing list-card guard to modal-containing cards should stabilize pointer targets. | Actual desktop clicks still cannot stabilize, a submit posts no row, or a double-click produces duplicate rows. |
 
 ## Regression evidence
 
@@ -39,9 +41,10 @@ Only POS-05-03, POS-05-04 and POS-05-13 are marked Completed. POS-04-07 remains 
 | Controlled concurrent cart mutations | 16 | 0 |
 | Full POS regression | 1,122 | 0 |
 | Fresh Sales regression | 1,225 | 0 |
-| **This phase** | **2,436** | **0** |
+| Repeated real keyboard/mouse submissions at 390px and 1440px | 48 | 0 |
+| **This phase** | **2,484** | **0** |
 
-The Sales rerun replaces the same 1,225-assertion suite in the first phase; it is not counted twice. Combining the documented phases gives 8,218 non-duplicated assertion results, with the source and incremental-verification qualifications below. This is not a claim that every first-phase suite was rerun on the last commit. The follow-up has 22 confirmed original failing assertions across six grouped findings. Two additional owner-chart assertions caught the uncommitted candidate's millisecond regression and are recorded separately, not counted as new original bugs.
+The Sales rerun replaces the same 1,225-assertion suite in the first phase; it is not counted twice. Combining the documented phases gives 8,266 non-duplicated assertion results, with the source and incremental-verification qualifications below. This is not a claim that every first-phase suite was rerun on the last commit. The follow-up has 23 confirmed original failing assertions across seven grouped findings. Two additional owner-chart assertions caught the uncommitted candidate's millisecond regression and are recorded separately, not counted as new original bugs.
 
 The pre-patch pricing reproduction has eight valid failures across the two layouts: dark-mode text contrast, document reload, lost price draft, and missing last-mode explanation. An additional independently checked baseline failure covers missing override history. The original owner-edit success is retained. An exploratory cashier-denial assertion is excluded: the code explicitly grants that role full POS write access and supports cashier-entered prices. It is existing behavior, not an unauthorized edit.
 
@@ -53,7 +56,9 @@ The JSON evidence and source fingerprints accompany this document. Intermediate 
 
 The after-midnight run exposed a second product defect. POS report bounds used JVM midnight while their date labels used the user's time zone. A bill made just after midnight in India disappeared from today's report. Synthetic boundary bills demonstrate nine failures before the fix: screens, CSV, item totals, audit dates and PDF omit/include the wrong records. Report bounds now reuse the timezone-aware parser already used by Payment Wise and Daily Summary. The tests include the first and final millisecond of a local day and exclude adjacent days. Sales dashboard ranges and forecast day buckets now use the same configured user calendar; the history fixture stores local-noon instants in that calendar. Date-only credit due dates are unchanged.
 
-Native runtime corrections are excluded from the bug count. A stale helper mounted at a second POS location lacked the current idle-clock transition; the canonical helper replaces it. Sales keyboard tests wait for a stable dialog and actual Quantity → Price focus, retaining their Enter/double-submit checks and failure screenshots.
+Native runtime corrections are excluded from the bug count. A stale helper mounted at a second POS location lacked the current idle-clock transition; the canonical helper replaces it.
+
+The first final-head Linux Sales run at `8f022b2f` still exposed a QA race: the Quasar `m-dialog` runs `focusFirst()` when its fade-in finishes, after input bounds are already stable. The test could start typing before that callback and lose focus to Product. The shared QA opener now registers the actual `onShow` / `shown.bs.modal` event before opening, and waits for it before typing. It then uses real Tab, Enter and mouse double-click input, with no forced clicks or animation disabling. This race is not counted as an application bug. The expanded native test separately reproduced the real card-transform defect above. All 48 focused assertions pass after the CSS fix, covering both layouts, two widths, three repetitions, and actual one-row/two-row persistence. The fresh local 1,225-assertion Sales run preceded these last UI/QA corrections; the focused run and final-head Linux Sales rerun cover those additions.
 
 All owned native memory JVMs were stopped after verification. HTTP/H2 listeners 18083/19095 and 18084/19096 were checked closed. The four repository guards, changed XML/JavaScript syntax, and whitespace checks pass. The first-phase npm test/build attempts remain ENOENT because there is no root package.json.
 
@@ -68,6 +73,8 @@ Synthetic screenshot evidence:
 ![Readable search text after the fix](evidence/search-dark-after.png)
 
 ![Only the two synthetic bills inside the selected local day appear](evidence/local-day-report.png)
+
+![The native desktop invoice modal remains inside the viewport with its submit button stable](evidence/invoice-modal-after.png)
 
 ## Reproduction
 
@@ -103,3 +110,5 @@ To reproduce the concurrency scheduling test, compile `PosTotalsBarrier.java` in
 - Sales dashboard ranges and forecast day grouping use local calendar boundaries instead of JVM/UTC dates.
 
 Physical receipt hardware, the reported deployed owner's exact role, the zero-price business decision, deployed stock-policy values, production capacity and live reminder delivery are outside this local proof.
+
+For the focused keyboard regression, use the guarded Sales native runtime from [Sales QA](../sales-runtime/README.md), memory database `sales-qa-sop` on loopback 18083/19095, and a private `SALES_QA_OUT`. Set the existing `SALES_QA_NATIVE_ROOT` and `SALES_QA_JAVA` variables, then run `node docs/qa/sales-runtime/verify-keyboard.cjs`. Do not reuse its mutable fixture database for a fresh full-suite run.

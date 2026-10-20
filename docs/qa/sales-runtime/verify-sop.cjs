@@ -1,6 +1,7 @@
 // Supplemental SOP-04 cases. Called with the already authenticated disposable QA
 // context; every write goes through the real Sales screen/service, never SQL.
 const fs=require('fs'),path=require('path'),cp=require('child_process');
+const openItemDialog=require('./dialog-ready.cjs');
 module.exports=async function({ctx,p,post,invoke,q,rows,inv,count,check,base,out,report}) {
  const cases=[],failures=[];
  async function scenario(ids,name,run){
@@ -261,18 +262,17 @@ module.exports=async function({ctx,p,post,invoke,q,rows,inv,count,check,base,out
  });
  await scenario(['SL-102','SL-105'],'Keyboard submission and rapid double-click add only one line',async()=>{
   for(const shell of ['apps','qapps']){
-   const id=await createInvoice();await page('EditInvoice?invoiceId='+id,shell);await p.getByText('Add Item',{exact:true}).first().click();
+   const id=await createInvoice();await page('EditInvoice?invoiceId='+id,shell);await openItemDialog(p,shell);
    const qty=p.locator('input[name="quantity"]:visible').first();await qty.fill('1');await p.locator('input[name="amount"]:visible').first().fill('100');await p.locator('input[name="description"]:visible').first().fill('SOP keyboard');
-   // Quasar animates the dialog and restores autofocus after insertion. A real click
-   // waits for stable bounds; focus() alone races that restoration on Linux CI.
-   await qty.click();await p.waitForFunction(()=>document.activeElement?.name==='quantity');
+   // The shown callback has finished autofocus before real keyboard navigation.
+   await qty.focus();await p.waitForFunction(()=>document.activeElement?.name==='quantity');
    await p.keyboard.press('Tab');await p.waitForFunction(()=>document.activeElement?.name==='amount');
    check('SOP '+shell+' quantity tabs to price',await p.evaluate(()=>document.activeElement?.name==='amount'),{active:await p.evaluate(()=>({name:document.activeElement?.name,type:document.activeElement?.type}))});
    await Promise.all([p.waitForResponse(r=>r.url().includes('/EditInvoice/addItem')&&r.request().method()==='POST'),p.keyboard.press('Enter')]);
    await p.getByText('SOP keyboard',{exact:true}).filter({visible:true}).first().waitFor({state:'visible'});
    await p.waitForLoadState('networkidle');
    check('SOP '+shell+' Enter adds exactly one line',count('invoice_item',`invoice_id='${id}'`)===1,{id});
-   await p.getByText('Add Item',{exact:true}).first().click();await p.locator('input[name="quantity"]:visible').first().fill('1');await p.locator('input[name="amount"]:visible').first().fill('100');await p.locator('input[name="description"]:visible').first().fill('SOP double-click');
+   await openItemDialog(p,shell);await p.locator('input[name="quantity"]:visible').first().fill('1');await p.locator('input[name="amount"]:visible').first().fill('100');await p.locator('input[name="description"]:visible').first().fill('SOP double-click');
    await Promise.all([p.waitForResponse(r=>r.url().includes('/EditInvoice/addItem')&&r.request().method()==='POST'),p.locator('#AddItemForm_submitButton').filter({visible:true}).dblclick({timeout:15000})]);await p.getByText('SOP double-click',{exact:true}).filter({visible:true}).first().waitFor({state:'visible'});await p.waitForLoadState('networkidle');
    check('SOP '+shell+' double-click adds one additional line',count('invoice_item',`invoice_id='${id}'`)===2,{id});
   }
