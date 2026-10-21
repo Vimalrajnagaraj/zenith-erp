@@ -48,4 +48,71 @@
                 }
         ]]></script></actions>
     </service>
+    <service verb="get" noun="PosCatalogPage" authenticate="true">
+        <in-parameters><parameter name="sessionId" required="true"/><parameter name="searchTerm"/><parameter name="catId"/><parameter name="productOffset"/></in-parameters>
+        <out-parameters><parameter name="gridProducts" type="List"/><parameter name="gridCardStock" type="Map"/><parameter name="gridHasMore" type="Boolean"/><parameter name="gridOffset" type="Integer"/><parameter name="gridNextOffset" type="Integer"/></out-parameters>
+        <actions>
+            <service-call name="zenith.pos.PosAccessServices.assert#PosAccess" in-map="[sessionId:sessionId]" out-map="access"/>
+            <if condition="!access.allowed"><return/></if>
+            <script><![CDATA[
+            def posOrg=access.organizationPartyId
+            gridProducts = []
+            // Limit the first screen's cards and per-product price lookups; "Load more" keeps the rest available.
+            gridPageSize = 60
+            def rawOffset = (productOffset ?: '0').toString()
+            gridOffset = rawOffset ==~ /[0-9]{1,4}/ ? Math.min(rawOffset.toInteger(), 3000) : 0
+            gridHasMore = false
+            if (searchTerm) {
+                def stLower = searchTerm.toLowerCase()
+                def allProds = ec.entity.find("mantle.product.Product")
+                    .condition([productTypeEnumId:'PtAsset', ownerPartyId: posOrg])
+                    .orderBy("productName,productId").limit(3000).list()
+                def matches = allProds.findAll { pr ->
+                    (pr.productName ?: '').toLowerCase().contains(stLower) ||
+                    (pr.pseudoId ?: '').toLowerCase().contains(stLower) ||
+                    (pr.productId ?: '').toLowerCase().contains(stLower)
+                }
+                gridProducts = gridOffset < matches.size() ? matches.subList(gridOffset, Math.min(matches.size(), gridOffset + gridPageSize + 1)) : []
+            } else if (catId) {
+                def category = ec.entity.find('mantle.product.category.ProductCategory')
+                    .condition('productCategoryId',catId).condition('ownerPartyId',posOrg).one()
+                def members = category ? ec.entity.find("mantle.product.category.ProductCategoryMember")
+                    .condition("productCategoryId", catId)
+                    .conditionDate("fromDate", "thruDate", ec.user.nowTimestamp)
+                    .orderBy("sequenceNum,productId").list() : []
+                def pIds = members.collect { it.productId }
+                if (pIds) {
+                    gridProducts = ec.entity.find("mantle.product.Product")
+                        .condition("productId", org.moqui.entity.EntityCondition.ComparisonOperator.IN, pIds)
+                        .condition([ownerPartyId: posOrg, productTypeEnumId: 'PtAsset'])
+                        .offset(gridOffset).limit(gridPageSize + 1).orderBy("productName,productId").list()
+                }
+            } else {
+                gridProducts = ec.entity.find("mantle.product.Product")
+                    .condition([productTypeEnumId:'PtAsset', ownerPartyId: posOrg])
+                    .offset(gridOffset).limit(gridPageSize + 1).orderBy("productName,productId").list()
+            }
+            if (gridProducts.size() > gridPageSize) {
+                gridHasMore = true
+                gridProducts = gridProducts.subList(0, gridPageSize)
+            }
+            gridNextOffset = gridOffset + gridProducts.size()
+            gridCardStock=[:]
+            if (sessionId && gridProducts) gridCardStock=ec.service.sync().name('zenith.pos.PosCheckoutServices.get#PosCardStock')
+                .parameters([sessionId:sessionId,productIds:gridProducts*.productId]).call().stock ?: [:]
+
+            // Show the live Pricing-module price on grid cards when this shop uses price lists (else the product MRP).
+            // No-op (one count query) for shops without price lists, so the POS stays fast and unchanged.
+            def _hasPL = ec.entity.find("zenith.erp.pricing.PriceList").condition("organizationPartyId", posOrg).condition("priceListTypeEnumId","PltSelling").count() != 0
+            if (_hasPL && gridProducts) {
+                for (gp in gridProducts) {
+                    try {
+                        def _pr = ec.service.sync().name("zenith.pricing.PricingServices.calculate#Price").parameters([productId:gp.productId, quantity:1, organizationPartyId:posOrg, salesChannelEnumId:"ScPos"]).call()
+                        if (_pr?.unitPrice != null && (_pr.unitPrice as BigDecimal).signum() == 1) gp.mrpAmount = _pr.unitPrice
+                    } catch (Throwable e) { }
+                }
+            }
+            ]]></script>
+        </actions>
+    </service>
 </services>
