@@ -14,7 +14,7 @@ async function fill(id,value){await page.$eval(id,(e,v)=>{e.value=v;e.dispatchEv
 async function clickText(selector,text){const es=await page.$$(selector);for(const e of es)if((await e.evaluate(x=>x.textContent)).includes(text)){await e.click();return;}throw Error('Missing '+text);}
 async function submit(id){await Promise.all([page.waitForNavigation({waitUntil:'networkidle2',timeout:60000}),page.click(id)]);}
 (async()=>{
- browser=await puppeteer.launch({headless:true,args:['--no-sandbox','--disable-dev-shm-usage']});page=await browser.newPage();
+ browser=await puppeteer.launch({headless:true,executablePath:process.env.TAX_QA_CHROME||undefined,args:['--no-sandbox','--disable-dev-shm-usage']});page=await browser.newPage();
  const res=await fetch(base+'/apps/zenith',{headers:{Authorization:'Basic '+Buffer.from('tax.qa:moqui').toString('base64')},redirect:'manual'});const cookie=res.headers.getSetCookie().find(c=>c.startsWith('JSESSIONID='));await res.text();assert(res.status===200&&cookie,'Authenticated disposable session required');await page.setCookie({name:'JSESSIONID',value:cookie.split(';')[0].slice(11),url:base,httpOnly:true});
  const errors=[];page.on('pageerror',e=>errors.push(e.message));page.on('dialog',d=>d.accept());
  for(const shell of ['apps','qapps']){
@@ -31,6 +31,7 @@ async function submit(id){await Promise.all([page.waitForNavigation({waitUntil:'
    });
   }
   await page.setViewport({width:1366,height:900});
+  await require('./verify-dropdowns.cjs')({page,record,open,assert,out,shell});
   await record(shell+' accessible modals and clear controls',async()=>{
    for(const [screen,prefix,opener,party] of [['FindTaxRegistration','nr','New Registration','TAX_QA_UI_CUST'],['FindTaxExemption','te','Add New Exemption','TAX_QA_UI_CUST']]) {
     await open(`/${shell}/zenith/tax/${screen}`);await clickText('button',opener);await page.waitForSelector(`#${prefix}-overlay`,{visible:true});
