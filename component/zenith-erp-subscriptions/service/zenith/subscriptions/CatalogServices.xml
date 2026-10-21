@@ -1,0 +1,132 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+    <service verb="assert" noun="SubscriptionWrite" authenticate="true">
+        <out-parameters><parameter name="activeOrgId"/></out-parameters>
+        <actions>
+            <service-call name="zenith.base.SecurityServices.check#ModuleWriteAccess" in-map="[moduleId:'subscriptions']" out-map="access"/>
+            <service-call name="zenith.contacts.ContactServices.get#AuthorizedActiveOrganization" out-map="scope"/>
+            <set field="activeOrgId" from="scope.activeOrgId"/>
+            <if condition="!access.canWrite || (!activeOrgId &amp;&amp; !ec.user.isInGroup('ADMIN'))">
+                <return error="true" message="Subscription write access and an authorized organization are required."/>
+            </if>
+        </actions>
+    </service>
+
+    <service verb="save" noun="SubscriptionPlan" authenticate="true">
+        <in-parameters>
+            <parameter name="planId"/>
+            <parameter name="planName"/><parameter name="planCode"/><parameter name="description"/>
+            <parameter name="billingFrequency"/><parameter name="billingAmount" type="BigDecimal"/>
+            <parameter name="setupFee" type="BigDecimal"/><parameter name="trialDays" type="Integer"/>
+            <parameter name="taxRate" type="BigDecimal"/><parameter name="productTaxCode"/>
+            <parameter name="currencyUomId"/><parameter name="maxUsers" type="Integer"/>
+            <parameter name="maxStorage"/><parameter name="features"/>
+            <parameter name="autoRenew"/><parameter name="isActive"/>
+        </in-parameters>
+        <out-parameters><parameter name="planId"/></out-parameters>
+        <actions>
+            <service-call name="zenith.subscriptions.CatalogServices.assert#SubscriptionWrite" out-map="scope"/>
+            <script><![CDATA[
+                def existing = planId ? ec.entity.find('zenith.erp.subscriptions.SubscriptionPlan')
+                        .condition('planId',planId).forUpdate(true).one() : null
+                if (planId && (!existing || existing.organizationPartyId != scope.activeOrgId)) {
+                    ec.message.addError('Plan not found for your organization.'); return
+                }
+                if (!scope.activeOrgId) { ec.message.addError('Select an organization before saving a plan.'); return }
+                def fields = ['planName','planCode','description','billingFrequency','billingAmount','setupFee',
+                              'trialDays','taxRate','productTaxCode','currencyUomId','maxUsers','maxStorage',
+                              'features','autoRenew','isActive']
+                def changes = fields.findAll { context.containsKey(it) && context[it] != null }.collectEntries { [(it):context[it]] }
+                def values = existing ? new LinkedHashMap(existing) : [:]
+                values.putAll(changes)
+                if (!values.planName?.trim() || !values.planCode?.trim() || values.billingAmount == null ||
+                        values.billingAmount < 0 || (values.setupFee != null && values.setupFee < 0) ||
+                        (values.trialDays != null && values.trialDays < 0) ||
+                        (values.taxRate != null && (values.taxRate < 0 || values.taxRate > 100)) ||
+                        (values.maxUsers != null && values.maxUsers < 0) ||
+                        !(values.billingFrequency in ['BfMonthly','BfQuarterly','BfHalfYearly','BfAnnually','BfOneTime']) ||
+                        (values.isActive != null && !(values.isActive in ['Y','N'])) ||
+                        (values.autoRenew != null && !(values.autoRenew in ['Y','N']))) {
+                    ec.message.addError('Enter a plan name, code, valid frequency and non-negative amounts and limits.'); return
+                }
+                changes.organizationPartyId = scope.activeOrgId
+                if (!existing && !changes.currencyUomId) {
+                    def currency = ec.entity.find('zenith.erp.base.CompanySettings')
+                            .condition('organizationPartyId',scope.activeOrgId).condition('settingKey','CURRENCY_UOM_ID').one()
+                    changes.currencyUomId = currency?.settingValue ?: 'USD'
+                }
+                if (existing) { existing.setAll(changes); existing.update() }
+                else {
+                    def created = ec.service.sync().name('create#zenith.erp.subscriptions.SubscriptionPlan').parameters(changes).call()
+                    planId = created.planId
+                }
+            ]]></script>
+        </actions>
+    </service>
+
+    <service verb="save" noun="SubscriptionDiscount" authenticate="true">
+        <in-parameters>
+            <parameter name="discountId"/><parameter name="discountCode"/><parameter name="discountName"/>
+            <parameter name="discountType"/><parameter name="discountValue" type="BigDecimal"/>
+            <parameter name="maxUses" type="Integer"/><parameter name="validFrom" type="Timestamp"/>
+            <parameter name="validTo" type="Timestamp"/><parameter name="applicablePlanId"/><parameter name="isActive"/>
+        </in-parameters>
+        <out-parameters><parameter name="discountId"/></out-parameters>
+        <actions>
+            <service-call name="zenith.subscriptions.CatalogServices.assert#SubscriptionWrite" out-map="scope"/>
+            <script><![CDATA[
+                def existing = discountId ? ec.entity.find('zenith.erp.subscriptions.SubscriptionDiscount')
+                        .condition('discountId',discountId).forUpdate(true).one() : null
+                if (discountId && (!existing || existing.organizationPartyId != scope.activeOrgId)) {
+                    ec.message.addError('Discount not found for your organization.'); return
+                }
+                if (!scope.activeOrgId) { ec.message.addError('Select an organization before saving a discount.'); return }
+                def fields = ['discountCode','discountName','discountType','discountValue','maxUses','validFrom','validTo','applicablePlanId','isActive']
+                def changes = fields.findAll { context.containsKey(it) && context[it] != null }.collectEntries { [(it):context[it]] }
+                def values = existing ? new LinkedHashMap(existing) : [:]
+                values.putAll(changes)
+                if (!values.discountCode?.trim() || !values.discountName?.trim() || values.discountValue == null ||
+                        values.discountValue < 0 || !(values.discountType in ['DtPercentage','DtFlat','DtTrialExtend']) ||
+                        (values.discountType == 'DtPercentage' && values.discountValue > 100) ||
+                        (values.maxUses != null && values.maxUses < 0) ||
+                        (values.validFrom && values.validTo && values.validFrom > values.validTo) ||
+                        (values.isActive != null && !(values.isActive in ['Y','N']))) {
+                    ec.message.addError('Enter a valid discount, non-negative limits and an ordered validity period.'); return
+                }
+                if (values.applicablePlanId && ec.entity.find('zenith.erp.subscriptions.SubscriptionPlan')
+                        .condition('planId',values.applicablePlanId).one()?.organizationPartyId != scope.activeOrgId) {
+                    ec.message.addError('Plan not found for your organization.'); return
+                }
+                changes.organizationPartyId = scope.activeOrgId
+                if (existing) { existing.setAll(changes); existing.update() }
+                else {
+                    def created = ec.service.sync().name('create#zenith.erp.subscriptions.SubscriptionDiscount').parameters(changes).call()
+                    discountId = created.discountId
+                }
+            ]]></script>
+        </actions>
+    </service>
+
+    <service verb="update" noun="SubscriptionInvoiceStatus" authenticate="true">
+        <in-parameters><parameter name="subInvoiceId" required="true"/><parameter name="statusId"/><parameter name="paymentReference"/></in-parameters>
+        <actions>
+            <service-call name="zenith.subscriptions.CatalogServices.assert#SubscriptionWrite" out-map="scope"/>
+            <script><![CDATA[
+                def invoice = ec.entity.find('zenith.erp.subscriptions.SubscriptionInvoice')
+                        .condition('subInvoiceId',subInvoiceId).forUpdate(true).one()
+                if (!invoice || invoice.organizationPartyId != scope.activeOrgId) {
+                    ec.message.addError('Invoice not found for your organization.'); return
+                }
+                if (!statusId && paymentReference == null) { ec.message.addError('Choose an invoice status or payment reference.'); return }
+                if (statusId && !(statusId in ['SiDraft','SiSent','SiPaid','SiOverdue','SiCancelled','SiRefunded'])) {
+                    ec.message.addError('Choose a valid invoice status.'); return
+                }
+                // Amounts, tax, number and ownership are never accepted from this status form.
+                if (statusId) invoice.statusId = statusId
+                if (paymentReference != null) invoice.paymentReference = paymentReference
+                invoice.update()
+            ]]></script>
+        </actions>
+    </service>
+</services>

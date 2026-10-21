@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Install ONLY in the disposable Sales native JVM, under Crm/AllModulesQa. -->
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd" default-menu-include="false">
+    <always-actions><script><![CDATA[
+        if (System.getProperty('sales.qa.disposable') != 'true' || !(ec.user.isInGroup('ADMIN') || ec.user.userId?.startsWith('AUDIT_QA_'))) {
+            throw new org.moqui.context.ArtifactAuthorizationException('Disposable audit helper only.')
+        }
+    ]]></script></always-actions>
+    <transition name="renderers" method="post"><actions><script><![CDATA[
+        def paths=['component://webroot/screen/includes/Header.html.ftl','component://webroot/screen/includes/Header.qvt.ftl','component://webroot/screen/includes/navbar.html.ftl']
+        ec.web.sendJsonResponse(paths.collectEntries { p -> [(p):ec.resource.getTemplateRendererByLocation(p)?.getClass()?.name] })
+    ]]></script></actions><default-response type="none"/></transition>
+    <transition name="initialize" method="post"><actions><script><![CDATA[
+        if (!ec.user.isInGroup('ADMIN') || ec.entity.find('mantle.party.Party').condition('partyId','AUDIT_QA_A').disableAuthz().count()) {
+            ec.web.response.setStatus(409);ec.web.sendJsonResponse([initialized:false]);return
+        }
+        ec.entity.makeDataLoader().location('component://zenith-erp-crm/AllModulesQaFixture.xml').load()
+        def demo=ec.entity.find('moqui.security.UserAccount').condition('userId','EX_JOHN_DOE').one()
+        ['AUDIT_QA_USER_A','AUDIT_QA_USER_B'].each { id ->
+            def account=ec.entity.find('moqui.security.UserAccount').condition('userId',id).one()
+            ['currentPassword','passwordSalt','passwordHashType','passwordBase64'].each { account.set(it,demo.get(it)) }
+            account.disabled='N';account.requirePasswordChange='N';account.update()
+        }
+        ec.web.sendJsonResponse([initialized:true])
+    ]]></script></actions><default-response type="none"/></transition>
+    <transition name="scope" method="post"><actions><script><![CDATA[
+        def org=ec.web.parameters.organizationPartyId
+        if (!(org in ['AUDIT_QA_A','AUDIT_QA_B','_NA_',''])) {ec.web.response.setStatus(400);return}
+        ec.user.setPreference('ACTIVE_ORGANIZATION',org)
+        ec.web.sendJsonResponse([saved:true])
+    ]]></script></actions><default-response type="none"/></transition>
+    <transition name="loadVolume" method="post"><actions><script><![CDATA[
+        if (!ec.user.isInGroup('ADMIN') || !ec.entity.find('mantle.party.Party').condition('partyId','AUDIT_QA_A').disableAuthz().count() ||
+                ec.entity.find('mantle.product.Product').condition('productId','AUDIT_VOL_P0').disableAuthz().count()) {
+            ec.web.response.setStatus(409);ec.web.sendJsonResponse([loaded:false]);return
+        }
+        def xml = new StringBuilder('<entity-facade-xml>')
+        (0..<1500).each { i ->
+            def org = i % 5 == 0 ? 'AUDIT_QA_B' : 'AUDIT_QA_A'
+            xml.append("<mantle.product.Product productId=\"AUDIT_VOL_P${i}\" pseudoId=\"AUDIT_VOL_P${i}\" ownerPartyId=\"${org}\" productName=\"Disposable volume product ${i}\" productTypeEnumId=\"PtAsset\" amountUomId=\"OTH_ea\" inventoryTracked=\"Y\" mrpAmount=\"${1+i%100}\"/>")
+        }
+        (0..<200).each { i ->
+            def org = i % 5 == 0 ? 'AUDIT_QA_B' : 'AUDIT_QA_A'
+            xml.append("<mantle.party.Party partyId=\"AUDIT_VOL_C${i}\" ownerPartyId=\"${org}\" partyTypeEnumId=\"PtyPerson\"/><mantle.party.Person partyId=\"AUDIT_VOL_C${i}\" firstName=\"Disposable volume customer ${i}\"/><mantle.party.PartyRole partyId=\"AUDIT_VOL_C${i}\" roleTypeId=\"Customer\"/>")
+        }
+        (0..<300).each { i ->
+            def org = i % 5 == 0 ? 'AUDIT_QA_B' : 'AUDIT_QA_A'
+            xml.append("<zenith.erp.crm.Lead leadId=\"AUDIT_VOL_L${i}\" organizationPartyId=\"${org}\" firstName=\"Disposable volume lead ${i}\" statusId=\"LeadNew\" rating=\"Warm\" score=\"0\"/>")
+        }
+        xml.append('</entity-facade-xml>')
+        ec.entity.makeDataLoader().xmlText(xml.toString()).transactionTimeout(180).disableDataFeed(true).load()
+        ec.web.sendJsonResponse([loaded:!ec.message.hasError(),businessRecords:2000,errors:ec.message.errors])
+    ]]></script></actions><default-response type="none"/></transition>
+    <transition name="invoke" method="post"><actions><script><![CDATA[
+        def operations=[
+            'lead.create':'zenith.crm.CrmServices.create#Lead','lead.update':'zenith.crm.CrmServices.update#Lead',
+            'lead.convert':'zenith.crm.CrmServices.convert#Lead','activity.log':'zenith.crm.CrmServices.log#Activity',
+            'opportunity.create':'zenith.crm.CrmServices.create#Opportunity','opportunity.advance':'zenith.crm.CrmServices.advance#OpportunityStage',
+            'segment.create':'zenith.crm.CrmServices.create#CustomerSegment','segment.evaluate':'zenith.crm.CrmServices.evaluate#Segment',
+            'receipt.create':'zenith.inventory.ReceiptServices.receive#Stock',
+            'transfer.create':'zenith.inventory.StockTransferServices.create#StockTransfer',
+            'transfer.add':'zenith.inventory.StockTransferServices.add#StockTransferItem',
+            'transfer.delete':'zenith.inventory.StockTransferServices.delete#StockTransferItem',
+            'transfer.ship':'zenith.inventory.StockTransferServices.ship#StockTransfer',
+            'transfer.count':'zenith.inventory.StockTransferServices.set#StockTransferReceivedQuantity',
+            'transfer.receive':'zenith.inventory.StockTransferServices.receive#StockTransfer',
+            'adjustment.create':'zenith.inventory.StockAdjustmentServices.create#StockAdjustment',
+            'adjustment.add':'zenith.inventory.StockAdjustmentServices.add#StockAdjustmentItem',
+            'adjustment.approve':'zenith.inventory.StockAdjustmentServices.approve#StockAdjustment',
+            'adjustment.apply':'zenith.inventory.StockAdjustmentServices.apply#StockAdjustment',
+            'adjustment.reopen':'zenith.inventory.StockAdjustmentServices.reopen#StockAdjustment',
+            'serial.register':'zenith.inventory.SerialTrackingServices.register#TrackedSerial',
+            'serial.status':'zenith.inventory.SerialTrackingServices.update#TrackedSerialStatus',
+            'catalogue.create':'zenith.inventory.CatalogueServices.create#Catalogue',
+            'catalogue.add':'zenith.inventory.CatalogueServices.add#CatalogueProduct',
+            'catalogue.remove':'zenith.inventory.CatalogueServices.remove#CatalogueProduct',
+            'subscription.create':'zenith.subscriptions.SubscriptionServices.create#Subscription',
+            'subscription.pause':'zenith.subscriptions.SubscriptionServices.pause#Subscription',
+            'subscription.resume':'zenith.subscriptions.SubscriptionServices.resume#Subscription',
+            'subscription.cancel':'zenith.subscriptions.SubscriptionServices.cancel#Subscription',
+            'subscription.renew':'zenith.subscriptions.SubscriptionServices.renew#Subscription',
+            'subscription.invoice':'zenith.subscriptions.SubscriptionServices.generate#Invoice',
+            'subscription.due':'zenith.subscriptions.SubscriptionServices.process#DueSubscriptions',
+            'subscription.tax':'zenith.subscriptions.SubscriptionServices.calculate#SubscriptionTax'
+        ]
+        def service=operations[ec.web.parameters.op]
+        if (!service) {ec.web.response.setStatus(400);ec.web.sendJsonResponse([errors:['Unknown test operation']]);return}
+        def input=new groovy.json.JsonSlurper().parseText(ec.web.parameters.input ?: '{}')
+        // Reproduce a forged editable preference after parent screen actions have finished.
+        if (input.testActiveOrg in ['AUDIT_QA_A','AUDIT_QA_B','_NA_','']) {
+            ec.user.setPreference('ACTIVE_ORGANIZATION',input.remove('testActiveOrg'))
+        }
+        def result=ec.service.sync().name(service).parameters(input).call()
+        ec.web.sendJsonResponse([result:result,errors:ec.message.errors,validation:ec.message.validationErrors*.message])
+    ]]></script></actions><default-response type="none"/></transition>
+    <widgets><form-single name="AuditTokenForm" transition="invoke"><field name="op"><default-field><hidden/></default-field></field></form-single></widgets>
+</screen>
