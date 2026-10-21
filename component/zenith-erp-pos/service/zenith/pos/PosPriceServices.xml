@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+    <service verb="get" noun="PriceOverrideAccess" authenticate="true">
+        <out-parameters><parameter name="canOverride" type="Boolean"/></out-parameters>
+        <actions>
+            <service-call name="zenith.base.SecurityServices.check#ModuleWriteAccess" in-map="[moduleId:'pos']" out-map="permission"/>
+            <set field="canOverride" from="permission.canWrite == true"/>
+        </actions>
+    </service>
+    <service verb="set" noun="ItemPrice" authenticate="true">
+        <in-parameters>
+            <parameter name="transactionId" required="true"/><parameter name="itemSeqId" required="true"/>
+            <parameter name="newPrice" type="BigDecimal" required="true"/><parameter name="taxOn" default="Y"/>
+        </in-parameters>
+        <actions>
+            <service-call name="zenith.pos.PosAccessServices.assert#PosAccess" in-map="[transactionId:transactionId]" out-map="access"/>
+            <if condition="!access.allowed"><return/></if>
+            <service-call name="zenith.pos.PosPriceServices.get#PriceOverrideAccess" out-map="permission"/>
+            <if condition="!permission.canOverride"><return error="true" message="POS write permission is required to change a bill price."/></if>
+            <if condition="newPrice &lt; 0 || !(taxOn in ['Y','N'])"><return error="true" message="Enter a non-negative price and a valid tax setting."/></if>
+            <script><![CDATA[
+                def txn = ec.entity.find('zenith.erp.pos.PosTransaction').condition('transactionId',transactionId).forUpdate(true).one()
+                if (txn.statusId != 'PtCreated') { ec.message.addError('Only an open bill can have its price changed.'); return }
+                def item = ec.entity.find('zenith.erp.pos.PosTransactionItem').condition('transactionId',transactionId)
+                        .condition('itemSeqId',itemSeqId).forUpdate(true).one()
+                if (!item) { ec.message.addError('Item not found for this bill.'); return }
+                def productAccess = ec.service.sync().name('zenith.pos.PosAccessServices.assert#PosAccess')
+                        .parameters([transactionId:transactionId,productId:item.productId]).call()
+                if (!productAccess?.allowed) return
+                def quantity = item.quantity as BigDecimal
+                def percent = (item.discountPercent ?: 0) as BigDecimal
+                if (quantity == null || quantity <= 0 || percent < 0 || percent > 100) {
+                    ec.message.addError('Correct the item quantity or discount before changing its price.'); return
+                }
+                def product = ec.entity.find('mantle.product.Product').condition('productId',item.productId).one()
+                def mode = item.salesModeId ? ec.entity.find('zenith.erp.pos.PosSalesMode').condition('salesModeId',item.salesModeId).one() : null
+                def discount = quantity * newPrice * percent / 100
+                def taxable = quantity * newPrice - discount
+                def tax = BigDecimal.ZERO
+                def taxedItem = null
+                if (taxOn == 'Y') {
+                    def result = ec.service.sync().name('zenith.tax.TaxServices.calculate#Tax').parameters([
+                        organizationPartyId:access.organizationPartyId,
+                        items:[[productId:item.productId,productTaxCode:item.productTaxCode ?: product.productTaxCode,
+                                taxCategoryId:product.taxCategoryId,quantity:quantity,unitAmount:newPrice,
+                                discountAmount:discount,isTaxInclusive:mode?.isTaxInclusive ?: 'N']],
+                        originRegionGeoId:txn.originRegionGeoId,destinationRegionGeoId:txn.destinationRegionGeoId,
+                        transactionType:'SALE']).call()
+                    if (ec.message.hasError()) return
+                    taxedItem = result?.taxedItems ? result.taxedItems[0] : null
+                    if (taxedItem?.taxableAmount != null) taxable = taxedItem.taxableAmount as BigDecimal
+                    tax = (taxedItem?.totalTaxAmount ?: 0) as BigDecimal
+                }
+                def original = (item.unitPrice ?: 0) as BigDecimal
+                if (original.compareTo(newPrice) != 0) {
+                    ec.service.sync().name('create#zenith.erp.pos.PosItemPriceOverride').parameters([
+                        organizationPartyId:access.organizationPartyId,transactionId:transactionId,itemSeqId:itemSeqId,
+                        transactionNumber:txn.transactionNumber,productId:item.productId,productName:item.productName,
+                        originalPrice:original,newPrice:newPrice,changedByPartyId:ec.user.userAccount?.partyId,
+                        changedByUserId:ec.user.userId,changeDate:ec.user.nowTimestamp,sessionId:txn.sessionId]).call()
+                }
+                item.setAll([unitPrice:newPrice,discountAmount:discount,taxableAmount:taxable,
+                             totalTaxAmount:tax,lineTotal:taxable+tax,manualPrice:'Y'])
+                item.update()
+                if (taxOn == 'Y' && taxedItem?.taxBreakdowns) {
+                    ec.service.sync().name('zenith.tax.TaxServices.store#TaxLineDetails').parameters([
+                        referenceType:'PosTransactionItem',referenceId:transactionId,
+                        referenceSeqId:itemSeqId,taxBreakdowns:taxedItem.taxBreakdowns]).call()
+                } else {
+                    ec.entity.find('zenith.erp.tax.TaxLineDetail').condition('referenceType','PosTransactionItem')
+                            .condition('referenceId',transactionId).condition('referenceSeqId',itemSeqId).deleteAll()
+                }
+                ec.service.sync().name('zenith.pos.PosServices.recalculate#TransactionTotals').parameters([transactionId:transactionId]).call()
+            ]]></script>
+        </actions>
+    </service>
+</services>

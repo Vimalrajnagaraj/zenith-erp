@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Test-only scheduling barrier. Never mount this screen on a customer runtime. -->
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd" default-menu-include="false">
+    <transition name="control" method="post"><actions><script><![CDATA[
+        if (System.getProperty('pos.qa.disposable') != 'true' || ec.user.username != 'pos.qa') {
+            ec.web.sendJsonResponse([denied:true]); return
+        }
+        def id = ec.web.parameters.transactionId
+        def txn = ec.entity.find('zenith.erp.pos.PosTransaction').condition('transactionId',id).one()
+        if (!txn || txn.organizationPartyId != 'POS_QA_A' || txn.statusId != 'PtCreated') {
+            ec.web.sendJsonResponse([denied:true]); return
+        }
+        def key = ec.web.session.id
+        def operation = ec.web.parameters.op
+        if (operation == 'prepare') {
+            qa.pos.PosTotalsBarrier.prepare(key,id)
+            ec.web.sendJsonResponse([prepared:true]); return
+        }
+        def race = qa.pos.PosTotalsBarrier.get(key,id)
+        if (!race) { ec.web.sendJsonResponse([denied:true]); return }
+        if (operation == 'state') { ec.web.sendJsonResponse([reached:race.reached.count == 0]); return }
+        if (operation == 'release') { race.release.countDown(); ec.web.sendJsonResponse([released:true]); return }
+        if (operation == 'pause' && ec.web.parameters.path in ['totals','reprice','mode','remove']) {
+            qa.pos.PosTotalsBarrier.activate(race)
+            try {
+                if (ec.web.parameters.path == 'totals') ec.service.sync().name('zenith.pos.PosServices.recalculate#TransactionTotals').parameter('transactionId',id).call()
+                else if (ec.web.parameters.path == 'reprice') ec.service.sync().name('zenith.pos.PosServices.reprice#PosTransaction').parameters([transactionId:id,salesModeId:'RETAIL',taxOn:'Y']).call()
+                else {
+                    def item = ec.entity.find('zenith.erp.pos.PosTransactionItem').condition('transactionId',id).one()
+                    if (ec.web.parameters.path == 'mode') ec.service.sync().name('zenith.pos.PosServices.set#PosTransactionItemMode').parameters([transactionId:id,itemSeqId:item.itemSeqId,salesModeId:'WHOLESALE',taxOn:'Y']).call()
+                    else ec.service.sync().name('zenith.pos.PosServices.remove#PosTransactionItem').parameters([transactionId:id,itemSeqId:item.itemSeqId]).call()
+                }
+                def errors = ec.message.hasError() ? [ec.message.errorsString] : []
+                ec.message.clearErrors()
+                ec.web.sendJsonResponse([errors:errors])
+            } finally { qa.pos.PosTotalsBarrier.clear() }
+            return
+        }
+        ec.web.sendJsonResponse([denied:true])
+    ]]></script></actions><default-response type="none"/></transition>
+</screen>

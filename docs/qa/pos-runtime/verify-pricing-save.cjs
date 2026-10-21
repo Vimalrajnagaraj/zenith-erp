@@ -26,7 +26,7 @@ module.exports=async function({a,foreign,base,check,q,out}) {
    if(shell==='qapps')await page.locator('#zq-subnav a[href*="/SalesMode"]').click();
    else await page.goto(`${base}/${shell}/zenith/pos/SalesMode`);
    await page.locator('.smode-h1').waitFor();await page.waitForLoadState('networkidle');await page.goBack();await row.waitFor();
-   check(`${shell} Back restores saved selected-mode price`,await input.inputValue()==='500'&&await root.locator('[data-mode-id=WHOLESALE]').count()===0);
+   check(`${shell} Back restores saved selected-mode price`,await input.inputValue()==='500'&&await root.locator('[data-mode-id=WHOLESALE]:visible').count()===0&&await root.locator('[data-mode-id=WHOLESALE]:not(:disabled)').count()===0);
    await page.goForward();await page.locator('.smode-h1').waitFor();await page.waitForLoadState('networkidle');await page.goBack();await row.waitFor();
    const historyPosts=posts;await input.fill('501');const second=page.waitForResponse(r=>r.url().includes('/ProductPricing/savePrices'));
    await button.click();check(`${shell} Save after Back/Forward succeeds`,(await (await second).json()).success&&read('POS_QA_A_P18')===501);

@@ -1,0 +1,125 @@
+module.exports=async function({manager,cashier,foreign,session,id,free,credit,cart,q,check,out,base}){
+ const path=require('node:path');
+ const rows=tx=>q(`SELECT * FROM pos_free_item_approval WHERE transaction_id='${tx}'`);
+ const body=async(response)=>response.status()===403?{success:false,error:'Forbidden'}:response.json();
+ const state=async(tx,actor=manager)=>body(await actor.post('Terminal','freeItemState',{transactionId:tx}));
+ const approve=async(tx,extra={},actor=manager)=>body(await actor.post('Terminal','approveFreeItems',{transactionId:tx,reason:'Synthetic free sample approval',expectedFingerprint:(await state(tx,actor)).approvalFingerprint,...extra}));
+ const ajax=async(data,actor=manager)=>(await actor.post('Terminal','ajaxCart',{sessionId:session.sessionId,...data})).json();
+ const setting={discountLimitPct:'10',roundOffStep:'0',managerPin:'246813'};
+ await manager.post('DiscountSettings','saveDiscountSettings',setting);
+ await foreign.post('DiscountSettings','saveDiscountSettings',{...setting,managerPin:'135790'});
+ await cashier.post('DiscountSettings','saveDiscountSettings',{...setting,managerPin:'111111'});
+ check('Cashier cannot replace the shop manager PIN',q("SELECT preference_value FROM user_preference WHERE user_id='POS_QA_A' AND preference_key='POS_DISC_PIN'")[0]?.preference_value==='246813');
+ check('A zero-total draft reports pending approval',(await state(free)).required===true);
+ for(const reason of ['', '   ','x'.repeat(501)])check('Blank/oversize approval reason rejected ('+reason.length+')',!(await approve(id,{reason})).success&&rows(id).length===0);
+ check('Cashier POS write grant alone is not manager approval',!(await approve(id,{},cashier)).success&&rows(id).length===0);
+ check('Another shop manager PIN is rejected',!(await approve(id,{managerPin:'135790'},cashier)).success&&rows(id).length===0);
+ check('Forged approver identity cannot authorize a free item',!(await approve(id,{approvedByUserId:'POS_QA_MANAGER'},cashier)).success&&rows(id).length===0);
+ check('Foreign manager cannot approve another shop bill',!(await approve(id,{},foreign)).success&&rows(id).length===0);
+ const leak=await state(id,foreign);check('Foreign state request exposes no free-item data',!leak.success&&leak.freeItemCount==null);
+ const noToken=await manager.c.request.post(base+'/apps/zenith/pos/Terminal/approveFreeItems',{form:{transactionId:id,reason:'No CSRF'},maxRedirects:0});
+ check('Approval requires CSRF',noToken.status()===401&&rows(id).length===0);
+ const ok=await approve(id);let audit=rows(id)[0];
+ check('Manager explicitly approves with a persisted reason',ok.success&&audit?.reason==='Synthetic free sample approval'&&audit.approved_by_user_id==='POS_QA_MANAGER'&&audit.approval_method==='ManagerLogin');
+ check('Approval audit records shop, session, requester, time and exact free-item snapshot',audit.organization_party_id==='POS_QA_A'&&audit.session_id===session.sessionId&&audit.requested_by_user_id==='POS_QA_MANAGER'&&audit.approval_date&&JSON.parse(audit.snapshot_json).length===1&&audit.fingerprint.length===64);
+ await approve(id);check('Repeated approval is idempotent for unchanged free items',rows(id).length===1);
+ check('Valid current approval clears the gate',(await state(id)).required===false);
+ const line=q(`SELECT * FROM pos_transaction_item WHERE transaction_id='${id}' AND unit_price=0`)[0];
+ const displayed=(await state(id)).approvalFingerprint;
+ await ajax({action:'updateQty',transactionId:id,itemSeqId:line.item_seq_id,newQty:'2',taxOn:'N'});
+ check('Increasing an approved free quantity requires approval again',(await state(id)).required===true);
+ check('A pending approval cannot cover contents changed in another tab',!(await approve(id,{expectedFingerprint:displayed})).success&&rows(id).length===1);
+ await ajax({action:'updateQty',transactionId:id,itemSeqId:line.item_seq_id,newQty:'1',taxOn:'N'});
+ check('Restoring the old quantity cannot revive a stale approval',(await state(id)).required===true);
+ check('Shop PIN can authorize the cashier request with a reason',(await approve(id,{managerPin:'246813'},cashier)).success);
+ audit=rows(id).find(r=>r.approval_method==='ShopManagerPin');
+ check('PIN audit identifies requester and method without inventing a manager identity',audit?.requested_by_user_id==='POS_QA_CASHIER'&&audit.approved_by_user_id==null&&!audit.snapshot_json.includes('246813'));
+ await manager.invoke('pay',{transactionId:id,paymentMethod:'Cash',amount:'100'});await manager.invoke('complete',{transactionId:id});
+ check('Approved mixed free/paid cash bill completes with real tender',q(`SELECT status_id FROM pos_transaction WHERE transaction_id='${id}'`)[0].status_id==='PtCompleted'&&q(`SELECT * FROM pos_payment WHERE transaction_id='${id}'`).length===1);
+ await approve(free);await manager.invoke('pay',{transactionId:free,paymentMethod:'Cash',amount:'0'});await manager.invoke('complete',{transactionId:free});
+ check('Approved all-free bill completes without a fabricated payment',q(`SELECT status_id FROM pos_transaction WHERE transaction_id='${free}'`)[0].status_id==='PtCompleted'&&q(`SELECT * FROM pos_payment WHERE transaction_id='${free}'`).length===0);
+ await approve(credit);const cr=await manager.invoke('credit',{transactionId:credit,customerName:'Synthetic Free Approval',customerPhone:'9990001234'});
+ check('Approved mixed free/paid credit sale completes',!cr.errors?.length&&q(`SELECT status_id FROM pos_transaction WHERE transaction_id='${credit}'`)[0].status_id==='PtCompleted');
+ for(const method of ['Card','UPI','Split']){
+  const tx=await cart(true),transition=method==='Split'?'splitPayAndComplete':'payAndComplete';
+  const fields={transactionId:tx,sessionId:session.sessionId,wantJson:'1',...(method==='Split'?{cashAmount:'40',cardAmount:'60'}:{paymentMethod:method,amount:'100'})};
+  await manager.post('Terminal',transition,fields);
+  check(method+' HTTP checkout cannot tender or finalize unapproved free items',q(`SELECT * FROM pos_payment WHERE transaction_id='${tx}'`).length===0&&q(`SELECT status_id FROM pos_transaction WHERE transaction_id='${tx}'`)[0].status_id==='PtCreated');
+  await approve(tx);const response=await (await manager.post('Terminal',transition,fields)).json();
+  check(method+' HTTP checkout succeeds after explicit approval',response.success&&q(`SELECT status_id FROM pos_transaction WHERE transaction_id='${tx}'`)[0].status_id==='PtCompleted');
+ }
+ for(const taxOn of ['Y','N']){
+  const tx=(await manager.invoke('cart',{sessionId:session.sessionId,reuseOpenCart:'false'})).result.transactionId;
+  await manager.invoke('add',{transactionId:tx,productId:'POS_QA_A_P18',unitPrice:'0',quantity:'1',taxOn});
+  check('Explicit zero override remains zero with tax '+taxOn,Number(q(`SELECT unit_price FROM pos_transaction_item WHERE transaction_id='${tx}'`)[0].unit_price)===0);
+  check('Tax '+taxOn+' requires approval for the zero override',(await state(tx)).required===true);
+  const raw=await manager.invoke('pay',{transactionId:tx,paymentMethod:'Cash',amount:'0'});
+  check('Tax '+taxOn+' blocks zero tender without approval',raw.errors?.length>0&&q(`SELECT * FROM pos_payment WHERE transaction_id='${tx}'`).length===0);
+  await approve(tx);await manager.invoke('complete',{transactionId:tx});
+  check('Tax '+taxOn+' approved zero override completes',q(`SELECT status_id FROM pos_transaction WHERE transaction_id='${tx}'`)[0].status_id==='PtCompleted');
+ }
+ const unpriced=(await manager.invoke('cart',{sessionId:session.sessionId,reuseOpenCart:'false'})).result.transactionId;
+ await manager.invoke('add',{transactionId:unpriced,productId:'POS_QA_A_UNPRICED',quantity:'1',taxOn:'N'});
+ check('A missing catalog price is treated as requiring manager approval',Number(q(`SELECT unit_price FROM pos_transaction_item WHERE transaction_id='${unpriced}'`)[0].unit_price)===0&&(await state(unpriced)).required===true);
+ const unpricedResult=await manager.invoke('complete',{transactionId:unpriced});
+ check('A missing catalog price cannot silently complete',unpricedResult.errors?.length>0&&q(`SELECT status_id FROM pos_transaction WHERE transaction_id='${unpriced}'`)[0].status_id==='PtCreated');
+ await approve(unpriced,{reason:'Synthetic approved unpriced sample'});await manager.invoke('complete',{transactionId:unpriced});
+ check('An explicitly approved unpriced sample can complete',q(`SELECT status_id FROM pos_transaction WHERE transaction_id='${unpriced}'`)[0].status_id==='PtCompleted');
+ const discount=(await manager.invoke('cart',{sessionId:session.sessionId,reuseOpenCart:'false'})).result.transactionId;
+ await manager.invoke('add',{transactionId:discount,productId:'POS_QA_A_P18',quantity:'1',taxOn:'N'});
+ await ajax({action:'applyDiscount',transactionId:discount,billDiscValue:'100',billDiscType:'pct',managerPin:'246813',taxOn:'N'});
+ check('A 100% discount cannot bypass the free-item gate',(await state(discount)).required===true);
+ const hold=await cart();await approve(hold);const held=(await manager.invoke('hold',{transactionId:hold})).result;
+ const recalled=(await manager.invoke('recall',{heldId:held.heldId,sessionId:session.sessionId})).result;
+ check('Holding and recalling unchanged free items preserves their approval',(await state(recalled.transactionId)).required===false&&rows(recalled.transactionId).length===1);
+ // Saving an issued bill must atomically roll back free-item changes until separately approved.
+ const paidSeq=q(`SELECT item_seq_id FROM pos_transaction_item WHERE transaction_id='${id}' AND unit_price>0`)[0].item_seq_id;
+ const change={action:'amendBill',editTxId:id,editReason:'Synthetic price correction',editType:'PRICE_CHANGE',editItemSeqId:paidSeq,newPrice:'0'};
+ const before=q(`SELECT * FROM pos_transaction WHERE transaction_id='${id}'`)[0];const edit=await ajax(change);
+ check('Unapproved free-price amendment requests explicit manager approval',!edit.success&&edit.needFreeApproval===true);
+ check('Rejected free-price edit rolls back line, totals and audit',Number(q(`SELECT unit_price FROM pos_transaction_item WHERE transaction_id='${id}' AND item_seq_id='${paidSeq}'`)[0].unit_price)===100&&Number(q(`SELECT grand_total FROM pos_transaction WHERE transaction_id='${id}'`)[0].grand_total)===Number(before.grand_total)&&q(`SELECT * FROM pos_transaction_amendment WHERE transaction_id='${id}'`).length===0);
+ const amended=await ajax({...change,freeItemReason:'Synthetic manager-approved correction',freeItemFingerprint:edit.approvalFingerprint});
+ check('Explicit manager reason allows the atomic zero-price bill edit',amended.success&&Number(q(`SELECT unit_price FROM pos_transaction_item WHERE transaction_id='${id}' AND item_seq_id='${paidSeq}'`)[0].unit_price)===0);
+ const allLines=q(`SELECT item_seq_id FROM pos_transaction_item WHERE transaction_id='${id}'`);
+ const batch={action:'amendBill',editTxId:id,editReason:'Synthetic batched free quantities',editOps:JSON.stringify(allLines.map(line=>({type:'QTY_CHANGE',seq:line.item_seq_id,newQty:'2'})))};
+ const preview=await ajax(batch),approvalCount=rows(id).length;
+ check('Batch approval previews all proposed free quantities before committing',preview.needFreeApproval&&preview.freeItems.length===2&&preview.freeItems.every(line=>Number(line.quantity)===2)&&q(`SELECT quantity FROM pos_transaction_item WHERE transaction_id='${id}'`).every(line=>Number(line.quantity)===1));
+ const savedBatch=await ajax({...batch,freeItemReason:'Synthetic approved batch',freeItemFingerprint:preview.approvalFingerprint});
+ check('One explicit approval commits the whole free-item amendment batch',savedBatch.success&&rows(id).length===approvalCount+1&&q(`SELECT quantity FROM pos_transaction_item WHERE transaction_id='${id}'`).every(line=>Number(line.quantity)===2));
+ check('Committed batch approval survives database decimal normalization',(await state(id)).required===false);
+ const auditPage=await manager.c.newPage();await auditPage.goto(base+'/apps/zenith/pos/EditTransaction?transactionId='+id,{waitUntil:'domcontentloaded'});
+ check('Transaction details display the free-item approval history',await auditPage.locator('body').innerText().then(t=>t.includes('Free-item approvals')&&t.includes('Synthetic manager-approved correction')));await auditPage.close();
+ // Real browser dialog: cancel is harmless; manager login still needs a reason and deliberate confirmation.
+ for(const shell of ['apps','qapps']){
+  const ui=await cart(true),page=await manager.c.newPage();await page.setViewportSize({width:shell==='apps'?390:1440,height:900});
+  let billingUrl=base+'/apps/zenith/pos/Terminal';
+  if(shell==='qapps'){
+   await page.goto(base+'/qapps/zenith/pos/Dashboard',{waitUntil:'domcontentloaded'});await page.locator('.z-pos-page').waitFor();
+   billingUrl=new URL(await page.locator('a').filter({hasText:/^Billing Terminal$/}).first().getAttribute('href'),base).href;
+  }
+  // Both modern layouts intentionally link billing to the native, dedicated terminal shell.
+  await page.goto(billingUrl+'?sessionId='+session.sessionId+'&transactionId='+ui+'&taxOn=N',{waitUntil:'domcontentloaded'});
+  await page.waitForFunction(()=>window.PosFreeItems && window._posAjax && document.querySelector('#pos-terminal-root'),null,{timeout:60000});
+  const run=()=>page.evaluate(async({tx,token})=>{try{await window.PosFreeItems.ensure(tx,token);return 'approved';}catch(e){return 'cancelled';}},{tx:ui,token:manager.token});
+  const cancelled=run();await page.locator('#pos-free-approval').waitFor();await page.locator('#pos-free-approval [data-cancel]').click();
+  check(shell+' cancelling the dialog records no approval',await cancelled==='cancelled'&&rows(ui).length===0);
+  await page.locator('#pos-pay-cash').click();await page.locator('.pos-cash-input,#posCashRecv').first().fill('100');await page.locator('.pos-cash-confirm,#posCashConfirm').first().click();
+  await page.locator('#pos-free-approval').waitFor();await page.locator('#pos-free-approval textarea').fill('Synthetic browser approved sample');
+  check(shell+' approval prompt identifies the actual free product and quantity',await page.locator('#pos-free-approval [data-free-items]').innerText().then(t=>t.includes('Disposable POS A FREE')&&t.includes('1')));
+  await page.screenshot({path:path.join(out,shell+'-free-approval.png')});
+  const bounds=await page.locator('#pos-free-approval form').boundingBox();check(shell+' approval dialog fits the viewport',bounds.x>=0&&bounds.x+bounds.width<=(shell==='apps'?390:1440)&&bounds.y>=0&&bounds.y+bounds.height<=900);
+  const payment=page.waitForResponse(r=>r.request().method()==='POST'&&r.url().includes('/payAndComplete'));
+  await page.locator('#pos-free-approval [type=submit]').click();const paid=await (await payment).json();
+  check(shell+' cash checkout asks for and persists the approval reason',paid.success&&rows(ui)[0]?.reason==='Synthetic browser approved sample'&&q(`SELECT status_id FROM pos_transaction WHERE transaction_id='${ui}'`)[0].status_id==='PtCompleted');await page.close();
+ }
+ const offlinePage=await manager.c.newPage();await offlinePage.goto(base+'/apps/zenith/pos/Terminal?sessionId='+session.sessionId+'&taxOn=N',{waitUntil:'domcontentloaded'});
+ await offlinePage.waitForFunction(()=>window._posOffline?.lookup('POS_QA_A_FREE'));
+ const queued=await offlinePage.evaluate(async()=>{window._posOffline.add('POS_QA_A_FREE',0);return(await window._posOffline.getQueue()).length;});
+ await offlinePage.locator('.ofl-pay[data-m="Cash"]').click();
+ check('Offline free item stays in the cart and creates no queued sale or receipt',await offlinePage.locator('.ofl-qi').count()===1&&(await offlinePage.evaluate(()=>window._posOffline.getQueue())).length===queued&&await offlinePage.locator('#pos-offline-frame').count()===0);
+ await offlinePage.close();
+ const locked=await cart();for(let n=0;n<5;n++)await approve(locked,{managerPin:'000000'},cashier);
+ check('Five failed PIN attempts persist a lockout despite rejected approval transactions',q("SELECT * FROM pos_manager_pin_attempt WHERE user_id='POS_QA_CASHIER' AND organization_party_id='POS_QA_A'")[0]?.locked_until!=null);
+ check('A locked cashier cannot approve even using the correct PIN',!(await approve(locked,{managerPin:'246813'},cashier)).success&&rows(locked).length===0);
+ check('A signed-in manager can still approve during a cashier PIN lockout',(await approve(locked)).success);
+};
