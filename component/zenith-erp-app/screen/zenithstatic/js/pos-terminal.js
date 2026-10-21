@@ -1,3 +1,76 @@
+/* Free-item approval is checked by the server again at every money/save boundary. */
+window.PosFreeItems = (function () {
+    function endpoint(name) {
+        var path = location.pathname.replace(/\/+$/, ''), i = path.indexOf('/zenith/pos/');
+        return (i >= 0 ? path.slice(0, i) + '/zenith/pos/Terminal/' : 'Terminal/') + name;
+    }
+    function api(name, data, token) {
+        return fetch(endpoint(name), {method:'POST',credentials:'same-origin',
+            body:new URLSearchParams(Object.assign({moquiSessionToken:token}, data))}).then(function (r) {
+            if (!r.ok) throw new Error('Approval could not be checked. Reconnect and try again.');
+            return r.json();
+        });
+    }
+    function promptApproval(canApprove, items, submit) {
+        return new Promise(function (resolve, reject) {
+            if (document.getElementById('pos-free-approval')) { reject(new Error('Finish the open approval first.')); return; }
+            var previous = document.activeElement, ov = document.createElement('div');
+            ov.id = 'pos-free-approval';ov.setAttribute('role','dialog');ov.setAttribute('aria-modal','true');ov.setAttribute('aria-labelledby','pos-free-title');
+            ov.style.cssText = 'position:fixed;inset:0;z-index:2147483640;background:#17132d99;display:flex;align-items:center;justify-content:center;padding:16px';
+            ov.innerHTML = '<form style="background:#fff;color:#172033;border:1px solid #e4ddf4;border-radius:16px;padding:24px;width:440px;max-width:100%;max-height:90vh;overflow:auto;box-shadow:0 16px 50px #17132d44">'
+                + '<h2 id="pos-free-title" style="font-size:20px;margin:0 0 12px">Approve free items</h2>'
+                + '<p style="font-size:14px">Review these free items. Changes require approval again.</p><ul data-free-items style="font-size:14px;padding-left:20px;max-height:150px;overflow:auto"></ul>'
+                + '<label style="display:block">Reason<textarea name="freeReason" required maxlength="500" rows="3" style="display:block;width:100%;box-sizing:border-box;margin:6px 0 14px;padding:10px;border:1px solid #c9bfdc;border-radius:8px;color:#172033;background:#fff"></textarea></label>'
+                + (canApprove ? '<p>Your signed-in manager account will be recorded.</p>' : '<label style="display:block">Shop manager PIN<input name="freePin" type="password" inputmode="numeric" autocomplete="off" required maxlength="6" style="display:block;width:100%;box-sizing:border-box;margin:6px 0 14px;padding:10px;border:1px solid #c9bfdc;border-radius:8px;color:#172033;background:#fff"></label>')
+                + '<p role="alert" style="color:#b91c1c;font-size:14px"></p><div style="display:flex;gap:10px;justify-content:flex-end"><button type="button" data-cancel style="padding:10px 16px;border:1px solid #d4cce5;border-radius:8px;background:#fff;color:#172033">Cancel</button><button type="submit" style="padding:10px 16px;border:0;border-radius:8px;background:#7c3aed;color:#fff">Approve &amp; continue</button></div></form>';
+            document.body.appendChild(ov);var form=ov.querySelector('form'),button=form.querySelector('[type=submit]'),pending=false;
+            (items || []).forEach(function(item){var row=document.createElement('li');row.textContent=(item.name || item.product)+' × '+item.quantity;form.querySelector('[data-free-items]').appendChild(row);});
+            function close() { form.reset();ov.remove();if(previous && previous.isConnected) previous.focus(); }
+            function cancel() { if(pending)return;close();reject(new Error('Free-item approval cancelled. The bill was not submitted.')); }
+            ov.querySelector('[data-cancel]').onclick=cancel;
+            ov.addEventListener('keydown',function(e){
+                if(e.key==='Escape'){e.preventDefault();e.stopPropagation();cancel();}
+                if(e.key==='Tab'){var nodes=Array.from(form.querySelectorAll('textarea,input,button')).filter(function(n){return !n.disabled;});if(e.shiftKey && document.activeElement===nodes[0]){e.preventDefault();nodes[nodes.length-1].focus();}else if(!e.shiftKey && document.activeElement===nodes[nodes.length-1]){e.preventDefault();nodes[0].focus();}}
+            });
+            form.onsubmit=function(e){e.preventDefault();e.stopPropagation();if(pending)return;
+                var reason=form.elements.freeReason.value.trim();if(!reason){form.elements.freeReason.focus();return;}
+                pending=true;button.disabled=true;
+                Promise.resolve().then(function(){return submit({reason:reason,managerPin:form.elements.freePin ? form.elements.freePin.value : ''});})
+                    .then(function(value){close();resolve(value);}).catch(function(error){pending=false;button.disabled=false;form.querySelector('[role=alert]').textContent=error.message;});
+            };
+            form.elements.freeReason.focus();
+        });
+    }
+    function ensure(transactionId, token) {
+        return api('freeItemState',{transactionId:transactionId},token).then(function(state){
+            if(!state.success)throw new Error(state.error || 'Approval could not be checked.');
+            if(!state.required)return;
+            return promptApproval(state.canApprove,state.freeItems,function(values){
+                return api('approveFreeItems',Object.assign({transactionId:transactionId,expectedFingerprint:state.approvalFingerprint},values),token).then(function(result){
+                    if(!result.success)throw new Error(result.error || 'Approval failed.');
+                });
+            });
+        });
+    }
+    function amendmentFetch(url, options, params, token) {
+        return fetch(url,options).then(function(response){
+            return response.clone().json().then(function(data){
+                if(!data.needFreeApproval)return response;
+                return api('freeItemState',{transactionId:params.editTxId},token).then(function(state){
+                    if(!state.success)throw new Error(state.error || 'Approval could not be checked.');
+                    return promptApproval(state.canApprove,data.freeItems,function(values){
+                        var revised=Object.assign({},params,{freeItemReason:values.reason,freeItemManagerPin:values.managerPin,freeItemFingerprint:data.approvalFingerprint});
+                        return fetch(url,Object.assign({},options,{body:new URLSearchParams(revised)})).then(function(retry){
+                            return retry.clone().json().then(function(result){if(!result.success)throw new Error(result.error || 'The edit was not saved.');return retry;});
+                        });
+                    });
+                });
+            });
+        });
+    }
+    return {ensure:ensure,amendmentFetch:amendmentFetch};
+})();
+
 // Receipt values are plain text. Clone/escape at the HTML boundary, preserving numbers.
 window._posReceiptTextData=function receiptText(value){
     if(typeof value==='string')return value.replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});
@@ -302,7 +375,7 @@ window._posOffline = (function() {
         h+='<div class="c b" style="margin-top:6px">Thank You !!</div><div class="c" style="font-size:7px;color:#666;margin-top:4px">Powered by ZetaERP &middot; www.zetaclantech.com</div></div>';
         h+='<script>window.onload=function(){window.print();}<\/script></body></html>';
         var f=document.getElementById('pos-offline-frame'); if(!f){ f=document.createElement('iframe'); f.id='pos-offline-frame'; f.style.cssText='position:fixed;left:-9999px;top:-9999px;width:80mm;height:0;border:none'; document.body.appendChild(f); } var d=f.contentDocument||f.contentWindow.document; d.open(); d.write(h); d.close(); }
-    function pay(method){ if(!cart.length) return; if(taxEnabled() && cart.some(function(it){return it.taxRate==null;})){toast('Tax cache unavailable. Reconnect before completing this sale.','#c62828');return;} var c=tCtx(); var total=payable();
+    function pay(method){ if(!cart.length) return; var _fia=document.getElementById('pos-free-item-approval'); if(_fia&&_fia.value==='Y'&&cart.some(function(it){return Number(it.price)<=0;})){toast('Free items need online manager approval. Reconnect to complete this bill.','#c62828');return;} if(taxEnabled() && cart.some(function(it){return it.taxRate==null;})){toast('Tax cache unavailable. Reconnect before completing this sale.','#c62828');return;} var c=tCtx(); var total=payable();
         var sale={ offlineId:'OFL-'+Date.now()+'-'+Math.floor(Math.random()*100000), organizationPartyId:orgId, taxOn:taxEnabled()?'Y':'N', terminalId:c.terminalId, sessionId:c.sessionId, items:cart.map(function(it){return {productId:it.productId,name:it.name,qty:it.qty,price:it.price,uom:it.uom};}), total:total, taxAmount:cart.reduce(function(a,it){return a+taxAmount(it);},0), roundOff:total-cart.reduce(function(a,it){return a+it.qty*it.price+taxAmount(it);},0), paymentMethod:method, ts:new Date().toISOString() };
         enqueue(sale).then(function(){ printReceipt(sale); cart=[]; render(); banner(true); toast('✔ Sale saved offline ('+method+') — will sync when online','#2e7d32'); }).catch(function(){toast('Sale NOT saved. Keep this cart and retry.','#c62828');}); }
     function removeSynced(ids){ return ensureDb().then(function(d){ if(!d) return; return new Promise(function(res,rej){ var tx=d.transaction(['queue'],'readwrite'); ids.forEach(function(id){tx.objectStore('queue').delete(id);}); tx.oncomplete=function(){res();};tx.onerror=function(){rej(new Error('Queue update failed'));}; }); }); }
@@ -477,7 +550,8 @@ window._posOffline = (function() {
                 if (_tsel && _tsel.value) params.terminalId = _tsel.value;
             }
             params.moquiSessionToken = histToken();
-            return fetch(ajaxCartUrl(), {   // ZE-POS-0211: absolute (was relative 'Terminal/ajaxCart' -> broke on a trailing-slash page URL)
+            var send = params.action === 'amendBill' ? function(url, options) { return window.PosFreeItems.amendmentFetch(url, options, params, histToken()); } : fetch;
+            return send(ajaxCartUrl(), {   // ZE-POS-0211: absolute (was relative 'Terminal/ajaxCart' -> broke on a trailing-slash page URL)
                 method: 'POST', headers: {'Content-Type': 'application/x-www-form-urlencoded'},
                 body: new URLSearchParams(params), credentials: 'same-origin'
             }).then(function(r) { return r.json(); });
@@ -1649,7 +1723,7 @@ window.posPayDigital = function(form) {
     if (window.__posKeysBound) { return; }
     window.__posKeysBound = true;
     document.addEventListener('keydown', function (e) {
-        if (document.getElementById('posCashTenderOverlay') || document.getElementById('posPayConfirmOverlay')) { return; }
+        if (document.getElementById('pos-free-approval') || document.getElementById('posCashTenderOverlay') || document.getElementById('posPayConfirmOverlay')) { return; }
         var tag = (e.target && e.target.tagName) ? e.target.tagName.toUpperCase() : '';
         var typing = (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT');
         function clk(id) { var el = document.getElementById(id); if (el) { e.preventDefault(); el.click(); } }
@@ -1869,7 +1943,7 @@ window.posPayDigital = function(form) {
     function typing(e) { var t = (e.target && e.target.tagName ? e.target.tagName : '').toUpperCase(); return t === 'INPUT' || t === 'TEXTAREA' || t === 'SELECT'; }
 
     document.addEventListener('keydown', function (e) {
-        if (document.getElementById('posCashTenderOverlay') || document.getElementById('posPayConfirmOverlay')) return;
+        if (document.getElementById('pos-free-approval') || document.getElementById('posCashTenderOverlay') || document.getElementById('posPayConfirmOverlay')) return;
         if (typing(e) || document.querySelector('[role=dialog]')) return;
         var k = e.key;
 
@@ -2500,8 +2574,9 @@ window.posToggleFullscreen = function() {
                 hid('upfrontAmount', paidNow.toFixed(2));
                 hid('creditDays',daysInp.value);hid('termsReason',document.getElementById('credit-terms-reason').value);
                 if (paidNow > 0) hid('upfrontMethod', document.getElementById('credit-upfront-method').value);
-                document.body.appendChild(f);
-                f.submit();
+                OPT.whenIdle().then(function(){f.querySelector('[name="transactionId"]').value=TX;return window.PosFreeItems.ensure(TX,TK);}).then(function(){
+                    document.body.appendChild(f);f.submit();
+                }).catch(function(error){btn.disabled=false;btn.textContent='Complete Credit Sale';alert(error.message);});
             });
         };
 
@@ -2768,6 +2843,11 @@ window.posToggleFullscreen = function() {
         // using the same QZ/iframe pipeline when a session is active.
         window._posPrintReceipt = printReceipt;
 
+        function approvedPaymentFetch(url, options) {
+            return OPT.whenIdle().then(function() { options.body.set('transactionId', TX);return window.PosFreeItems.ensure(TX, TK); })
+                .then(function() { return fetch(url, options); });
+        }
+
         /* --- Cart AJAX --- */
         function post(params) {
             if (busy) return Promise.resolve(null);
@@ -3028,11 +3108,13 @@ window.posToggleFullscreen = function() {
                         modeCell = '<span style="display:inline-block;font-size:12px;font-weight:600;padding:3px 8px;border-radius:6px;background:'+_cbg+';color:'+_cfg+'">'+cartText(_mn)+'</span>';
                     }
                 }
-                h += '<td style="padding:3px 10px"><div style="font-size:14px;font-weight:600;color:#000;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+cartText(it.name)+'</div><div style="font-size:11px;color:#555">'+cartText(it.pid)+'</div></td>';
+                h += '<td style="padding:3px 10px"><div style="font-size:14px;font-weight:600;color:#000;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+cartText(it.name)+'</div><div style="font-size:11px;color:#555">'+cartText(it.pid)+'</div>'+(((document.getElementById('pos-free-item-approval')||{}).value==='Y' && (Number(it.price)<=0 || Number(it.total)<=0))?'<small style="display:block;color:#92400e;font-weight:600">Free item · manager approval</small>':'')+'</td>';
                 h += '<td style="padding:3px 8px;text-align:left;vertical-align:middle">'+modeCell+'</td>';
                 h += '<td style="padding:4px 4px;text-align:right;vertical-align:middle"><div style="display:flex;align-items:center;gap:3px;justify-content:flex-end">';
-                h += '<input type="text" inputmode="decimal" value="'+Number(it.price)+'" data-seq="'+cartText(it.seq)+'" class="aj-p" style="width:65px;padding:8px 6px;border:1px solid #ccc;border-radius:6px;font-size:14px;text-align:right;background:#fff;color:#000;box-sizing:border-box"/>';
-                h += '<button data-seq="'+cartText(it.seq)+'" class="aj-pb" style="width:32px;height:32px;border:none;background:#7C3AED;color:#fff;border-radius:6px;cursor:pointer;font-size:14px;display:flex;align-items:center;justify-content:center;padding:0;flex-shrink:0">&#10003;</button>';
+                var priceCapability = document.getElementById('pos-price-override-allowed');
+                var priceAllowed = !priceCapability || priceCapability.value === 'Y';
+                h += '<input type="text" inputmode="decimal" value="'+Number(it.price)+'" data-seq="'+cartText(it.seq)+'" class="aj-p" '+(priceAllowed?'':'readonly title="POS write permission is required to change a bill price."')+' style="width:65px;padding:8px 6px;border:1px solid #ccc;border-radius:6px;font-size:14px;text-align:right;background:#fff;color:#000;box-sizing:border-box"/>';
+                h += '<button data-seq="'+cartText(it.seq)+'" class="aj-pb" '+(priceAllowed?'':'disabled title="POS write permission is required to change a bill price."')+' style="width:32px;height:32px;border:none;background:#7C3AED;color:#fff;border-radius:6px;cursor:pointer;font-size:14px;display:flex;align-items:center;justify-content:center;padding:0;flex-shrink:0">&#10003;</button>';
                 h += '</div></td>';
                 h += '<td style="padding:4px;text-align:center;vertical-align:middle"><div style="display:flex;align-items:center;justify-content:center;gap:0">';
                 h += '<button data-seq="'+cartText(it.seq)+'" data-q="'+(Number(it.qty)-1)+'" class="aj-q" style="width:34px;height:34px;border:2px solid #e53935;background:#fff;font-size:19px;font-weight:bold;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0;border-radius:8px 0 0 8px;color:#e53935">-</button>';
@@ -3932,7 +4014,7 @@ window.posToggleFullscreen = function() {
                 var savedTx = TX;
                 var btn = form.querySelector('button');
                 if (btn) { btn.disabled = true; btn.style.opacity = '0.6'; }
-                fetch(form.action, {method: 'POST', body: new URLSearchParams(fd), credentials: 'same-origin'})
+                approvedPaymentFetch(form.action, {method: 'POST', body: new URLSearchParams(fd), credentials: 'same-origin'})
                     .then(function(r) { return r.json().catch(function() { return {success:false, error:'Payment failed'}; }); })
                     .then(function(d) {
                         if (!d || !d.success) throw new Error((d && d.error) || 'Payment failed');
@@ -3989,7 +4071,7 @@ window.posToggleFullscreen = function() {
                 var savedTx = TX;
                 var btn = form.querySelector('button[type="submit"]');
                 if (btn) { btn.disabled = true; btn.style.opacity = '0.6'; btn.textContent = 'Processing...'; }
-                fetch(form.action, {method: 'POST', body: new URLSearchParams(fd), credentials: 'same-origin'})
+                approvedPaymentFetch(form.action, {method: 'POST', body: new URLSearchParams(fd), credentials: 'same-origin'})
                     .then(function(r) { return r.json().catch(function() { return {success:false, error:'Split payment failed'}; }); })
                     .then(function(d) {
                         if (!d || !d.success) throw new Error((d && d.error) || 'Split payment failed');
@@ -4099,7 +4181,7 @@ window.posToggleFullscreen = function() {
                 params.set('salesModeId', SM); params.set('customerPhone', '');
                 params.set('moquiSessionToken', TK);
                 params.set('wantJson', '1'); // get the print-receipt data back in the same response
-                fetch('Terminal/payAndComplete', {method: 'POST', body: params, credentials: 'same-origin'})
+                approvedPaymentFetch('Terminal/payAndComplete', {method: 'POST', body: params, credentials: 'same-origin'})
                     .then(function(r) { return r.json().catch(function() { return {success:false, error:'Payment failed'}; }); })
                     .then(function(d) {
                         if (!d || !d.success) throw new Error((d && d.error) || 'Payment failed');

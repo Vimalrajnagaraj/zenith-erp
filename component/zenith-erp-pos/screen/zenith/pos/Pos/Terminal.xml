@@ -669,154 +669,12 @@
 
 
 
-    <transition name="updateItemPrice" begin-transaction="true">
-
-
-
+    <transition name="updateItemPrice" method="post" begin-transaction="true">
         <actions>
-
-
-
-            <entity-find-one entity-name="zenith.erp.pos.PosTransactionItem" value-field="item"/>
-
-
-
-            <if condition="!item"><return error="true" message="Item not found"/></if>
-
-
-
-            <set field="newPrice" from="(newPrice as BigDecimal)" type="BigDecimal"/>
-
-
-
-            <if condition="newPrice &lt; 0"><return error="true" message="Price cannot be negative"/></if>
-
-
-
-
-
-
-
-            <entity-find-one entity-name="zenith.erp.pos.PosTransaction" value-field="priceTxn">
-
-
-
-                <field-map field-name="transactionId" from="item.transactionId"/>
-
-
-
-            </entity-find-one>
-
-
-
-
-
-
-
-            <service-call name="create#zenith.erp.pos.PosItemPriceOverride"
-
-
-
-                in-map="[organizationPartyId:priceTxn?.organizationPartyId, transactionId:item.transactionId, itemSeqId:item.itemSeqId,
-
-
-
-                         transactionNumber:priceTxn?.transactionNumber,
-
-
-
-                         productId:item.productId, productName:item.productName,
-
-
-
-                         originalPrice:item.unitPrice, newPrice:newPrice,
-
-
-
-                         changedByPartyId:ec.user.userAccount?.partyId,
-
-
-
-                         changedByUserId:ec.user.userId,
-
-
-
-                         changeDate:ec.user.nowTimestamp,
-
-
-
-                         sessionId:sessionId]"/>
-
-
-
-
-
-
-
-            <set field="qty" from="(item.quantity ?: 1) as BigDecimal" type="BigDecimal"/>
-
-
-
-            <set field="lineSubtotal" from="qty * newPrice" type="BigDecimal"/>
-
-
-
-            <set field="discAmt" from="lineSubtotal * ((item.discountPercent ?: 0) as BigDecimal) / 100" type="BigDecimal"/>
-
-
-
-            <set field="taxableAmount" from="lineSubtotal - discAmt" type="BigDecimal"/>
-
-
-
-            <set field="taxRate" from="(taxOn == 'N') ? BigDecimal.ZERO : ((item.totalTaxAmount != null &amp;&amp; item.taxableAmount != null &amp;&amp; (item.taxableAmount as BigDecimal) != 0) ? ((item.totalTaxAmount as BigDecimal) / (item.taxableAmount as BigDecimal)) : BigDecimal.ZERO)"/>
-
-
-
-            <set field="totalTaxAmount" from="taxableAmount * taxRate" type="BigDecimal"/>
-
-
-
-            <set field="lineTotal" from="taxableAmount + totalTaxAmount" type="BigDecimal"/>
-
-
-
-            <service-call name="update#zenith.erp.pos.PosTransactionItem"
-
-
-
-                          in-map="[transactionId:transactionId, itemSeqId:item.itemSeqId,
-
-
-
-                                   unitPrice:newPrice, discountAmount:discAmt,
-
-
-
-                                   taxableAmount:taxableAmount, totalTaxAmount:totalTaxAmount,
-
-
-
-                                   lineTotal:lineTotal, manualPrice:'Y']"/>
-
-
-
-            <service-call name="zenith.pos.PosServices.recalculate#TransactionTotals"
-
-
-
-                          in-map="[transactionId:transactionId]"/>
-
-
-
+            <service-call name="zenith.pos.PosPriceServices.set#ItemPrice"
+                          in-map="[transactionId:transactionId,itemSeqId:itemSeqId,newPrice:newPrice,taxOn:taxOn ?: 'Y']"/>
         </actions>
-
-
-
         <default-response url="." parameter-map="[sessionId:sessionId, transactionId:transactionId, catId:catId, taxOn:taxOn, salesModeId:salesModeId]"/>
-
-
-
     </transition>
 
 
@@ -1818,6 +1676,22 @@
 
 
 
+    <transition name="freeItemState" method="post"><actions><script><![CDATA[
+        def state = ec.service.sync().name('zenith.pos.PosFreeItemServices.get#FreeItemApprovalState').parameters([transactionId:transactionId]).call()
+        def manager = ec.service.sync().name('zenith.pos.PosFreeItemServices.get#ManagerApprovalAccess').call()
+        ec.web.sendJsonResponse([success:!ec.message.hasError(),required:state?.required,freeItemCount:state?.freeItemCount,freeItems:state?.freeItems,approvalFingerprint:state?.approvalFingerprint,canApprove:manager?.canApprove,error:ec.message.errorsString])
+    ]]></script></actions><default-response type="none"/></transition>
+    <transition name="approveFreeItems" method="post" begin-transaction="true"><actions><script><![CDATA[
+        try {
+            def approval = ec.service.sync().name('zenith.pos.PosFreeItemServices.approve#FreeItems')
+                .parameters([transactionId:transactionId,reason:ec.web.parameters.reason,managerPin:ec.web.parameters.managerPin,expectedFingerprint:ec.web.parameters.expectedFingerprint]).call()
+            ec.web.sendJsonResponse([success:!ec.message.hasError(),approvalId:approval?.approvalId,error:ec.message.errorsString])
+        } catch (Exception ignored) {
+            def message = ec.message.errorsString ?: 'Free items could not be approved.'
+            ec.message.clearErrors();ec.web.sendJsonResponse([success:false,error:message])
+        }
+    ]]></script></actions><default-response type="none"/></transition>
+
     <transition name="touchSession" begin-transaction="true">
         <actions>
             <service-call name="zenith.pos.PosServices.touch#PosSessionActivity" in-map="[sessionId:sessionId]" out-map="_touch"/>
@@ -2133,95 +2007,12 @@
 
 
                     } else if (action == 'updatePrice') {
-
-
-
-                        def item = ec.entity.find("zenith.erp.pos.PosTransactionItem")
-
-
-
-                            .condition("transactionId", transactionId).condition("itemSeqId", p.itemSeqId).one()
-
-
-
-                        if (item) {
-
-
-
-                            def np = null
-                            try { np = new BigDecimal((p.newPrice ?: '').toString()) } catch (Exception ignored) {}
-                            if (np==null || np<0) { ec.web.sendJsonResponse([success:false,error:'Enter a non-negative price.']);return }
-
-
-
-                            def q = (item.quantity ?: 1) as BigDecimal
-
-
-
-                            def ls = q * np
-
-
-
-                            def da = ls * ((item.discountPercent ?: 0) as BigDecimal) / 100
-
-
-
-                            def ta = ls - da
-
-
-
-                            def taxR = BigDecimal.ZERO
-
-
-
-                            if (taxOn != 'N' && item.totalTaxAmount != null && item.taxableAmount != null && (item.taxableAmount as BigDecimal) != 0) {
-
-
-
-                                taxR = (item.totalTaxAmount as BigDecimal) / (item.taxableAmount as BigDecimal)
-
-
-
-                            }
-
-
-
-                            def tt = ta * taxR
-
-
-
-                            def lt = ta + tt
-
-
-
-                            ec.service.sync().name("update#zenith.erp.pos.PosTransactionItem")
-
-
-
-                                .parameters([transactionId:transactionId, itemSeqId:p.itemSeqId,
-
-
-
-                                    unitPrice:np, discountAmount:da, taxableAmount:ta,
-
-
-
-                                    totalTaxAmount:tt, lineTotal:lt, manualPrice:'Y']).call()
-
-
-
-                            ec.service.sync().name("zenith.pos.PosServices.recalculate#TransactionTotals")
-
-
-
-                                .parameters([transactionId:transactionId]).call()
-
-
-
+                        ec.service.sync().name('zenith.pos.PosPriceServices.set#ItemPrice').parameters([
+                            transactionId:transactionId,itemSeqId:p.itemSeqId,newPrice:p.newPrice,taxOn:taxOn]).call()
+                        if (ec.message.hasError()) {
+                            def error = ec.message.errorsString
+                            ec.message.clearErrors(); ec.web.sendJsonResponse([success:false,error:error]); return
                         }
-
-
-
                     } else if (action == 'applyDiscount') {
                         def dTxId = transactionId ?: p.transactionId
                         def dTxn = ec.entity.find("zenith.erp.pos.PosTransaction").condition("transactionId", dTxId).one()
@@ -2926,6 +2717,14 @@
                             ]]
                         if (ec.message.hasError()) throw new IllegalStateException(ec.message.errorsString)
                         }
+                        def freeState = ec.service.sync().name('zenith.pos.PosFreeItemServices.get#FreeItemApprovalState').parameters([transactionId:txId]).call()
+                        if (freeState?.required) {
+                            context.freeApprovalPreview = freeState
+                            if (!p.freeItemReason) throw new IllegalStateException('FREE_ITEM_APPROVAL_REQUIRED')
+                            ec.service.sync().name('zenith.pos.PosFreeItemServices.approve#FreeItems').parameters([
+                                transactionId:txId,reason:p.freeItemReason,managerPin:p.freeItemManagerPin,expectedFingerprint:p.freeItemFingerprint]).call()
+                            if (ec.message.hasError()) throw new IllegalStateException(ec.message.errorsString)
+                        }
                         ec.web.sendJsonResponse(result)
                         return
                     } else if (action == 'listHeld') {
@@ -3156,7 +2955,8 @@
                         ec.transaction.setRollbackOnly('POS bill amendment failed', e)
                         if (ec.message.hasError()) ec.message.clearErrors()
                     }
-                    result = [success:false, error:e.message]
+                    result = [success:false, needFreeApproval:e.message?.contains('FREE_ITEM_APPROVAL_REQUIRED'),
+                        freeItems:context.freeApprovalPreview?.freeItems,approvalFingerprint:context.freeApprovalPreview?.approvalFingerprint,error:e.message]
 
 
 
@@ -3193,6 +2993,10 @@
 
 
     <actions>
+        <service-call name="zenith.pos.PosPriceServices.get#PriceOverrideAccess" out-map="posPriceAccess"/>
+        <!-- Per-org opt-in (default OFF): drives the client offline-checkout free-item block + cart label.
+             The authoritative gate is server-side in PosFreeItemServices.get#FreeItemApprovalState. -->
+        <set field="posFreeItemApproval" from="ec.entity.find('zenith.erp.pos.PosOrgBillingConfig').condition('organizationPartyId', ec.user.getPreference('ACTIVE_ORGANIZATION')).one()?.freeItemApproval == 'Y'"/>
 
         <set field="taxOn" from="taxOn ?: 'N'"/>
 
@@ -5624,7 +5428,9 @@ window.sendWhatsAppWithPdf=function() {
 
 
 
-    <div class="pos-cart" style="width:55%;min-width:300px;display:flex;flex-direction:column;background:#fff;border-left:none">
+    <input type="hidden" id="pos-price-override-allowed" value="${(posPriceAccess.canOverride!false)?string('Y','N')}"/>
+    <input type="hidden" id="pos-free-item-approval" value="${(posFreeItemApproval!false)?string('Y','N')}"/>
+        <div class="pos-cart" style="width:55%;min-width:300px;display:flex;flex-direction:column;background:#fff;border-left:none">
 
 
 
@@ -5769,11 +5575,11 @@ window.sendWhatsAppWithPdf=function() {
 
 
 
-                                    <input type="text" inputmode="decimal" name="newPrice" class="aj-p" data-seq="${item.itemSeqId}" value="${(item.unitPrice!0)?c}" style="width:60px;padding:clamp(5px,0.9vh,8px) 6px;border:1px solid #ccc;border-radius:6px;font-size:14px;text-align:right;background:#fff;color:#333;box-sizing:border-box"/>
+                                    <input type="text" inputmode="decimal" name="newPrice" class="aj-p" <#if !(posPriceAccess.canOverride!false)>readonly title="POS write permission is required to change a bill price."</#if> data-seq="${item.itemSeqId}" value="${(item.unitPrice!0)?c}" style="width:60px;padding:clamp(5px,0.9vh,8px) 6px;border:1px solid #ccc;border-radius:6px;font-size:14px;text-align:right;background:#fff;color:#333;box-sizing:border-box"/>
 
 
 
-                                    <button type="submit" style="width:clamp(27px,3.7vh,32px);height:clamp(27px,3.7vh,32px);border:none;background:#7C3AED;color:#fff;border-radius:6px;cursor:pointer;font-size:14px;display:flex;align-items:center;justify-content:center;padding:0;flex-shrink:0" title="Update Price" class="aj-pb" data-seq="${item.itemSeqId}">&#10003;</button>
+                                    <button type="submit" <#if !(posPriceAccess.canOverride!false)>disabled</#if> style="width:clamp(27px,3.7vh,32px);height:clamp(27px,3.7vh,32px);border:none;background:#7C3AED;color:#fff;border-radius:6px;cursor:pointer;font-size:14px;display:flex;align-items:center;justify-content:center;padding:0;flex-shrink:0" title="Update Price" class="aj-pb" data-seq="${item.itemSeqId}">&#10003;</button>
 
 
 

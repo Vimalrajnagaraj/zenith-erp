@@ -7,7 +7,7 @@ module.exports=async function({a,base,check,q,invoke,post}) {
  const add=async(t,id,quantity,reject=false)=>invoke('add',{transactionId:t.transactionId,productId:id,quantity:String(quantity),taxOn:'N'},reject);
  // An empty operator session is deliberately retired when a new terminal opens.
  // Finish a valid zero-price sale so this session remains active for the two-till race.
- const anchor=await cart(s.sessionId);await add(anchor,'POS_QA_A_FREE',1);await invoke('complete',{transactionId:anchor.transactionId});
+ const anchor=await cart(s.sessionId);await add(anchor,'POS_QA_A_FREE',1);await invoke('approveFree',{transactionId:anchor.transactionId,reason:'Synthetic approved stock-test anchor'});await invoke('complete',{transactionId:anchor.transactionId});
  const s2=await session('POS_QA_A_TERM2');
  const empty=await cart(s.sessionId);await add(empty,'POS_QA_A_EMPTY',1,true);
  check('empty stock cannot create a bill line',Number(q(`SELECT count(*) AS n FROM pos_transaction_item WHERE transaction_id='${empty.transactionId}'`)[0].n)===0);

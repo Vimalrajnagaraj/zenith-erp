@@ -77,6 +77,19 @@
         <default-response type="none"/>
     </transition>
 
+    <transition name="saveModeSelection" method="post"><actions><script><![CDATA[
+        def access = ec.service.sync().name('zenith.pos.PosAccessServices.assert#PosAccess').call()
+        if (!access?.allowed) return
+        def ids = (ec.web.parameters.modeIds ?: '').toString().split(',').collect { it.trim() }.findAll { it }.unique()
+        def modes = ids && ids.size() <= 100 ? ec.entity.find('zenith.erp.pos.PosSalesMode')
+                .condition('salesModeId','in',ids).condition('isActive','Y').list() : []
+        if (!ids || modes.size() != ids.size() || modes.any { it.organizationPartyId && it.organizationPartyId != access.organizationPartyId }) {
+            ec.web.sendJsonResponse([success:false,error:'Select at least one available sales mode.']); return
+        }
+        ec.user.setPreference('POS_PRODUCT_PRICE_MODES_' + access.organizationPartyId,ids.join(','))
+        ec.web.sendJsonResponse([success:true])
+    ]]></script></actions><default-response type="none"/></transition>
+
     <!-- Export the current (filtered) product pricing as CSV. Read-only; honours the same filters. -->
     <transition name="exportCsv" read-only="true">
         <actions>
@@ -87,7 +100,7 @@
                 def availableModes = ec.entity.find('zenith.erp.pos.PosSalesMode').condition('isActive','Y').list()
                     .findAll { !it.organizationPartyId || it.organizationPartyId == posOrg }
                     .sort { a,b -> ((a.salesModeId == 'RETAIL') ? 0 : (a.salesModeId == 'WHOLESALE' ? 1 : 2)) <=> ((b.salesModeId == 'RETAIL') ? 0 : (b.salesModeId == 'WHOLESALE' ? 1 : 2)) ?: (a.modeName ?: '') <=> (b.modeName ?: '') }
-                def requested = (p.modeIds ?: 'RETAIL,WHOLESALE').toString().split(',').collect { it.trim() }.findAll { it }.unique()
+                def requested = (p.modeIds ?: ec.user.getPreference('POS_PRODUCT_PRICE_MODES_' + posOrg) ?: 'RETAIL,WHOLESALE').toString().split(',').collect { it.trim() }.findAll { it }.unique()
                 def selectedModes = availableModes.findAll { requested.contains(it.salesModeId) }
                 if (!selectedModes && availableModes) selectedModes = [availableModes[0]]
                 def catPIds = null
@@ -146,7 +159,7 @@
             priceModeChoices = ec.entity.find('zenith.erp.pos.PosSalesMode').condition('isActive','Y').list()
                 .findAll { !it.organizationPartyId || it.organizationPartyId == posOrg }
                 .sort { a,b -> ((a.salesModeId == 'RETAIL') ? 0 : (a.salesModeId == 'WHOLESALE' ? 1 : 2)) <=> ((b.salesModeId == 'RETAIL') ? 0 : (b.salesModeId == 'WHOLESALE' ? 1 : 2)) ?: (a.modeName ?: '') <=> (b.modeName ?: '') }
-            def requestedIds = (modeIds ?: 'RETAIL,WHOLESALE').toString().split(',').collect { it.trim() }.findAll { it }.unique()
+            def requestedIds = (modeIds ?: ec.user.getPreference('POS_PRODUCT_PRICE_MODES_' + posOrg) ?: 'RETAIL,WHOLESALE').toString().split(',').collect { it.trim() }.findAll { it }.unique()
             selectedPriceModes = priceModeChoices.findAll { requestedIds.contains(it.salesModeId) }
             if (!selectedPriceModes && priceModeChoices) selectedPriceModes = [priceModeChoices[0]]
             selectedModeIds = selectedPriceModes.collect { it.salesModeId }
@@ -202,12 +215,12 @@
             def to = Math.min(from + pageSizeNum, totalCount)
             def pageProds = (from < totalCount) ? filtered.subList(from, to) : []
 
-            // Only selected mode prices are loaded into editable table rows.
+            // Fetch prices for all available modes on this page; toggling columns never discards drafts.
             def pageIds = pageProds.collect { it.productId }
             def modePriceMap = [:]; def wThr = [:]
             if (pageIds) {
                 ec.entity.find("zenith.erp.pos.PosProductModePrice").condition("productId", "in", pageIds).list().each { mp ->
-                    if (selectedModeIds.contains(mp.salesModeId)) modePriceMap[mp.productId + ':' + mp.salesModeId] = mp.price
+                    if (priceModeChoices.any { it.salesModeId == mp.salesModeId }) modePriceMap[mp.productId + ':' + mp.salesModeId] = mp.price
                     if (mp.salesModeId == 'WHOLESALE') wThr[mp.productId] = mp.thresholdQty
                 }
             }
@@ -222,7 +235,7 @@
             }
             rows = pageProds.collect { pr ->
                 def _r = rateOf(pr); def prices = [:]
-                selectedPriceModes.each { mode ->
+                priceModeChoices.each { mode ->
                     def value = mode.priceSource == 'PpsFixedProduct' ? modePriceMap[pr.productId + ':' + mode.salesModeId] : pr.mrpAmount
                     if (mode.priceSource == 'PpsDiscountMrp' && value != null) value = (value as BigDecimal) * (1G - ((mode.discountPercent ?: 0) as BigDecimal) / 100G)
                     prices[mode.salesModeId] = value == null ? '' : (value as BigDecimal).setScale(2, java.math.RoundingMode.HALF_UP).stripTrailingZeros().toPlainString()
@@ -248,7 +261,7 @@
 
     <widgets>
         <render-mode><text type="html,qvt" template="true"><![CDATA[
-        <div id="posProductPricing" data-save-url="${sri.buildUrl('savePrices').url?html}" style="padding:20px 24px;font-family:'Segoe UI',Arial,sans-serif;background:#F8F9FC">
+        <div id="posProductPricing" data-save-url="${sri.buildUrl('savePrices').url?html}" data-mode-url="${sri.buildUrl('saveModeSelection').url?html}" style="padding:20px 24px;font-family:'Segoe UI',Arial,sans-serif;background:#F8F9FC">
             <input type="hidden" name="moquiSessionToken" value="${(ec.web.sessionToken!'')?html}"/>
             <!-- Page header -->
             <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:18px">
@@ -297,8 +310,10 @@
                 <details class="pp-mode-picker">
                     <summary><strong>Sales Modes</strong><span class="pp-mode-chips"><#list (selectedPriceModes![]) as mode><span>${mode.modeName?html}</span></#list></span><span aria-hidden="true">&#9662;</span></summary>
                     <div class="pp-mode-options" role="group" aria-label="Sales modes to display">
-                        <#list (priceModeChoices![]) as mode><label><input type="checkbox" class="pp-mode-choice" value="${mode.salesModeId?html}" <#if (selectedModeIds![])?seq_contains(mode.salesModeId)>checked</#if>/>${mode.modeName?html}<#if mode.priceSource != 'PpsFixedProduct' && mode.salesModeId != 'RETAIL'><small>Derived from MRP</small></#if></label></#list>
+                        <#list (priceModeChoices![]) as mode><label><input type="checkbox" class="pp-mode-choice" data-mode-name="${mode.modeName?html}" data-editable="<#if mode.salesModeId == 'RETAIL' || mode.priceSource == 'PpsFixedProduct'>true<#else>false</#if>" value="${mode.salesModeId?html}" <#if (selectedModeIds![])?seq_contains(mode.salesModeId)>checked</#if>/>${mode.modeName?html}<#if mode.priceSource != 'PpsFixedProduct' && mode.salesModeId != 'RETAIL'><small>Derived from MRP</small></#if></label></#list>
                     </div>
+                    <p class="pp-mode-message" role="status" aria-live="polite" style="font-size:12px;padding:8px;margin:0;background:#fff;color:#b91c1c" hidden></p>
+                    <button type="button" class="pp-mode-retry" hidden>Retry saving selection</button>
                 </details>
                 <input type="hidden" name="modeIds" value="${selectedModeIdsCsv?html}"/>
                 <div style="position:relative;flex:1;min-width:220px">
@@ -342,9 +357,9 @@
                         <th style="padding:11px 14px;font-weight:600">Product Name</th>
                         <th style="padding:11px 14px;font-weight:600;width:96px">SKU</th>
                         <th style="padding:11px 8px;font-weight:600;width:64px;text-align:center">GST %</th>
-                        <#list (selectedPriceModes![]) as mode>
-                        <th style="padding:11px 10px;font-weight:600;min-width:135px;text-align:right">${mode.modeName?html} Price <span style="font-weight:400;color:#9CA3AF">(Before GST)</span></th>
-                        <#if mode.salesModeId == 'WHOLESALE'><th style="padding:11px 10px;font-weight:600;min-width:120px;text-align:center">Auto-WS <span style="font-weight:400;color:#9CA3AF">(&rarr; WS at qty)</span></th></#if>
+                        <#list (priceModeChoices![]) as mode>
+                        <th data-pp-mode="${mode.salesModeId?html}" <#if !selectedModeIds?seq_contains(mode.salesModeId)>hidden</#if> style="padding:11px 10px;font-weight:600;min-width:135px;text-align:right">${mode.modeName?html} Price <span style="font-weight:400;color:#9CA3AF">(Before GST)</span></th>
+                        <#if mode.salesModeId == 'WHOLESALE'><th data-pp-mode="${mode.salesModeId?html}" <#if !selectedModeIds?seq_contains(mode.salesModeId)>hidden</#if> style="padding:11px 10px;font-weight:600;min-width:120px;text-align:center">Auto-WS <span style="font-weight:400;color:#9CA3AF">(&rarr; WS at qty)</span></th></#if>
                         </#list>
                         <th style="padding:11px 10px;font-weight:600;width:96px;text-align:center">Action</th>
                     </tr>
@@ -356,15 +371,15 @@
                         <td style="padding:9px 14px;color:#111827;font-weight:500">${(r.productName)?html}</td>
                         <td style="padding:9px 14px;color:#6B7280;font-size:12.5px">${(r.pseudoId)?html}</td>
                         <td style="padding:7px 8px;text-align:center"><#if (r.gstRate!'')?has_content><span class="zenith-badge primary nd" style="padding:2px 9px;font-size:11.5px">${r.gstRate}%</span><#else><span style="color:#C4C4C4" title="No GST slab set on this product">&mdash;</span></#if></td>
-                        <#list (selectedPriceModes![]) as mode>
-                        <td style="padding:7px 10px">
+                        <#list (priceModeChoices![]) as mode>
+                        <td data-pp-mode="${mode.salesModeId?html}" <#if !selectedModeIds?seq_contains(mode.salesModeId)>hidden</#if> style="padding:7px 10px">
                           <#if mode.salesModeId == 'RETAIL' || mode.priceSource == 'PpsFixedProduct'>
-                            <input class="pp-mode-price pp-price" data-mode-id="${mode.salesModeId?html}" aria-label="${mode.modeName?html} price for ${r.productName?html}" type="number" min="0" step="0.01" value="${(r.modePrices[mode.salesModeId]!'')?html}" <#if mode.salesModeId != 'RETAIL'>placeholder="blank = blocked"</#if> style="width:100%;text-align:right;padding:6px;border:1px solid #ccc;border-radius:5px;font-size:14px;box-sizing:border-box"/><div class="pp-incl" style="font-size:10px;color:#888;text-align:right;height:13px;line-height:13px;margin-top:1px"></div>
+                            <input <#if !selectedModeIds?seq_contains(mode.salesModeId)>disabled</#if> class="pp-mode-price pp-price" data-mode-id="${mode.salesModeId?html}" aria-label="${mode.modeName?html} price for ${r.productName?html}" type="number" min="0" step="0.01" value="${(r.modePrices[mode.salesModeId]!'')?html}" <#if mode.salesModeId != 'RETAIL'>placeholder="blank = blocked"</#if> style="width:100%;text-align:right;padding:6px;border:1px solid #ccc;border-radius:5px;font-size:14px;box-sizing:border-box"/><div class="pp-incl" style="font-size:10px;color:#888;text-align:right;height:13px;line-height:13px;margin-top:1px"></div>
                           <#else><span class="pp-derived-price">${(r.modePrices[mode.salesModeId]!'')?html}</span><small class="pp-derived-note">Derived from MRP</small></#if>
                         </td>
-                        <#if mode.salesModeId == 'WHOLESALE'><td style="padding:7px 10px;text-align:center;white-space:nowrap"><label class="pp-switch" title="Auto-switch this Retail line to the Wholesale price at a quantity"><input type="checkbox" class="pp-wstoggle" <#if (r.wholesaleThreshold!'')?has_content>checked</#if>/><span class="pp-switch-sl"></span></label><span class="pp-wswrap" style="<#if (r.wholesaleThreshold!'')?has_content>display:inline-flex<#else>display:none</#if>;align-items:center;gap:3px;margin-left:7px;font-size:11px;color:#6B7280">at <input class="pp-wsthreshold" type="number" step="1" min="0" value="${r.wholesaleThreshold}" placeholder="qty" style="width:50px;text-align:center;padding:4px 5px;border:1px solid #ccc;border-radius:5px;font-size:12.5px;box-sizing:border-box"/></span></td></#if>
+                        <#if mode.salesModeId == 'WHOLESALE'><td data-pp-mode="${mode.salesModeId?html}" <#if !selectedModeIds?seq_contains(mode.salesModeId)>hidden</#if> style="padding:7px 10px;text-align:center;white-space:nowrap"><label class="pp-switch" title="Auto-switch this Retail line to the Wholesale price at a quantity"><input type="checkbox" class="pp-wstoggle" <#if (r.wholesaleThreshold!'')?has_content>checked</#if>/><span class="pp-switch-sl"></span></label><span class="pp-wswrap" style="<#if (r.wholesaleThreshold!'')?has_content>display:inline-flex<#else>display:none</#if>;align-items:center;gap:3px;margin-left:7px;font-size:11px;color:#6B7280">at <input class="pp-wsthreshold" type="number" step="1" min="0" value="${r.wholesaleThreshold}" placeholder="qty" style="width:50px;text-align:center;padding:4px 5px;border:1px solid #ccc;border-radius:5px;font-size:12.5px;box-sizing:border-box"/></span></td></#if>
                         </#list>
-                        <td style="padding:7px 10px;text-align:center"><#if hasEditableSelectedMode><button type="button" class="pp-save" style="padding:7px 14px;background:#2e7d32;color:#fff;border:none;border-radius:6px;font-size:13px;font-weight:700;cursor:pointer">Save</button><#else><span style="color:#9CA3AF">View only</span></#if></td>
+                        <td style="padding:7px 10px;text-align:center"><button type="button" class="pp-save" <#if !hasEditableSelectedMode>hidden</#if> style="padding:7px 14px;background:#2e7d32;color:#fff;border:none;border-radius:6px;font-size:13px;font-weight:700;cursor:pointer">Save</button><span class="pp-view-only" <#if hasEditableSelectedMode>hidden</#if> style="color:#9CA3AF">View only</span></td>
                     </tr>
                     </#list>
                     <#if !(rows?has_content)>

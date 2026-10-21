@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+    <service verb="get" noun="ManagerApprovalAccess" authenticate="true">
+        <out-parameters><parameter name="canApprove" type="Boolean"/></out-parameters>
+        <actions>
+            <service-call name="zenith.base.SecurityServices.check#ModuleWriteAccess" in-map="[moduleId:'pos']" out-map="permission"/>
+            <set field="canApprove" from="permission.canWrite == true &amp;&amp; ['ADMIN','ZENITH_ADMIN','ZENITH_STORE_MGR'].any { ec.user.isInGroup(it) }"/>
+        </actions>
+    </service>
+    <!-- PIN attempts commit independently: a rejected sale cannot roll back its attempt counter. -->
+    <service verb="verify" noun="ShopManagerPin" authenticate="true" transaction="force-new">
+        <in-parameters><parameter name="managerPin"/></in-parameters>
+        <out-parameters><parameter name="valid" type="Boolean"/></out-parameters>
+        <actions>
+            <set field="valid" from="false"/>
+            <service-call name="zenith.pos.PosAccessServices.assert#PosAccess" out-map="access"/>
+            <if condition="!access.allowed"><return/></if>
+            <script><![CDATA[
+                // Lock the existing shop PIN row to serialize the first attempt as well as retries.
+                def pin = ec.entity.find('moqui.security.UserPreference').condition('userId',access.organizationPartyId)
+                        .condition('preferenceKey','POS_DISC_PIN').forUpdate(true).one()
+                if (!pin?.preferenceValue) return
+                def attempt = ec.entity.find('zenith.erp.pos.PosManagerPinAttempt').condition('organizationPartyId',access.organizationPartyId)
+                        .condition('userId',ec.user.userId).forUpdate(true).one()
+                if (attempt?.lockedUntil && attempt.lockedUntil > ec.user.nowTimestamp) return
+                valid = java.security.MessageDigest.isEqual(pin.preferenceValue.getBytes('UTF-8'),(managerPin ?: '').toString().getBytes('UTF-8'))
+                def failed = valid ? 0 : ((attempt?.lockedUntil ? 0 : (attempt?.failedAttempts ?: 0)) as int) + 1
+                def values = [organizationPartyId:access.organizationPartyId,userId:ec.user.userId,failedAttempts:failed,
+                    lockedUntil:failed >= 5 ? new java.sql.Timestamp(ec.user.nowTimestamp.time + 300000L) : null]
+                if (attempt) { attempt.setAll(values); attempt.update() }
+                else ec.entity.makeValue('zenith.erp.pos.PosManagerPinAttempt').setAll(values).create()
+            ]]></script>
+        </actions>
+    </service>
+    <service verb="get" noun="FreeItemApprovalState" authenticate="true">
+        <in-parameters><parameter name="transactionId" required="true"/></in-parameters>
+        <out-parameters><parameter name="required" type="Boolean"/><parameter name="freeItemCount" type="Integer"/>
+            <parameter name="fingerprint"/><parameter name="approvalFingerprint"/><parameter name="freeItems" type="List"/>
+            <parameter name="snapshotJson"/><parameter name="approvalId"/></out-parameters>
+        <actions>
+            <service-call name="zenith.pos.PosAccessServices.assert#PosAccess" in-map="[transactionId:transactionId]" out-map="access"/>
+            <if condition="!access.allowed"><return/></if>
+            <script><![CDATA[
+                def lines = ec.entity.find('zenith.erp.pos.PosTransactionItem').condition('transactionId',transactionId).orderBy('itemSeqId').list()
+                def free = lines.findAll { ((it.unitPrice ?: 0) as BigDecimal) <= 0 || ((it.lineTotal ?: 0) as BigDecimal) <= 0 }
+                freeItemCount = free.size()
+                def decimal = { value -> ((value ?: 0) as BigDecimal).stripTrailingZeros().toPlainString() }
+                // The row stamp prevents reusing an approval after a free line is changed and restored.
+                snapshotJson = groovy.json.JsonOutput.toJson(free.collect { line ->
+                    [seq:line.itemSeqId,product:line.productId,mode:line.salesModeId,quantity:decimal(line.quantity),
+                     price:decimal(line.unitPrice),discount:decimal(line.discountAmount),total:decimal(line.lineTotal),stamp:line.lastUpdatedStamp?.time]
+                })
+                def txn = ec.entity.find('zenith.erp.pos.PosTransaction').condition('transactionId',transactionId).one()
+                fingerprint = java.security.MessageDigest.getInstance('SHA-256').digest(((txn.sessionId ?: '') + '\n' + snapshotJson).getBytes('UTF-8')).encodeHex().toString()
+                freeItems = free.collect { [seq:it.itemSeqId,product:it.productId,name:it.productName,quantity:decimal(it.quantity),
+                    price:decimal(it.unitPrice),discount:decimal(it.discountAmount),total:decimal(it.lineTotal),mode:it.salesModeId] }
+                // Stable across an amendment's rollback/retry; still bound to the exact displayed contents.
+                approvalFingerprint = java.security.MessageDigest.getInstance('SHA-256')
+                        .digest(((txn.sessionId ?: '') + '\n' + groovy.json.JsonOutput.toJson(freeItems)).getBytes('UTF-8')).encodeHex().toString()
+                def approval = free ? ec.entity.find('zenith.erp.pos.PosFreeItemApproval').condition('organizationPartyId',access.organizationPartyId)
+                        .condition('transactionId',transactionId).condition('fingerprint',fingerprint).orderBy('-approvalDate').one() : null
+                approvalId = approval?.approvalId
+                // Per-org opt-in (default OFF): the approval gate is inert unless the organization
+                // has PosOrgBillingConfig.freeItemApproval='Y'. No config row => no gate (no-op).
+                def _billingCfg = ec.entity.find('zenith.erp.pos.PosOrgBillingConfig').condition('organizationPartyId',access.organizationPartyId).one()
+                required = (_billingCfg?.freeItemApproval == 'Y') && freeItemCount > 0 && !approvalId
+            ]]></script>
+        </actions>
+    </service>
+    <service verb="approve" noun="FreeItems" authenticate="true">
+        <in-parameters><parameter name="transactionId" required="true"/><parameter name="reason" required="true"/>
+            <parameter name="managerPin"/><parameter name="expectedFingerprint" required="true"/></in-parameters>
+        <out-parameters><parameter name="approvalId"/></out-parameters>
+        <actions>
+            <service-call name="zenith.pos.PosAccessServices.assert#PosAccess" in-map="[transactionId:transactionId]" out-map="access"/>
+            <if condition="!access.allowed"><return/></if>
+            <service-call name="zenith.base.SecurityServices.check#ModuleWriteAccess" in-map="[moduleId:'pos']" out-map="write"/>
+            <if condition="!write.canWrite"><return error="true" message="POS write permission is required."/></if>
+            <if condition="!reason?.trim() || reason.trim().length() &gt; 500"><return error="true" message="Enter a free-item reason from 1 to 500 characters."/></if>
+            <set field="txn" from="ec.entity.find('zenith.erp.pos.PosTransaction').condition('transactionId',transactionId).forUpdate(true).one()"/>
+            <if condition="!(txn.statusId in ['PtCreated','PtCompleted'])"><return error="true" message="Only an open or issued bill can be approved."/></if>
+            <service-call name="zenith.pos.PosFreeItemServices.get#FreeItemApprovalState" in-map="[transactionId:transactionId]" out-map="state"/>
+            <if condition="expectedFingerprint != state.approvalFingerprint"><return error="true" message="The free items changed. Cancel and reopen approval to review the current bill."/></if>
+            <service-call name="zenith.pos.PosFreeItemServices.get#ManagerApprovalAccess" out-map="manager"/>
+            <if condition="!manager.canApprove">
+                <service-call name="zenith.pos.PosFreeItemServices.verify#ShopManagerPin" in-map="[managerPin:managerPin]" out-map="pin"/>
+                <if condition="!pin.valid"><return error="true" message="Manager approval required: use this shop's manager PIN or ask a manager to sign in. After 5 failed attempts, wait 5 minutes."/></if>
+            </if>
+            <if condition="!state.freeItemCount"><return error="true" message="There are no free items to approve."/></if>
+            <if condition="state.approvalId"><set field="approvalId" from="state.approvalId"/><return/></if>
+            <service-call name="create#zenith.erp.pos.PosFreeItemApproval" out-map="context" in-map="[organizationPartyId:access.organizationPartyId,
+                transactionId:transactionId,sessionId:txn.sessionId,fingerprint:state.fingerprint,snapshotJson:state.snapshotJson,
+                reason:reason.trim(),approvalDate:ec.user.nowTimestamp,requestedByUserId:ec.user.userId,
+                approvedByUserId:manager.canApprove ? ec.user.userId : null,approvalMethod:manager.canApprove ? 'ManagerLogin' : 'ShopManagerPin']"/>
+        </actions>
+    </service>
+    <service verb="assert" noun="FreeItemsApproved" authenticate="true">
+        <in-parameters><parameter name="transactionId" required="true"/></in-parameters>
+        <actions>
+            <service-call name="zenith.pos.PosFreeItemServices.get#FreeItemApprovalState" in-map="[transactionId:transactionId]" out-map="state"/>
+            <if condition="state.required"><return error="true" message="Manager approval and a reason are required for free items. Approve the current free items before payment or saving."/></if>
+        </actions>
+    </service>
+</services>
