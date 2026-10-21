@@ -17,7 +17,7 @@ The shared Tax native form now uses its existing light palette explicitly, inclu
 - Chrome, Edge and WebKit: 21/21 runner cases, including six targeted scenarios per engine across `/apps` and `/qapps`, default/hover/focus/disabled/selected text, keyboard selection and zero registration writes. No unhandled script exception was observed.
 - Modal bounds and Create-button reachability: 1366, 800, 390 and 320 px.
 - Existing Tax acceptance: 70/70 service cases and 37/37 browser cases, including create/edit persistence, country → region, CSRF, foreign-record denial and read-only roles.
-- The synthetic cross-module supplier fixture now has the Supplier role that current Purchase validation requires; no application rule was weakened.
+- Acceptance uses the synthetic supplier's Supplier role required by current Purchase validation. That equivalent fixture correction is already on master; no application rule was weakened.
 - Four repository guards pass; changed XML/JavaScript parse and `git diff --check` pass.
 - Requested `npm run test` and `npm run build` both fail ENOENT (-4058): this Moqui repository has no root package.json. They are not counted as passes.
 
