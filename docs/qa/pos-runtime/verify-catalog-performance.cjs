@@ -103,9 +103,15 @@ module.exports = async function ({a, foreign, base, check, q, invoke}) {
         });
         check('removing another row preserves the remaining price draft while renumbering',removal.connected&&removal.focused&&removal.draft==='209.50'&&removal.rows===1,removal);
         await p.waitForLoadState('networkidle');
-        await p.evaluate(()=>document.activeElement.blur());
-        await p.keyboard.press('Tab');await p.keyboard.press('7');await p.keyboard.press('Enter');
-        await p.waitForLoadState('networkidle');
+        await p.locator('.pos-cart-heading h2').click();
+        await p.keyboard.press('Tab');
+        await p.waitForFunction(()=>document.getElementById('posZoneHint')?.textContent.includes('CART LINE'));
+        await p.keyboard.press('7');
+        await p.waitForFunction(()=>document.getElementById('posZoneHint')?.textContent.includes('SET QTY'));
+        const savedQuantity=p.waitForResponse(r=>r.request().method()==='POST'&&r.url().includes('/ajaxCart')&&
+            new URLSearchParams(r.request().postData()||'').get('action')==='updateQty'&&
+            new URLSearchParams(r.request().postData()||'').get('newQty')==='7');
+        await p.keyboard.press('Enter');await savedQuantity;
         const keyed=q(`SELECT quantity FROM pos_transaction_item WHERE transaction_id='${cart.transactionId}' AND product_id='POS_QA_A_P5'`)[0];
         check('numeric keyboard entry remains an absolute quantity edit',Number(keyed.quantity)===7,keyed);
     } finally {
