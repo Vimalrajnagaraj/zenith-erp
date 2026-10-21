@@ -43,6 +43,8 @@ module.exports = async ({a,foreign,base,check,q,invoke,post,out,sessionId,accoun
   check(shell+' cancelling Delete keeps the whole card',await card.count()===1&&q(`SELECT is_active FROM pos_sales_mode WHERE sales_mode_id='${id}'`)[0].is_active==='Y');
   p.once('dialog',d=>d.accept());await card.getByRole('button',{name:'Delete '+name,exact:true}).click();await p.waitForLoadState('networkidle');
   check(shell+' Delete removes the entire card and icon',await p.locator('.smode-tile').filter({hasText:name}).count()===0);
+  await post('SalesMode','updateMode',{salesModeId:id,modeName:name,modeCode:code,priceSource:'PpsMrp',isActive:'Y'});
+  check(shell+' stale edit cannot resurrect a deleted mode',q(`SELECT is_active FROM pos_sales_mode WHERE sales_mode_id='${id}'`)[0].is_active==='N');
   check(shell+' archived mode absent from assignment and rule options',await p.locator(`option[value="${id}"]`).count()===0);
   await p.reload({waitUntil:'networkidle'});
   check(shell+' deleted mode stays absent after reload',await p.locator('.smode-tile').filter({hasText:name}).count()===0);
