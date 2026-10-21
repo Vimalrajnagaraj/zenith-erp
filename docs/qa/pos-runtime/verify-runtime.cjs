@@ -20,6 +20,7 @@ const rows=(table,where)=>q(`SELECT * FROM ${table} WHERE ${where}`),count=(tabl
  const a=await account('pos.qa');const foreign=await account('pos.b.qa');const p=a.p;p.on('pageerror',e=>report.consoleErrors.push({url:p.url(),message:e.message,stack:e.stack}));
  async function post(screen,transition,params={},actor=a,csrf=true,shell='apps'){return actor.c.request.post(`${base}/${shell}/zenith/pos/${screen}/${transition}`,{form:{...(csrf?{moquiSessionToken:actor.t}:{}),...params},maxRedirects:0});}
  async function invoke(op,params={},reject=false,actor=a){const r=await post('PosQaAcceptance','invoke',{op,...params},actor);let b;try{b=await r.json()}catch{b={errors:[(await r.text()).slice(0,160)]}}check(op+(reject?' rejected':' succeeded'),reject?(r.status()===403||b.errors?.length>0):r.status()===200&&!b.errors?.length,{status:r.status(),...b});return b.result||{};}
+ if(process.env.POS_QA_UI_ONLY!=='true')await require('./verify-catalog-performance.cjs')({a,foreign,base,check,q,invoke,post,out});
  if(process.env.POS_QA_UI_ONLY!=='true'){
  await require('./verify-pricing-save.cjs')({a,foreign,base,check,q,out});
  const terminalDraft={terminalId:'POS_QA_A_NEW_TERM',terminalName:'Disposable POS new terminal',facilityId:'POS_QA_A_FAC',organizationPartyId:'POS_QA_A',stateCode:'33',isActive:'Y'};

@@ -63,6 +63,48 @@
 
     <!-- ==================== TRANSITIONS ==================== -->
 
+    <!-- Read-only, bounded product response; avoids rendering the entire till for a category/search. -->
+    <transition name="productGrid">
+        <actions><script><![CDATA[
+            if (ec.web.request.method!='POST') { ec.web.sendJsonError(405,'Use POST to load products.',null);return }
+            def p=ec.web.parameters
+            def access=ec.service.sync().name('zenith.pos.PosAccessServices.assert#PosAccess')
+                .parameter('sessionId',p.sessionId).call()
+            if (!access?.allowed || !p.sessionId) {
+                ec.web.sendJsonError(403,'Select an authorized POS session.',null);return
+            }
+            def session=ec.entity.find('zenith.erp.pos.PosSession').condition('sessionId',p.sessionId)
+                .condition('organizationPartyId',access.organizationPartyId).one()
+            if (session?.statusId!='PsOpen') {
+                ec.web.sendJsonError(409,'This POS session is closed.',null);return
+            }
+            def modes=ec.service.sync().name('zenith.pos.PosModeServices.get#TerminalModes')
+                .parameter('terminalId',session.terminalId).call().modes ?: []
+            def mode=p.salesModeId ? modes.find { it.salesModeId==p.salesModeId } : (modes.find { it.isDefault=='Y' } ?: modes.find())
+            if (!mode) { ec.web.sendJsonError(400,'Choose an available sales mode.',null);return }
+            def page=ec.service.sync().name('zenith.pos.PosCheckoutServices.get#PosCatalogPage')
+                .parameters([sessionId:p.sessionId,searchTerm:p.searchTerm,catId:p.catId,productOffset:p.productOffset]).call()
+            if (ec.message.hasError()) { ec.web.sendJsonResponse([success:false,error:ec.message.errorsString]);return }
+            def prices=[:]
+            if (mode.priceSource=='PpsFixedProduct' && page.gridProducts) {
+                ec.entity.find('zenith.erp.pos.PosProductModePrice').condition('organizationPartyId',access.organizationPartyId)
+                    .condition('salesModeId',mode.salesModeId).condition('productId','in',page.gridProducts*.productId).list()
+                    .each { prices[it.productId]=it.price }
+            }
+            def cards=page.gridProducts.collect { product ->
+                def price=mode.priceSource=='PpsFixedProduct' ? prices[product.productId] : product.mrpAmount
+                def blocked=mode.priceSource=='PpsFixedProduct' && price==null
+                def stock=page.gridCardStock[product.productId] ?: [:]
+                [productId:product.productId,name:product.productName ?: product.pseudoId ?: '',price:price ?: 0,blocked:blocked,
+                    priceText:blocked ? 'No '+mode.modeName+' price' : '₹'+ec.l10n.format(price ?: 0,'#,##0.##'),
+                    stockText:!stock.tracked ? 'Stock: not tracked' : stock.quantity!=null ? 'Stock: '+ec.l10n.format(stock.quantity,'#,##0.###') : 'Stock: unavailable']
+            }
+            ec.web.sendJsonResponse([success:true,products:cards,hasMore:page.gridHasMore,nextOffset:page.gridNextOffset])
+        ]]></script></actions><default-response type="none"/>
+    </transition>
+
+
+
 
 
     <transition name="openSession" begin-transaction="true">
@@ -3812,59 +3854,13 @@
 
 
 
-            gridProducts = []
-// Limit the first screen's cards and per-product price lookups; "Load more" keeps the rest available.
-gridPageSize = 60
-def rawOffset = (productOffset ?: '0').toString()
-gridOffset = rawOffset ==~ /[0-9]{1,4}/ ? Math.min(rawOffset.toInteger(), 3000) : 0
-gridHasMore = false
-if (searchTerm) {
-    def stLower = searchTerm.toLowerCase()
-    def allProds = ec.entity.find("mantle.product.Product")
-        .condition([productTypeEnumId:'PtAsset', ownerPartyId: posOrg])
-        .orderBy("productName,productId").limit(3000).list()
-    def matches = allProds.findAll { pr ->
-        (pr.productName ?: '').toLowerCase().contains(stLower) ||
-        (pr.pseudoId ?: '').toLowerCase().contains(stLower) ||
-        (pr.productId ?: '').toLowerCase().contains(stLower)
-    }
-    gridProducts = gridOffset < matches.size() ? matches.subList(gridOffset, Math.min(matches.size(), gridOffset + gridPageSize + 1)) : []
-} else if (catId) {
-    def members = ec.entity.find("mantle.product.category.ProductCategoryMember")
-        .condition("productCategoryId", catId)
-        .conditionDate("fromDate", "thruDate", ec.user.nowTimestamp)
-        .orderBy("sequenceNum,productId").list()
-    def pIds = members.collect { it.productId }
-    if (pIds) {
-        gridProducts = ec.entity.find("mantle.product.Product")
-            .condition("productId", org.moqui.entity.EntityCondition.ComparisonOperator.IN, pIds)
-            .condition([ownerPartyId: posOrg, productTypeEnumId: 'PtAsset'])
-            .offset(gridOffset).limit(gridPageSize + 1).orderBy("productName,productId").list()
-    }
-} else {
-    gridProducts = ec.entity.find("mantle.product.Product")
-        .condition([productTypeEnumId:'PtAsset', ownerPartyId: posOrg])
-        .offset(gridOffset).limit(gridPageSize + 1).orderBy("productName,productId").list()
-}
-if (gridProducts.size() > gridPageSize) {
-    gridHasMore = true
-    gridProducts = gridProducts.subList(0, gridPageSize)
-}
-gridNextOffset = gridOffset + gridProducts.size()
-gridCardStock=[:]
-if (sessionId && gridProducts) gridCardStock=ec.service.sync().name('zenith.pos.PosCheckoutServices.get#PosCardStock')
-    .parameters([sessionId:sessionId,productIds:gridProducts*.productId]).call().stock ?: [:]
-
-// Show the live Pricing-module price on grid cards when this shop uses price lists (else the product MRP).
-            // No-op (one count query) for shops without price lists, so the POS stays fast and unchanged.
-            def _hasPL = ec.entity.find("zenith.erp.pricing.PriceList").condition("organizationPartyId", posOrg).condition("priceListTypeEnumId","PltSelling").count() != 0
-            if (_hasPL && gridProducts) {
-                for (gp in gridProducts) {
-                    try {
-                        def _pr = ec.service.sync().name("zenith.pricing.PricingServices.calculate#Price").parameters([productId:gp.productId, quantity:1, organizationPartyId:posOrg, salesChannelEnumId:"ScPos"]).call()
-                        if (_pr?.unitPrice != null && (_pr.unitPrice as BigDecimal).signum() == 1) gp.mrpAmount = _pr.unitPrice
-                    } catch (Throwable e) { }
-                }
+            gridProducts=[]; gridCardStock=[:]; gridHasMore=false; gridNextOffset=0; gridOffset=0
+            if (sessionId) {
+                def page=ec.service.sync().name('zenith.pos.PosCheckoutServices.get#PosCatalogPage')
+                    .parameters([sessionId:sessionId,searchTerm:searchTerm,catId:catId,productOffset:productOffset]).call()
+                gridProducts=page.gridProducts ?: []; gridCardStock=page.gridCardStock ?: [:]
+                gridHasMore=page.gridHasMore ?: false; gridNextOffset=page.gridNextOffset ?: 0
+                gridOffset=page.gridOffset ?: 0
             }
             lastBillNo = '-'
             lastBillAmt = '0'
@@ -4582,7 +4578,7 @@ if (sessionId && gridProducts) gridCardStock=ec.service.sync().name('zenith.pos.
                           </div>
                           </#if>
                         ]]></text></render-mode>
-                        <render-mode><text type="html,qvt" template="true"><![CDATA[<img src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" alt="" style="display:none" onload="try{if(location.pathname.indexOf('/qapps/')===0){location.replace(location.href.replace('/qapps/','/apps/'));}}catch(e){}"/><div style="text-align:center;margin-top:18px"><button id="pos-history-btn-ns" type="button" onclick="window.posOpenHistory&amp;&amp;window.posOpenHistory()" style="padding:10px 24px;border-radius:8px;font-size:14px;font-weight:bold;cursor:pointer;background:#7C3AED;color:#fff;border:1px solid #A78BFA">&#128196; View Bill History<span style="margin-left:7px;padding:1px 6px;border:1px solid rgba(255,255,255,0.7);border-radius:4px;font-size:11px;font-weight:700;opacity:0.9">F9</span></button></div><script src="/zenithstatic/js/pos-terminal.js?v=${ec.resource.getLocationReference('component://zenith-erp-app/screen/zenithstatic/js/pos-terminal.js').getLastModified()?c}"></script>]]></text></render-mode>
+                        <render-mode><text type="html,qvt" template="true"><![CDATA[<img src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" alt="" style="display:none" onload="try{if(location.pathname.indexOf('/qapps/')===0){location.replace(location.href.replace('/qapps/','/apps/'));}}catch(e){}"/><div style="text-align:center;margin-top:18px"><button id="pos-history-btn-ns" type="button" onclick="window.posOpenHistory&amp;&amp;window.posOpenHistory()" style="padding:10px 24px;border-radius:8px;font-size:14px;font-weight:bold;cursor:pointer;background:#7C3AED;color:#fff;border:1px solid #A78BFA">&#128196; View Bill History<span style="margin-left:7px;padding:1px 6px;border:1px solid rgba(255,255,255,0.7);border-radius:4px;font-size:11px;font-weight:700;opacity:0.9">F9</span></button></div><script src="/zenithstatic/js/pos-terminal.js?perf=1&amp;v=${ec.resource.getLocationReference('component://zenith-erp-app/screen/zenithstatic/js/pos-terminal.js').getLastModified()?c}"></script>]]></text></render-mode>
 
 
 
@@ -5311,7 +5307,7 @@ window.sendWhatsAppWithPdf=function() {
 
 
 
-<link rel="stylesheet" href="/zenithstatic/css/pos-checkout.css?v=${ec.resource.getLocationReference('component://zenith-erp-app/screen/zenithstatic/css/pos-checkout.css').getLastModified()?c}"/>
+<link rel="stylesheet" href="/zenithstatic/css/pos-checkout.css?perf=1&amp;v=${ec.resource.getLocationReference('component://zenith-erp-app/screen/zenithstatic/css/pos-checkout.css').getLastModified()?c}"/>
 <div id="pos-terminal-root" class="pos-checkout-reference">
 <script>(function(){try{var m=localStorage.getItem('posLayoutMode');document.body.classList.add(m==='advanced'?'pos-mode-advanced':'pos-mode-normal');}catch(e){try{document.body.classList.add('pos-mode-normal');}catch(_){}}})();</script>
 <#if (modeSwitchError!'')?has_content>
@@ -6254,7 +6250,7 @@ window.sendWhatsAppWithPdf=function() {
 <script src="https://cdn.jsdelivr.net/npm/qz-tray@2.2.4/qz-tray.js"></script>
 
 
-<script src="/zenithstatic/js/pos-terminal.js?v=${ec.resource.getLocationReference('component://zenith-erp-app/screen/zenithstatic/js/pos-terminal.js').getLastModified()?c}"></script>
+<script src="/zenithstatic/js/pos-terminal.js?perf=1&amp;v=${ec.resource.getLocationReference('component://zenith-erp-app/screen/zenithstatic/js/pos-terminal.js').getLastModified()?c}"></script>
 
 
 
