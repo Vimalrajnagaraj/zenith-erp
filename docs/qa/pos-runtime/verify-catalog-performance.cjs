@@ -103,9 +103,17 @@ module.exports = async function ({a, foreign, base, check, q, invoke}) {
         });
         check('removing another row preserves the remaining price draft while renumbering',removal.connected&&removal.focused&&removal.draft==='209.50'&&removal.rows===1,removal);
         await p.waitForLoadState('networkidle');
-        await p.locator('.pos-cart-heading h2').click();
+        // Start this independent keyboard scenario from the persisted cart. A queued
+        // removal repaint can otherwise refocus search between Tab and the digit.
+        await p.reload({waitUntil:'networkidle'});
+        await p.waitForFunction(()=>typeof window._posRefreshCart==='function');
+        await p.evaluate(()=>document.activeElement.blur());
         await p.keyboard.press('Tab');
-        await p.waitForFunction(()=>document.getElementById('posZoneHint')?.textContent.includes('CART LINE'));
+        await p.waitForFunction(()=>document.getElementById('posZoneHint')?.textContent.includes('CART LINE')).catch(async error=>{
+            const state=await p.evaluate(()=>({focus:document.activeElement.tagName,focusId:document.activeElement.id,
+                dialog:!!document.querySelector('[role=dialog]'),hint:document.getElementById('posZoneHint')?.textContent}));
+            throw Error('Keyboard cart selection failed: '+JSON.stringify(state)+'; '+error.message);
+        });
         await p.keyboard.press('7');
         await p.waitForFunction(()=>document.getElementById('posZoneHint')?.textContent.includes('SET QTY'));
         const savedQuantity=p.waitForResponse(r=>r.request().method()==='POST'&&r.url().includes('/ajaxCart')&&
