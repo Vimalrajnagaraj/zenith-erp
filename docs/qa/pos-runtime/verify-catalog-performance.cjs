@@ -107,6 +107,8 @@ module.exports = async function ({a, foreign, base, check, q, invoke}) {
         // removal repaint can otherwise refocus search between Tab and the digit.
         await p.reload({waitUntil:'networkidle'});
         await p.waitForFunction(()=>typeof window._posRefreshCart==='function');
+        await p.evaluate(()=>window._posRefreshCart());
+        check('keyboard scenario hydrates the remaining persisted line',await p.locator('.pos-cart tbody tr .aj-qi').count()===1);
         await p.evaluate(()=>document.activeElement.blur());
         await p.keyboard.press('Tab');
         await p.waitForFunction(()=>document.getElementById('posZoneHint')?.textContent.includes('CART LINE')).catch(async error=>{
@@ -115,7 +117,11 @@ module.exports = async function ({a, foreign, base, check, q, invoke}) {
             throw Error('Keyboard cart selection failed: '+JSON.stringify(state)+'; '+error.message);
         });
         await p.keyboard.press('7');
-        await p.waitForFunction(()=>document.getElementById('posZoneHint')?.textContent.includes('SET QTY'));
+        await p.waitForFunction(()=>document.getElementById('posZoneHint')?.textContent.includes('SET QTY')).catch(async error=>{
+            const state=await p.evaluate(()=>({focus:document.activeElement.tagName,focusId:document.activeElement.id,
+                hint:document.getElementById('posZoneHint')?.textContent,rows:Array.from(document.querySelectorAll('.pos-cart tbody tr')).map(r=>({visible:!!r.offsetParent,seq:r.querySelector('.aj-q')?.dataset.seq,qty:r.querySelector('.aj-qi')?.value}))}));
+            throw Error('Keyboard digit failed: '+JSON.stringify(state)+'; '+error.message);
+        });
         const savedQuantity=p.waitForResponse(r=>r.request().method()==='POST'&&r.url().includes('/ajaxCart')&&
             new URLSearchParams(r.request().postData()||'').get('action')==='updateQty'&&
             new URLSearchParams(r.request().postData()||'').get('newQty')==='7');
