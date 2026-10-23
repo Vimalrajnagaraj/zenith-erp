@@ -11,6 +11,8 @@
                 def terminal = ec.entity.find('zenith.erp.pos.PosTerminal').condition('terminalId',terminalId).one()
                 def removed = ec.entity.find('zenith.erp.pos.PosSalesModeShop')
                     .condition('organizationPartyId',access.organizationPartyId).condition('facilityId',terminal.facilityId).list()*.salesModeId as Set
+                removed.addAll(ec.entity.find('zenith.erp.pos.PosSalesModeOrgRemoval')
+                    .condition('organizationPartyId',access.organizationPartyId).list()*.salesModeId)
                 def assigned = ec.entity.find('zenith.erp.pos.PosTerminalSalesMode')
                     .condition('terminalId',terminalId).condition('isActive','Y').list()*.salesModeId as Set
                 modes = ec.entity.find('zenith.erp.pos.PosSalesMode').condition('isActive','Y').orderBy('isDefault,modeName').list().findAll {
@@ -30,6 +32,41 @@
             <if condition="!available.modes.any { it.salesModeId == salesModeId }">
                 <return error="true" message="This sales mode is not available at this shop. Choose an available mode."/>
             </if>
+        </actions>
+    </service>
+    <service verb="delete" noun="SalesMode">
+        <in-parameters><parameter name="salesModeId" required="true"/></in-parameters>
+        <actions>
+            <service-call name="zenith.base.SecurityServices.check#ModuleWriteAccess" in-map="[moduleId:'pos']" out-map="permission"/>
+            <if condition="permission.canWrite != true || !(ec.user.isInGroup('ADMIN') || ec.user.isInGroup('ZENITH_ADMIN'))">
+                <return error="true" message="POS administrator access is required to delete sales modes."/>
+            </if>
+            <service-call name="zenith.pos.PosAccessServices.assert#PosAccess" in-map="[:]" out-map="access"/>
+            <if condition="!access.allowed"><return/></if>
+            <script><![CDATA[
+                def org = access.organizationPartyId
+                // Mode changes/adds lock their terminal; lock the same rows before checking open carts.
+                ec.entity.find('zenith.erp.pos.PosTerminal').condition('organizationPartyId',org).orderBy('terminalId').forUpdate(true).list()
+                def mode = ec.entity.find('zenith.erp.pos.PosSalesMode').condition('salesModeId',salesModeId).forUpdate(true).one()
+                if (!mode || (mode.organizationPartyId && mode.organizationPartyId != org) || mode.isDefault == 'Y') {
+                    ec.message.addError('This sales mode cannot be deleted. The default Retail mode must remain available.'); return
+                }
+                if (ec.entity.find('zenith.erp.pos.PosTransaction').condition('organizationPartyId',org).condition('salesModeId',salesModeId).condition('statusId','in',['PtCreated','PtHeld']).count() > 0) {
+                    ec.message.addError('Finish, switch or void open and held carts using this mode before deleting it.'); return
+                }
+                def itemUse = ec.entity.find('zenith.erp.pos.PosTransactionItem')
+                itemUse.makeEntityDynamicView()
+                    .addMemberEntity('I','zenith.erp.pos.PosTransactionItem',null,null,null)
+                    .addMemberEntity('T','zenith.erp.pos.PosTransaction','I',false,[transactionId:'transactionId'])
+                    .addAlias('I','salesModeId').addAlias('T','organizationPartyId').addAlias('T','statusId')
+                if (itemUse.condition('organizationPartyId',org).condition('salesModeId',salesModeId).condition('statusId','in',['PtCreated','PtHeld']).count() > 0) {
+                    ec.message.addError('Finish, switch or void open and held carts using this mode before deleting it.'); return
+                }
+                // Preserve prices and issued bills; never deactivate a definition shared with another tenant.
+                if (mode.organizationPartyId == org) mode.set('isActive','N').update()
+                else ec.service.sync().name('store#zenith.erp.pos.PosSalesModeOrgRemoval').parameters([organizationPartyId:org,salesModeId:salesModeId]).call()
+                ec.message.addMessage('Sales mode deleted from your organization. Existing bills and other organizations are unchanged.')
+            ]]></script>
         </actions>
     </service>
     <service verb="set" noun="ShopModeAvailability">
@@ -52,6 +89,7 @@
                     ec.message.addError('Choose an active sales mode from your organization.'); return
                 }
                 if (mode.isDefault == 'Y') { ec.message.addError('The default Retail mode must remain available.'); return }
+                if (ec.entity.find('zenith.erp.pos.PosSalesModeOrgRemoval').condition('organizationPartyId',access.organizationPartyId).condition('salesModeId',salesModeId).count()) { ec.message.addError('This sales mode has been deleted from your organization.'); return }
                 if (!ids || ids.size() > 100) { ec.message.addError('Select the shop or shops to update.'); return }
                 def shops = ec.entity.find('mantle.facility.Facility').condition('facilityId','in',ids)
                     .condition('ownerPartyId',access.organizationPartyId).condition('facilityTypeEnumId','FcTpRetailStore').list()
