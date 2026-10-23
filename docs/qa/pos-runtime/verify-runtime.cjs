@@ -12,6 +12,7 @@ const rows=(table,where)=>q(`SELECT * FROM ${table} WHERE ${where}`),count=(tabl
 (async()=>{let browser;try{
  for(let i=0;;i++){try{if((await fetch(base+'/Login')).status<500)break}catch{}if(i>60)throw Error('POS runtime did not start');await new Promise(r=>setTimeout(r,1000))}
  browser=await chromium.launch({headless:true,executablePath:process.env.POS_QA_CHROME||'C:/Program Files/Google/Chrome/Application/chrome.exe',args:['--no-sandbox','--disable-dev-shm-usage']});
+ cp.execFileSync(process.execPath,[path.join(__dirname,'../pos-cash-ui/verify.cjs')],{stdio:'inherit',env:{...process.env,POS_CASH_BROWSERS:'chrome',POS_CASH_OUT:path.join(out,'cash-ui')}});
  if(process.env.POS_QA_UI_ONLY!=='true'){
  const bootstrap=await browser.newContext();await bootstrap.request.get(base+'/apps/zenith/Contacts/Customers',{headers:{Authorization:'Basic '+Buffer.from('john.doe:moqui').toString('base64')}});const bp=await bootstrap.newPage();await bp.goto(base+'/apps/zenith/Contacts/Customers');const bt=await bp.locator('[name=moquiSessionToken]').first().inputValue();
  let r=await bootstrap.request.post(base+'/apps/zenith/pos/PosQaAcceptance/initialize',{form:{moquiSessionToken:bt}});let init;try{init=await r.json()}catch{throw Error('Initializer '+r.status()+': '+(await r.text()).slice(0,180))}check('isolated fixtures initialized',r.status()===200&&init.initialized,init);await bootstrap.close();
