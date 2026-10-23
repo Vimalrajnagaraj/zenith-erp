@@ -37,7 +37,8 @@ function check(name, truth) { assert(truth, name); checks.push(name); }
         const a = await actor('pos.qa');
         const card = a.page.locator('.smode-tile').filter({hasText: 'Employee'});
         check('Shared mode exposes shop-specific removal', !await card.locator('.smode-delete').isDisabled());
-        await card.locator('.smode-delete').click();
+        await card.locator('.smode-menu summary').click();
+        await card.locator('.smode-menu').getByRole('button',{name:'Remove from selected shops',exact:true}).click();
         check('Removal asks which shop', await card.locator('.smode-shop-dialog').isVisible());
         await card.locator('.smode-shop-dialog button').filter({hasText: 'Cancel'}).click();
         const marker = 'Disposable mode shop ' + Date.now();
@@ -76,7 +77,8 @@ function check(name, truth) { assert(truth, name); checks.push(name); }
         for (const shell of ['apps', 'qapps']) {
             await a.page.goto(`${base}/${shell}/zenith/pos/SalesMode`, {waitUntil: 'networkidle'});
             const tile = a.page.locator('.smode-tile').filter({hasText: 'Employee'});
-            await tile.locator('.smode-delete').click();
+            await tile.locator('.smode-menu summary').click();
+            await tile.locator('.smode-menu').getByRole('button',{name:'Remove from selected shops',exact:true}).click();
             const dialog = tile.locator('.smode-shop-dialog');
             for (const width of [1366,390]) {
                 await a.page.setViewportSize({width,height:768});
