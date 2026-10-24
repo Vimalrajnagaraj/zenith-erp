@@ -215,6 +215,8 @@ window._posOffline = (function() {
     var cart = [];
     var booted = false;
     var syncing = false;
+    var payPending = false;
+    var serverDraftPaused = false;
     function active(){ return !navigator.onLine; }
     function esc(x){ return String(x==null?'':x).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}); }
     function f2(x){ return Number(x||0).toFixed(2); }
@@ -331,11 +333,37 @@ window._posOffline = (function() {
     function getQueue(){ return ensureDb().then(function(d){ if(!d) return []; return new Promise(function(res){ var tx=d.transaction(['queue'],'readonly'); var rq=tx.objectStore('queue').getAll(); rq.onsuccess=function(){res(rq.result||[]);}; rq.onerror=function(){res([]);}; }); }); }
     function clearQueue(){ return ensureDb().then(function(d){ if(!d) return; return new Promise(function(res){ var tx=d.transaction(['queue'],'readwrite'); tx.objectStore('queue').clear(); tx.oncomplete=function(){res();}; tx.onerror=function(){res();}; }); }); }
     function toast(msg,bg){ var t=document.createElement('div'); t.textContent=msg; t.style.cssText='position:fixed;top:52px;left:50%;transform:translateX(-50%);z-index:9999999;background:'+(bg||'#2e7d32')+';color:#fff;padding:14px 28px;border-radius:10px;font-weight:700;box-shadow:0 6px 24px rgba(0,0,0,0.3);max-width:90vw;text-align:center'; document.body.appendChild(t); setTimeout(function(){t.remove();},3000); }
-    function banner(show){ var b=document.getElementById('pos-offline-banner'); if(!b){ b=document.createElement('div'); b.id='pos-offline-banner'; b.style.cssText='position:fixed;top:0;left:0;right:0;z-index:999991;background:#c62828;color:#fff;text-align:center;padding:7px 12px;font-weight:700;font-size:13px;box-shadow:0 2px 8px rgba(0,0,0,0.3)'; document.body.appendChild(b); } b.style.display=show?'block':'none'; if(show){ getQueue().then(function(q){ b.innerHTML='&#9888; OFFLINE — sales saved on this device, will sync when online'+(q.length?(' &middot; '+q.length+' queued'):''); }); } }
+    function hasServerDraft(){
+        var tx=document.querySelector('#cartInlineAddForm [name=transactionId]');
+        return !!((tx&&tx.value)||document.querySelector('.pos-cart .aj-qi'));
+    }
+    function paused(){ return serverDraftPaused; }
+    function banner(show){
+        var b=document.getElementById('pos-offline-banner');
+        if(!b){
+            b=document.createElement('div'); b.id='pos-offline-banner'; b.setAttribute('role','status');
+            b.style.cssText='position:fixed;top:0;left:0;right:0;z-index:999991;background:#c62828;color:#fff;text-align:center;padding:7px 12px;font-weight:700;font-size:13px;box-shadow:0 2px 8px rgba(0,0,0,0.3)';
+            document.body.appendChild(b);
+        }
+        b.style.display=show?'block':'none';
+        if(!show) return;
+        function message(count){
+            return (serverDraftPaused?'OFFLINE — current bill is paused. Reconnect to verify items and total before payment.':'OFFLINE — new sales can be saved on this device.')
+                +(count?' '+count+' sale(s) queued for sync.':'');
+        }
+        b.textContent=message(0);
+        getQueue().then(function(q){ if(!navigator.onLine && b.style.display!=='none') b.textContent=message(q.length); });
+    }
+    function pauseServerDraft(){
+        if(!serverDraftPaused && hasServerDraft()) serverDraftPaused=true;
+        if(serverDraftPaused) banner(true);
+        return serverDraftPaused;
+    }
     function taxEnabled(){return typeof window._posCurrentTax==='function' ? window._posCurrentTax()!=='N' : true;}
     function taxAmount(it){return taxEnabled() ? Math.round(Number(it.qty)*Number(it.price)*Number(it.taxRate||0))/100 : 0;}
     function payable(){return Math.round(cart.reduce(function(a,it){return a+Number(it.qty)*Number(it.price)+taxAmount(it);},0));}
     function render(){
+        if(serverDraftPaused) return;
         var tb=document.querySelector('.pos-cart tbody');
         if(tb){ var h=''; if(!cart.length) h='<tr><td colspan="8" style="text-align:center;padding:40px;color:#aaa;font-size:16px">Offline &mdash; tap products to add items</td></tr>';
             cart.forEach(function(it,i){ h+='<tr style="border-bottom:1px solid #e0e0e0">'
@@ -363,7 +391,7 @@ window._posOffline = (function() {
             } else { s+='<div class="pos-paywrap pos-reference-payments" style="justify-content:center;text-align:center;padding:16px;color:#aaa">Offline &mdash; tap products to add items</div>'; }
             sm.innerHTML=s; }
     }
-    function add(pid, price){ var p=catalog[pid]||{}; var pr=Number(price||p.price||0); var ex=cart.find(function(it){return it.productId===pid && Number(it.price)===pr;}); if(ex) ex.qty=Number(ex.qty)+1; else cart.push({productId:pid,name:p.name||pid,price:pr,qty:1,uom:p.uom||'',taxRate:p.taxRate}); render(); }
+    function add(pid, price){ if(serverDraftPaused){toast('Reconnect to verify the current bill before adding items.','#c62828');return;} var p=catalog[pid]||{}; var pr=Number(price||p.price||0); var ex=cart.find(function(it){return it.productId===pid && Number(it.price)===pr;}); if(ex) ex.qty=Number(ex.qty)+1; else cart.push({productId:pid,name:p.name||pid,price:pr,qty:1,uom:p.uom||'',taxRate:p.taxRate}); render(); }
     function scan(code){ var lc=(code||'').toLowerCase(); var found=null; for(var k in catalog){ var p=catalog[k]; if(p.barcode===code||p.productId===code||(p.name||'').toLowerCase().indexOf(lc)!==-1){found=p;break;} } if(found) add(found.productId,found.price); else toast('Item not in offline catalog','#e53935'); }
     function printReceipt(sale){ var h='<!DOCTYPE html><html><head><meta charset="utf-8"><style>@page{size:80mm auto;margin:0}body{margin:0;padding:0;font-family:Arial;font-size:12px}.rcpt{width:72mm;margin:0 auto;padding:2mm 3mm;box-sizing:border-box}.c{text-align:center}.r{text-align:right}.b{font-weight:bold}table{width:100%;border-collapse:collapse}td,th{font-size:11px;padding:2px 1px}.sep{border-bottom:1px dashed #000;margin:4px 0}</style></head><body><div class="rcpt">';
         h+='<div class="c b" style="font-size:15px">Offline Receipt</div><div class="c" style="font-size:9px;color:#444">** SAVED OFFLINE &mdash; will sync **</div><div class="sep"></div>';
@@ -375,9 +403,17 @@ window._posOffline = (function() {
         h+='<div class="c b" style="margin-top:6px">Thank You !!</div><div class="c" style="font-size:7px;color:#666;margin-top:4px">Powered by ZetaERP &middot; www.zetaclantech.com</div></div>';
         h+='<script>window.onload=function(){window.print();}<\/script></body></html>';
         var f=document.getElementById('pos-offline-frame'); if(!f){ f=document.createElement('iframe'); f.id='pos-offline-frame'; f.style.cssText='position:fixed;left:-9999px;top:-9999px;width:80mm;height:0;border:none'; document.body.appendChild(f); } var d=f.contentDocument||f.contentWindow.document; d.open(); d.write(h); d.close(); }
-    function pay(method){ if(!cart.length) return; var _fia=document.getElementById('pos-free-item-approval'); if(_fia&&_fia.value==='Y'&&cart.some(function(it){return Number(it.price)<=0;})){toast('Free items need online manager approval. Reconnect to complete this bill.','#c62828');return;} if(taxEnabled() && cart.some(function(it){return it.taxRate==null;})){toast('Tax cache unavailable. Reconnect before completing this sale.','#c62828');return;} var c=tCtx(); var total=payable();
+    function pay(method){ if(payPending||serverDraftPaused||!cart.length) return; var _fia=document.getElementById('pos-free-item-approval'); if(_fia&&_fia.value==='Y'&&cart.some(function(it){return Number(it.price)<=0;})){toast('Free items need online manager approval. Reconnect to complete this bill.','#c62828');return;} if(taxEnabled() && cart.some(function(it){return it.taxRate==null;})){toast('Tax cache unavailable. Reconnect before completing this sale.','#c62828');return;} var c=tCtx(); var total=payable();
         var sale={ offlineId:'OFL-'+Date.now()+'-'+Math.floor(Math.random()*100000), organizationPartyId:orgId, taxOn:taxEnabled()?'Y':'N', terminalId:c.terminalId, sessionId:c.sessionId, items:cart.map(function(it){return {productId:it.productId,name:it.name,qty:it.qty,price:it.price,uom:it.uom};}), total:total, taxAmount:cart.reduce(function(a,it){return a+taxAmount(it);},0), roundOff:total-cart.reduce(function(a,it){return a+it.qty*it.price+taxAmount(it);},0), paymentMethod:method, ts:new Date().toISOString() };
-        enqueue(sale).then(function(){ printReceipt(sale); cart=[]; render(); banner(true); toast('✔ Sale saved offline ('+method+') — will sync when online','#2e7d32'); }).catch(function(){toast('Sale NOT saved. Keep this cart and retry.','#c62828');}); }
+        payPending=true;
+        enqueue(sale).then(function(){
+            cart=[];
+            try{ render(); banner(true); }
+            catch(e){ toast('Sale saved offline. Reload to verify the empty cart.','#c62828'); return; }
+            toast('✔ Sale saved offline ('+method+') — will sync when online','#2e7d32');
+            try{ printReceipt(sale); }
+            catch(e){ toast('Sale saved offline, but receipt could not print. Reprint from history.','#c62828'); }
+        },function(){ toast('Sale NOT saved. Keep this cart and retry.','#c62828'); }).finally(function(){payPending=false;}); }
     function removeSynced(ids){ return ensureDb().then(function(d){ if(!d) return; return new Promise(function(res,rej){ var tx=d.transaction(['queue'],'readwrite'); ids.forEach(function(id){tx.objectStore('queue').delete(id);}); tx.oncomplete=function(){res();};tx.onerror=function(){rej(new Error('Queue update failed'));}; }); }); }
     function sync(){ if(syncing) return Promise.resolve(0); syncing=true; return recoverLegacy().then(function(){ return getQueue(); }).then(function(q){ if(!q.length) return 0; var c=tCtx(), af=document.getElementById('cartInlineAddForm'), tk=af&&af.querySelector('[name=moquiSessionToken]'); var body=JSON.stringify({moquiSessionToken:tk?tk.value:'', terminalId:c.terminalId, transactions:q.map(function(s){return JSON.stringify(s);})}); return fetch('Terminal/syncOfflineTransactions',{method:'POST',headers:{'Content-Type':'application/json'},body:body,credentials:'same-origin'}).then(function(r){if(!r.ok)throw new Error('Sync rejected');return r.json();}).then(function(d){ var ack=Array.isArray(d.syncedIds)?d.syncedIds.filter(function(id){return q.some(function(s){return s.offlineId===id;});}):[]; return removeSynced(ack).then(function(){ return acknowledgeLegacy(ack,q); }).then(function(){ if(q.length>ack.length)toast('Some offline sales remain pending. Review and retry.','#c62828'); return ack.length; }); }); }).catch(function(){return 0;}).then(function(n){syncing=false;return n;}); }
     // Instant local-first reads against the cached master data (no server round-trip)
@@ -385,9 +421,16 @@ window._posOffline = (function() {
     function lookup(pid){ return catalog[pid] || null; }
     function catalogSize(){ var n=0; for(var k in catalog) n++; return n; }
     function boot(){ if(booted || !orgId || location.pathname.indexOf('/pos/Terminal')<0) return; booted=true;
-        openDB().then(function(){ return recoverLegacy(); }).then(function(){ return loadCatalog(); }).then(function(){ if(navigator.onLine) cacheCatalog(); banner(!navigator.onLine); if(!navigator.onLine) render(); }).catch(function(){toast('Offline storage unavailable. Use online checkout.','#c62828');});
-        window.addEventListener('offline', function(){ banner(true); render(); });
-        window.addEventListener('online', function(){ banner(false); sync().then(function(nn){ if(nn>0) toast('✔ '+nn+' offline sale(s) synced','#2e7d32'); setTimeout(function(){ try{location.reload();}catch(e){} }, nn>0?1600:300); }); });
+        openDB().then(function(){ return recoverLegacy(); }).then(function(){ return loadCatalog(); }).then(function(){
+            if(navigator.onLine){ cacheCatalog(); banner(false); }
+            else if(!pauseServerDraft()){ banner(true); render(); }
+        }).catch(function(){toast('Offline storage unavailable. Use online checkout.','#c62828');});
+        window.addEventListener('offline', function(){ if(!pauseServerDraft()){ banner(true); render(); } });
+        window.addEventListener('online', function(){ if(serverDraftPaused){ var b=document.getElementById('pos-offline-banner'); if(b) b.textContent='Reconnecting — verifying the current bill before payment.'; } else banner(false); sync().then(function(nn){ if(nn>0) toast('✔ '+nn+' offline sale(s) synced','#2e7d32'); setTimeout(function(){ try{location.reload();}catch(e){} }, nn>0?1600:300); }); });
+        // A visible server draft may contain an in-flight edit. Keep it read-only until
+        // the server is reachable again; never turn it into a second offline sale.
+        ['click','submit','beforeinput','change'].forEach(function(type){ document.addEventListener(type,function(e){ if(!serverDraftPaused)return; var t=e.target; if(t.closest && t.closest('#pos-terminal-root,.pos-product-grid,.pos-cart,.pos-summary,#cartInlineAddForm')){e.preventDefault();e.stopImmediatePropagation();} },true); });
+        document.addEventListener('keydown',function(e){ if(serverDraftPaused && !e.ctrlKey && !e.metaKey && !e.altKey && (e.key==='Enter'||e.key==='/'||/^F[2-9]$/.test(e.key))){e.preventDefault();e.stopImmediatePropagation();} },true);
         // Stale-while-revalidate: refresh the local master-data cache in the background so local reads stay current
         setInterval(function(){ if(navigator.onLine) cacheCatalog(); }, 180000);
         document.addEventListener('click', function(e){ var t=e.target.closest ? (e.target.closest('.ofl-minus,.ofl-plus,.ofl-rm,.ofl-pay') || e.target) : e.target; if(!t.classList) return;
@@ -398,7 +441,7 @@ window._posOffline = (function() {
         document.addEventListener('change', function(e){ if(e.target.classList&&e.target.classList.contains('ofl-qi')){ var i=+e.target.dataset.i; var nq=Number(e.target.value); if(!Number.isFinite(nq)||nq<=0){toast('Quantity must be greater than zero. Use remove to delete a line.','#c62828');} else cart[i].qty=nq; render(); } });
     }
     setTimeout(boot, 1500);
-    return { boot:boot, active:active, add:add, scan:scan, sync:sync, clearDraft:function(){cart=[];render();}, render:render, cacheCatalog:cacheCatalog, search:search, lookup:lookup, catalogSize:catalogSize, getQueue:getQueue, recoverLegacy:recoverLegacy };
+    return { boot:boot, active:active, paused:paused, add:add, scan:scan, sync:sync, clearDraft:function(){cart=[];render();}, render:render, cacheCatalog:cacheCatalog, search:search, lookup:lookup, catalogSize:catalogSize, getQueue:getQueue, recoverLegacy:recoverLegacy };
 })();
 
 /* === Product Import screen: manual add + search auto-fill + CSV (external JS, so the
