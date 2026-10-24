@@ -10,6 +10,7 @@ After successful payment, `resetCompletedCart()` resets the live model and cance
 - After resetting the model, an additional queued-quantity regression exposed an old claimed item sequence: the next bill's quantity request never left the queue. Scoping claims to the new transaction fixes it.
 - `verify-next-bill.cjs` now covers Cash, Card, UPI and Split with tax on and off (eight combinations). It captures generated receipts with an isolated QZ stub, holds the checkout screen response and first add response, samples cart frames, queues a rapid quantity increment, checks database rows and verifies that the late screen response cannot erase the next bill. No physical print job is sent.
 - `verify-checkout-reference.cjs` verifies the removed controls and exercises `/` search, tax, editing, Clear Cart, payments, hold/recall/void and layouts at 1672, 1366, 1024, 800, 390 and 320 pixels.
+- The existing rapid-click catalog test now waits for its final `updateQty=12` response before checking the database. A trace showed its previous `networkidle` wait could return before the coalesced add request was even sent; the exact 12-item assertion is unchanged.
 - Both helpers run from `verify-runtime.cjs` in POS acceptance.
 
 All local browser/data checks use a disposable loopback Moqui runtime and synthetic `POS_QA_*` tenants. Production was not accessed. Source shop database files, account details and credentials are not included in this PR.
