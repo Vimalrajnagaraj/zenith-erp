@@ -2,8 +2,12 @@ const path = require('node:path');
 module.exports = async function({a, base, check, q, invoke, post, out, terminalId='POS_QA_A_NEXT_BILL'}) {
  await post('PosTerminals', 'createTerminal', {terminalId, terminalName:'Disposable next-bill counter', facilityId:'POS_QA_A_FAC', organizationPartyId:'POS_QA_A', regionGeoId:'33', stateCode:'33', countryGeoId:'IND', isActive:'Y'});
  const session = await invoke('open', {terminalId, openingCash:'0'});
- const page = await a.c.newPage(); page.setDefaultTimeout(30000);
+ // Earlier acceptance cases exercise offline storage. Keep this network-race test
+ // in its own authenticated context so cached responses cannot bypass its routes.
+ const context=await a.c.browser().newContext({storageState:{cookies:await a.c.cookies(),origins:[]},serviceWorkers:'block',viewport:{width:1672,height:941}});
+ const page = await context.newPage(); page.setDefaultTimeout(30000);
  const errors = []; page.on('pageerror', e => errors.push(e.message));
+ page.on('dialog', async d => {errors.push(d.message());await d.dismiss();});
  // Exercise receipt generation without a physical printer or external QZ service.
  await page.route('**/qz-tray.js', route => route.fulfill({contentType:'application/javascript', body:`window.qz={websocket:{isActive:()=>true},configs:{create:()=>({})},print:(_,data)=>{window.qaReceipts.push(data[0].data);return Promise.resolve()}};`}));
  await page.addInitScript(() => { window.qaReceipts=[]; localStorage.setItem('posPrinter','Disposable QA printer'); });
@@ -30,7 +34,9 @@ module.exports = async function({a, base, check, q, invoke, post, out, terminalI
     await page.locator('#pos-pay-'+method.toLowerCase()).click(); await page.locator('#posPayConfOk').click();
    }
    const payment=await (await paid).json(); check(method+' tax '+taxOn+' checkout succeeds',payment.success,payment.error);
-   await screenSent;
+   let screenTimer;
+   try { await Promise.race([screenSent,new Promise((_,reject)=>{screenTimer=setTimeout(()=>reject(Error('Checkout screen request did not start: '+errors.join('; '))),30000);})]); }
+   finally {clearTimeout(screenTimer);}
    await page.waitForFunction(() => !document.querySelector('.pos-cart .aj-qi') && !document.querySelector('#cartInlineAddForm [name=transactionId]')?.value);
    await page.waitForFunction(() => window.qaReceipts.length===1);
    check(method+' tax '+taxOn+' receipt contains the completed product',await page.evaluate(()=>window.qaReceipts[0].includes('Disposable POS A P18')));
@@ -61,5 +67,5 @@ module.exports = async function({a, base, check, q, invoke, post, out, terminalI
   check('next-bill checkout produces no JavaScript exceptions',errors.length===0,{errors});
   await invoke('close',{sessionId:session.sessionId,closingCash:'0'});
  } catch(error) { console.log('Next-bill diagnostics',await page.evaluate(()=>({receipts:window.qaReceipts?.length,frame:!!document.getElementById('pos-receipt-frame'),cart:document.querySelector('.pos-cart tbody')?.textContent,printer:localStorage.getItem('posPrinter')})),errors);await page.screenshot({path:path.join(out,'next-bill-failure.png'),fullPage:true}); throw error; }
- finally { await page.close(); }
+ finally { await context.close(); }
 };
