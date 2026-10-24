@@ -339,6 +339,12 @@
         <if condition="invoice != null &amp;&amp; (!_dispOrg || invoice.fromPartyId != _dispOrg) &amp;&amp; !ec.user.isInGroup('ADMIN')">
             <set field="invoice" from="null"/>
         </if>
+        <!-- A restored invoice can still refer to a buyer whose Party ownership is stale. The invoice
+             remains readable to its seller, but tax registration is scoped to the buyer's owning org. -->
+        <set field="buyerOrgMismatch" from="false"/>
+        <if condition="invoice?.toPartyId">
+            <set field="buyerOrgMismatch" from="ec.entity.find('mantle.party.Party').condition('partyId', invoice.toPartyId).disableAuthz().one()?.ownerPartyId != invoice.fromPartyId"/>
+        </if>
         <!-- ZE-SALES-002 (SL-051): a tax invoice is editable only while it is a draft (In-Process). Gate the
              add / edit / delete controls on this so an issued invoice reads cleanly as locked, instead of
              showing controls that the server then rejects. -->
@@ -370,9 +376,11 @@
         <entity-find-one entity-name="mantle.party.PartyDetail" value-field="supplier">
             <field-map field-name="partyId" from="invoice?.fromPartyId"/>
         </entity-find-one>
-        <entity-find-one entity-name="mantle.party.PartyDetail" value-field="customer">
-            <field-map field-name="partyId" from="invoice?.toPartyId"/>
-        </entity-find-one>
+        <if condition="invoice != null &amp;&amp; !buyerOrgMismatch">
+            <entity-find-one entity-name="mantle.party.PartyDetail" value-field="customer">
+                <field-map field-name="partyId" from="invoice.toPartyId"/>
+            </entity-find-one>
+        </if>
 
         <!-- Communicate the existing missing-state fallback without asserting that a missing
              registration determines the delivery destination. Users can supply the actual
@@ -380,12 +388,12 @@
         <script><![CDATA[
             def _st2 = { s -> (s && s.toString().trim().length() >= 2 && (s.toString().trim().substring(0,2) ==~ /[0-9]{2}/)) ? s.toString().trim().substring(0,2) : null }
             def _c2 = { s -> (s && s.toString().trim() ==~ /[0-9]{2}/) ? s.toString().trim() : null }
-            def _bReg2 = invoice?.toPartyId ? ec.service.sync().name("zenith.tax.TaxServices.get#PartyTaxRegistration").parameters([partyId:invoice.toPartyId]).call() : null
+            def _bReg2 = invoice?.toPartyId && !buyerOrgMismatch ? ec.service.sync().name("zenith.tax.TaxServices.get#PartyTaxRegistration").parameters([partyId:invoice.toPartyId]).call() : null
             def _sReg2 = invoice?.fromPartyId ? ec.service.sync().name("zenith.tax.TaxServices.get#PartyTaxRegistration").parameters([partyId:invoice.fromPartyId]).call() : null
             def _buyerState = _st2(invoice?.buyerGstin) ?: _c2(invoice?.placeOfSupplyStateCode) ?: _c2(_bReg2?.regionGeoId) ?: _st2(_bReg2?.registrationNumber)
             def _sellerState = _st2(invoice?.supplierGstin) ?: _c2(invoice?.supplierStateCode) ?: _c2(_sReg2?.regionGeoId) ?: _st2(_sReg2?.registrationNumber)
             // Only for a normal (non-RCM, non-export) sale to a stateless buyer — those regimes have their own rules.
-            buyerStateMissing = (invoice != null && !_buyerState && invoice.isReverseCharge != 'Y' && invoice.isExport != 'Y')
+            buyerStateMissing = (invoice != null && !buyerOrgMismatch && !_buyerState && invoice.isReverseCharge != 'Y' && invoice.isExport != 'Y')
             def _sName = _sellerState ? ec.entity.find("zenith.erp.india.IndiaState").condition("stateCode", _sellerState).one()?.stateName : null
             fallbackStateLabel = _sellerState ? (_sellerState + (_sName ? ' - ' + _sName : '')) : 'your registered state'
         ]]></script>
@@ -400,7 +408,7 @@
             <field-map field-name="statusId" from="invoice?.statusId"/>
         </entity-find-one>
         <set field="invoiceStatusTone" from="invoice?.statusId == 'InvoiceCancelled' ? 'zinv-status--cancelled' : (invoice?.statusId in ['InvoiceFinalized','InvoicePmtRecvd','InvoicePaid'] ? 'zinv-status--complete' : 'zinv-status--draft')"/>
-        <set field="customerName" from="customer?.organizationName ?: ((customer?.firstName ?: '') + ' ' + (customer?.lastName ?: '')).trim() ?: (invoice?.toPartyId ? 'Customer ' + invoice.toPartyId : 'Walk-in Customer')"/>
+        <set field="customerName" from="buyerOrgMismatch ? 'Customer record needs review' : (customer?.organizationName ?: ((customer?.firstName ?: '') + ' ' + (customer?.lastName ?: '')).trim() ?: (invoice?.toPartyId ? 'Customer ' + invoice.toPartyId : 'Walk-in Customer'))"/>
 
         <!-- If this invoice originated from a POS counter sale, load how it was paid (Cash/UPI/Card, incl.
              split tenders) and when the sale was started/closed, to show a POS panel below. -->
@@ -445,6 +453,11 @@
         </widgets></section>
         <section name="InvoiceDetails" condition="invoice != null"><widgets>
         <container style="zinv-page">
+        <section name="BuyerOrgReview" condition="buyerOrgMismatch"><widgets>
+            <container style="bg-orange-1 text-orange-10 q-pa-md border-radius-sm q-mb-md">
+                <label text="This invoice's customer record needs organization review. Tax registration details are unavailable here. Ask an administrator to verify the customer association." type="p" style="q-my-none"/>
+            </container>
+        </widgets></section>
         <container style="zinv-heading-row">
             <container style="zinv-heading-main">
                 <link url="findInvoice" text="Back to Invoices" icon="fa fa-arrow-left" style="zinv-back"/>
