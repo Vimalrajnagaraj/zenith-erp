@@ -44,6 +44,7 @@ window.PosFreeItems = (function () {
     function ensure(transactionId, token) {
         return api('freeItemState',{transactionId:transactionId},token).then(function(state){
             if(!state.success)throw new Error(state.error || 'Approval could not be checked.');
+            if((state.freeItems||[]).some(function(item){return !(Number(item.price)>0);}))throw new Error('Set a price above ₹0 for every product before payment.');
             if(!state.required)return;
             return promptApproval(state.canApprove,state.freeItems,function(values){
                 return api('approveFreeItems',Object.assign({transactionId:transactionId,expectedFingerprint:state.approvalFingerprint},values),token).then(function(result){
@@ -391,7 +392,7 @@ window._posOffline = (function() {
             } else { s+='<div class="pos-paywrap pos-reference-payments" style="justify-content:center;text-align:center;padding:16px;color:#aaa">Offline &mdash; tap products to add items</div>'; }
             sm.innerHTML=s; }
     }
-    function add(pid, price){ if(serverDraftPaused){toast('Reconnect to verify the current bill before adding items.','#c62828');return;} var p=catalog[pid]||{}; var pr=Number(price||p.price||0); if(!(pr>0)) return toast('Set a product price above ₹0 before adding it to the bill.','#c62828'); var ex=cart.find(function(it){return it.productId===pid && Number(it.price)===pr;}); if(ex) ex.qty=Number(ex.qty)+1; else cart.push({productId:pid,name:p.name||pid,price:pr,qty:1,uom:p.uom||'',taxRate:p.taxRate}); render(); }
+    function add(pid, price){ if(serverDraftPaused){toast('Reconnect to verify the current bill before adding items.','#c62828');return;} var p=catalog[pid]||{}; var pr=Number(price||p.price||0); var ex=cart.find(function(it){return it.productId===pid && Number(it.price)===pr;}); if(ex) ex.qty=Number(ex.qty)+1; else cart.push({productId:pid,name:p.name||pid,price:pr,qty:1,uom:p.uom||'',taxRate:p.taxRate}); render(); }
     function scan(code){ var lc=(code||'').toLowerCase(); var found=null; for(var k in catalog){ var p=catalog[k]; if(p.barcode===code||p.productId===code||(p.name||'').toLowerCase().indexOf(lc)!==-1){found=p;break;} } if(found) add(found.productId,found.price); else toast('Item not in offline catalog','#e53935'); }
     function printReceipt(sale){ var h='<!DOCTYPE html><html><head><meta charset="utf-8"><style>@page{size:80mm auto;margin:0}body{margin:0;padding:0;font-family:Arial;font-size:12px}.rcpt{width:72mm;margin:0 auto;padding:2mm 3mm;box-sizing:border-box}.c{text-align:center}.r{text-align:right}.b{font-weight:bold}table{width:100%;border-collapse:collapse}td,th{font-size:11px;padding:2px 1px}.sep{border-bottom:1px dashed #000;margin:4px 0}</style></head><body><div class="rcpt">';
         h+='<div class="c b" style="font-size:15px">Offline Receipt</div><div class="c" style="font-size:9px;color:#444">** SAVED OFFLINE &mdash; will sync **</div><div class="sep"></div>';

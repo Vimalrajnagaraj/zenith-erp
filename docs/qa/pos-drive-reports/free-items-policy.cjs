@@ -50,16 +50,18 @@ module.exports=async function({manager,cashier,foreign,session,id,free,credit,ca
  }
  for(const taxOn of ['Y','N']){
   const tx=(await manager.invoke('cart',{sessionId:session.sessionId,reuseOpenCart:'false'})).result.transactionId;
-  const rejected=await manager.invoke('add',{transactionId:tx,productId:'POS_QA_A_P18',unitPrice:'0',quantity:'1',taxOn});
-  check('Tax '+taxOn+' rejects a zero unit-price override',rejected.errors?.length>0&&q(`SELECT * FROM pos_transaction_item WHERE transaction_id='${tx}'`).length===0);
-  await manager.invoke('add',{transactionId:tx,productId:'POS_QA_A_P18',quantity:'1',discountPercent:'100',taxOn});
-  check('Tax '+taxOn+' keeps a positive unit price for a fully discounted item',Number(q(`SELECT unit_price FROM pos_transaction_item WHERE transaction_id='${tx}'`)[0].unit_price)===100&&(await state(tx)).required===true);
-  await approve(tx);await manager.invoke('complete',{transactionId:tx});
-  check('Tax '+taxOn+' approved 100% discount completes',q(`SELECT status_id FROM pos_transaction WHERE transaction_id='${tx}'`)[0].status_id==='PtCompleted');
+  const added=await manager.invoke('add',{transactionId:tx,productId:'POS_QA_A_P18',unitPrice:'0',quantity:'1',taxOn});
+  check('Tax '+taxOn+' keeps a zero-price product in the draft cart',!added.errors?.length&&Number(q(`SELECT unit_price FROM pos_transaction_item WHERE transaction_id='${tx}'`)[0].unit_price)===0);
+  const tender=await manager.invoke('pay',{transactionId:tx,paymentMethod:'Cash',amount:'1'});
+  check('Tax '+taxOn+' rejects payment for a zero-price line',tender.errors?.length>0&&q(`SELECT * FROM pos_payment WHERE transaction_id='${tx}'`).length===0);
+  await approve(tx);const completed=await manager.invoke('complete',{transactionId:tx});
+  check('Tax '+taxOn+' manager approval cannot issue the zero-price bill',completed.errors?.length>0&&q(`SELECT status_id FROM pos_transaction WHERE transaction_id='${tx}'`)[0].status_id==='PtCreated');
  }
  const unpriced=(await manager.invoke('cart',{sessionId:session.sessionId,reuseOpenCart:'false'})).result.transactionId;
  const unpricedResult=await manager.invoke('add',{transactionId:unpriced,productId:'POS_QA_A_UNPRICED',quantity:'1',taxOn:'N'});
- check('A missing catalog price cannot create a bill line',unpricedResult.errors?.length>0&&q(`SELECT * FROM pos_transaction_item WHERE transaction_id='${unpriced}'`).length===0);
+ check('A missing catalog price stays in the draft cart',!unpricedResult.errors?.length&&Number(q(`SELECT unit_price FROM pos_transaction_item WHERE transaction_id='${unpriced}'`)[0].unit_price)===0);
+ await approve(unpriced);const unpricedCompletion=await manager.invoke('complete',{transactionId:unpriced});
+ check('An approved unpriced product still cannot generate a bill',unpricedCompletion.errors?.length>0&&q(`SELECT status_id FROM pos_transaction WHERE transaction_id='${unpriced}'`)[0].status_id==='PtCreated');
  const discount=(await manager.invoke('cart',{sessionId:session.sessionId,reuseOpenCart:'false'})).result.transactionId;
  await manager.invoke('add',{transactionId:discount,productId:'POS_QA_A_P18',quantity:'1',taxOn:'N'});
  await ajax({action:'applyDiscount',transactionId:discount,billDiscValue:'100',billDiscType:'pct',managerPin:'246813',taxOn:'N'});
@@ -98,8 +100,12 @@ module.exports=async function({manager,cashier,foreign,session,id,free,credit,ca
   await page.goto(billingUrl+'?sessionId='+session.sessionId+'&transactionId='+ui+'&taxOn=N',{waitUntil:'domcontentloaded'});
   await page.waitForFunction(()=>window.PosFreeItems && window._posAjax && document.querySelector('#pos-terminal-root'),null,{timeout:60000});
   await page.locator('form:has(input[name="productId"][value="POS_QA_A_FREE"]) button').click();
-  await page.waitForFunction(()=>document.body.innerText.includes('Set a product price above ₹0'));
-  check(shell+' zero-price tile leaves the bill unchanged',q(`SELECT * FROM pos_transaction_item WHERE transaction_id='${ui}'`).length===2&&await page.locator('body').innerText().then(t=>t.includes('Set a product price above ₹0')));
+  await page.waitForFunction(()=>/Bill Items\s*\(\s*3\s*\)/.test(document.body.innerText));
+  check(shell+' zero-price tile enters the draft cart',q(`SELECT * FROM pos_transaction_item WHERE transaction_id='${ui}'`).length===3);
+  const blocked=await page.evaluate(async({tx,token})=>{try{await window.PosFreeItems.ensure(tx,token);return '';}catch(e){return e.message;}},{tx:ui,token:manager.token});
+  check(shell+' zero-price line blocks checkout before manager approval',blocked.includes('price above ₹0')&&await page.locator('#pos-free-approval').count()===0);
+  const zeroSeq=q(`SELECT item_seq_id FROM pos_transaction_item WHERE transaction_id='${ui}' AND product_id='POS_QA_A_FREE'`)[0].item_seq_id;
+  await manager.invoke('remove',{transactionId:ui,itemSeqId:zeroSeq});await page.reload({waitUntil:'domcontentloaded'});
   const run=()=>page.evaluate(async({tx,token})=>{try{await window.PosFreeItems.ensure(tx,token);return 'approved';}catch(e){return 'cancelled';}},{tx:ui,token:manager.token});
   const cancelled=run();await page.locator('#pos-free-approval').waitFor();await page.locator('#pos-free-approval [data-cancel]').click();
   check(shell+' cancelling the dialog records no approval',await cancelled==='cancelled'&&rows(ui).length===0);
@@ -116,7 +122,7 @@ module.exports=async function({manager,cashier,foreign,session,id,free,credit,ca
  await offlinePage.waitForFunction(()=>window._posOffline?.lookup('POS_QA_A_FREE'));
  const queued=await offlinePage.evaluate(async()=>{window._posOffline.add('POS_QA_A_FREE',0);return(await window._posOffline.getQueue()).length;});
  await offlinePage.locator('.ofl-pay[data-m="Cash"]').click();
- check('Offline zero-price item cannot enter cart or queue',await offlinePage.locator('.ofl-qi').count()===0&&(await offlinePage.evaluate(()=>window._posOffline.getQueue())).length===queued&&await offlinePage.locator('#pos-offline-frame').count()===0);
+ check('Offline zero-price item stays in cart without a queued bill',await offlinePage.locator('.ofl-qi').count()===1&&(await offlinePage.evaluate(()=>window._posOffline.getQueue())).length===queued&&await offlinePage.locator('#pos-offline-frame').count()===0);
  await offlinePage.close();
  const locked=await cart();for(let n=0;n<5;n++)await approve(locked,{managerPin:'000000'},cashier);
  check('Five failed PIN attempts persist a lockout despite rejected approval transactions',q("SELECT * FROM pos_manager_pin_attempt WHERE user_id='POS_QA_CASHIER' AND organization_party_id='POS_QA_A'")[0]?.locked_until!=null);
