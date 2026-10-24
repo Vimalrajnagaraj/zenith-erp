@@ -12,6 +12,7 @@ const rows=(table,where)=>q(`SELECT * FROM ${table} WHERE ${where}`),count=(tabl
 (async()=>{let browser;try{
  for(let i=0;;i++){try{if((await fetch(base+'/Login')).status<500)break}catch{}if(i>60)throw Error('POS runtime did not start');await new Promise(r=>setTimeout(r,1000))}
  browser=await chromium.launch({headless:true,executablePath:process.env.POS_QA_CHROME||'C:/Program Files/Google/Chrome/Application/chrome.exe',args:['--no-sandbox','--disable-dev-shm-usage']});
+ cp.execFileSync(process.execPath,[path.join(__dirname,'../pos-cash-ui/verify.cjs')],{stdio:'inherit',env:{...process.env,POS_CASH_BROWSERS:'chrome',POS_CASH_OUT:path.join(out,'cash-ui')}});
  if(process.env.POS_QA_UI_ONLY!=='true'){
  const bootstrap=await browser.newContext();await bootstrap.request.get(base+'/apps/zenith/Contacts/Customers',{headers:{Authorization:'Basic '+Buffer.from('john.doe:moqui').toString('base64')}});const bp=await bootstrap.newPage();await bp.goto(base+'/apps/zenith/Contacts/Customers');const bt=await bp.locator('[name=moquiSessionToken]').first().inputValue();
  let r=await bootstrap.request.post(base+'/apps/zenith/pos/PosQaAcceptance/initialize',{form:{moquiSessionToken:bt}});let init;try{init=await r.json()}catch{throw Error('Initializer '+r.status()+': '+(await r.text()).slice(0,180))}check('isolated fixtures initialized',r.status()===200&&init.initialized,init);await bootstrap.close();
@@ -131,10 +132,12 @@ const rows=(table,where)=>q(`SELECT * FROM ${table} WHERE ${where}`),count=(tabl
  await post('SalesMode','removeTerminal',{terminalId:'POS_QA_A_TERM1',salesModeId:customId});check('terminal assignment removal persists',count('pos_terminal_sales_mode',`terminal_id='POS_QA_A_TERM1' AND sales_mode_id='${customId}'`)===0);
  const archivePage=await a.c.newPage();await archivePage.goto(base+'/apps/zenith/pos/SalesMode',{waitUntil:'networkidle'});
  const archiveCard=archivePage.locator('.smode-tile').filter({hasText:displayModeName});await archiveCard.locator('.smode-menu summary').click();
- await archiveCard.getByRole('button',{name:/Delete/}).click();await archiveCard.locator('.smode-shop-dialog [name=facilityIds][value="POS_QA_A_FAC"]').check();await archiveCard.locator('.smode-shop-dialog button[type=submit]').click();await archivePage.waitForLoadState('networkidle');await archivePage.close();
- check('Visible Delete removes mode from this shop and retains prices and definition',count('pos_sales_mode_shop',`sales_mode_id='${customId}' AND facility_id='POS_QA_A_FAC'`)===1&&count('pos_sales_mode',`sales_mode_id='${customId}' AND is_active='Y'`)===1&&count('pos_product_mode_price',`sales_mode_id='${customId}'`)===1);
+ archivePage.once('dialog',dialog=>dialog.accept());await archiveCard.getByRole('button',{name:/Delete/}).click();await archivePage.waitForLoadState('networkidle');
+ check('Visible Delete removes the entire owned card after redirect',await archivePage.locator('.smode-tile').filter({hasText:displayModeName}).count()===0);await archivePage.close();
+ check('Visible Delete archives the owned definition and retains prices',count('pos_sales_mode',`sales_mode_id='${customId}' AND is_active='N'`)===1&&count('pos_product_mode_price',`sales_mode_id='${customId}'`)===1);
  const archivedPage=await a.c.request.get(base+'/apps/zenith/pos/Terminal?sessionId='+s.sessionId);check('archived custom mode absent from terminal choices',!modeChoice.test(await archivedPage.text()),{status:archivedPage.status()});
  const archivedCart=await cart(s);await invoke('add',{transactionId:archivedCart.transactionId,productId:'POS_QA_A_P18',quantity:'1',salesModeId:customId},true);await invoke('void',{transactionId:archivedCart.transactionId});
+ await require('./verify-mode-deletion.cjs')({a,foreign,base,check,q,invoke,post,out,sessionId:s.sessionId,account});
  const taxMode=await cart(s);const taxLine=await item(taxMode,{taxOn:'N'});
  await invoke('mode',{transactionId:taxMode.transactionId,itemSeqId:taxLine.itemSeqId,salesModeId:'WHOLESALE',taxOn:'N'});
  check('tax-off mode switch stays tax-free with no GST detail',Number(tx(taxMode.transactionId).total_tax_amount)===0&&count('tax_line_detail',`reference_type='PosTransactionItem' AND reference_id='${taxMode.transactionId}'`)===0,tx(taxMode.transactionId));
