@@ -11,14 +11,17 @@ module.exports=async function({browser,base,q,check,out,admin,token}) {
       cashiers:[{username:`cashier-a-${stamp}@example.com`,fullName:'Clean QA Cashier A',shopKey:'a'},{username:`cashier-b-${stamp}@example.com`,fullName:'Clean QA Cashier B',shopKey:'b'}],
       pricesIncludeGst:false,modeNames:['Retail','Wholesale'],excluded:[],issues:[],products:[1,2].map(id=>({sourceId:String(id),sku:'SRC-22-'+id,name:'Clean QA Product '+id,sourceCode:'DUP',localName:'தமிழ்',barcode:'',hsn:'',amountUomId:'OTH_ea',sourceUnit:'PCS',category:'Clean QA category',cgst:'6',sgst:'6',retail:String(id*100)+'.00',wholesale:String(id*90)+'.00',sourceMrp:String(id*110)}))};
     const clone=()=>JSON.parse(JSON.stringify(b));
-    const tables=['saas_tenant','saas_subscription','saas_invoice','saas_payment','product','pos_sales_mode','pos_product_mode_price','pos_terminal','store','user_account','invoice','payment','pos_transaction','asset','party','person','organization','party_role','party_relationship','user_preference','user_group','user_group_member','company_settings','facility','pos_receipt_template','product_category','product_category_member'];
+    const tables=['saas_tenant','saas_subscription','saas_invoice','saas_payment','product','pos_sales_mode','pos_product_mode_price','pos_terminal','store','user_account','invoice','payment','pos_transaction','asset','party','person','organization','party_role','party_relationship','user_preference','user_group','user_group_member','company_settings','facility','pos_receipt_template','product_category','product_category_member','product_barcode'];
     const counts=()=>{const row=q('SELECT '+tables.map((t,i)=>`(SELECT count(*) FROM ${t}) AS c${i}`).join(','))[0];return Object.fromEntries(tables.map((t,i)=>[t,Number(row['c'+i])]))};
     const before=counts();
     const foreignBefore=q("SELECT product_id,owner_party_id,mrp_amount FROM product WHERE owner_party_id IN ('POS_QA_A','POS_QA_B') ORDER BY product_id");
     const sharedBefore=q('SELECT * FROM pos_sales_mode WHERE organization_party_id IS NULL ORDER BY sales_mode_id');
     const passwords=Array.from({length:3},()=>crypto.randomBytes(18).toString('hex')+'Aa1!');
     async function invoke(bundle,apply=false,confirmationDigest='',actor=admin,csrf=token) {
-      const response=await actor.request.post(base+'/apps/zenith/pos/PosQaAcceptance/cleanWorkspace',{form:{moquiSessionToken:csrf,bundleJson:JSON.stringify(bundle),apply:String(apply),confirmationDigest,adminPassword:passwords[0],cashierOnePassword:passwords[1],cashierTwoPassword:passwords[2]},maxRedirects:0,timeout:120000});
+      const fields={moquiSessionToken:csrf,apply:String(apply),confirmationDigest,adminPassword:passwords[0],cashierOnePassword:passwords[1],cashierTwoPassword:passwords[2]};
+      const json=JSON.stringify(bundle);
+      const payload=json.length>150000?{multipart:{...fields,bundleFile:{name:'synthetic-catalog.json',mimeType:'application/json',buffer:Buffer.from(json)}}}:{form:{...fields,bundleJson:json}};
+      const response=await actor.request.post(base+'/apps/zenith/pos/PosQaAcceptance/cleanWorkspace',{...payload,maxRedirects:0,timeout:120000});
       const text=await response.text();let body;try{body=JSON.parse(text)}catch{throw Error('Clean migration HTTP '+response.status()+': '+text.slice(0,240))}
       return {status:response.status(),...body};
     }
@@ -75,6 +78,15 @@ module.exports=async function({browser,base,q,check,out,admin,token}) {
     for(const table of ['invoice','payment','saas_invoice','saas_payment'])check('migration creates no '+table,counts()[table]===before[table]);
     const replay=await invoke(b,true,first.result.bundleDigest);
     check('replaying the same import never creates a second workspace',!!replay.errors&&n('saas_tenant',`subdomain=${literal(b.workspace.code)}`)===1,replay);
+    const bulk=clone();bulk.workspace.code+='-bulk';bulk.workspace.adminEmail='bulk-'+bulk.workspace.adminEmail;bulk.cashiers.forEach(u=>u.username='bulk-'+u.username);
+    bulk.source.productCount=1212;bulk.products=Array.from({length:1212},(_,i)=>({...b.products[0],sourceId:String(i+1),sku:'SRC-22-'+(i+1),name:'Clean QA bulk product '+(i+1)}));
+    bulk.products[0].sourceCode='LEGACY-QA-BULK-1';
+    const bulkPreview=await invoke(bulk);check('1212-product migration validates',!!bulkPreview.result&&!bulkPreview.errors);
+    const started=Date.now(),bulkCreated=await invoke(bulk,true,bulkPreview.result.bundleDigest);
+    check('1212-product migration commits complete retail and wholesale catalogs',!!bulkCreated.result&&!bulkCreated.errors&&n('product',`owner_party_id=${literal(bulkCreated.result?.organizationPartyId)}`)===1212&&n('pos_product_mode_price',`organization_party_id=${literal(bulkCreated.result?.organizationPartyId)}`)===2424,{elapsedMs:Date.now()-started,products:bulkCreated.result?.products,errors:bulkCreated.errors});
+    check('same source SKUs in another workspace never overwrite the first import',JSON.stringify(imported)===JSON.stringify(q(`SELECT pseudo_id,mrp_amount FROM product WHERE owner_party_id=${literal(org)} ORDER BY pseudo_id`)));
+    check('unambiguous legacy SKU labels retained without ambiguous duplicate aliases',bulkCreated.result.legacyScanAliases===1&&n('product_barcode',`organization_party_id=${literal(bulkCreated.result.organizationPartyId)} AND barcode_value='LEGACY-QA-BULK-1'`)===1&&n('product_barcode',`organization_party_id=${literal(bulkCreated.result.organizationPartyId)} AND barcode_value='DUP'`)===0);
+
     for(let i=0;i<3;i++){
       const c=await browser.newContext();try{
         const username=[b.workspace.adminEmail,...b.cashiers.map(u=>u.username)][i];
@@ -86,6 +98,28 @@ module.exports=async function({browser,base,q,check,out,admin,token}) {
           const headers=await p.locator('thead').innerText();
           check('new owner sees editable retail and wholesale price columns',headers.includes('Retail')&&headers.includes('Wholesale')&&await p.locator('input[data-mode-id]').count()===4,{headers});
           await p.goto(base+'/apps/zenith/pos/PosSessions',{waitUntil:'networkidle'});
+          const csrf=await p.locator('[name=moquiSessionToken]').first().inputValue();
+          const submit=async(screen,transition,params)=>c.request.post(`${base}/apps/zenith/pos/${screen}/${transition}`,{form:{moquiSessionToken:csrf,...params},maxRedirects:0});
+          const terminal=q(`SELECT terminal_id FROM pos_terminal WHERE organization_party_id=${literal(org)} ORDER BY terminal_id`)[0].terminal_id;
+          await submit('PosSessions','openSession',{terminalId:terminal,openingCash:'0'});
+          const session=q(`SELECT session_id FROM pos_session WHERE terminal_id=${literal(terminal)} AND status_id='PsOpen'`)[0];
+          check('new owner opens an imported counter',!!session);
+          const retail=q(`SELECT sales_mode_id FROM pos_sales_mode WHERE organization_party_id=${literal(org)} AND mode_code='RTL'`)[0].sales_mode_id;
+          const wholesale=q(`SELECT sales_mode_id FROM pos_sales_mode WHERE organization_party_id=${literal(org)} AND mode_code='WSL'`)[0].sales_mode_id;
+          const product=q(`SELECT product_id FROM product WHERE owner_party_id=${literal(org)} AND pseudo_id='SRC-22-1'`)[0].product_id;
+          await submit('Terminal','addItem',{sessionId:session.session_id,productId:product,addQty:'1',taxOn:'N',salesModeId:retail});
+          const cart=q(`SELECT transaction_id,grand_total FROM pos_transaction WHERE organization_party_id=${literal(org)} AND status_id='PtCreated'`)[0];
+          check('new catalog creates a tax-off retail cart at the imported price',Number(cart?.grand_total)===100,cart);
+          const line=()=>q(`SELECT item_seq_id,sales_mode_id,unit_price,manual_price FROM pos_transaction_item WHERE transaction_id=${literal(cart.transaction_id)}`)[0];
+          const parameters={transactionId:cart.transaction_id,sessionId:session.session_id,itemSeqId:line().item_seq_id,taxOn:'N',salesModeId:retail};
+          await submit('Terminal','setItemMode',{...parameters,itemMode:wholesale});
+          check('new catalog switches the line to its imported wholesale price',Number(line().unit_price)===90);
+          await submit('Terminal','setItemMode',{...parameters,itemMode:'__AUTO__'});
+          check('automatic line reset uses this workspace default',line().sales_mode_id===retail&&Number(line().unit_price)===100&&line().manual_price==='N',line());
+          await submit('Terminal','toggleTax',{...parameters,taxOn:'Y'});
+          check('new catalog GST rates calculate on the fresh account',Number(q(`SELECT total_tax_amount FROM pos_transaction WHERE transaction_id=${literal(cart.transaction_id)}`)[0].total_tax_amount)===12);
+          await submit('Terminal','toggleTax',{...parameters,taxOn:'N'});
+          check('new catalog tax-off removes the computed tax',Number(q(`SELECT total_tax_amount FROM pos_transaction WHERE transaction_id=${literal(cart.transaction_id)}`)[0].total_tax_amount)===0);
           const marker=async mode=>{const r=await admin.request.post(base+'/apps/zenith/pos/PosQaAcceptance/cleanWorkspace',{form:{moquiSessionToken:token,bundleJson:JSON.stringify(b),markerMode:mode}});return (await r.json()).changed};
           try{
             check('synthetic permanent marker changed for authorization probe',await marker('foreign'));
@@ -106,7 +140,7 @@ module.exports=async function({browser,base,q,check,out,admin,token}) {
       check(shell+' clean workspace form renders',await page.getByText('Create a clean shop workspace',{exact:true}).count()===1&&await page.locator('input[type=password]').count()===3);
       const ui=clone();ui.workspace.code+='-'+shell;ui.workspace.adminEmail=shell+'-'+ui.workspace.adminEmail;ui.cashiers.forEach(u=>u.username=shell+'-'+u.username);
       const form=page.locator('form').filter({has:page.getByRole('button',{name:'Preview only',exact:true})});
-      await form.locator('textarea').fill(JSON.stringify(ui));
+      await form.locator('input[type=file]').setInputFiles({name:'synthetic-catalog.json',mimeType:'application/json',buffer:Buffer.from(JSON.stringify(ui))});
       const oldCounts=counts();
       const previewNavigation=shell==='apps'?page.waitForNavigation({waitUntil:'networkidle'}):Promise.resolve();
       const [submitted]=await Promise.all([page.waitForResponse(r=>r.url().includes('/previewWorkspace')&&r.request().method()==='POST'),page.getByRole('button',{name:'Preview only',exact:true}).click(),previewNavigation]);
@@ -116,7 +150,7 @@ module.exports=async function({browser,base,q,check,out,admin,token}) {
       check(shell+' real preview form validates without creating records',previewText.includes(expectedDigest)&&JSON.stringify(oldCounts)===JSON.stringify(counts()));
       await page.getByText('Create a clean shop workspace',{exact:true}).waitFor();
       const applyForm=page.locator('form').filter({has:page.getByRole('button',{name:'Create new workspace',exact:true})});
-      await applyForm.locator('textarea').fill(JSON.stringify(ui));
+      await applyForm.locator('input[type=file]').setInputFiles({name:'synthetic-catalog.json',mimeType:'application/json',buffer:Buffer.from(JSON.stringify(ui))});
       await applyForm.locator('[name=confirmationDigest]').fill('0'.repeat(64));
       for(const [i,name] of ['adminPassword','cashierOnePassword','cashierTwoPassword'].entries())await applyForm.locator('[name='+name+']').fill(passwords[i]);
       const deniedNavigation=shell==='apps'?page.waitForNavigation({waitUntil:'networkidle'}):Promise.resolve();
@@ -128,11 +162,5 @@ module.exports=async function({browser,base,q,check,out,admin,token}) {
       await page.goto(`${base}/${shell}/zenith/saas-admin/PlanAssignments?tenantId=${created.result.tenantId}`,{waitUntil:'networkidle'});
       check(shell+' permanent access is displayed without an expiry countdown',await page.getByText('Non-expiring manual access',{exact:true}).count()===1);
     }
-    const bulk=clone();bulk.workspace.code+='-bulk';bulk.workspace.adminEmail='bulk-'+bulk.workspace.adminEmail;bulk.cashiers.forEach(u=>u.username='bulk-'+u.username);
-    bulk.source.productCount=1212;bulk.products=Array.from({length:1212},(_,i)=>({...b.products[0],sourceId:String(i+1),sku:'SRC-22-'+(i+1),name:'Clean QA bulk product '+(i+1)}));
-    const bulkPreview=await invoke(bulk);check('1212-product migration validates',!!bulkPreview.result&&!bulkPreview.errors);
-    const started=Date.now(),bulkCreated=await invoke(bulk,true,bulkPreview.result.bundleDigest);
-    check('1212-product migration commits complete retail and wholesale catalogs',!!bulkCreated.result&&!bulkCreated.errors&&n('product',`owner_party_id=${literal(bulkCreated.result?.organizationPartyId)}`)===1212&&n('pos_product_mode_price',`organization_party_id=${literal(bulkCreated.result?.organizationPartyId)}`)===2424,{elapsedMs:Date.now()-started,products:bulkCreated.result?.products,errors:bulkCreated.errors});
-    check('same source SKUs in another workspace never overwrite the first import',JSON.stringify(imported)===JSON.stringify(q(`SELECT pseudo_id,mrp_amount FROM product WHERE owner_party_id=${literal(org)} ORDER BY pseudo_id`)));
   }finally{await page.close()}
 };

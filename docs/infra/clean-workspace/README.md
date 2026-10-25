@@ -30,7 +30,10 @@ SHA-256. It selects only the configured company's price rows. Retail is
 `comrate1`; wholesale is `comrate2`; `commrp` is retained separately as legacy
 metadata, since ZetaERP's `mrpAmount` is the POS retail selling price. Source IDs
 become unique `SRC-company-id` SKUs; duplicate human display codes remain in
-metadata and never merge different items. Names, local names, units, categories,
+metadata and never merge different items. Unique letter-prefixed legacy SKUs are
+also retained as non-primary scan aliases when they conflict with no imported
+SKU or explicit barcode; duplicate/numeric display codes require label review.
+Names, local names, units, categories,
 HSN and the separate CGST/SGST rates are retained. Explicit source barcodes are
 validated by the existing Barcode service. Display codes are not automatically
 installed as scan aliases when they are duplicated.
@@ -48,7 +51,9 @@ private; **none belong in Git or a PR attachment**.
 
 Deploy only after review through the normal maintainer process. Sign in as the
 **platform ADMIN**, open **SaaS Admin → Clean Workspace** on `/apps` or `/qapps`,
-and paste the private bundle into Preview. The service validates a unique new
+and upload the private JSON file into Preview (small bundles can also be pasted).
+File upload avoids the web server's ordinary URL-encoded form size limit for a
+full catalog; it does not raise that limit globally. The service validates a unique new
 workspace code and usernames, exactly two shops/three counters/three users,
 plan limits, positive mode prices, real UOMs and an exact active zero-cess GST
 slab matching the source rates. No tenant/user/product records are created by

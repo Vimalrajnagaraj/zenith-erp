@@ -154,6 +154,8 @@ try {
         require(available == (modeIds as Set), 'Each new counter must expose exactly the two imported sales modes.')
     }
     def categories = [:]
+    def sourceCodeCounts = b.products.countBy { it.sourceCode }
+    int legacyAliases = 0
     b.products.each { p ->
         def taxKey = new BigDecimal(p.cgst.toString()).toPlainString() + ':' + new BigDecimal(p.sgst.toString()).toPlainString()
         def product = call('create#mantle.product.Product',[productTypeEnumId:'PtAsset',ownerPartyId:org,pseudoId:p.sku,productName:p.name,amountUomId:p.amountUomId,
@@ -165,6 +167,13 @@ try {
             call('create#mantle.product.category.ProductCategoryMember',[productCategoryId:categories[p.category],productId:product.productId,fromDate:ec.user.nowTimestamp])
         }
         if (p.barcode) call('zenith.barcode.BarcodeServices.add#ProductBarcode',[productId:product.productId,barcodeTypeEnumId:'BctCode128',barcodeValue:p.barcode,isPrimary:'N'])
+        // Preserve unambiguous letter-prefixed legacy SKUs (e.g. printed labels).
+        // Numeric codes can have GTIN aliases; leave those to the explicit barcode field.
+        if (p.sourceCode instanceof String && p.sourceCode ==~ /[A-Za-z][A-Za-z0-9_-]{0,59}/ &&
+            sourceCodeCounts[p.sourceCode] == 1 && !skus.contains(p.sourceCode) && !barcodes.contains(p.sourceCode)) {
+            call('zenith.barcode.BarcodeServices.add#ProductBarcode',[productId:product.productId,barcodeTypeEnumId:'BctCode128',barcodeValue:p.sourceCode,isPrimary:'N'])
+            legacyAliases++
+        }
     }
     // Permanent access is an explicit, audited grant for THIS new tenant only.
     // Never change shared plans, the protected old organization, or global expiry policy.
@@ -177,7 +186,7 @@ try {
     call('update#zenith.erp.saas.SaasTenant',[tenantId:created.tenantId,statusId:'SaasTenantActive'])
     call('create#zenith.erp.saas.SaasAuditLog',[tenantId:created.tenantId,eventType:'CLEAN_WORKSPACE_CREATED',eventDate:ec.user.nowTimestamp,userId:ec.user.userId,
         description:'Catalog-only migration '+digest+'; source '+b.source.sha256+'; non-expiring manual access: '+w.permanentAccessReason])
-    result = result + [organizationPartyId:org,tenantId:created.tenantId,workspaceCode:subdomain.canonical,nonExpiringAccess:true]
+    result = result + [organizationPartyId:org,tenantId:created.tenantId,workspaceCode:subdomain.canonical,nonExpiringAccess:true,legacyScanAliases:legacyAliases]
     ec.message.addMessage('New workspace '+subdomain.canonical+' created with '+b.products.size()+' products, 2 shops, 3 logins and 3 counters. No existing account was changed or deleted.')
 } catch (Exception failure) {
     // A reported validation or service error marks the force-new transaction rollback-only.
