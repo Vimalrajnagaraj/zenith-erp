@@ -14,8 +14,12 @@ module.exports = async ({a,foreign,base,check,q,invoke,post,out,sessionId,accoun
  check('CSRF-less Delete leaves the mode unchanged',removed()===0);
  await a.c.request.get(base+'/apps/zenith/pos/SalesMode/deleteMode?salesModeId=EMPLOYEE');
  check('GET cannot delete a shared mode',removed()===0);
+ // Other workspaces may already have an explicitly configured owned default.
+ const retailRemovals = () => q("SELECT * FROM pos_sales_mode_org_removal WHERE sales_mode_id='RETAIL' ORDER BY organization_party_id");
+ const retailBefore = retailRemovals();
  await post('SalesMode','deleteMode',{salesModeId:'RETAIL'});
- check('default Retail cannot be deleted',q("SELECT * FROM pos_sales_mode_org_removal WHERE sales_mode_id='RETAIL'").length===0&&q("SELECT is_active FROM pos_sales_mode WHERE sales_mode_id='RETAIL'")[0].is_active==='Y');
+ assert.deepEqual(retailRemovals(),retailBefore);
+ check('default Retail cannot be deleted',q("SELECT is_active FROM pos_sales_mode WHERE sales_mode_id='RETAIL'")[0].is_active==='Y');
  const cart = await invoke('cart',{sessionId});
  await invoke('add',{transactionId:cart.transactionId,productId:'POS_QA_A_P18',salesModeId:'EMPLOYEE',quantity:'1',taxOn:'N'});
  await post('SalesMode','deleteMode',{salesModeId:'EMPLOYEE'});
