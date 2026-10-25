@@ -69,14 +69,18 @@ module.exports=async({a,foreign,base,check,q,invoke,post,out})=>{
    closeResult={status:response.status(),body:await response.text()};
    await route.fulfill({response});
   });
-  await Promise.all([page.waitForURL(/\/PosSessions\?/),page.locator('.pos-close-confirm').click()]);
+  await Promise.all([page.waitForURL(url=>url.pathname.endsWith('/Terminal')&&url.searchParams.get('sessionId')===session.sessionId,{waitUntil:'networkidle'}),page.locator('.pos-close-confirm').click()]);
+  await page.locator('.pos-no-session').waitFor();
   const raw=closeResult.body;let result;try{result=JSON.parse(raw)}catch{}
   check('manual close returns JSON and closes a session containing unpaid held bills',result?.success&&q(`SELECT status_id FROM pos_session WHERE session_id='${session.sessionId}'`)[0].status_id==='PsClosed',{status:closeResult.status,body:raw.slice(0,300)});
   check('closing session voids unpaid held draft and its snapshot',tx(heldBill.transactionId).status_id==='PtVoided'&&q(`SELECT status_id FROM pos_held_transaction WHERE held_id='${held.heldId}'`)[0].status_id==='PhVoided');
   check('closing preserves every completed bill and recorded tender',completed.every(t=>tx(t.transaction_id).status_id==='PtCompleted'&&Number(tx(t.transaction_id).paid_amount)===Number(t.paid_amount)));
-  check('closing popup returns to the session review screen',new URL(page.url()).pathname.endsWith('/PosSessions'));
+  check('closing popup returns to the terminal opening screen without an active cart',new URL(page.url()).pathname.endsWith('/Terminal')&&await page.locator('#OpenSessionForm').isVisible()&&await page.locator('#cartInlineAddForm').count()===0);
+  if(out)await page.screenshot({path:require('node:path').join(out,'closed-terminal-opening-screen.png'),fullPage:true});
   const retry=await post('Terminal','closeSession',{sessionId:session.sessionId,closingCash:'0',wantJson:'1'});
   check('duplicate manual close is idempotent',(await retry.json()).success);
+  const nativeClose=await post('Terminal','closeSession',{sessionId:session.sessionId,closingCash:'0'});
+  check('native close fallback uses the same terminal opening destination',nativeClose.status()===302&&new URL(nativeClose.headers().location,base).pathname.endsWith('/Terminal'));
   const paidSession=await invoke('open',{terminalId,openingCash:'0'});
   const paid=await invoke('cart',{sessionId:paidSession.sessionId});
   await invoke('add',{transactionId:paid.transactionId,productId:'POS_QA_A_P18',quantity:'1',taxOn:'N'});

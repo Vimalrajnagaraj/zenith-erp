@@ -3899,7 +3899,7 @@ window.posToggleFullscreen = function() {
                                 if (!result.success) throw new Error(result.error || 'Session close failed.');
                                 ov.remove();
                                 showToast('Session closed successfully');
-                                window.location.assign('/apps/zenith/pos/PosSessions?sessionId=' + encodeURIComponent(SI));
+                                window.location.assign(result.redirectUrl || '/apps/zenith/pos/Terminal?sessionId=' + encodeURIComponent(SI));
                             }).catch(function(error) {
                                 confirmButton.disabled = false;
                                 confirmButton.textContent = 'CLOSE SESSION';
