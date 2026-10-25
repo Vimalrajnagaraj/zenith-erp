@@ -87,6 +87,18 @@ module.exports=async function({browser,base,q,check,out,admin,token}) {
     check('same source SKUs in another workspace never overwrite the first import',JSON.stringify(imported)===JSON.stringify(q(`SELECT pseudo_id,mrp_amount FROM product WHERE owner_party_id=${literal(org)} ORDER BY pseudo_id`)));
     check('unambiguous legacy SKU labels retained without ambiguous duplicate aliases',bulkCreated.result.legacyScanAliases===1&&n('product_barcode',`organization_party_id=${literal(bulkCreated.result.organizationPartyId)} AND barcode_value='LEGACY-QA-BULK-1'`)===1&&n('product_barcode',`organization_party_id=${literal(bulkCreated.result.organizationPartyId)} AND barcode_value='DUP'`)===0);
 
+    // Creating owned RTL/WSL codes must not disable another tenant's quantity pricing.
+    const existing=await browser.newContext();try{
+      const login=await existing.request.get(base+'/apps/zenith/pos/Terminal',{headers:{Authorization:'Basic '+Buffer.from('pos.qa:moqui').toString('base64')}});
+      const csrf=(await login.text()).match(/name="moquiSessionToken" value="([^"]+)"/)?.[1];
+      const op=async(action,params={})=>{const r=await existing.request.post(base+'/apps/zenith/pos/PosQaAcceptance/invoke',{form:{moquiSessionToken:csrf,op:action,...params}});const body=await r.json();check('existing tenant '+action+' after migration',r.status()===200&&!body.errors?.length,{status:r.status(),errors:body.errors,denied:body.denied});return body.result;};
+      const session=await op('open',{terminalId:'POS_QA_A_TERM1',openingCash:'0'}),cart=await op('cart',{sessionId:session.sessionId});
+      await op('add',{transactionId:cart.transactionId,productId:'POS_QA_A_BREAK',quantity:'5',taxOn:'N'});
+      const line=q(`SELECT sales_mode_id,unit_price FROM pos_transaction_item WHERE transaction_id=${literal(cart.transactionId)}`)[0];
+      check('foreign owned mode codes cannot disable existing quantity pricing',line.sales_mode_id==='WHOLESALE'&&Number(line.unit_price)===90,line);
+      await op('void',{transactionId:cart.transactionId});await op('close',{sessionId:session.sessionId,closingCash:'0'});
+    }finally{await existing.close()}
+
     for(let i=0;i<3;i++){
       const c=await browser.newContext();try{
         const username=[b.workspace.adminEmail,...b.cashiers.map(u=>u.username)][i];
