@@ -32,6 +32,7 @@ module.exports=async function({a,base,check,q,invoke,out}) {
   await page.locator('.nb-modes summary').click();
   await page.locator('[data-pos-layout=advanced]').click();
   const added=page.waitForResponse(r=>r.url().includes('/ajaxCart')&&r.request().postData()?.includes('action=add'));
+  await page.locator('.nb-modes summary').click();await page.locator('[data-pos-layout="advanced"]').click();
   await page.locator('.pos-product-grid form').filter({has:page.locator('input[name=productId][value=POS_QA_A_P18]')}).locator('button[type=submit]').click();await added;
   const card=page.locator('#pos-pay-card');await card.waitFor();const before=posts;
   await card.click();await page.locator('#posPayConfirmOverlay').waitFor();await page.waitForTimeout(350);

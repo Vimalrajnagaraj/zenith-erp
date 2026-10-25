@@ -1177,11 +1177,13 @@ window._posOffline = (function() {
         var t = af ? af.querySelector('[name=transactionId]') : document.querySelector('input[name="transactionId"]');
         return t ? (t.value || '') : '';
     }
-    function setCustChip(name) {
+    function setCustChip(name, phone) {
         ['pos-cust-name', 'pos-header-customer-name'].forEach(function(id) {
             var el = document.getElementById(id);
             if (el) el.textContent = (name && name.length) ? name : 'Walk-in Customer';
         });
+        var phoneEl = document.getElementById('pos-cust-phone');
+        if (phoneEl) phoneEl.textContent = phone || '—';
     }
     function custEscape(value) {
         return String(value == null ? '' : value).replace(/[&<>"']/g, function(ch) {
@@ -1285,7 +1287,7 @@ window._posOffline = (function() {
                                 window.location.assign(next.toString()); return;
                             }
                             if (window._posRefreshCart) window._posRefreshCart();
-                            setCustChip(d.customer || nm); histToast('Customer: ' + (d.customer || nm), '#7C3AED'); closeCustomer();
+                            setCustChip(d.customer || nm, d.customerPhone); histToast('Customer: ' + (d.customer || nm), '#7C3AED'); closeCustomer();
                         }
                         else { histToast((d && d.error) || 'Could not set customer', '#c62828'); }
                     });
