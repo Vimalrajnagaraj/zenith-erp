@@ -55,13 +55,15 @@ module.exports=async function({manager,cashier,foreign,session,id,free,credit,ca
   const tender=await manager.invoke('pay',{transactionId:tx,paymentMethod:'Cash',amount:'1'});
   check('Tax '+taxOn+' rejects payment for a zero-price line',tender.errors?.length>0&&q(`SELECT * FROM pos_payment WHERE transaction_id='${tx}'`).length===0);
   await approve(tx);const completed=await manager.invoke('complete',{transactionId:tx});
-  check('Tax '+taxOn+' manager approval cannot issue the zero-price bill',completed.errors?.length>0&&q(`SELECT status_id FROM pos_transaction WHERE transaction_id='${tx}'`)[0].status_id==='PtCreated');
+  // Coexist with #138: POS_QA_A is opted into freeItemApproval, so a manager-approved ₹0 line DOES
+  // complete (the free-item feature). A non-opted-in shop still hard-blocks ₹0 (default, e.g. MARUTHI).
+  check('Tax '+taxOn+' manager approval issues the zero-price bill for an opted-in shop',!completed.errors?.length&&q(`SELECT status_id FROM pos_transaction WHERE transaction_id='${tx}'`)[0].status_id==='PtCompleted');
  }
  const unpriced=(await manager.invoke('cart',{sessionId:session.sessionId,reuseOpenCart:'false'})).result.transactionId;
  const unpricedResult=await manager.invoke('add',{transactionId:unpriced,productId:'POS_QA_A_UNPRICED',quantity:'1',taxOn:'N'});
  check('A missing catalog price stays in the draft cart',!unpricedResult.errors?.length&&Number(q(`SELECT unit_price FROM pos_transaction_item WHERE transaction_id='${unpriced}'`)[0].unit_price)===0);
  await approve(unpriced);const unpricedCompletion=await manager.invoke('complete',{transactionId:unpriced});
- check('An approved unpriced product still cannot generate a bill',unpricedCompletion.errors?.length>0&&q(`SELECT status_id FROM pos_transaction WHERE transaction_id='${unpriced}'`)[0].status_id==='PtCreated');
+ check('An approved unpriced product generates a bill for an opted-in shop',!unpricedCompletion.errors?.length&&q(`SELECT status_id FROM pos_transaction WHERE transaction_id='${unpriced}'`)[0].status_id==='PtCompleted');
  const discount=(await manager.invoke('cart',{sessionId:session.sessionId,reuseOpenCart:'false'})).result.transactionId;
  await manager.invoke('add',{transactionId:discount,productId:'POS_QA_A_P18',quantity:'1',taxOn:'N'});
  await ajax({action:'applyDiscount',transactionId:discount,billDiscValue:'100',billDiscType:'pct',managerPin:'246813',taxOn:'N'});
