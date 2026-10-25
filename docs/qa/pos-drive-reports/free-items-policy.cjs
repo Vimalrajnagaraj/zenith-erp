@@ -72,7 +72,7 @@ module.exports=async function({manager,cashier,foreign,session,id,free,credit,ca
  const recalled=(await manager.invoke('recall',{heldId:held.heldId,sessionId:session.sessionId})).result;
  check('Holding and recalling unchanged free items preserves their approval',(await state(recalled.transactionId)).required===false&&rows(recalled.transactionId).length===1);
  // Saving an issued bill must atomically roll back free-item changes until separately approved.
- const paidSeq=q(`SELECT item_seq_id FROM pos_transaction_item WHERE transaction_id='${id}' AND unit_price>0`)[0].item_seq_id;
+ const paidSeq=q(`SELECT item_seq_id FROM pos_transaction_item WHERE transaction_id='${id}' AND line_total>0`)[0].item_seq_id;
  const change={action:'amendBill',editTxId:id,editReason:'Synthetic price correction',editType:'PRICE_CHANGE',editItemSeqId:paidSeq,newPrice:'0'};
  const before=q(`SELECT * FROM pos_transaction WHERE transaction_id='${id}'`)[0];const edit=await ajax(change);
  check('Zero-price amendment is rejected before approval',!edit.success&&!edit.needFreeApproval);
