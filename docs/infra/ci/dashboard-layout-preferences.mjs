@@ -49,6 +49,36 @@ export async function verifyDashboardLayout(page, base, surface, screenshot) {
     await ready();
     await page.waitForSelector('.pos-dash-secondary');
     console.log(`PASS POS Customize Save/persist/Reset on /${surface}`);
+    stage = 'select This Week';
+    const today = await page.$eval('.pos-dash-periods a', a => new URL(a.href).searchParams.get('dashDate'));
+    const monday = new Date(today + 'T00:00:00Z');
+    monday.setUTCDate(monday.getUTCDate() - (monday.getUTCDay() + 6) % 7);
+    const from = monday.toISOString().slice(0, 10);
+    const dateResponse = start => page.waitForResponse(response => {
+      const url = new URL(response.url());
+      return response.request().method() === 'GET' && url.pathname.endsWith('/zenith/pos/Dashboard') &&
+        url.searchParams.get('dashDate') === start && url.searchParams.get('dashDateTo') === today;
+    });
+    await Promise.all([dateResponse(from), click('.pos-dash-periods a:nth-child(2)')]);
+    const rangeReady = async start => page.waitForFunction((first, last) =>
+      document.querySelector('.pos-dash-range [name="dashDate"]')?.value === first &&
+      document.querySelector('.pos-dash-range [name="dashDateTo"]')?.value === last &&
+      document.querySelector('.pos-dash-chart svg')?.getAttribute('aria-label')?.includes(`sales from ${first} to ${last}`), {}, start, today);
+    await rangeReady(from);
+    stage = 'reload This Week';
+    await page.reload({ waitUntil: 'networkidle2' });
+    await rangeReady(from);
+    stage = 'apply custom seven-day range';
+    const sevenDays = new Date(today + 'T00:00:00Z');
+    sevenDays.setUTCDate(sevenDays.getUTCDate() - 6);
+    const customFrom = sevenDays.toISOString().slice(0, 10);
+    await click('.pos-dash-range summary');
+    await page.$eval('.pos-dash-range [name="dashDate"]', (input, value) => { input.value = value; }, customFrom);
+    await Promise.all([dateResponse(customFrom), click('.pos-dash-range button[type="submit"]')]);
+    await rangeReady(customFrom);
+    await page.waitForFunction(() => new URL(location.href).searchParams.get('dateMode') === 'custom');
+    assert.equal(new URL(page.url()).pathname, `/${surface}/zenith/pos/Dashboard`);
+    console.log(`PASS POS This Week and custom seven-day range on /${surface}`);
   } catch (error) {
     error.message = `${surface} dashboard ${stage}: ${error.message}; URL=${page.url()}`;
     if (screenshot) await page.screenshot({ path: screenshot }).catch(() => {});
