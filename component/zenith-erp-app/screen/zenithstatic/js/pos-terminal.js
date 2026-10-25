@@ -2342,29 +2342,15 @@ window.posToggleFullscreen = function() {
             });
         }
         function recallHeldBill(hid) {
-            var fd = new URLSearchParams();
-            fd.set('heldId', hid); fd.set('sessionId', SI); fd.set('taxOn', TO);
-            fd.set('salesModeId', SM); fd.set('moquiSessionToken', TK);
-            fetch('Terminal/recallSale', {method:'POST', body:fd, credentials:'same-origin'})
-                .then(function(r) { return r.text().then(function(html) { return {html:html, url:r.url||''}; }); })
-                .then(function(resp) {
-                    var respDoc = new DOMParser().parseFromString(resp.html, 'text/html');
-                    var ntx = respDoc.querySelector('input[name="transactionId"]');
-                    var newTx = ntx ? (ntx.value||'') : '';
-                    if (!newTx && resp.url) { var m = resp.url.match(/transactionId=(\d+)/); if (m) newTx = m[1]; }
-                    if (newTx) {
-                        TX = newTx;
-                        document.querySelectorAll('input[name="transactionId"]').forEach(function(el) { el.value = TX; });
-                        var ntk = respDoc.querySelector('input[name="moquiSessionToken"]');
-                        if (ntk && ntk.value) TK = ntk.value;
-                        extractHeldInfo(respDoc);
-                        updateHeldBadge();
-                        post({action:'refresh', transactionId:TX}).then(function(d) {
-                            renderCart(d);
-                            showToast('✔ Held sale recalled', '#e65100');
-                        });
-                    }
-                });
+            // Native navigation restores the bill's mode, tax, customer and pricing together.
+            var form = document.createElement('form');
+            form.method = 'post'; form.action = 'Terminal/recallSale'; form.hidden = true;
+            var values = {heldId:hid, sessionId:SI, moquiSessionToken:TK};
+            Object.keys(values).forEach(function(name) {
+                var input = document.createElement('input'); input.type='hidden';
+                input.name=name; input.value=values[name]; form.appendChild(input);
+            });
+            document.body.appendChild(form); form.submit();
         }
         function recallBtn() {
             return '<form method="post" action="Terminal/recallSale" style="margin:0">'
@@ -3977,39 +3963,31 @@ window.posToggleFullscreen = function() {
         extractHeldInfo(document);
 
         // Refresh the server-rendered held-bills picker (#pos-held-wrap <details>) from a full
-        // terminal render, so HOLD/RECALL/VOID keep the badge correct with no page reload.
+        // terminal render after an AJAX void.
         function syncHeldWrap(doc) {
             try { var s = doc.querySelector('#pos-held-wrap'); var d = document.getElementById('pos-held-wrap'); if (s && d) d.innerHTML = s.innerHTML; } catch (e) {}
         }
-        function reconcileTerminal(doc) {
-            var ntk = doc.querySelector('input[name="moquiSessionToken"]'); if (ntk && ntk.value) TK = ntk.value;
-            swapGrid(doc);
-            var nb = doc.querySelector('.pos-cart tbody'); var ct = document.querySelector('.pos-cart tbody'); if (nb && ct) ct.innerHTML = nb.innerHTML;
-            var ns = doc.querySelector('.pos-summary'); var sd = document.querySelector('.pos-summary'); if (ns && sd) sd.innerHTML = ns.innerHTML;
-            syncHeldWrap(doc);
-        }
-
-        /* Hold uses the server's normal POST/redirect so a rejected hold never clears the cart.
-           Recall and void continue through the existing delegated handler. */
+        /* Hold and recall use native POST/redirect to restore the complete bill context.
+           Void continues through the delegated handler. */
         document.addEventListener('submit', function(e) {
             var form = e.target.closest ? e.target.closest('form') : null;
             if (!form) return;
             var act = form.getAttribute('action') || '';
-            if (act.indexOf('holdSale') !== -1) return; // Native POST confirms the hold before the cart is cleared.
-            if (act.indexOf('voidSale') !== -1 || act.indexOf('recallSale') !== -1) {
+            if (act.indexOf('holdSale') !== -1) return;
+            if (act.indexOf('recallSale') !== -1) {
+                e.preventDefault(); e.stopImmediatePropagation();
+                HTMLFormElement.prototype.submit.call(form);
+                return;
+            }
+            if (act.indexOf('voidSale') !== -1) {
                 e.preventDefault();
-                var isRecall = act.indexOf('recallSale') !== -1;
                 var fd = new FormData(form);
                 fd.set('transactionId', TX); fd.set('sessionId', SI); fd.set('taxOn', TO);
                 fd.set('salesModeId', SM); fd.set('moquiSessionToken', TK);
-                if (isRecall) {
-                    showToast('Recalling held sale…', '#e65100');
-                } else {
-                    // Empty the cart optimistically for void; Hold waits for its native response.
-                    renderCart({ success: true, transactionId: '', items: [], sub: 0, tax: 0, disc: 0, tQty: 0, grand: 0, pay: 0 });
-                    TX = ''; lastCartData = null; lastPay = 0;
-                    showToast('Sale voided', '#e53935');
-                }
+                // Empty the cart optimistically for void; Hold waits for its native response.
+                renderCart({ success: true, transactionId: '', items: [], sub: 0, tax: 0, disc: 0, tQty: 0, grand: 0, pay: 0 });
+                TX = ''; lastCartData = null; lastPay = 0;
+                showToast('Sale voided', '#e53935');
                 fetch(form.action, { method: 'POST', body: new URLSearchParams(fd), credentials: 'same-origin' })
                     .then(function(r) { var u = r.url || ''; return r.text().then(function(html) { return { html: html, url: u }; }); })
                     .then(function(resp) {
@@ -4019,18 +3997,11 @@ window.posToggleFullscreen = function() {
                         if (!newTx && resp.url) { var m = resp.url.match(/transactionId=(\d+)/); if (m) newTx = m[1]; }
                         TX = newTx;
                         document.querySelectorAll('input[name="transactionId"]').forEach(function(el) { el.value = TX; });
-                        if (isRecall) {
-                            // Show the recalled cart immediately (server HTML), then load the JSON
-                            // model so optimistic edits work on the recalled lines.
-                            reconcileTerminal(doc);
-                            post({ action: 'refresh', transactionId: TX }).then(function(d) { renderCart(d); showToast('✔ Held sale recalled', '#e65100'); });
-                        } else {
-                            // Void keeps the optimistic empty cart until the next bill starts.
-                            var ntk = doc.querySelector('input[name="moquiSessionToken"]'); if (ntk && ntk.value) TK = ntk.value;
-                            syncHeldWrap(doc);
-                            var bn = document.querySelector('.pos-header [style*="background:#e65100"]') || document.querySelector('.pos-header [style*="background: rgb(230, 81, 0)"]');
-                            if (bn) bn.textContent = 'BILL- 0';
-                        }
+                        // Void keeps the optimistic empty cart until the next bill starts.
+                        var ntk = doc.querySelector('input[name="moquiSessionToken"]'); if (ntk && ntk.value) TK = ntk.value;
+                        syncHeldWrap(doc);
+                        var bn = document.querySelector('.pos-header [style*="background:#e65100"]') || document.querySelector('.pos-header [style*="background: rgb(230, 81, 0)"]');
+                        if (bn) bn.textContent = 'BILL- 0';
                     })
                     .catch(function() { try { location.reload(); } catch (e) {} });
             }
