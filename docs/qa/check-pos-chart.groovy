@@ -95,7 +95,7 @@ def execute = { Map extra=[:], Map data=tables ->
     def prefs=[ACTIVE_ORGANIZATION:'ORG',POS_DASH_ORDER:'payments,salesKpi'] + (extra.prefs ?: [:])
     def service=new Expando(); service.name={ n->service }; service.call={->[activeShopId:extra.activeShop]}
     def ec=[entity:[find:{ name->new Query(rows:new ArrayList(data[name] ?: []), fields:name=='zenith.erp.pos.PosTransactionAmendment' ? ['transactionId'] as Set : null)}],
-        user:[timeZone:tz,nowTimestamp:stamp('2026-10-12 12:00:00.000',tz),userGroupIdSet:extra.groups ?: ['ADMIN'],isInGroup:{ g->(extra.groups ?: ['ADMIN']).contains(g) },getPreference:{ name->prefs[name] }],
+        user:[timeZone:tz,nowTimestamp:extra.now ?: stamp('2026-10-12 12:00:00.000',tz),userGroupIdSet:extra.groups ?: ['ADMIN'],isInGroup:{ g->(extra.groups ?: ['ADMIN']).contains(g) },getPreference:{ name->prefs[name] }],
         service:[sync:{->service}],l10n:new TestL10n(zone:tz),
         web:[request:[requestURI:extra.uri ?: '/qapps/zenith/pos/Dashboard'],sessionToken:'synthetic-token']]
     def b=new Binding([ec:ec,context:[:],posOrganizationPartyId:'ORG',zinr:new TestFmt(),dashDate:'2026-10-11',dashDateTo:'2026-10-11',dashLoc:'',dateMode:'custom',chartMode:null,showSettings:'1'] + extra)
@@ -104,6 +104,23 @@ def execute = { Map extra=[:], Map data=tables ->
 // Keep this fixture local and synthetic, and exercise only this request's behavior.
 tables.values().each { rows -> rows.removeAll { it.organizationPartyId == 'OTHER' || it.ownerPartyId == 'OTHER' || it.transactionId == 'FOREIGN' } }
 def normal = execute()
+// This Week follows the chart's Monday-based buckets, including Sundays and year rollover.
+def originalLocale = Locale.default
+try {
+    for (def locale : [Locale.US, Locale.UK]) {
+        Locale.setDefault(locale)
+        for (def day : ['2026-10-25','2026-10-19','2026-10-20','2026-10-21','2026-10-22','2026-10-23','2026-10-24','2027-01-03']) {
+            def today = java.time.LocalDate.parse(day)
+            def monday = today.with(java.time.temporal.TemporalAdjusters.previousOrSame(java.time.DayOfWeek.MONDAY)).toString()
+            def week = execute([now:stamp(day+' 12:00:00.000'),dashDate:monday,dashDateTo:day,dateMode:null])
+            assert week.urlWeek.startsWith('?dashDate='+monday+'&dashDateTo='+day): "This Week must use Monday in ${locale} on ${day}: ${week.urlWeek}"
+            if (today.dayOfWeek != java.time.DayOfWeek.MONDAY) assert week.presetActive == 'week'
+        }
+    }
+} finally { Locale.setDefault(originalLocale) }
+def sundayWeek = execute([now:stamp('2026-10-11 12:00:00.000'),dashDate:'2026-10-05',dashDateTo:'2026-10-11',dateMode:null,chartMode:'daily'])
+assert sundayWeek.urlWeek.startsWith('?dashDate=2026-10-05&dashDateTo=2026-10-11')
+assert sundayWeek.totalSales == 225G && sundayWeek.chartBuckets.sum { it.amount } == 225G
 assert normal.chartBuckets.size() == 24
 assert normal.chartBuckets[0].amount == 100G && normal.chartBuckets[23].amount == 50G
 assert normal.chartBuckets[0].label == '12 AM' && normal.chartBuckets[12].label == '12 PM'
