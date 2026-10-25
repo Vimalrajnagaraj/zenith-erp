@@ -467,6 +467,7 @@ const rows=(table,where)=>q(`SELECT * FROM ${table} WHERE ${where}`),count=(tabl
  check('POS pages have no JavaScript exceptions',report.consoleErrors.length===0,report.consoleErrors);
  await require('./verify-next-bill.cjs')({a,base,check,q,invoke,post,out});
  await require('./verify-checkout-reference.cjs')({a,foreign,base,check,q,invoke,post,out});
+ if(process.env.POS_QA_UI_ONLY!=='true')await require('./verify-normal-layout.cjs')({a,base,check,q,invoke,post,out});
  if(process.env.POS_QA_UI_ONLY!=='true')await require('./verify-free-items.cjs')({browser,base,q,check,out});
  await browser.close();browser=null;
 }catch(e){if(!report.failures.length)report.failures.push({name:'runner',error:e.message});throw e}finally{if(browser)await browser.close();report.passed=report.failures.length===0;report.finished=new Date().toISOString();fs.writeFileSync(path.join(out,'report.json'),JSON.stringify(report,null,2));console.log(JSON.stringify({passed:report.passed,checks:report.checks.length,failures:report.failures.length,pages:report.pages.length,layouts:report.layouts.length}));}})().catch(e=>{console.error(e.message);process.exitCode=1});

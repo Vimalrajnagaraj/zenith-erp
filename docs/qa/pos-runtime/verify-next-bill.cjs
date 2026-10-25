@@ -14,7 +14,8 @@ module.exports = async function({a, base, check, q, invoke, post, out, terminalI
  try {
   for (const taxOn of ['N','Y']) for (const method of ['Card','UPI','Cash','Split']) {
    await page.goto(`${base}/apps/zenith/pos/Terminal?sessionId=${session.sessionId}&taxOn=${taxOn}`);
-   if (method === 'UPI') await page.evaluate(() => { if (!document.body.classList.contains('pos-mode-advanced')) window.posToggleLayout(); });
+   await page.locator('.nb-modes summary').click();
+   await page.locator('[data-pos-layout=advanced]').click();
    const tile = pid => page.locator(`.pos-product-grid form:has(input[name=productId][value=${pid}]) button`);
    const actionReply = action => page.waitForResponse(r => r.request().method()==='POST' && r.url().includes('/ajaxCart') && new URLSearchParams(r.request().postData()||'').get('action')===action);
    let reply=actionReply('addItem'); await tile('POS_QA_A_P18').click();const added=await (await reply).json();check(method+' tax '+taxOn+' first item accepted',added.success,added.error);

@@ -21,6 +21,7 @@ module.exports=async function({a,foreign,base,check,q,invoke,post,out}) {
   await page.goto(`${base}/apps/zenith/pos/Terminal?sessionId=${session.sessionId}&transactionId=${cart.transactionId}&taxOn=N`);
   await page.locator('.pos-checkout-reference').waitFor();
   check('billing header removes technical terminal, cashier badge and duplicate Search control',await page.locator('.nb-cashier,#pos-search-toggle').count()===0&&!(await page.locator('.nb-hrow').innerText()).includes(terminalId));
+  await page.locator('.nb-modes summary').click();await page.locator('[data-pos-layout="advanced"]').click();
   check('reference empty cart keeps all tender buttons disabled',await page.locator('.pos-reference-payments button:disabled').count()===8&&await page.locator('#pos-copilot').isEnabled());
   check('counter and Back to POS target registered POS screens',(await page.locator('.nb-counter a').last().getAttribute('href'))==='/apps/zenith/pos/PosTerminals'&&(await page.locator('.nb-back').getAttribute('href'))==='/apps/zenith/pos/Dashboard');
   const stock=await api({action:'cardStock',productIds:'POS_QA_A_STOCK,POS_QA_B_P18'});
