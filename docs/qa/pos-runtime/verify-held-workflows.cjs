@@ -1,11 +1,17 @@
 module.exports=async({a,foreign,base,check,q,invoke,post,out})=>{
  const terminalId='POS_QA_A_HELD_FLOW';
  await post('PosTerminals','createTerminal',{terminalId,terminalName:'Disposable held workflow counter',facilityId:'POS_QA_A_FAC',organizationPartyId:'POS_QA_A',regionGeoId:'33',stateCode:'33',isActive:'Y'});
+ // Earlier deletion tests intentionally remove the shared Employee mode. Use an owned
+ // custom definition instead of undoing those shop policies or depending on test order.
+ await post('SalesMode','createMode',{modeName:'Synthetic held custom',modeCode:'QAHLD',priceSource:'PpsFixedProduct',minOrderAmount:'0',requireCustomer:'N'});
+ const customMode=q("SELECT sales_mode_id FROM pos_sales_mode WHERE organization_party_id='POS_QA_A' AND mode_code='QAHLD'")[0]?.sales_mode_id;
+ check('held workflow creates an isolated custom mode',!!customMode);
+ await invoke('price',{productId:'POS_QA_A_P18',salesModeId:customMode,price:'80'});
  const session=await invoke('open',{terminalId,openingCash:'0'});
  const tx=id=>q(`SELECT * FROM pos_transaction WHERE transaction_id='${id}'`)[0];
  const page=await a.c.newPage();
  try{
-  for(const [saved,next,price] of [['RETAIL','WHOLESALE',100],['WHOLESALE','EMPLOYEE',90],['EMPLOYEE','RETAIL',80]]){
+  for(const [saved,next,price] of [['RETAIL','WHOLESALE',100],['WHOLESALE',customMode,90],[customMode,'RETAIL',80]]){
    const bill=await invoke('cart',{sessionId:session.sessionId});
    await invoke('reprice',{transactionId:bill.transactionId,salesModeId:saved,taxOn:'N'});
    await invoke('add',{transactionId:bill.transactionId,productId:'POS_QA_A_P18',quantity:'1',salesModeId:saved,taxOn:'N'});
