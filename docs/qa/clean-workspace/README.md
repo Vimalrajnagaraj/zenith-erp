@@ -1,6 +1,6 @@
 # Clean workspace migration verification
 
-Native application candidate: `e1b21333aa1152cfc12e9dd362be59bfc655d459`.
+Native application candidate: `a16c235747f0fee36f8904d243d1a56af81fbcb2`.
 All data in this verification is synthetic. No live database, customer catalog,
 old test-account export or private credential is an input or a committed artifact.
 
@@ -10,7 +10,7 @@ old test-account export or private credential is an input or a committed artifac
   files, including unchanged source checksums, selected-company pricing,
   duplicate IDs/codes, missing/zero/negative prices, unit and GST/VAT review,
   explicit exclusions and exclusion of historical transaction/credential tables.
-- **67 real service/database/browser checks passed** on loopback Moqui with a new
+- **73 real service/database/browser checks passed** on loopback Moqui with a new
   in-memory H2 database. Independent JDBC reads establish persisted state.
 - A **1,212-product** multipart import commits all 1,212 products and **2,424 mode
   prices**, without overwriting the same source SKUs in a different workspace.
@@ -50,6 +50,14 @@ the server's form-content limit; bounded file uploads handle the full catalog
 without globally raising that limit. Private parameters are scrubbed in
 `finally`, including service-error returns that bypass XML actions after a
 service-call.
+
+The Linux/PostgreSQL suite exposed an existing global mode-code lookup in
+quantity-break pricing: after a different workspace defines RTL/WSL, its first
+row could suppress another counter's configured wholesale threshold. The service
+now resolves these codes only from that counter's authorized modes. A direct
+real-service regression verifies that an existing tenant still gets Wholesale
+90 at quantity 5 after two new workspaces are created. The full-suite failure
+before this fix is recorded in PR CI run 40184965261, attempt 2.
 
 ## Cleanup and execution limits
 
