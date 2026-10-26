@@ -44,6 +44,7 @@ window.PosFreeItems = (function () {
     function ensure(transactionId, token) {
         return api('freeItemState',{transactionId:transactionId},token).then(function(state){
             if(!state.success)throw new Error(state.error || 'Approval could not be checked.');
+            if(!state.approvalEnabled && (state.freeItems||[]).some(function(item){return !(Number(item.price)>0);}))throw new Error('Set a price above ₹0 for every product before payment.');
             if(!state.required)return;
             return promptApproval(state.canApprove,state.freeItems,function(values){
                 return api('approveFreeItems',Object.assign({transactionId:transactionId,expectedFingerprint:state.approvalFingerprint},values),token).then(function(result){
@@ -403,7 +404,7 @@ window._posOffline = (function() {
         h+='<div class="c b" style="margin-top:6px">Thank You !!</div><div class="c" style="font-size:7px;color:#666;margin-top:4px">Powered by ZetaERP &middot; www.zetaclantech.com</div></div>';
         h+='<script>window.onload=function(){window.print();}<\/script></body></html>';
         var f=document.getElementById('pos-offline-frame'); if(!f){ f=document.createElement('iframe'); f.id='pos-offline-frame'; f.style.cssText='position:fixed;left:-9999px;top:-9999px;width:80mm;height:0;border:none'; document.body.appendChild(f); } var d=f.contentDocument||f.contentWindow.document; d.open(); d.write(h); d.close(); }
-    function pay(method){ if(payPending||serverDraftPaused||!cart.length) return; var _fia=document.getElementById('pos-free-item-approval'); if(_fia&&_fia.value==='Y'&&cart.some(function(it){return Number(it.price)<=0;})){toast('Free items need online manager approval. Reconnect to complete this bill.','#c62828');return;} if(taxEnabled() && cart.some(function(it){return it.taxRate==null;})){toast('Tax cache unavailable. Reconnect before completing this sale.','#c62828');return;} var c=tCtx(); var total=payable();
+    function pay(method){ if(payPending||serverDraftPaused||!cart.length) return; var _fia=document.getElementById('pos-free-item-approval'); if((!_fia||_fia.value!=='Y')&&cart.some(function(it){return !(Number(it.price)>0);})){toast('Set a price above ₹0 for every product before payment.','#c62828');return;} if(_fia&&_fia.value==='Y'&&cart.some(function(it){return Number(it.qty)*Number(it.price)+taxAmount(it)<=0;})){toast('Free items need online manager approval. Reconnect to complete this bill.','#c62828');return;} if(taxEnabled() && cart.some(function(it){return it.taxRate==null;})){toast('Tax cache unavailable. Reconnect before completing this sale.','#c62828');return;} var c=tCtx(); var total=payable();
         var sale={ offlineId:'OFL-'+Date.now()+'-'+Math.floor(Math.random()*100000), organizationPartyId:orgId, taxOn:taxEnabled()?'Y':'N', terminalId:c.terminalId, sessionId:c.sessionId, items:cart.map(function(it){return {productId:it.productId,name:it.name,qty:it.qty,price:it.price,uom:it.uom};}), total:total, taxAmount:cart.reduce(function(a,it){return a+taxAmount(it);},0), roundOff:total-cart.reduce(function(a,it){return a+it.qty*it.price+taxAmount(it);},0), paymentMethod:method, ts:new Date().toISOString() };
         payPending=true;
         enqueue(sale).then(function(){
@@ -1177,11 +1178,13 @@ window._posOffline = (function() {
         var t = af ? af.querySelector('[name=transactionId]') : document.querySelector('input[name="transactionId"]');
         return t ? (t.value || '') : '';
     }
-    function setCustChip(name) {
+    function setCustChip(name, phone) {
         ['pos-cust-name', 'pos-header-customer-name'].forEach(function(id) {
             var el = document.getElementById(id);
             if (el) el.textContent = (name && name.length) ? name : 'Walk-in Customer';
         });
+        var phoneEl = document.getElementById('pos-cust-phone');
+        if (phoneEl) phoneEl.textContent = phone || '—';
     }
     function custEscape(value) {
         return String(value == null ? '' : value).replace(/[&<>"']/g, function(ch) {
@@ -1285,7 +1288,7 @@ window._posOffline = (function() {
                                 window.location.assign(next.toString()); return;
                             }
                             if (window._posRefreshCart) window._posRefreshCart();
-                            setCustChip(d.customer || nm); histToast('Customer: ' + (d.customer || nm), '#7C3AED'); closeCustomer();
+                            setCustChip(d.customer || nm, d.customerPhone); histToast('Customer: ' + (d.customer || nm), '#7C3AED'); closeCustomer();
                         }
                         else { histToast((d && d.error) || 'Could not set customer', '#c62828'); }
                     });
@@ -3225,7 +3228,11 @@ window.posToggleFullscreen = function() {
                 + cartText(bill && bill.dataset.sessionLastAmount || '0') + '</div>';
         }
 
-        function clearCompletedCartUrl() {
+        function resetCompletedCart() {
+            // Reset the live model and any scheduled optimistic paint before the next tap.
+            // The receipt keeps its own completed-bill payload.
+            renderCart({success:true, transactionId:'', items:[], sub:0, tax:0, disc:0,
+                tQty:0, grand:0, pay:0, round:0, modes:lastCartData && lastCartData.modes || []});
             // Checkout leaves an empty cart. A refresh must not reopen the completed
             // transaction still present in the original cashier URL.
             var current = new URL(window.location.href);
@@ -3348,7 +3355,13 @@ window.posToggleFullscreen = function() {
                     .then(function (d) {
                         inflight = false; var done = q.shift();
                         if (d && d.success) {
-                            if (d.transactionId) { TX = d.transactionId; document.querySelectorAll('input[name="transactionId"]').forEach(function (el) { el.value = TX; }); syncModeLinks(); }
+                            if (d.transactionId) {
+                                // Item sequence numbers restart per bill; prior claims must not
+                                // strand a rapid edit queued behind the first add of the next bill.
+                                if (d.transactionId !== TX) { claimed = {}; realByTmp = {}; }
+                                TX = d.transactionId;
+                                document.querySelectorAll('input[name="transactionId"]').forEach(function (el) { el.value = TX; }); syncModeLinks();
+                            }
                             calibrate(d);
                             if (done.action === 'addItem') mapAdd(done, d);
                             applyRealSeqs();
@@ -4064,26 +4077,18 @@ window.posToggleFullscreen = function() {
                         var billNum = d.bill && d.bill.number || '';
                         showToast('✔ Sale Complete' + (billNum ? ' — ' + billNum : '') + ' — ' + CS + fmt(paidAmt) + ' ' + method.toUpperCase());
                         printReceipt(savedTx, billNum, TO, false, d.receiptUnavailable ? null : d);
-                        TX = '';
-                        lastTxnNum = '';
-                        clearCompletedCartUrl();
+                        resetCompletedCart();
                         return fetchScreen({});
                     })
                     .then(function(doc) {
                         if (!doc) return;
                         extractHeldInfo(doc);
                         updateHeldBadge();
-                        var ntx = doc.querySelector('input[name="transactionId"]');
-                        TX = ntx ? (ntx.value || '') : '';
-                        document.querySelectorAll('input[name="transactionId"]').forEach(function(el) { el.value = TX; });
                         var ntk = doc.querySelector('input[name="moquiSessionToken"]');
                         if (ntk && ntk.value) TK = ntk.value;
+                        // Only refresh catalog/header metadata: a new bill may already be active.
                         swapGrid(doc);
                         syncIssuedBillHeader(doc);
-                        var nb = doc.querySelector('.pos-cart tbody');
-                        if (nb) document.querySelector('.pos-cart tbody').innerHTML = nb.innerHTML;
-                        var ns = doc.querySelector('.pos-summary');
-                        if (ns) document.querySelector('.pos-summary').innerHTML = ns.innerHTML;
                         appendRecallIfNeeded();
                         var bn = document.querySelector('.pos-header [style*="background:#e65100"]') || document.querySelector('.pos-header [style*="background: rgb(230, 81, 0)"]');
                         if (bn) bn.textContent = 'BILL- 0';
@@ -4121,28 +4126,18 @@ window.posToggleFullscreen = function() {
                         var billNum = d.bill && d.bill.number || '';
                         showToast('✔ Sale Complete' + (billNum ? ' — ' + billNum : '') + ' — ' + splitParts.join(' + '));
                         printReceipt(savedTx, billNum, TO, false, d.receiptUnavailable ? null : d);
-                        TX = '';
-                        lastTxnNum = '';
-                        lastPay = 0;
-                        lastCartData = null;
-                        clearCompletedCartUrl();
+                        resetCompletedCart();
                         return fetchScreen({});
                     })
                     .then(function(doc) {
                         if (!doc) return;
                         extractHeldInfo(doc);
                         updateHeldBadge();
-                        var ntx = doc.querySelector('input[name="transactionId"]');
-                        TX = ntx ? (ntx.value || '') : '';
-                        document.querySelectorAll('input[name="transactionId"]').forEach(function(el) { el.value = TX; });
                         var ntk = doc.querySelector('input[name="moquiSessionToken"]');
                         if (ntk && ntk.value) TK = ntk.value;
+                        // Only refresh catalog/header metadata: a new bill may already be active.
                         swapGrid(doc);
                         syncIssuedBillHeader(doc);
-                        var nb = doc.querySelector('.pos-cart tbody');
-                        if (nb) document.querySelector('.pos-cart tbody').innerHTML = nb.innerHTML;
-                        var ns = doc.querySelector('.pos-summary');
-                        if (ns) document.querySelector('.pos-summary').innerHTML = ns.innerHTML;
                         appendRecallIfNeeded();
                         var bn = document.querySelector('.pos-header [style*="background:#e65100"]') || document.querySelector('.pos-header [style*="background: rgb(230, 81, 0)"]');
                         if (bn) bn.textContent = 'BILL- 0';
@@ -4232,25 +4227,18 @@ window.posToggleFullscreen = function() {
                         if (change > 0) toastMsg += ' (Change: ' + CS + fmt(change) + ')';
                         showToast(toastMsg);
                         printReceipt(savedTx, billNum, TO, false, d.receiptUnavailable ? null : d);
-                        TX = ''; lastTxnNum = ''; lastPay = 0; lastCartData = null;
-                        clearCompletedCartUrl();
+                        resetCompletedCart();
                         return fetchScreen({});
                     })
                     .then(function(doc) {
                         if (!doc) return;
                         extractHeldInfo(doc);
                         updateHeldBadge();
-                        var ntx = doc.querySelector('input[name="transactionId"]');
-                        TX = ntx ? (ntx.value || '') : '';
-                        document.querySelectorAll('input[name="transactionId"]').forEach(function(el) { el.value = TX; });
                         var ntk = doc.querySelector('input[name="moquiSessionToken"]');
                         if (ntk && ntk.value) TK = ntk.value;
+                        // Only refresh catalog/header metadata: a new bill may already be active.
                         swapGrid(doc);
                         syncIssuedBillHeader(doc);
-                        var nb = doc.querySelector('.pos-cart tbody');
-                        if (nb) document.querySelector('.pos-cart tbody').innerHTML = nb.innerHTML;
-                        var ns = doc.querySelector('.pos-summary');
-                        if (ns) document.querySelector('.pos-summary').innerHTML = ns.innerHTML;
                         appendRecallIfNeeded();
                         var bn = document.querySelector('.pos-header [style*="background:#e65100"]') || document.querySelector('.pos-header [style*="background: rgb(230, 81, 0)"]');
                         if (bn) bn.textContent = 'BILL- 0';
