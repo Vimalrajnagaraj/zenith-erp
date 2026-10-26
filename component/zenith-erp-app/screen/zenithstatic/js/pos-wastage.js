@@ -53,6 +53,25 @@
             });
         });
     }
-    setInterval(function(){ var root=document.getElementById('wastage-expiring-root'); if(root && !root.dataset.wr){ root.dataset.wr='1'; renderExpiring(); } }, 700);
+    setInterval(function(){
+        var root=document.getElementById('wastage-expiring-root');
+        if(root && !root.dataset.wr){ root.dataset.wr='1'; renderExpiring(); }
+        var date=document.getElementById('AddWastage_wastageDate');
+        if(date && !date.dataset.pickerBelow && window.jQuery){
+            var picker=jQuery(date).data('DateTimePicker');
+            if(picker){
+                picker.widgetPositioning({vertical:'bottom'});
+                jQuery(date).on('dp.show.wastage',function(){ requestAnimationFrame(function(){
+                    var widget=date.parentElement.querySelector('.bootstrap-datetimepicker-widget');
+                    if(widget){
+                        widget.scrollIntoView({block:'nearest',behavior:'instant'});
+                        var overflow=widget.getBoundingClientRect().bottom-innerHeight+16;
+                        if(overflow>0)window.scrollBy({top:overflow,behavior:'instant'});
+                    }
+                }); });
+                date.dataset.pickerBelow='1';
+            }
+        }
+    }, 700);
 })();
 

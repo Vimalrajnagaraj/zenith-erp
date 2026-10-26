@@ -10,6 +10,19 @@
     var heading=root.querySelector('#FindProductList_table .thead > .tr, #FindProductList_table > thead > tr:not(.form-list-nav-row):last-child');if(heading&&!heading.querySelector('.catalog-row-actions')){var th=el(heading.tagName==='TR'?'th':'div','th catalog-row-actions');th.setAttribute('aria-label','Product actions');heading.appendChild(th);}
   }
   function init(root) {
+    [['mrpAmount','MRP Range (₹)'],['totalQoh','Stock Range']].forEach(function(range){
+      var field=root.querySelector('#FindProductList_hdialog label[for="FindProductList_header_'+range[0]+'"]');
+      if(!field)return;
+      field.textContent=range[1];
+      var row=field.parentElement;
+      ['_from','_thru'].forEach(function(suffix,i){
+        var input=row.querySelector('input[name="'+range[0]+suffix+'"]');
+        if(!input)return;
+        input.setAttribute('aria-label',range[1]+' '+(i?'Maximum':'Minimum'));
+        var caption=input.previousElementSibling;
+        if(caption)caption.textContent=(i?'Max':'Min')+' ';
+      });
+    });
     var side=document.querySelector('#zq-sidebar .zqs-scroll,#z-sidebar .zs-scroll');
     if(side&&!movedLinks.length){Array.from(side.querySelectorAll('a')).filter(function(a){return /\/zenith\/(pricing|barcode|tax|expenses)(\/|$)/i.test(new URL(a.href,location.href).pathname);}).forEach(function(a){movedLinks.push({node:a,parent:a.parentNode,next:a.nextSibling});side.appendChild(a);});}
     var input=root.querySelector('input[name="catalogSearch"]');
