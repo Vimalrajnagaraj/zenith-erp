@@ -101,6 +101,8 @@ module.exports=async function({manager,cashier,foreign,session,id,free,credit,ca
   // Both modern layouts intentionally link billing to the native, dedicated terminal shell.
   await page.goto(billingUrl+'?sessionId='+session.sessionId+'&transactionId='+ui+'&taxOn=N',{waitUntil:'domcontentloaded'});
   await page.waitForFunction(()=>window.PosFreeItems && window._posAjax && document.querySelector('#pos-terminal-root'),null,{timeout:60000});
+  await page.locator('.nb-modes summary').click();
+  await page.locator('[data-pos-layout=advanced]').click();
   await page.locator('form:has(input[name="productId"][value="POS_QA_A_FREE"]) button').click();
   await page.waitForFunction(()=>/Bill Items\s*\(\s*3\s*\)/.test(document.body.innerText));
   check(shell+' zero-price tile enters the draft cart',q(`SELECT * FROM pos_transaction_item WHERE transaction_id='${ui}'`).length===3);
