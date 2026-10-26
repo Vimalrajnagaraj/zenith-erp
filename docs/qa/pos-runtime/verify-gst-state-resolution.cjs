@@ -18,7 +18,16 @@ module.exports=async({a,base,check,q,invoke,post,out})=>{
   const page=await a.c.newPage();
   try{
    for(const shell of ['apps','qapps']){
-    await page.goto(`${base}/${shell}/zenith/pos/Terminal?sessionId=${session.sessionId}&transactionId=${cart.transactionId}&taxOn=Y`,{waitUntil:'domcontentloaded'});
+    let terminalUrl=new URL('/apps/zenith/pos/Terminal',base);
+    if(shell==='qapps'){
+     await page.goto(`${base}/qapps/zenith/pos/Dashboard`,{waitUntil:'domcontentloaded'});
+     const entry=page.locator('#zq-subnav a[href*="/Terminal"]').first();await entry.waitFor({state:'attached'});
+     const href=await entry.getAttribute('href');
+     check('Quasar GST entry uses the registered native billing terminal',href.startsWith('/apps/zenith/pos/Terminal'));
+     terminalUrl=new URL(href,base);
+    }
+    terminalUrl.searchParams.set('sessionId',session.sessionId);terminalUrl.searchParams.set('transactionId',cart.transactionId);terminalUrl.searchParams.set('taxOn','Y');
+    await page.goto(terminalUrl.href,{waitUntil:'domcontentloaded'});
     await page.locator('.nb-tax__lbl').waitFor({state:'visible'});
     check(shell+' entry renders corrected GST in the billing terminal',await page.locator('.nb-tax__lbl').innerText()==='Tax: On'&&await page.locator('#posModeSwitchErr').count()===0);
     if(out)await page.screenshot({path:require('path').join(out,shell+'-gst-state.png'),fullPage:true});
