@@ -138,6 +138,7 @@ const rows=(table,where)=>q(`SELECT * FROM ${table} WHERE ${where}`),count=(tabl
  const archivedPage=await a.c.request.get(base+'/apps/zenith/pos/Terminal?sessionId='+s.sessionId);check('archived custom mode absent from terminal choices',!modeChoice.test(await archivedPage.text()),{status:archivedPage.status()});
  const archivedCart=await cart(s);await invoke('add',{transactionId:archivedCart.transactionId,productId:'POS_QA_A_P18',quantity:'1',salesModeId:customId},true);await invoke('void',{transactionId:archivedCart.transactionId});
  await require('./verify-mode-deletion.cjs')({a,foreign,base,check,q,invoke,post,out,sessionId:s.sessionId,account});
+ await require('./verify-discount-tax.cjs')({a,foreign,base,check,q,invoke,post,out});
  const taxMode=await cart(s);const taxLine=await item(taxMode,{taxOn:'N'});
  await invoke('mode',{transactionId:taxMode.transactionId,itemSeqId:taxLine.itemSeqId,salesModeId:'WHOLESALE',taxOn:'N'});
  check('tax-off mode switch stays tax-free with no GST detail',Number(tx(taxMode.transactionId).total_tax_amount)===0&&count('tax_line_detail',`reference_type='PosTransactionItem' AND reference_id='${taxMode.transactionId}'`)===0,tx(taxMode.transactionId));
