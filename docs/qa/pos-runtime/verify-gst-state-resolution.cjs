@@ -18,7 +18,8 @@ module.exports=async({a,base,check,q,invoke,post,out})=>{
   const page=await a.c.newPage();
   try{
    for(const shell of ['apps','qapps']){
-    await page.goto(`${base}/${shell}/zenith/pos/Terminal?sessionId=${session.sessionId}&transactionId=${cart.transactionId}&taxOn=Y`,{waitUntil:'networkidle'});
+    await page.goto(`${base}/${shell}/zenith/pos/Terminal?sessionId=${session.sessionId}&transactionId=${cart.transactionId}&taxOn=Y`,{waitUntil:'domcontentloaded'});
+    await page.locator('.nb-tax__lbl').waitFor({state:'visible'});
     check(shell+' entry renders corrected GST in the billing terminal',await page.locator('.nb-tax__lbl').innerText()==='Tax: On'&&await page.locator('#posModeSwitchErr').count()===0);
     if(out)await page.screenshot({path:require('path').join(out,shell+'-gst-state.png'),fullPage:true});
    }
