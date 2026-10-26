@@ -317,8 +317,8 @@ const rows=(table,where)=>q(`SELECT * FROM ${table} WHERE ${where}`),count=(tabl
  await p.locator('.pos-close-overlay').waitFor({state:'visible'});
  await p.locator('.pos-close-cash').fill('100');
  await p.locator('.pos-close-confirm').click();
- await p.waitForURL(u=>u.pathname==='/apps/zenith/pos/PosSessions'&&u.searchParams.get('sessionId')===String(us.sessionId),{timeout:30000});
- check('terminal session close opens POS Sessions and stores closing cash',count('pos_session',`session_id='${us.sessionId}' AND status_id='PsClosed' AND closing_cash=100`)===1,{url:p.url(),sessionId:us.sessionId});
+ await p.locator('.pos-no-session').waitFor();
+ check('terminal session close returns to opening screen and stores closing cash',new URL(p.url()).pathname==='/apps/zenith/pos/Terminal'&&count('pos_session',`session_id='${us.sessionId}' AND status_id='PsClosed' AND closing_cash=100`)===1,{url:p.url(),sessionId:us.sessionId});
  const cashier=await account('pos.cashier.qa');let cr=await cashier.c.request.get(base+'/apps/zenith/pos/Terminal');check('cashier reaches terminal',cr.status()===200);cr=await cashier.c.request.get(base+'/apps/zenith/Inventory/FindProduct');check('cashier reaches authorized inventory',cr.status()===200);cr=await cashier.c.request.get(base+'/apps/zenith/Accounting/AcctgDashboard');check('cashier cannot access accounting',cr.status()===403||cr.url().includes('/pos/Terminal'),{status:cr.status(),url:cr.url()});await cashier.c.close();
  }
  if(process.env.POS_QA_UI_ONLY!=='true'){
@@ -434,6 +434,7 @@ const rows=(table,where)=>q(`SELECT * FROM ${table} WHERE ${where}`),count=(tabl
  if(process.env.POS_QA_UI_ONLY!=='true')await require('./verify-idle-logout.cjs')({a,foreign,base,check,q,invoke,post,out});
  if(process.env.POS_QA_UI_ONLY!=='true')await require('./verify-last-bill.cjs')({a,base,check,q,invoke,post,out});
  if(process.env.POS_QA_UI_ONLY!=='true')await require('./verify-credit-terms.cjs')({a,foreign,base,check,q,invoke,post,out});
+ if(process.env.POS_QA_UI_ONLY!=='true')await require('./verify-held-workflows.cjs')({a,foreign,base,check,q,invoke,post,out});
  // A populated Daily Summary used to render the FreeMarker ?url charset exception as table rows.
  if(process.env.POS_QA_UI_ONLY!=='true')for(const shell of ['apps','qapps']){
   const date=new Date(tx(t.transactionId).entry_date);
