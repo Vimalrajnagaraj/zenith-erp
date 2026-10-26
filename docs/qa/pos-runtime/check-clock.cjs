@@ -1,0 +1,11 @@
+const assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm'),path=require('node:path');
+const source=fs.readFileSync(path.join(__dirname,'../../../component/zenith-erp-app/screen/zenithstatic/js/pos-clock.js'),'utf8');
+let elapsed=0,intervals=0,tick;
+const clock={dataset:{serverEpoch:Date.parse('2026-10-25T18:29:59Z'),timeZone:'Asia/Kolkata'},textContent:''},date={textContent:''};
+const context=vm.createContext({window:{},document:{getElementById:id=>id==='nb-clock'?clock:date,addEventListener:()=>{}},performance:{now:()=>elapsed},Intl,Date,Number,setInterval:fn=>{tick=fn;intervals++}});
+vm.runInContext(source,context);
+assert.equal(clock.textContent,'11:59:59 PM');assert.equal(date.textContent,'25-10-2026');
+elapsed=2000;tick();assert.equal(clock.textContent,'12:00:01 AM');assert.equal(date.textContent,'26-10-2026');
+vm.runInContext(source,context);assert.equal(intervals,1);
+elapsed=65000;tick();assert.equal(clock.textContent,'12:01:04 AM');
+console.log('PASS POS clock: user timezone, live ticks, midnight date, resume elapsed time and one timer');
