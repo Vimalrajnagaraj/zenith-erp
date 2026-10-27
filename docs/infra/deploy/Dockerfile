@@ -66,6 +66,7 @@ RUN sh /tmp/patch-log4j2-dbmeta-filter.sh && rm /tmp/patch-log4j2-dbmeta-filter.
 #  (3) patch-webroot-inr-grid.sh wraps m-display's displayValue (client-rendered grid cells) as a backstop.
 # Source: docs/infra/zenith-classes/ + docs/infra/framework-patches/patch-macro-inr.sh + patch-webroot-inr-grid.sh
 COPY ./zenith-classes/ /opt/moqui/runtime/classes/
+COPY ./zenith-libs/*.jar /opt/moqui/WEB-INF/lib/
 COPY ./framework-patches/patch-macro-inr.sh /tmp/patch-macro-inr.sh
 RUN for m in html vuet qvt; do sh /tmp/patch-macro-inr.sh /opt/moqui/runtime/template/screen-macro/DefaultScreenMacros.$m.ftl; done && rm /tmp/patch-macro-inr.sh
 COPY ./framework-patches/patch-webroot-inr-grid.sh /tmp/patch-webroot-inr-grid.sh
