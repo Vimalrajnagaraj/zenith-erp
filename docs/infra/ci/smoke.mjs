@@ -221,6 +221,7 @@ try {
   await page.setViewport({ width: 1400, height: 1000 });
 
   // A disposable write verifies the actual service path, source badge and retry key.
+  let sourceSmokeEmail;
   try {
     await page.goto(`${BASE}/apps/zenith/Crm/Leads?period=all`, { waitUntil: 'networkidle2', timeout: 60000 });
     const email = `crm-smoke-${Date.now()}@example.test`;
@@ -250,10 +251,30 @@ try {
     if (rows.length !== 1 || !rows[0].includes('Instagram')) {
       throw new Error(`expected one Instagram lead after retry, found ${rows.length} matching rows`);
     }
+    sourceSmokeEmail = email;
     console.log('PASS  CRM source capture and idempotent lead retry');
   } catch (error) {
     failures++;
     console.log(`FAIL  CRM source capture and idempotent lead retry — ${error.message}`);
+  }
+
+  try {
+    if (!sourceSmokeEmail) throw new Error('source lead was not created');
+    await page.goto(`${BASE}/apps/zenith/Crm/Reports?period=all`, { waitUntil: 'networkidle2', timeout: 60000 });
+    const hrefs = await page.evaluate(() => ({
+      original: document.querySelector('a[href*="firstTouchSourceId=Instagram"]')?.href,
+      latest: document.querySelector('a[href*="latestTouchSourceId=Instagram"]')?.href,
+    }));
+    if (!hrefs.original || !hrefs.latest) throw new Error('original or latest source drill-down is missing');
+    for (const href of Object.values(hrefs)) {
+      await page.goto(href, { waitUntil: 'networkidle2', timeout: 60000 });
+      const present = await page.$$eval('tr', (rows, email) => rows.some(row => row.textContent.includes(email)), sourceSmokeEmail);
+      if (!present) throw new Error(`source lead is absent from ${href}`);
+    }
+    console.log('PASS  CRM original and latest source report drill-down');
+  } catch (error) {
+    failures++;
+    console.log(`FAIL  CRM original and latest source report drill-down — ${error.message}`);
   }
 
   try {
@@ -350,7 +371,7 @@ try {
       const data = new FormData(form);
       data.set('activityType', 'Task');
       data.set('subject', subject);
-      data.set('dueDate', new Date(Date.now() - 86400000).toISOString().slice(0, 16));
+      data.set('dueDate', new Date(Date.now() - 86400000).toISOString().slice(0, 19).replace('T', ' '));
       data.set('priority', 'High');
       const response = await fetch(form.action, { method: 'POST', body: data, credentials: 'same-origin' });
       return response.status;
@@ -450,6 +471,6 @@ try {
   await browser.close();
 }
 
-const interactionChecks = 2 * (CRM_SCREENS.length + 1) + 4;
+const interactionChecks = 2 * (CRM_SCREENS.length + 1) + 5;
 console.log(`\n${failures === 0 ? 'SMOKE OK' : 'SMOKE FAILED'} — ${PATHS.length + interactionChecks - failures}/${PATHS.length + interactionChecks} render and interaction checks passed.`);
 process.exit(failures === 0 ? 0 : 1);
