@@ -43,6 +43,7 @@ const PATHS = [
   '/apps/zenith/Crm/SourcesCampaigns',
   '/apps/zenith/Crm/Reports',
   '/apps/zenith/Crm/ImportLeads',
+  '/apps/zenith/Crm/CrmSettings',
   '/apps/zenith/Dashboard',
   '/apps/zenith/Inventory/InventoryDashboard',
   '/apps/zenith/Inventory/InventoryDashboard?dateMode=all',
@@ -64,6 +65,7 @@ const PATHS = [
   '/qapps/zenith/Crm/SourcesCampaigns',
   '/qapps/zenith/Crm/Reports',
   '/qapps/zenith/Crm/ImportLeads',
+  '/qapps/zenith/Crm/CrmSettings',
   '/qapps/zenith/Inventory/InventoryDashboard',
   '/qapps/zenith/Inventory/InventoryDashboard?dateMode=all',
   '/qapps/zenith/Inventory/DashboardDetails?listType=movements',
@@ -73,6 +75,8 @@ const PATHS = [
 
 const ERR_SIG = /(java\.lang\.|groovy\.lang\.|org\.moqui\.\w+Exception|freemarker\.core|ScreenRenderException|Error rendering|500 Internal Server Error|HTTP Status 500)/i;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+const CRM_SCREENS = ['Dashboard', 'Leads', 'Pipeline', 'Activities', 'Segments', 'Contacts', 'SourcesCampaigns', 'Reports', 'ImportLeads', 'CrmSettings'];
+const CRM_WIDTHS = [390, 768, 1024, 1280, 1440];
 
 const browser = await puppeteer.launch({
   headless: 'new',
@@ -99,7 +103,7 @@ try {
         if (path.includes('/Crm/Dashboard')) {
           await page.waitForSelector('.zcrm-dashboard-metrics', { timeout: 15000 });
           const count = await page.$$eval('.zcrm-dashboard-metrics .zcrm-metric', cards => cards.length);
-          if (count !== 4) throw new Error(`CRM dashboard rendered ${count} metric cards instead of four`);
+          if (count !== 6) throw new Error(`CRM dashboard rendered ${count} metric cards instead of six`);
         }
         if (path.includes('/Crm/Leads')) {
           await page.waitForSelector('.zcrm-lead-metrics', { timeout: 15000 });
@@ -180,17 +184,21 @@ try {
   // every dashboard widget. These checks use the same synthetic staging tenant.
   for (const surface of ['apps', 'qapps']) {
     await page.setViewport({ width: 390, height: 844 });
-    for (const screen of ['Dashboard', 'Leads', 'Pipeline', 'Activities', 'Segments', 'Contacts', 'SourcesCampaigns', 'Reports', 'ImportLeads']) {
+    for (const screen of CRM_SCREENS) {
       const path = `/${surface}/zenith/Crm/${screen}`;
       try {
         await page.goto(BASE + path, { waitUntil: 'networkidle2', timeout: 60000 });
         await page.waitForSelector('.zcrm-page', { timeout: 15000 });
-        const overflow = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth + 2);
-        if (overflow) throw new Error('horizontal page overflow at 390px');
-        console.log(`PASS  CRM ${surface} ${screen} mobile`);
+        for (const width of CRM_WIDTHS) {
+          await page.setViewport({ width, height: 844 });
+          const overflow = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth + 2);
+          if (overflow) throw new Error(`horizontal page overflow at ${width}px`);
+        }
+        console.log(`PASS  CRM ${surface} ${screen} at ${CRM_WIDTHS.join(', ')}px`);
+        await page.setViewport({ width: 390, height: 844 });
       } catch (error) {
         failures++;
-        console.log(`FAIL  CRM ${surface} ${screen} mobile — ${error.message}`);
+        console.log(`FAIL  CRM ${surface} ${screen} responsive — ${error.message}`);
       }
     }
     try {
@@ -211,6 +219,42 @@ try {
     }
   }
   await page.setViewport({ width: 1400, height: 1000 });
+
+  // A disposable write verifies the actual service path, source badge and retry key.
+  try {
+    await page.goto(`${BASE}/apps/zenith/Crm/Leads?period=all`, { waitUntil: 'networkidle2', timeout: 60000 });
+    const email = `crm-smoke-${Date.now()}@example.test`;
+    const created = await page.evaluate(async email => {
+      const form = document.getElementById('NewLeadForm') || document.querySelector('form[name="NewLeadForm"]');
+      if (!form) throw new Error('New Lead form is missing');
+      const data = new FormData(form);
+      data.set('firstName', 'Disposable CRM smoke');
+      data.set('email', email);
+      data.set('leadSourceId', 'Instagram');
+      data.set('sourceDetail', 'CI attribution check');
+      data.set('utmSource', 'instagram');
+      data.set('externalSubmissionId', `ci:${email}`);
+      const result = [];
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const response = await fetch(form.action, { method: 'POST', body: data, credentials: 'same-origin' });
+        const html = await response.text();
+        result.push({ status: response.status, error: /Possible duplicate|Choose an active lead source|Error rendering|First name is required/.exec(html)?.[0] || '' });
+      }
+      return result;
+    }, email);
+    if (created.some(result => result.status !== 200 || result.error)) {
+      throw new Error(`create/retry failed: ${JSON.stringify(created)}`);
+    }
+    await page.goto(`${BASE}/apps/zenith/Crm/Leads?period=all`, { waitUntil: 'networkidle2', timeout: 60000 });
+    const rows = await page.$$eval('tr', (tableRows, expected) => tableRows.filter(row => row.textContent.includes(expected)).map(row => row.textContent), email);
+    if (rows.length !== 1 || !rows[0].includes('Instagram')) {
+      throw new Error(`expected one Instagram lead after retry, found ${rows.length} matching rows`);
+    }
+    console.log('PASS  CRM source capture and idempotent lead retry');
+  } catch (error) {
+    failures++;
+    console.log(`FAIL  CRM source capture and idempotent lead retry — ${error.message}`);
+  }
 
   // Exercise the two existing date controls, including the legacy form that submits
   // to the module's default screen. These checks are read-only and need no stock data.
@@ -279,6 +323,6 @@ try {
   await browser.close();
 }
 
-const interactionChecks = 2 * (9 + 1);
+const interactionChecks = 2 * (CRM_SCREENS.length + 1) + 1;
 console.log(`\n${failures === 0 ? 'SMOKE OK' : 'SMOKE FAILED'} — ${PATHS.length + interactionChecks - failures}/${PATHS.length + interactionChecks} render and interaction checks passed.`);
 process.exit(failures === 0 ? 0 : 1);
