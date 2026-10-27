@@ -146,6 +146,7 @@ const rows=(table,where)=>q(`SELECT * FROM ${table} WHERE ${where}`),count=(tabl
  await invoke('reprice',{transactionId:taxMode.transactionId,salesModeId:'RETAIL',taxOn:'Y'});
  check('tax-on reprice restores exact line GST detail',Number(tx(taxMode.transactionId).total_tax_amount)===18&&Number(q(`SELECT coalesce(sum(tax_amount),0) AS n FROM tax_line_detail WHERE reference_type='PosTransactionItem' AND reference_id='${taxMode.transactionId}'`)[0].n)===18,tx(taxMode.transactionId));
  await invoke('void',{transactionId:taxMode.transactionId});
+  await require('./verify-gst-state-resolution.cjs')({a,base,check,q,invoke,post,out});
   const legacyTaxCart=await cart(s);await item(legacyTaxCart,{taxOn:'N'});
   const legacySeed=await post('PosQaAcceptance','legacyCartStates',{transactionId:legacyTaxCart.transactionId});
   check('disposable legacy cart has blank supply states',legacySeed.status()===200&&!(tx(legacyTaxCart.transactionId).origin_region_geo_id)&&!(tx(legacyTaxCart.transactionId).destination_region_geo_id));
