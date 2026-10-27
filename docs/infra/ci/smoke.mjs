@@ -375,7 +375,8 @@ try {
       data.set('priority', 'High');
       const response = await fetch(form.action, { method: 'POST', body: data, credentials: 'same-origin' });
       const html = await response.text();
-      return { status: response.status, error: /could not be converted|CRM write access is required|Error rendering/i.exec(html)?.[0] || '' };
+      const match = /could not be converted|CRM write access is required|Error rendering/i.exec(html);
+      return { status: response.status, error: match ? html.slice(Math.max(0, match.index - 100), match.index + 500).replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ') : '' };
     }, subject);
     if (posted.status !== 200 || posted.error) throw new Error(`activity schedule failed: ${JSON.stringify(posted)}`);
     await page.goto(`${BASE}/apps/zenith/Crm/Activities?period=all`, { waitUntil: 'networkidle2', timeout: 60000 });
