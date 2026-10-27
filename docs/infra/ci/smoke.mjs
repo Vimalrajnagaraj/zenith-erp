@@ -34,7 +34,10 @@ const PATHS = [
   '/apps/zenith/Crm/Dashboard',
   '/apps/zenith/Crm/Leads',
   '/apps/zenith/Crm/Pipeline',
+  '/apps/zenith/Crm/Pipeline?period=all',
+  '/apps/zenith/Crm/Pipeline?searchText=__qa_no_match__',
   '/apps/zenith/Crm/Activities',
+  '/apps/zenith/Crm/Activities?period=all',
   '/apps/zenith/Crm/Segments',
   '/apps/zenith/Dashboard',
   '/apps/zenith/Inventory/InventoryDashboard',
@@ -48,7 +51,10 @@ const PATHS = [
   '/qapps/zenith/Crm/Dashboard',
   '/qapps/zenith/Crm/Leads',
   '/qapps/zenith/Crm/Pipeline',
+  '/qapps/zenith/Crm/Pipeline?period=all',
+  '/qapps/zenith/Crm/Pipeline?searchText=__qa_no_match__',
   '/qapps/zenith/Crm/Activities',
+  '/qapps/zenith/Crm/Activities?period=all',
   '/qapps/zenith/Crm/Segments',
   '/qapps/zenith/Inventory/InventoryDashboard',
   '/qapps/zenith/Inventory/InventoryDashboard?dateMode=all',
@@ -92,6 +98,27 @@ try {
           const count = await page.$$eval('.zcrm-lead-metrics .zcrm-metric', cards => cards.length);
           if (count !== 4 || !(await page.$('.zcrm-leads-directory'))) {
             throw new Error('CRM lead metrics or directory did not render');
+          }
+        }
+        if (['Pipeline', 'Activities', 'Segments'].some(screen => path.includes(`/Crm/${screen}`))) {
+          await page.waitForSelector('.zcrm-reference-metrics', { timeout: 15000 });
+          const count = await page.$$eval('.zcrm-reference-metrics .zcrm-metric', cards => cards.length);
+          if (count !== 4) throw new Error(`CRM screen rendered ${count} metric cards instead of four`);
+          if (path.includes('/Crm/Pipeline')) {
+            await page.waitForSelector('.zcrm-board', { timeout: 15000 });
+            const stages = await page.$$eval('.zcrm-board-column', columns => columns.length);
+            if (stages < 5) throw new Error(`CRM pipeline rendered only ${stages} open stages`);
+            if (path.includes('searchText=__qa_no_match__')) {
+              const deals = await page.$$eval('.zcrm-deal-card', cards => cards.length);
+              if (deals !== 0) throw new Error('CRM pipeline search did not filter all cards');
+            }
+          } else if (!(await page.$('.zcrm-reference-list'))) {
+            throw new Error('CRM activity or segment list did not render');
+          }
+          if (path.includes('period=all')) {
+            const expected = path.includes('/Crm/Pipeline') ? 'Closing All Time' : 'All time';
+            const text = await page.$eval('.zcrm-reference-metrics', element => element.innerText);
+            if (!text.includes(expected)) throw new Error(`CRM period filter did not show ${expected}`);
           }
         }
       }
@@ -145,7 +172,7 @@ try {
   // every dashboard widget. These checks use the same synthetic staging tenant.
   for (const surface of ['apps', 'qapps']) {
     await page.setViewport({ width: 390, height: 844 });
-    for (const screen of ['Dashboard', 'Leads']) {
+    for (const screen of ['Dashboard', 'Leads', 'Pipeline', 'Activities', 'Segments']) {
       const path = `/${surface}/zenith/Crm/${screen}`;
       try {
         await page.goto(BASE + path, { waitUntil: 'networkidle2', timeout: 60000 });
