@@ -256,6 +256,89 @@ try {
     console.log(`FAIL  CRM source capture and idempotent lead retry — ${error.message}`);
   }
 
+  try {
+    await page.goto(`${BASE}/apps/zenith/Crm/SourcesCampaigns`, { waitUntil: 'networkidle2', timeout: 60000 });
+    const campaignName = `Disposable CRM campaign ${Date.now()}`;
+    const posted = await page.evaluate(async name => {
+      const form = document.getElementById('NewCampaignForm') || document.querySelector('form[name="NewCampaignForm"]');
+      if (!form) throw new Error('New Campaign form is missing');
+      const data = new FormData(form);
+      data.set('campaignName', name);
+      data.set('leadSourceId', 'Instagram');
+      data.set('medium', 'social');
+      const response = await fetch(form.action, { method: 'POST', body: data, credentials: 'same-origin' });
+      return response.status;
+    }, campaignName);
+    if (posted !== 200) throw new Error(`campaign create returned HTTP ${posted}`);
+    await page.goto(`${BASE}/apps/zenith/Crm/SourcesCampaigns`, { waitUntil: 'networkidle2', timeout: 60000 });
+    const campaignId = await page.evaluate(name => {
+      const options = [...document.querySelectorAll('select[name="trackingCampaignId"] option')];
+      return options.find(option => option.textContent.trim() === name)?.value;
+    }, campaignName);
+    if (!campaignId) throw new Error('new campaign is absent from the tracking-link builder');
+    const destination = 'https://example.test/signup?existing=a%26b#section';
+    const query = new URLSearchParams({ trackingCampaignId: campaignId, destinationUrl: destination, utmContent: 'autumn offer' });
+    await page.goto(`${BASE}/apps/zenith/Crm/SourcesCampaigns?${query}`, { waitUntil: 'networkidle2', timeout: 60000 });
+    const tracked = await page.$eval('.zcrm-tracking-url', element => element.textContent.trim());
+    const url = new URL(tracked);
+    if (url.hash !== '#section' || url.searchParams.get('existing') !== 'a&b' ||
+        url.searchParams.get('utm_source') !== 'instagram' ||
+        url.searchParams.get('utm_medium') !== 'social' ||
+        url.searchParams.get('utm_content') !== 'autumn offer' ||
+        url.searchParams.get('crm_campaign_id') !== campaignId || !(await page.$('.zcrm-copy-link'))) {
+      throw new Error('tracking URL lost the destination, UTM values or copy action');
+    }
+    console.log('PASS  CRM campaign tracking URL and copy action');
+  } catch (error) {
+    failures++;
+    console.log(`FAIL  CRM campaign tracking URL and copy action — ${error.message}`);
+  }
+
+  try {
+    await page.goto(`${BASE}/apps/zenith/Crm/Pipeline`, { waitUntil: 'networkidle2', timeout: 60000 });
+    const name = `Disposable CRM opportunity ${Date.now()}`;
+    const posted = await page.evaluate(async name => {
+      const form = document.getElementById('NewOppForm') || document.querySelector('form[name="NewOppForm"]');
+      if (!form) throw new Error('New Opportunity form is missing');
+      const data = new FormData(form);
+      data.set('opportunityName', name);
+      data.set('opportunityStageId', 'SoProspecting');
+      data.set('estimatedAmount', '100');
+      const response = await fetch(form.action, { method: 'POST', body: data, credentials: 'same-origin' });
+      return response.status;
+    }, name);
+    if (posted !== 200) throw new Error(`opportunity create returned HTTP ${posted}`);
+    await page.goto(`${BASE}/apps/zenith/Crm/Pipeline?period=all`, { waitUntil: 'networkidle2', timeout: 60000 });
+    const dealId = await page.evaluate(name => [...document.querySelectorAll('.zcrm-deal-card')]
+      .find(card => card.textContent.includes(name))?.id.slice('crm-deal-'.length), name);
+    if (!dealId) throw new Error('new opportunity is absent from the board');
+    const before = await page.$eval(`#crm-deal-${dealId}`, card => card.closest('.zcrm-board-column')?.id);
+    if (before !== 'crm-stage-SoProspecting') throw new Error(`new opportunity started in ${before}`);
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }),
+      page.evaluate(id => {
+        const card = document.getElementById(`crm-deal-${id}`);
+        const target = document.getElementById('crm-stage-SoQualification');
+        if (!card?.draggable || !target) throw new Error('drag handle or target stage is missing');
+        const dataTransfer = new DataTransfer();
+        card.dispatchEvent(new DragEvent('dragstart', { bubbles: true, dataTransfer }));
+        target.dispatchEvent(new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer }));
+        target.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer }));
+      }, dealId),
+    ]);
+    await page.goto(`${BASE}/apps/zenith/Crm/Pipeline?period=all`, { waitUntil: 'networkidle2', timeout: 60000 });
+    const after = await page.$eval(`#crm-deal-${dealId}`, card => card.closest('.zcrm-board-column')?.id);
+    if (after !== 'crm-stage-SoQualification') throw new Error(`drag stage did not persist: ${after}`);
+    await page.goto(`${BASE}/apps/zenith/Crm/EditOpportunity?salesOpportunityId=${encodeURIComponent(dealId)}`, { waitUntil: 'networkidle2', timeout: 60000 });
+    if (!(await page.$eval('body', body => body.innerText.includes('SoProspecting') && body.innerText.includes('SoQualification')))) {
+      throw new Error('stage-change history is missing');
+    }
+    console.log('PASS  CRM pipeline drag, persistence and stage audit');
+  } catch (error) {
+    failures++;
+    console.log(`FAIL  CRM pipeline drag, persistence and stage audit — ${error.message}`);
+  }
+
   // Exercise the two existing date controls, including the legacy form that submits
   // to the module's default screen. These checks are read-only and need no stock data.
   async function clickVisibleControl(selector) {
@@ -323,6 +406,6 @@ try {
   await browser.close();
 }
 
-const interactionChecks = 2 * (CRM_SCREENS.length + 1) + 1;
+const interactionChecks = 2 * (CRM_SCREENS.length + 1) + 3;
 console.log(`\n${failures === 0 ? 'SMOKE OK' : 'SMOKE FAILED'} — ${PATHS.length + interactionChecks - failures}/${PATHS.length + interactionChecks} render and interaction checks passed.`);
 process.exit(failures === 0 ? 0 : 1);

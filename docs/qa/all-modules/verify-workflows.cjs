@@ -154,6 +154,16 @@ async function scenario(name,fn){try{await fn();}catch(error){check(name,false,{
     check('CRM: manual membership removal updates count',count('segment_member',`segment_id=${quote(id)}`)===0&&Number(q(`SELECT member_count FROM customer_segment WHERE segment_id=${quote(id)}`)[0]?.member_count)===0);
    }
   });
+  await scenario('CRM dynamic source segment',async()=>{
+   const contactId=leadId?q(`SELECT converted_party_id FROM lead WHERE lead_id=${quote(leadId)}`)[0]?.converted_party_id:null;
+   if(!contactId){check('CRM: dynamic source segment has a converted contact',false);return;}
+   const created=await a.invoke('segment.create',{segmentName:'Disposable Instagram customers',segmentTypeEnumId:'CstDynamic'});
+   const segmentId=created.result?.segmentId;
+   if(!segmentId){check('CRM: dynamic source segment created',false,{errors:created.errors});return;}
+   const rule=await a.invoke('segment.addRule',{segmentId,criteriaTypeEnumId:'SctLeadSource',operator:'eq',fieldValue:'Instagram'});
+   const member=q(`SELECT * FROM segment_member WHERE segment_id=${quote(segmentId)} AND party_id=${quote(contactId)}`)[0];
+   check('CRM: dynamic segment matches original source after a later YouTube touch',!rule.errors?.length&&!!member&&Number(q(`SELECT member_count FROM customer_segment WHERE segment_id=${quote(segmentId)}`)[0]?.member_count)===1,{errors:rule.errors});
+  });
   const foreignLead=q("SELECT * FROM lead WHERE lead_id='AUDIT_QA_LEAD_B'");
   const denied=await a.invoke('lead.update',{leadId:'AUDIT_QA_LEAD_B',firstName:'Rejected A update'});
   check('CRM: foreign lead write rejected',denied.errors?.length>0&&JSON.stringify(q("SELECT * FROM lead WHERE lead_id='AUDIT_QA_LEAD_B'"))===JSON.stringify(foreignLead));
