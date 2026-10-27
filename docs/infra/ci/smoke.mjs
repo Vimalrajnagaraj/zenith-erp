@@ -309,26 +309,28 @@ try {
     }, name);
     if (posted !== 200) throw new Error(`opportunity create returned HTTP ${posted}`);
     await page.goto(`${BASE}/apps/zenith/Crm/Pipeline?period=all`, { waitUntil: 'networkidle2', timeout: 60000 });
-    const dealId = await page.evaluate(name => [...document.querySelectorAll('.zcrm-deal-card')]
-      .find(card => card.textContent.includes(name))?.id.slice('crm-deal-'.length), name);
-    if (!dealId) throw new Error('new opportunity is absent from the board');
-    const before = await page.$eval(`#crm-deal-${dealId}`, card => card.closest('.zcrm-board-column')?.id);
-    if (before !== 'crm-stage-SoProspecting') throw new Error(`new opportunity started in ${before}`);
+    const cardId = await page.evaluate(name => [...document.querySelectorAll('.zcrm-deal-card')]
+      .find(card => card.textContent.includes(name))?.id, name);
+    if (!cardId) throw new Error('new opportunity is absent from the board');
+    const dealId = cardId.slice('crm-deal-'.length).replace(/(?:_\d+)+$/, '');
+    const before = await page.$eval(`#${cardId}`, card => card.closest('.zcrm-board-column')?.id);
+    if (!before?.startsWith('crm-stage-SoProspecting')) throw new Error(`new opportunity started in ${before}`);
     await Promise.all([
       page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }),
       page.evaluate(id => {
-        const card = document.getElementById(`crm-deal-${id}`);
-        const target = document.getElementById('crm-stage-SoQualification');
+        const card = document.getElementById(id);
+        const target = document.querySelector('[id^="crm-stage-SoQualification"]');
         if (!card?.draggable || !target) throw new Error('drag handle or target stage is missing');
         const dataTransfer = new DataTransfer();
         card.dispatchEvent(new DragEvent('dragstart', { bubbles: true, dataTransfer }));
         target.dispatchEvent(new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer }));
         target.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer }));
-      }, dealId),
+      }, cardId),
     ]);
     await page.goto(`${BASE}/apps/zenith/Crm/Pipeline?period=all`, { waitUntil: 'networkidle2', timeout: 60000 });
-    const after = await page.$eval(`#crm-deal-${dealId}`, card => card.closest('.zcrm-board-column')?.id);
-    if (after !== 'crm-stage-SoQualification') throw new Error(`drag stage did not persist: ${after}`);
+    const after = await page.evaluate(name => [...document.querySelectorAll('.zcrm-deal-card')]
+      .find(card => card.textContent.includes(name))?.closest('.zcrm-board-column')?.id, name);
+    if (!after?.startsWith('crm-stage-SoQualification')) throw new Error(`drag stage did not persist: ${after}`);
     await page.goto(`${BASE}/apps/zenith/Crm/EditOpportunity?salesOpportunityId=${encodeURIComponent(dealId)}`, { waitUntil: 'networkidle2', timeout: 60000 });
     if (!(await page.$eval('body', body => body.innerText.includes('SoProspecting') && body.innerText.includes('SoQualification')))) {
       throw new Error('stage-change history is missing');
@@ -337,6 +339,48 @@ try {
   } catch (error) {
     failures++;
     console.log(`FAIL  CRM pipeline drag, persistence and stage audit — ${error.message}`);
+  }
+
+  try {
+    await page.goto(`${BASE}/apps/zenith/Crm/Activities`, { waitUntil: 'networkidle2', timeout: 60000 });
+    const subject = `Disposable CRM follow-up ${Date.now()}`;
+    const posted = await page.evaluate(async subject => {
+      const form = document.getElementById('ScheduleActivityForm') || document.querySelector('form[name="ScheduleActivityForm"]');
+      if (!form) throw new Error('Schedule Activity form is missing');
+      const data = new FormData(form);
+      data.set('activityType', 'Task');
+      data.set('subject', subject);
+      data.set('dueDate', new Date(Date.now() - 86400000).toISOString().slice(0, 16));
+      data.set('priority', 'High');
+      const response = await fetch(form.action, { method: 'POST', body: data, credentials: 'same-origin' });
+      return response.status;
+    }, subject);
+    if (posted !== 200) throw new Error(`activity schedule returned HTTP ${posted}`);
+    await page.goto(`${BASE}/apps/zenith/Crm/Activities?view=overdue`, { waitUntil: 'networkidle2', timeout: 60000 });
+    const detailHref = await page.evaluate(subject => [...document.querySelectorAll('tr')]
+      .find(row => row.textContent.includes(subject))?.querySelector('a[href*="ActivityDetail"]')?.href, subject);
+    if (!detailHref) throw new Error('new activity is absent from Overdue');
+    await page.goto(detailHref, { waitUntil: 'networkidle2', timeout: 60000 });
+    const completed = await page.evaluate(async () => {
+      const form = document.getElementById('CompleteActivityForm') || document.querySelector('form[name="CompleteActivityForm"]');
+      if (!form) throw new Error('Complete Activity form is missing');
+      const data = new FormData(form);
+      data.set('outcome', 'Contacted');
+      data.set('description', 'Disposable staging follow-up completed');
+      data.set('durationMinutes', '5');
+      const response = await fetch(form.action, { method: 'POST', body: data, credentials: 'same-origin' });
+      return response.status;
+    });
+    if (completed !== 200) throw new Error(`activity completion returned HTTP ${completed}`);
+    await page.goto(detailHref, { waitUntil: 'networkidle2', timeout: 60000 });
+    const detail = await page.$eval('body', body => body.innerText);
+    if (!detail.includes('Completed') || !detail.includes('Outcome: Contacted')) {
+      throw new Error('activity completion or outcome did not persist');
+    }
+    console.log('PASS  CRM overdue activity scheduling and completion');
+  } catch (error) {
+    failures++;
+    console.log(`FAIL  CRM overdue activity scheduling and completion — ${error.message}`);
   }
 
   // Exercise the two existing date controls, including the legacy form that submits
@@ -406,6 +450,6 @@ try {
   await browser.close();
 }
 
-const interactionChecks = 2 * (CRM_SCREENS.length + 1) + 3;
+const interactionChecks = 2 * (CRM_SCREENS.length + 1) + 4;
 console.log(`\n${failures === 0 ? 'SMOKE OK' : 'SMOKE FAILED'} — ${PATHS.length + interactionChecks - failures}/${PATHS.length + interactionChecks} render and interaction checks passed.`);
 process.exit(failures === 0 ? 0 : 1);

@@ -11,7 +11,7 @@
     board.addEventListener('dragstart', event => {
       const card = event.target.closest('.zcrm-deal-card[id^="crm-deal-"]');
       if (!card || !event.dataTransfer) return;
-      event.dataTransfer.setData('text/plain', card.id.slice('crm-deal-'.length));
+      event.dataTransfer.setData('text/plain', card.id);
       event.dataTransfer.effectAllowed = 'move';
     });
     board.addEventListener('dragover', event => {
@@ -21,11 +21,12 @@
     });
     board.addEventListener('drop', event => {
       const column = event.target.closest('.zcrm-board-column[id^="crm-stage-"]');
-      const dealId = event.dataTransfer?.getData('text/plain');
-      if (!column || !dealId || !board.querySelector(`#crm-deal-${CSS.escape(dealId)}`)) return;
+      const card = document.getElementById(event.dataTransfer?.getData('text/plain'));
+      if (!column || !card || !board.contains(card)) return;
       event.preventDefault();
-      form.elements.salesOpportunityId.value = dealId;
-      form.elements.opportunityStageId.value = column.id.slice('crm-stage-'.length);
+      // Moqui adds numeric suffixes to IDs rendered inside section-iterate.
+      form.elements.salesOpportunityId.value = card.id.slice('crm-deal-'.length).replace(/(?:_\d+)+$/, '');
+      form.elements.opportunityStageId.value = column.id.slice('crm-stage-'.length).replace(/(?:_\d+)+$/, '');
       form.requestSubmit();
     });
   }
