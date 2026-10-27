@@ -72,19 +72,27 @@
         }
 
         function ask() {
-            var q = input.value;
+            var q = input.value.trim();
             if (!q) return;
             append("user", "You", q);
             input.value = "";
-            var appRoot = (window.moqui && window.moqui.webrootVue && window.moqui.webrootVue.appRootPath) || "";
-            fetch(appRoot + "/apps/zenith/askCopilot?query=" + encodeURIComponent(q), {
+            // Navigation requests are app actions, so they should work without an AI provider.
+            if (/^(?:please\s+)?(?:open|go to|take me to|show me)\s+(?:the\s+)?(?:pos\s+)?(?:billing\s+)?terminal\s*(?:please)?[.!]?$/i.test(q)) {
+                append("ai", "Copilot", "Opening Billing Terminal.");
+                location.assign("/apps/zenith/pos/Terminal");
+                return;
+            }
+            send.disabled = true;
+            input.disabled = true;
+            fetch("/apps/zenith/askCopilot?query=" + encodeURIComponent(q), {
                 method: "GET",
                 headers: { "Accept": "application/json" },
                 credentials: "same-origin"
             })
-            .then(function(r) { return r.json(); })
-            .then(function(res) { append("ai", "Copilot", res.response || res.errors || "(no response)"); })
-            .catch(function() { append("error", "Error", "Could not reach AI service.", "red"); });
+            .then(function(r) { if (!r.ok) throw new Error("Assistant request failed"); return r.json(); })
+            .then(function(res) { append("ai", "Copilot", res.response || "The assistant is unavailable right now. Please try again shortly."); })
+            .catch(function() { append("error", "Copilot", "The assistant is unavailable right now. Please try again shortly."); })
+            .finally(function() { send.disabled = false; input.disabled = false; input.focus(); });
         }
 
         send.addEventListener("click", ask);
@@ -168,6 +176,7 @@
         if (document.getElementById("ai-copilot-container")) {  // classic /apps already rendered it
             window._zenithCopilotLoaded = true;
             injectStyle();  // ensure the fixed bottom-right positioning CSS is present in /apps too
+            wire();
             makeDraggable(document.getElementById("ai-copilot-container"), document.getElementById("ai-copilot-toggle"));
             return true;
         }
