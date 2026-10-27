@@ -374,13 +374,18 @@ try {
       data.set('dueDate', new Date(Date.now() - 86400000).toISOString().slice(0, 19).replace('T', ' '));
       data.set('priority', 'High');
       const response = await fetch(form.action, { method: 'POST', body: data, credentials: 'same-origin' });
-      return response.status;
+      const html = await response.text();
+      return { status: response.status, error: /could not be converted|CRM write access is required|Error rendering/i.exec(html)?.[0] || '' };
     }, subject);
-    if (posted !== 200) throw new Error(`activity schedule returned HTTP ${posted}`);
+    if (posted.status !== 200 || posted.error) throw new Error(`activity schedule failed: ${JSON.stringify(posted)}`);
+    await page.goto(`${BASE}/apps/zenith/Crm/Activities?period=all`, { waitUntil: 'networkidle2', timeout: 60000 });
+    const allRow = await page.evaluate(subject => [...document.querySelectorAll('tr')]
+      .find(row => row.textContent.includes(subject))?.innerText, subject);
+    if (!allRow) throw new Error('new activity is absent from All after scheduling');
     await page.goto(`${BASE}/apps/zenith/Crm/Activities?view=overdue`, { waitUntil: 'networkidle2', timeout: 60000 });
     const detailHref = await page.evaluate(subject => [...document.querySelectorAll('tr')]
       .find(row => row.textContent.includes(subject))?.querySelector('a[href*="ActivityDetail"]')?.href, subject);
-    if (!detailHref) throw new Error('new activity is absent from Overdue');
+    if (!detailHref) throw new Error(`new activity is absent from Overdue; All row was ${allRow.replace(/\s+/g, ' ')}`);
     await page.goto(detailHref, { waitUntil: 'networkidle2', timeout: 60000 });
     const completed = await page.evaluate(async () => {
       const form = document.getElementById('CompleteActivityForm') || document.querySelector('form[name="CompleteActivityForm"]');
@@ -402,6 +407,46 @@ try {
   } catch (error) {
     failures++;
     console.log(`FAIL  CRM overdue activity scheduling and completion — ${error.message}`);
+  }
+
+  try {
+    await page.goto(`${BASE}/apps/zenith/Crm/ImportLeads`, { waitUntil: 'networkidle2', timeout: 60000 });
+    const email = `crm-import-${Date.now()}@example.test`;
+    const previewStatus = await page.evaluate(async email => {
+      const form = document.getElementById('PreviewLeadCsv') || document.querySelector('form[name="PreviewLeadCsv"]');
+      if (!form) throw new Error('CSV preview form is missing');
+      const data = new FormData(form);
+      data.set('csvText', `FirstName,Email,Source\nDisposable import,${email},Instagram\nInvalid row,bad-email,YouTube`);
+      const response = await fetch(form.action, { method: 'POST', body: data, credentials: 'same-origin' });
+      return response.status;
+    }, email);
+    if (previewStatus !== 200) throw new Error(`CSV preview returned HTTP ${previewStatus}`);
+    await page.goto(`${BASE}/apps/zenith/Crm/ImportLeads`, { waitUntil: 'networkidle2', timeout: 60000 });
+    const preview = await page.$eval('body', body => body.innerText);
+    if (!preview.includes('2 rows') || !preview.includes('1 ready') || !preview.includes('1 need attention')) {
+      throw new Error('CSV preview did not separate valid and invalid rows');
+    }
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const committed = await page.evaluate(async () => {
+        const form = document.getElementById('CommitLeadCsv') || document.querySelector('form[name="CommitLeadCsv"]');
+        if (!form) throw new Error('CSV commit form is missing');
+        const response = await fetch(form.action, { method: 'POST', body: new FormData(form), credentials: 'same-origin' });
+        return response.status;
+      });
+      if (committed !== 200) throw new Error(`CSV commit returned HTTP ${committed}`);
+      await page.goto(`${BASE}/apps/zenith/Crm/ImportLeads`, { waitUntil: 'networkidle2', timeout: 60000 });
+      const outcome = await page.$eval('body', body => body.innerText);
+      if (!outcome.includes('1 imported or already present') || !outcome.includes('1 skipped')) {
+        throw new Error(`CSV import result was incorrect on attempt ${attempt + 1}`);
+      }
+    }
+    await page.goto(`${BASE}/apps/zenith/Crm/Leads?period=all`, { waitUntil: 'networkidle2', timeout: 60000 });
+    const rows = await page.$$eval('tr', (tableRows, expected) => tableRows.filter(row => row.textContent.includes(expected)).length, email);
+    if (rows !== 1) throw new Error(`CSV retry created ${rows} matching leads`);
+    console.log('PASS  CRM CSV preview, valid-row import and safe retry');
+  } catch (error) {
+    failures++;
+    console.log(`FAIL  CRM CSV preview, valid-row import and safe retry — ${error.message}`);
   }
 
   // Exercise the two existing date controls, including the legacy form that submits
@@ -471,6 +516,6 @@ try {
   await browser.close();
 }
 
-const interactionChecks = 2 * (CRM_SCREENS.length + 1) + 5;
+const interactionChecks = 2 * (CRM_SCREENS.length + 1) + 6;
 console.log(`\n${failures === 0 ? 'SMOKE OK' : 'SMOKE FAILED'} — ${PATHS.length + interactionChecks - failures}/${PATHS.length + interactionChecks} render and interaction checks passed.`);
 process.exit(failures === 0 ? 0 : 1);

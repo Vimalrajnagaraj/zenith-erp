@@ -49,7 +49,9 @@
                         mobile:mobileColumn ?: 'Mobile', leadSourceId:sourceColumn ?: 'Source',
                         sourceDetail:sourceDetailColumn ?: 'SourceDetail', campaignId:campaignColumn ?: 'CampaignId',
                         utmSource:utmSourceColumn ?: 'UtmSource', utmMedium:utmMediumColumn ?: 'UtmMedium',
-                        utmCampaign:utmCampaignColumn ?: 'UtmCampaign']
+                        utmCampaign:utmCampaignColumn ?: 'UtmCampaign', utmContent:utmContentColumn ?: 'UtmContent',
+                        utmTerm:utmTermColumn ?: 'UtmTerm', landingPageUrl:landingPageColumn ?: 'LandingPageUrl',
+                        referrerUrl:referrerColumn ?: 'ReferrerUrl']
                     def indices = requested.collectEntries { field, header -> [(field):headers.indexOf(header.toString().trim().toLowerCase(java.util.Locale.ROOT))] }
                     if (indices.firstName < 0 || indices.leadSourceId < 0) {
                         ec.message.addError('Map FirstName and Source to existing CSV headers.'); return
@@ -61,16 +63,29 @@
                     def existing = ec.entity.find('zenith.erp.crm.Lead').condition('organizationPartyId',orgId).list()
                     def contacts = ec.entity.find('zenith.erp.contacts.ContactListView').condition('ownerPartyId',orgId).list()
                     def parsed = []
+                    def seenEmails = [:], seenMobiles = [:]
                     records.drop(1).eachWithIndex { cells, index ->
                         def values = indices.collectEntries { key, idx -> [(key):(idx >= 0 && idx < cells.size() ? cells[idx].trim() : '')] }
                         def errors = []
+                        values.email = values.email?.toLowerCase(java.util.Locale.ROOT)
+                        values.mobile = values.mobile?.replaceAll(/[\s().-]/, '')
                         if (!values.firstName) errors.add('FirstName required')
                         if (!values.email && !values.mobile && !values.companyName) errors.add('Email, Mobile or CompanyName required')
                         if (values.email && !(values.email ==~ /[^\s@]+@[^\s@]+\.[^\s@]+/)) errors.add('Invalid email')
+                        if (values.mobile && !(values.mobile ==~ /\+?[0-9]{6,15}/)) errors.add('Invalid mobile')
+                        ['sourceDetail','utmSource','utmMedium','utmCampaign','utmContent','utmTerm',
+                         'landingPageUrl','referrerUrl'].each { field ->
+                            if (values[field]?.length() > 255) errors.add(field + ' exceeds 255 characters')
+                        }
+                        ['landingPageUrl','referrerUrl'].each { field ->
+                            if (values[field] && !(values[field] ==~ /(?i)https?:\/\/.+/)) errors.add(field + ' must be an HTTP or HTTPS URL')
+                        }
                         def source = availableSources.find { it.leadSourceId.equalsIgnoreCase(values.leadSourceId) || it.description.equalsIgnoreCase(values.leadSourceId) }
                         if (!source) errors.add('Unknown source; use the exact source name or Unknown')
                         else values.leadSourceId = source.leadSourceId
                         if (values.campaignId && !knownCampaigns.any { it.campaignId == values.campaignId }) errors.add('Campaign ID not found')
+                        if (values.email && seenEmails[values.email]) errors.add('Duplicate email in CSV row ' + seenEmails[values.email])
+                        if (values.mobile && seenMobiles[values.mobile]) errors.add('Duplicate mobile in CSV row ' + seenMobiles[values.mobile])
                         def duplicate = existing.find { item -> (values.email && item.email?.equalsIgnoreCase(values.email)) ||
                             (values.mobile && item.mobile?.replaceAll(/\D/,'') == values.mobile.replaceAll(/\D/,'')) }
                         if (duplicate) errors.add('Possible duplicate lead ' + duplicate.leadId)
@@ -78,6 +93,10 @@
                             (values.email && item.emailAddress?.equalsIgnoreCase(values.email)) ||
                             (values.mobile && item.phoneNumber?.replaceAll(/\D/,'') == values.mobile.replaceAll(/\D/,'')) }
                         if (matchingContact) errors.add('Matching contact ' + matchingContact.partyId)
+                        if (!errors) {
+                            if (values.email) seenEmails[values.email] = index + 2
+                            if (values.mobile) seenMobiles[values.mobile] = index + 2
+                        }
                         parsed.add([rowNumber:index+2, firstName:values.firstName, email:values.email,
                             mobile:values.mobile, sourceName:values.leadSourceId, error:errors.join('; '), values:values])
                     }
@@ -112,7 +131,8 @@
                     if (row.error) { skipped++; errors.add('Row ' + row.rowNumber + ': ' + row.error); return }
                     def result = ec.service.sync().name('zenith.crm.CrmServices.create#Lead')
                         .parameters(row.values + [organizationPartyId:orgId, captureMethod:'Import',
-                            externalSubmissionId:'import:' + plan.digest + ':' + row.rowNumber]).call()
+                            externalSubmissionId:'import:' + plan.digest + ':' + row.rowNumber])
+                        .requireNewTransaction(true).call()
                     if (ec.message.hasError()) {
                         errors.add('Row ' + row.rowNumber + ': ' + ec.message.errorsString)
                         ec.message.clearErrors(); skipped++
