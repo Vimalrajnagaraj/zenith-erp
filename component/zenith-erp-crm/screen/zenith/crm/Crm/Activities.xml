@@ -3,11 +3,16 @@
         xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
         default-menu-title="Activities" default-menu-index="3">
     <parameter name="period"/>
+    <parameter name="view"/>
 
     <transition name="logActivity">
         <service-call name="zenith.crm.CrmServices.log#Activity"/>
         <default-response url="."/>
         <error-response url="."/>
+    </transition>
+    <transition name="scheduleActivity">
+        <service-call name="zenith.crm.CrmServices.schedule#Activity"/>
+        <default-response url="."/><error-response url="."/>
     </transition>
     <!-- ZE-SEC-JSON f/u: org-scoped party picker (stock SimpleScreens searchPartyList leaks cross-tenant). -->
     <transition-include name="searchPartyList" location="component://zenith-erp-base/screen/include/PartyPicker.xml"/>
@@ -16,9 +21,16 @@
         <script><![CDATA[
             import org.moqui.entity.EntityCondition
             period = period == 'all' ? 'all' : 'month'
+            view = ['today','overdue','upcoming','mine','completed'].contains(view) ? view : 'all'
             def today = java.time.LocalDate.parse(new java.text.SimpleDateFormat('yyyy-MM-dd').format(ec.user.nowTimestamp))
-            periodStart = period == 'month' ? java.sql.Timestamp.valueOf(today.withDayOfMonth(1).atStartOfDay()) : null
-            periodEnd = period == 'month' ? java.sql.Timestamp.valueOf(today.withDayOfMonth(1).plusMonths(1).atStartOfDay()) : null
+            periodStart = view == 'all' && period == 'month' ? java.sql.Timestamp.valueOf(today.withDayOfMonth(1).atStartOfDay()) : null
+            periodEnd = view == 'all' && period == 'month' ? java.sql.Timestamp.valueOf(today.withDayOfMonth(1).plusMonths(1).atStartOfDay()) : null
+            todayStart = java.sql.Timestamp.valueOf(today.atStartOfDay())
+            tomorrowStart = java.sql.Timestamp.valueOf(today.plusDays(1).atStartOfDay())
+            dueStart = view in ['today','upcoming'] ? (view == 'today' ? todayStart : tomorrowStart) : null
+            dueEnd = view == 'today' ? tomorrowStart : (view == 'overdue' ? ec.user.nowTimestamp : null)
+            statusFilter = view == 'completed' ? 'Completed' : (view in ['today','upcoming','overdue'] ? 'Scheduled' : null)
+            ownerFilter = view == 'mine' ? ec.user.userId : null
             def orgId = (crmOrganization.activeOrgId ?: '_NA_') ?: '__NO_ORGANIZATION__'
             def find = ec.entity.find('zenith.erp.crm.CrmActivity').condition('organizationPartyId', orgId)
             if (periodStart) find.condition('activityDate', EntityCondition.GREATER_THAN_EQUAL_TO, periodStart)
@@ -28,14 +40,18 @@
             callCount = activityRows.count { it.activityType == 'Call' }
             meetingCount = activityRows.count { it.activityType == 'Meeting' }
             overdueCount = ec.entity.find('zenith.erp.crm.CrmActivity').condition('organizationPartyId', orgId)
-                    .condition('nextFollowUpDate', EntityCondition.LESS_THAN, ec.user.nowTimestamp)
-                    .list().count { !['completed', 'done'].contains(it.outcome?.toString()?.trim()?.toLowerCase(java.util.Locale.ROOT)) }
+                    .condition('dueDate', EntityCondition.LESS_THAN, ec.user.nowTimestamp)
+                    .list().count { it.statusId == 'Scheduled' }
         ]]></script>
         <entity-find entity-name="zenith.erp.crm.CrmActivity" list="activityList">
             <search-form-inputs default-order-by="-activityDate" skip-fields="organizationPartyId"/>
             <econdition field-name="organizationPartyId" from="(crmOrganization.activeOrgId ?: '_NA_') ?: '__NO_ORGANIZATION__'"/>
             <econdition field-name="activityDate" operator="greater-equals" from="periodStart" ignore-if-empty="true"/>
             <econdition field-name="activityDate" operator="less" from="periodEnd" ignore-if-empty="true"/>
+            <econdition field-name="dueDate" operator="greater-equals" from="dueStart" ignore-if-empty="true"/>
+            <econdition field-name="dueDate" operator="less" from="dueEnd" ignore-if-empty="true"/>
+            <econdition field-name="statusId" from="statusFilter" ignore-if-empty="true"/>
+            <econdition field-name="assignedToUserId" from="ownerFilter" ignore-if-empty="true"/>
         </entity-find>
     </actions>
 
@@ -43,6 +59,19 @@
         <container style="zcrm-intro"><label text="Activities" type="h3"/><label text="Track calls, meetings, tasks and follow-ups in one place." type="p"/></container>
         <container style="zcrm-activity-actions">
             <section name="LogActivity_write"><condition><expression>modCanWrite</expression></condition><widgets>
+                <container-dialog id="ScheduleActivityDialog" button-text="Schedule Activity">
+                    <form-single name="ScheduleActivityForm" transition="scheduleActivity">
+                        <field name="activityType"><default-field title="Type"><drop-down><option key="Call"/><option key="Email"/><option key="Meeting"/><option key="Demo"/><option key="Task"/><option key="FollowUp"/><option key="SiteVisit"/></drop-down></default-field></field>
+                        <field name="subject"><default-field><text-line size="40"/></default-field></field>
+                        <field name="description"><default-field title="Notes"><text-area rows="3" cols="40"/></default-field></field>
+                        <field name="dueDate"><default-field title="Due"><date-time type="date-time"/></default-field></field>
+                        <field name="priority"><default-field><drop-down><option key="Normal"/><option key="High"/><option key="Low"/></drop-down></default-field></field>
+                        <field name="leadId"><default-field title="Lead (optional)"><drop-down allow-empty="true"><entity-options key="${leadId}" text="${firstName} ${lastName ?: ''}"><entity-find entity-name="zenith.erp.crm.Lead"><econdition field-name="organizationPartyId" from="(crmOrganization.activeOrgId ?: '_NA_') ?: '__NO_ORGANIZATION__'"/></entity-find></entity-options></drop-down></default-field></field>
+                        <field name="salesOpportunityId"><default-field title="Opportunity (optional)"><drop-down allow-empty="true"><entity-options key="${salesOpportunityId}" text="${opportunityName}"><entity-find entity-name="mantle.sales.opportunity.SalesOpportunity"><econdition field-name="organizationPartyId" from="(crmOrganization.activeOrgId ?: '_NA_') ?: '__NO_ORGANIZATION__'"/></entity-find></entity-options></drop-down></default-field></field>
+                        <field name="contactPartyId"><default-field title="Contact (optional)"><drop-down allow-empty="true"><dynamic-options transition="searchPartyList" server-search="true" min-length="2"/></drop-down></default-field></field>
+                        <field name="submitButton"><default-field title="Schedule"><submit/></default-field></field>
+                    </form-single>
+                </container-dialog>
                 <container-dialog id="LogActivityDialog" button-text="Log Activity">
                     <form-single name="LogActivityForm" transition="logActivity">
                         <field name="activityType"><default-field title="Type"><drop-down>
@@ -68,6 +97,14 @@
             <link url="." text="This month" parameter-map="[period:'month']" style="${period == 'month' ? 'zcrm-period-active' : ''}"/>
             <link url="." text="All time" parameter-map="[period:'all']" style="${period == 'all' ? 'zcrm-period-active' : ''}"/>
         </container>
+        <container style="zcrm-period zcrm-reference-period">
+            <link url="." text="All" parameter-map="[view:'all',period:period]" style="${view == 'all' ? 'zcrm-period-active' : ''}"/>
+            <link url="." text="Today" parameter-map="[view:'today']" style="${view == 'today' ? 'zcrm-period-active' : ''}"/>
+            <link url="." text="Overdue" parameter-map="[view:'overdue']" style="${view == 'overdue' ? 'zcrm-period-active' : ''}"/>
+            <link url="." text="Upcoming" parameter-map="[view:'upcoming']" style="${view == 'upcoming' ? 'zcrm-period-active' : ''}"/>
+            <link url="." text="Mine" parameter-map="[view:'mine']" style="${view == 'mine' ? 'zcrm-period-active' : ''}"/>
+            <link url="." text="Completed" parameter-map="[view:'completed']" style="${view == 'completed' ? 'zcrm-period-active' : ''}"/>
+        </container>
         <container style="zcrm-metrics zcrm-reference-metrics">
             <container style="zcrm-metric"><label text="Total activities" type="span"/><label text="${activityCount}" type="h4"/><label text="${period == 'month' ? 'This month' : 'All time'}" type="span" style="zcrm-muted"/></container>
             <container style="zcrm-metric"><label text="Calls" type="span"/><label text="${callCount}" type="h4"/><label text="Recorded calls" type="span" style="zcrm-muted"/></container>
@@ -80,6 +117,8 @@
             <form-list name="ActivityListForm" list="activityList" skip-form="true" header-dialog="true"
                        show-csv-button="true" show-page-size="true">
                 <field name="period"><header-field><hidden default-value="${period}"/></header-field><default-field><hidden/></default-field></field>
+                <field name="view"><header-field><hidden default-value="${view}"/></header-field><default-field><hidden/></default-field></field>
+                <field name="activityId"><default-field title="Activity"><link url="../ActivityDetail" text="Open" parameter-map="[activityId:activityId]"/></default-field></field>
                 <field name="activityDate">
                     <header-field title="Date" show-order-by="true"><date-find/></header-field>
                     <default-field><display format="dd/MM/yyyy HH:mm"/></default-field>
@@ -97,6 +136,9 @@
                     <header-field><text-find size="25" hide-options="true"/></header-field>
                     <default-field><display/></default-field>
                 </field>
+                <field name="dueDate"><header-field title="Due" show-order-by="true"><date-find/></header-field><default-field><display format="dd/MM/yyyy HH:mm"/></default-field></field>
+                <field name="statusId"><default-field title="Status"><display text="${statusId ?: 'Completed'}"/></default-field></field>
+                <field name="priority"><default-field><display/></default-field></field>
                 <field name="contactPartyId">
                     <default-field title="Contact"><display/></default-field>
                 </field>

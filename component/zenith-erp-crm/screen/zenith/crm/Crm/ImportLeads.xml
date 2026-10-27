@@ -1,0 +1,168 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
+        default-menu-title="Import Leads" default-menu-include="false">
+    <transition name="previewImport" method="get"><actions><script><![CDATA[
+        ec.web.response.setHeader('Allow','POST'); ec.web.sendJsonError(405,'POST required',null)
+    ]]></script></actions><default-response type="none"/></transition>
+    <transition name="previewImport" method="post">
+        <actions>
+            <service-call name="zenith.crm.CrmServices.assert#CrmWrite" out-map="crmWrite"/>
+            <if condition="!crmWrite.allowed"><return error="true" message="CRM write access is required."/></if>
+            <script><![CDATA[
+                try {
+                    def upload = ec.web.parameters.csvFile
+                    def csv = ec.web.parameters.csvText
+                    if (upload && upload.metaClass.respondsTo(upload,'getInputStream')) {
+                        if (upload.getSize() > 1000000) { ec.message.addError('CSV must be at most 1 MB.'); return }
+                        csv = upload.getInputStream().withCloseable { new String(it.readAllBytes(), 'UTF-8') }
+                    }
+                    if (!csv?.trim()) { ec.message.addError('Choose a CSV file or paste CSV rows.'); return }
+                    if (csv.length() > 1000000) { ec.message.addError('CSV must be at most 1 MB.'); return }
+                    csv = csv.replaceFirst(/^\uFEFF/, '')
+                    def records = []
+                    def row = []
+                    def cell = new StringBuilder()
+                    boolean quoted = false
+                    for (int i=0; i<csv.length(); i++) {
+                        char ch = csv.charAt(i)
+                        if (ch == ('"' as char)) {
+                            if (quoted && i+1<csv.length() && csv.charAt(i+1)==('"' as char)) { cell.append('"'); i++ }
+                            else quoted = !quoted
+                        } else if (ch == (',' as char) && !quoted) {
+                            row.add(cell.toString()); cell = new StringBuilder()
+                        } else if ((ch == ('\n' as char) || ch == ('\r' as char)) && !quoted) {
+                            if (ch == ('\r' as char) && i+1<csv.length() && csv.charAt(i+1)==('\n' as char)) i++
+                            row.add(cell.toString()); cell = new StringBuilder()
+                            if (row.any { it.trim() }) records.add(row)
+                            row = []
+                        } else cell.append(ch)
+                    }
+                    if (quoted) { ec.message.addError('CSV contains an unclosed quoted value.'); return }
+                    row.add(cell.toString()); if (row.any { it.trim() }) records.add(row)
+                    if (records.size() < 2 || records.size() > 501) {
+                        ec.message.addError('CSV needs a header and 1–500 data rows.'); return
+                    }
+                    def headers = records[0].collect { it.trim().toLowerCase(java.util.Locale.ROOT) }
+                    def requested = [firstName:firstNameColumn ?: 'FirstName', lastName:lastNameColumn ?: 'LastName',
+                        companyName:companyNameColumn ?: 'CompanyName', email:emailColumn ?: 'Email',
+                        mobile:mobileColumn ?: 'Mobile', leadSourceId:sourceColumn ?: 'Source',
+                        sourceDetail:sourceDetailColumn ?: 'SourceDetail', campaignId:campaignColumn ?: 'CampaignId',
+                        utmSource:utmSourceColumn ?: 'UtmSource', utmMedium:utmMediumColumn ?: 'UtmMedium',
+                        utmCampaign:utmCampaignColumn ?: 'UtmCampaign']
+                    def indices = requested.collectEntries { field, header -> [(field):headers.indexOf(header.toString().trim().toLowerCase(java.util.Locale.ROOT))] }
+                    if (indices.firstName < 0 || indices.leadSourceId < 0) {
+                        ec.message.addError('Map FirstName and Source to existing CSV headers.'); return
+                    }
+                    def orgId = ec.user.getPreference('ACTIVE_ORGANIZATION')
+                    def availableSources = ec.entity.find('zenith.erp.crm.LeadSource').condition('isActive','Y').list()
+                        .findAll { !it.organizationPartyId || it.organizationPartyId == orgId }
+                    def knownCampaigns = ec.entity.find('zenith.erp.crm.CrmCampaign').condition('organizationPartyId',orgId).list()
+                    def existing = ec.entity.find('zenith.erp.crm.Lead').condition('organizationPartyId',orgId).list()
+                    def parsed = []
+                    records.drop(1).eachWithIndex { cells, index ->
+                        def values = indices.collectEntries { key, idx -> [(key):(idx >= 0 && idx < cells.size() ? cells[idx].trim() : '')] }
+                        def errors = []
+                        if (!values.firstName) errors.add('FirstName required')
+                        if (!values.email && !values.mobile && !values.companyName) errors.add('Email, Mobile or CompanyName required')
+                        if (values.email && !(values.email ==~ /[^\s@]+@[^\s@]+\.[^\s@]+/)) errors.add('Invalid email')
+                        def source = availableSources.find { it.leadSourceId.equalsIgnoreCase(values.leadSourceId) || it.description.equalsIgnoreCase(values.leadSourceId) }
+                        if (!source) errors.add('Unknown source; use the exact source name or Unknown')
+                        else values.leadSourceId = source.leadSourceId
+                        if (values.campaignId && !knownCampaigns.any { it.campaignId == values.campaignId }) errors.add('Campaign ID not found')
+                        def duplicate = existing.find { item -> (values.email && item.email?.equalsIgnoreCase(values.email)) ||
+                            (values.mobile && item.mobile?.replaceAll(/\D/,'') == values.mobile.replaceAll(/\D/,'')) }
+                        if (duplicate) errors.add('Possible duplicate lead ' + duplicate.leadId)
+                        parsed.add([rowNumber:index+2, firstName:values.firstName, email:values.email,
+                            mobile:values.mobile, sourceName:values.leadSourceId, error:errors.join('; '), values:values])
+                    }
+                    def digest = java.security.MessageDigest.getInstance('SHA-256').digest(csv.getBytes('UTF-8'))
+                        .collect { String.format('%02x', it & 0xff) }.join('')
+                    ec.web.sessionAttributes.put('crmLeadImport', [userId:ec.user.userId, organizationPartyId:orgId,
+                        digest:digest, rows:parsed])
+                    ec.web.sessionAttributes.remove('crmLeadImportResult')
+                } finally {
+                    ['csvText','csvFile'].each { key ->
+                        ec.web.parameters.put(key,null); ec.web.requestParameters.put(key,null); ec.context.put(key,null)
+                    }
+                }
+            ]]></script>
+        </actions><default-response url="."/><error-response url="."/>
+    </transition>
+    <transition name="commitImport" method="get"><actions><script><![CDATA[
+        ec.web.response.setHeader('Allow','POST'); ec.web.sendJsonError(405,'POST required',null)
+    ]]></script></actions><default-response type="none"/></transition>
+    <transition name="commitImport" method="post">
+        <actions>
+            <service-call name="zenith.crm.CrmServices.assert#CrmWrite" out-map="crmWrite"/>
+            <if condition="!crmWrite.allowed"><return error="true" message="CRM write access is required."/></if>
+            <script><![CDATA[
+                def plan = ec.web.sessionAttributes.get('crmLeadImport')
+                def orgId = ec.user.getPreference('ACTIVE_ORGANIZATION')
+                if (!plan || plan.userId != ec.user.userId || plan.organizationPartyId != orgId || plan.digest != confirmationDigest) {
+                    ec.message.addError('Preview the same CSV in this organization before importing.'); return
+                }
+                int imported = 0; int skipped = 0; def errors = []
+                plan.rows.each { row ->
+                    if (row.error) { skipped++; errors.add('Row ' + row.rowNumber + ': ' + row.error); return }
+                    def result = ec.service.sync().name('zenith.crm.CrmServices.create#Lead')
+                        .parameters(row.values + [organizationPartyId:orgId, captureMethod:'Import',
+                            externalSubmissionId:'import:' + plan.digest + ':' + row.rowNumber]).call()
+                    if (ec.message.hasError()) {
+                        errors.add('Row ' + row.rowNumber + ': ' + ec.message.errorsString)
+                        ec.message.clearErrors(); skipped++
+                    } else if (result?.leadId) imported++
+                }
+                ec.web.sessionAttributes.put('crmLeadImportResult', [imported:imported, skipped:skipped, errors:errors.take(100)])
+            ]]></script>
+        </actions><default-response url="."/><error-response url="."/>
+    </transition>
+    <actions>
+        <set field="preview" from="ec.web.sessionAttributes.get('crmLeadImport')"/>
+        <set field="importResult" from="ec.web.sessionAttributes.get('crmLeadImportResult')"/>
+        <if condition="preview &amp;&amp; (preview.userId != ec.user.userId || preview.organizationPartyId != crmOrganization.activeOrgId)">
+            <set field="preview" from="null"/>
+        </if>
+    </actions>
+    <widgets>
+        <container style="zcrm-intro"><label text="Import Leads" type="h3"/><label text="Map CSV columns, preview every row, then import valid leads into this organization." type="p"/><link url="../Leads" text="Back to leads"/></container>
+        <section name="ImportWrite" condition="modCanWrite"><widgets>
+            <container-box><box-header title="1. Upload and map"/><box-body>
+                <label text="Required CSV headers: FirstName and Source. Add Email, Mobile or CompanyName, and optional UTM columns. Choose Unknown explicitly when the source is not known." type="p"/>
+                <form-single name="PreviewLeadCsv" transition="previewImport" upload="true">
+                    <field name="csvFile"><default-field title="CSV file (up to 1 MB)"><file accept=".csv,text/csv"/></default-field></field>
+                    <field name="csvText"><default-field title="Or paste CSV"><text-area rows="5" cols="80"/></default-field></field>
+                    <field name="firstNameColumn"><default-field title="First name column (default FirstName)"><text-line size="20"/></default-field></field>
+                    <field name="sourceColumn"><default-field title="Source column (default Source)"><text-line size="20"/></default-field></field>
+                    <field name="emailColumn"><default-field title="Email column (default Email)"><text-line size="20"/></default-field></field>
+                    <field name="mobileColumn"><default-field title="Mobile column (default Mobile)"><text-line size="20"/></default-field></field>
+                    <field name="companyNameColumn"><default-field title="Company column (default CompanyName)"><text-line size="20"/></default-field></field>
+                    <field name="submitButton"><default-field title="Preview rows"><submit/></default-field></field>
+                </form-single>
+            </box-body></container-box>
+            <section name="HasPreview" condition="preview"><widgets>
+                <container-box><box-header title="2. Review rows"/><box-body>
+                    <label text="${preview.rows.size()} rows · ${preview.rows.count { !it.error }} ready · ${preview.rows.count { it.error }} need attention" type="p"/>
+                    <form-list name="ImportPreviewRows" list="preview.rows" skip-form="true">
+                        <field name="rowNumber"><default-field title="Row"><display/></default-field></field>
+                        <field name="firstName"><default-field title="Name"><display/></default-field></field>
+                        <field name="email"><default-field><display/></default-field></field>
+                        <field name="mobile"><default-field><display/></default-field></field>
+                        <field name="sourceName"><default-field title="Source"><display/></default-field></field>
+                        <field name="error"><default-field title="Validation"><display text="${error ?: 'Ready'}"/></default-field></field>
+                    </form-list>
+                    <form-single name="CommitLeadCsv" transition="commitImport">
+                        <field name="confirmationDigest"><default-field><hidden default-value="${preview.digest}"/></default-field></field>
+                        <field name="submitButton"><default-field title="Import valid rows"><submit/></default-field></field>
+                    </form-single>
+                </box-body></container-box>
+            </widgets></section>
+            <section name="HasImportResult" condition="importResult"><widgets>
+                <container-box><box-header title="Import result"/><box-body>
+                    <label text="${importResult.imported} imported or already present · ${importResult.skipped} skipped" type="p"/>
+                    <section-iterate name="ImportErrors" list="importResult.errors" entry="rowError"><widgets><label text="${rowError}" type="p"/></widgets></section-iterate>
+                </box-body></container-box>
+            </widgets></section>
+        </widgets></section>
+    </widgets>
+</screen>
