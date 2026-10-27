@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
         xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
-        default-menu-title="Pipeline" default-menu-index="2">
+        default-menu-title="Pipeline" default-menu-index="3">
     <parameter name="period"/>
     <parameter name="ownerId"/>
     <parameter name="searchText"/>
@@ -16,6 +16,7 @@
         <default-response url="."/>
         <error-response url="."/>
     </transition>
+    <transition name="saveView"><service-call name="zenith.crm.CrmServices.save#CrmFilter"/><default-response url="."/><error-response url="."/></transition>
     <!-- ZE-SEC-JSON f/u: org-scoped party picker (stock SimpleScreens searchPartyList leaks cross-tenant). -->
     <transition-include name="searchPartyList" location="component://zenith-erp-base/screen/include/PartyPicker.xml"/>
 
@@ -31,11 +32,29 @@
         </entity-find>
         <entity-find entity-name="mantle.sales.opportunity.SalesOpportunityStage" list="stages">
             <order-by field-name="sequenceNum"/></entity-find>
-        <set field="openStages" from="stages.findAll { !['SoClosedWon','SoClosedLost'].contains(it.opportunityStageId) }"/>
+        <entity-find entity-name="zenith.erp.crm.CrmStageSetting" list="stageSettings">
+            <econdition field-name="organizationPartyId" from="(crmOrganization.activeOrgId ?: '_NA_') ?: '__NO_ORGANIZATION__'"/>
+        </entity-find>
+        <script><![CDATA[
+            def byId = stageSettings.collectEntries { [(it.opportunityStageId):it] }
+            stages = stages.collect { stage ->
+                def setting = byId[stage.opportunityStageId]
+                [opportunityStageId:stage.opportunityStageId,
+                 description:setting?.displayName ?: stage.description,
+                 sequenceNum:setting?.sequenceNum ?: stage.sequenceNum,
+                 isActive:setting?.isActive ?: 'Y']
+            }.sort { it.sequenceNum ?: 0 }
+            openStages = stages.findAll { !['SoClosedWon','SoClosedLost'].contains(it.opportunityStageId) && it.isActive == 'Y' }
+        ]]></script>
         <entity-find entity-name="zenith.erp.crm.CrmActivity" list="opportunityActivities">
             <econdition field-name="organizationPartyId" from="(crmOrganization.activeOrgId ?: '_NA_') ?: '__NO_ORGANIZATION__'"/>
             <econdition field-name="statusId" value="Scheduled"/>
             <order-by field-name="dueDate"/>
+        </entity-find>
+        <entity-find entity-name="zenith.erp.crm.CrmSavedFilter" list="savedFilters">
+            <econdition field-name="organizationPartyId" from="(crmOrganization.activeOrgId ?: '_NA_') ?: '__NO_ORGANIZATION__'"/>
+            <econdition field-name="userId" from="ec.user.userId"/><econdition field-name="screenName" value="Pipeline"/>
+            <order-by field-name="filterName"/>
         </entity-find>
 
         <!-- Pipeline summary by stage -->
@@ -78,7 +97,7 @@
             wonValue = wonRows.sum { it.estimatedAmount ?: 0G } ?: 0G
             boardStages = stages.findAll { !['SoClosedWon', 'SoClosedLost'].contains(it.opportunityStageId) }.collect { stage ->
                 def deals = openRows.findAll { it.opportunityStageId == stage.opportunityStageId }
-                [name:stage.description, deals:deals, count:deals.size(), value:(deals.sum { it.estimatedAmount ?: 0G } ?: 0G)]
+                [id:stage.opportunityStageId, name:stage.description, deals:deals, count:deals.size(), value:(deals.sum { it.estimatedAmount ?: 0G } ?: 0G)]
             }
             nextActivityByOpportunity = [:]
             opportunityActivities.each { activity ->
@@ -122,6 +141,17 @@
                 <field-layout><field-row><field-ref name="period"/><field-ref name="ownerId"/><field-ref name="searchText"/><field-ref name="submitButton"/><field-ref name="resetButton"/></field-row></field-layout>
             </form-single>
         </container>
+        <container style="zcrm-period zcrm-saved-views">
+            <section-iterate name="PipelineSavedViews" list="savedFilters" entry="saved"><widgets><link url="." text="${saved.filterName}" parameter-map="new groovy.json.JsonSlurper().parseText(saved.filterJson)"/></widgets></section-iterate>
+            <section name="SavePipelineView" condition="modCanWrite"><widgets><form-single name="SavePipelineFilter" transition="saveView">
+                <field name="screenName"><default-field><hidden default-value="Pipeline"/></default-field></field>
+                <field name="period"><default-field><hidden default-value="${period}"/></default-field></field>
+                <field name="ownerId"><default-field><hidden default-value="${ownerId ?: ''}"/></default-field></field>
+                <field name="searchText"><default-field><hidden default-value="${searchText ?: ''}"/></default-field></field>
+                <field name="filterName"><default-field title="Save current view as"><text-line size="20"/></default-field></field>
+                <field name="submitButton"><default-field title="Save view"><submit/></default-field></field>
+            </form-single></widgets></section>
+        </container>
         <container style="zcrm-metrics zcrm-reference-metrics">
             <container style="zcrm-metric"><label text="Open Pipeline" type="span"/><label text="${currSymbol}${zinr.inr(ec.l10n.format(openValue, '#,##,##0'))}" type="h4"/><label text="${openCount} deals" type="span" style="zcrm-muted"/></container>
             <container style="zcrm-metric"><label text="Weighted Value" type="span"/><label text="${currSymbol}${zinr.inr(ec.l10n.format(weightedValue, '#,##,##0'))}" type="h4"/><label text="Expected revenue" type="span" style="zcrm-muted"/></container>
@@ -130,11 +160,11 @@
         </container>
         <container style="zcrm-board" id="pipeline-board">
             <section-iterate name="crmPipelineStages" list="boardStages" entry="column"><widgets>
-                <container style="zcrm-board-column">
+                <container style="zcrm-board-column" id="crm-stage-${column.id}">
                     <container style="zcrm-board-stage-head"><label text="${column.name}" type="h4"/><label text="${column.count} deals · ${currSymbol}${zinr.inr(ec.l10n.format(column.value, '#,##,##0'))}" type="span"/></container>
                     <section name="EmptyStage" condition="column.deals.isEmpty()"><widgets><label text="No opportunities in this stage" type="p" style="zcrm-board-empty"/></widgets></section>
                     <section-iterate name="crmStageDeals" list="column.deals" entry="deal"><widgets>
-                        <container style="zcrm-deal-card">
+                        <container style="zcrm-deal-card" id="crm-deal-${deal.salesOpportunityId}">
                             <link url="../EditOpportunity" text="${deal.opportunityName}" parameter-map="[salesOpportunityId:deal.salesOpportunityId]"/>
                             <label text="${deal.accountName ?: 'No account'}" type="span" style="zcrm-muted"/>
                             <label text="${currSymbol}${zinr.inr(ec.l10n.format(deal.estimatedAmount ?: 0, '#,##,##0'))}" type="strong" style="zcrm-deal-amount"/>
@@ -147,6 +177,13 @@
                 </container>
             </widgets></section-iterate>
         </container>
+        <section name="DragStageWrite" condition="modCanWrite"><widgets><container style="zcrm-drag-form">
+            <form-single name="DragStageForm" transition="advanceStage">
+                <field name="salesOpportunityId"><default-field><hidden/></default-field></field>
+                <field name="opportunityStageId"><default-field><hidden/></default-field></field>
+                <field name="submitButton"><default-field><submit/></default-field></field>
+            </form-single>
+        </container></widgets></section>
 
         <!-- Opportunities List -->
         <container-box><box-header title="Manage opportunities"/><box-body>

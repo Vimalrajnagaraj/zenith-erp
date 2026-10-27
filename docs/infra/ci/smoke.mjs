@@ -39,6 +39,10 @@ const PATHS = [
   '/apps/zenith/Crm/Activities',
   '/apps/zenith/Crm/Activities?period=all',
   '/apps/zenith/Crm/Segments',
+  '/apps/zenith/Crm/Contacts',
+  '/apps/zenith/Crm/SourcesCampaigns',
+  '/apps/zenith/Crm/Reports',
+  '/apps/zenith/Crm/ImportLeads',
   '/apps/zenith/Dashboard',
   '/apps/zenith/Inventory/InventoryDashboard',
   '/apps/zenith/Inventory/InventoryDashboard?dateMode=all',
@@ -56,6 +60,10 @@ const PATHS = [
   '/qapps/zenith/Crm/Activities',
   '/qapps/zenith/Crm/Activities?period=all',
   '/qapps/zenith/Crm/Segments',
+  '/qapps/zenith/Crm/Contacts',
+  '/qapps/zenith/Crm/SourcesCampaigns',
+  '/qapps/zenith/Crm/Reports',
+  '/qapps/zenith/Crm/ImportLeads',
   '/qapps/zenith/Inventory/InventoryDashboard',
   '/qapps/zenith/Inventory/InventoryDashboard?dateMode=all',
   '/qapps/zenith/Inventory/DashboardDetails?listType=movements',
@@ -172,7 +180,7 @@ try {
   // every dashboard widget. These checks use the same synthetic staging tenant.
   for (const surface of ['apps', 'qapps']) {
     await page.setViewport({ width: 390, height: 844 });
-    for (const screen of ['Dashboard', 'Leads', 'Pipeline', 'Activities', 'Segments']) {
+    for (const screen of ['Dashboard', 'Leads', 'Pipeline', 'Activities', 'Segments', 'Contacts', 'SourcesCampaigns', 'Reports', 'ImportLeads']) {
       const path = `/${surface}/zenith/Crm/${screen}`;
       try {
         await page.goto(BASE + path, { waitUntil: 'networkidle2', timeout: 60000 });
@@ -271,5 +279,6 @@ try {
   await browser.close();
 }
 
-console.log(`\n${failures === 0 ? 'SMOKE OK' : 'SMOKE FAILED'} — ${PATHS.length + 10 - failures}/${PATHS.length + 10} render and interaction checks passed.`);
+const interactionChecks = 2 * (9 + 1);
+console.log(`\n${failures === 0 ? 'SMOKE OK' : 'SMOKE FAILED'} — ${PATHS.length + interactionChecks - failures}/${PATHS.length + interactionChecks} render and interaction checks passed.`);
 process.exit(failures === 0 ? 0 : 1);

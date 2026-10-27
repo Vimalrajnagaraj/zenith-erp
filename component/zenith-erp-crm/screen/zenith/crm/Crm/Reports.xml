@@ -1,16 +1,22 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
         xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
-        default-menu-title="Reports" default-menu-index="7">
+        default-menu-title="Reports" default-menu-index="8">
     <parameter name="period"/><parameter name="sourceId"/><parameter name="campaignId"/>
+    <transition name="saveView"><service-call name="zenith.crm.CrmServices.save#CrmFilter"/><default-response url="."/><error-response url="."/></transition>
     <actions>
         <set field="activeOrg" from="(crmOrganization.activeOrgId ?: '_NA_') ?: '__NO_ORGANIZATION__'"/>
         <entity-find entity-name="zenith.erp.crm.Lead" list="allLeads"><econdition field-name="organizationPartyId" from="activeOrg"/></entity-find>
         <entity-find entity-name="mantle.sales.opportunity.SalesOpportunity" list="allOpportunities"><econdition field-name="organizationPartyId" from="activeOrg"/></entity-find>
         <entity-find entity-name="zenith.erp.crm.CrmActivity" list="allActivities"><econdition field-name="organizationPartyId" from="activeOrg"/></entity-find>
         <entity-find entity-name="zenith.erp.crm.LeadSource" list="sourceCatalogue"><order-by field-name="description"/></entity-find>
+        <set field="sourceCatalogue" from="sourceCatalogue.findAll { !it.organizationPartyId || it.organizationPartyId == activeOrg }"/>
         <entity-find entity-name="zenith.erp.crm.CrmCampaign" list="campaigns"><econdition field-name="organizationPartyId" from="activeOrg"/></entity-find>
         <entity-find entity-name="mantle.sales.opportunity.SalesOpportunityStage" list="stages"><order-by field-name="sequenceNum"/></entity-find>
+        <entity-find entity-name="zenith.erp.crm.CrmSavedFilter" list="savedFilters">
+            <econdition field-name="organizationPartyId" from="activeOrg"/><econdition field-name="userId" from="ec.user.userId"/>
+            <econdition field-name="screenName" value="Reports"/><order-by field-name="filterName"/>
+        </entity-find>
         <script><![CDATA[
             period = period == 'month' ? 'month' : 'all'
             def today = java.time.LocalDate.parse(new java.text.SimpleDateFormat('yyyy-MM-dd').format(ec.user.nowTimestamp))
@@ -21,13 +27,13 @@
             campaignId = campaigns.any { it.campaignId == campaignId } ? campaignId : ''
             filteredLeads = allLeads.findAll { within(it.createdDate) && (!sourceId || (it.firstTouchSourceId ?: it.leadSourceId ?: 'Unknown') == sourceId) && (!campaignId || it.campaignId == campaignId) }
             def selectedIds = filteredLeads*.leadId as Set
-            filteredOpps = allOpportunities.findAll { (!sourceId || (it.leadSourceId ?: 'Unknown') == sourceId) && (!campaignId || it.campaignId == campaignId) && (period == 'all' || selectedIds.contains(it.leadId)) }
+            filteredOpps = allOpportunities.findAll { (!sourceId || (it.leadSourceId ?: 'Unknown') == sourceId) && (!campaignId || it.campaignId == campaignId) }
             filteredActivities = allActivities.findAll { within(it.dueDate ?: it.activityDate) }
             def sourceNames = sourceCatalogue.collectEntries { [(it.leadSourceId):it.description] }
             def sourceKeys = filteredLeads.collect { it.firstTouchSourceId ?: it.leadSourceId ?: 'Unknown' }.unique().sort()
             sourceRows = sourceKeys.collect { key ->
                 def leads = filteredLeads.findAll { (it.firstTouchSourceId ?: it.leadSourceId ?: 'Unknown') == key }
-                def opps = filteredOpps.findAll { (it.leadSourceId ?: 'Unknown') == key }
+                def opps = filteredOpps.findAll { (it.leadSourceId ?: 'Unknown') == key && (period == 'all' || selectedIds.contains(it.leadId)) }
                 def won = opps.findAll { it.opportunityStageId == 'SoClosedWon' && within(it.wonDate) }
                 def qualified = leads.count { it.statusId in ['LeadQualified','LeadConverted'] }
                 [sourceId:key, sourceName:sourceNames[key] ?: key, leads:leads.size(),
@@ -37,7 +43,9 @@
             latestRows = filteredLeads.groupBy { it.latestTouchSourceId ?: it.leadSourceId ?: 'Unknown' }
                 .collect { key, rows -> [sourceName:sourceNames[key] ?: key, leads:rows.size()] }
                 .sort { it.sourceName }
-            openOpps = filteredOpps.findAll { !['SoClosedWon','SoClosedLost'].contains(it.opportunityStageId) }
+            openOpps = filteredOpps.findAll { !['SoClosedWon','SoClosedLost'].contains(it.opportunityStageId) &&
+                (period == 'all' || (it.estimatedCloseDate && it.estimatedCloseDate >= java.sql.Date.valueOf(today.withDayOfMonth(1)) &&
+                    it.estimatedCloseDate < java.sql.Date.valueOf(today.withDayOfMonth(1).plusMonths(1)))) }
             forecastRows = stages.findAll { stage -> openOpps.any { it.opportunityStageId == stage.opportunityStageId } }
                 .collect { stage ->
                     def rows = openOpps.findAll { it.opportunityStageId == stage.opportunityStageId }
@@ -67,6 +75,17 @@
             <field name="submitButton"><default-field title="Apply"><submit/></default-field></field>
             <field name="resetButton"><default-field title="Reset"><link url="." text="Reset"/></default-field></field>
         </form-single></container>
+        <container style="zcrm-period zcrm-saved-views">
+            <section-iterate name="ReportSavedViews" list="savedFilters" entry="saved"><widgets><link url="." text="${saved.filterName}" parameter-map="new groovy.json.JsonSlurper().parseText(saved.filterJson)"/></widgets></section-iterate>
+            <section name="SaveReportView" condition="modCanWrite"><widgets><form-single name="SaveReportFilter" transition="saveView">
+                <field name="screenName"><default-field><hidden default-value="Reports"/></default-field></field>
+                <field name="period"><default-field><hidden default-value="${period}"/></default-field></field>
+                <field name="sourceId"><default-field><hidden default-value="${sourceId ?: ''}"/></default-field></field>
+                <field name="campaignId"><default-field><hidden default-value="${campaignId ?: ''}"/></default-field></field>
+                <field name="filterName"><default-field title="Save current view as"><text-line size="20"/></default-field></field>
+                <field name="submitButton"><default-field title="Save view"><submit/></default-field></field>
+            </form-single></widgets></section>
+        </container>
         <container style="zcrm-metrics zcrm-reference-metrics">
             <container style="zcrm-metric"><label text="Leads" type="span"/><label text="${filteredLeads.size()}" type="h4"/></container>
             <container style="zcrm-metric"><label text="Open pipeline" type="span"/><label text="${currSymbol}${zinr.inr(ec.l10n.format(openOpps.sum { it.estimatedAmount ?: 0G } ?: 0G, '#,##,##0'))}" type="h4"/></container>
@@ -76,7 +95,7 @@
         <container-box><box-header title="Original source performance"/><box-body>
             <section name="NoSources" condition="sourceRows.isEmpty()"><widgets><label text="No leads match the selected filters." type="p"/></widgets></section>
             <form-list name="SourceReport" list="sourceRows" skip-form="true" show-csv-button="true">
-                <field name="sourceName"><default-field title="Source"><link url="../Leads" text="${sourceName}" parameter-map="[leadSourceId:sourceId]"/></default-field></field>
+                <field name="sourceName"><default-field title="Source"><link url="../Leads" text="${sourceName}" parameter-map="[leadSourceId:sourceId, campaignId:campaignId, period:period]"/></default-field></field>
                 <field name="leads"><default-field title="Leads"><display/></default-field></field>
                 <field name="qualified"><default-field title="Qualified"><display/></default-field></field>
                 <field name="qualifiedPercent"><default-field title="Qualified %"><display/></default-field></field>
