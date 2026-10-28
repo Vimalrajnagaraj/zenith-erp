@@ -41,6 +41,8 @@
             link.node.hidden = settings.hidden.indexOf(link.id) >= 0;
             current.strip.appendChild(link.node);
         });
+        var selected = current.strip.querySelector(current.selector + '.on');
+        if (selected) selected.scrollIntoView({ block:'nearest', inline:'nearest' });
     }
     function findBar() {
         var ssr = document.getElementById('z-subnav');
