@@ -18,14 +18,36 @@
                 def org = txn.organizationPartyId
 
                 // ZE-SHOP: resolve the shop (retail-store facility) this bill belongs to via session -> terminal ->
-                // facility, so per-shop Sales/AR reporting works. Every hop null-safe + cached; null => unattributed
-                // (behaviour identical to before this change — no amount/tax/number is touched).
+                // facility, so per-shop Sales/AR reporting works. Do not allow a mismatched terminal, session
+                // or facility to silently issue an invoice under another organization's legal name.
                 def _shopFac = null
-                try {
-                    def _sess = txn.sessionId ? ec.entity.find("zenith.erp.pos.PosSession").condition("sessionId", txn.sessionId).useCache(true).one() : null
-                    def _term = _sess?.terminalId ? ec.entity.find("zenith.erp.pos.PosTerminal").condition("terminalId", _sess.terminalId).useCache(true).one() : null
-                    _shopFac = _term?.facilityId
-                } catch (Exception _fe) { _shopFac = null }
+                def _sess = txn.sessionId ? ec.entity.find("zenith.erp.pos.PosSession").condition("sessionId", txn.sessionId).useCache(true).one() : null
+                def _term = _sess?.terminalId ? ec.entity.find("zenith.erp.pos.PosTerminal").condition("terminalId", _sess.terminalId).useCache(true).one() : null
+                if (_sess && _term && (_sess.organizationPartyId != org || _term.organizationPartyId != org))
+                    throw new IllegalStateException('POS session, terminal and invoice seller belong to different organizations.')
+                _shopFac = _term?.facilityId
+                def _facility = null
+                if (_shopFac) {
+                    _facility = ec.entity.find('mantle.facility.Facility').condition('facilityId', _shopFac).one()
+                    if (!_facility || _facility.ownerPartyId != org)
+                        throw new IllegalStateException('POS facility does not belong to the invoice seller organization.')
+                }
+                // A shop may have its own GST registration, but it must belong to the legal seller.
+                if (_term) {
+                    def _gstins = [_facility?.facilityGstin, _term.gstin]
+                        .collect { it?.trim()?.toUpperCase() }.findAll { it }
+                    if (_gstins) {
+                        def _registered = ec.entity.find('zenith.erp.tax.TaxRegistration').condition('partyId', org).list()
+                            .collect { it.registrationNumber?.trim()?.toUpperCase() }.findAll { it }
+                        _registered.addAll(ec.entity.find('zenith.erp.india.IndiaGstin').condition('partyId', org).list()
+                            .collect { it.gstin?.trim()?.toUpperCase() }.findAll { it })
+                        def _gstConfig = ec.entity.find('zenith.erp.india.IndiaGstConfig')
+                            .condition('organizationPartyId', org).one()
+                        if (_gstConfig?.gstin) _registered.add(_gstConfig.gstin.trim().toUpperCase())
+                        if (!_registered.containsAll(_gstins))
+                            throw new IllegalStateException('The terminal or facility GSTIN is not registered to the invoice seller. Select the correct organization and terminal before billing.')
+                    }
+                }
 
                 // Resolve customer: real customer, else a per-org Walk-in Customer party (B2C cash sale)
                 def toParty = txn.customerPartyId

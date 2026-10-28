@@ -85,6 +85,13 @@ log "building from $REF @ $SHA"
 rm -rf "$CTX"; mkdir -p "$CTX/zenith-erp"
 cp "$DEPLOY/Dockerfile" "$DEPLOY/MoquiDevConf.xml" "$CTX/"
 cp -r "$DEPLOY/framework-patches" "$DEPLOY/zenith-classes" "$CTX/"
+git -C "$CACHE" archive "$REF" docs/infra/zenith-libs | tar -x -C "$CTX"
+mv "$CTX/docs/infra/zenith-libs" "$CTX/zenith-libs"
+rm -rf "$CTX/docs"
+# Hosts may still have the previous Dockerfile; include the QR library in this candidate image.
+if ! grep -q 'zenith-libs/' "$CTX/Dockerfile"; then
+  printf '\nCOPY ./zenith-libs/ /opt/moqui/WEB-INF/lib/\n' >> "$CTX/Dockerfile"
+fi
 install -m 600 "$DEPLOY/qz-private-key.pem" "$CTX/qz-private-key.pem"   # transient; trap shreds $CTX
 # app tree straight from git; ship ONLY zenith-erp-* (ignore any stray top-level component dirs)
 git -C "$CACHE" archive "$REF" component | tar -x -C "$CTX"

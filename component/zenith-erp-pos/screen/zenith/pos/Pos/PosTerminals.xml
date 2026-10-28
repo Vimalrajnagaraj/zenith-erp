@@ -16,14 +16,28 @@
         </actions>
         <default-response url="."/>
     </transition>
-    <transition name="updateTerminal" begin-transaction="true">
+    <transition name="updateTerminal" method="post" begin-transaction="true">
         <actions>
-            <!-- ZE-POS-TERM-VIS: don't let an edit blank/re-point the org (would make the terminal vanish or
-                 cross-tenant). Re-stamp the caller's org for tenant users. -->
-            <set field="_ao" from="ec.user.getPreference('ACTIVE_ORGANIZATION')"/>
-            <if condition="_ao &amp;&amp; _ao != '_NA_' &amp;&amp; !ec.user.isInGroup('ADMIN')">
-                <set field="organizationPartyId" from="_ao"/>
+            <service-call name="zenith.base.SecurityServices.check#ModuleWriteAccess" in-map="[moduleId:'pos']" out-map="_writeAccess"/>
+            <if condition="_writeAccess.canWrite != true"><return error="true" message="POS write access is required to edit a terminal."/></if>
+            <entity-find-one entity-name="zenith.erp.pos.PosTerminal" value-field="_existingTerminal">
+                <field-map field-name="terminalId" from="terminalId"/>
+            </entity-find-one>
+            <if condition="!_existingTerminal || _existingTerminal.organizationPartyId != posOrganizationPartyId">
+                <return error="true" message="This terminal does not belong to your active organization."/>
             </if>
+            <!-- A terminal's legal seller cannot be changed by editing its facility, even for an admin. -->
+            <if condition="organizationPartyId &amp;&amp; organizationPartyId != posOrganizationPartyId">
+                <return error="true" message="Switch to the correct organization before editing a terminal."/>
+            </if>
+            <if condition="_existingTerminal.facilityId != facilityId">
+                <entity-find entity-name="zenith.erp.pos.PosSession" list="_openTerminalSessions" limit="1">
+                    <econdition field-name="terminalId" from="terminalId"/>
+                    <econdition field-name="statusId" value="PsOpen"/>
+                </entity-find>
+                <if condition="_openTerminalSessions"><return error="true" message="Close the POS session before changing this terminal's facility."/></if>
+            </if>
+            <set field="organizationPartyId" from="posOrganizationPartyId"/>
             <service-call name="update#zenith.erp.pos.PosTerminal" in-map="context"/>
         </actions>
         <default-response url="."/>
@@ -42,6 +56,9 @@
             <econdition field-name="ownerPartyId" from="(hasActiveOrg ? activeOrgId : null) ?: '__NO_ORGANIZATION__'"/>
             <order-by field-name="facilityName"/>
         </entity-find>
+        <entity-find-one entity-name="mantle.party.PartyDetail" value-field="invoiceSeller">
+            <field-map field-name="partyId" from="activeOrgId"/>
+        </entity-find-one>
         <script><![CDATA[
             totalTerminals = terminalList.size()
             activeTerminals = terminalList.count { it.isActive == 'Y' }
@@ -62,6 +79,7 @@
                 <container style="column">
                     <label text="POS Terminals" type="h3" style="text-primary text-weight-bold q-my-none"/>
                     <label text="Manage and configure all POS terminals in your outlet" type="p" style="text-grey-7 q-mt-sm q-mb-none"/>
+                    <label text="Invoice seller: ${invoiceSeller?.organizationName ?: activeOrgId ?: 'No organization selected'}. A facility selection does not change the legal seller or GSTIN." type="p" style="text-grey-7 q-mt-xs q-mb-none"/>
                 </container>
                 <section name="CreateTerminal_write"><condition><expression>modCanWrite &amp;&amp; hasActiveOrg</expression></condition><widgets>
                 <container style="pos-terminals-reference__actions">
