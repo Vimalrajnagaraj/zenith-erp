@@ -29,6 +29,13 @@ deployment claim. Never reuse a database containing customer records.
 
 ## Regressions covered
 
+- History add-item search uses a disposable catalog with more than 520 products,
+  including late Water Cup/Tea Cup matches, mixed case, codes and literal `%`/`_`.
+  Both endpoints retain tenant scope; cancelling the editor leaves the issued test
+  bill unchanged. The same check covers stale fullscreen flags, a denied fullscreen
+  request, native exit, scrolling Close Session at short/mobile heights, and tax
+  on/off receipt output. Set `POS_QA_FOCUS=history-window` to run this focused group
+  on a fresh disposable runtime. `check-receipt-layout.cjs` also runs without a server.
 - Assert an opened session actually committed to its authorized org/terminal before
   creating a cart. Session creation no longer calls speculative pricing/tax
   calculations or clears their errors: a failed optional warmup could roll back

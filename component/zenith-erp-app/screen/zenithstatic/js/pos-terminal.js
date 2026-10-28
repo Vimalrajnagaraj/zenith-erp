@@ -618,10 +618,10 @@ window._posOffline = (function() {
             var s = d.store || {}, bi = d.bill || {}, sm = d.summary || {};
             function f2(n) { return Number(n||0).toFixed(2); }
             var h = '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Revised Receipt</title><style>'
-                + '@page{size:80mm auto;margin:0}body{margin:0;padding:0;font-family:Arial,Helvetica,sans-serif;font-size:12px;color:#000}'
+                + '@page{size:80mm auto;margin:0}body{margin:0;padding:0;font-family:Arial,Helvetica,sans-serif;font-size:12px;font-weight:600;color:#000}'
                 + '.rcpt{width:72mm;margin:0 auto;padding:2mm 3mm;box-sizing:border-box}'
                 + '.c{text-align:center}.r{text-align:right}.b{font-weight:bold}.sep{border-bottom:1px dashed #000;margin:4px 0}.sep2{border-bottom:2px solid #000;margin:4px 0}'
-                + 'table{width:100%;border-collapse:collapse}th,td{padding:2px 1px;font-size:11px}th{border-bottom:1px solid #000}.hdr{font-size:8px;color:#666}.tot{font-size:15px;font-weight:bold}</style></head><body><div class="rcpt">';
+                + 'table{width:100%;border-collapse:collapse}th,td{padding:2px 1px;font-size:11px}th{border-bottom:1px solid #000}.hdr{font-size:10px;color:#000}.tot{font-size:15px;font-weight:bold}</style></head><body><div class="rcpt">';
             h += '<div class="c b" style="font-size:16px;margin:2px 0">' + (s.name || 'Store') + '</div>';
             if (s.address) h += '<div class="c hdr">' + s.address + '</div>';
             if (isTax && s.taxReg) h += '<div class="c hdr">GSTIN: ' + s.taxReg + '</div>';
@@ -635,11 +635,11 @@ window._posOffline = (function() {
             h += '<div class="sep2"></div>';
             h += '<table><thead><tr><th style="width:16px">#</th><th style="text-align:left">Item</th><th class="c">Qty</th><th class="r">Rate</th><th class="r">Total</th></tr></thead><tbody>';
             (d.items || []).forEach(function(it, i) {
-                var hnm = (it.name||'') + (it.mode && it.mode !== 'Retail' ? ' <span style="font-size:8px;color:#555">['+it.mode+']</span>' : '');
-                h += '<tr><td class="c">' + (i+1) + '</td><td>' + hnm + '</td><td class="c">' + (it.qty + (it.uom ? ' ' + it.uom : '')) + '</td><td class="r">' + f2(it.rate) + '</td><td class="r">' + f2(it.total) + '</td></tr>';
+                var hnm = (it.name||'') + (it.mode && it.mode !== 'Retail' ? ' <span style="font-size:10px;color:#000">['+it.mode+']</span>' : '');
+                h += '<tr><td class="c">' + (i+1) + '</td><td>' + hnm + '</td><td class="c" style="white-space:nowrap">' + (it.qty + (it.uom ? ' ' + it.uom : '')) + '</td><td class="r">' + f2(it.rate) + '</td><td class="r">' + f2(it.total) + '</td></tr>';
             });
             h += '</tbody></table><div class="sep"></div>';
-            h += '<table><tr><td>Taxable (after discount)</td><td class="r">' + f2(sm.subtotal) + '</td></tr>';
+            h += '<table><tr><td>Subtotal</td><td class="r">' + f2(sm.subtotal) + '</td></tr>';
             if (isTax && Number(sm.tax||0) > 0) h += '<tr><td>Tax</td><td class="r">' + f2(sm.tax) + '</td></tr>';
             h += '</table><div class="sep2"></div>';
             h += '<table><tr><td class="tot">' + (isTax ? 'GRAND TOTAL' : 'TOTAL') + '</td><td class="r tot">' + f2(sm.total) + '</td></tr></table>';
@@ -649,7 +649,7 @@ window._posOffline = (function() {
                 h += '<table><tr><td class="b">Amount Due</td><td class="r b">' + f2(d.outstanding) + '</td></tr></table>';
             }
             h += '<div class="c b" style="font-size:13px;margin-top:6px">Thank You !!</div>';
-            h += '<div class="c" style="margin-top:6px;font-size:7px;color:#666">Powered by ZetaERP &middot; visit www.zetaclantech.com</div>';
+            h += '<div class="c" style="margin-top:6px;font-size:7px;color:#000">Powered by ZetaERP &middot; visit www.zetaclantech.com</div>';
             h += '</div>';
             return h;
         }
@@ -1627,8 +1627,6 @@ window._posOffline = (function() {
     }, 700);
 })();
 
-/* === Fullscreen Toggle === */
-window._pfs = window._pfs || {saved: [], active: false};
 window.posPayCash = function(form) {
     if (form.dataset.posPaymentConfirmed === '1') return true;
     // Cash tender modal: quick denomination buttons + editable amount + live change.
@@ -2115,61 +2113,8 @@ window.posPayDigital = function(form) {
 })();
 
 window.posToggleFullscreen = function() {
-    var root = document.getElementById('pos-terminal-root');
-    if (!root) return;
-    var pfs = window._pfs;
-    if (pfs.active) {
-        pfs.active = false;
-        root.style.cssText = '';
-        var ml = root.querySelector('.pos-main-layout');
-        if (ml) ml.style.height = '';
-        document.body.style.overflow = '';
-        for (var i = pfs.saved.length - 1; i >= 0; i--) pfs.saved[i].el.style.cssText = pfs.saved[i].css;
-        pfs.saved = [];
-        try { sessionStorage.removeItem('posFS'); } catch(e) {}
-        var ic = document.getElementById('fsBtnIcon');
-        if (ic) ic.textContent = '⛶';
-    } else {
-        pfs.active = true; pfs.saved = [];
-        var el = root.parentNode;
-        while (el && el !== document) {
-            if (el.style) {
-                pfs.saved.push({el: el, css: el.style.cssText});
-                if (el !== document.body && el !== document.documentElement) {
-                    el.style.padding = '0'; el.style.margin = '0'; el.style.maxWidth = 'none';
-                    el.style.width = '100%'; el.style.height = '100%'; el.style.border = 'none'; el.style.overflow = 'visible';
-                }
-            }
-            if (el.parentNode && el.parentNode.children) {
-                for (var i = 0; i < el.parentNode.children.length; i++) {
-                    var sib = el.parentNode.children[i];
-                    if (sib !== el && sib.tagName !== 'SCRIPT' && sib.tagName !== 'STYLE' && sib.tagName !== 'LINK') {
-                        pfs.saved.push({el: sib, css: sib.style.cssText}); sib.style.display = 'none';
-                    }
-                }
-            }
-            el = el.parentNode;
-        }
-        document.body.style.overflow = 'hidden';
-        // height:100dvh (dynamic viewport height) overrides 100vh where supported (Safari 15.4+)
-        // so the fullscreen terminal isn't clipped by the iOS Safari URL bar; falls back to 100vh
-        // on older browsers (the invalid dvh declaration is simply dropped).
-        root.style.cssText = 'position:fixed;top:0;left:0;width:100vw;height:100vh;height:100dvh;z-index:999999;background:#fff';
-        var ml = root.querySelector('.pos-main-layout');
-        if (ml) { ml.style.height = 'calc(100vh - 52px)'; ml.style.height = 'calc(100dvh - 52px)'; }
-        window.scrollTo(0, 0);
-        try { sessionStorage.setItem('posFS', '1'); } catch(e) {}
-        var ic = document.getElementById('fsBtnIcon');
-        if (ic) ic.textContent = '✖';
-    }
+    if (window.posToggleFocus) return window.posToggleFocus();
 };
-(function() {
-    try { if (sessionStorage.getItem('posFS') === '1') setTimeout(window.posToggleFullscreen, 100); } catch(e) {}
-    document.addEventListener('keydown', function(e) {
-        if (e.key === 'F11') { e.preventDefault(); window.posToggleFullscreen(); }
-        if (e.key === 'Escape' && window._pfs && window._pfs.active) window.posToggleFullscreen();
-    });
-})();
 
 /* === Core AJAX Engine === */
 (function() {
@@ -2740,7 +2685,7 @@ window.posToggleFullscreen = function() {
             var html = '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Receipt</title>'
                 + '<style>'
                 + '@page{size:80mm auto;margin:0}'
-                + 'body{margin:0;padding:0;font-family:Arial,Helvetica,sans-serif;font-size:12px;color:#000}'
+                + 'body{margin:0;padding:0;font-family:Arial,Helvetica,sans-serif;font-size:12px;font-weight:600;color:#000}'
                 + '.rcpt{width:72mm;margin:0 auto;padding:2mm 3mm;box-sizing:border-box}'
                 + '.c{text-align:center} .r{text-align:right} .b{font-weight:bold}'
                 + '.sep{border-bottom:1px dashed #000;margin:4px 0}'
@@ -2748,7 +2693,7 @@ window.posToggleFullscreen = function() {
                 + 'table{width:100%;border-collapse:collapse}'
                 + 'th,td{padding:2px 1px;font-size:11px}'
                 + 'th{border-bottom:1px solid #000}'
-                + '.hdr{font-size:8px;color:#666}'
+                + '.hdr{font-size:10px;color:#000}'
                 + '.tot{font-size:15px;font-weight:bold}'
                 + '@media print{body{margin:0;padding:0}}'
                 + '</style></head><body><div class="rcpt">';
@@ -2777,15 +2722,14 @@ window.posToggleFullscreen = function() {
             html += '<div class="sep2"></div>';
             html += '<table><thead><tr><th style="text-align:center;width:16px">#</th><th style="text-align:left">Item</th><th class="c">Qty</th><th class="r">Rate</th><th class="r">Total</th></tr></thead><tbody>';
             (d.items||[]).forEach(function(it, idx) {
-                var nm = (it.name||'') + (it.mode && it.mode !== 'Retail' ? ' <span style="font-size:8px;color:#555">['+it.mode+']</span>' : '');
-                html += '<tr><td class="c">' + (idx+1) + '</td><td>' + nm + '</td><td class="c">' + (it.qty + (it.uom ? ' ' + it.uom : '')) + '</td><td class="r">' + f2(it.rate) + '</td><td class="r">' + f2(it.total) + '</td></tr>';
-                if (Number(it.discount||0) > 0) html += '<tr><td colspan="5" style="font-size:9px;color:#666;padding-left:6px">' + (it.mode && it.mode !== 'Retail' ? it.mode + ' disc' : 'Disc') + ': -' + cs2 + f2(it.discount) + '</td></tr>';
+                var nm = (it.name||'') + (it.mode && it.mode !== 'Retail' ? ' <span style="font-size:10px;color:#000">['+it.mode+']</span>' : '');
+                html += '<tr><td class="c">' + (idx+1) + '</td><td>' + nm + '</td><td class="c" style="white-space:nowrap">' + (it.qty + (it.uom ? ' ' + it.uom : '')) + '</td><td class="r">' + f2(it.rate) + '</td><td class="r">' + f2(it.total) + '</td></tr>';
+                if (Number(it.discount||0) > 0) html += '<tr><td colspan="5" style="font-size:10px;color:#000;padding-left:6px">' + (it.mode && it.mode !== 'Retail' ? it.mode + ' disc' : 'Disc') + ': -' + cs2 + f2(it.discount) + '</td></tr>';
             });
             html += '</tbody></table>';
             html += '<div class="sep"></div>';
-            html += '<div style="font-size:10px;margin:2px 0">Total Qty: ' + sm2.totalQty + ' | Items: ' + sm2.itemCount + '</div>';
             html += '<table>';
-            html += '<tr><td>Taxable (after discount)</td><td class="r">' + cs2 + f2(sm2.subtotal) + '</td></tr>';
+            html += '<tr><td>Subtotal</td><td class="r">' + cs2 + f2(sm2.subtotal) + '</td></tr>';
             if (Number(sm2.discount||0) > 0) html += '<tr><td>Discount included</td><td class="r">' + cs2 + f2(sm2.discount) + '</td></tr>';
             if (isTax && Number(sm2.tax||0) > 0) {
                 var halfTax = Number(sm2.tax) / 2;
@@ -2796,10 +2740,9 @@ window.posToggleFullscreen = function() {
             html += '</table>';
             html += '<div class="sep2"></div>';
             html += '<table><tr><td class="tot">' + (isTax ? 'GRAND TOTAL' : 'TOTAL') + '</td><td class="r tot">' + cs2 + f2(sm2.total) + '</td></tr></table>';
-            if (isTax) html += '<div style="font-size:8px;color:#666;text-align:right;margin-top:1px">(Incl. of all taxes)</div>';
+            if (isTax) html += '<div style="font-size:10px;color:#000;text-align:right;margin-top:1px">(Incl. of all taxes)</div>';
             html += '<div class="sep2"></div>';
             html += '<table>';
-            (d.payments||[]).forEach(function(p) { html += '<tr><td>' + (p.method||'') + '</td><td class="r">' + cs2 + f2(p.amount) + '</td></tr>'; });
             if (Number(d.change||0) > 0) html += '<tr><td class="b">Change</td><td class="r b">' + cs2 + f2(d.change) + '</td></tr>';
             html += '</table>';
             if (d.isCredit) {
@@ -2813,7 +2756,7 @@ window.posToggleFullscreen = function() {
             }
             if (s.footerText) { html += '<div class="sep"></div><div class="c hdr" style="white-space:pre-line">' + String(s.footerText).replace(/\\r/g,'').replace(/\\n/g,'<br>').replace(/\n/g,'<br>') + '</div>'; }
             html += '<div class="c b" style="font-size:13px;margin-top:6px">Thank You !!</div>';
-            html += '<div class="c" style="margin-top:6px;font-size:7px;color:#666">Powered by ZetaERP &middot; visit www.zetaclantech.com</div>';
+            html += '<div class="c" style="margin-top:6px;font-size:7px;color:#000">Powered by ZetaERP &middot; visit www.zetaclantech.com</div>';
             html += '</div>';
             return html;
         }
@@ -3827,13 +3770,13 @@ window.posToggleFullscreen = function() {
                     if (!d || !d.success) { alert(d ? d.error : 'Failed to load session summary'); return; }
                     var ov = document.createElement('div');
                     ov.className = 'pos-close-overlay'; ov.id='posCloseSessionOverlay'; ov.setAttribute('role','dialog'); ov.setAttribute('aria-label','Close session');
-                    ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:99999;display:flex;align-items:center;justify-content:center';
+                    ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:99999;display:flex;align-items:center;justify-content:center;padding:12px;box-sizing:border-box';
                     var row = function(label, val, color) {
                         return '<div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #eee">'
                             + '<span style="color:#555;font-size:15px">'+label+'</span>'
                             + '<span style="font-weight:700;font-size:15px;color:'+(color||'#333')+'">'+CS+fmt2(val)+'</span></div>';
                     };
-                    var html = '<div style="background:#fff;border-radius:16px;padding:28px 32px;width:420px;max-width:90vw;box-shadow:0 12px 40px rgba(0,0,0,0.3)">'
+                    var html = '<div style="background:#fff;border-radius:16px;padding:28px 32px;width:484px;max-width:100%;max-height:calc(100vh - 24px);max-height:calc(100dvh - 24px);overflow-y:auto;overscroll-behavior:contain;box-sizing:border-box;box-shadow:0 12px 40px rgba(0,0,0,0.3)">'
                         + '<div style="text-align:center;font-size:22px;font-weight:800;color:#463D7A;margin-bottom:4px">Close Session</div>'
                         + '<div style="text-align:center;font-size:13px;color:#888;margin-bottom:18px">Session #'+SI+'</div>'
                         + '<div style="background:#f5f5f5;border-radius:10px;padding:14px 16px;margin-bottom:16px">'
