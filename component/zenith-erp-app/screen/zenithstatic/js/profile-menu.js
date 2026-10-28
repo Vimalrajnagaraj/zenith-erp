@@ -30,6 +30,10 @@
         if (cfg && cfg.getAttribute('data-tenant') === 'true') {
             addLink('My Subscription', '/vapps/zenith/my-subscription');
         }
+        if (cfg && cfg.getAttribute('data-is-admin') === 'true') {
+            var shell = location.pathname.indexOf('/qapps/') === 0 ? '/qapps' : '/apps';
+            addLink('Settings', shell + '/zenith/Settings/Users');
+        }
         addLink('Logout', '/Login/logout');
         document.body.appendChild(menu);
 
