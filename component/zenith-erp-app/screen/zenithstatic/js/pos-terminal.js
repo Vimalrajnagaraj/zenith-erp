@@ -519,6 +519,7 @@ window._posOffline = (function() {
             });
         }
     }
+    wire();
     setInterval(wire, 600);
 })();
 
