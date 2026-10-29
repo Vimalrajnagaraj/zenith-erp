@@ -16,6 +16,33 @@
             <if condition="!_openTerminal || _openTerminal.isActive != 'Y'"><return error="true" message="Choose an active POS terminal."/></if>
             <service-call name="zenith.pos.PosAccessServices.assert#PosAccess" out-map="_posAccess" in-map="[terminalId:terminalId]"/>
             <if condition="!_posAccess.allowed"><return/></if>
+            <set field="_sellerFacility" from="null"/>
+            <if condition="_openTerminal.facilityId">
+                <entity-find-one entity-name="mantle.facility.Facility" value-field="_sellerFacility">
+                    <field-map field-name="facilityId" from="_openTerminal.facilityId"/>
+                </entity-find-one>
+                <if condition="!_sellerFacility || _sellerFacility.ownerPartyId != _posAccess.organizationPartyId">
+                    <return error="true" message="The terminal facility belongs to a different legal seller. Select a terminal in the correct organization."/>
+                </if>
+            </if>
+            <script><![CDATA[
+                def gstins = [_sellerFacility?.facilityGstin, _openTerminal.gstin]
+                    .collect { it?.trim()?.toUpperCase() }.findAll { it }
+                if (gstins) {
+                    def registrations = ec.entity.find('zenith.erp.tax.TaxRegistration')
+                        .condition('partyId', _posAccess.organizationPartyId).list()
+                        .collect { it.registrationNumber?.trim()?.toUpperCase() }.findAll { it }
+                    registrations.addAll(ec.entity.find('zenith.erp.india.IndiaGstin')
+                        .condition('partyId', _posAccess.organizationPartyId).list()
+                        .collect { it.gstin?.trim()?.toUpperCase() }.findAll { it })
+                    def gstConfig = ec.entity.find('zenith.erp.india.IndiaGstConfig')
+                        .condition('organizationPartyId', _posAccess.organizationPartyId).one()
+                    if (gstConfig?.gstin) registrations.add(gstConfig.gstin.trim().toUpperCase())
+                    if (!registrations.containsAll(gstins))
+                        ec.message.addError('The terminal or facility GSTIN does not belong to this invoice seller. Switch to the correct organization and terminal before billing.')
+                }
+            ]]></script>
+            <if condition="ec.message.hasError()"><return/></if>
             <service-call name="zenith.pos.PosIdleServices.ensure#PosIdleJob"/>
             <if condition="ec.message.hasError()"><return/></if>
             <entity-find-one entity-name="zenith.erp.pos.PosOrgBillingConfig" value-field="_idlePolicy">
@@ -362,6 +389,13 @@
             <if condition="session.statusId != 'PsOpen'">
                 <return error="true" message="Session is not open"/></if>
 
+            <entity-find-one entity-name="zenith.erp.pos.PosTerminal" value-field="terminal">
+                <field-map field-name="terminalId" from="session.terminalId"/>
+            </entity-find-one>
+            <if condition="!terminal || terminal.organizationPartyId != session.organizationPartyId">
+                <return error="true" message="The terminal's legal seller changed after this session opened. Close the session and open a terminal in the correct organization."/>
+            </if>
+
             <!-- Idempotent: reuse this session's in-progress cart if one exists (prevents duplicate/orphan carts) -->
             <entity-find entity-name="zenith.erp.pos.PosTransaction" list="existingOpen" limit="1">
                 <econdition field-name="sessionId"/>
@@ -374,9 +408,6 @@
             </if>
 
             <!-- Get the terminal for organization + region (the bill number is minted at completion, not here) -->
-            <entity-find-one entity-name="zenith.erp.pos.PosTerminal" value-field="terminal">
-                <field-map field-name="terminalId" from="session.terminalId"/>
-            </entity-find-one>
             <entity-find entity-name="zenith.erp.india.IndiaGstConfig" list="_posGstConfig" limit="1">
                 <econdition field-name="organizationPartyId" from="terminal.organizationPartyId"/>
             </entity-find>
