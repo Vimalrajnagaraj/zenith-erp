@@ -2564,6 +2564,7 @@ window.posToggleFullscreen = function() {
             document.body.appendChild(t);
             setTimeout(function() { t.style.opacity = '1'; }, 30);
             setTimeout(function() { t.style.opacity = '0'; setTimeout(function() { t.remove(); }, 400); }, 3500);
+            return t;
         }
 
         function showBanner(billNum, method) {
@@ -2571,7 +2572,7 @@ window.posToggleFullscreen = function() {
             if (old) old.remove();
             var b = document.createElement('div');
             b.className = 'pos-print-banner';
-            var label = method === 'qz' ? 'printed silently' : 'sent to printer';
+            var label = method === 'qz' ? 'sent to printer' : 'browser print requested';
             b.style.cssText = 'position:fixed;top:0;left:0;width:100%;z-index:999998;background:linear-gradient(135deg,#1b5e20,#2e7d32);color:#fff;padding:18px 30px;display:flex;align-items:center;justify-content:center;gap:16px;font-size:18px;font-weight:700;box-shadow:0 4px 20px rgba(0,0,0,0.3);transform:translateY(-100%);transition:transform 0.4s cubic-bezier(0.22,1,0.36,1);letter-spacing:0.5px';
             b.innerHTML = '<span style="font-size:28px">&#128424;</span> BILL-' + (billNum || '') + ' ' + label + ' <span style="font-size:22px">&#10004;</span>';
             document.body.appendChild(b);
@@ -2580,27 +2581,31 @@ window.posToggleFullscreen = function() {
         }
 
         /* === QZ Tray - Silent Thermal Printing === */
-        var qzReady = false;
-        var qzConnectFailed = false; // set once a connect attempt fails so we never stall waiting on it again
+        var qzConnection = null;
+        var qzSetup = null;
         var qzPrinter = '';
         try { qzPrinter = localStorage.getItem('posPrinter') || ''; } catch(e) {}
 
         function qzConnect() {
-            if (typeof qz === 'undefined') { qzConnectFailed = true; return Promise.reject('QZ Tray library not loaded'); }
-            if (qz.websocket.isActive()) { qzReady = true; qzConnectFailed = false; return Promise.resolve(); }
-            // Race the connect against a short timeout — a missing/closed QZ Tray must never delay the receipt.
+            if (typeof qz === 'undefined') return Promise.reject('QZ Tray library not loaded');
+            if (!qzConnection && qz.websocket.isActive()) return Promise.resolve();
+            // Checkout can overlap the background probe or QZ's permission prompt.
+            // Share the real connection, including after a caller's deadline expires.
+            if (!qzConnection) {
+                qzConnection = Promise.resolve().then(function() {
+                    return qz.websocket.connect({ retries: 0, delay: 0 });
+                }).finally(function() { qzConnection = null; });
+            }
             var timer;
-            var attempt = qz.websocket.connect({ retries: 0, delay: 0 });
-            var guard = new Promise(function(_, rej) { timer = setTimeout(function() { rej('qz-timeout'); }, 1200); });
-            return Promise.race([attempt, guard]).then(function() {
-                clearTimeout(timer); qzReady = true; qzConnectFailed = false;
-            }).catch(function(err) {
-                clearTimeout(timer); qzConnectFailed = true; throw err;
+            var guard = new Promise(function(_, reject) {
+                timer = setTimeout(function() { reject('QZ connection timed out'); }, 30000);
             });
+            return Promise.race([qzConnection, guard]).finally(function() { clearTimeout(timer); });
         }
 
         function qzShowSetup() {
-            return qzConnect().then(function() {
+            if (qzSetup) return qzSetup;
+            qzSetup = qzConnect().then(function() {
                 return qz.printers.find();
             }).then(function(printers) {
                 return new Promise(function(resolve, reject) {
@@ -2611,7 +2616,7 @@ window.posToggleFullscreen = function() {
                     ov.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.6);z-index:999999;display:flex;align-items:center;justify-content:center';
                     var card = '<div style="background:#fff;border-radius:16px;padding:28px;width:420px;max-height:80vh;overflow-y:auto;box-shadow:0 20px 60px rgba(0,0,0,0.4)">'
                         + '<div style="font-size:20px;font-weight:700;color:#7C3AED;margin-bottom:6px">&#128424; Printer Setup</div>'
-                        + '<div style="font-size:13px;color:#666;margin-bottom:16px">Select your thermal receipt printer for silent printing via QZ Tray</div>';
+                        + '<div style="font-size:13px;color:#666;margin-bottom:16px">Select your receipt printer for direct printing via QZ Tray. Allow QZ permission requests when prompted.</div>';
                     if (printers.length === 0) {
                         card += '<div style="padding:20px;text-align:center;color:#e53935;font-size:15px">No printers found. Make sure your thermal printer is connected and drivers are installed.</div>';
                     } else {
@@ -2648,7 +2653,8 @@ window.posToggleFullscreen = function() {
                         }
                     });
                 });
-            });
+            }).finally(function() { qzSetup = null; });
+            return qzSetup;
         }
 
         function qzPrint(html, billNum) {
@@ -2668,13 +2674,9 @@ window.posToggleFullscreen = function() {
             });
         }
 
-        // Probe QZ Tray in the background right after load so the very first sale already
-        // knows whether silent printing is available (qzConnectFailed) — no per-receipt stall.
+        // Probe QZ Tray early. A later receipt can retry a failed or disconnected service.
         setTimeout(function() {
-            qzConnect().then(function() {
-                console.log('QZ Tray connected — silent printing enabled');
-                showToast('Printer connected — silent printing active', '#7C3AED');
-            }).catch(function() {});
+            qzConnect().catch(function() {});
         }, 400);
 
         function buildReceiptHtml(d, isTax, edited) {
@@ -2790,18 +2792,59 @@ window.posToggleFullscreen = function() {
             setTimeout(triggerBanner, 6000);
         }
 
+        function offerBrowserPrint(html, billNum) {
+            // Never force a native print dialog over fullscreen after a QZ failure.
+            // A retry prints only this receipt; it does not repeat checkout/payment.
+            var panel = document.createElement('div');
+            panel.className = 'pos-print-fallback';
+            panel.setAttribute('role', 'dialog');
+            panel.setAttribute('aria-label', 'Receipt printing');
+            panel.style.cssText = 'position:fixed;inset:0;z-index:999999;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;padding:16px;box-sizing:border-box';
+            panel.innerHTML = '<div style="background:#fff;color:#111;padding:24px;border-radius:12px;max-width:440px;max-height:85vh;overflow:auto">'
+                + '<h2 style="margin-top:0;font-size:20px">Receipt printing</h2>'
+                + '<p class="pos-print-status" role="status">QZ Tray did not confirm printing. Check the printer before retrying. Browser printing may exit fullscreen.</p>'
+                + '<div style="display:flex;flex-wrap:wrap;gap:10px">'
+                + '<button type="button" class="pos-print-retry">Retry QZ</button>'
+                + '<button type="button" class="pos-print-browser">Print using browser</button>'
+                + '<button type="button" class="pos-print-cancel">Close</button></div></div>';
+            document.body.appendChild(panel);
+            panel.querySelectorAll('button').forEach(function(button) {
+                button.style.cssText = 'padding:10px 14px;border:1px solid #7C3AED;border-radius:8px;background:#fff;color:#5b21b6;font-size:14px;cursor:pointer';
+            });
+            var retry = panel.querySelector('.pos-print-retry');
+            retry.style.background = '#7C3AED'; retry.style.color = '#fff';
+            retry.addEventListener('click', function() {
+                panel.querySelectorAll('button').forEach(function(button) { button.disabled = true; });
+                panel.querySelector('.pos-print-status').textContent = 'Connecting to QZ Tray. Allow the connection if prompted.';
+                qzPrint(html + '</body></html>', billNum).then(function() { panel.remove(); }).catch(function(err) {
+                    if (err === 'cancelled') { panel.remove(); return; }
+                    panel.querySelector('.pos-print-status').textContent = 'QZ Tray did not confirm printing. Check the printer, then retry or choose browser printing.';
+                }).finally(function() {
+                    panel.querySelectorAll('button').forEach(function(button) { button.disabled = false; });
+                });
+            });
+            panel.querySelector('.pos-print-browser').addEventListener('click', function() {
+                panel.remove(); iframePrint(html, billNum);
+            });
+            panel.querySelector('.pos-print-cancel').addEventListener('click', function() { panel.remove(); });
+            retry.focus();
+        }
+
         function printReceipt(txId, billNum, taxOn, edited, preData) {
             if (!txId) return;
             var isTax = (taxOn === 'Y');
             function render(d) {
                 if (!d || !d.success) return;
                 var html = buildReceiptHtml(d, isTax, edited);
-                if (qzReady || (typeof qz !== 'undefined' && !qzConnectFailed)) {
+                if (typeof qz !== 'undefined') {
+                    var connecting = !qz.websocket.isActive() ? showToast('Connecting to QZ Tray. Allow the connection if prompted.', '#7C3AED') : null;
                     qzPrint(html + '</body></html>', billNum).catch(function(err) {
                         if (err === 'cancelled') return;
-                        console.warn('QZ Tray print failed, falling back to browser print:', err);
-                        iframePrint(html, billNum);
-                    });
+                        console.warn('QZ Tray did not confirm receipt printing:', err);
+                        offerBrowserPrint(html, billNum);
+                    }).finally(function() { if (connecting) connecting.remove(); });
+                } else if (document.fullscreenElement || document.webkitFullscreenElement) {
+                    offerBrowserPrint(html, billNum);
                 } else {
                     iframePrint(html, billNum);
                 }

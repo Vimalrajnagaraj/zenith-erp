@@ -131,6 +131,9 @@ module.exports = async function ({a, foreign, base, check, q, invoke, post, out}
             check('receipt PDF renders for tax '+tax,pdf.status()===200 && (pdf.headers()['content-type']||'').includes('pdf'),{status:pdf.status()});
             if(out)fs.writeFileSync(path.join(out,'receipt-tax-'+tax+'.pdf'),await pdf.body());
         }
+        await require('./verify-print-routing-browser.cjs')({a,base,sessionId:session.sessionId,
+            transactionId:bill.transactionId,receipt:(await invoke('receipt',{transactionId:bill.transactionId})).receipt,check,out});
+        check('printer routing tests leave the issued test bill and tenders unchanged',snapshot()===before);
         if (out) await page.screenshot({path:path.join(out,'history-window-regression.png')});
     } finally {
         await page.close();

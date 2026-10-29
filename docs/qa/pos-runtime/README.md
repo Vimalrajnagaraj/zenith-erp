@@ -29,6 +29,16 @@ deployment claim. Never reuse a database containing customer records.
 
 ## Regressions covered
 
+- `check-print-routing.cjs` exercises QZ's slow permission prompt, overlapping probe
+  and checkout, timeout/late success, failed probe, reconnect, cancellation and
+  explicit fullscreen fallback with a virtual clock and no printer jobs. The browser
+  group verifies actual fullscreen, printer selection, consecutive tax on/off and
+  revised receipts, retry and duplicate-copy prevention on both app shells. QZ's
+  external library is intercepted in those tests; no workstation service is used.
+  A successful QZ send keeps fullscreen. Browser printing remains an explicit choice
+  after a QZ failure because native dialogs can exit fullscreen; browsers require a
+  user gesture to enter it again. QZ permission/signing configuration and a physical
+  printer check remain deployment/workstation checks, not simulated test claims.
 - History add-item search uses a disposable catalog with more than 520 products,
   including late Water Cup/Tea Cup matches, mixed case, codes and literal `%`/`_`.
   Both endpoints retain tenant scope; cancelling the editor leaves the issued test
