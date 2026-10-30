@@ -19,6 +19,7 @@ const rows=(table,where)=>q(`SELECT * FROM ${table} WHERE ${where}`),count=(tabl
  cp.execFileSync(process.execPath,[path.join(__dirname,'check-receipt-layout.cjs')],{stdio:'inherit'});
  cp.execFileSync(process.execPath,[path.join(__dirname,'check-print-routing.cjs')],{stdio:'inherit'});
  cp.execFileSync(process.execPath,[path.join(__dirname,'check-shared-chrome.cjs')],{stdio:'inherit'});
+ cp.execFileSync(process.execPath,[path.join(__dirname,'check-tablet-checkout.cjs')],{stdio:'inherit'});
  cp.execFileSync(process.execPath,[path.join(__dirname,'check-navigation-policy.cjs')],{stdio:'inherit'});
  cp.execFileSync(process.execPath,[path.join(__dirname,'../pos-cash-ui/verify.cjs')],{stdio:'inherit',env:{...process.env,POS_CASH_BROWSERS:'chrome',POS_CASH_OUT:path.join(out,'cash-ui')}});
  if(process.env.POS_QA_UI_ONLY!=='true'){
