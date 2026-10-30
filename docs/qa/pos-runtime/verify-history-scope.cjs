@@ -72,6 +72,10 @@ module.exports=async function({a,foreign,base,check,q,invoke,post,out}) {
    if(shell==='apps')check(shell+' embeds cashier allowlist in initial response',html.includes('data-nav-restricted="true"')&&!/<a[^>]+class="zs-link"[^>]+data-mod="sales"/.test(html));
    await page.goto(`${base}/${shell}/zenith/Inventory/FindProduct`);
    if(shell==='qapps')await page.locator('#zq-sidebar').waitFor();
+   const navigation=page.locator(shell==='apps'?'#z-subnav':'#zq-subnav');
+   await navigation.locator('.zsn-trigger:not([disabled])').waitFor();
+   const geometry=await navigation.evaluate(nav=>{const box=node=>node.getBoundingClientRect().toJSON();return {nav:box(nav),strip:box(nav.querySelector('.zsub-grp.show,.zsn-strip')),button:box(nav.querySelector('.zsn-trigger'))};});
+   check(shell+' real Bootstrap/Quasar navigation keeps Customize beside the tabs',geometry.button.left>=geometry.strip.right-1&&geometry.button.top>=geometry.nav.top&&geometry.button.bottom<=geometry.nav.bottom,geometry);
    for(const wait of [0,3500]){
     await page.waitForTimeout(wait);
     const forbidden=page.locator(shell==='qapps'?'.zqs-link[data-mod="sales"]':'.zs-link[data-mod="sales"]');

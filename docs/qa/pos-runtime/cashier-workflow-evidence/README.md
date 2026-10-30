@@ -13,7 +13,8 @@ was not saved without Enter; the lower strip repeated the bill number; manual ra
 changes were counted as discounts; History had no Reprint button; the editor had no
 independent Print bill button; and cashier initial HTML contained unauthorized
 Sales navigation links. The shared CSS check separately reproduced Customize
-wrapping below its tabs. The QZ virtual-clock check reproduced a device connection
+wrapping below its tabs. The strengthened check includes Bootstrap 3’s
+`!important` display rule, which otherwise overrides the classic shell’s flex row. The QZ virtual-clock check reproduced a device connection
 on simply entering billing.
 
 ## Verified behavior
