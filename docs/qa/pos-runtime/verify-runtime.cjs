@@ -18,16 +18,28 @@ const rows=(table,where)=>q(`SELECT * FROM ${table} WHERE ${where}`),count=(tabl
   return context;};
  cp.execFileSync(process.execPath,[path.join(__dirname,'check-receipt-layout.cjs')],{stdio:'inherit'});
  cp.execFileSync(process.execPath,[path.join(__dirname,'check-print-routing.cjs')],{stdio:'inherit'});
+ cp.execFileSync(process.execPath,[path.join(__dirname,'check-shared-chrome.cjs')],{stdio:'inherit'});
+ cp.execFileSync(process.execPath,[path.join(__dirname,'check-navigation-policy.cjs')],{stdio:'inherit'});
  cp.execFileSync(process.execPath,[path.join(__dirname,'../pos-cash-ui/verify.cjs')],{stdio:'inherit',env:{...process.env,POS_CASH_BROWSERS:'chrome',POS_CASH_OUT:path.join(out,'cash-ui')}});
  if(process.env.POS_QA_UI_ONLY!=='true'){
  const bootstrap=await browser.newContext();await bootstrap.request.get(base+'/apps/zenith/Contacts/Customers',{headers:{Authorization:'Basic '+Buffer.from('john.doe:moqui').toString('base64')}});const bp=await bootstrap.newPage();await bp.goto(base+'/apps/zenith/Contacts/Customers');const bt=await bp.locator('[name=moquiSessionToken]').first().inputValue();
  let r=await bootstrap.request.post(base+'/apps/zenith/pos/PosQaAcceptance/initialize',{form:{moquiSessionToken:bt}});let init;try{init=await r.json()}catch{throw Error('Initializer '+r.status()+': '+(await r.text()).slice(0,180))}check('isolated fixtures initialized',r.status()===200&&init.initialized,init);if(process.env.POS_QA_FOCUS!=='history-window')await require('./verify-clean-workspace.cjs')({browser,base,q,check,out,admin:bootstrap,token:bt});await bootstrap.close();
  }
- async function account(user){const c=await browser.newContext({viewport:{width:1366,height:768}});const r=await c.request.get(base+'/apps/zenith/pos/Dashboard',{headers:{Authorization:'Basic '+Buffer.from(user+':moqui').toString('base64')}});const p=await c.newPage();await p.goto(base+'/apps/zenith/pos/Terminal');const t=await p.locator('[name=moquiSessionToken]').first().inputValue();check(user+' authenticated POS access',r.status()===200,{status:r.status()});if(user==='pos.qa'){const back=p.locator('.pos-no-session a').filter({hasText:'Back to POS'});check('no-session screen links to POS dashboard',await back.count()===1&&await back.getAttribute('href')==='/apps/zenith/pos/Dashboard');await back.click();check('no-session Back to POS opens dashboard',new URL(p.url()).pathname==='/apps/zenith/pos/Dashboard');await p.goto(base+'/apps/zenith/pos/Terminal');}return {c,p,t};}
+ async function account(user){const c=await browser.newContext({viewport:{width:1366,height:768}});const r=await c.request.get(base+'/apps/zenith/pos/Dashboard',{headers:{Authorization:'Basic '+Buffer.from(user+':moqui').toString('base64')}});const p=await c.newPage();await p.goto(base+'/apps/zenith/pos/Terminal');const t=await p.locator('[name=moquiSessionToken]').first().inputValue();check(user+' authenticated POS access',r.status()===200,{status:r.status()});if(user==='pos.qa'&&process.env.POS_QA_UI_ONLY!=='true'){const back=p.locator('.pos-no-session a').filter({hasText:'Back to POS'});check('no-session screen links to POS dashboard',await back.count()===1&&await back.getAttribute('href')==='/apps/zenith/pos/Dashboard');await back.click();check('no-session Back to POS opens dashboard',new URL(p.url()).pathname==='/apps/zenith/pos/Dashboard');await p.goto(base+'/apps/zenith/pos/Terminal');}return {c,p,t};}
  const a=await account('pos.qa');const foreign=await account('pos.b.qa');const p=a.p;p.on('pageerror',e=>report.consoleErrors.push({url:p.url(),message:e.message,stack:e.stack}));
  async function post(screen,transition,params={},actor=a,csrf=true,shell='apps'){return actor.c.request.post(`${base}/${shell}/zenith/pos/${screen}/${transition}`,{form:{...(csrf?{moquiSessionToken:actor.t}:{}),...params},maxRedirects:0});}
  async function invoke(op,params={},reject=false,actor=a){const r=await post('PosQaAcceptance','invoke',{op,...params},actor);let b;try{b=await r.json()}catch{b={errors:[(await r.text()).slice(0,160)]}}check(op+(reject?' rejected':' succeeded'),reject?(r.status()===403||b.errors?.length>0):r.status()===200&&!b.errors?.length,{status:r.status(),...b});return b.result||{};}
- if(process.env.POS_QA_UI_ONLY!=='true')await require('./verify-history-window.cjs')({a,foreign,base,check,q,invoke,post,out});
+ if(process.env.POS_QA_FOCUS==='confirmation'){await require('./verify-checkout-confirmation.cjs')({a,base,check,q,invoke,out});await browser.close();browser=null;return;}
+ if(process.env.POS_QA_FOCUS==='rate-sync'){await require('./verify-rate-sync.cjs')({a,base,check,q,invoke,post,out});await browser.close();browser=null;return;}
+ if(process.env.POS_QA_FOCUS==='catalog'){await require('./verify-catalog-performance.cjs')({a,foreign,base,check,q,invoke,post,out});await browser.close();browser=null;return;}
+ if(process.env.POS_QA_FOCUS==='history-scope'){
+  await require('./verify-history-scope.cjs')({a,foreign,base,check,q,invoke,post,out});await browser.close();browser=null;return;
+ }
+ if(process.env.POS_QA_FOCUS==='cashier-entry'){
+  await require('./verify-cashier-entry.cjs')({a,base,check,q,invoke,post,out});
+  await require('./verify-rate-sync.cjs')({a,base,check,q,invoke,post,out});await browser.close();browser=null;return;
+ }
+ if(process.env.POS_QA_UI_ONLY!=='true'||process.env.POS_QA_FOCUS==='history-window')await require('./verify-history-window.cjs')({a,foreign,base,check,q,invoke,post,out});
  if(process.env.POS_QA_FOCUS==='history-window'){await browser.close();browser=null;return;}
  if(process.env.POS_QA_UI_ONLY!=='true')await require('./verify-catalog-performance.cjs')({a,foreign,base,check,q,invoke,post,out});
  if(process.env.POS_QA_UI_ONLY!=='true'){
@@ -483,5 +495,10 @@ const rows=(table,where)=>q(`SELECT * FROM ${table} WHERE ${where}`),count=(tabl
  await require('./verify-checkout-reference.cjs')({a,foreign,base,check,q,invoke,post,out});
  if(process.env.POS_QA_UI_ONLY!=='true')await require('./verify-normal-layout.cjs')({a,base,check,q,invoke,post,out});
  if(process.env.POS_QA_UI_ONLY!=='true')await require('./verify-free-items.cjs')({browser,base,q,check,out});
+ if(process.env.POS_QA_UI_ONLY!=='true'){
+  await require('./verify-cashier-entry.cjs')({a,base,check,q,invoke,post,out});
+  await require('./verify-history-scope.cjs')({a,foreign,base,check,q,invoke,post,out});
+  await require('./verify-rate-sync.cjs')({a,base,check,q,invoke,post,out});
+ }
  await browser.close();browser=null;
-}catch(e){if(!report.failures.length)report.failures.push({name:'runner',error:e.message});throw e}finally{if(browser)await browser.close();report.passed=report.failures.length===0;report.finished=new Date().toISOString();fs.writeFileSync(path.join(out,'report.json'),JSON.stringify(report,null,2));console.log(JSON.stringify({passed:report.passed,checks:report.checks.length,failures:report.failures.length,pages:report.pages.length,layouts:report.layouts.length}));}})().catch(e=>{console.error(e.message);process.exitCode=1});
+}catch(e){if(!report.failures.length)report.failures.push({name:'runner',error:e.message});throw e}finally{if(browser)await browser.close();report.passed=report.failures.length===0;report.finished=new Date().toISOString();fs.writeFileSync(path.join(out,'report.json'),JSON.stringify(report,null,2));console.log(JSON.stringify({passed:report.passed,checks:report.checks.length,failures:report.failures.length,pages:report.pages.length,layouts:report.layouts.length}));}})().catch(e=>{console.error(e.stack||e.message);process.exitCode=1});

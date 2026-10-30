@@ -2367,9 +2367,7 @@
                         def search = p.search ?: ''
                         def offset = p.offset ? (p.offset as int) : 0
                         def limit = p.histLimit ? (p.histLimit as int) : 20
-                        // Scope bill history to ALL terminals in the same organization (whole store).
-                        // Works with no active session too: derive the terminal from an explicit
-                        // terminalId param, else from the operator's most recent session.
+                        // History belongs to the chosen terminal; owner dashboards aggregate shops separately.
                         def histTermId = null
                         if (sessionId) {
                             def curSess = ec.entity.find("zenith.erp.pos.PosSession").condition("sessionId", sessionId).one()
@@ -2377,20 +2375,16 @@
                         }
                         if (!histTermId && p.terminalId) histTermId = p.terminalId
                         if (!histTermId) {
-                            def recentSess = ec.entity.find("zenith.erp.pos.PosSession").condition("operatorPartyId", ec.user.userAccount?.partyId).orderBy("-openDate").limit(1).list()
+                            def recentSess = ec.entity.find("zenith.erp.pos.PosSession").condition("organizationPartyId",posOrganizationPartyId).condition("operatorPartyId", ec.user.userAccount?.partyId).orderBy("-openDate").limit(1).list()
                             if (recentSess) histTermId = recentSess[0].terminalId
                         }
-                        def curTerm = histTermId ? ec.entity.find("zenith.erp.pos.PosTerminal").condition("terminalId", histTermId).one() : null
-                        def effOrgId = curTerm?.organizationPartyId
-                        if (!effOrgId) { def _ao = ec.user.getPreference('ACTIVE_ORGANIZATION'); if (_ao && _ao != '_NA_') effOrgId = _ao }
-                        if (!effOrgId) { ec.web.sendJsonResponse([success:true, action:'billHistory', bills:[], total:0, offset:0]); return }
-                        // Scope every completed bill to the store by organizationPartyId (fully populated, and
-                        // avoids a huge sessionId IN-list) and PAGINATE IN THE DB. A large tenant (MARUTHI has
-                        // ~5,700 bills) must never load the whole history into memory + build every bill - that
-                        // hung the history panel on "Loading...". count() gives the total; offset/limit fetch
-                        // only the page actually shown.
-                        def txnBase = ec.entity.find("zenith.erp.pos.PosTransaction")
-                            .condition("organizationPartyId", effOrgId).condition("statusId", "PtCompleted")
+                        def curTerm = histTermId ? ec.entity.find("zenith.erp.pos.PosTerminal").condition("terminalId", histTermId).condition('organizationPartyId',posOrganizationPartyId).one() : null
+                        if (!curTerm) { ec.web.sendJsonResponse([success:true, action:'billHistory', bills:[], total:0, offset:0]); return }
+                        def txnBase = ec.entity.find("zenith.erp.pos.PosTransactionView")
+                            .condition("organizationPartyId",posOrganizationPartyId).condition("terminalId",curTerm.terminalId).condition("statusId", "PtCompleted")
+                        if (!ec.user.isInGroup('ADMIN') && !ec.user.isInGroup('ZENITH_ADMIN') && !ec.user.isInGroup('ZENITH_STORE_MGR')) {
+                            txnBase.condition('operatorPartyId',ec.user.userAccount?.partyId)
+                        }
                         BigDecimal searchAmt = null
                         if (search) {
                             try { searchAmt = new BigDecimal(search) } catch (Exception ignored) {}
@@ -3403,7 +3397,7 @@
 
 
 
-                def totalSaving = BigDecimal.ZERO
+                def totalSaving = (completedTxn.discountTotal ?: 0) as BigDecimal
 
 
 
@@ -3423,7 +3417,7 @@
 
 
 
-                    def saving = (mrp - rate) * qty
+                    def saving = (it.discountAmount ?: 0) as BigDecimal
 
 
 
@@ -3431,7 +3425,7 @@
 
 
 
-                    totalSaving += saving
+                    // The bill discount total already includes explicit line discounts.
 
 
 
@@ -5967,7 +5961,7 @@ window.sendWhatsAppWithPdf=function() {
 
 
 
-                <div id="pos-last-completed" style="font-size:13px;color:#777">Last: ${lastBillNo?html} / ${lastBillAmt?html}</div>
+                <div id="pos-last-completed" style="font-size:13px;color:#777">Last amount: ${lastBillAmt?html}</div>
 
 
 

@@ -39,7 +39,7 @@ module.exports = async function ({a, base, sessionId, transactionId, receipt, ch
             await page.locator('#posFullscreenBtn').click();
             await page.waitForFunction(()=>!!document.fullscreenElement);
             const print = (tax='N', edited=false) => page.evaluate(({transactionId,receipt,tax,edited})=>
-                window._posPrintReceipt(transactionId,'QA-PRINT',tax,edited,receipt),{transactionId,receipt,tax,edited});
+                { void window._posPrintReceipt(transactionId,'QA-PRINT',tax,edited,receipt); },{transactionId,receipt,tax,edited});
             await print();
             await page.waitForTimeout(1700); // Beyond the original 1.2-second failure window.
             const waiting = await page.evaluate(()=>({connections:qaPrinter.connections,browser:qaPrinter.browser,

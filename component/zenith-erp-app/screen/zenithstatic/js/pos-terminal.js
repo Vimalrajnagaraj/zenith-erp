@@ -613,7 +613,18 @@ window._posOffline = (function() {
                 histIframePrint(buildHistReceipt(d, taxOn === 'Y'));
             });
         }
-        function buildHistReceipt(d, isTax) {
+        function reprintSavedBill(bill, button) {
+            if (button.disabled) return;
+            button.disabled = true;
+            historyPost({action:'receiptData', transactionId:bill.txId}).then(function(data) {
+                if (!data || !data.success) throw new Error('The saved receipt could not be loaded.');
+                var taxOn = Number(data.summary && data.summary.tax || 0) > 0 ? 'Y' : 'N';
+                if (typeof window._posPrintReceipt === 'function') return window._posPrintReceipt(bill.txId, bill.billNo, taxOn, bill.amendCount > 0, data);
+                else histIframePrint(buildHistReceipt(data, taxOn === 'Y', bill.amendCount > 0));
+            }).catch(function() { histToast('The saved bill could not be printed. Try again.', '#c62828'); })
+                .finally(function() { button.disabled = false; });
+        }
+        function buildHistReceipt(d, isTax, edited) {
             d=window._posReceiptTextData(d);
             var s = d.store || {}, bi = d.bill || {}, sm = d.summary || {};
             function f2(n) { return Number(n||0).toFixed(2); }
@@ -627,8 +638,10 @@ window._posOffline = (function() {
             if (isTax && s.taxReg) h += '<div class="c hdr">GSTIN: ' + s.taxReg + '</div>';
             h += '<div class="sep"></div>';
             h += '<div class="c b" style="font-size:13px;margin:3px 0">' + (isTax ? 'POS TAX RECEIPT' : 'RECEIPT') + '</div>';
-            h += '<div class="c b" style="font-size:12px;margin:3px 0;border:1px dashed #000;padding:3px 2px">** EDITED / REVISED BILL **</div>';
-            h += '<div class="c hdr" style="margin-bottom:2px">Reprinted after modification</div>';
+            if (edited !== false) {
+                h += '<div class="c b" style="font-size:12px;margin:3px 0;border:1px dashed #000;padding:3px 2px">** EDITED / REVISED BILL **</div>';
+                h += '<div class="c hdr" style="margin-bottom:2px">Reprinted after modification</div>';
+            }
             h += '<table><tr><td class="hdr" style="width:30%">POS Bill No:</td><td class="b">' + (bi.number || '') + '</td></tr>';
             h += '<tr><td class="hdr">Date:</td><td>' + (bi.date || '') + '</td></tr>';
             h += '<tr><td class="hdr">Customer:</td><td>' + (bi.customer || 'Walk-In') + '</td></tr></table>';
@@ -643,6 +656,7 @@ window._posOffline = (function() {
             if (isTax && Number(sm.tax||0) > 0) h += '<tr><td>Tax</td><td class="r">' + f2(sm.tax) + '</td></tr>';
             h += '</table><div class="sep2"></div>';
             h += '<table><tr><td class="tot">' + (isTax ? 'GRAND TOTAL' : 'TOTAL') + '</td><td class="r tot">' + f2(sm.total) + '</td></tr></table>';
+            if (Number(d.saving) > 0) h += '<div class="sep"></div><div class="c b">You Saved: ' + f2(d.saving) + '</div>';
             if (d.isCredit) {
                 h += '<div class="sep"></div>';
                 h += '<div class="c b" style="border:1px dashed #000;padding:3px 2px;font-size:12px">** ' + (Number(d.outstanding) > 0 ? 'CREDIT / PAY LATER' : 'CREDIT / PAID IN FULL') + ' **</div>';
@@ -665,30 +679,36 @@ window._posOffline = (function() {
             var iDoc = iframe.contentDocument || iframe.contentWindow.document;
             iDoc.open(); iDoc.write(html); iDoc.close();
         }
+        function histEsc(value) { return String(value == null ? '' : value).replace(/[&<>"']/g, function(c) { return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
         function loadHistoryList(search) {
             var listEl = document.getElementById('hist-list');
             if (!listEl) return;
             listEl.innerHTML = '<div style="text-align:center;padding:40px;color:#999">Loading...</div>';
             historyPost({action:'billHistory', search:search||''}).then(function(d) {
                 if (!d || !d.success || !d.bills || d.bills.length === 0) {
-                    listEl.innerHTML = '<div style="text-align:center;padding:40px;color:#999">'+(search ? 'No bills match "'+search+'"' : 'No completed bills in this session')+'</div>';
+                    listEl.innerHTML = '<div style="text-align:center;padding:40px;color:#999">'+(search ? 'No bills match "'+histEsc(search)+'"' : 'No completed bills in this session')+'</div>';
                     return;
                 }
                 var h = '<div style="font-size:12px;color:#999;padding:4px 8px;margin-bottom:4px">'+d.total+' bill'+(d.total>1?'s':'')+' found</div>';
                 d.bills.forEach(function(bill) {
                     var payStr = (bill.payments||[]).map(function(p) { return p.method; }).join(', ');
                     var edited = bill.amendCount > 0 ? '<span style="background:#ff9800;color:#fff;padding:1px 6px;border-radius:4px;font-size:10px;margin-left:6px">EDITED ('+bill.amendCount+')</span>' : '';
-                    h += '<div class="hist-bill-row" data-tx-id="'+bill.txId+'" style="padding:12px 14px;border:1px solid #e8e8e8;border-radius:10px;margin-bottom:8px;cursor:pointer;transition:all 0.15s;background:#fafafa" onmouseover="this.style.background=\'#ECE8FB\';this.style.borderColor=\'#CBB8F0\'" onmouseout="this.style.background=\'#fafafa\';this.style.borderColor=\'#e8e8e8\'">'
+                    h += '<div class="hist-bill-row" data-tx-id="'+histEsc(bill.txId)+'" style="display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px 14px;padding:12px 14px;border:1px solid #e8e8e8;border-radius:10px;margin-bottom:8px;cursor:pointer;transition:all 0.15s;background:#fafafa" onmouseover="this.style.background=\'#ECE8FB\';this.style.borderColor=\'#CBB8F0\'" onmouseout="this.style.background=\'#fafafa\';this.style.borderColor=\'#e8e8e8\'">'
                         + '<div style="display:flex;justify-content:space-between;align-items:center">'
-                        + '<div><span style="font-weight:700;font-size:15px;color:#7C3AED">#'+bill.billNo+'</span>'+edited+'</div>'
+                        + '<div><span style="font-weight:700;font-size:15px;color:#7C3AED">#'+histEsc(bill.billNo)+'</span>'+edited+'</div>'
                         + '<span style="font-weight:800;font-size:16px;color:#2e7d32">₹'+Number(bill.grand||0).toFixed(2)+'</span></div>'
-                        + '<div style="display:flex;justify-content:space-between;margin-top:4px;font-size:12px;color:#777">'
-                        + '<span>'+bill.date+'</span>'
-                        + '<span>'+bill.customer+' &middot; '+bill.itemCount+' item'+(bill.itemCount>1?'s':'')+' &middot; '+payStr+'</span>'
-                        + '</div></div>';
+                        + '<div style="grid-column:1;display:flex;flex-wrap:wrap;gap:4px 12px;justify-content:space-between;font-size:12px;color:#777">'
+                        + '<span>'+histEsc(bill.date)+'</span>'
+                        + '<span>'+histEsc(bill.customer)+' &middot; '+bill.itemCount+' item'+(bill.itemCount>1?'s':'')+' &middot; '+histEsc(payStr)+'</span>'
+                        + '</div><button type="button" class="hist-reprint" style="grid-column:2;grid-row:1 / span 2;align-self:center;padding:9px 14px;border:1px solid #7C3AED;border-radius:8px;color:#7C3AED;background:#fff;font-weight:700;cursor:pointer">&#128424; Reprint</button></div>';
                 });
                 listEl.innerHTML = h;
                 listEl.querySelectorAll('.hist-bill-row').forEach(function(row) {
+                    row.querySelector('.hist-reprint').addEventListener('click', function(event) {
+                        event.stopPropagation();
+                        var bill = d.bills.find(function(item) { return item.txId === row.dataset.txId; });
+                        if (bill) reprintSavedBill(bill, event.currentTarget);
+                    });
                     row.addEventListener('click', function() {
                         var txId = row.dataset.txId;
                         var bill = d.bills.find(function(b) { return b.txId === txId; });
@@ -720,7 +740,7 @@ window._posOffline = (function() {
                                 + '<div style="display:flex;justify-content:space-between;align-items:center">'
                                 + '<span style="background:#c62828;color:#fff;padding:1px 8px;border-radius:4px;font-size:10px;font-weight:700">OFFLINE &mdash; PENDING SYNC</span>'
                                 + '<span style="font-weight:800;font-size:16px;color:#2e7d32">&#8377;' + Number(x.total || 0).toFixed(2) + '</span></div>'
-                                + '<div style="display:flex;justify-content:space-between;margin-top:4px;font-size:12px;color:#777">'
+                                + '<div style="grid-column:1;display:flex;flex-wrap:wrap;gap:4px 12px;justify-content:space-between;font-size:12px;color:#777">'
                                 + '<span>' + when + '</span>'
                                 + '<span>' + (x.items || []).length + ' item' + ((x.items || []).length !== 1 ? 's' : '') + ' &middot; qty ' + n + ' &middot; ' + (x.paymentMethod || '') + '</span>'
                                 + '</div></div>';
@@ -737,12 +757,12 @@ window._posOffline = (function() {
             h += '<button id="hist-back" style="background:none;border:none;color:#7C3AED;font-size:14px;cursor:pointer;padding:4px 0;font-weight:600">&larr; Back to list</button>';
             h += '<div style="background:#f5f5f5;border-radius:10px;padding:14px;margin-top:8px">';
             h += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">'
-                + '<span style="font-size:18px;font-weight:700;color:#7C3AED">Bill #'+bill.billNo+'</span>'
-                + '<span style="font-size:11px;color:#999">'+bill.date+'</span></div>';
+                + '<span style="font-size:18px;font-weight:700;color:#7C3AED">Bill #'+histEsc(bill.billNo)+'</span>'
+                + '<span style="font-size:11px;color:#999">'+histEsc(bill.date)+'</span></div>';
             h += '<table style="width:100%;border-collapse:collapse;font-size:13px">';
             h += '<thead><tr style="border-bottom:2px solid #ddd"><th style="text-align:left;padding:6px 4px">#</th><th style="text-align:left;padding:6px 4px">Item</th><th style="text-align:right;padding:6px 4px">Rate</th><th style="text-align:center;padding:6px 4px">Qty</th><th style="text-align:right;padding:6px 4px">Total</th><th style="padding:6px 4px"></th></tr></thead><tbody>';
             (bill.items||[]).forEach(function(it, idx) {
-                h += '<tr style="border-bottom:1px solid #eee" data-seq="'+it.seq+'" data-tx="'+bill.txId+'">'
+                h += '<tr style="border-bottom:1px solid #eee" data-seq="'+it.seq+'" data-tx="'+histEsc(bill.txId)+'">'
                     + '<td style="padding:6px 4px;color:#999">'+(idx+1)+'</td>'
                     + '<td style="padding:6px 4px;font-weight:600">'+it.name+'</td>'
                     + '<td style="padding:6px 4px;text-align:right"><input type="number" class="hist-price" value="'+Number(it.price).toFixed(2)+'" data-seq="'+it.seq+'" style="width:70px;padding:4px;border:1px solid #ccc;border-radius:4px;text-align:right;font-size:13px"/></td>'
@@ -953,7 +973,7 @@ window._posOffline = (function() {
             ed.addEventListener('keydown', function(e) { e.stopPropagation(); });
             ed.innerHTML =
                 '<div style="background:#7C3AED;color:#fff;padding:10px 14px;display:flex;justify-content:space-between;align-items:center;flex-shrink:0">'
-              + '<div><span style="font-size:16px;font-weight:800">&#9998; Editing Bill #'+bill.billNo+'</span>'
+              + '<div><span style="font-size:16px;font-weight:800">&#9998; Editing Bill #'+histEsc(bill.billNo)+'</span>'
               + '<div style="font-size:11px;opacity:0.9;margin-top:2px">Change qty / price, remove items, or <b>tap a product on the left</b> to add it. You will be asked for a reason before saving the revised bill.</div></div>'
               + '<button id="ced-cancel-x" title="Cancel" style="background:rgba(255,255,255,0.18);border:none;color:#fff;font-size:22px;line-height:1;cursor:pointer;border-radius:6px;width:34px;height:34px">&times;</button></div>'
               + '<div id="ced-rows" style="flex:1;overflow-y:auto;padding:6px 10px"></div>'
@@ -968,6 +988,7 @@ window._posOffline = (function() {
               +   '<div id="ced-totals" style="font-size:13px;color:#333;margin-bottom:8px"></div>'
               +   '<div style="display:flex;gap:8px">'
               +     '<button id="ced-cancel" style="flex:1;padding:13px;border:2px solid #ccc;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;background:#fff;color:#555">Cancel</button>'
+              +     '<button id="ced-print" type="button" style="flex:1;padding:13px;border:1px solid #bbb;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;background:#fff;color:#222">&#128424; Print bill</button>'
               +     '<button id="ced-save" style="flex:2;padding:13px;border:none;border-radius:10px;font-size:15px;font-weight:800;cursor:pointer;background:#2e7d32;color:#fff">&#10003; Save &amp; print revised bill</button>'
               +   '</div>'
               + '</div>'
@@ -1084,8 +1105,9 @@ window._posOffline = (function() {
             });
             document.addEventListener('click', function ofc(e){ if(!cartEditorEl){ document.removeEventListener('click', ofc); return; } if(addRes && !addRes.contains(e.target) && e.target!==addInp) addRes.style.display='none'; });
 
-            function doCancel() { if (dirty() && !window.confirm('Discard your unsaved changes to Bill #'+bill.billNo+'?')) return; closeCartEditor(); }
+            function doCancel() { if (dirty() && !window.confirm('Discard your unsaved changes to Bill #'+histEsc(bill.billNo)+'?')) return; closeCartEditor(); }
             ed.querySelector('#ced-cancel').addEventListener('click', doCancel);
+            ed.querySelector('#ced-print').addEventListener('click', function(event) { reprintSavedBill(bill, event.currentTarget); });
             ed.querySelector('#ced-cancel-x').addEventListener('click', doCancel);
 
             function pendingEditOps() {
@@ -1264,7 +1286,7 @@ window._posOffline = (function() {
             if (!d.customers || !d.customers.length) { listEl.innerHTML = '<div style="text-align:center;padding:24px;color:#999">No customers found. Use “+ New” to add one in Contacts.</div>'; return; }
             var h = '';
             d.customers.forEach(function(c) {
-                h += '<div class="cust-row" data-pid="' + custEscape(c.partyId) + '" data-name="' + custEscape(c.name || '') + '" style="padding:12px 14px;border:1px solid #e8e8e8;border-radius:10px;margin-bottom:8px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;gap:10px" onmouseover="this.style.background=\'#e8eaf6\'" onmouseout="this.style.background=\'#fff\'">'
+                h += '<div class="cust-row" data-pid="' + custEscape(c.partyId) + '" data-name="' + custEscape(c.name || '') + '" style="display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px 14px;padding:12px 14px;border:1px solid #e8e8e8;border-radius:10px;margin-bottom:8px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;gap:10px" onmouseover="this.style.background=\'#e8eaf6\'" onmouseout="this.style.background=\'#fff\'">'
                   + '<span style="font-weight:700;color:#7C3AED">' + custEscape(c.name || c.partyId) + '</span>'
                   + (c.phone ? '<span style="font-size:13px;color:#777;white-space:nowrap">' + custEscape(c.phone) + '</span>' : '')
                   + '</div>';
@@ -1509,7 +1531,7 @@ window._posOffline = (function() {
         ov.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;z-index:999999;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center';
         var tabBtn = 'flex:1;padding:10px;border:none;font-weight:700;font-size:14px;cursor:pointer';
         ov.innerHTML = '<div style="background:#fff;border-radius:16px;width:440px;max-width:92vw;max-height:92vh;overflow:auto;box-shadow:0 12px 48px rgba(0,0,0,0.3)">'
-            + '<div style="padding:18px 20px;background:#2e7d32;color:#fff;text-align:center;font-size:17px;font-weight:700">Settle Credit — #'+bill.billNo+'</div>'
+            + '<div style="padding:18px 20px;background:#2e7d32;color:#fff;text-align:center;font-size:17px;font-weight:700">Settle Credit — #'+histEsc(bill.billNo)+'</div>'
             + '<div style="padding:20px 24px">'
             + '<div style="font-size:13px;color:#555;margin-bottom:6px">'+bill.customer+(bill.phone?' · '+bill.phone:'')+'</div>'
             + '<div style="display:flex;justify-content:space-between;font-size:14px;margin-bottom:14px"><span>Outstanding</span><span style="font-weight:800;color:#c62828">₹'+creditFmt(outstanding)+'</span></div>'
@@ -1628,6 +1650,8 @@ window._posOffline = (function() {
 })();
 
 window.posPayCash = function(form) {
+    if (window._posCommitEdits && !window._posCommitEdits()) return false;
+    if (window._posWaitForEdits && window._posWaitForEdits(form)) return false;
     if (form.dataset.posPaymentConfirmed === '1') return true;
     // Cash tender modal: quick denomination buttons + editable amount + live change.
     // Defensive: any script error must NOT block checkout -> fall through to a normal exact-amount submit.
@@ -1709,6 +1733,8 @@ window.posPayCash = function(form) {
 };
 
 window.posPayDigital = function(form) {
+    if (window._posCommitEdits && !window._posCommitEdits()) return false;
+    if (window._posWaitForEdits && window._posWaitForEdits(form)) return false;
     if (form.dataset.posPaymentConfirmed === '1') return true;
     // Card / UPI confirmation gate. Unlike Cash, these forms submit (and mint the
     // bill) the instant the button is tapped, so a mis-tap or a declined/cancelled
@@ -2674,10 +2700,7 @@ window.posToggleFullscreen = function() {
             });
         }
 
-        // Probe QZ Tray early. A later receipt can retry a failed or disconnected service.
-        setTimeout(function() {
-            qzConnect().catch(function() {});
-        }, 400);
+        // Connect only for an explicit print/setup action; opening billing must not prompt for device access.
 
         function buildReceiptHtml(d, isTax, edited) {
             d=window._posReceiptTextData(d);
@@ -2838,7 +2861,7 @@ window.posToggleFullscreen = function() {
                 var html = buildReceiptHtml(d, isTax, edited);
                 if (typeof qz !== 'undefined') {
                     var connecting = !qz.websocket.isActive() ? showToast('Connecting to QZ Tray. Allow the connection if prompted.', '#7C3AED') : null;
-                    qzPrint(html + '</body></html>', billNum).catch(function(err) {
+                    return qzPrint(html + '</body></html>', billNum).catch(function(err) {
                         if (err === 'cancelled') return;
                         console.warn('QZ Tray did not confirm receipt printing:', err);
                         offerBrowserPrint(html, billNum);
@@ -2850,8 +2873,8 @@ window.posToggleFullscreen = function() {
                 }
             }
             // Live sale passes the receipt data straight from the payment response — no extra fetch.
-            if (preData && preData.success) { render(preData); return; }
-            fetch('Terminal/ajaxCart', {
+            if (preData && preData.success) return render(preData);
+            return fetch('Terminal/ajaxCart', {
                 method: 'POST', headers: {'Content-Type': 'application/x-www-form-urlencoded'},
                 body: new URLSearchParams({action:'receiptData', transactionId: txId, sessionId: SI, taxOn: TO, salesModeId: SM, moquiSessionToken: TK}),
                 credentials: 'same-origin'
@@ -3066,6 +3089,12 @@ window.posToggleFullscreen = function() {
         // Keep stable rows connected: replacing tbody on each tap discarded other line drafts
         // and forced the browser to lay out every control again, even for an unchanged reply.
         function patchCartRows(body, rows) {
+            var active = document.activeElement;
+            var selection = active && active.tagName === 'INPUT' && active.type !== 'number' ? [active.selectionStart, active.selectionEnd] : null;
+            Array.from(body.children).forEach(function(row) {
+                var match = rows.find(function(item) { return item.pid === row.dataset.posProduct && item.mode === row.dataset.posMode; });
+                if (match) row.dataset.posLineKey = match.key;
+            });
             var existing = new Map(), wanted = new Set(rows.map(function(item) { return item.key; }));
             Array.from(body.children).forEach(function(row) {
                 if (wanted.has(row.dataset.posLineKey)) existing.set(row.dataset.posLineKey, row);
@@ -3081,7 +3110,13 @@ window.posToggleFullscreen = function() {
                     Array.from(next.children).forEach(function(cell, index) {
                         cells.push(cell.outerHTML);
                         if (!row.children[index]) row.appendChild(cell);
-                        else if (!row._posCells || row._posCells[index] !== cells[index]) row.replaceChild(cell, row.children[index]);
+                        else if (!row._posCells || row._posCells[index] !== cells[index]) {
+                            if (row.children[index].contains(active) && active.matches('.aj-p,.aj-qi')) {
+                                var replacement = cell.querySelector(active.classList.contains('aj-p') ? '.aj-p' : '.aj-qi');
+                                if (replacement) { active.dataset.seq = replacement.dataset.seq; replacement.replaceWith(active); }
+                            }
+                            row.replaceChild(cell, row.children[index]);
+                        }
                     });
                     while (row.children.length > cells.length) row.lastElementChild.remove();
                     row._posCells = cells;
@@ -3089,10 +3124,15 @@ window.posToggleFullscreen = function() {
                     row.style.borderBottom = '1px solid #e0e0e0';
                 }
                 if (body.children[index] !== row) body.insertBefore(row, body.children[index] || null);
+                row.dataset.posProduct = item.pid || ''; row.dataset.posMode = item.mode || '';
             });
             existing.forEach(function(row) { row.remove(); });
+            if (active && active.isConnected && active.matches('.aj-p,.aj-qi')) {
+                active.focus(); if (selection) try { active.setSelectionRange(selection[0], selection[1]); } catch (ignored) {}
+            }
         }
 
+        var pendingProductFocus = null;
         function renderCart(d) {
             if (cartFrame) { cancelAnimationFrame(cartFrame); cartFrame = 0; }
             if (d && d.cartClosed) { recoverClosedCart(); return; }
@@ -3144,11 +3184,20 @@ window.posToggleFullscreen = function() {
                 h += '<td style="padding:3px 10px;text-align:right;font-size:14px;color:#6B7280;vertical-align:middle">'+Number(it.tax||0).toFixed(3)+'</td>';
                 h += '<td style="padding:3px 10px;text-align:right;font-size:15px;font-weight:700;color:#000;vertical-align:middle">'+fmt2(it.total)+'</td>';
                 h += '<td style="padding:4px 6px;text-align:center;vertical-align:middle"><button data-seq="'+cartText(it.seq)+'" class="aj-rm" style="width:32px;height:32px;border:none;background:#e53935;color:#fff;border-radius:6px;cursor:pointer;font-size:16px;display:flex;align-items:center;justify-content:center;padding:0" title="Remove item">&#10005;</button></td>';
-                rows.push({key:String(it.seq), html:h});
+                rows.push({key:String(it.seq), pid:it.pid, mode:it.mode || SM || '', html:h});
             });
             var _cs = document.getElementById('cartScroll'); var _ps = _cs ? _cs.scrollTop : 0; var _pc = (lastCartData && lastCartData.items) ? lastCartData.items.length : 0;
             if (d.items.length) patchCartRows(tb, rows);
             else tb.innerHTML = h;
+            if (pendingProductFocus) {
+                var selected = d.items.findIndex(function(item) { return item.pid === pendingProductFocus; });
+                if (selected >= 0) {
+                    var row = tb.children[selected], rate = row.querySelector('.aj-p');
+                    var field = rate && !rate.readOnly ? rate : row.querySelector('.aj-qi');
+                    if (field) { field.focus(); field.select(); }
+                    pendingProductFocus = null;
+                }
+            }
             if (_cs) { if (d.items.length > _pc) _cs.scrollTop = _cs.scrollHeight; else _cs.scrollTop = _ps; }
             /* ZE-BC-091: after any cart re-render, return focus to the barcode search box so scanning
                survives a qty/price/remove button click (the reported "scanner dead after changing qty
@@ -3195,8 +3244,7 @@ window.posToggleFullscreen = function() {
 
         function lastCompletedMarkup() {
             var bill = document.getElementById('pos-bill-badge');
-            return '<div id="pos-last-completed" style="font-size:13px;color:#777">Last: '
-                + cartText(bill && bill.dataset.sessionLastBill || '-') + ' / '
+            return '<div id="pos-last-completed" style="font-size:13px;color:#777">Last amount: '
                 + cartText(bill && bill.dataset.sessionLastAmount || '0') + '</div>';
         }
 
@@ -3225,8 +3273,7 @@ window.posToggleFullscreen = function() {
                 bill.classList.toggle('nb-billno__new', !bill.dataset.lastBill);
             }
             var lastSummary = document.getElementById('pos-last-completed');
-            if (lastSummary && bill) lastSummary.textContent = 'Last: '
-                + (bill.dataset.sessionLastBill || '-') + ' / ' + (bill.dataset.sessionLastAmount || '0');
+            if (lastSummary && bill) lastSummary.textContent = 'Last amount: ' + (bill.dataset.sessionLastAmount || '0');
             var sourceCount = doc.querySelector('#pos-today-bills');
             var count = document.getElementById('pos-today-bills');
             if (sourceCount && count) {
@@ -3254,10 +3301,21 @@ window.posToggleFullscreen = function() {
             var taxK = 1, tmp = 0;
             var q = [];               // pending server ops (FIFO; qty/price/add coalesced)
             var inflight = false;
+            var syncError = null;
+            var fallbackWork = Promise.resolve();
+            var fallbackPending = 0;
+            function fallbackEdit(params) {
+                fallbackPending++;
+                fallbackWork = fallbackWork.then(function() { return post(params); }).then(function(data) {
+                    if (!data || !data.success) throw new Error(data && data.error || 'The bill edit could not be saved. Reload before taking payment.');
+                    renderCart(data);
+                }).finally(function() { fallbackPending--; });
+                fallbackWork.catch(function(error) { showToast(error.message, '#c62828'); });
+            }
             var idleWaiters = [];
             function notifyIdle() {
                 if (inflight || q.length) return;
-                idleWaiters.splice(0).forEach(function(resolve) { resolve(); });
+                idleWaiters.splice(0).forEach(function(waiter) { if (syncError) waiter.reject(syncError); else waiter.resolve(); });
             }
             var tmpMeta = {};         // tmpSeq -> {pid, mode}  (lines not yet saved server-side)
             var realByTmp = {};       // tmpSeq -> real itemSeqId (filled when its add completes)
@@ -3340,6 +3398,7 @@ window.posToggleFullscreen = function() {
                             if (q.length === 0) renderCart(d);   // unchanged cells retain drafts while totals settle
                         } else {
                             if (d && d.cartClosed) { q.length = 0; recoverClosedCart(); return; }
+                            if (done.action === 'updatePrice' || done.action === 'updateQty') syncError = new Error(d && d.error || 'The bill edit could not be saved. Reload before taking payment.');
                             // server rejected this op (e.g. product has no price in the active sales
                             // mode): undo the purely-optimistic line so the cart can't drift from server.
                             if (done.action === 'addItem' && done.ts) {
@@ -3353,7 +3412,11 @@ window.posToggleFullscreen = function() {
                         drain();
                         notifyIdle();
                     })
-                    .catch(function () { inflight = false; q.shift(); drain(); notifyIdle(); });
+                    .catch(function () {
+                        syncError = new Error('The bill could not be synchronized. Reload before taking payment.');
+                        showToast(syncError.message, '#c62828');
+                        inflight = false; q.shift(); drain(); notifyIdle();
+                    });
             }
             function mergeable(i) { return !(i === 0 && inflight); }
             // Coalesce ONLY with the most-recent pending op on the same line, and
@@ -3375,6 +3438,8 @@ window.posToggleFullscreen = function() {
             }
 
             function doAdd(pid, price, name, uom) {
+                // A deliberate product selection focuses its rate; background additions preserve an active line draft.
+                if (!document.activeElement || !document.activeElement.matches('.aj-p,.aj-qi')) pendingProductFocus = pid;
                 var L = lc();
                 // First item of a fresh bill: no cart/transaction yet. Start a local cart
                 // and render instantly; the addItem goes out with an empty transactionId,
@@ -3428,15 +3493,19 @@ window.posToggleFullscreen = function() {
 
             return {
                 add: function (pid, price, name, uom) { if (cartClearing || modeSwitching) return showToast('Wait for the cart to finish updating', '#c62828'); try { doAdd(pid, price, name, uom); } catch (e) { post({ action: 'addItem', transactionId: TX, productId: pid, unitPrice: price, addQty: 1 }).then(renderCart); } },
-                qty: function (seq, q2) { if (cartClearing || modeSwitching) return showToast('Wait for the cart to finish updating', '#c62828'); try { doQty(seq, q2); } catch (e) { post({ action: Number(q2) <= 0 ? 'removeItem' : 'updateQty', transactionId: TX, itemSeqId: seq, newQty: q2 }).then(renderCart); } },
-                price: function (seq, p2) { if (cartClearing || modeSwitching) return showToast('Wait for the cart to finish updating', '#c62828'); try { doPrice(seq, p2); } catch (e) { post({ action: 'updatePrice', transactionId: TX, itemSeqId: seq, newPrice: p2 }).then(renderCart); } },
+                qty: function (seq, q2) { if (cartClearing || modeSwitching) return showToast('Wait for the cart to finish updating', '#c62828'); try { doQty(seq, q2); } catch (e) { fallbackEdit({ action: 'updateQty', transactionId: TX, itemSeqId: seq, newQty: q2 }); } },
+                price: function (seq, p2) { if (cartClearing || modeSwitching) return showToast('Wait for the cart to finish updating', '#c62828'); try { doPrice(seq, p2); } catch (e) { fallbackEdit({ action: 'updatePrice', transactionId: TX, itemSeqId: seq, newPrice: p2 }); } },
                 remove: function (seq) { if (cartClearing || modeSwitching) return showToast('Wait for the cart to finish updating', '#c62828'); try { doRemove(seq); } catch (e) { post({ action: 'removeItem', transactionId: TX, itemSeqId: seq }).then(renderCart); } },
                 mode: function (seq, m) { if (cartClearing || modeSwitching) return showToast('Wait for the cart to finish updating', '#c62828'); try { doMode(seq, m); } catch (e) { post({ action: 'setItemMode', transactionId: TX, itemSeqId: seq, itemMode: m }).then(renderCart); } },
                 scan: function (code) { if (cartClearing || modeSwitching) return showToast('Wait for the cart to finish updating', '#c62828'); try { doScan(code); } catch (e) { post({ action: 'scanAdd', transactionId: TX, cartSearch: code }).then(function (d) { if (d && !d.success && d.error) alert(d.error); else renderCart(d); }); } },
-                _drainPending: function () { return q.length + (inflight ? 1 : 0); },
+                _drainPending: function () { return q.length + (inflight ? 1 : 0) + fallbackPending; },
                 whenIdle: function () {
-                    if (cartFrame) renderCart(lastCartData);
-                    return (inflight || q.length) ? new Promise(function(resolve) { idleWaiters.push(resolve); }) : Promise.resolve();
+                    if (window._posCommitEdits && !window._posCommitEdits()) return Promise.reject(new Error('Correct the bill rate or quantity before continuing.'));
+                    return fallbackWork.then(function() {
+                        if (cartFrame) renderCart(lastCartData);
+                        if (syncError) return Promise.reject(syncError);
+                        return (inflight || q.length) ? new Promise(function(resolve, reject) { idleWaiters.push({resolve:resolve,reject:reject}); }) : Promise.resolve();
+                    });
                 }
             };
         })();
@@ -3522,7 +3591,47 @@ window.posToggleFullscreen = function() {
 
         /* --- Cart event delegation --- */
         var cart = document.querySelector('.pos-cart');
+        function commitLineInput(input) {
+            if (!input || input.readOnly || !input.matches('.aj-p,.aj-qi')) return true;
+            var raw = input.value.trim(), value = Number(raw), price = input.classList.contains('aj-p');
+            var valid = /^(?:\d+(?:\.\d*)?|\.\d+)$/.test(raw) && Number.isFinite(value) && (price ? value >= 0 : value > 0);
+            input.setCustomValidity(valid ? '' : (price ? 'Enter a valid nonnegative rate.' : 'Enter a quantity greater than zero.'));
+            input.setAttribute('aria-invalid', String(!valid));
+            if (!valid) return false;
+            var line = lastCartData && lastCartData.items.find(function(item) { return String(item.seq) === input.dataset.seq; });
+            var previous = line ? Number(price ? line.price : line.qty) : Number(input.dataset.posSubmitted != null ? input.dataset.posSubmitted : input.defaultValue);
+            if (previous !== value) {
+                if (!line) input.dataset.posSubmitted = String(value);
+                if (price) OPT.price(input.dataset.seq, value); else OPT.qty(input.dataset.seq, value);
+            }
+            return true;
+        }
+        window._posWaitForEdits = function(form) {
+            if (!OPT._drainPending()) return false;
+            var method = form.querySelector('[name=paymentMethod]');
+            method = method && method.value;
+            OPT.whenIdle().then(function() {
+                var updated = Array.from(document.querySelectorAll('form.pos-pay-form')).find(function(candidate) {
+                    var input = candidate.querySelector('[name=paymentMethod]'); return input && input.value === method;
+                });
+                if (!updated) {
+                    updated = form;
+                    var amount = updated.querySelector('[name=amount]'); if (amount) amount.value = lastPay;
+                    if (!updated.isConnected) { updated.hidden = true; document.body.appendChild(updated); }
+                }
+                updated.requestSubmit();
+            }).catch(function(error) { showToast(error.message, '#c62828'); });
+            return true;
+        };
+        window._posCommitEdits = function() {
+            var fields = cart ? cart.querySelectorAll('.aj-p,.aj-qi') : [];
+            for (var i = 0; i < fields.length; i++) {
+                if (!commitLineInput(fields[i])) { fields[i].focus(); fields[i].reportValidity(); return false; }
+            }
+            return true;
+        };
         if (cart) {
+            cart.addEventListener('input', function(e) { commitLineInput(e.target); });
             cart.addEventListener('click', function(e) {
                 var t = e.target.closest ? (e.target.closest('.aj-q,.aj-pb,.aj-rm') || e.target) : e.target;
                 if (t.classList.contains('aj-q')) {
@@ -3546,8 +3655,11 @@ window.posToggleFullscreen = function() {
                 }
             });
             cart.addEventListener('keydown', function(e) {
-                if (e.key === 'Enter' && e.target.classList.contains('aj-p')) { e.preventDefault(); var btn = e.target.nextElementSibling; if (btn) btn.click(); }
-                if (e.key === 'Enter' && e.target.classList.contains('aj-qi')) { e.preventDefault(); e.target.blur(); }
+                if (e.key !== 'Enter' || !e.target.matches('.aj-p,.aj-qi')) return;
+                e.preventDefault();
+                if (!commitLineInput(e.target)) { e.target.reportValidity(); return; }
+                var next = e.target.classList.contains('aj-p') ? e.target.closest('tr').querySelector('.aj-qi') : document.getElementById('cartInlineSearch');
+                if (next) { next.focus(); next.select(); }
             });
             // Typeable quantity (decimals for loose/weighed goods); price auto-recalculates server-side
             cart.addEventListener('change', function(e) {
@@ -3556,9 +3668,16 @@ window.posToggleFullscreen = function() {
                     // Empty/0/NaN (e.g. the box was cleared to retype a decimal) must not delete
                     // the line — revert to the last good qty. Any value > 0 (incl. decimals like
                     // 0.5) keeps the line and recomputes its amount (qty × rate).
-                    if (!(nq > 0)) { if (lastCartData) renderCart(lastCartData); else e.target.value = e.target.defaultValue; return; }
-                    OPT.qty(e.target.dataset.seq, nq);
+                    if (!(nq > 0)) {
+                        var savedItem = lastCartData && lastCartData.items.find(function(item) { return String(item.seq) === String(e.target.dataset.seq); });
+                        e.target.value = savedItem ? savedItem.qty : e.target.defaultValue;
+                        e.target.setCustomValidity(''); e.target.removeAttribute('aria-invalid');
+                        if (lastCartData) renderCart(lastCartData);
+                        return;
+                    }
+                    commitLineInput(e.target);
                 }
+                if (e.target.classList.contains('aj-p')) commitLineInput(e.target);
                 if (e.target.classList.contains('aj-mode')) {
                     OPT.mode(e.target.dataset.seq, e.target.value);
                 }
@@ -3972,7 +4091,15 @@ window.posToggleFullscreen = function() {
             var form = e.target.closest ? e.target.closest('form') : null;
             if (!form) return;
             var act = form.getAttribute('action') || '';
-            if (act.indexOf('holdSale') !== -1) return;
+            if (act.indexOf('holdSale') !== -1) {
+                e.preventDefault(); e.stopImmediatePropagation();
+                OPT.whenIdle().then(function() {
+                    var id = form.querySelector('[name=transactionId]'); if (id) id.value = TX;
+                    if (!form.isConnected) { form.hidden = true; document.body.appendChild(form); }
+                    HTMLFormElement.prototype.submit.call(form);
+                }).catch(function(error) { showToast(error.message, '#c62828'); });
+                return;
+            }
             if (act.indexOf('recallSale') !== -1) {
                 e.preventDefault(); e.stopImmediatePropagation();
                 HTMLFormElement.prototype.submit.call(form);
