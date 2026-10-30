@@ -450,8 +450,16 @@ window._posOffline = (function() {
 (function() {
     function piEsc(x){return String(x==null?'':x).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
 
-    function piTok(){ try{ if(window.moqui&&window.moqui.webrootVue&&window.moqui.webrootVue.moquiSessionToken) return window.moqui.webrootVue.moquiSessionToken; }catch(e){} return ''; }
-    function piPost(url, params){ var p=new URLSearchParams(); for(var k in params){ p.append(k, params[k]==null?'':params[k]); } p.append('moquiSessionToken', piTok()); return fetch(url,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p,credentials:'same-origin'}).then(function(r){return r.json();}); }
+    function piTok(){ var token=document.getElementById('pi-token'); if(token && token.value) return token.value; try{ if(window.moqui&&window.moqui.webrootVue&&window.moqui.webrootVue.moquiSessionToken) return window.moqui.webrootVue.moquiSessionToken; }catch(e){} return ''; }
+    function piPost(url, params){
+        var token=piTok();
+        if(!token) return Promise.reject(new Error('Your session is unavailable. Refresh the page and try again.'));
+        var p=new URLSearchParams(); for(var k in params){ p.append(k, params[k]==null?'':params[k]); } p.append('moquiSessionToken', token);
+        return fetch(url,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p,credentials:'same-origin'}).then(function(r){
+            if(!r.ok) throw new Error('Request failed (HTTP '+r.status+'). Refresh the page and try again.');
+            return r.json();
+        });
+    }
     function g(id){ return document.getElementById(id); }
     var FIELDS = ['pi-sku','pi-name','pi-description','pi-listPrice','pi-mrp','pi-productTaxCode','pi-reorderPoint','pi-reorderQuantity','pi-expiryDate','pi-unit'];
     function wire(){
@@ -491,9 +499,9 @@ window._posOffline = (function() {
                 sv.disabled=true; var ot=sv.innerHTML; sv.textContent='Saving...';
                 piPost('ProductImport/addSingleProduct',{sku:g('pi-sku').value.trim(), productName:name, description:g('pi-description').value.trim(), listPrice:g('pi-listPrice').value.trim(), mrp:g('pi-mrp').value.trim(), productTaxCode:g('pi-productTaxCode').value.trim(), reorderPoint:g('pi-reorderPoint').value.trim(), reorderQuantity:g('pi-reorderQuantity').value.trim(), expiryDate:(g('pi-expiryDate')?g('pi-expiryDate').value.trim():''), unit:(g('pi-unit')?g('pi-unit').value:'')}).then(function(d){
                     sv.disabled=false; sv.innerHTML=ot;
-                    if(d&&d.success){ resEl.innerHTML='<span style="color:#2e7d32;font-weight:700">✔ Product '+(d.created?'added':'updated')+': '+d.name+'</span>'; FIELDS.forEach(function(id){ g(id).value=''; }); setMode(''); }
-                    else { resEl.innerHTML='<span style="color:#e53935">'+((d&&d.error)||'Error')+'</span>'; }
-                }).catch(function(e){ sv.disabled=false; sv.innerHTML=ot; resEl.innerHTML='<span style="color:#e53935">'+e.message+'</span>'; });
+                    if(d&&d.success){ resEl.innerHTML='<span style="color:#2e7d32;font-weight:700">✔ Product '+(d.created?'added':'updated')+': '+piEsc(d.name)+'</span>'; FIELDS.forEach(function(id){ g(id).value=''; }); setMode(''); }
+                    else { resEl.innerHTML='<span style="color:#e53935">'+piEsc((d&&d.error)||'Error')+'</span>'; }
+                }).catch(function(e){ sv.disabled=false; sv.innerHTML=ot; resEl.innerHTML='<span style="color:#e53935">'+piEsc(e.message)+'</span>'; });
             });
         }
         // CSV bulk import (file read client-side or paste)
@@ -505,12 +513,13 @@ window._posOffline = (function() {
                 cbtn.disabled=true; var ot=cbtn.innerHTML; cbtn.textContent='Importing...';
                 piPost('ProductImport/importProducts',{csvText:txt}).then(function(d){
                     cbtn.disabled=false; cbtn.innerHTML=ot;
-                    if(d&&d.success){ var h='<span style="color:#2e7d32;font-weight:700">✔ Imported/updated '+d.imported+', skipped '+d.skipped+'</span>'; if(d.errors&&d.errors.length){ h+='<div style="color:#e65100;font-size:12px;margin-top:6px">'+d.errors.join('<br>')+'</div>'; } cres.innerHTML=h; }
-                    else { cres.innerHTML='<span style="color:#e53935">'+((d&&d.error)||'Import failed')+'</span>'; }
-                }).catch(function(e){ cbtn.disabled=false; cbtn.innerHTML=ot; cres.innerHTML='<span style="color:#e53935">'+e.message+'</span>'; });
+                    if(d&&d.success){ var h='<span style="color:#2e7d32;font-weight:700">✔ Imported/updated '+d.imported+', skipped '+d.skipped+'</span>'; if(d.errors&&d.errors.length){ h+='<div style="color:#e65100;font-size:12px;margin-top:6px">'+d.errors.map(piEsc).join('<br>')+'</div>'; } cres.innerHTML=h; }
+                    else { cres.innerHTML='<span style="color:#e53935">'+piEsc((d&&d.error)||'Import failed')+'</span>'; }
+                }).catch(function(e){ cbtn.disabled=false; cbtn.innerHTML=ot; cres.innerHTML='<span style="color:#e53935">'+piEsc(e.message)+'</span>'; });
             });
         }
     }
+    wire();
     setInterval(wire, 600);
 })();
 
