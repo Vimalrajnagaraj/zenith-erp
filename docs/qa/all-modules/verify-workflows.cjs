@@ -95,15 +95,31 @@ async function scenario(name,fn){try{await fn();}catch(error){check(name,false,{
   });
   let leadId;
   await scenario('CRM lead lifecycle',async()=>{
-   const r=await a.invoke('lead.create',{organizationPartyId:'AUDIT_QA_B',firstName:'Disposable lead A',email:'LEAD.A@EXAMPLE.COM',estimatedAmount:'100',rating:'Warm'});leadId=r.result?.leadId;
+   const r=await a.invoke('lead.create',{organizationPartyId:'AUDIT_QA_B',firstName:'Disposable lead A',email:'LEAD.A@EXAMPLE.COM',estimatedAmount:'100',rating:'Warm',leadSourceId:'Instagram',sourceDetail:'Disposable campaign link',utmSource:'instagram',utmMedium:'social',externalSubmissionId:'audit-lead-a'});leadId=r.result?.leadId;
    const row=leadId?q(`SELECT * FROM lead WHERE lead_id=${quote(leadId)}`)[0]:null;
    check('CRM: create ignores foreign owner input and normalizes email',row?.organization_party_id==='AUDIT_QA_A'&&row?.email==='lead.a@example.com',{errors:r.errors,httpStatus:r.httpStatus});
    if(!leadId)return;
+   check('CRM: original source and UTM are stored',row.lead_source_id==='Instagram'&&row.first_touch_source_id==='Instagram'&&row.utm_source==='instagram'&&row.utm_medium==='social');
+   const retry=await a.invoke('lead.create',{firstName:'Disposable lead A',leadSourceId:'Instagram',externalSubmissionId:'audit-lead-a'});
+   check('CRM: intake retry returns the original lead',retry.result?.leadId===leadId&&count('lead_submission',"organization_party_id='AUDIT_QA_A' AND external_submission_id='audit-lead-a'")===1);
+   await a.invoke('lead.touch',{leadId,touchId:'audit-touch-1',leadSourceId:'YouTube',utmSource:'youtube'});
+   await a.invoke('lead.touch',{leadId,touchId:'audit-touch-1',leadSourceId:'YouTube',utmSource:'youtube'});
+   const touched=q(`SELECT first_touch_source_id,latest_touch_source_id FROM lead WHERE lead_id=${quote(leadId)}`)[0];
+   check('CRM: later touch preserves original source and retry does not duplicate',touched.first_touch_source_id==='Instagram'&&touched.latest_touch_source_id==='YouTube'&&count('lead_touch',`lead_id=${quote(leadId)}`)===1);
    await a.invoke('lead.update',{leadId,firstName:'Disposable updated lead'});
    check('CRM: partial lead update persists',q(`SELECT first_name FROM lead WHERE lead_id=${quote(leadId)}`)[0]?.first_name==='Disposable updated lead');
    const before=count('crm_activity',"organization_party_id='AUDIT_QA_A'");
    await a.invoke('activity.log',{leadId,activityType:'Call',subject:'Disposable call',durationMinutes:'5'});
    check('CRM: valid activity persists and advances New → Contacted',count('crm_activity',"organization_party_id='AUDIT_QA_A'")===before+1&&q(`SELECT status_id FROM lead WHERE lead_id=${quote(leadId)}`)[0]?.status_id==='LeadContacted');
+   const dueDate=new Date(Date.now()+86400000).toISOString();
+   const scheduled=await a.invoke('activity.schedule',{leadId,activityType:'Task',subject:'Disposable follow-up',dueDate,externalSubmissionId:'audit-activity-a'});
+   const activityId=scheduled.result?.activityId;
+   await a.invoke('activity.schedule',{leadId,activityType:'Task',subject:'Disposable follow-up',dueDate,externalSubmissionId:'audit-activity-a'});
+   check('CRM: scheduled activity retry creates one task',!!activityId&&count('activity_submission',"organization_party_id='AUDIT_QA_A' AND external_submission_id='audit-activity-a'")===1&&count('crm_activity',`activity_id=${quote(activityId)}`)===1,{errors:scheduled.errors});
+   if(activityId){
+    const completed=await a.invoke('activity.complete',{activityId,outcome:'Connected',description:'Discussed next steps'});
+    check('CRM: completed activity keeps outcome and timestamp',!completed.errors?.length&&q(`SELECT status_id,outcome,completed_date FROM crm_activity WHERE activity_id=${quote(activityId)}`)[0]?.status_id==='Completed'&&!!q(`SELECT completed_date FROM crm_activity WHERE activity_id=${quote(activityId)}`)[0]?.completed_date,{errors:completed.errors});
+   }
    await a.invoke('lead.update',{leadId,statusId:'LeadQualified'});
    const converted=await a.invoke('lead.convert',{leadId,createOpportunity:'Y'});
    check('CRM: qualified lead converts to one owned contact and opportunity',!!converted.result?.partyId&&!!converted.result?.salesOpportunityId&&q(`SELECT status_id FROM lead WHERE lead_id=${quote(leadId)}`)[0]?.status_id==='LeadConverted',{errors:converted.errors,httpStatus:converted.httpStatus});
@@ -119,7 +135,7 @@ async function scenario(name,fn){try{await fn();}catch(error){check(name,false,{
    const id=created.result?.salesOpportunityId;
    check('CRM: owned opportunity persists in pipeline',!!id&&q(`SELECT organization_party_id FROM sales_opportunity WHERE sales_opportunity_id=${quote(id)}`)[0]?.organization_party_id==='AUDIT_QA_A');
    if(id){
-    await a.invoke('opportunity.advance',{salesOpportunityId:id,opportunityStageId:'SoClosedWon'});
+    await a.invoke('opportunity.advance',{salesOpportunityId:id,opportunityStageId:'SoClosedWon',confirmOutcome:'Y'});
     const won=q(`SELECT * FROM sales_opportunity WHERE sales_opportunity_id=${quote(id)}`)[0];
     check('CRM: won stage records full expected revenue',won.opportunity_stage_id==='SoClosedWon'&&Number(won.expected_revenue)===100);
     const rejected=await a.invoke('opportunity.advance',{salesOpportunityId:id,opportunityStageId:'SoClosedLost'});
@@ -127,7 +143,7 @@ async function scenario(name,fn){try{await fn();}catch(error){check(name,false,{
    }
   });
   await scenario('CRM segment workflow',async()=>{
-   const created=await a.invoke('segment.create',{segmentName:'Disposable manual segment',segmentTypeEnumId:'CstCustom'});const id=created.result?.segmentId;
+   const created=await a.invoke('segment.create',{segmentName:'Disposable manual segment',segmentTypeEnumId:'CstStatic'});const id=created.result?.segmentId;
    check('CRM: own manual segment persists',!!id&&q(`SELECT organization_party_id FROM customer_segment WHERE segment_id=${quote(id)}`)[0]?.organization_party_id==='AUDIT_QA_A');
    if(id){
     await a.post('Crm/EditSegment/addMember',{segmentId:id,partyId:'AUDIT_QA_CUST_A'});
@@ -137,6 +153,16 @@ async function scenario(name,fn){try{await fn();}catch(error){check(name,false,{
     await a.post('Crm/EditSegment/removeMember',{segmentId:id,partyId:'AUDIT_QA_CUST_A'});
     check('CRM: manual membership removal updates count',count('segment_member',`segment_id=${quote(id)}`)===0&&Number(q(`SELECT member_count FROM customer_segment WHERE segment_id=${quote(id)}`)[0]?.member_count)===0);
    }
+  });
+  await scenario('CRM dynamic source segment',async()=>{
+   const contactId=leadId?q(`SELECT converted_party_id FROM lead WHERE lead_id=${quote(leadId)}`)[0]?.converted_party_id:null;
+   if(!contactId){check('CRM: dynamic source segment has a converted contact',false);return;}
+   const created=await a.invoke('segment.create',{segmentName:'Disposable Instagram customers',segmentTypeEnumId:'CstDynamic'});
+   const segmentId=created.result?.segmentId;
+   if(!segmentId){check('CRM: dynamic source segment created',false,{errors:created.errors});return;}
+   const rule=await a.invoke('segment.addRule',{segmentId,criteriaTypeEnumId:'SctLeadSource',operator:'eq',fieldValue:'Instagram'});
+   const member=q(`SELECT * FROM segment_member WHERE segment_id=${quote(segmentId)} AND party_id=${quote(contactId)}`)[0];
+   check('CRM: dynamic segment matches original source after a later YouTube touch',!rule.errors?.length&&!!member&&Number(q(`SELECT member_count FROM customer_segment WHERE segment_id=${quote(segmentId)}`)[0]?.member_count)===1,{errors:rule.errors});
   });
   const foreignLead=q("SELECT * FROM lead WHERE lead_id='AUDIT_QA_LEAD_B'");
   const denied=await a.invoke('lead.update',{leadId:'AUDIT_QA_LEAD_B',firstName:'Rejected A update'});

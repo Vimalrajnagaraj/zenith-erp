@@ -34,8 +34,16 @@ const PATHS = [
   '/apps/zenith/Crm/Dashboard',
   '/apps/zenith/Crm/Leads',
   '/apps/zenith/Crm/Pipeline',
+  '/apps/zenith/Crm/Pipeline?period=all',
+  '/apps/zenith/Crm/Pipeline?searchText=__qa_no_match__',
   '/apps/zenith/Crm/Activities',
+  '/apps/zenith/Crm/Activities?period=all',
   '/apps/zenith/Crm/Segments',
+  '/apps/zenith/Crm/Contacts',
+  '/apps/zenith/Crm/SourcesCampaigns',
+  '/apps/zenith/Crm/Reports',
+  '/apps/zenith/Crm/ImportLeads',
+  '/apps/zenith/Crm/CrmSettings',
   '/apps/zenith/Dashboard',
   '/apps/zenith/Inventory/InventoryDashboard',
   '/apps/zenith/Inventory/InventoryDashboard?dateMode=all',
@@ -48,8 +56,16 @@ const PATHS = [
   '/qapps/zenith/Crm/Dashboard',
   '/qapps/zenith/Crm/Leads',
   '/qapps/zenith/Crm/Pipeline',
+  '/qapps/zenith/Crm/Pipeline?period=all',
+  '/qapps/zenith/Crm/Pipeline?searchText=__qa_no_match__',
   '/qapps/zenith/Crm/Activities',
+  '/qapps/zenith/Crm/Activities?period=all',
   '/qapps/zenith/Crm/Segments',
+  '/qapps/zenith/Crm/Contacts',
+  '/qapps/zenith/Crm/SourcesCampaigns',
+  '/qapps/zenith/Crm/Reports',
+  '/qapps/zenith/Crm/ImportLeads',
+  '/qapps/zenith/Crm/CrmSettings',
   '/qapps/zenith/Inventory/InventoryDashboard',
   '/qapps/zenith/Inventory/InventoryDashboard?dateMode=all',
   '/qapps/zenith/Inventory/DashboardDetails?listType=movements',
@@ -59,6 +75,8 @@ const PATHS = [
 
 const ERR_SIG = /(java\.lang\.|groovy\.lang\.|org\.moqui\.\w+Exception|freemarker\.core|ScreenRenderException|Error rendering|500 Internal Server Error|HTTP Status 500)/i;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+const CRM_SCREENS = ['Dashboard', 'Leads', 'Pipeline', 'Activities', 'Segments', 'Contacts', 'SourcesCampaigns', 'Reports', 'ImportLeads', 'CrmSettings'];
+const CRM_WIDTHS = [390, 768, 1024, 1280, 1440];
 
 const browser = await puppeteer.launch({
   headless: 'new',
@@ -85,13 +103,34 @@ try {
         if (path.includes('/Crm/Dashboard')) {
           await page.waitForSelector('.zcrm-dashboard-metrics', { timeout: 15000 });
           const count = await page.$$eval('.zcrm-dashboard-metrics .zcrm-metric', cards => cards.length);
-          if (count !== 4) throw new Error(`CRM dashboard rendered ${count} metric cards instead of four`);
+          if (count !== 6) throw new Error(`CRM dashboard rendered ${count} metric cards instead of six`);
         }
         if (path.includes('/Crm/Leads')) {
           await page.waitForSelector('.zcrm-lead-metrics', { timeout: 15000 });
           const count = await page.$$eval('.zcrm-lead-metrics .zcrm-metric', cards => cards.length);
           if (count !== 4 || !(await page.$('.zcrm-leads-directory'))) {
             throw new Error('CRM lead metrics or directory did not render');
+          }
+        }
+        if (['Pipeline', 'Activities', 'Segments'].some(screen => path.includes(`/Crm/${screen}`))) {
+          await page.waitForSelector('.zcrm-reference-metrics', { timeout: 15000 });
+          const count = await page.$$eval('.zcrm-reference-metrics .zcrm-metric', cards => cards.length);
+          if (count !== 4) throw new Error(`CRM screen rendered ${count} metric cards instead of four`);
+          if (path.includes('/Crm/Pipeline')) {
+            await page.waitForSelector('.zcrm-board', { timeout: 15000 });
+            const stages = await page.$$eval('.zcrm-board-column', columns => columns.length);
+            if (stages < 5) throw new Error(`CRM pipeline rendered only ${stages} open stages`);
+            if (path.includes('searchText=__qa_no_match__')) {
+              const deals = await page.$$eval('.zcrm-deal-card', cards => cards.length);
+              if (deals !== 0) throw new Error('CRM pipeline search did not filter all cards');
+            }
+          } else if (!(await page.$('.zcrm-reference-list'))) {
+            throw new Error('CRM activity or segment list did not render');
+          }
+          if (path.includes('period=all')) {
+            const expected = path.includes('/Crm/Pipeline') ? 'Closing All Time' : 'All time';
+            const text = await page.$eval('.zcrm-reference-metrics', element => element.innerText);
+            if (!text.includes(expected)) throw new Error(`CRM period filter did not show ${expected}`);
           }
         }
       }
@@ -145,17 +184,21 @@ try {
   // every dashboard widget. These checks use the same synthetic staging tenant.
   for (const surface of ['apps', 'qapps']) {
     await page.setViewport({ width: 390, height: 844 });
-    for (const screen of ['Dashboard', 'Leads']) {
+    for (const screen of CRM_SCREENS) {
       const path = `/${surface}/zenith/Crm/${screen}`;
       try {
         await page.goto(BASE + path, { waitUntil: 'networkidle2', timeout: 60000 });
         await page.waitForSelector('.zcrm-page', { timeout: 15000 });
-        const overflow = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth + 2);
-        if (overflow) throw new Error('horizontal page overflow at 390px');
-        console.log(`PASS  CRM ${surface} ${screen} mobile`);
+        for (const width of CRM_WIDTHS) {
+          await page.setViewport({ width, height: 844 });
+          const overflow = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth + 2);
+          if (overflow) throw new Error(`horizontal page overflow at ${width}px`);
+        }
+        console.log(`PASS  CRM ${surface} ${screen} at ${CRM_WIDTHS.join(', ')}px`);
+        await page.setViewport({ width: 390, height: 844 });
       } catch (error) {
         failures++;
-        console.log(`FAIL  CRM ${surface} ${screen} mobile — ${error.message}`);
+        console.log(`FAIL  CRM ${surface} ${screen} responsive — ${error.message}`);
       }
     }
     try {
@@ -176,6 +219,236 @@ try {
     }
   }
   await page.setViewport({ width: 1400, height: 1000 });
+
+  // A disposable write verifies the actual service path, source badge and retry key.
+  let sourceSmokeEmail;
+  try {
+    await page.goto(`${BASE}/apps/zenith/Crm/Leads?period=all`, { waitUntil: 'networkidle2', timeout: 60000 });
+    const email = `crm-smoke-${Date.now()}@example.test`;
+    const created = await page.evaluate(async email => {
+      const form = document.getElementById('NewLeadForm') || document.querySelector('form[name="NewLeadForm"]');
+      if (!form) throw new Error('New Lead form is missing');
+      const data = new FormData(form);
+      data.set('firstName', 'Disposable CRM smoke');
+      data.set('email', email);
+      data.set('leadSourceId', 'Instagram');
+      data.set('sourceDetail', 'CI attribution check');
+      data.set('utmSource', 'instagram');
+      data.set('externalSubmissionId', `ci:${email}`);
+      const result = [];
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const response = await fetch(form.action, { method: 'POST', body: data, credentials: 'same-origin' });
+        const html = await response.text();
+        result.push({ status: response.status, error: /Possible duplicate|Choose an active lead source|Error rendering|First name is required/.exec(html)?.[0] || '' });
+      }
+      return result;
+    }, email);
+    if (created.some(result => result.status !== 200 || result.error)) {
+      throw new Error(`create/retry failed: ${JSON.stringify(created)}`);
+    }
+    await page.goto(`${BASE}/apps/zenith/Crm/Leads?period=all`, { waitUntil: 'networkidle2', timeout: 60000 });
+    const rows = await page.$$eval('tr', (tableRows, expected) => tableRows.filter(row => row.textContent.includes(expected)).map(row => row.textContent), email);
+    if (rows.length !== 1 || !rows[0].includes('Instagram')) {
+      throw new Error(`expected one Instagram lead after retry, found ${rows.length} matching rows`);
+    }
+    sourceSmokeEmail = email;
+    console.log('PASS  CRM source capture and idempotent lead retry');
+  } catch (error) {
+    failures++;
+    console.log(`FAIL  CRM source capture and idempotent lead retry — ${error.message}`);
+  }
+
+  try {
+    if (!sourceSmokeEmail) throw new Error('source lead was not created');
+    await page.goto(`${BASE}/apps/zenith/Crm/Reports?period=all`, { waitUntil: 'networkidle2', timeout: 60000 });
+    const hrefs = await page.evaluate(() => ({
+      original: document.querySelector('a[href*="firstTouchSourceId=Instagram"]')?.href,
+      latest: document.querySelector('a[href*="latestTouchSourceId=Instagram"]')?.href,
+    }));
+    if (!hrefs.original || !hrefs.latest) throw new Error('original or latest source drill-down is missing');
+    for (const href of Object.values(hrefs)) {
+      await page.goto(href, { waitUntil: 'networkidle2', timeout: 60000 });
+      const present = await page.$$eval('tr', (rows, email) => rows.some(row => row.textContent.includes(email)), sourceSmokeEmail);
+      if (!present) throw new Error(`source lead is absent from ${href}`);
+    }
+    console.log('PASS  CRM original and latest source report drill-down');
+  } catch (error) {
+    failures++;
+    console.log(`FAIL  CRM original and latest source report drill-down — ${error.message}`);
+  }
+
+  try {
+    await page.goto(`${BASE}/apps/zenith/Crm/SourcesCampaigns`, { waitUntil: 'networkidle2', timeout: 60000 });
+    const campaignName = `Disposable CRM campaign ${Date.now()}`;
+    const posted = await page.evaluate(async name => {
+      const form = document.getElementById('NewCampaignForm') || document.querySelector('form[name="NewCampaignForm"]');
+      if (!form) throw new Error('New Campaign form is missing');
+      const data = new FormData(form);
+      data.set('campaignName', name);
+      data.set('leadSourceId', 'Instagram');
+      data.set('medium', 'social');
+      const response = await fetch(form.action, { method: 'POST', body: data, credentials: 'same-origin' });
+      return response.status;
+    }, campaignName);
+    if (posted !== 200) throw new Error(`campaign create returned HTTP ${posted}`);
+    await page.goto(`${BASE}/apps/zenith/Crm/SourcesCampaigns`, { waitUntil: 'networkidle2', timeout: 60000 });
+    const campaignId = await page.evaluate(name => {
+      const options = [...document.querySelectorAll('select[name="trackingCampaignId"] option')];
+      return options.find(option => option.textContent.trim() === name)?.value;
+    }, campaignName);
+    if (!campaignId) throw new Error('new campaign is absent from the tracking-link builder');
+    const destination = 'https://example.test/signup?existing=a%26b#section';
+    const query = new URLSearchParams({ trackingCampaignId: campaignId, destinationUrl: destination, utmContent: 'autumn offer' });
+    await page.goto(`${BASE}/apps/zenith/Crm/SourcesCampaigns?${query}`, { waitUntil: 'networkidle2', timeout: 60000 });
+    const tracked = await page.$eval('.zcrm-tracking-url', element => element.textContent.trim());
+    const url = new URL(tracked);
+    if (url.hash !== '#section' || url.searchParams.get('existing') !== 'a&b' ||
+        url.searchParams.get('utm_source') !== 'instagram' ||
+        url.searchParams.get('utm_medium') !== 'social' ||
+        url.searchParams.get('utm_content') !== 'autumn offer' ||
+        url.searchParams.get('crm_campaign_id') !== campaignId || !(await page.$('.zcrm-copy-link'))) {
+      throw new Error('tracking URL lost the destination, UTM values or copy action');
+    }
+    console.log('PASS  CRM campaign tracking URL and copy action');
+  } catch (error) {
+    failures++;
+    console.log(`FAIL  CRM campaign tracking URL and copy action — ${error.message}`);
+  }
+
+  try {
+    await page.goto(`${BASE}/apps/zenith/Crm/Pipeline`, { waitUntil: 'networkidle2', timeout: 60000 });
+    const name = `Disposable CRM opportunity ${Date.now()}`;
+    const posted = await page.evaluate(async name => {
+      const form = document.getElementById('NewOppForm') || document.querySelector('form[name="NewOppForm"]');
+      if (!form) throw new Error('New Opportunity form is missing');
+      const data = new FormData(form);
+      data.set('opportunityName', name);
+      data.set('opportunityStageId', 'SoProspecting');
+      data.set('estimatedAmount', '100');
+      const response = await fetch(form.action, { method: 'POST', body: data, credentials: 'same-origin' });
+      return response.status;
+    }, name);
+    if (posted !== 200) throw new Error(`opportunity create returned HTTP ${posted}`);
+    await page.goto(`${BASE}/apps/zenith/Crm/Pipeline?period=all`, { waitUntil: 'networkidle2', timeout: 60000 });
+    const cardId = await page.evaluate(name => [...document.querySelectorAll('.zcrm-deal-card')]
+      .find(card => card.textContent.includes(name))?.id, name);
+    if (!cardId) throw new Error('new opportunity is absent from the board');
+    const dealId = cardId.slice('crm-deal-'.length).replace(/(?:_\d+)+$/, '');
+    const before = await page.$eval(`#${cardId}`, card => card.closest('.zcrm-board-column')?.id);
+    if (!before?.startsWith('crm-stage-SoProspecting')) throw new Error(`new opportunity started in ${before}`);
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }),
+      page.evaluate(id => {
+        const card = document.getElementById(id);
+        const target = document.querySelector('[id^="crm-stage-SoQualification"]');
+        if (!card?.draggable || !target) throw new Error('drag handle or target stage is missing');
+        const dataTransfer = new DataTransfer();
+        card.dispatchEvent(new DragEvent('dragstart', { bubbles: true, dataTransfer }));
+        target.dispatchEvent(new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer }));
+        target.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer }));
+      }, cardId),
+    ]);
+    await page.goto(`${BASE}/apps/zenith/Crm/Pipeline?period=all`, { waitUntil: 'networkidle2', timeout: 60000 });
+    const after = await page.evaluate(name => [...document.querySelectorAll('.zcrm-deal-card')]
+      .find(card => card.textContent.includes(name))?.closest('.zcrm-board-column')?.id, name);
+    if (!after?.startsWith('crm-stage-SoQualification')) throw new Error(`drag stage did not persist: ${after}`);
+    await page.goto(`${BASE}/apps/zenith/Crm/EditOpportunity?salesOpportunityId=${encodeURIComponent(dealId)}`, { waitUntil: 'networkidle2', timeout: 60000 });
+    if (!(await page.$eval('body', body => body.innerText.includes('SoProspecting') && body.innerText.includes('SoQualification')))) {
+      throw new Error('stage-change history is missing');
+    }
+    console.log('PASS  CRM pipeline drag, persistence and stage audit');
+  } catch (error) {
+    failures++;
+    console.log(`FAIL  CRM pipeline drag, persistence and stage audit — ${error.message}`);
+  }
+
+  try {
+    await page.goto(`${BASE}/apps/zenith/Crm/Activities`, { waitUntil: 'networkidle2', timeout: 60000 });
+    const subject = `Disposable CRM follow-up ${Date.now()}`;
+    const posted = await page.evaluate(async subject => {
+      const form = document.getElementById('ScheduleActivityForm') || document.querySelector('form[name="ScheduleActivityForm"]');
+      if (!form) throw new Error('Schedule Activity form is missing');
+      const data = new FormData(form);
+      data.set('activityType', 'Task');
+      data.set('subject', subject);
+      data.set('dueDate', new Date(Date.now() - 86400000).toISOString().slice(0, 19).replace('T', ' '));
+      data.set('priority', 'High');
+      const response = await fetch(form.action, { method: 'POST', body: data, credentials: 'same-origin' });
+      const html = await response.text();
+      const match = /could not be converted|CRM write access is required|Error rendering/i.exec(html);
+      return { status: response.status, error: match ? html.slice(Math.max(0, match.index - 100), match.index + 500).replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ') : '' };
+    }, subject);
+    if (posted.status !== 200 || posted.error) throw new Error(`activity schedule failed: ${JSON.stringify(posted)}`);
+    await page.goto(`${BASE}/apps/zenith/Crm/Activities?period=all`, { waitUntil: 'networkidle2', timeout: 60000 });
+    const allRow = await page.evaluate(subject => [...document.querySelectorAll('tr')]
+      .find(row => row.textContent.includes(subject))?.innerText, subject);
+    if (!allRow) throw new Error('new activity is absent from All after scheduling');
+    await page.goto(`${BASE}/apps/zenith/Crm/Activities?view=overdue`, { waitUntil: 'networkidle2', timeout: 60000 });
+    const detailHref = await page.evaluate(subject => [...document.querySelectorAll('tr')]
+      .find(row => row.textContent.includes(subject))?.querySelector('a[href*="ActivityDetail"]')?.href, subject);
+    if (!detailHref) throw new Error(`new activity is absent from Overdue; All row was ${allRow.replace(/\s+/g, ' ')}`);
+    await page.goto(detailHref, { waitUntil: 'networkidle2', timeout: 60000 });
+    const completed = await page.evaluate(async () => {
+      const form = document.getElementById('CompleteActivityForm') || document.querySelector('form[name="CompleteActivityForm"]');
+      if (!form) throw new Error('Complete Activity form is missing');
+      const data = new FormData(form);
+      data.set('outcome', 'Contacted');
+      data.set('description', 'Disposable staging follow-up completed');
+      data.set('durationMinutes', '5');
+      const response = await fetch(form.action, { method: 'POST', body: data, credentials: 'same-origin' });
+      return response.status;
+    });
+    if (completed !== 200) throw new Error(`activity completion returned HTTP ${completed}`);
+    await page.goto(detailHref, { waitUntil: 'networkidle2', timeout: 60000 });
+    const detail = await page.$eval('body', body => body.innerText);
+    if (!detail.includes('Completed') || !detail.includes('Outcome: Contacted')) {
+      throw new Error('activity completion or outcome did not persist');
+    }
+    console.log('PASS  CRM overdue activity scheduling and completion');
+  } catch (error) {
+    failures++;
+    console.log(`FAIL  CRM overdue activity scheduling and completion — ${error.message}`);
+  }
+
+  try {
+    await page.goto(`${BASE}/apps/zenith/Crm/ImportLeads`, { waitUntil: 'networkidle2', timeout: 60000 });
+    const email = `crm-import-${Date.now()}@example.test`;
+    const previewStatus = await page.evaluate(async email => {
+      const form = document.getElementById('PreviewLeadCsv') || document.querySelector('form[name="PreviewLeadCsv"]');
+      if (!form) throw new Error('CSV preview form is missing');
+      const data = new FormData(form);
+      data.set('csvText', `FirstName,Email,Source\nDisposable import,${email},Instagram\nInvalid row,bad-email,YouTube`);
+      const response = await fetch(form.action, { method: 'POST', body: data, credentials: 'same-origin' });
+      return response.status;
+    }, email);
+    if (previewStatus !== 200) throw new Error(`CSV preview returned HTTP ${previewStatus}`);
+    await page.goto(`${BASE}/apps/zenith/Crm/ImportLeads`, { waitUntil: 'networkidle2', timeout: 60000 });
+    const preview = await page.$eval('body', body => body.innerText);
+    if (!preview.includes('2 rows') || !preview.includes('1 ready') || !preview.includes('1 need attention')) {
+      throw new Error('CSV preview did not separate valid and invalid rows');
+    }
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const committed = await page.evaluate(async () => {
+        const form = document.getElementById('CommitLeadCsv') || document.querySelector('form[name="CommitLeadCsv"]');
+        if (!form) throw new Error('CSV commit form is missing');
+        const response = await fetch(form.action, { method: 'POST', body: new FormData(form), credentials: 'same-origin' });
+        return response.status;
+      });
+      if (committed !== 200) throw new Error(`CSV commit returned HTTP ${committed}`);
+      await page.goto(`${BASE}/apps/zenith/Crm/ImportLeads`, { waitUntil: 'networkidle2', timeout: 60000 });
+      const outcome = await page.$eval('body', body => body.innerText);
+      if (!outcome.includes('1 imported or already present') || !outcome.includes('1 skipped')) {
+        throw new Error(`CSV import result was incorrect on attempt ${attempt + 1}`);
+      }
+    }
+    await page.goto(`${BASE}/apps/zenith/Crm/Leads?period=all`, { waitUntil: 'networkidle2', timeout: 60000 });
+    const rows = await page.$$eval('tr', (tableRows, expected) => tableRows.filter(row => row.textContent.includes(expected)).length, email);
+    if (rows !== 1) throw new Error(`CSV retry created ${rows} matching leads`);
+    console.log('PASS  CRM CSV preview, valid-row import and safe retry');
+  } catch (error) {
+    failures++;
+    console.log(`FAIL  CRM CSV preview, valid-row import and safe retry — ${error.message}`);
+  }
 
   // Exercise the two existing date controls, including the legacy form that submits
   // to the module's default screen. These checks are read-only and need no stock data.
@@ -244,5 +517,6 @@ try {
   await browser.close();
 }
 
-console.log(`\n${failures === 0 ? 'SMOKE OK' : 'SMOKE FAILED'} — ${PATHS.length + 10 - failures}/${PATHS.length + 10} render and interaction checks passed.`);
+const interactionChecks = 2 * (CRM_SCREENS.length + 1) + 6;
+console.log(`\n${failures === 0 ? 'SMOKE OK' : 'SMOKE FAILED'} — ${PATHS.length + interactionChecks - failures}/${PATHS.length + interactionChecks} render and interaction checks passed.`);
 process.exit(failures === 0 ? 0 : 1);
