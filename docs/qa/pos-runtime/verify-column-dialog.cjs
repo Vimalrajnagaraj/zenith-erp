@@ -17,7 +17,7 @@ module.exports=async function({a,base,check,out}) {
    check(`${shell} list-card hover never creates a modal containing block`,await page.locator('.z-txntable').evaluate(el=>getComputedStyle(el).transform)==='none');
    const save=shell==='apps'?dialog.locator('[name=SaveColumns]'):dialog.getByRole('button',{name:'Save Changes',exact:true});await save.focus();
    check(`${shell} Column Fields Save remains keyboard-focusable`,await save.evaluate(el=>el===document.activeElement));
-   await page.screenshot({path:path.join(out,`${shell}-transaction-columns-stable.png`)});
+   await page.screenshot({path:path.join(out,`${shell}-transaction-columns-stable.png`),timeout:90000});
    const saved=page.waitForResponse(r=>r.request().method()==='POST'&&r.url().includes('formSelectColumns'));
    await page.keyboard.press('Enter');check(`${shell} Save Columns posts successfully`,(await saved).status()<400);await page.waitForLoadState('networkidle');
    await page.locator('.zlc-toolbar button').filter({hasText:'Columns'}).first().click();await dialog.waitFor();

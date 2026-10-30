@@ -56,22 +56,25 @@
                                 <#if invoice.documentType??><@encodeText invoice.documentType?upper_case/><#else>TAX INVOICE</#if>
                                 (Original for Recipient)
                             </fo:block>
-                            <#-- ZE-POS-010: the old "[ QR CODE ]" placeholder was a dead decorative box. Render a
-                                 real scannable DataMatrix (2D barcode) of the invoice number via the barcode4j FOP
-                                 extension (barcode4j-fop-ext on the classpath); omit entirely when there is no number. -->
+                            <#-- The invoice-number QR is intentionally distinct from a government-signed e-invoice QR. -->
                             <#assign bcMsg = (invoice.gstInvoiceNumber)!((invoice.customInvoiceNumber)!'')>
-                            <#if bcMsg?has_content>
+                            <#if bcMsg?has_content && invoiceQrMatrix??>
                             <fo:block text-align="center" margin-top="1mm" padding-top="1mm" padding-bottom="1mm">
                                 <fo:instream-foreign-object>
-                                    <barcode:barcode xmlns:barcode="http://barcode4j.krysalis.org/ns" message="${bcMsg}">
-                                        <barcode:datamatrix>
-                                            <barcode:module-width>0.7mm</barcode:module-width>
-                                            <barcode:quiet-zone>2mm</barcode:quiet-zone>
-                                        </barcode:datamatrix>
-                                    </barcode:barcode>
+                                    <svg:svg xmlns:svg="http://www.w3.org/2000/svg" width="26mm" height="26mm"
+                                             viewBox="0 0 ${invoiceQrMatrix.width} ${invoiceQrMatrix.height}">
+                                        <svg:rect width="100%" height="100%" fill="#fff"/>
+                                        <#list 0..(invoiceQrMatrix.height - 1) as y>
+                                            <#list 0..(invoiceQrMatrix.width - 1) as x>
+                                                <#if invoiceQrMatrix.get(x, y)>
+                                                    <svg:rect x="${x}" y="${y}" width="1" height="1" fill="#000"/>
+                                                </#if>
+                                            </#list>
+                                        </#list>
+                                    </svg:svg>
                                 </fo:instream-foreign-object>
                             </fo:block>
-                            <fo:block font-size="6pt" color="#666" text-align="center">Scan: ${bcMsg}</fo:block>
+                            <fo:block font-size="6pt" color="#666" text-align="center">Scan: <@encodeText bcMsg/></fo:block>
                             </#if>
                         </fo:table-cell>
                         
