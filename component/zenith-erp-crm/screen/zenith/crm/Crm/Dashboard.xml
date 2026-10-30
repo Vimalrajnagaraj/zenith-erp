@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <screen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
         xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/xml-screen-3.xsd"
-        default-menu-title="Dashboard" default-menu-index="0">
+        default-menu-title="Dashboard" default-menu-index="1">
     <parameter name="period"/>
     <actions>
         <script><![CDATA[
@@ -25,8 +25,10 @@
             leadRows = []; opportunityRows = []; activityRows = []; followupRows = []
             stageRows = []; stageSummary = [:]; sourceSummary = [:]
             leadStatusNames = [LeadNew:'New', LeadContacted:'Contacted', LeadQualified:'Qualified', LeadConverted:'Converted', LeadLost:'Lost']
-            leadCount = 0; activeLeadCount = 0; openOpportunityCount = 0
-            pipelineValue = 0G; activityCount = 0; followupDueCount = 0
+            leadCount = 0; activeLeadCount = 0; qualifiedRate = 0; openOpportunityCount = 0
+            pipelineValue = 0G; weightedValue = 0G; wonValue = 0G
+            activityCount = 0; followupDueCount = 0; unassignedLeads = 0; unattendedLeads = 0
+            closingSoon = 0; overdueRows = []
             if (org && org != '_NA_') {
                 try {
                     def leadFind = ec.entity.find('zenith.erp.crm.LeadListView').condition('organizationPartyId', org)
@@ -35,6 +37,7 @@
                     leadRows = leadFind.orderBy('-createdDate').list()
                     leadCount = leadRows.size()
                     activeLeadCount = leadRows.count { !['LeadConverted','LeadLost'].contains(it.statusId) }
+                    qualifiedRate = leadCount ? (leadRows.count { it.statusId in ['LeadQualified','LeadConverted'] } * 100 / leadCount).intValue() : 0
                     leadRows.each { row ->
                         def source = row.sourceName ?: 'Unknown / not set'
                         sourceSummary[source] = (sourceSummary[source] ?: 0) + 1
@@ -42,35 +45,42 @@
 
                     stageRows = ec.entity.find('mantle.sales.opportunity.SalesOpportunityStage').orderBy('sequenceNum').list()
                     stageRows.each { stage -> stageSummary[stage.opportunityStageId] = [name:stage.description, count:0, value:0G] }
-                    def oppFind = ec.entity.find('zenith.erp.crm.OpportunityListView').condition('organizationPartyId', org)
-                    if (fromDate) oppFind.condition('estimatedCloseDate', EntityCondition.GREATER_THAN_EQUAL_TO, fromDate)
-                    if (fromDate) oppFind.condition('estimatedCloseDate', EntityCondition.LESS_THAN, endDate)
-                    opportunityRows = oppFind.list()
+                    def allOpps = ec.entity.find('zenith.erp.crm.OpportunityListView').condition('organizationPartyId', org).list()
+                    opportunityRows = allOpps.findAll { row -> !fromDate || (row.estimatedCloseDate && row.estimatedCloseDate >= fromDate && row.estimatedCloseDate < endDate) }
                     opportunityRows.each { row ->
                         def bucket = stageSummary[row.opportunityStageId]
                         if (bucket) { bucket.count++; bucket.value += (row.estimatedAmount ?: 0G) }
                         if (!['SoClosedWon','SoClosedLost'].contains(row.opportunityStageId)) {
                             openOpportunityCount++
                             pipelineValue += (row.estimatedAmount ?: 0G)
+                            weightedValue += (row.expectedRevenue ?: 0G)
                         }
                     }
+                    wonValue = allOpps.findAll { it.opportunityStageId == 'SoClosedWon' && (!fromTime || (it.wonDate && it.wonDate >= fromTime && it.wonDate < endTime)) }
+                        .sum { it.estimatedAmount ?: 0G } ?: 0G
+                    closingSoon = allOpps.count { !['SoClosedWon','SoClosedLost'].contains(it.opportunityStageId) &&
+                        it.estimatedCloseDate && it.estimatedCloseDate >= todayDate && it.estimatedCloseDate <= java.sql.Date.valueOf(today.plusDays(7)) }
 
                     def activityFind = ec.entity.find('zenith.erp.crm.CrmActivity').condition('organizationPartyId', org)
                     if (fromTime) activityFind.condition('activityDate', EntityCondition.GREATER_THAN_EQUAL_TO, fromTime)
                     if (fromTime) activityFind.condition('activityDate', EntityCondition.LESS_THAN, endTime)
                     activityRows = activityFind.orderBy('-activityDate').list()
                     activityCount = activityRows.size()
-                    def followupFind = ec.entity.find('zenith.erp.crm.CrmActivity').condition('organizationPartyId', org)
-                            .condition('nextFollowUpDate', EntityCondition.LESS_THAN, endTime)
-                    if (fromTime) followupFind.condition('nextFollowUpDate', EntityCondition.GREATER_THAN_EQUAL_TO, fromTime)
-                    followupRows = followupFind.orderBy('nextFollowUpDate').list()
-                    followupDueCount = followupRows.size()
+                    def allActivityRows = ec.entity.find('zenith.erp.crm.CrmActivity').condition('organizationPartyId', org).list()
+                    def overdueAll = allActivityRows.findAll { it.statusId == 'Scheduled' && it.dueDate && it.dueDate < ec.user.nowTimestamp }
+                    followupDueCount = overdueAll.size()
+                    overdueRows = overdueAll.sort { it.dueDate }.take(6)
+                    def scheduledLeadIds = allActivityRows.findAll { it.statusId == 'Scheduled' && it.leadId }.collect { it.leadId } as Set
+                    def allLeadRows = ec.entity.find('zenith.erp.crm.Lead').condition('organizationPartyId', org).list()
+                    unassignedLeads = allLeadRows.count { !it.assignedToUserId && it.statusId !in ['LeadConverted','LeadLost'] }
+                    unattendedLeads = allLeadRows.count { it.statusId !in ['LeadConverted','LeadLost'] && !scheduledLeadIds.contains(it.leadId) }
                 } catch (Exception e) {
                     dashboardError = 'CRM data could not be loaded. Please retry or contact support.'
                     leadRows = []; opportunityRows = []; activityRows = []; followupRows = []
                     stageSummary = [:]; sourceSummary = [:]
-                    leadCount = 0; activeLeadCount = 0; openOpportunityCount = 0
-                    pipelineValue = 0G; activityCount = 0; followupDueCount = 0
+                    leadCount = 0; activeLeadCount = 0; qualifiedRate = 0; openOpportunityCount = 0
+                    pipelineValue = 0G; weightedValue = 0G; wonValue = 0G
+                    activityCount = 0; followupDueCount = 0; unassignedLeads = 0; unattendedLeads = 0; closingSoon = 0; overdueRows = []
                 }
             }
             hasActiveOrg = org && org != '_NA_'
@@ -78,7 +88,7 @@
             recentActivities = activityRows.take(6)
             sources = sourceSummary.collect { name, count -> [name:name, count:count] }
                     .sort { a, b -> b.count <=> a.count }
-            def sourceColors = ['#7138ed', '#4a94f2', '#3ac493', '#ffbd3e', '#ff8656', '#fa6672']
+            def sourceColors = ['#078996', '#4a94f2', '#3ac493', '#ffbd3e', '#ff8656', '#fa6672']
             def sourceOffset = 0G
             sourceGradient = sources.withIndex().collect { source, index ->
                 def start = sourceOffset
@@ -105,6 +115,7 @@
             <container style="zcrm-heading-icon"><label text="▥" type="span"/></container>
             <container><label text="CRM Dashboard" type="h3"/>
                 <label text="Leads, opportunities and follow-ups from your active organization." type="p"/></container>
+            <link url="../CrmSettings" text="⚙ CRM Settings" condition="modCanWrite &amp;&amp; (ec.user.isInGroup('ADMIN') || ec.user.isInGroup('ZENITH_ADMIN'))"/>
         </container>
         <section name="crmMissingOrg" condition="!hasActiveOrg"><widgets>
             <container style="zcrm-empty"><label text="Select an organization to view its CRM dashboard." type="p"/></container>
@@ -115,9 +126,11 @@
         <section name="crmDashboardData" condition="hasActiveOrg &amp;&amp; !dashboardError"><widgets>
             <container style="zcrm-metrics zcrm-dashboard-metrics">
                 <container style="zcrm-metric zcrm-tone-purple"><label text="New leads" type="span"/><label text="${leadCount}" type="h4"/><label text="Created in ${periodLabel.toLowerCase()}" type="span" style="zcrm-muted"/><link url="../Leads" text="View leads"/></container>
-                <container style="zcrm-metric zcrm-tone-green"><label text="Active leads" type="span"/><label text="${activeLeadCount}" type="h4"/><label text="Not converted or lost" type="span" style="zcrm-muted"/><link url="../Leads" text="View leads"/></container>
-                <container style="zcrm-metric zcrm-tone-orange"><label text="Open opportunities" type="span"/><label text="${openOpportunityCount}" type="h4"/><label text="Expected to close in range" type="span" style="zcrm-muted"/><link url="../Pipeline" text="View pipeline"/></container>
+                <container style="zcrm-metric zcrm-tone-green"><label text="Qualified rate" type="span"/><label text="${qualifiedRate}%" type="h4"/><label text="Qualified or converted / new leads" type="span" style="zcrm-muted"/><link url="../Leads" text="View leads"/></container>
+                <container style="zcrm-metric zcrm-tone-orange"><label text="Weighted pipeline" type="span"/><label text="${currSymbol}${zinr.inr(ec.l10n.format(weightedValue, '#,##,##0'))}" type="h4"/><label text="Open deals closing in range" type="span" style="zcrm-muted"/><link url="../Pipeline" text="View pipeline"/></container>
                 <container style="zcrm-metric zcrm-tone-blue"><label text="Open pipeline value" type="span"/><label text="${currSymbol}${zinr.inr(ec.l10n.format(pipelineValue, '#,##,##0'))}" type="h4"/><label text="Estimated, not booked revenue" type="span" style="zcrm-muted"/><link url="../Pipeline" text="View pipeline"/></container>
+                <container style="zcrm-metric zcrm-tone-orange"><label text="Overdue activities" type="span"/><label text="${followupDueCount}" type="h4"/><label text="Scheduled past due time" type="span" style="zcrm-muted"/><link url="../Activities" text="View activities" parameter-map="[view:'overdue']"/></container>
+                <container style="zcrm-metric zcrm-tone-green"><label text="Won revenue" type="span"/><label text="${currSymbol}${zinr.inr(ec.l10n.format(wonValue, '#,##,##0'))}" type="h4"/><label text="Closed won in range" type="span" style="zcrm-muted"/><link url="../Reports" text="View reports"/></container>
             </container>
             <container style="zcrm-grid">
                 <container style="zcrm-panel zcrm-chart-panel"><container style="zcrm-panel-head"><label text="Pipeline by stage" type="h5"/><link url="../Pipeline" text="View pipeline"/></container>
@@ -144,7 +157,11 @@
                 </container>
                 <container style="zcrm-panel"><container style="zcrm-panel-head"><label text="Activities &amp; follow-ups" type="h5"/><link url="../Activities" text="View activities"/></container>
                     <container style="zcrm-breakdown-row"><label text="Activities logged" type="span"/><label text="${activityCount}" type="strong"/></container>
-                    <container style="zcrm-breakdown-row"><label text="Follow-ups due in range" type="span"/><label text="${followupDueCount}" type="strong"/></container>
+                    <container style="zcrm-breakdown-row"><label text="Overdue scheduled activities" type="span"/><label text="${followupDueCount}" type="strong"/></container>
+                    <container style="zcrm-breakdown-row"><label text="Unassigned leads" type="span"/><label text="${unassignedLeads}" type="strong"/></container>
+                    <container style="zcrm-breakdown-row"><label text="Leads without a scheduled activity" type="span"/><label text="${unattendedLeads}" type="strong"/></container>
+                    <container style="zcrm-breakdown-row"><label text="Opportunities closing in 7 days" type="span"/><label text="${closingSoon}" type="strong"/></container>
+                    <section-iterate name="crmOverdueActions" list="overdueRows" entry="overdue"><widgets><container style="zcrm-breakdown-row"><link url="../ActivityDetail" text="${overdue.subject}" parameter-map="[activityId:overdue.activityId]"/><label text="${ec.l10n.format(overdue.dueDate, 'dd MMM yyyy')}" type="span"/></container></widgets></section-iterate>
                     <section name="noActivities" condition="recentActivities.isEmpty()"><widgets><label text="No activities logged in this date range. Log a call or meeting to start a history." type="p" style="zcrm-empty"/></widgets></section>
                     <section-iterate name="crmRecentActivities" list="recentActivities" entry="act"><widgets><container style="zcrm-breakdown-row"><label text="${act.activityType}: ${act.subject}" type="span"/><label text="${ec.l10n.format(act.activityDate, 'dd MMM yyyy')}" type="span" style="zcrm-muted"/></container></widgets></section-iterate>
                 </container>
