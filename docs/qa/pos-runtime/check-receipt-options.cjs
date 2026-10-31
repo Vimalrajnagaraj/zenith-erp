@@ -28,4 +28,6 @@ assert.ok(!render({}, {showLogo:'Y',logoUrl:'javascript:alert(1)'}).includes('<i
 assert.equal(JSON.stringify(base),original,'presentation never mutates bill or prices');
 const pdf=fs.readFileSync(path.join(__dirname,'../../../component/zenith-erp-pos/screen/zenith/pos/Pos/ReceiptPdf.xml'),'utf8');
 assert.ok(pdf.includes('<#if ((txn.totalTaxAmount!0)) gt 0>TAX INVOICE'), 'hiding a tax breakdown must not rename a tax invoice');
+const runtimeChecks=fs.readFileSync(path.join(__dirname,'verify-runtime.cjs'),'utf8');
+assert.ok(!runtimeChecks.includes('\u00e2\u201a\u00b9'), 'currency assertions must retain their original UTF-8 rupee symbol');
 console.log('PASS receipt options: widths, greetings, Unicode preview, labels, visibility, tones, flags, escaping and immutable bill data');
