@@ -52,8 +52,8 @@
     // tenant's allowed plan modules (null = all-access / not a plan-gated tenant)
     function tenantMods() {
         try { var cfg = document.getElementById('zenith-saas-cfg');
-            if (cfg && cfg.getAttribute('data-tenant') === 'true' && cfg.getAttribute('data-all') !== 'true') {
-                var m = []; try { m = JSON.parse(cfg.getAttribute('data-modules') || '[]'); } catch (_e) {} return m.length ? m : null;
+            if (cfg && (cfg.getAttribute('data-nav-restricted') === 'true' || (cfg.getAttribute('data-tenant') === 'true' && cfg.getAttribute('data-all') !== 'true'))) {
+                try { var modules = JSON.parse(cfg.getAttribute('data-modules') || '[]'); return Array.isArray(modules) ? modules : []; } catch (_e) { return []; }
             }
         } catch (_e) {} return null;
     }
@@ -173,9 +173,9 @@
     function applyRbac(side) {
         try {
             var cfg = document.getElementById('zenith-saas-cfg');
-            if (cfg && cfg.getAttribute('data-tenant') === 'true' && cfg.getAttribute('data-all') !== 'true') {
+            if (cfg && (cfg.getAttribute('data-nav-restricted') === 'true' || (cfg.getAttribute('data-tenant') === 'true' && cfg.getAttribute('data-all') !== 'true'))) {
                 var mods = []; try { mods = JSON.parse(cfg.getAttribute('data-modules') || '[]'); } catch (_e) {}
-                if (mods.length) {
+                if (Array.isArray(mods)) {
                     allLinks.forEach(function (a) { var k = a.getAttribute('data-mod'); if (k && mods.indexOf(k) < 0) a.style.display = 'none'; });
                     [].slice.call(side.querySelectorAll('.zqs-cat')).forEach(function (h) {
                         var n = h.nextElementSibling, any = false;
@@ -420,14 +420,16 @@
     }
 
     function init() {
+        if (document.getElementById('zq-sidebar')) return true;
+        if (!document.getElementById('zenith-saas-cfg')) return false;
         var header = document.querySelector('.q-header');
         var layout = document.querySelector('.q-layout');
         if (!header || !layout) return false;
         var body = document.body;
         body.classList.add('zq-nav');
         var side = buildSidebar();
-        body.appendChild(side);
         applyRbac(side);
+        body.appendChild(side);
         applyActive();
         buildTopbar(header);
         subBar = el('div'); subBar.id = 'zq-subnav';
@@ -465,4 +467,5 @@
         if (!document.getElementById('z-shopdata') && tries <= 16) return;
         if (init() || tries > 60) clearInterval(iv);
     }, 250);
+    window.addEventListener('zenith:nav-config', function() { if (init()) clearInterval(iv); });
 })();
