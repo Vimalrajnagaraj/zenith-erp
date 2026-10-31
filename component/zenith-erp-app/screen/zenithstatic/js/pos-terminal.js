@@ -634,47 +634,7 @@ window._posOffline = (function() {
                 .finally(function() { button.disabled = false; });
         }
         function buildHistReceipt(d, isTax, edited) {
-            d=window._posReceiptTextData(d);
-            var s = d.store || {}, bi = d.bill || {}, sm = d.summary || {};
-            function f2(n) { return Number(n||0).toFixed(2); }
-            var h = '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Revised Receipt</title><style>'
-                + '@page{size:80mm auto;margin:0}body{margin:0;padding:0;font-family:Arial,Helvetica,sans-serif;font-size:12px;font-weight:600;color:#000}'
-                + '.rcpt{width:72mm;margin:0 auto;padding:2mm 3mm;box-sizing:border-box}'
-                + '.c{text-align:center}.r{text-align:right}.b{font-weight:bold}.sep{border-bottom:1px dashed #000;margin:4px 0}.sep2{border-bottom:2px solid #000;margin:4px 0}'
-                + 'table{width:100%;border-collapse:collapse}th,td{padding:2px 1px;font-size:11px}th{border-bottom:1px solid #000}.hdr{font-size:10px;color:#000}.tot{font-size:15px;font-weight:bold}</style></head><body><div class="rcpt">';
-            h += '<div class="c b" style="font-size:16px;margin:2px 0">' + (s.name || 'Store') + '</div>';
-            if (s.address) h += '<div class="c hdr">' + s.address + '</div>';
-            if (isTax && s.taxReg) h += '<div class="c hdr">GSTIN: ' + s.taxReg + '</div>';
-            h += '<div class="sep"></div>';
-            h += '<div class="c b" style="font-size:13px;margin:3px 0">' + (isTax ? 'POS TAX RECEIPT' : 'RECEIPT') + '</div>';
-            if (edited !== false) {
-                h += '<div class="c b" style="font-size:12px;margin:3px 0;border:1px dashed #000;padding:3px 2px">** EDITED / REVISED BILL **</div>';
-                h += '<div class="c hdr" style="margin-bottom:2px">Reprinted after modification</div>';
-            }
-            h += '<table><tr><td class="hdr" style="width:30%">POS Bill No:</td><td class="b">' + (bi.number || '') + '</td></tr>';
-            h += '<tr><td class="hdr">Date:</td><td>' + (bi.date || '') + '</td></tr>';
-            h += '<tr><td class="hdr">Customer:</td><td>' + (bi.customer || 'Walk-In') + '</td></tr></table>';
-            h += '<div class="sep2"></div>';
-            h += '<table><thead><tr><th style="width:16px">#</th><th style="text-align:left">Item</th><th class="c">Qty</th><th class="r">Rate</th><th class="r">Total</th></tr></thead><tbody>';
-            (d.items || []).forEach(function(it, i) {
-                var hnm = (it.name||'') + (it.mode && it.mode !== 'Retail' ? ' <span style="font-size:10px;color:#000">['+it.mode+']</span>' : '');
-                h += '<tr><td class="c">' + (i+1) + '</td><td>' + hnm + '</td><td class="c" style="white-space:nowrap">' + (it.qty + (it.uom ? ' ' + it.uom : '')) + '</td><td class="r">' + f2(it.rate) + '</td><td class="r">' + f2(it.total) + '</td></tr>';
-            });
-            h += '</tbody></table><div class="sep"></div>';
-            h += '<table><tr><td>Subtotal</td><td class="r">' + f2(sm.subtotal) + '</td></tr>';
-            if (isTax && Number(sm.tax||0) > 0) h += '<tr><td>Tax</td><td class="r">' + f2(sm.tax) + '</td></tr>';
-            h += '</table><div class="sep2"></div>';
-            h += '<table><tr><td class="tot">' + (isTax ? 'GRAND TOTAL' : 'TOTAL') + '</td><td class="r tot">' + f2(sm.total) + '</td></tr></table>';
-            if (Number(d.saving) > 0) h += '<div class="sep"></div><div class="c b">You Saved: ' + f2(d.saving) + '</div>';
-            if (d.isCredit) {
-                h += '<div class="sep"></div>';
-                h += '<div class="c b" style="border:1px dashed #000;padding:3px 2px;font-size:12px">** ' + (Number(d.outstanding) > 0 ? 'CREDIT / PAY LATER' : 'CREDIT / PAID IN FULL') + ' **</div>';
-                h += '<table><tr><td class="b">Amount Due</td><td class="r b">' + f2(d.outstanding) + '</td></tr></table>';
-            }
-            h += '<div class="c b" style="font-size:13px;margin-top:6px">Thank You !!</div>';
-            h += '<div class="c" style="margin-top:6px;font-size:7px;color:#000">Powered by ZetaERP &middot; visit www.zetaclantech.com</div>';
-            h += '</div>';
-            return h;
+            return window.PosReceiptLayout.render(d, isTax, edited);
         }
         function histIframePrint(html) {
             html += '<script>window.onload=function(){window.print();}<\/script></body></html>';
@@ -2698,11 +2658,11 @@ window.posToggleFullscreen = function() {
                 return qzPrinter;
             }).then(function(printer) {
                 var cfg = qz.configs.create(printer, {
-                    size: {width: 80}, units: 'mm', colorType: 'grayscale',
+                    size: {width: /data-paper-width="58"/.test(html) ? 58 : 80}, units: 'mm', colorType: 'grayscale',
                     margins: {top: 0, right: 0, bottom: 0, left: 0}, scaleContent: false
                 });
                 var data = [{type: 'pixel', format: 'html', data: html,
-                    options: {pageWidth: 80, pageHeight: null}}];
+                    options: {pageWidth: /data-paper-width="58"/.test(html) ? 58 : 80, pageHeight: null}}];
                 return qz.print(cfg, data);
             }).then(function() {
                 showBanner(billNum, 'qz');
@@ -2712,89 +2672,8 @@ window.posToggleFullscreen = function() {
         // Connect only for an explicit print/setup action; opening billing must not prompt for device access.
 
         function buildReceiptHtml(d, isTax, edited) {
-            d=window._posReceiptTextData(d);
-            var s = d.store || {}, bi = d.bill || {}, sm2 = d.summary || {};
-            var cs2 = '₹';
-            function f2(n) { return Number(n||0).toFixed(2); }
-            var html = '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Receipt</title>'
-                + '<style>'
-                + '@page{size:80mm auto;margin:0}'
-                + 'body{margin:0;padding:0;font-family:Arial,Helvetica,sans-serif;font-size:12px;font-weight:600;color:#000}'
-                + '.rcpt{width:72mm;margin:0 auto;padding:2mm 3mm;box-sizing:border-box}'
-                + '.c{text-align:center} .r{text-align:right} .b{font-weight:bold}'
-                + '.sep{border-bottom:1px dashed #000;margin:4px 0}'
-                + '.sep2{border-bottom:2px solid #000;margin:4px 0}'
-                + 'table{width:100%;border-collapse:collapse}'
-                + 'th,td{padding:2px 1px;font-size:11px}'
-                + 'th{border-bottom:1px solid #000}'
-                + '.hdr{font-size:10px;color:#000}'
-                + '.tot{font-size:15px;font-weight:bold}'
-                + '@media print{body{margin:0;padding:0}}'
-                + '</style></head><body><div class="rcpt">';
-            if (s.headerText) html += '<div class="c hdr">' + s.headerText + '</div>';
-            html += '<div class="c b" style="font-size:16px;margin:2px 0">' + (s.name||'Store') + '</div>';
-            if (s.address) html += '<div class="c hdr">' + s.address + '</div>';
-            if (s.phone) html += '<div class="c hdr">Ph: ' + s.phone + '</div>';
-            if (s.email) html += '<div class="c hdr">' + s.email + '</div>';
-            if (isTax && s.taxReg) html += '<div class="c hdr">GSTIN: ' + s.taxReg + '</div>';
-            html += '<div class="sep"></div>';
-            if (isTax) {
-                html += '<div class="c b" style="font-size:13px;margin:3px 0">POS TAX RECEIPT</div>';
-            } else {
-                html += '<div class="c b" style="font-size:13px;margin:3px 0">RECEIPT</div>';
-            }
-            if (edited) {
-                html += '<div class="c b" style="font-size:12px;margin:3px 0;border:1px dashed #000;padding:3px 2px">** EDITED / REVISED BILL **</div>';
-                html += '<div class="c hdr" style="margin-bottom:2px">Reprinted after modification</div>';
-            }
-            html += '<table><tr><td class="hdr" style="width:30%">Bill No:</td><td class="b">' + (bi.number||'') + '</td></tr>';
-            html += '<tr><td class="hdr">Date:</td><td>' + (bi.date||'') + '</td></tr>';
-            if (bi.cashier) html += '<tr><td class="hdr">Cashier:</td><td>' + bi.cashier + '</td></tr>';
-            html += '<tr><td class="hdr">Customer:</td><td>' + (bi.customer||'Walk-In') + '</td></tr>';
-            if (bi.customerPhone) html += '<tr><td class="hdr">Mobile:</td><td>' + bi.customerPhone + '</td></tr>';
-            html += '</table>';
-            html += '<div class="sep2"></div>';
-            html += '<table><thead><tr><th style="text-align:center;width:16px">#</th><th style="text-align:left">Item</th><th class="c">Qty</th><th class="r">Rate</th><th class="r">Total</th></tr></thead><tbody>';
-            (d.items||[]).forEach(function(it, idx) {
-                var nm = (it.name||'') + (it.mode && it.mode !== 'Retail' ? ' <span style="font-size:10px;color:#000">['+it.mode+']</span>' : '');
-                html += '<tr><td class="c">' + (idx+1) + '</td><td>' + nm + '</td><td class="c" style="white-space:nowrap">' + (it.qty + (it.uom ? ' ' + it.uom : '')) + '</td><td class="r">' + f2(it.rate) + '</td><td class="r">' + f2(it.total) + '</td></tr>';
-                if (Number(it.discount||0) > 0) html += '<tr><td colspan="5" style="font-size:10px;color:#000;padding-left:6px">' + (it.mode && it.mode !== 'Retail' ? it.mode + ' disc' : 'Disc') + ': -' + cs2 + f2(it.discount) + '</td></tr>';
-            });
-            html += '</tbody></table>';
-            html += '<div class="sep"></div>';
-            html += '<table>';
-            html += '<tr><td>Subtotal</td><td class="r">' + cs2 + f2(sm2.subtotal) + '</td></tr>';
-            if (Number(sm2.discount||0) > 0) html += '<tr><td>Discount included</td><td class="r">' + cs2 + f2(sm2.discount) + '</td></tr>';
-            if (isTax && Number(sm2.tax||0) > 0) {
-                var halfTax = Number(sm2.tax) / 2;
-                html += '<tr><td>CGST</td><td class="r">' + cs2 + f2(halfTax) + '</td></tr>';
-                html += '<tr><td>SGST</td><td class="r">' + cs2 + f2(halfTax) + '</td></tr>';
-            }
-            if (Number(sm2.roundOff||0) !== 0) html += '<tr><td class="hdr">Round Off</td><td class="r hdr">' + f2(sm2.roundOff) + '</td></tr>';
-            html += '</table>';
-            html += '<div class="sep2"></div>';
-            html += '<table><tr><td class="tot">' + (isTax ? 'GRAND TOTAL' : 'TOTAL') + '</td><td class="r tot">' + cs2 + f2(sm2.total) + '</td></tr></table>';
-            if (isTax) html += '<div style="font-size:10px;color:#000;text-align:right;margin-top:1px">(Incl. of all taxes)</div>';
-            html += '<div class="sep2"></div>';
-            html += '<table>';
-            if (Number(d.change||0) > 0) html += '<tr><td class="b">Change</td><td class="r b">' + cs2 + f2(d.change) + '</td></tr>';
-            html += '</table>';
-            if (d.isCredit) {
-                html += '<div class="sep2"></div>';
-                html += '<div class="c b" style="font-size:13px;border:1px dashed #000;padding:3px 2px">** ' + (Number(d.outstanding) > 0 ? 'CREDIT — AMOUNT DUE' : 'CREDIT — PAID IN FULL') + ' **</div>';
-                html += '<table><tr><td class="b">Outstanding</td><td class="r b">' + cs2 + f2(d.outstanding) + '</td></tr></table>';
-            }
-            if (Number(d.saving||0) > 0) {
-                html += '<div class="sep"></div>';
-                html += '<div class="c b" style="font-size:12px">You Saved: ' + cs2 + f2(d.saving) + '</div>';
-            }
-            if (s.footerText) { html += '<div class="sep"></div><div class="c hdr" style="white-space:pre-line">' + String(s.footerText).replace(/\\r/g,'').replace(/\\n/g,'<br>').replace(/\n/g,'<br>') + '</div>'; }
-            html += '<div class="c b" style="font-size:13px;margin-top:6px">Thank You !!</div>';
-            html += '<div class="c" style="margin-top:6px;font-size:7px;color:#000">Powered by ZetaERP &middot; visit www.zetaclantech.com</div>';
-            html += '</div>';
-            return html;
+            return window.PosReceiptLayout.render(d, isTax, edited);
         }
-
         function iframePrint(html, billNum) {
             html += '</body></html>';
             // Use a fresh iframe each time — Safari can hold stale state on a reused print frame
