@@ -4203,15 +4203,14 @@ window.posToggleFullscreen = function() {
             var disabled = !d.items.length;
             var badge = function(key) { return '<kbd>'+key+'</kbd>'; };
             var html = '<div class="pos-paywrap pos-reference-payments">'
-                + '<button type="button" id="pos-discount" class="pos-discount-btn">&#127991; DISCOUNT / ROUND-OFF'+badge('F1')+'</button>'
-                + '<button type="button" id="pos-pay-cash" class="pos-cash-btn">&#128176; CASH'+badge('F2')+'</button>'
-                + payBtn('Card','&#128179; CARD'+badge('F3'),'#009dff')
-                + '<button id="pos-credit" type="button" onclick="posCreditSale()">&#128196; CREDIT'+badge('F4')+'</button>'
-                + payBtn('UPI','&#128241; UPI'+badge('F5'),'#9518dd')
-                + '<button id="pos-split" type="button" class="pos-split-btn">&#8596; SPLIT PAYMENT'+badge('F6')+'</button>'
-                + actionBtn('holdSale','&#10074;&#10074; HOLD'+badge('F7'),'#ff9b00')
-                + actionBtn('voidSale','&#10005; VOID / CANCEL'+badge('F8'),'#ff3f49','Void this sale?')
-                + '<button id="pos-copilot" type="button" onclick="posCheckoutCopilot()">&#9635; AI Copilot</button></div>';
+                + '<button type="button" id="pos-discount" class="pos-discount-btn">Discount / Roundoff'+badge('F1')+'</button>'
+                + '<button type="button" id="pos-pay-cash" class="pos-cash-btn">Cash'+badge('F2')+'</button>'
+                + payBtn('Card','Card'+badge('F3'),'#009dff')
+                + '<button id="pos-credit" type="button" onclick="posCreditSale()">Credit'+badge('F4')+'</button>'
+                + payBtn('UPI','UPI'+badge('F5'),'#9518dd')
+                + '<button id="pos-split" type="button" class="pos-split-btn">Split Payment'+badge('F6')+'</button>'
+                + actionBtn('holdSale','Hold'+badge('F7'),'#ff9b00')
+                + '<button id="pos-copilot" type="button" onclick="posCheckoutCopilot()">AI Copilot</button></div>';
             if (disabled) html=html.replace(/<button(?![^>]*id="pos-copilot")/g,'<button disabled');
             return html;
         }
