@@ -23,7 +23,9 @@ module.exports = async ({ browser, a, foreign, base, check, q, out }) => {
    await page.goto(base+'/'+shell+'/zenith/pos/Dashboard');
    await sidebar.click();
    await page.locator('#kd-wrap').waitFor();
-   check(shell+' opens KOT as its own sidebar module',await sidebar.isVisible()&&await sidebar.evaluate(a=>a.classList.contains('on')));
+   const activeSidebar = sidebar.and(page.locator('.on'));
+   await activeSidebar.waitFor();
+   check(shell+' opens KOT as its own sidebar module',await activeSidebar.isVisible(),{url:page.url()});
    check(shell+' shows exactly the six KOT sections in order',(await links.allTextContents()).map(x=>x.trim()).join('|')===tabs.map(x=>x[1]).join('|'));
    for (const [seg,name,content] of tabs.slice(1)) {
     await strip.getByRole('link',{name,exact:true}).click();
@@ -33,7 +35,10 @@ module.exports = async ({ browser, a, foreign, base, check, q, out }) => {
    if(out) await page.screenshot({path:path.join(out,shell+'-standalone-kot.png')});
   }
   await page.goto(base+'/apps/zenith/pos/Kitchen');
-  check('old Kitchen bookmark still opens the shared Kitchen Display',await page.locator('.zk-display').isVisible());
+  await page.locator('.zk-display').waitFor();
+  check('old Kitchen bookmark still opens the shared Kitchen Display',
+   await page.locator('.zk-display').isVisible(),
+   {url:page.url()});
   const role=await post(a,'Settings/RoleEditor/saveRole',{
    roleName:'Synthetic KOT Clerk '+randomUUID().slice(0,8),selectionsJson:JSON.stringify({kot:['/kot/KotBilling']})
   });
