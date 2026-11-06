@@ -1886,9 +1886,9 @@ window._posOffline = (function () {
 (function() {
     var CTX = { sessionId: '', terminalId: '' };
     function histToken() {
-        try { if (window.moqui && window.moqui.webrootVue && window.moqui.webrootVue.moquiSessionToken) return window.moqui.webrootVue.moquiSessionToken; } catch(e){}
         var af = document.getElementById('cartInlineAddForm');
         if (af) { var t = af.querySelector('[name=moquiSessionToken]'); if (t && t.value) return t.value; }
+        try { if (window.moqui && window.moqui.webrootVue && window.moqui.webrootVue.moquiSessionToken) return window.moqui.webrootVue.moquiSessionToken; } catch(e){}
         // Start-session screen: no cart form and window.moqui.webrootVue may not be initialised yet,
         // so the token came back EMPTY and the history POST was rejected (non-JSON -> "Couldn't load").
         // Any server-rendered token on the page (e.g. the OpenSessionForm) is valid for this session.
@@ -1906,6 +1906,7 @@ window._posOffline = (function () {
     }
         /* === Bill History Panel === */
         var historyOverlay = null, historyCriteria = {}, historyRequest, historyVersion = 0;
+        var historyReconnect, historyFailed = false;
         function openBillHistory(search) {
             closeHistory(); historyCriteria = {};
             var ov = document.createElement('div');
@@ -1940,6 +1941,8 @@ window._posOffline = (function () {
             var error = panel.querySelector('#hist-filter-error');
             var searchTimer;
             function reload() { clearTimeout(searchTimer); loadHistoryList(searchInput.value); }
+            historyReconnect = function() { if (historyFailed) reload(); };
+            window.addEventListener('online', historyReconnect);
             filter.addEventListener('click', function () {
                 form.hidden = !form.hidden;
                 filter.setAttribute('aria-expanded', String(!form.hidden));
@@ -1968,6 +1971,8 @@ window._posOffline = (function () {
         }
         function closeHistory() {
             ++historyVersion;
+            window.removeEventListener('online', historyReconnect);
+            historyReconnect = null; historyFailed = false;
             if (historyRequest) historyRequest.abort();
             if (historyOverlay) { historyOverlay.remove(); historyOverlay = null; }
         }
@@ -1985,7 +1990,7 @@ window._posOffline = (function () {
             if (i >= 0) return path.slice(0, i) + '/zenith/pos/Terminal/ajaxCart';
             return path.slice(0, path.lastIndexOf('/')) + '/Terminal/ajaxCart';  // fallback: sibling of current screen
         }
-        function historyPost(params, signal) {
+        function historyPost(params, signal, renewed) {
             if (CTX.sessionId) params.sessionId = CTX.sessionId;
             if (CTX.terminalId) params.terminalId = CTX.terminalId;
             // Start-session screen: no active session, so scope bill history by the terminal chosen
@@ -2000,7 +2005,24 @@ window._posOffline = (function () {
             return send(ajaxCartUrl(), {   // ZE-POS-0211: absolute (was relative 'Terminal/ajaxCart' -> broke on a trailing-slash page URL)
                 method: 'POST', headers: {'Content-Type': 'application/x-www-form-urlencoded'},
                 body: new URLSearchParams(params), credentials: 'same-origin', signal: signal
-            }).then(function(r) { return r.json(); });
+            }).then(function(r) {
+                var loginRedirect = r.redirected && /\/Login(?:[/?#]|$)/i.test(r.url);
+                if (params.action === 'billHistory' && r.status === 401 && !r.redirected && !renewed &&
+                    typeof window._posRefreshBrowserToken === 'function') {
+                    return window._posRefreshBrowserToken().then(function() { return historyPost(params, signal, true); }, function() {
+                        var authError = new Error('Sign in again to load bill history.');
+                        authError.historyAuth = true;
+                        throw authError;
+                    });
+                }
+                if (params.action === 'billHistory' && (!r.ok || loginRedirect)) {
+                    var error = new Error('Bill history request failed (HTTP ' + r.status + ').');
+                    error.status = r.status;
+                    error.historyAuth = r.status === 401 || r.status === 403 || loginRedirect;
+                    throw error;
+                }
+                return r.json();
+            });
         }
         /* === Auto-print a REVISED receipt (with EDITED note) after a bill is amended === */
         function printEditedReceipt(txId, billNo, taxOn) {
@@ -2042,7 +2064,7 @@ window._posOffline = (function () {
             iDoc.open(); iDoc.write(html); iDoc.close();
         }
         function histEsc(value) { return String(value == null ? '' : value).replace(/[&<>"']/g, function(c) { return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
-        function loadHistoryList(search, offset) {
+        function loadHistoryList(search, offset, retried) {
             var listEl = document.getElementById('hist-list');
             if (!listEl) return;
             offset = offset || 0;
@@ -2051,6 +2073,7 @@ window._posOffline = (function () {
             var version = ++historyVersion;
             var filtered = !!historyCriteria.historyFromDate;
             function current() { return version === historyVersion && listEl.isConnected; }
+            historyFailed = false;
             listEl.innerHTML = '<div role="status" style="text-align:center;padding:40px;color:#999">Loading...</div>';
             listEl.parentElement.scrollTop = 0;
             historyPost(Object.assign({action:'billHistory', search:search||'', offset:offset}, historyCriteria), historyRequest.signal).then(function(d) {
@@ -2099,12 +2122,32 @@ window._posOffline = (function () {
                 });
             }).catch(function(failure) {
                 if (!current() || failure.name === 'AbortError') return;
-                if (filtered) { listEl.textContent = 'Reconnect to search saved bills by date and time.'; return; }
+                // Only replay this read, never payments, amendments or receipt printing.
+                var temporary = failure.status >= 500 || failure.status === 408 || failure.status === 429 || failure.name === 'TypeError' || failure.name === 'SyntaxError';
+                if (!retried && temporary && !failure.historyAuth && navigator.onLine !== false) {
+                    setTimeout(function() { if (current()) loadHistoryList(search, offset, true); }, 300);
+                    return;
+                }
+                historyFailed = !failure.historyAuth;
                 // ZE-POS-017: while offline, show the bills saved on THIS device (pending sync) instead of
                 // a bare connection error. Falls back to the error only when there is nothing queued.
+                function addRetry() {
+                    var retry = document.createElement('button');
+                    retry.type = 'button'; retry.textContent = 'Retry';
+                    retry.style.cssText = 'display:block;margin:12px auto;padding:10px 24px;border:1px solid #7C3AED;border-radius:8px;background:white;color:#6D28D9;cursor:pointer';
+                    retry.onclick = function() { if (current()) loadHistoryList(search, offset); };
+                    listEl.appendChild(retry);
+                }
                 var showErr = function() {
-                    if (current()) listEl.innerHTML = '<div style="text-align:center;padding:40px;color:#c62828">Couldn&#39;t load bill history &mdash; check your connection and try again.</div>';
+                    if (!current()) return;
+                    listEl.innerHTML = '<div role="alert" style="text-align:center;padding:24px;color:#c62828"></div>';
+                    var message = listEl.firstElementChild;
+                    message.textContent = failure.historyAuth
+                        ? 'History access was refused. Sign in again if your session expired, or check your access with an administrator.'
+                        : 'Bill history is temporarily unavailable. Retry here without leaving billing.';
+                    addRetry();
                 };
+                if (failure.historyAuth || filtered) { showErr(); return; }
                 if (window._posOffline && window._posOffline.getQueue) {
                     window._posOffline.getQueue().then(function(q) {
                         if (!q || !q.length) { showErr(); return; }
@@ -2129,7 +2172,7 @@ window._posOffline = (function () {
                                 + '<span>' + (x.items || []).length + ' item' + ((x.items || []).length !== 1 ? 's' : '') + ' &middot; qty ' + n + ' &middot; ' + histEsc(x.paymentMethod) + '</span>'
                                 + '</div></div>';
                         });
-                        if (current()) listEl.innerHTML = h;
+                        if (current()) { listEl.innerHTML = h; addRetry(); }
                     }).catch(showErr);
                 } else showErr();
             });
@@ -4071,6 +4114,7 @@ window.posToggleFullscreen = function() {
                 confirmCatalogTender().then(function(){
                     hid('catalogRevision', catalogRevision);
                     f.querySelector('[name="transactionId"]').value = TX;
+                    f.querySelector('[name="moquiSessionToken"]').value = TK;
                     return window.PosFreeItems.ensure(TX, TK);
                 }).then(function(){
                     document.body.appendChild(f);f.submit();
@@ -4326,6 +4370,7 @@ window.posToggleFullscreen = function() {
                 options.body.set('transactionId', TX);
                 options.body.set('catalogRevision', catalogRevision);
                 options.body.set('taxOn', TO);
+                options.body.set('moquiSessionToken', TK);
                 return window.PosFreeItems.ensure(TX, TK);
             }).then(function() { return fetch(url, options); })
                 .then(function(r) { return r.json().catch(function() { return null; }); })
@@ -4760,10 +4805,21 @@ window.posToggleFullscreen = function() {
                 idleWaiters.splice(0).forEach(function(waiter) { if (syncError) waiter.reject(syncError); else waiter.resolve(); });
             }
             function realSeq(seq) { return realByTmp[seq] || seq; }
-            function requestCart(params) {
-                return fetch('Terminal/ajaxCart', { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+            function requestCart(params, renewed) {
+                return fetch('Terminal/ajaxCart', { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded',Accept:'application/json','X-Requested-With':'XMLHttpRequest'},
                     body:new URLSearchParams(params), credentials:'same-origin', signal:AbortSignal.timeout(25000) })
-                    .then(function(response) { return response.json(); });
+                    .then(function(response) {
+                        // Only retry an explicitly rejected request and absolute edits/reads.
+                        // Never replay an add/scan delta or an ambiguous network failure.
+                        if (response.status === 401 && !response.redirected && !renewed &&
+                            ['refresh','updatePrice','updateQty','setItemMode'].indexOf(params.action) !== -1) {
+                            return refreshBrowserToken(params.transactionId).then(function() {
+                                params.moquiSessionToken = TK;
+                                return requestCart(params, true);
+                            });
+                        }
+                        return response.json();
+                    });
             }
             function reconcile() {
                 if (recovering) return recovering;
@@ -5000,10 +5056,24 @@ window.posToggleFullscreen = function() {
             if (CATID) p.catId = CATID;
             for (var k in params) { if (params[k] !== undefined && params[k] !== null && params[k] !== '') p[k] = params[k]; else delete p[k]; }
             var qs = Object.keys(p).filter(function(k) { return p[k] !== '' && p[k] !== undefined; }).map(function(k) { return k + '=' + encodeURIComponent(p[k]); }).join('&');
-            return fetch(base + '?' + qs, {credentials: 'same-origin', signal: signal})
+            return fetch(base + '?' + qs, {credentials: 'same-origin', cache:'no-store', signal: signal})
                 .then(function(r) { if (!r.ok) throw new Error('Product refresh failed'); return r.text(); })
                 .then(function(html) { return new DOMParser().parseFromString(html, 'text/html'); });
         }
+        function refreshBrowserToken(expectedTx) {
+            // A different tab can renew the session while the till stays open. A fresh,
+            // authorized form supplies its token without replacing the cashier's cart.
+            return fetchScreen({}).then(function(doc) {
+                var form = doc.getElementById('cartInlineAddForm');
+                var session = form && form.querySelector('[name=sessionId]');
+                var token = form && form.querySelector('[name=moquiSessionToken]');
+                if (!af.isConnected || expectedTx !== TX || !session || session.value !== SI || !token || !token.value)
+                    throw new Error('Your sign-in session needs attention. Sign in again to continue this bill.');
+                TK = token.value;
+                document.querySelectorAll('[name=moquiSessionToken]').forEach(function(input) { input.value = TK; });
+            });
+        }
+        window._posRefreshBrowserToken = function() { return refreshBrowserToken(TX); };
 
         function fetchCatalog(params, signal) {
             var data = Object.assign({sessionId:SI, salesModeId:SM, moquiSessionToken:TK}, params);
@@ -5294,15 +5364,38 @@ window.posToggleFullscreen = function() {
                 return catalogCheck.catch(function() {}).then(function() { return refreshCatalog(true); });
             }
             var checkedTx = TX, previous = catalogRevision;
-            catalogCheck = fetch('Terminal/catalogRevision', {
-                method:'POST', credentials:'same-origin', signal:AbortSignal.timeout(10000),
-                body:new URLSearchParams({sessionId:SI, transactionId:checkedTx, taxOn:TO,
-                    since:previous, revalidate:revalidate ? 'Y' : 'N', moquiSessionToken:TK})
-            }).then(function(response) {
-                return response.json().catch(function() { return null; });
-            }).then(function(data) {
+            function request(attempt) {
+                return fetch('Terminal/catalogRevision', {
+                    method:'POST', credentials:'same-origin', cache:'no-store', signal:AbortSignal.timeout(10000),
+                    headers:{Accept:'application/json','X-Requested-With':'XMLHttpRequest'},
+                    body:new URLSearchParams({sessionId:SI, transactionId:checkedTx, taxOn:TO,
+                        since:previous, revalidate:revalidate ? 'Y' : 'N', moquiSessionToken:TK})
+                }).then(function(response) {
+                    if (response.status === 401 && !attempt) {
+                        return refreshBrowserToken(checkedTx).then(function() {
+                            catalogDirtyTx = checkedTx;
+                            return request(1);
+                        });
+                    }
+                    if (response.status === 401 || response.redirected && /\/Login(?:[/?#]|$)/i.test(response.url))
+                        throw new Error('Your sign-in session expired. Sign in again to continue this bill.');
+                    if (!response.ok) {
+                        var error = new Error(response.status === 403 ? 'Access to this POS session was denied.' : 'Could not verify product prices. Try again.');
+                        error.retryable = response.status >= 500 || response.status === 408 || response.status === 429;
+                        throw error;
+                    }
+                    return response.json();
+                }).catch(function(error) {
+                    if (attempt || !af.isConnected || checkedTx !== TX ||
+                        !(error.retryable || error instanceof TypeError || error instanceof SyntaxError || error.name === 'TimeoutError')) throw error;
+                    // The verification is idempotent. Re-read the saved cart if a response was lost.
+                    catalogDirtyTx = checkedTx;
+                    return new Promise(function(resolve) { setTimeout(resolve, 300); }).then(function() { return request(1); });
+                });
+            }
+            catalogCheck = request(0).then(function(data) {
                 if (!data || !data.success || !data.revision)
-                    throw new Error(data && data.error || 'Could not verify product prices. Try again.');
+                    throw new Error(data && (data.error || (data.errors || []).join(' ')) || 'Could not verify product prices. Try again.');
                 if (!af.isConnected) return data;
                 catalogRevision = data.revision;
                 if (data.changed) {
@@ -5349,8 +5442,9 @@ window.posToggleFullscreen = function() {
             }).catch(function() {});
         }
         function confirmCatalogTender() {
-            var total = Number(lastPay);
+            var total = Number(lastPay), checkedTx = TX;
             return OPT.whenIdle().then(function() { return refreshCatalog(true); }).then(function(data) {
+                if (TX !== checkedTx) throw new Error('The active bill changed. Review it before taking payment.');
                 if (!af.isConnected || !TX || catalogDirtyTx === TX) throw new Error('Could not verify the current bill. Try again.');
                 if (data.cartChanged || Number(lastPay) !== total)
                     throw new Error('Product prices changed. Review the updated bill total before taking payment.');
