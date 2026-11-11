@@ -21,6 +21,7 @@ const rows=(table,where)=>q(`SELECT * FROM ${table} WHERE ${where}`),count=(tabl
  cp.execFileSync(process.execPath,[path.join(__dirname,'check-receipt-layout.cjs')],{stdio:'inherit'});
  cp.execFileSync(process.execPath,[path.join(__dirname,'check-receipt-options.cjs')],{stdio:'inherit'});
  cp.execFileSync(process.execPath,[path.join(__dirname,'check-print-routing.cjs')],{stdio:'inherit'});
+ cp.execFileSync(process.execPath,[path.join(__dirname,'verify-kot-print-popup.cjs')],{stdio:'inherit'});
  cp.execFileSync(process.execPath,[path.join(__dirname,'verify-offline-cart.cjs')],{stdio:'inherit'});
  cp.execFileSync(process.execPath,[path.join(__dirname,'check-idle-lock.cjs')],{stdio:'inherit'});
  cp.execFileSync(process.execPath,[path.join(__dirname,'check-shared-chrome.cjs')],{stdio:'inherit'});
@@ -40,6 +41,7 @@ const rows=(table,where)=>q(`SELECT * FROM ${table} WHERE ${where}`),count=(tabl
  async function invoke(op,params={},reject=false,actor=a){const r=await post('PosQaAcceptance','invoke',{op,...params},actor);let b;try{b=await r.json()}catch{b={errors:[(await r.text()).slice(0,160)]}}check(op+(reject?' rejected':' succeeded'),reject?(r.status()===403||b.errors?.length>0):r.status()===200&&!b.errors?.length,{status:r.status(),...b});return b.result||{};}
  if(process.env.POS_QA_FOCUS==='kot-receipts'){await require('./verify-kot-receipts.cjs')({a,foreign,base,check,q,invoke,post,out});await browser.close();browser=null;return;}
  if(process.env.POS_QA_FOCUS==='kot-module'){await require('./verify-kot-module.cjs')({browser,a,foreign,base,check,q,out});await browser.close();browser=null;return;}
+ if(process.env.POS_QA_FOCUS==='kot-offline-multitab'){await require('./verify-kot-offline-multitab.cjs')({a,base,check,q,invoke});await browser.close();browser=null;return;}
  if(process.env.POS_QA_FOCUS==='kot-terminal-policy'){await require('./verify-kot-terminal-policy.cjs')({a,foreign,base,check,q,invoke,post,out});await browser.close();browser=null;return;}
  if(process.env.POS_QA_FOCUS==='kot-workflows'){
   await require('./verify-kot.cjs')({a,foreign,base,post,rows,count,check});
@@ -577,6 +579,7 @@ const rows=(table,where)=>q(`SELECT * FROM ${table} WHERE ${where}`),count=(tabl
   await require('./verify-subnav-preference.cjs')({browser,base,check});
   await require('./verify-kitchen-tables.cjs')({a,foreign,base,post,rows,count,check});
   await require('./verify-kitchen-print.cjs')({a,foreign,base,post,rows,count,check,out});
+  await require('./verify-kot-offline-multitab.cjs')({a,base,check,q,invoke});
   await require('./verify-kot-module.cjs')({browser,a,foreign,base,check,q,out});
   await require('./verify-kot-compact.cjs')({a,foreign,base,check,q,invoke,post,out});
   await require('./verify-kot-terminal-policy.cjs')({a,foreign,base,check,q,invoke,post,out});

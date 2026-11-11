@@ -35,7 +35,7 @@
         '/pricing': ['Pricing', 'PricingDashboard:Dashboard', 'FindPriceList:Price Lists', 'FindPricingRule:Pricing Rules', 'PriceChangeHistory:Price History'],
         '/barcode': ['Barcode', 'BarcodeDashboard:Dashboard', 'FindBarcode:Product Barcodes', 'LabelTemplates:Label Templates', 'PrintJobs:Print Jobs']
     };
-    var KOT_TOOLS = new Set(["PosTransactions", "PosSessions", "PosTerminals", "Wastage", "ProductPricing", "DiscountSettings", "SalesMode", "ProductImport", "ReceiptConfig", "PrinterConfig", "BillNumberRegister", "OfflineMode"]);
+    var KOT_TOOLS = new Set(["PosTransactions", "PosSessions", "PosTerminals", "CreditBills", "Wastage", "ProductPricing", "DiscountSettings", "SalesMode", "ProductImport", "ReceiptConfig", "PrinterConfig", "BillNumberRegister", "OfflineMode"]);
     // the "Dashboards" hub shown on the Home/Dashboard landing — [label, href, matchPrefix, planModule] across
     // the ERP. A tab is shown only if its planModule is in the tenant's plan (null = always shown).
     var DASHBOARDS = [
@@ -466,7 +466,8 @@
             var match = key + '/' + seg;
             if ((key === '/pos' && posCash && !posCash[seg]) || !roleAllows(match)) return;
             var a = el('a', 'zqsub-tab', label);
-            a.href = match === '/pos/Terminal' ? '/apps/zenith' + match : '/qapps/zenith' + match;
+            var classicOnly = match === '/pos/Terminal' || match === '/kot/CreditBills';
+            a.href = (classicOnly ? '/apps/zenith' : '/qapps/zenith') + match;
             a.setAttribute('data-match', match);
             if (relA.indexOf(match) === 0 && match.length > alen) { active = a; alen = match.length; }
             subBar.appendChild(a);
