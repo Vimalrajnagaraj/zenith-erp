@@ -873,6 +873,7 @@
         input.inputMode='decimal';
       }
       for(const input of panel.querySelectorAll('input[type=text]'))input.maxLength=80;
+      PosTillDialogs.bindSplit(panel.querySelector('.pos-split-panel'),paymentAmount,{exact:true,minMethods:2});
       panel.querySelector('[name=cashAmount]').focus();
     }else if(method==='Credit'){
       panel.innerHTML=PosTillDialogs.creditMarkup();
@@ -1178,6 +1179,7 @@
     const submit=e.submitter||form.querySelector('[type=submit]');
     if(!submit)return;
     if(cash&&!PosTillDialogs.updateCash($('cash-slot'),confirmedTotal))return;
+    if(method==='Split'&&!PosTillDialogs.updateSplit($('other-payment').querySelector('.pos-split-panel'),confirmedTotal,{exact:true,minMethods:2}))return;
     if(method==='Credit'){
       const phone=form.elements.customerPhone;
       if(!/^\d{10,15}$/.test(phone.value.replace(/\D/g,''))){
@@ -1215,6 +1217,7 @@
       busy=false;controls();actions.forEach(button=>button.disabled=false);
       if(!bill&&$('payment').open&&!sessionLost&&!unconfirmedOrder){
         if(cash)PosTillDialogs.updateCash($('cash-slot'),confirmedTotal);
+        if(method==='Split')PosTillDialogs.updateSplit($('other-payment').querySelector('.pos-split-panel'),confirmedTotal,{exact:true,minMethods:2});
         if(!submit.disabled)submit.focus();
       }
     }

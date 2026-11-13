@@ -5665,6 +5665,10 @@ window.posToggleFullscreen = function() {
             }
             if (act.indexOf('splitPayAndComplete') !== -1) {
                 e.preventDefault();
+                if (!PosTillDialogs.updateSplit(form.closest('.pos-split-panel'), lastPay)) {
+                    showToast('Check the split amounts before completing the bill.', '#c62828');
+                    return;
+                }
                 var fd = new FormData(form);
                 fd.set('transactionId', TX); fd.set('sessionId', SI);
                 fd.set('salesModeId', SM); fd.set('moquiSessionToken', TK);
@@ -5672,11 +5676,6 @@ window.posToggleFullscreen = function() {
                 var cAmt = Number(fd.get('cashAmount') || 0);
                 var dAmt = Number(fd.get('cardAmount') || 0);
                 var uAmt = Number(fd.get('upiAmount') || 0);
-                var splitTotal = cAmt + dAmt + uAmt;
-                if (splitTotal < lastPay) {
-                    showToast('Split total (' + CS + fmt(splitTotal) + ') is less than the payable amount (' + CS + fmt(lastPay) + '). Please adjust.', '#c62828');
-                    return;
-                }
                 var splitParts = [];
                 if (cAmt > 0) splitParts.push(CS + fmt(cAmt) + ' Cash');
                 if (dAmt > 0) splitParts.push(CS + fmt(dAmt) + ' Card');
@@ -5708,7 +5707,7 @@ window.posToggleFullscreen = function() {
                     })
                     .catch(function(err) {
                         showToast('Split payment error: ' + err.message, '#c62828');
-                        if (btn) { btn.disabled = false; btn.style.opacity = ''; btn.textContent = '✓ CONFIRM SPLIT'; }
+                        if (btn) { btn.style.opacity = ''; btn.textContent = 'Confirm split'; PosTillDialogs.updateSplit(form.closest('.pos-split-panel'), lastPay); }
                     });
             }
         }, true);
@@ -5726,7 +5725,9 @@ window.posToggleFullscreen = function() {
                     var totalEl = smRoot.querySelector('[style*="font-size:28px"], [style*="font-size: 28px"]');
                     if (totalEl) { var m = totalEl.textContent.replace(/[^\d.]/g, ''); lastPay = Number(m) || 0; lastCartData.pay = lastPay; }
                 }
-                openPaymentPanel(buildSplitPanel);
+                openPaymentPanel(buildSplitPanel, function() {
+                    PosTillDialogs.bindSplit(smRoot.querySelector('.pos-split-panel'), lastPay);
+                });
             }
             if (e.target.closest('.pos-split-cancel') || (link && link.href && link.href.indexOf('cancelSplitPay') !== -1)) {
                 e.preventDefault();
