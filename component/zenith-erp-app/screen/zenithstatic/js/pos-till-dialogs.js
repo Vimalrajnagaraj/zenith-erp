@@ -79,7 +79,7 @@
 
     function splitMarkup(total, formOpen = '', formClose = '') {
         const methods = [
-            ['Cash', 'cash', '&#128176;'], ['Card', 'card', '&#128179;'], ['UPI', 'upi', '&#128241;']
+            ['Cash', 'cash', '&#128176;'], ['UPI', 'upi', '&#128241;'], ['Card', 'card', '&#128179;']
         ];
         const rows = methods.map(([label, key, icon]) =>
             '<div class="pos-split-method" data-method="'+key+'">'
