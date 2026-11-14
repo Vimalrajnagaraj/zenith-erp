@@ -4316,7 +4316,6 @@ window.posToggleFullscreen = function() {
             var disabled = !d.items.length;
             var badge = function(key) { return '<kbd>'+key+'</kbd>'; };
             var html = '<div class="pos-paywrap pos-reference-payments">'
-                + '<button type="button" id="pos-discount" class="pos-discount-btn">Discount / Roundoff'+badge('F1')+'</button>'
                 + '<button type="button" id="pos-pay-cash" class="pos-cash-btn">Cash'+badge('F2')+'</button>'
                 + payBtn('Card','Card'+badge('F3'),'#009dff')
                 + '<button id="pos-credit" type="button" onclick="posCreditSale()">Credit'+badge('F4')+'</button>'
@@ -4478,6 +4477,8 @@ window.posToggleFullscreen = function() {
             if (!d || !d.success) { if (d && d.error) showToast(d.error, '#c62828'); return; }
             TX = d.transactionId || '';
             document.querySelectorAll('input[name="transactionId"]').forEach(function(el) { if (el.value !== TX) el.value = TX; });
+            var discountButton = document.querySelector('.pos-checkout-reference #pos-discount');
+            if (discountButton) discountButton.disabled = !d.items.length;
             syncModeLinks();
             var tb = document.querySelector('.pos-cart tbody');
             if (!tb) return;
