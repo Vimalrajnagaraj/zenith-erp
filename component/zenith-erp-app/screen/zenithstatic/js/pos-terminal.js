@@ -980,7 +980,9 @@ window._posOffline = (function () {
                         );
                     })
                     .join('') +
-                '<button type="button" id="pos-discount" class="pos-discount-btn">Discount F1</button><button type="button" id="pos-hold">Hold F7</button><button type="button" id="pos-offline-holds">Held bills</button><button type="button" id="pos-offline-customer">Customer</button><button type="button" id="pos-offline-print">Pending receipts</button></div>';
+                '<button type="button" id="pos-hold">Hold F7</button><button type="button" id="pos-offline-holds">Held bills</button><button type="button" id="pos-offline-customer">Customer</button><button type="button" id="pos-offline-print">Pending receipts</button></div>';
+        var discountButton = document.querySelector('.nb-actionbar #pos-discount');
+        if (discountButton) discountButton.disabled = !cart.length;
         var countLabel = document.getElementById('pos-side-item-count');
         if (countLabel) countLabel.textContent = 'Subtotal (' + cart.length + ' items)';
         [['pos-side-subtotal',t.sub],['pos-side-discount',t.disc],['pos-side-tax',t.tax],['pos-side-round',t.round]].forEach(function (pair) {
