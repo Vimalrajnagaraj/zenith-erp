@@ -215,7 +215,11 @@ module.exports = async ({ browser, a, foreign, base, check, q, out }) => {
   check('POS Bill Wise report includes the completed KOT bill once',
    await page.getByRole('row').filter({has:page.getByText(settled.billNumber,{exact:true})}).count()===1);
   for (const shell of ['apps','qapps']) {
-   const homeAfter=await homeTotal(shell);
+   let homeAfter=await homeTotal(shell);
+   for(let retry=0;retry<4&&(homeAfter.amount!==homeAfter.chart||homeAfter.invoices===0);retry++){
+    await page.waitForTimeout(750);
+    homeAfter=await homeTotal(shell);
+   }
    check(shell+' Home Dashboard adds the KOT bill exactly once to sales, invoices and charts',
     homeAfter.amount===homeBefore.amount+100&&homeAfter.invoices===homeBefore.invoices+1&&
     homeAfter.chart===homeAfter.amount&&homeAfter.hourly===homeAfter.amount,
@@ -246,8 +250,8 @@ module.exports = async ({ browser, a, foreign, base, check, q, out }) => {
      check(plan+' '+shell+' '+view+' opens the full KOT editor with the saved bill',
       await quantity.inputValue()===expected&&
       await editor.locator('[data-edit-rate]').first().isVisible()&&await editor.locator('[data-edit-remove]').first().isVisible()&&
-      await editor.locator('#kb-history-add').isVisible()&&await editor.locator('#kb-history-detail-reprint').innerText()==='Print bill'&&
-      await editor.locator('#kb-history-save').innerText()==='Save & print revised bill');
+      await editor.locator('#kb-history-add').isVisible()&&
+      (await editor.locator('footer button:visible').allTextContents()).map(label=>label.trim()).join('|')==='Print|Reprint|Save');
      if(plan==='KOT'&&shell==='apps'){
       await clerkPage.screenshot({path:path.join(out,'kot-cashier-history-editor.png')});
       await quantity.fill('2');
