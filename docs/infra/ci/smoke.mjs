@@ -114,6 +114,12 @@ try {
           const count = await page.$$eval('.zcrm-dashboard-metrics .zcrm-metric', cards => cards.length);
           if (count !== 6) throw new Error(`CRM dashboard rendered ${count} metric cards instead of six`);
         }
+        const crmHeadings = { Dashboard: 'My follow-ups due', Reports: 'Forecast by category', Workflows: 'Your follow-up rules' };
+        const screenName = path.split('/Crm/')[1].split('?')[0];
+        if (crmHeadings[screenName]) {
+          const content = await page.$eval('.zcrm-page', element => element.innerText);
+          if (!content.includes(crmHeadings[screenName])) throw new Error(`Missing CRM section: ${crmHeadings[screenName]}`);
+        }
         if (path.includes('/Crm/Leads')) {
           await page.waitForSelector('.zcrm-lead-metrics', { timeout: 15000 });
           const count = await page.$$eval('.zcrm-lead-metrics .zcrm-metric', cards => cards.length);
@@ -137,7 +143,7 @@ try {
             throw new Error('CRM activity or segment list did not render');
           }
           if (path.includes('period=all')) {
-            const expected = path.includes('/Crm/Pipeline') ? 'Closing All Time' : 'All time';
+            const expected = path.includes('/Crm/Pipeline') ? 'Closing · All time' : 'All time';
             const text = await page.$eval('.zcrm-reference-metrics', element => element.innerText);
             if (!text.includes(expected)) throw new Error(`CRM period filter did not show ${expected}`);
           }
